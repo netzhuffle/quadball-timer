@@ -14,7 +14,7 @@ Common Options:
   --outdir <path>          Output directory (default: "dist")
   --minify                 Enable minification (or --minify.whitespace, --minify.syntax, etc)
   --sourcemap <type>      Sourcemap type: none|linked|inline|external
-  --target <target>        Build target: browser|bun|node
+  --target <target>        Build target: bun|browser|node
   --format <format>        Output format: esm|cjs|iife
   --splitting              Enable code splitting
   --packages <type>        Package handling: bundle|external
@@ -28,7 +28,7 @@ Common Options:
   --help, -h               Show this help message
 
 Example:
-  bun run build.ts --outdir=dist --minify --sourcemap=linked --external=react,react-dom
+  bun run build.ts --outdir=dist --target=bun --minify --sourcemap=linked
 `);
   process.exit(0);
 }
@@ -127,12 +127,10 @@ if (existsSync(outdir)) {
 }
 
 const start = performance.now();
-
-const entrypoints = [...new Bun.Glob("**.html").scanSync("src")]
-  .map((a) => path.resolve("src", a))
-  .filter((dir) => !dir.includes("node_modules"));
+const serverEntrypoint = path.resolve("src", "index.ts");
+const entrypoints = [serverEntrypoint];
 console.log(
-  `📄 Found ${entrypoints.length} HTML ${entrypoints.length === 1 ? "file" : "files"} to process\n`,
+  `📄 Bundling full-stack entrypoint ${path.relative(process.cwd(), serverEntrypoint)}\n`,
 );
 
 const result = await Bun.build({
@@ -140,7 +138,7 @@ const result = await Bun.build({
   outdir,
   plugins: [plugin],
   minify: true,
-  target: "browser",
+  target: "bun",
   sourcemap: "linked",
   define: {
     "process.env.NODE_ENV": JSON.stringify("production"),

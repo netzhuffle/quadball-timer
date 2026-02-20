@@ -9,7 +9,7 @@ Group=quadball-timer
 WorkingDirectory=/srv/quadball-timer/current
 Environment=NODE_ENV=production
 Environment=PORT=3000
-ExecStart=/home/quadball-timer/.bun/bin/bun src/index.ts
+ExecStart=/home/quadball-timer/.bun/bin/bun dist/index.js
 Restart=always
 RestartSec=3
 NoNewPrivileges=true

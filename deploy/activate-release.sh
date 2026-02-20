@@ -71,11 +71,14 @@ restart_service() {
 }
 
 check_health() {
-  local health_url="http://127.0.0.1:${port}/api/games"
+  local api_health_url="http://127.0.0.1:${port}/api/games"
+  local root_url="http://127.0.0.1:${port}/"
   local attempt
 
   for attempt in $(seq 1 20); do
-    if curl --fail --silent --show-error --max-time 2 "$health_url" >/dev/null; then
+    if curl --fail --silent --show-error --max-time 2 "$api_health_url" >/dev/null &&
+      curl --fail --silent --show-error --max-time 2 "$root_url" | grep -qi "<!doctype html"
+    then
       return 0
     fi
     sleep 1
