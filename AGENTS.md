@@ -47,6 +47,7 @@ Provide clear, low-friction defaults so OpenAI Codex can make safe, high-quality
 - Changes in websocket event parsing/contract (`/ws` flow) must include parser/contract tests for valid events and rejection of unsupported event types.
 - Changes in `src/lib/game-engine.ts` must include/update direct rule tests (clock/penalty ticking, timeout behavior, score-triggered expiration, flag-catch behavior).
 - Concurrency/offline-sync bug fixes must include a regression test that asserts the exact undesired behavior does not recur.
+- Changes to controller persistence/recovery (`src/lib/controller-session.ts` and controller sync flow in `src/App.tsx`) must include tests for corrupted payload rejection and safe local recovery behavior.
 
 ## Code Style
 - TypeScript first: prefer explicit, narrow types at public boundaries.
@@ -69,6 +70,8 @@ Provide clear, low-friction defaults so OpenAI Codex can make safe, high-quality
 - For offline command queueing, include a client timestamp per command and replay in order when reconnecting.
 - Keep idempotent command IDs on the server to avoid duplicate state application during reconnect/resend.
 - Live timer UIs must render from projected state (`projectGameView`) against `now`, not only from last synced snapshot.
+- Controller devices must remain operable even if the server loses a game ID: keep local state as authoritative, keep accepting local actions, and avoid forced session closure.
+- When in local-only fallback mode, keep periodic background reconnect attempts so sync resumes automatically if the server recovers.
 
 ## Common Pitfalls
 - Avoid `return` inside `finally` blocks (`no-unsafe-finally`); compute restart/cleanup decisions and apply them after `finally`.

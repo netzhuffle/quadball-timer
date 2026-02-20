@@ -10,6 +10,11 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import {
+  createPersistedControllerSession,
+  getControllerSessionStorageKey,
+  parsePersistedControllerSession,
+} from "@/lib/controller-session";
 import { applyGameCommand, projectGameView } from "@/lib/game-engine";
 import type {
   CardType,
@@ -35,7 +40,10 @@ type Route =
       role: ControllerRole;
     };
 
-type ConnectionState = "connecting" | "online" | "offline";
+type ConnectionState = "connecting" | "online" | "offline" | "local-only";
+const LOCAL_ONLY_MESSAGE = "Server does not know this game. Continuing locally on this device.";
+const NORMAL_RECONNECT_DELAY_MS = 1_000;
+const LOCAL_ONLY_RETRY_DELAY_MS = 60_000;
 
 export function App() {
   const route = useRoute();
@@ -265,11 +273,18 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
 
   const nowMs = useNow(250);
 
-  const { baseState, clockOffsetMs, dispatchCommand, connectionState, pendingCommands, error } =
-    useGameConnection({
-      gameId,
-      role,
-    });
+  const {
+    baseState,
+    clockOffsetMs,
+    dispatchCommand,
+    connectionState,
+    pendingCommands,
+    error,
+    localOnlyMode,
+  } = useGameConnection({
+    gameId,
+    role,
+  });
 
   useEffect(() => {
     if (baseState !== null) {
@@ -420,10 +435,14 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
           </div>
         </div>
 
-        {controller && connectionState !== "online" ? (
-          <p className="mt-2 text-xs font-medium text-amber-600">
-            Offline mode active. {pendingCommands} local change(s) will sync automatically.
-          </p>
+        {controller ? (
+          localOnlyMode ? (
+            <p className="mt-2 text-xs font-medium text-amber-600">{LOCAL_ONLY_MESSAGE}</p>
+          ) : connectionState !== "online" ? (
+            <p className="mt-2 text-xs font-medium text-amber-600">
+              Offline mode active. {pendingCommands} local change(s) will sync automatically.
+            </p>
+          ) : null
         ) : null}
       </header>
 
@@ -843,7 +862,9 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
           </div>
         ) : null}
 
-        {error !== null ? <p className="text-sm text-destructive">{error}</p> : null}
+        {error !== null && !localOnlyMode ? (
+          <p className="text-sm text-destructive">{error}</p>
+        ) : null}
       </div>
     </div>
   );
@@ -955,15 +976,53 @@ function useGameConnection({ gameId, role }: { gameId: string; role: ControllerR
   const [clockOffsetMs, setClockOffsetMs] = useState(0);
   const [connectionState, setConnectionState] = useState<ConnectionState>("connecting");
   const [error, setError] = useState<string | null>(null);
+  const [pendingCommandsCount, setPendingCommandsCount] = useState(0);
+  const [localOnlyMode, setLocalOnlyMode] = useState(false);
 
   const pendingRef = useRef<ClientCommandEnvelope[]>([]);
   const reconnectTimeoutRef = useRef<number | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const commandCounterRef = useRef(0);
   const clientInstanceId = useRef(crypto.randomUUID());
+  const subscribedToServerGameRef = useRef(false);
+  const localOnlyModeRef = useRef(false);
+
+  const setLocalOnlyState = useCallback((value: boolean) => {
+    localOnlyModeRef.current = value;
+    setLocalOnlyMode(value);
+  }, []);
+
+  const setPendingCommands = useCallback((commands: ClientCommandEnvelope[]) => {
+    pendingRef.current = commands;
+    setPendingCommandsCount(commands.length);
+  }, []);
+
+  const persistControllerSession = useCallback(
+    (state: GameState, pendingCommands: ClientCommandEnvelope[], commandCounter: number) => {
+      if (role !== "controller") {
+        return;
+      }
+
+      savePersistedControllerSession({
+        gameId,
+        state,
+        pendingCommands,
+        commandCounter,
+      });
+    },
+    [gameId, role],
+  );
 
   const flushPendingCommands = useCallback(() => {
     if (role !== "controller") {
+      return;
+    }
+
+    if (localOnlyModeRef.current) {
+      return;
+    }
+
+    if (!subscribedToServerGameRef.current) {
       return;
     }
 
@@ -993,7 +1052,7 @@ function useGameConnection({ gameId, role }: { gameId: string; role: ControllerR
     }) => {
       if (ackedCommandIds.length > 0) {
         const ackedSet = new Set(ackedCommandIds);
-        pendingRef.current = pendingRef.current.filter((command) => !ackedSet.has(command.id));
+        setPendingCommands(pendingRef.current.filter((command) => !ackedSet.has(command.id)));
       }
 
       setClockOffsetMs(serverNowMs - Date.now());
@@ -1005,27 +1064,62 @@ function useGameConnection({ gameId, role }: { gameId: string; role: ControllerR
       }
 
       setBaseState(reconciled);
+      persistControllerSession(reconciled, pendingRef.current, commandCounterRef.current);
     },
-    [],
+    [persistControllerSession, setPendingCommands],
   );
 
   useEffect(() => {
     let cancelled = false;
+    let recoveredFromLocal = false;
+
+    if (role === "controller") {
+      const persisted = loadPersistedControllerSession(gameId);
+      if (persisted !== null) {
+        recoveredFromLocal = true;
+        setPendingCommands(persisted.pendingCommands);
+        commandCounterRef.current = Math.max(commandCounterRef.current, persisted.commandCounter);
+        setBaseState(persisted.state);
+        setConnectionState("offline");
+        setError("Recovered local game state. Reconnecting server...");
+      }
+    }
 
     const fetchInitialSnapshot = async () => {
       try {
         const response = await fetch(`/api/games/${gameId}`);
         if (!response.ok) {
+          if (role === "controller" && recoveredFromLocal) {
+            setLocalOnlyState(true);
+            setConnectionState("local-only");
+            setError(LOCAL_ONLY_MESSAGE);
+            return;
+          }
+
           setError("Game not found.");
           return;
         }
 
         const payload = (await response.json()) as { game?: GameView };
         if (!cancelled && payload.game !== undefined) {
-          setBaseState(payload.game.state);
+          setError(null);
+
+          let reconciled = payload.game.state;
+          for (const command of pendingRef.current) {
+            reconciled = applyLocalEnvelope(reconciled, command);
+          }
+
+          setLocalOnlyState(false);
+          setBaseState(reconciled);
+          persistControllerSession(reconciled, pendingRef.current, commandCounterRef.current);
         }
       } catch {
         if (!cancelled) {
+          if (role === "controller" && recoveredFromLocal) {
+            setError("Unable to reach server. Continuing locally on this device.");
+            return;
+          }
+
           setError("Unable to fetch game snapshot.");
         }
       }
@@ -1036,12 +1130,21 @@ function useGameConnection({ gameId, role }: { gameId: string; role: ControllerR
         return;
       }
 
-      setConnectionState("connecting");
+      if (localOnlyModeRef.current) {
+        setConnectionState("local-only");
+      } else {
+        setConnectionState("connecting");
+      }
+
       const ws = new WebSocket(wsUrl);
       wsRef.current = ws;
+      subscribedToServerGameRef.current = false;
 
       ws.onopen = () => {
-        setConnectionState("online");
+        if (!localOnlyModeRef.current) {
+          setConnectionState("online");
+        }
+
         ws.send(
           JSON.stringify({
             type: "subscribe-game",
@@ -1058,11 +1161,23 @@ function useGameConnection({ gameId, role }: { gameId: string; role: ControllerR
         }
 
         if (parsed.type === "error") {
+          if (role === "controller" && isServerGameUnavailableError(parsed.message)) {
+            subscribedToServerGameRef.current = false;
+            setLocalOnlyState(true);
+            setConnectionState("local-only");
+            setError(LOCAL_ONLY_MESSAGE);
+            ws.close();
+            return;
+          }
+
           setError(parsed.message);
           return;
         }
 
         if (parsed.type === "game-snapshot") {
+          subscribedToServerGameRef.current = true;
+          setLocalOnlyState(false);
+          setConnectionState("online");
           setError(null);
           reconcileWithServer({
             state: parsed.game.state,
@@ -1074,10 +1189,19 @@ function useGameConnection({ gameId, role }: { gameId: string; role: ControllerR
       };
 
       ws.onclose = () => {
-        setConnectionState("offline");
+        if (localOnlyModeRef.current) {
+          setConnectionState("local-only");
+        } else {
+          setConnectionState("offline");
+        }
+
         wsRef.current = null;
+        subscribedToServerGameRef.current = false;
         if (!cancelled) {
-          reconnectTimeoutRef.current = window.setTimeout(connect, 1_000);
+          const retryDelay = localOnlyModeRef.current
+            ? LOCAL_ONLY_RETRY_DELAY_MS
+            : NORMAL_RECONNECT_DELAY_MS;
+          reconnectTimeoutRef.current = window.setTimeout(connect, retryDelay);
         }
       };
 
@@ -1091,6 +1215,7 @@ function useGameConnection({ gameId, role }: { gameId: string; role: ControllerR
 
     return () => {
       cancelled = true;
+      subscribedToServerGameRef.current = false;
       if (wsRef.current !== null) {
         wsRef.current.close();
       }
@@ -1098,7 +1223,16 @@ function useGameConnection({ gameId, role }: { gameId: string; role: ControllerR
         window.clearTimeout(reconnectTimeoutRef.current);
       }
     };
-  }, [flushPendingCommands, gameId, reconcileWithServer, role, wsUrl]);
+  }, [
+    flushPendingCommands,
+    gameId,
+    persistControllerSession,
+    reconcileWithServer,
+    role,
+    setLocalOnlyState,
+    setPendingCommands,
+    wsUrl,
+  ]);
 
   const dispatchCommand = useCallback(
     (command: GameCommand) => {
@@ -1118,15 +1252,17 @@ function useGameConnection({ gameId, role }: { gameId: string; role: ControllerR
           command,
         };
 
-        pendingRef.current = [...pendingRef.current, envelope];
+        const nextPendingCommands = [...pendingRef.current, envelope];
+        setPendingCommands(nextPendingCommands);
         const next = applyLocalEnvelope(previous, envelope);
+        persistControllerSession(next, nextPendingCommands, commandCounterRef.current);
 
         window.setTimeout(flushPendingCommands, 0);
 
         return next;
       });
     },
-    [clockOffsetMs, flushPendingCommands, role],
+    [clockOffsetMs, flushPendingCommands, persistControllerSession, role, setPendingCommands],
   );
 
   return {
@@ -1134,8 +1270,9 @@ function useGameConnection({ gameId, role }: { gameId: string; role: ControllerR
     clockOffsetMs,
     dispatchCommand,
     connectionState,
-    pendingCommands: pendingRef.current.length,
+    pendingCommands: pendingCommandsCount,
     error,
+    localOnlyMode,
   };
 }
 
@@ -1200,6 +1337,53 @@ function parseServerMessage(input: unknown): ServerWsMessage | null {
     return JSON.parse(input) as ServerWsMessage;
   } catch {
     return null;
+  }
+}
+
+function isServerGameUnavailableError(message: string) {
+  return (
+    message === "Game not found." ||
+    message === "Not subscribed to a game." ||
+    message === "Command gameId mismatch."
+  );
+}
+
+function loadPersistedControllerSession(gameId: string) {
+  try {
+    const raw = window.localStorage.getItem(getControllerSessionStorageKey(gameId));
+    if (raw === null) {
+      return null;
+    }
+
+    return parsePersistedControllerSession(raw, gameId);
+  } catch {
+    return null;
+  }
+}
+
+function savePersistedControllerSession({
+  gameId,
+  state,
+  pendingCommands,
+  commandCounter,
+}: {
+  gameId: string;
+  state: GameState;
+  pendingCommands: ClientCommandEnvelope[];
+  commandCounter: number;
+}) {
+  try {
+    const payload = createPersistedControllerSession({
+      gameId,
+      state,
+      pendingCommands,
+      commandCounter,
+      savedAtMs: Date.now(),
+    });
+
+    window.localStorage.setItem(getControllerSessionStorageKey(gameId), JSON.stringify(payload));
+  } catch {
+    // Best-effort persistence only; keep runtime behavior even if storage is unavailable.
   }
 }
 
