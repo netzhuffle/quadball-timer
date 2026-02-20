@@ -144,10 +144,6 @@ export type GameCommand =
       playerKey: string | null;
     }
   | {
-      type: "dismiss-penalty-expiration";
-      pendingId: string;
-    }
-  | {
       type: "start-timeout";
       team: TeamId;
     }

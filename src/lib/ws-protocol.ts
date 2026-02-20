@@ -326,23 +326,6 @@ function parseGameCommand(payload: Record<string, unknown>):
     };
   }
 
-  if (payload.type === "dismiss-penalty-expiration") {
-    if (typeof payload.pendingId !== "string") {
-      return {
-        ok: false,
-        error: "dismiss-penalty-expiration requires pendingId.",
-      };
-    }
-
-    return {
-      ok: true,
-      command: {
-        type: "dismiss-penalty-expiration",
-        pendingId: payload.pendingId,
-      },
-    };
-  }
-
   if (payload.type === "start-timeout") {
     if (!isTeam(payload.team)) {
       return {

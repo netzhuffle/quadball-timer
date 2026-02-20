@@ -513,6 +513,38 @@ describe("game-engine", () => {
     expect(getPlayerRemainingMs(state, "away:6")).toBe(44_000);
   });
 
+  test("pending expiration auto-clears when no eligible player remains", () => {
+    const makeId = createIdGenerator();
+    let state = createInitialGameState({ id: "game-18", nowMs: 0 });
+
+    state = applyGameCommand({
+      state,
+      command: { type: "add-card", team: "away", playerNumber: 4, cardType: "blue" },
+      nowMs: 0,
+      idGenerator: makeId,
+    });
+
+    state = applyGameCommand({
+      state,
+      command: { type: "change-score", team: "home", delta: 10, reason: "goal" },
+      nowMs: 0,
+      idGenerator: makeId,
+    });
+
+    expect(state.pendingExpirations).toHaveLength(1);
+
+    state = applyGameCommand({
+      state,
+      command: { type: "set-running", running: true },
+      nowMs: 0,
+      idGenerator: makeId,
+    });
+
+    state = projectGameView(state, 61_000).state;
+    expect(state.players["away:4"]).toBeUndefined();
+    expect(state.pendingExpirations).toHaveLength(0);
+  });
+
   test("red-card penalties never create score-based expiration candidates", () => {
     const makeId = createIdGenerator();
     let state = createInitialGameState({ id: "game-5", nowMs: 0 });

@@ -10,7 +10,6 @@ import {
   Delete,
   Eye,
   Flag,
-  Info,
   Minus,
   OctagonX,
   Pause,
@@ -286,9 +285,7 @@ function HomePage() {
 
 function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
   const controller = role === "controller";
-  const [activePanel, setActivePanel] = useState<"overview" | "card" | "timeout" | "admin">(
-    "overview",
-  );
+  const [activePanel, setActivePanel] = useState<"card" | "timeout" | "game">("card");
   const [homeName, setHomeName] = useState("Home");
   const [awayName, setAwayName] = useState("Away");
   const [cardDraft, setCardDraft] = useState<{
@@ -313,7 +310,6 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
     dispatchCommand,
     connectionState,
     pendingCommands,
-    error,
     localOnlyMode,
   } = useGameConnection({
     gameId,
@@ -360,7 +356,6 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
     !gameView.state.isFinished &&
     gameView.seekerReleased &&
     gameView.state.flagCatch === null;
-  const pendingCount = pendingExpirations.length;
   const pendingReleaseByPlayer = useMemo(() => {
     const byPlayer: Record<string, PendingReleaseAction[]> = {};
 
@@ -386,15 +381,6 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
 
     return byPlayer;
   }, [liveState, pendingExpirations]);
-  const unresolvedPendingExpirations = useMemo(
-    () =>
-      pendingExpirations.filter((pending) =>
-        pending.candidatePlayerKeys.every(
-          (playerKey) => liveState?.players[playerKey] === undefined,
-        ),
-      ),
-    [liveState, pendingExpirations],
-  );
 
   const submitCard = useCallback(() => {
     if (
@@ -492,7 +478,6 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
   }
 
   const state = liveState;
-  const recentCards = state.cardEvents.slice(-3).reverse();
   const visibleHomePenalties = selectVisiblePenalties(homePenalties, pendingReleaseByPlayer, 2);
   const visibleAwayPenalties = selectVisiblePenalties(awayPenalties, pendingReleaseByPlayer, 2);
   const activeTimeoutTeamName =
@@ -581,7 +566,7 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
 
   return (
     <div className="h-[100dvh] overflow-hidden bg-background p-2">
-      <div className="mx-auto grid h-full w-full max-w-[460px] grid-rows-[auto_auto_minmax(0,0.9fr)_minmax(0,1.1fr)_auto] gap-2">
+      <div className="mx-auto grid h-full w-full max-w-[460px] grid-rows-[auto_auto_minmax(0,1fr)_auto_auto] gap-2">
         <section className="rounded-xl border bg-card px-3 py-2 shadow-sm">
           <div className="flex items-start justify-between gap-2">
             <div className="min-w-0">
@@ -1063,220 +1048,162 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
           </Card>
         </section>
 
-        <Card className="min-h-0 py-2">
-          <CardContent className="flex h-full flex-col gap-1 overflow-hidden px-2.5">
-            {activePanel === "overview" ? (
-              <>
-                <div className="grid gap-1 text-[10px]">
-                  {pendingCount > 0 ? (
-                    <p className="rounded border border-amber-300 bg-amber-50 px-2 py-1 font-medium text-amber-800">
-                      {pendingCount} pending expiration{pendingCount > 1 ? "s" : ""}.
-                    </p>
-                  ) : null}
-                  {state.flagCatch !== null ? (
-                    <p className="rounded border border-emerald-300 bg-emerald-50 px-2 py-1 font-medium text-emerald-800">
-                      Flag catch:{" "}
-                      {state.flagCatch.team === "home" ? state.homeName : state.awayName}
-                    </p>
-                  ) : null}
-                  {recentCards.length > 0 ? (
-                    recentCards.map((card) => (
-                      <p key={card.id} className="truncate">
-                        {card.team === "home" ? state.homeName : state.awayName} •{" "}
-                        {card.playerNumber === null ? "Unknown" : `#${card.playerNumber}`} •{" "}
-                        {card.cardType}
-                      </p>
-                    ))
-                  ) : pendingCount === 0 && state.flagCatch === null ? (
-                    <p className="text-muted-foreground">No active alerts.</p>
-                  ) : null}
-                  {unresolvedPendingExpirations.length > 0
-                    ? unresolvedPendingExpirations.map((pending) => (
-                        <div
-                          key={pending.id}
-                          className="flex items-center justify-between rounded border border-amber-300 bg-amber-50 px-2 py-1 text-amber-900"
-                        >
-                          <span>
-                            {pending.reason === "score" ? "Goal" : "Flag"} pending without player
-                          </span>
-                          <Button
-                            size="sm"
-                            variant="outline"
-                            className="h-5 px-1.5 text-[10px]"
-                            onClick={() =>
-                              dispatchCommand({
-                                type: "dismiss-penalty-expiration",
-                                pendingId: pending.id,
-                              })
-                            }
-                            disabled={!controller}
-                          >
-                            Dismiss
-                          </Button>
-                        </div>
-                      ))
-                    : null}
-                </div>
-                {error !== null && !localOnlyMode ? (
-                  <p className="mt-auto text-[10px] font-medium text-destructive">{error}</p>
-                ) : null}
-              </>
-            ) : null}
+        <Card className="py-2">
+          <CardContent className="grid min-h-0 overflow-hidden px-2.5">
+            <div
+              className={`col-start-1 row-start-1 flex min-h-0 flex-col gap-1 py-1 ${
+                activePanel === "card" ? "" : "pointer-events-none opacity-0"
+              }`}
+            >
+              <div className="grid grid-cols-2 gap-1">
+                {cardTypeOptions.map((option) => {
+                  const Icon = option.icon;
+                  const active = cardDraft.cardType === option.type;
 
-            {activePanel === "card" ? (
-              <>
-                <div className="grid grid-cols-2 gap-1">
-                  {cardTypeOptions.map((option) => {
-                    const Icon = option.icon;
-                    const active = cardDraft.cardType === option.type;
-
-                    return (
-                      <Button
-                        key={option.type}
-                        size="sm"
-                        variant="outline"
-                        className={`h-6 justify-start gap-1.5 px-2 text-[10px] ${
-                          active ? option.activeClassName : option.idleClassName
-                        }`}
-                        onClick={() =>
-                          setCardDraft((previous) => ({
-                            ...previous,
-                            cardType: option.type,
-                            startedGameClockMs:
-                              previous.startedGameClockMs === null
-                                ? state.gameClockMs
-                                : previous.startedGameClockMs,
-                          }))
-                        }
-                        disabled={!canSelectCardType}
-                      >
-                        <Icon className="h-3.5 w-3.5" />
-                        {option.label}
-                      </Button>
-                    );
-                  })}
-                </div>
-                <div className="grid grid-cols-2 gap-1">
-                  <Button
-                    size="sm"
-                    variant={cardDraft.team === "home" ? "default" : "outline"}
-                    className="h-6 text-[10px]"
-                    onClick={() =>
-                      setCardDraft((previous) => ({
-                        ...previous,
-                        team: "home",
-                      }))
-                    }
-                    disabled={!canSelectCardTeam}
-                  >
-                    {state.homeName}
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant={cardDraft.team === "away" ? "default" : "outline"}
-                    className="h-6 text-[10px]"
-                    onClick={() =>
-                      setCardDraft((previous) => ({
-                        ...previous,
-                        team: "away",
-                      }))
-                    }
-                    disabled={!canSelectCardTeam}
-                  >
-                    {state.awayName}
-                  </Button>
-                </div>
-                <div className="grid grid-cols-[auto_1fr_auto] items-center gap-2 rounded border px-2 py-1 text-[10px] font-medium">
-                  {cardDraft.cardType === null ? (
-                    <span className="text-muted-foreground">Card?</span>
-                  ) : (
-                    <>
-                      <span className="uppercase">{cardDraft.cardType}</span>
-                      <span className="truncate text-muted-foreground">
-                        •{" "}
-                        {cardDraft.team === null
-                          ? "team?"
-                          : cardDraft.team === "home"
-                            ? state.homeName
-                            : state.awayName}{" "}
-                        • {cardPlayerLabel}
-                      </span>
-                    </>
-                  )}
-                  <Button
-                    size="sm"
-                    variant="ghost"
-                    className="h-5 px-1.5 text-[10px]"
-                    onClick={() =>
-                      setCardDraft({
-                        cardType: null,
-                        team: null,
-                        digits: "",
-                        startedGameClockMs: null,
-                      })
-                    }
-                    disabled={!controller || !cardEntryStarted}
-                  >
-                    Reset
-                  </Button>
-                </div>
-                <p className="h-4 text-[10px] text-muted-foreground">{cardAddStatusText}</p>
-                <div className="grid grid-cols-3 gap-1">
-                  {["1", "2", "3", "4", "5", "6", "7", "8", "9"].map((digit) => (
+                  return (
                     <Button
-                      key={digit}
+                      key={option.type}
                       size="sm"
                       variant="outline"
-                      className="h-6 text-sm"
-                      onClick={() => appendCardDigit(digit)}
-                      disabled={!canEditCardDigits}
+                      className={`h-6 justify-start gap-1.5 px-2 text-[10px] ${
+                        active ? option.activeClassName : option.idleClassName
+                      }`}
+                      onClick={() =>
+                        setCardDraft((previous) => ({
+                          ...previous,
+                          cardType: option.type,
+                          startedGameClockMs:
+                            previous.startedGameClockMs === null
+                              ? state.gameClockMs
+                              : previous.startedGameClockMs,
+                        }))
+                      }
+                      disabled={!canSelectCardType}
                     >
-                      {digit}
+                      <Icon className="h-3.5 w-3.5" />
+                      {option.label}
                     </Button>
-                  ))}
+                  );
+                })}
+              </div>
+              <div className="grid grid-cols-2 gap-1">
+                <Button
+                  size="sm"
+                  variant={cardDraft.team === "home" ? "default" : "outline"}
+                  className="h-6 text-[10px]"
+                  onClick={() =>
+                    setCardDraft((previous) => ({
+                      ...previous,
+                      team: "home",
+                    }))
+                  }
+                  disabled={!canSelectCardTeam}
+                >
+                  {state.homeName}
+                </Button>
+                <Button
+                  size="sm"
+                  variant={cardDraft.team === "away" ? "default" : "outline"}
+                  className="h-6 text-[10px]"
+                  onClick={() =>
+                    setCardDraft((previous) => ({
+                      ...previous,
+                      team: "away",
+                    }))
+                  }
+                  disabled={!canSelectCardTeam}
+                >
+                  {state.awayName}
+                </Button>
+              </div>
+              <div className="grid grid-cols-[auto_1fr_auto] items-center gap-2 rounded border px-2 py-1 text-[10px] font-medium">
+                {cardDraft.cardType === null ? (
+                  <span className="text-muted-foreground">Card?</span>
+                ) : (
+                  <>
+                    <span className="uppercase">{cardDraft.cardType}</span>
+                    <span className="truncate text-muted-foreground">
+                      •{" "}
+                      {cardDraft.team === null
+                        ? "team?"
+                        : cardDraft.team === "home"
+                          ? state.homeName
+                          : state.awayName}{" "}
+                      • {cardPlayerLabel}
+                    </span>
+                  </>
+                )}
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  className="h-5 px-1.5 text-[10px]"
+                  onClick={() =>
+                    setCardDraft({
+                      cardType: null,
+                      team: null,
+                      digits: "",
+                      startedGameClockMs: null,
+                    })
+                  }
+                  disabled={!controller || !cardEntryStarted}
+                >
+                  Reset
+                </Button>
+              </div>
+              <p className="h-4 text-[10px] text-muted-foreground">{cardAddStatusText}</p>
+              <div className="grid grid-cols-3 gap-1">
+                {["1", "2", "3", "4", "5", "6", "7", "8", "9"].map((digit) => (
                   <Button
-                    size="sm"
-                    variant="outline"
-                    className="h-6"
-                    onClick={() =>
-                      setCardDraft((previous) => ({
-                        ...previous,
-                        digits: previous.digits.slice(0, -1),
-                      }))
-                    }
-                    disabled={!canEditCardDigits || cardDraft.digits.length === 0}
-                  >
-                    <Delete className="h-4 w-4" />
-                  </Button>
-                  <Button
+                    key={digit}
                     size="sm"
                     variant="outline"
                     className="h-6 text-sm"
-                    onClick={() => appendCardDigit("0")}
+                    onClick={() => appendCardDigit(digit)}
                     disabled={!canEditCardDigits}
                   >
-                    0
+                    {digit}
                   </Button>
-                  <Button
-                    size="sm"
-                    className="h-6 gap-1"
-                    onClick={submitCard}
-                    disabled={!canSubmitCard}
-                  >
-                    <Check className="h-4 w-4" />
-                    OK
-                  </Button>
-                </div>
-                {state.isRunning && !cardEntryStarted ? (
-                  <p className="text-[10px] text-muted-foreground">
-                    Pause play to start card entry.
-                  </p>
-                ) : null}
-              </>
-            ) : null}
+                ))}
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="h-6"
+                  onClick={() =>
+                    setCardDraft((previous) => ({
+                      ...previous,
+                      digits: previous.digits.slice(0, -1),
+                    }))
+                  }
+                  disabled={!canEditCardDigits || cardDraft.digits.length === 0}
+                >
+                  <Delete className="h-4 w-4" />
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="h-6 text-sm"
+                  onClick={() => appendCardDigit("0")}
+                  disabled={!canEditCardDigits}
+                >
+                  0
+                </Button>
+                <Button
+                  size="sm"
+                  className="h-6 gap-1"
+                  onClick={submitCard}
+                  disabled={!canSubmitCard}
+                >
+                  <Check className="h-4 w-4" />
+                  OK
+                </Button>
+              </div>
+              {state.isRunning && !cardEntryStarted ? (
+                <p className="text-[10px] text-muted-foreground">Pause play to start card entry.</p>
+              ) : null}
+            </div>
 
             {activePanel === "timeout" ? (
-              <>
+              <div className="col-start-1 row-start-1 flex min-h-0 flex-col gap-1 py-1">
                 {activeTimeout === null ? (
                   <div className="grid gap-1">
                     <Button
@@ -1366,11 +1293,11 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
                     )}
                   </>
                 )}
-              </>
+              </div>
             ) : null}
 
-            {activePanel === "admin" ? (
-              <>
+            {activePanel === "game" ? (
+              <div className="col-start-1 row-start-1 flex min-h-0 flex-col gap-1 py-1">
                 {canRecordFlagCatch ? (
                   <div className="grid grid-cols-2 gap-1">
                     <Button
@@ -1402,21 +1329,12 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
                     Finish game
                   </Button>
                 ) : null}
-              </>
+              </div>
             ) : null}
           </CardContent>
         </Card>
 
-        <section className="grid grid-cols-4 gap-1">
-          <Button
-            variant={activePanel === "overview" ? "default" : "outline"}
-            size="sm"
-            className="h-8 gap-1 px-1 text-[11px]"
-            onClick={() => setActivePanel("overview")}
-          >
-            <Info className="h-3.5 w-3.5" />
-            Info
-          </Button>
+        <section className="grid grid-cols-3 gap-1">
           <Button
             variant={activePanel === "card" ? "default" : "outline"}
             size="sm"
@@ -1433,16 +1351,16 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
             onClick={() => setActivePanel("timeout")}
           >
             <Clock3 className="h-3.5 w-3.5" />
-            TO
+            Timeout
           </Button>
           <Button
-            variant={activePanel === "admin" ? "default" : "outline"}
+            variant={activePanel === "game" ? "default" : "outline"}
             size="sm"
             className="h-8 gap-1 px-1 text-[11px]"
-            onClick={() => setActivePanel("admin")}
+            onClick={() => setActivePanel("game")}
           >
             <Settings className="h-3.5 w-3.5" />
-            Admin
+            Game
           </Button>
         </section>
       </div>

@@ -134,6 +134,7 @@ export function advanceGameState(state: GameState, nowMs: number): GameState {
     }
   }
 
+  pruneInactivePendingExpirations(next);
   pruneRecentReleases(next, nowMs);
   next.updatedAtMs = nowMs;
   return next;
@@ -224,18 +225,6 @@ export function applyGameCommand({
         playerKey: command.playerKey,
         nowMs,
       });
-      return next;
-    }
-
-    case "dismiss-penalty-expiration": {
-      const pending = next.pendingExpirations.find(
-        (expiration) => expiration.id === command.pendingId,
-      );
-      if (pending !== undefined && pending.resolvedAtMs === null) {
-        next.pendingExpirations = next.pendingExpirations.filter(
-          (expiration) => expiration.id !== command.pendingId,
-        );
-      }
       return next;
     }
 
@@ -723,6 +712,23 @@ function pruneRecentReleases(state: GameState, nowMs: number) {
   state.recentReleases = state.recentReleases.filter(
     (entry) => nowMs - entry.releasedAtMs <= RELEASE_EVENT_VISIBLE_MS,
   );
+}
+
+function pruneInactivePendingExpirations(state: GameState) {
+  state.pendingExpirations = state.pendingExpirations.filter(
+    (pending) => pending.resolvedAtMs !== null || isPendingExpirationActionable(state, pending),
+  );
+}
+
+function isPendingExpirationActionable(state: GameState, pending: PendingPenaltyExpiration) {
+  return pending.candidatePlayerKeys.some((playerKey) => {
+    const player = state.players[playerKey];
+    if (player === undefined || player.team !== pending.penalizedTeam) {
+      return false;
+    }
+
+    return player.segments.some((segment) => segment.expirableByScore && segment.remainingMs > 0);
+  });
 }
 
 function recordReleasedPenalty({

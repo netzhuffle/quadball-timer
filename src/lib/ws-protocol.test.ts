@@ -134,6 +134,32 @@ describe("ws-protocol", () => {
     expect(parsed.error).toContain("Unsupported command type");
   });
 
+  test("rejects removed dismiss-penalty-expiration command", () => {
+    const parsed = parseClientWsMessage(
+      JSON.stringify({
+        type: "apply-commands",
+        gameId: "game-123",
+        commands: [
+          {
+            id: "cmd-legacy-dismiss",
+            clientSentAtMs: 123_456,
+            command: {
+              type: "dismiss-penalty-expiration",
+              pendingId: "pending-1",
+            },
+          },
+        ],
+      }),
+    );
+
+    expect(parsed.ok).toBe(false);
+    if (parsed.ok) {
+      return;
+    }
+
+    expect(parsed.error).toContain("Unsupported command type");
+  });
+
   test("parses undo-timeout-start command", () => {
     const parsed = parseClientWsMessage(
       JSON.stringify({
