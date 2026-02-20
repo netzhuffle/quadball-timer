@@ -1,0 +1,18 @@
+[Unit]
+Description=Quadball Timer Bun server
+After=network.target
+
+[Service]
+Type=simple
+User=quadball-timer
+Group=quadball-timer
+WorkingDirectory=/srv/quadball-timer/current
+Environment=NODE_ENV=production
+Environment=PORT=3000
+ExecStart=/home/quadball-timer/.bun/bin/bun src/index.ts
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
