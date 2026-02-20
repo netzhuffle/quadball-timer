@@ -72,6 +72,7 @@ Provide clear, low-friction defaults so OpenAI Codex can make safe, high-quality
 - Use contextual reveal for low-frequency actions (for example clock correction or rename flows) instead of showing all controls at once.
 - Prefer showing actionable/urgent information only; hide neutral status text when nothing requires attention.
 - Keep high-frequency actions single-tap with clear, compact controls suitable for quick glances during live play.
+- After controller layout changes, manually verify narrow-phone viewports (at least one ~360px width) to ensure no panel/control cutoff in any active bottom tab.
 
 ## Sync Guardrails
 - For offline command queueing, include a client timestamp per command and replay in order when reconnecting.
@@ -97,6 +98,7 @@ Provide clear, low-friction defaults so OpenAI Codex can make safe, high-quality
 ## Git Workflow
 - Before finishing, run relevant checks/tests for touched areas.
 - Include a concise change summary and any follow-up risks in PR/hand-off notes.
+- In this Codex sandbox setup, run `git add`/`git commit` with escalated permissions by default (to avoid recurring `.git/index.lock` permission failures), with a clear one-line justification.
 
 ## Safety Rules
 - Never run destructive git/file commands unless explicitly requested.

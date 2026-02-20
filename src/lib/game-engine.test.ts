@@ -57,6 +57,37 @@ describe("game-engine", () => {
     expect(getPlayerRemainingMs(pausedView.state, "home:7")).toBe(30_000);
   });
 
+  test("released penalties stay visible for 30 seconds of real time", () => {
+    const makeId = createIdGenerator();
+    let state = createInitialGameState({ id: "game-release-1", nowMs: 0 });
+
+    state = applyGameCommand({
+      state,
+      command: { type: "add-card", team: "home", playerNumber: 7, cardType: "blue" },
+      nowMs: 0,
+      idGenerator: makeId,
+    });
+
+    state = applyGameCommand({
+      state,
+      command: { type: "set-running", running: true },
+      nowMs: 0,
+      idGenerator: makeId,
+    });
+
+    let view = projectGameView(state, 60_000);
+    expect(view.state.players["home:7"]).toBeUndefined();
+    expect(view.state.recentReleases).toHaveLength(1);
+    expect(view.state.recentReleases[0]?.playerNumber).toBe(7);
+    expect(view.state.recentReleases[0]?.reason).toBe("served");
+
+    view = projectGameView(view.state, 85_000);
+    expect(view.state.recentReleases).toHaveLength(1);
+
+    view = projectGameView(view.state, 91_000);
+    expect(view.state.recentReleases).toHaveLength(0);
+  });
+
   test("score expiration targets player with fewest remaining expirable minutes", () => {
     const makeId = createIdGenerator();
     let state = createInitialGameState({ id: "game-2", nowMs: 0 });
@@ -194,6 +225,292 @@ describe("game-engine", () => {
     });
 
     expect(getPlayerRemainingMs(state, "away:5")).toBe(60_000);
+  });
+
+  test("confirming last expirable segment records a released player event", () => {
+    const makeId = createIdGenerator();
+    let state = createInitialGameState({ id: "game-release-2", nowMs: 0 });
+
+    state = applyGameCommand({
+      state,
+      command: { type: "add-card", team: "away", playerNumber: 11, cardType: "blue" },
+      nowMs: 0,
+      idGenerator: makeId,
+    });
+
+    state = applyGameCommand({
+      state,
+      command: { type: "change-score", team: "home", delta: 10, reason: "goal" },
+      nowMs: 0,
+      idGenerator: makeId,
+    });
+
+    const pendingId = state.pendingExpirations[0]?.id ?? "";
+    state = applyGameCommand({
+      state,
+      command: { type: "confirm-penalty-expiration", pendingId, playerKey: "away:11" },
+      nowMs: 0,
+      idGenerator: makeId,
+    });
+
+    expect(state.players["away:11"]).toBeUndefined();
+    expect(state.recentReleases).toHaveLength(1);
+    expect(state.recentReleases[0]?.playerNumber).toBe(11);
+    expect(state.recentReleases[0]?.reason).toBe("expired");
+  });
+
+  test("add-card can apply elapsed running game time since entry started", () => {
+    const makeId = createIdGenerator();
+    let state = createInitialGameState({ id: "game-12", nowMs: 0 });
+
+    state = applyGameCommand({
+      state,
+      command: { type: "set-running", running: true },
+      nowMs: 0,
+      idGenerator: makeId,
+    });
+
+    state = projectGameView(state, 20_000).state;
+
+    state = applyGameCommand({
+      state,
+      command: {
+        type: "add-card",
+        team: "home",
+        playerNumber: 3,
+        cardType: "blue",
+        startedGameClockMs: 15_000,
+      },
+      nowMs: 20_000,
+      idGenerator: makeId,
+    });
+
+    expect(getPlayerRemainingMs(state, "home:3")).toBe(55_000);
+  });
+
+  test("add-card started while paused only loses time after play resumes", () => {
+    const makeId = createIdGenerator();
+    let state = createInitialGameState({ id: "game-14", nowMs: 0 });
+
+    state = applyGameCommand({
+      state,
+      command: { type: "set-running", running: true },
+      nowMs: 5_000,
+      idGenerator: makeId,
+    });
+
+    state = applyGameCommand({
+      state,
+      command: {
+        type: "add-card",
+        team: "home",
+        playerNumber: 4,
+        cardType: "blue",
+        startedGameClockMs: 0,
+      },
+      nowMs: 12_000,
+      idGenerator: makeId,
+    });
+
+    expect(state.gameClockMs).toBe(7_000);
+    expect(getPlayerRemainingMs(state, "home:4")).toBe(53_000);
+  });
+
+  test("elapsed add-card time does not skip queued penalties for same player", () => {
+    const makeId = createIdGenerator();
+    let state = createInitialGameState({ id: "game-13", nowMs: 0 });
+
+    state = applyGameCommand({
+      state,
+      command: { type: "add-card", team: "home", playerNumber: 8, cardType: "blue" },
+      nowMs: 0,
+      idGenerator: makeId,
+    });
+
+    state = applyGameCommand({
+      state,
+      command: { type: "set-running", running: true },
+      nowMs: 0,
+      idGenerator: makeId,
+    });
+
+    state = projectGameView(state, 30_000).state;
+
+    state = applyGameCommand({
+      state,
+      command: {
+        type: "add-card",
+        team: "home",
+        playerNumber: 8,
+        cardType: "yellow",
+        startedGameClockMs: 0,
+      },
+      nowMs: 30_000,
+      idGenerator: makeId,
+    });
+
+    expect(getPlayerRemainingMs(state, "home:8")).toBe(90_000);
+  });
+
+  test("elapsed add-card time only backdates newly penalized players", () => {
+    const makeId = createIdGenerator();
+    let state = createInitialGameState({ id: "game-15", nowMs: 0 });
+
+    state = applyGameCommand({
+      state,
+      command: { type: "add-card", team: "home", playerNumber: 1, cardType: "blue" },
+      nowMs: 0,
+      idGenerator: makeId,
+    });
+
+    state = applyGameCommand({
+      state,
+      command: { type: "set-running", running: true },
+      nowMs: 0,
+      idGenerator: makeId,
+    });
+
+    state = projectGameView(state, 13_000).state;
+    expect(getPlayerRemainingMs(state, "home:1")).toBe(47_000);
+
+    state = applyGameCommand({
+      state,
+      command: {
+        type: "add-card",
+        team: "home",
+        playerNumber: 1,
+        cardType: "yellow",
+        startedGameClockMs: 13_000,
+      },
+      nowMs: 26_000,
+      idGenerator: makeId,
+    });
+
+    state = applyGameCommand({
+      state,
+      command: {
+        type: "add-card",
+        team: "away",
+        playerNumber: 2,
+        cardType: "blue",
+        startedGameClockMs: 13_000,
+      },
+      nowMs: 26_000,
+      idGenerator: makeId,
+    });
+
+    expect(getPlayerRemainingMs(state, "home:1")).toBe(94_000);
+    expect(getPlayerRemainingMs(state, "away:2")).toBe(47_000);
+  });
+
+  test("pending expiration keeps goal-time amount even when confirmed later", () => {
+    const makeId = createIdGenerator();
+    let state = createInitialGameState({ id: "game-16", nowMs: 0 });
+
+    state = applyGameCommand({
+      state,
+      command: { type: "add-card", team: "away", playerNumber: 6, cardType: "yellow" },
+      nowMs: 0,
+      idGenerator: makeId,
+    });
+
+    state = applyGameCommand({
+      state,
+      command: { type: "add-card", team: "away", playerNumber: 6, cardType: "blue" },
+      nowMs: 0,
+      idGenerator: makeId,
+    });
+
+    state = applyGameCommand({
+      state,
+      command: { type: "set-running", running: true },
+      nowMs: 0,
+      idGenerator: makeId,
+    });
+
+    state = applyGameCommand({
+      state,
+      command: { type: "change-score", team: "home", delta: 10, reason: "goal" },
+      nowMs: 34_000,
+      idGenerator: makeId,
+    });
+
+    const pending = state.pendingExpirations[0];
+    expect(pending?.expireMs).toBe(26_000);
+
+    state = projectGameView(state, 50_000).state;
+    expect(getPlayerRemainingMs(state, "away:6")).toBe(70_000);
+
+    state = applyGameCommand({
+      state,
+      command: {
+        type: "confirm-penalty-expiration",
+        pendingId: pending?.id ?? "",
+        playerKey: "away:6",
+      },
+      nowMs: 50_000,
+      idGenerator: makeId,
+    });
+
+    expect(getPlayerRemainingMs(state, "away:6")).toBe(44_000);
+  });
+
+  test("pending expiration does not release player if new minute was added before confirm", () => {
+    const makeId = createIdGenerator();
+    let state = createInitialGameState({ id: "game-17", nowMs: 0 });
+
+    state = applyGameCommand({
+      state,
+      command: { type: "add-card", team: "away", playerNumber: 6, cardType: "yellow" },
+      nowMs: 0,
+      idGenerator: makeId,
+    });
+
+    state = applyGameCommand({
+      state,
+      command: { type: "set-running", running: true },
+      nowMs: 0,
+      idGenerator: makeId,
+    });
+
+    state = applyGameCommand({
+      state,
+      command: { type: "change-score", team: "home", delta: 10, reason: "goal" },
+      nowMs: 34_000,
+      idGenerator: makeId,
+    });
+
+    const pending = state.pendingExpirations[0];
+    expect(pending?.expireMs).toBe(26_000);
+
+    state = applyGameCommand({
+      state,
+      command: {
+        type: "add-card",
+        team: "away",
+        playerNumber: 6,
+        cardType: "blue",
+        startedGameClockMs: 34_000,
+      },
+      nowMs: 40_000,
+      idGenerator: makeId,
+    });
+
+    state = projectGameView(state, 50_000).state;
+    expect(getPlayerRemainingMs(state, "away:6")).toBe(70_000);
+
+    state = applyGameCommand({
+      state,
+      command: {
+        type: "confirm-penalty-expiration",
+        pendingId: pending?.id ?? "",
+        playerKey: "away:6",
+      },
+      nowMs: 50_000,
+      idGenerator: makeId,
+    });
+
+    expect(getPlayerRemainingMs(state, "away:6")).toBe(44_000);
   });
 
   test("red-card penalties never create score-based expiration candidates", () => {

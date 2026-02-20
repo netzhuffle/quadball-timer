@@ -6,6 +6,7 @@ import type {
   GameView,
   PendingPenaltyExpiration,
   PlayerPenaltyState,
+  ReleasedPenaltyEvent,
   ScoreEvent,
   TeamId,
 } from "@/lib/game-types";
@@ -14,6 +15,7 @@ const ONE_MINUTE_MS = 60_000;
 const SEEKER_RELEASE_MS = 20 * ONE_MINUTE_MS;
 const SEEKER_COUNTDOWN_START_MS = 19 * ONE_MINUTE_MS;
 const TIMEOUT_REMINDER_MS = 15_000;
+const RELEASE_EVENT_VISIBLE_MS = 30_000;
 
 export type IdGenerator = () => string;
 
@@ -45,6 +47,7 @@ export function createInitialGameState({
     cardEvents: [],
     players: {},
     pendingExpirations: [],
+    recentReleases: [],
     flagCatch: null,
     timeouts: {
       home: { used: false },
@@ -59,7 +62,19 @@ export function createInitialGameState({
 }
 
 export function cloneGameState(state: GameState): GameState {
-  return structuredClone(state);
+  const cloned = structuredClone(state) as GameState;
+  if (!Array.isArray(cloned.pendingExpirations)) {
+    cloned.pendingExpirations = [];
+  }
+  for (const pending of cloned.pendingExpirations) {
+    if (typeof pending.expireMs !== "number" || pending.expireMs < 0) {
+      pending.expireMs = ONE_MINUTE_MS;
+    }
+  }
+  if (!Array.isArray(cloned.recentReleases)) {
+    cloned.recentReleases = [];
+  }
+  return cloned;
 }
 
 export function projectGameView(state: GameState, nowMs: number): GameView {
@@ -108,7 +123,7 @@ export function advanceGameState(state: GameState, nowMs: number): GameState {
 
   if (next.isRunning && !next.isFinished) {
     next.gameClockMs += deltaMs;
-    tickPenaltyClock(next, deltaMs);
+    tickPenaltyClock(next, deltaMs, nowMs);
   }
 
   if (!next.isRunning && next.timeouts.active?.running) {
@@ -119,6 +134,7 @@ export function advanceGameState(state: GameState, nowMs: number): GameState {
     }
   }
 
+  pruneRecentReleases(next, nowMs);
   next.updatedAtMs = nowMs;
   return next;
 }
@@ -194,6 +210,7 @@ export function applyGameCommand({
         cardType: command.cardType,
         team: command.team,
         playerNumber: command.playerNumber,
+        startedGameClockMs: command.startedGameClockMs,
         nowMs,
         idGenerator: makeId,
       });
@@ -398,6 +415,7 @@ function addCardToPlayer({
   team,
   playerNumber,
   cardType,
+  startedGameClockMs,
   nowMs,
   idGenerator,
 }: {
@@ -405,6 +423,7 @@ function addCardToPlayer({
   team: TeamId;
   playerNumber: number | null;
   cardType: CardType;
+  startedGameClockMs?: number;
   nowMs: number;
   idGenerator: IdGenerator;
 }) {
@@ -416,17 +435,42 @@ function addCardToPlayer({
 
   if (cardType !== "ejection") {
     playerKey = getPlayerKey(state, team, playerNumber);
+    const existingPlayer = state.players[playerKey];
+    const hadExistingSegments =
+      existingPlayer !== undefined &&
+      existingPlayer.segments.some((segment) => segment.remainingMs > 0);
     const player = getOrCreatePlayer(state, team, playerNumber, playerKey);
+    const newSegments: PlayerPenaltyState["segments"] = [];
 
     if (cardType === "red") {
-      player.segments.push(
+      newSegments.push(
         createPenaltySegment({ idGenerator, cardType: "red", expirableByScore: false }),
         createPenaltySegment({ idGenerator, cardType: "red", expirableByScore: false }),
       );
     }
 
     if (cardType === "blue" || cardType === "yellow") {
-      player.segments.push(createPenaltySegment({ idGenerator, cardType, expirableByScore: true }));
+      newSegments.push(createPenaltySegment({ idGenerator, cardType, expirableByScore: true }));
+    }
+
+    const normalizedStartedClockMs =
+      typeof startedGameClockMs === "number" ? Math.max(0, startedGameClockMs) : state.gameClockMs;
+    const elapsedSinceEntryStartMs = Math.max(0, state.gameClockMs - normalizedStartedClockMs);
+
+    if (!hadExistingSegments && elapsedSinceEntryStartMs > 0) {
+      consumePenaltySegments(newSegments, elapsedSinceEntryStartMs);
+    }
+
+    player.segments.push(...newSegments.filter((segment) => segment.remainingMs > 0));
+
+    if (player.segments.length === 0) {
+      recordReleasedPenalty({
+        state,
+        player,
+        nowMs,
+        reason: "served",
+      });
+      delete state.players[player.key];
     }
   } else if (playerNumber !== null) {
     playerKey = `${team}:${playerNumber}`;
@@ -487,30 +531,67 @@ function getOrCreatePlayer(
   return state.players[key];
 }
 
-function tickPenaltyClock(state: GameState, deltaMs: number) {
+function tickPenaltyClock(state: GameState, deltaMs: number, nowMs: number) {
   for (const [key, player] of Object.entries(state.players)) {
-    let remainingDelta = deltaMs;
-
-    for (const segment of player.segments) {
-      if (remainingDelta <= 0) {
-        break;
-      }
-
-      if (segment.remainingMs <= 0) {
-        continue;
-      }
-
-      const consumed = Math.min(segment.remainingMs, remainingDelta);
-      segment.remainingMs -= consumed;
-      remainingDelta -= consumed;
-    }
+    consumePenaltySegments(player.segments, deltaMs);
 
     player.segments = player.segments.filter((segment) => segment.remainingMs > 0);
 
     if (player.segments.length === 0) {
+      recordReleasedPenalty({
+        state,
+        player,
+        nowMs,
+        reason: "served",
+      });
       delete state.players[key];
     }
   }
+}
+
+function consumePenaltySegments(
+  segments: Array<{
+    remainingMs: number;
+  }>,
+  deltaMs: number,
+) {
+  let remainingDelta = deltaMs;
+
+  for (const segment of segments) {
+    if (remainingDelta <= 0) {
+      break;
+    }
+
+    if (segment.remainingMs <= 0) {
+      continue;
+    }
+
+    const consumed = Math.min(segment.remainingMs, remainingDelta);
+    segment.remainingMs -= consumed;
+    remainingDelta -= consumed;
+  }
+}
+
+function consumeExpirablePenaltySegments(player: PlayerPenaltyState, amountMs: number) {
+  let remainingDelta = amountMs;
+  const requested = amountMs;
+
+  for (const segment of player.segments) {
+    if (remainingDelta <= 0) {
+      break;
+    }
+
+    if (!segment.expirableByScore || segment.remainingMs <= 0) {
+      continue;
+    }
+
+    const consumed = Math.min(segment.remainingMs, remainingDelta);
+    segment.remainingMs -= consumed;
+    remainingDelta -= consumed;
+  }
+
+  player.segments = player.segments.filter((entry) => entry.remainingMs > 0);
+  return requested - remainingDelta;
 }
 
 function createPendingExpiration({
@@ -529,7 +610,7 @@ function createPendingExpiration({
   const penalizedTeam = getOpposingTeam(scoringTeam);
 
   const candidates = getPenaltyExpirationCandidates(state, penalizedTeam);
-  if (candidates.length === 0) {
+  if (candidates === null) {
     return null;
   }
 
@@ -539,7 +620,8 @@ function createPendingExpiration({
     benefitingTeam: scoringTeam,
     penalizedTeam,
     createdAtMs: nowMs,
-    candidatePlayerKeys: candidates,
+    candidatePlayerKeys: candidates.playerKeys,
+    expireMs: candidates.expireMs,
     resolvedAtMs: null,
     resolvedPlayerKey: null,
   };
@@ -548,7 +630,10 @@ function createPendingExpiration({
   return pending;
 }
 
-function getPenaltyExpirationCandidates(state: GameState, penalizedTeam: TeamId): string[] {
+function getPenaltyExpirationCandidates(
+  state: GameState,
+  penalizedTeam: TeamId,
+): { playerKeys: string[]; expireMs: number } | null {
   const eligibles = Object.values(state.players)
     .filter((player) => player.team === penalizedTeam)
     .map((player) => {
@@ -566,17 +651,22 @@ function getPenaltyExpirationCandidates(state: GameState, penalizedTeam: TeamId)
     .filter((candidate) => candidate.expirableCount > 0);
 
   if (eligibles.length === 0) {
-    return [];
+    return null;
   }
 
   const minCount = Math.min(...eligibles.map((candidate) => candidate.expirableCount));
   const lowestCount = eligibles.filter((candidate) => candidate.expirableCount === minCount);
   const leastRemainingMs = Math.min(...lowestCount.map((candidate) => candidate.firstExpirableMs));
 
-  return lowestCount
+  const playerKeys = lowestCount
     .filter((candidate) => candidate.firstExpirableMs === leastRemainingMs)
     .map((candidate) => candidate.key)
     .sort();
+
+  return {
+    playerKeys,
+    expireMs: leastRemainingMs,
+  };
 }
 
 function confirmPendingExpiration({
@@ -607,14 +697,17 @@ function confirmPendingExpiration({
     return;
   }
 
-  const segment = player.segments.find((entry) => entry.expirableByScore && entry.remainingMs > 0);
-  if (segment === undefined) {
+  const removedMs = consumeExpirablePenaltySegments(player, Math.max(0, pending.expireMs));
+  if (removedMs <= 0) {
     return;
   }
-
-  segment.remainingMs = 0;
-  player.segments = player.segments.filter((entry) => entry.remainingMs > 0);
   if (player.segments.length === 0) {
+    recordReleasedPenalty({
+      state,
+      player,
+      nowMs,
+      reason: "expired",
+    });
     delete state.players[player.key];
   }
 
@@ -626,9 +719,37 @@ function getOpposingTeam(team: TeamId): TeamId {
   return team === "home" ? "away" : "home";
 }
 
+function pruneRecentReleases(state: GameState, nowMs: number) {
+  state.recentReleases = state.recentReleases.filter(
+    (entry) => nowMs - entry.releasedAtMs <= RELEASE_EVENT_VISIBLE_MS,
+  );
+}
+
+function recordReleasedPenalty({
+  state,
+  player,
+  nowMs,
+  reason,
+}: {
+  state: GameState;
+  player: PlayerPenaltyState;
+  nowMs: number;
+  reason: ReleasedPenaltyEvent["reason"];
+}) {
+  state.recentReleases.push({
+    id: crypto.randomUUID(),
+    team: player.team,
+    playerKey: player.key,
+    playerNumber: player.playerNumber,
+    releasedAtMs: nowMs,
+    reason,
+  });
+}
+
 export const gameConstants = {
   ONE_MINUTE_MS,
   SEEKER_RELEASE_MS,
   SEEKER_COUNTDOWN_START_MS,
   TIMEOUT_REMINDER_MS,
+  RELEASE_EVENT_VISIBLE_MS,
 } as const;

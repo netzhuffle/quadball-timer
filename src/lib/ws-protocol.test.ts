@@ -39,6 +39,7 @@ describe("ws-protocol", () => {
               team: "home",
               cardType: "yellow",
               playerNumber: 3,
+              startedGameClockMs: 1_020_000,
             },
           },
         ],
@@ -57,6 +58,40 @@ describe("ws-protocol", () => {
 
     expect(parsed.message.commands).toHaveLength(1);
     expect(parsed.message.commands[0]?.command.type).toBe("add-card");
+    if (parsed.message.commands[0]?.command.type !== "add-card") {
+      return;
+    }
+
+    expect(parsed.message.commands[0].command.startedGameClockMs).toBe(1_020_000);
+  });
+
+  test("rejects add-card with non-numeric startedGameClockMs", () => {
+    const parsed = parseClientWsMessage(
+      JSON.stringify({
+        type: "apply-commands",
+        gameId: "game-123",
+        commands: [
+          {
+            id: "cmd-1",
+            clientSentAtMs: 123_456,
+            command: {
+              type: "add-card",
+              team: "home",
+              cardType: "yellow",
+              playerNumber: 3,
+              startedGameClockMs: "bad-value",
+            },
+          },
+        ],
+      }),
+    );
+
+    expect(parsed.ok).toBe(false);
+    if (parsed.ok) {
+      return;
+    }
+
+    expect(parsed.error).toContain("startedGameClockMs");
   });
 
   test("rejects unsupported websocket event types", () => {

@@ -278,6 +278,16 @@ function parseGameCommand(payload: Record<string, unknown>):
       };
     }
 
+    if (
+      payload.startedGameClockMs !== undefined &&
+      typeof payload.startedGameClockMs !== "number"
+    ) {
+      return {
+        ok: false,
+        error: "add-card startedGameClockMs must be number when provided.",
+      };
+    }
+
     return {
       ok: true,
       command: {
@@ -285,6 +295,8 @@ function parseGameCommand(payload: Record<string, unknown>):
         team: payload.team,
         playerNumber: payload.playerNumber,
         cardType: payload.cardType,
+        startedGameClockMs:
+          typeof payload.startedGameClockMs === "number" ? payload.startedGameClockMs : undefined,
       },
     };
   }

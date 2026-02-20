@@ -4,25 +4,22 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
-import {
-  AlertTriangle,
+  Check,
   Clock3,
   CloudOff,
+  Delete,
   Eye,
   Flag,
   Info,
   Minus,
+  OctagonX,
   Pause,
   Play,
   Plus,
   Settings,
-  Timer,
+  Shield,
+  TriangleAlert,
+  UserX,
   Wifi,
   WifiOff,
 } from "lucide-react";
@@ -56,6 +53,12 @@ type Route =
     };
 
 type ConnectionState = "connecting" | "online" | "offline" | "local-only";
+type PendingReleaseAction = {
+  pendingId: string;
+  reason: "score" | "flag-catch";
+  expireMs: number;
+};
+
 const LOCAL_ONLY_MESSAGE = "Server does not know this game. Continuing locally on this device.";
 const NORMAL_RECONNECT_DELAY_MS = 1_000;
 const LOCAL_ONLY_RETRY_DELAY_MS = 60_000;
@@ -63,6 +66,7 @@ const ONE_MINUTE_MS = 60_000;
 const SEEKER_RELEASE_MS = 20 * ONE_MINUTE_MS;
 const SEEKER_STATUS_SHOW_FROM_MS = 18 * ONE_MINUTE_MS;
 const SEEKER_STATUS_HIDE_AFTER_MS = 21 * ONE_MINUTE_MS;
+const RELEASE_EVENT_VISIBLE_MS = 30_000;
 
 export function App() {
   const route = useRoute();
@@ -282,17 +286,24 @@ function HomePage() {
 
 function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
   const controller = role === "controller";
-  const [activePanel, setActivePanel] = useState<
-    "overview" | "card" | "expire" | "timeout" | "admin"
-  >("overview");
+  const [activePanel, setActivePanel] = useState<"overview" | "card" | "timeout" | "admin">(
+    "overview",
+  );
   const [homeName, setHomeName] = useState("Home");
   const [awayName, setAwayName] = useState("Away");
-  const [cardTeam, setCardTeam] = useState<TeamId>("home");
-  const [cardType, setCardType] = useState<CardType>("blue");
-  const [playerNumberInput, setPlayerNumberInput] = useState("");
+  const [cardDraft, setCardDraft] = useState<{
+    cardType: CardType | null;
+    team: TeamId | null;
+    digits: string;
+    startedGameClockMs: number | null;
+  }>({
+    cardType: null,
+    team: null,
+    digits: "",
+    startedGameClockMs: null,
+  });
   const [clockAdjustOpen, setClockAdjustOpen] = useState(false);
   const [renamingTeam, setRenamingTeam] = useState<TeamId | null>(null);
-  const [pendingSelections, setPendingSelections] = useState<Record<string, string>>({});
 
   const nowMs = useNow(250);
 
@@ -350,22 +361,67 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
     gameView.seekerReleased &&
     gameView.state.flagCatch === null;
   const pendingCount = pendingExpirations.length;
+  const pendingReleaseByPlayer = useMemo(() => {
+    const byPlayer: Record<string, PendingReleaseAction[]> = {};
+
+    if (liveState === null) {
+      return byPlayer;
+    }
+
+    for (const pending of pendingExpirations) {
+      for (const playerKey of pending.candidatePlayerKeys) {
+        const player = liveState.players[playerKey];
+        if (player === undefined || player.team !== pending.penalizedTeam) {
+          continue;
+        }
+
+        byPlayer[playerKey] ??= [];
+        byPlayer[playerKey]?.push({
+          pendingId: pending.id,
+          reason: pending.reason,
+          expireMs: pending.expireMs,
+        });
+      }
+    }
+
+    return byPlayer;
+  }, [liveState, pendingExpirations]);
+  const unresolvedPendingExpirations = useMemo(
+    () =>
+      pendingExpirations.filter((pending) =>
+        pending.candidatePlayerKeys.every(
+          (playerKey) => liveState?.players[playerKey] === undefined,
+        ),
+      ),
+    [liveState, pendingExpirations],
+  );
 
   const submitCard = useCallback(() => {
-    if (!controller) {
+    if (
+      !controller ||
+      cardDraft.cardType === null ||
+      cardDraft.team === null ||
+      liveState === null
+    ) {
       return;
     }
 
-    const playerNumber = parsePlayerNumber(playerNumberInput);
+    const playerNumber = cardDraft.digits.length === 0 ? null : Number(cardDraft.digits);
     dispatchCommand({
       type: "add-card",
-      team: cardTeam,
-      cardType,
+      team: cardDraft.team,
+      cardType: cardDraft.cardType,
       playerNumber,
+      startedGameClockMs: cardDraft.startedGameClockMs ?? liveState.gameClockMs,
     });
 
-    setPlayerNumberInput("");
-  }, [cardTeam, cardType, controller, dispatchCommand, playerNumberInput]);
+    setCardDraft({
+      cardType: null,
+      team: null,
+      digits: "",
+      startedGameClockMs: null,
+    });
+  }, [cardDraft, controller, dispatchCommand, liveState]);
 
   const adjustGameClock = useCallback(
     (deltaMs: number) => {
@@ -394,6 +450,29 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
     setRenamingTeam(null);
   }, [awayName, controller, dispatchCommand, homeName]);
 
+  const wallNowMs = nowMs + clockOffsetMs;
+  const homeRecentReleases = useMemo(
+    () => getTeamRecentReleases(liveState, "home", wallNowMs),
+    [liveState, wallNowMs],
+  );
+  const awayRecentReleases = useMemo(
+    () => getTeamRecentReleases(liveState, "away", wallNowMs),
+    [liveState, wallNowMs],
+  );
+
+  const appendCardDigit = useCallback((digit: string) => {
+    setCardDraft((previous) => {
+      if (previous.digits.length >= 2) {
+        return previous;
+      }
+
+      return {
+        ...previous,
+        digits: `${previous.digits}${digit}`,
+      };
+    });
+  }, []);
+
   if (gameView === null || liveState === null) {
     return (
       <div className="mx-auto flex min-h-screen w-full max-w-3xl items-center justify-center p-6">
@@ -414,18 +493,95 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
 
   const state = liveState;
   const recentCards = state.cardEvents.slice(-3).reverse();
-  const visibleHomePenalties = homePenalties.slice(0, 1);
-  const visibleAwayPenalties = awayPenalties.slice(0, 1);
+  const visibleHomePenalties = selectVisiblePenalties(homePenalties, pendingReleaseByPlayer, 2);
+  const visibleAwayPenalties = selectVisiblePenalties(awayPenalties, pendingReleaseByPlayer, 2);
   const activeTimeoutTeamName =
     activeTimeout === null ? null : activeTimeout.team === "home" ? state.homeName : state.awayName;
   const showSeekerStatus =
     state.gameClockMs >= SEEKER_STATUS_SHOW_FROM_MS &&
     state.gameClockMs <= SEEKER_STATUS_HIDE_AFTER_MS;
   const seekerRemainingMs = Math.max(0, SEEKER_RELEASE_MS - state.gameClockMs);
+  const cardEntryStarted =
+    cardDraft.cardType !== null ||
+    cardDraft.team !== null ||
+    cardDraft.digits.length > 0 ||
+    cardDraft.startedGameClockMs !== null;
+  const canSelectCardType =
+    controller && !state.isFinished && (!state.isRunning || cardEntryStarted);
+  const canSelectCardTeam = canSelectCardType && cardDraft.cardType !== null;
+  const canEditCardDigits = canSelectCardTeam;
+  const canSubmitCard =
+    controller && !state.isFinished && cardDraft.cardType !== null && cardDraft.team !== null;
+  const cardPlayerLabel = cardDraft.digits.length > 0 ? `#${cardDraft.digits}` : "No #";
+  const cardBasePenaltyMs =
+    cardDraft.cardType === "red"
+      ? 2 * ONE_MINUTE_MS
+      : cardDraft.cardType === "blue" || cardDraft.cardType === "yellow"
+        ? ONE_MINUTE_MS
+        : cardDraft.cardType === "ejection"
+          ? 0
+          : null;
+  const elapsedCardEntryGameMs =
+    cardDraft.startedGameClockMs === null
+      ? 0
+      : Math.max(0, state.gameClockMs - cardDraft.startedGameClockMs);
+  const predictedCardRemainingMs =
+    cardBasePenaltyMs === null ? null : Math.max(0, cardBasePenaltyMs - elapsedCardEntryGameMs);
+  const selectedCardPlayerKey =
+    cardDraft.team !== null && cardDraft.digits.length > 0
+      ? `${cardDraft.team}:${Number(cardDraft.digits)}`
+      : null;
+  const selectedCardPlayer =
+    selectedCardPlayerKey === null ? null : (state.players[selectedCardPlayerKey] ?? null);
+  const selectedCardPlayerServingPenalty = hasServingPenalty(selectedCardPlayer);
+  const cardAddStatusText =
+    cardDraft.cardType === null || cardDraft.team === null
+      ? "Remaining on add: --"
+      : cardDraft.cardType === "ejection"
+        ? "Remaining on add: n/a"
+        : selectedCardPlayerServingPenalty
+          ? `Adds on confirm: +${formatPenaltySlice(cardBasePenaltyMs ?? ONE_MINUTE_MS)}`
+          : `Remaining on add: ${formatRemaining(predictedCardRemainingMs ?? ONE_MINUTE_MS)}${state.isRunning ? " (live)" : ""}`;
+  const cardTypeOptions: Array<{
+    type: CardType;
+    label: string;
+    icon: typeof Shield;
+    activeClassName: string;
+    idleClassName: string;
+  }> = [
+    {
+      type: "blue",
+      label: "Blue",
+      icon: Shield,
+      activeClassName: "border-sky-600 bg-sky-600 text-white",
+      idleClassName: "border-sky-200 bg-sky-50 text-sky-800",
+    },
+    {
+      type: "yellow",
+      label: "Yellow",
+      icon: TriangleAlert,
+      activeClassName: "border-amber-500 bg-amber-500 text-white",
+      idleClassName: "border-amber-200 bg-amber-50 text-amber-900",
+    },
+    {
+      type: "red",
+      label: "Red",
+      icon: OctagonX,
+      activeClassName: "border-rose-600 bg-rose-600 text-white",
+      idleClassName: "border-rose-200 bg-rose-50 text-rose-800",
+    },
+    {
+      type: "ejection",
+      label: "Ejection",
+      icon: UserX,
+      activeClassName: "border-violet-600 bg-violet-600 text-white",
+      idleClassName: "border-violet-200 bg-violet-50 text-violet-800",
+    },
+  ];
 
   return (
     <div className="h-[100dvh] overflow-hidden bg-background p-2">
-      <div className="mx-auto grid h-full w-full max-w-[460px] grid-rows-[auto_auto_minmax(0,1fr)_minmax(0,1fr)_auto] gap-2">
+      <div className="mx-auto grid h-full w-full max-w-[460px] grid-rows-[auto_auto_minmax(0,0.9fr)_minmax(0,1.1fr)_auto] gap-2">
         <section className="rounded-xl border bg-card px-3 py-2 shadow-sm">
           <div className="flex items-start justify-between gap-2">
             <div className="min-w-0">
@@ -577,7 +733,7 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
               </Button>
             </div>
           ) : null}
-          {showSeekerStatus || activeTimeout !== null || pendingCount > 0 ? (
+          {showSeekerStatus || activeTimeout !== null ? (
             <div className="mt-2 flex flex-wrap gap-1 text-[10px]">
               {showSeekerStatus ? (
                 <div
@@ -607,14 +763,6 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
                   <span className="inline-flex items-center gap-1">
                     <Clock3 className="h-3 w-3" />
                     {activeTimeoutTeamName} {formatRemaining(activeTimeout.remainingMs)}
-                  </span>
-                </div>
-              ) : null}
-              {pendingCount > 0 ? (
-                <div className="rounded border border-amber-300 bg-amber-50 px-2 py-1 font-semibold text-amber-800">
-                  <span className="inline-flex items-center gap-1">
-                    <AlertTriangle className="h-3 w-3" />
-                    Expire {pendingCount}
                   </span>
                 </div>
               ) : null}
@@ -713,23 +861,63 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
                 {visibleHomePenalties.length === 0 ? (
                   <p className="text-[10px] text-muted-foreground">No penalties</p>
                 ) : (
-                  visibleHomePenalties.map((entry) => (
-                    <div
-                      key={entry.playerKey}
-                      className={`flex items-center justify-between rounded border px-2 py-1 text-[10px] ${
-                        entry.highlight ? "border-amber-300 bg-amber-50 text-amber-900" : ""
-                      }`}
-                    >
-                      <span>{entry.label}</span>
-                      <span className="font-semibold tabular-nums">{entry.remaining}</span>
-                    </div>
-                  ))
+                  visibleHomePenalties.map((entry) => {
+                    const releaseActions = pendingReleaseByPlayer[entry.playerKey] ?? [];
+                    const playerState = state.players[entry.playerKey] ?? null;
+
+                    return (
+                      <div
+                        key={entry.playerKey}
+                        className={`rounded border px-2 py-1 text-[10px] ${
+                          releaseActions.length > 0
+                            ? "animate-pulse border-red-300 bg-red-50 text-red-900"
+                            : entry.highlight
+                              ? "border-amber-300 bg-amber-50 text-amber-900"
+                              : ""
+                        }`}
+                      >
+                        <div className="flex items-center justify-between">
+                          <span>{entry.label}</span>
+                          <span className="font-semibold tabular-nums">{entry.remaining}</span>
+                        </div>
+                        {releaseActions.length > 0 ? (
+                          <div className="mt-1 grid gap-1">
+                            {releaseActions.map((action) => (
+                              <Button
+                                key={action.pendingId}
+                                size="sm"
+                                className="h-6 justify-start px-1.5 text-[10px]"
+                                onClick={() =>
+                                  dispatchCommand({
+                                    type: "confirm-penalty-expiration",
+                                    pendingId: action.pendingId,
+                                    playerKey: entry.playerKey,
+                                  })
+                                }
+                                disabled={!controller}
+                              >
+                                {formatPendingReleaseActionLabel(action, playerState)}
+                              </Button>
+                            ))}
+                          </div>
+                        ) : null}
+                      </div>
+                    );
+                  })
                 )}
                 {homePenalties.length > visibleHomePenalties.length ? (
                   <p className="text-[10px] text-muted-foreground">
                     +{homePenalties.length - visibleHomePenalties.length} more
                   </p>
                 ) : null}
+                {homeRecentReleases.slice(0, 2).map((release) => (
+                  <div
+                    key={release.id}
+                    className="rounded border border-emerald-300 bg-emerald-50 px-2 py-1 text-[10px] text-emerald-900"
+                  >
+                    <span>{release.label} released</span>
+                  </div>
+                ))}
               </div>
             </CardContent>
           </Card>
@@ -813,30 +1001,70 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
                 {visibleAwayPenalties.length === 0 ? (
                   <p className="text-[10px] text-muted-foreground">No penalties</p>
                 ) : (
-                  visibleAwayPenalties.map((entry) => (
-                    <div
-                      key={entry.playerKey}
-                      className={`flex items-center justify-between rounded border px-2 py-1 text-[10px] ${
-                        entry.highlight ? "border-amber-300 bg-amber-50 text-amber-900" : ""
-                      }`}
-                    >
-                      <span>{entry.label}</span>
-                      <span className="font-semibold tabular-nums">{entry.remaining}</span>
-                    </div>
-                  ))
+                  visibleAwayPenalties.map((entry) => {
+                    const releaseActions = pendingReleaseByPlayer[entry.playerKey] ?? [];
+                    const playerState = state.players[entry.playerKey] ?? null;
+
+                    return (
+                      <div
+                        key={entry.playerKey}
+                        className={`rounded border px-2 py-1 text-[10px] ${
+                          releaseActions.length > 0
+                            ? "animate-pulse border-red-300 bg-red-50 text-red-900"
+                            : entry.highlight
+                              ? "border-amber-300 bg-amber-50 text-amber-900"
+                              : ""
+                        }`}
+                      >
+                        <div className="flex items-center justify-between">
+                          <span>{entry.label}</span>
+                          <span className="font-semibold tabular-nums">{entry.remaining}</span>
+                        </div>
+                        {releaseActions.length > 0 ? (
+                          <div className="mt-1 grid gap-1">
+                            {releaseActions.map((action) => (
+                              <Button
+                                key={action.pendingId}
+                                size="sm"
+                                className="h-6 justify-start px-1.5 text-[10px]"
+                                onClick={() =>
+                                  dispatchCommand({
+                                    type: "confirm-penalty-expiration",
+                                    pendingId: action.pendingId,
+                                    playerKey: entry.playerKey,
+                                  })
+                                }
+                                disabled={!controller}
+                              >
+                                {formatPendingReleaseActionLabel(action, playerState)}
+                              </Button>
+                            ))}
+                          </div>
+                        ) : null}
+                      </div>
+                    );
+                  })
                 )}
                 {awayPenalties.length > visibleAwayPenalties.length ? (
                   <p className="text-[10px] text-muted-foreground">
                     +{awayPenalties.length - visibleAwayPenalties.length} more
                   </p>
                 ) : null}
+                {awayRecentReleases.slice(0, 2).map((release) => (
+                  <div
+                    key={release.id}
+                    className="rounded border border-emerald-300 bg-emerald-50 px-2 py-1 text-[10px] text-emerald-900"
+                  >
+                    <span>{release.label} released</span>
+                  </div>
+                ))}
               </div>
             </CardContent>
           </Card>
         </section>
 
         <Card className="min-h-0 py-2">
-          <CardContent className="flex h-full flex-col gap-2 overflow-hidden px-2.5">
+          <CardContent className="flex h-full flex-col gap-1 overflow-hidden px-2.5">
             {activePanel === "overview" ? (
               <>
                 <div className="grid gap-1 text-[10px]">
@@ -862,6 +1090,32 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
                   ) : pendingCount === 0 && state.flagCatch === null ? (
                     <p className="text-muted-foreground">No active alerts.</p>
                   ) : null}
+                  {unresolvedPendingExpirations.length > 0
+                    ? unresolvedPendingExpirations.map((pending) => (
+                        <div
+                          key={pending.id}
+                          className="flex items-center justify-between rounded border border-amber-300 bg-amber-50 px-2 py-1 text-amber-900"
+                        >
+                          <span>
+                            {pending.reason === "score" ? "Goal" : "Flag"} pending without player
+                          </span>
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            className="h-5 px-1.5 text-[10px]"
+                            onClick={() =>
+                              dispatchCommand({
+                                type: "dismiss-penalty-expiration",
+                                pendingId: pending.id,
+                              })
+                            }
+                            disabled={!controller}
+                          >
+                            Dismiss
+                          </Button>
+                        </div>
+                      ))
+                    : null}
                 </div>
                 {error !== null && !localOnlyMode ? (
                   <p className="mt-auto text-[10px] font-medium text-destructive">{error}</p>
@@ -872,134 +1126,152 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
             {activePanel === "card" ? (
               <>
                 <div className="grid grid-cols-2 gap-1">
-                  <Select
-                    value={cardTeam}
-                    onValueChange={(value) => setCardTeam(value as TeamId)}
-                    disabled={!controller}
-                  >
-                    <SelectTrigger className="h-8 w-full">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="home">{state.homeName}</SelectItem>
-                      <SelectItem value="away">{state.awayName}</SelectItem>
-                    </SelectContent>
-                  </Select>
-                  <Select
-                    value={cardType}
-                    onValueChange={(value) => setCardType(value as CardType)}
-                    disabled={!controller}
-                  >
-                    <SelectTrigger className="h-8 w-full">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="blue">Blue</SelectItem>
-                      <SelectItem value="yellow">Yellow</SelectItem>
-                      <SelectItem value="red">Red</SelectItem>
-                      <SelectItem value="ejection">Ejection</SelectItem>
-                    </SelectContent>
-                  </Select>
-                </div>
-                <Input
-                  value={playerNumberInput}
-                  onChange={(event) => setPlayerNumberInput(event.target.value)}
-                  placeholder="Player # (optional)"
-                  inputMode="numeric"
-                  className="h-8"
-                  disabled={!controller}
-                />
-                <Button
-                  className="h-9"
-                  onClick={submitCard}
-                  disabled={!controller || state.isFinished}
-                >
-                  <Plus className="h-4 w-4" />
-                  Add card
-                </Button>
-              </>
-            ) : null}
-
-            {activePanel === "expire" ? (
-              <>
-                {pendingExpirations.length === 0 ? (
-                  <p className="text-[11px] text-muted-foreground">Nothing pending.</p>
-                ) : (
-                  pendingExpirations.slice(0, 2).map((expiration) => {
-                    const candidates = expiration.candidatePlayerKeys.filter(
-                      (playerKey) => state.players[playerKey] !== undefined,
-                    );
-                    const selected = pendingSelections[expiration.id] ?? "";
-                    const auto = candidates.length === 1 ? (candidates[0] ?? "") : "";
-                    const effective = selected.length > 0 ? selected : auto;
+                  {cardTypeOptions.map((option) => {
+                    const Icon = option.icon;
+                    const active = cardDraft.cardType === option.type;
 
                     return (
-                      <div key={expiration.id} className="rounded border p-2 text-[10px]">
-                        <p className="font-medium">
-                          {expiration.reason === "score" ? "Goal" : "Flag"} •{" "}
-                          {expiration.penalizedTeam === "home" ? state.homeName : state.awayName}
-                        </p>
-                        {candidates.length > 1 ? (
-                          <Select
-                            value={effective}
-                            onValueChange={(playerKey) =>
-                              setPendingSelections((previous) => ({
-                                ...previous,
-                                [expiration.id]: playerKey,
-                              }))
-                            }
-                            disabled={!controller}
-                          >
-                            <SelectTrigger className="mt-1 h-7 w-full">
-                              <SelectValue placeholder="Choose player" />
-                            </SelectTrigger>
-                            <SelectContent>
-                              {candidates.map((playerKey) => (
-                                <SelectItem key={playerKey} value={playerKey}>
-                                  {formatPlayerLabel(state.players[playerKey])}
-                                </SelectItem>
-                              ))}
-                            </SelectContent>
-                          </Select>
-                        ) : (
-                          <p className="mt-1 truncate">
-                            {formatPlayerLabel(state.players[candidates[0] ?? ""])}
-                          </p>
-                        )}
-                        <div className="mt-1 grid grid-cols-2 gap-1">
-                          <Button
-                            size="sm"
-                            onClick={() =>
-                              dispatchCommand({
-                                type: "confirm-penalty-expiration",
-                                pendingId: expiration.id,
-                                playerKey: effective.length > 0 ? effective : null,
-                              })
-                            }
-                            disabled={
-                              !controller || (candidates.length > 1 && effective.length === 0)
-                            }
-                          >
-                            Confirm
-                          </Button>
-                          <Button
-                            size="sm"
-                            variant="outline"
-                            onClick={() =>
-                              dispatchCommand({
-                                type: "dismiss-penalty-expiration",
-                                pendingId: expiration.id,
-                              })
-                            }
-                            disabled={!controller}
-                          >
-                            Dismiss
-                          </Button>
-                        </div>
-                      </div>
+                      <Button
+                        key={option.type}
+                        size="sm"
+                        variant="outline"
+                        className={`h-6 justify-start gap-1.5 px-2 text-[10px] ${
+                          active ? option.activeClassName : option.idleClassName
+                        }`}
+                        onClick={() =>
+                          setCardDraft((previous) => ({
+                            ...previous,
+                            cardType: option.type,
+                            startedGameClockMs:
+                              previous.startedGameClockMs === null
+                                ? state.gameClockMs
+                                : previous.startedGameClockMs,
+                          }))
+                        }
+                        disabled={!canSelectCardType}
+                      >
+                        <Icon className="h-3.5 w-3.5" />
+                        {option.label}
+                      </Button>
                     );
-                  })
-                )}
+                  })}
+                </div>
+                <div className="grid grid-cols-2 gap-1">
+                  <Button
+                    size="sm"
+                    variant={cardDraft.team === "home" ? "default" : "outline"}
+                    className="h-6 text-[10px]"
+                    onClick={() =>
+                      setCardDraft((previous) => ({
+                        ...previous,
+                        team: "home",
+                      }))
+                    }
+                    disabled={!canSelectCardTeam}
+                  >
+                    {state.homeName}
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant={cardDraft.team === "away" ? "default" : "outline"}
+                    className="h-6 text-[10px]"
+                    onClick={() =>
+                      setCardDraft((previous) => ({
+                        ...previous,
+                        team: "away",
+                      }))
+                    }
+                    disabled={!canSelectCardTeam}
+                  >
+                    {state.awayName}
+                  </Button>
+                </div>
+                <div className="grid grid-cols-[auto_1fr_auto] items-center gap-2 rounded border px-2 py-1 text-[10px] font-medium">
+                  {cardDraft.cardType === null ? (
+                    <span className="text-muted-foreground">Card?</span>
+                  ) : (
+                    <>
+                      <span className="uppercase">{cardDraft.cardType}</span>
+                      <span className="truncate text-muted-foreground">
+                        •{" "}
+                        {cardDraft.team === null
+                          ? "team?"
+                          : cardDraft.team === "home"
+                            ? state.homeName
+                            : state.awayName}{" "}
+                        • {cardPlayerLabel}
+                      </span>
+                    </>
+                  )}
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    className="h-5 px-1.5 text-[10px]"
+                    onClick={() =>
+                      setCardDraft({
+                        cardType: null,
+                        team: null,
+                        digits: "",
+                        startedGameClockMs: null,
+                      })
+                    }
+                    disabled={!controller || !cardEntryStarted}
+                  >
+                    Reset
+                  </Button>
+                </div>
+                <p className="h-4 text-[10px] text-muted-foreground">{cardAddStatusText}</p>
+                <div className="grid grid-cols-3 gap-1">
+                  {["1", "2", "3", "4", "5", "6", "7", "8", "9"].map((digit) => (
+                    <Button
+                      key={digit}
+                      size="sm"
+                      variant="outline"
+                      className="h-6 text-sm"
+                      onClick={() => appendCardDigit(digit)}
+                      disabled={!canEditCardDigits}
+                    >
+                      {digit}
+                    </Button>
+                  ))}
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="h-6"
+                    onClick={() =>
+                      setCardDraft((previous) => ({
+                        ...previous,
+                        digits: previous.digits.slice(0, -1),
+                      }))
+                    }
+                    disabled={!canEditCardDigits || cardDraft.digits.length === 0}
+                  >
+                    <Delete className="h-4 w-4" />
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="h-6 text-sm"
+                    onClick={() => appendCardDigit("0")}
+                    disabled={!canEditCardDigits}
+                  >
+                    0
+                  </Button>
+                  <Button
+                    size="sm"
+                    className="h-6 gap-1"
+                    onClick={submitCard}
+                    disabled={!canSubmitCard}
+                  >
+                    <Check className="h-4 w-4" />
+                    OK
+                  </Button>
+                </div>
+                {state.isRunning && !cardEntryStarted ? (
+                  <p className="text-[10px] text-muted-foreground">
+                    Pause play to start card entry.
+                  </p>
+                ) : null}
               </>
             ) : null}
 
@@ -1135,7 +1407,7 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
           </CardContent>
         </Card>
 
-        <section className="grid grid-cols-5 gap-1">
+        <section className="grid grid-cols-4 gap-1">
           <Button
             variant={activePanel === "overview" ? "default" : "outline"}
             size="sm"
@@ -1153,15 +1425,6 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
           >
             <Flag className="h-3.5 w-3.5" />
             Card
-          </Button>
-          <Button
-            variant={activePanel === "expire" ? "default" : "outline"}
-            size="sm"
-            className="h-8 gap-1 px-1 text-[11px]"
-            onClick={() => setActivePanel("expire")}
-          >
-            <Timer className="h-3.5 w-3.5" />
-            Exp {pendingCount > 0 ? pendingCount : ""}
           </Button>
           <Button
             variant={activePanel === "timeout" ? "default" : "outline"}
@@ -1622,19 +1885,6 @@ function navigateTo(path: string) {
   window.dispatchEvent(new PopStateEvent("popstate"));
 }
 
-function parsePlayerNumber(value: string): number | null {
-  if (value.trim().length === 0) {
-    return null;
-  }
-
-  const number = Number(value.trim());
-  if (!Number.isInteger(number) || number < 0 || number > 99) {
-    return null;
-  }
-
-  return number;
-}
-
 function formatClock(ms: number) {
   const totalSeconds = Math.max(0, Math.floor(ms / 1_000));
   const minutes = Math.floor(totalSeconds / 60);
@@ -1654,6 +1904,13 @@ function formatRemaining(ms: number) {
   return `${minutes}:${String(seconds).padStart(2, "0")}`;
 }
 
+function formatPenaltySlice(ms: number) {
+  const totalSeconds = Math.max(0, Math.ceil(ms / 1_000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}:${String(seconds).padStart(2, "0")}`;
+}
+
 function deriveLiveClockMs(game: GameSummary, nowMs: number) {
   if (!game.isRunning || game.isFinished) {
     return game.gameClockMs;
@@ -1668,6 +1925,12 @@ type PlayerPenaltyView = {
   remaining: string;
   remainingMs: number;
   highlight: boolean;
+};
+
+type ReleasedPenaltyView = {
+  id: string;
+  label: string;
+  releasedAtMs: number;
 };
 
 function getTeamPenalties(state: GameState | null | undefined, team: TeamId): PlayerPenaltyView[] {
@@ -1692,6 +1955,99 @@ function getTeamPenalties(state: GameState | null | undefined, team: TeamId): Pl
       };
     })
     .sort((a, b) => a.remainingMs - b.remainingMs || a.label.localeCompare(b.label));
+}
+
+function selectVisiblePenalties(
+  penalties: PlayerPenaltyView[],
+  pendingReleaseByPlayer: Record<string, PendingReleaseAction[]>,
+  limit: number,
+) {
+  const pendingFirst = penalties.filter((entry) => {
+    const pending = pendingReleaseByPlayer[entry.playerKey];
+    return pending !== undefined && pending.length > 0;
+  });
+  const normal = penalties.filter((entry) => {
+    const pending = pendingReleaseByPlayer[entry.playerKey];
+    return pending === undefined || pending.length === 0;
+  });
+
+  return [...pendingFirst, ...normal].slice(0, limit);
+}
+
+function hasServingPenalty(player: PlayerPenaltyState | null | undefined) {
+  if (player === null || player === undefined) {
+    return false;
+  }
+
+  return player.segments.some((segment) => segment.remainingMs > 0);
+}
+
+function willPendingReleaseNow(
+  action: PendingReleaseAction,
+  player: PlayerPenaltyState | null | undefined,
+) {
+  if (player === null || player === undefined) {
+    return false;
+  }
+
+  const totalRemainingMs = player.segments.reduce(
+    (total, segment) => total + Math.max(0, segment.remainingMs),
+    0,
+  );
+  const expirableRemainingMs = player.segments.reduce(
+    (total, segment) => total + (segment.expirableByScore ? Math.max(0, segment.remainingMs) : 0),
+    0,
+  );
+  if (totalRemainingMs <= 0 || expirableRemainingMs <= 0) {
+    return false;
+  }
+
+  const removedMs = Math.min(expirableRemainingMs, Math.max(0, action.expireMs));
+  return totalRemainingMs - removedMs <= 0;
+}
+
+function formatPendingReleaseActionLabel(
+  action: PendingReleaseAction,
+  player: PlayerPenaltyState | null | undefined,
+) {
+  const source = action.reason === "score" ? "Goal" : "Flag";
+  if (willPendingReleaseNow(action, player)) {
+    return `${source} release`;
+  }
+
+  return `${source} -${formatPenaltySlice(action.expireMs)}`;
+}
+
+function getTeamRecentReleases(
+  state: GameState | null | undefined,
+  team: TeamId,
+  nowMs: number,
+): ReleasedPenaltyView[] {
+  if (state === undefined || state === null) {
+    return [];
+  }
+
+  const releases = Array.isArray(state.recentReleases) ? state.recentReleases : [];
+
+  return releases
+    .filter((entry) => entry.team === team)
+    .map((entry): ReleasedPenaltyView | null => {
+      const remainingMs = RELEASE_EVENT_VISIBLE_MS - Math.max(0, nowMs - entry.releasedAtMs);
+      if (remainingMs <= 0) {
+        return null;
+      }
+
+      return {
+        id: entry.id,
+        label:
+          entry.playerNumber === null
+            ? `Unknown (${entry.playerKey.split(":").slice(2).join(":") || "penalty"})`
+            : `#${entry.playerNumber}`,
+        releasedAtMs: entry.releasedAtMs,
+      };
+    })
+    .filter((entry): entry is ReleasedPenaltyView => entry !== null)
+    .sort((a, b) => b.releasedAtMs - a.releasedAtMs);
 }
 
 function formatPlayerLabel(player: PlayerPenaltyState | null | undefined) {

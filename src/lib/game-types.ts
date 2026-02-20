@@ -27,6 +27,7 @@ export type PendingPenaltyExpiration = {
   reason: PendingExpirationReason;
   createdAtMs: number;
   candidatePlayerKeys: string[];
+  expireMs: number;
   resolvedAtMs: number | null;
   resolvedPlayerKey: string | null;
 };
@@ -60,6 +61,15 @@ export type ActiveTimeout = {
   remainingMs: number;
 };
 
+export type ReleasedPenaltyEvent = {
+  id: string;
+  team: TeamId;
+  playerKey: string;
+  playerNumber: number | null;
+  releasedAtMs: number;
+  reason: "served" | "expired";
+};
+
 export type GameState = {
   id: string;
   createdAtMs: number;
@@ -74,6 +84,7 @@ export type GameState = {
   cardEvents: CardEvent[];
   players: Record<string, PlayerPenaltyState>;
   pendingExpirations: PendingPenaltyExpiration[];
+  recentReleases: ReleasedPenaltyEvent[];
   flagCatch: {
     team: TeamId;
     createdAtMs: number;
@@ -125,6 +136,7 @@ export type GameCommand =
       team: TeamId;
       playerNumber: number | null;
       cardType: CardType;
+      startedGameClockMs?: number;
     }
   | {
       type: "confirm-penalty-expiration";
