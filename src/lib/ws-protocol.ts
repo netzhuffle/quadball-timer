@@ -395,6 +395,84 @@ function parseGameCommand(payload: Record<string, unknown>):
     };
   }
 
+  if (payload.type === "record-target-score") {
+    if (!isTeam(payload.team)) {
+      return {
+        ok: false,
+        error: "record-target-score requires team.",
+      };
+    }
+
+    return {
+      ok: true,
+      command: {
+        type: "record-target-score",
+        team: payload.team,
+      },
+    };
+  }
+
+  if (payload.type === "record-concede") {
+    if (!isTeam(payload.team)) {
+      return {
+        ok: false,
+        error: "record-concede requires team.",
+      };
+    }
+
+    return {
+      ok: true,
+      command: {
+        type: "record-concede",
+        team: payload.team,
+      },
+    };
+  }
+
+  if (payload.type === "record-forfeit") {
+    if (!isTeam(payload.team)) {
+      return {
+        ok: false,
+        error: "record-forfeit requires team.",
+      };
+    }
+
+    return {
+      ok: true,
+      command: {
+        type: "record-forfeit",
+        team: payload.team,
+      },
+    };
+  }
+
+  if (payload.type === "record-double-forfeit") {
+    return {
+      ok: true,
+      command: {
+        type: "record-double-forfeit",
+      },
+    };
+  }
+
+  if (payload.type === "suspend-game") {
+    return {
+      ok: true,
+      command: {
+        type: "suspend-game",
+      },
+    };
+  }
+
+  if (payload.type === "resume-game") {
+    return {
+      ok: true,
+      command: {
+        type: "resume-game",
+      },
+    };
+  }
+
   if (payload.type === "rename-teams") {
     if (typeof payload.homeName !== "string" || typeof payload.awayName !== "string") {
       return {
@@ -409,15 +487,6 @@ function parseGameCommand(payload: Record<string, unknown>):
         type: "rename-teams",
         homeName: payload.homeName,
         awayName: payload.awayName,
-      },
-    };
-  }
-
-  if (payload.type === "finish-game") {
-    return {
-      ok: true,
-      command: {
-        type: "finish-game",
       },
     };
   }

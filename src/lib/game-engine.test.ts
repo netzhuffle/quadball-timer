@@ -742,6 +742,306 @@ describe("game-engine", () => {
     expect(getPlayerRemainingMs(state, "away:2")).toBe(0);
   });
 
+  test("suspending a game requires paused state and blocks running until resumed", () => {
+    const makeId = createIdGenerator();
+    let state = createInitialGameState({ id: "game-19", nowMs: 0 });
+
+    state = applyGameCommand({
+      state,
+      command: { type: "set-running", running: true },
+      nowMs: 0,
+      idGenerator: makeId,
+    });
+
+    state = applyGameCommand({
+      state,
+      command: { type: "suspend-game" },
+      nowMs: 10_000,
+      idGenerator: makeId,
+    });
+    expect(state.isSuspended).toBe(false);
+
+    state = applyGameCommand({
+      state,
+      command: { type: "set-running", running: false },
+      nowMs: 10_000,
+      idGenerator: makeId,
+    });
+    state = applyGameCommand({
+      state,
+      command: { type: "suspend-game" },
+      nowMs: 10_000,
+      idGenerator: makeId,
+    });
+    expect(state.isSuspended).toBe(true);
+
+    state = applyGameCommand({
+      state,
+      command: { type: "set-running", running: true },
+      nowMs: 10_000,
+      idGenerator: makeId,
+    });
+    expect(state.isRunning).toBe(false);
+
+    state = applyGameCommand({
+      state,
+      command: { type: "resume-game" },
+      nowMs: 10_000,
+      idGenerator: makeId,
+    });
+    state = applyGameCommand({
+      state,
+      command: { type: "set-running", running: true },
+      nowMs: 10_000,
+      idGenerator: makeId,
+    });
+    expect(state.isSuspended).toBe(false);
+    expect(state.isRunning).toBe(true);
+  });
+
+  test("forfeit ends the game with opposing team as winner and no score change", () => {
+    const makeId = createIdGenerator();
+    let state = createInitialGameState({ id: "game-20", nowMs: 0 });
+
+    state = applyGameCommand({
+      state,
+      command: { type: "change-score", team: "home", delta: 70, reason: "manual" },
+      nowMs: 0,
+      idGenerator: makeId,
+    });
+    state = applyGameCommand({
+      state,
+      command: { type: "change-score", team: "away", delta: 30, reason: "manual" },
+      nowMs: 0,
+      idGenerator: makeId,
+    });
+
+    state = applyGameCommand({
+      state,
+      command: { type: "record-forfeit", team: "home" },
+      nowMs: 0,
+      idGenerator: makeId,
+    });
+
+    expect(state.isFinished).toBe(true);
+    expect(state.winner).toBe("away");
+    expect(state.finishReason).toBe("forfeit");
+    expect(state.score.home).toBe(70);
+    expect(state.score.away).toBe(30);
+  });
+
+  test("double forfeit ends game with no winner and no score change", () => {
+    const makeId = createIdGenerator();
+    let state = createInitialGameState({ id: "game-21", nowMs: 0 });
+
+    state = applyGameCommand({
+      state,
+      command: { type: "change-score", team: "home", delta: 40, reason: "manual" },
+      nowMs: 0,
+      idGenerator: makeId,
+    });
+
+    state = applyGameCommand({
+      state,
+      command: { type: "record-double-forfeit" },
+      nowMs: 0,
+      idGenerator: makeId,
+    });
+
+    expect(state.isFinished).toBe(true);
+    expect(state.winner).toBeNull();
+    expect(state.finishReason).toBe("double-forfeit");
+    expect(state.score.home).toBe(40);
+    expect(state.score.away).toBe(0);
+  });
+
+  test("flag catch that does not create a lead enters overtime instead of ending game", () => {
+    const makeId = createIdGenerator();
+    let state = createInitialGameState({ id: "game-22", nowMs: 0 });
+
+    state = applyGameCommand({
+      state,
+      command: { type: "change-score", team: "home", delta: 120, reason: "manual" },
+      nowMs: 0,
+      idGenerator: makeId,
+    });
+    state = applyGameCommand({
+      state,
+      command: { type: "change-score", team: "away", delta: 80, reason: "manual" },
+      nowMs: 0,
+      idGenerator: makeId,
+    });
+    state = applyGameCommand({
+      state,
+      command: { type: "set-running", running: true },
+      nowMs: 0,
+      idGenerator: makeId,
+    });
+    state = projectGameView(state, 1_200_000).state;
+    state = applyGameCommand({
+      state,
+      command: { type: "set-running", running: false },
+      nowMs: 1_200_000,
+      idGenerator: makeId,
+    });
+
+    state = applyGameCommand({
+      state,
+      command: { type: "record-flag-catch", team: "away" },
+      nowMs: 1_200_000,
+      idGenerator: makeId,
+    });
+
+    expect(state.score.home).toBe(120);
+    expect(state.score.away).toBe(110);
+    expect(state.isFinished).toBe(false);
+    expect(state.isOvertime).toBe(true);
+    expect(state.winner).toBeNull();
+  });
+
+  test("target-score command ends overtime game with selected team as winner", () => {
+    const makeId = createIdGenerator();
+    let state = createInitialGameState({ id: "game-23", nowMs: 0 });
+
+    state = applyGameCommand({
+      state,
+      command: { type: "change-score", team: "home", delta: 120, reason: "manual" },
+      nowMs: 0,
+      idGenerator: makeId,
+    });
+    state = applyGameCommand({
+      state,
+      command: { type: "change-score", team: "away", delta: 80, reason: "manual" },
+      nowMs: 0,
+      idGenerator: makeId,
+    });
+    state = applyGameCommand({
+      state,
+      command: { type: "set-running", running: true },
+      nowMs: 0,
+      idGenerator: makeId,
+    });
+    state = projectGameView(state, 1_200_000).state;
+    state = applyGameCommand({
+      state,
+      command: { type: "set-running", running: false },
+      nowMs: 1_200_000,
+      idGenerator: makeId,
+    });
+    state = applyGameCommand({
+      state,
+      command: { type: "record-flag-catch", team: "away" },
+      nowMs: 1_200_000,
+      idGenerator: makeId,
+    });
+
+    state = applyGameCommand({
+      state,
+      command: { type: "record-target-score", team: "home" },
+      nowMs: 1_200_000,
+      idGenerator: makeId,
+    });
+
+    expect(state.isFinished).toBe(true);
+    expect(state.isOvertime).toBe(false);
+    expect(state.winner).toBe("home");
+    expect(state.finishReason).toBe("target-score");
+  });
+
+  test("conceding during overtime awards +10 lead only if conceding team is leading", () => {
+    const makeId = createIdGenerator();
+    let state = createInitialGameState({ id: "game-24", nowMs: 0 });
+
+    state = applyGameCommand({
+      state,
+      command: { type: "change-score", team: "home", delta: 120, reason: "manual" },
+      nowMs: 0,
+      idGenerator: makeId,
+    });
+    state = applyGameCommand({
+      state,
+      command: { type: "change-score", team: "away", delta: 80, reason: "manual" },
+      nowMs: 0,
+      idGenerator: makeId,
+    });
+    state = applyGameCommand({
+      state,
+      command: { type: "set-running", running: true },
+      nowMs: 0,
+      idGenerator: makeId,
+    });
+    state = projectGameView(state, 1_200_000).state;
+    state = applyGameCommand({
+      state,
+      command: { type: "set-running", running: false },
+      nowMs: 1_200_000,
+      idGenerator: makeId,
+    });
+    state = applyGameCommand({
+      state,
+      command: { type: "record-flag-catch", team: "away" },
+      nowMs: 1_200_000,
+      idGenerator: makeId,
+    });
+
+    state = applyGameCommand({
+      state,
+      command: { type: "record-concede", team: "away" },
+      nowMs: 1_200_000,
+      idGenerator: makeId,
+    });
+    expect(state.score.home).toBe(120);
+    expect(state.score.away).toBe(110);
+    expect(state.isFinished).toBe(true);
+    expect(state.winner).toBe("home");
+    expect(state.finishReason).toBe("concede");
+
+    state = createInitialGameState({ id: "game-24b", nowMs: 0 });
+    state = applyGameCommand({
+      state,
+      command: { type: "change-score", team: "home", delta: 120, reason: "manual" },
+      nowMs: 0,
+      idGenerator: makeId,
+    });
+    state = applyGameCommand({
+      state,
+      command: { type: "change-score", team: "away", delta: 80, reason: "manual" },
+      nowMs: 0,
+      idGenerator: makeId,
+    });
+    state = applyGameCommand({
+      state,
+      command: { type: "set-running", running: true },
+      nowMs: 0,
+      idGenerator: makeId,
+    });
+    state = projectGameView(state, 1_200_000).state;
+    state = applyGameCommand({
+      state,
+      command: { type: "set-running", running: false },
+      nowMs: 1_200_000,
+      idGenerator: makeId,
+    });
+    state = applyGameCommand({
+      state,
+      command: { type: "record-flag-catch", team: "away" },
+      nowMs: 1_200_000,
+      idGenerator: makeId,
+    });
+
+    state = applyGameCommand({
+      state,
+      command: { type: "record-concede", team: "home" },
+      nowMs: 1_200_000,
+      idGenerator: makeId,
+    });
+    expect(state.score.home).toBe(120);
+    expect(state.score.away).toBe(130);
+    expect(state.isFinished).toBe(true);
+    expect(state.winner).toBe("away");
+    expect(state.finishReason).toBe("concede");
+  });
+
   test("flag catch is only accepted after seeker release while paused", () => {
     const makeId = createIdGenerator();
     let state = createInitialGameState({ id: "game-7", nowMs: 0 });

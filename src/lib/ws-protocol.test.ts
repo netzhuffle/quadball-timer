@@ -190,6 +190,82 @@ describe("ws-protocol", () => {
     expect(parsed.message.commands[0]?.command.type).toBe("undo-timeout-start");
   });
 
+  test("parses suspend-game command", () => {
+    const parsed = parseClientWsMessage(
+      JSON.stringify({
+        type: "apply-commands",
+        gameId: "game-123",
+        commands: [
+          {
+            id: "cmd-suspend",
+            clientSentAtMs: 1,
+            command: {
+              type: "suspend-game",
+            },
+          },
+        ],
+      }),
+    );
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok || parsed.message.type !== "apply-commands") {
+      return;
+    }
+
+    expect(parsed.message.commands[0]?.command.type).toBe("suspend-game");
+  });
+
+  test("parses record-forfeit command", () => {
+    const parsed = parseClientWsMessage(
+      JSON.stringify({
+        type: "apply-commands",
+        gameId: "game-123",
+        commands: [
+          {
+            id: "cmd-forfeit",
+            clientSentAtMs: 1,
+            command: {
+              type: "record-forfeit",
+              team: "home",
+            },
+          },
+        ],
+      }),
+    );
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok || parsed.message.type !== "apply-commands") {
+      return;
+    }
+
+    expect(parsed.message.commands[0]?.command.type).toBe("record-forfeit");
+  });
+
+  test("rejects removed finish-game command", () => {
+    const parsed = parseClientWsMessage(
+      JSON.stringify({
+        type: "apply-commands",
+        gameId: "game-123",
+        commands: [
+          {
+            id: "cmd-legacy-finish",
+            clientSentAtMs: 123_456,
+            command: {
+              type: "finish-game",
+            },
+          },
+        ],
+      }),
+    );
+
+    expect(parsed.ok).toBe(false);
+    if (parsed.ok) {
+      return;
+    }
+
+    expect(parsed.error).toContain("Unsupported command type");
+  });
+
   test("rejects command envelopes without client timestamp", () => {
     const parsed = parseClientWsMessage(
       JSON.stringify({

@@ -6,6 +6,13 @@ export type PendingExpirationReason = "score" | "flag-catch";
 
 export type ControllerRole = "controller" | "spectator";
 
+export type GameFinishReason =
+  | "forfeit"
+  | "double-forfeit"
+  | "flag-catch"
+  | "target-score"
+  | "concede";
+
 export type PenaltySegment = {
   id: string;
   cardType: Exclude<CardType, "ejection">;
@@ -79,6 +86,11 @@ export type GameState = {
   gameClockMs: number;
   isRunning: boolean;
   isFinished: boolean;
+  isSuspended: boolean;
+  suspendedAtMs: number | null;
+  isOvertime: boolean;
+  winner: TeamId | null;
+  finishReason: GameFinishReason | null;
   score: Record<TeamId, number>;
   scoreEvents: ScoreEvent[];
   cardEvents: CardEvent[];
@@ -105,6 +117,10 @@ export type GameSummary = {
   gameClockMs: number;
   isRunning: boolean;
   isFinished: boolean;
+  isSuspended: boolean;
+  isOvertime: boolean;
+  winner: TeamId | null;
+  finishReason: GameFinishReason | null;
   updatedAtMs: number;
 };
 
@@ -162,12 +178,30 @@ export type GameCommand =
       team: TeamId;
     }
   | {
+      type: "record-target-score";
+      team: TeamId;
+    }
+  | {
+      type: "record-concede";
+      team: TeamId;
+    }
+  | {
+      type: "record-forfeit";
+      team: TeamId;
+    }
+  | {
+      type: "record-double-forfeit";
+    }
+  | {
+      type: "suspend-game";
+    }
+  | {
+      type: "resume-game";
+    }
+  | {
       type: "rename-teams";
       homeName: string;
       awayName: string;
-    }
-  | {
-      type: "finish-game";
     };
 
 export type GameView = {

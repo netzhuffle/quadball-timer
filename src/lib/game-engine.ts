@@ -1,5 +1,6 @@
 import type {
   CardType,
+  GameFinishReason,
   GameCommand,
   GameState,
   GameSummary,
@@ -39,6 +40,11 @@ export function createInitialGameState({
     gameClockMs: 0,
     isRunning: false,
     isFinished: false,
+    isSuspended: false,
+    suspendedAtMs: null,
+    isOvertime: false,
+    winner: null,
+    finishReason: null,
     score: {
       home: 0,
       away: 0,
@@ -73,6 +79,21 @@ export function cloneGameState(state: GameState): GameState {
   }
   if (!Array.isArray(cloned.recentReleases)) {
     cloned.recentReleases = [];
+  }
+  if (typeof cloned.isSuspended !== "boolean") {
+    cloned.isSuspended = false;
+  }
+  if (typeof cloned.suspendedAtMs !== "number" && cloned.suspendedAtMs !== null) {
+    cloned.suspendedAtMs = null;
+  }
+  if (typeof cloned.isOvertime !== "boolean") {
+    cloned.isOvertime = false;
+  }
+  if (cloned.winner !== "home" && cloned.winner !== "away" && cloned.winner !== null) {
+    cloned.winner = null;
+  }
+  if (!isGameFinishReason(cloned.finishReason) && cloned.finishReason !== null) {
+    cloned.finishReason = null;
   }
   return cloned;
 }
@@ -109,6 +130,10 @@ export function projectGameSummary(state: GameState, nowMs: number): GameSummary
     gameClockMs: advanced.gameClockMs,
     isRunning: advanced.isRunning,
     isFinished: advanced.isFinished,
+    isSuspended: advanced.isSuspended,
+    isOvertime: advanced.isOvertime,
+    winner: advanced.winner,
+    finishReason: advanced.finishReason,
     updatedAtMs: advanced.updatedAtMs,
   };
 }
@@ -121,7 +146,7 @@ export function advanceGameState(state: GameState, nowMs: number): GameState {
   const next = cloneGameState(state);
   const deltaMs = nowMs - next.updatedAtMs;
 
-  if (next.isRunning && !next.isFinished) {
+  if (next.isRunning && !next.isFinished && !next.isSuspended) {
     next.gameClockMs += deltaMs;
     tickPenaltyClock(next, deltaMs, nowMs);
   }
@@ -157,6 +182,10 @@ export function applyGameCommand({
   switch (command.type) {
     case "set-running": {
       if (next.isFinished) {
+        return next;
+      }
+
+      if (next.isSuspended && command.running) {
         return next;
       }
 
@@ -276,7 +305,13 @@ export function applyGameCommand({
     }
 
     case "record-flag-catch": {
-      if (next.flagCatch !== null || next.isRunning || next.gameClockMs < SEEKER_RELEASE_MS) {
+      if (
+        next.flagCatch !== null ||
+        next.isFinished ||
+        next.isSuspended ||
+        next.isRunning ||
+        next.gameClockMs < SEEKER_RELEASE_MS
+      ) {
         return next;
       }
 
@@ -292,11 +327,102 @@ export function applyGameCommand({
         team: command.team,
         createdAtMs: nowMs,
       };
-      next.isFinished = true;
+
+      if (next.score[command.team] > next.score[getOpposingTeam(command.team)]) {
+        finalizeGame({
+          state: next,
+          winner: command.team,
+          reason: "flag-catch",
+        });
+      } else {
+        next.isOvertime = true;
+        next.isRunning = false;
+        if (next.timeouts.active !== null) {
+          next.timeouts.active.running = false;
+        }
+      }
+      return next;
+    }
+
+    case "record-target-score": {
+      if (next.isFinished || next.isSuspended || next.isRunning || !next.isOvertime) {
+        return next;
+      }
+
+      finalizeGame({
+        state: next,
+        winner: command.team,
+        reason: "target-score",
+      });
+      return next;
+    }
+
+    case "record-concede": {
+      if (next.isFinished || next.isSuspended || next.isRunning || !next.isOvertime) {
+        return next;
+      }
+
+      const concedingTeam = command.team;
+      const winner = getOpposingTeam(concedingTeam);
+      if (next.score[concedingTeam] > next.score[winner]) {
+        next.score[winner] = Math.max(next.score[winner], next.score[concedingTeam] + 10);
+      }
+
+      finalizeGame({
+        state: next,
+        winner,
+        reason: "concede",
+      });
+      return next;
+    }
+
+    case "record-forfeit": {
+      if (next.isFinished || next.isSuspended || next.isRunning) {
+        return next;
+      }
+
+      finalizeGame({
+        state: next,
+        winner: getOpposingTeam(command.team),
+        reason: "forfeit",
+      });
+      return next;
+    }
+
+    case "record-double-forfeit": {
+      if (next.isFinished || next.isSuspended || next.isRunning) {
+        return next;
+      }
+
+      finalizeGame({
+        state: next,
+        winner: null,
+        reason: "double-forfeit",
+      });
+      return next;
+    }
+
+    case "suspend-game": {
+      if (next.isFinished || next.isSuspended || next.isRunning) {
+        return next;
+      }
+
+      next.isSuspended = true;
+      next.suspendedAtMs = nowMs;
       next.isRunning = false;
       if (next.timeouts.active !== null) {
         next.timeouts.active.running = false;
       }
+      return next;
+    }
+
+    case "resume-game": {
+      if (next.isFinished || !next.isSuspended) {
+        return next;
+      }
+
+      next.isSuspended = false;
+      next.suspendedAtMs = null;
       return next;
     }
 
@@ -308,15 +434,6 @@ export function applyGameCommand({
       }
       if (awayName.length > 0) {
         next.awayName = awayName;
-      }
-      return next;
-    }
-
-    case "finish-game": {
-      next.isFinished = true;
-      next.isRunning = false;
-      if (next.timeouts.active !== null) {
-        next.timeouts.active.running = false;
       }
       return next;
     }
@@ -708,6 +825,28 @@ function getOpposingTeam(team: TeamId): TeamId {
   return team === "home" ? "away" : "home";
 }
 
+function finalizeGame({
+  state,
+  winner,
+  reason,
+}: {
+  state: GameState;
+  winner: TeamId | null;
+  reason: GameFinishReason;
+}) {
+  state.isFinished = true;
+  state.isRunning = false;
+  state.isSuspended = false;
+  state.suspendedAtMs = null;
+  state.isOvertime = false;
+  state.winner = winner;
+  state.finishReason = reason;
+  if (state.timeouts.active !== null) {
+    state.timeouts.active.running = false;
+    state.timeouts.active = null;
+  }
+}
+
 function pruneRecentReleases(state: GameState, nowMs: number) {
   state.recentReleases = state.recentReleases.filter(
     (entry) => nowMs - entry.releasedAtMs <= RELEASE_EVENT_VISIBLE_MS,
@@ -729,6 +868,16 @@ function isPendingExpirationActionable(state: GameState, pending: PendingPenalty
 
     return player.segments.some((segment) => segment.expirableByScore && segment.remainingMs > 0);
   });
+}
+
+function isGameFinishReason(value: unknown): value is GameFinishReason {
+  return (
+    value === "forfeit" ||
+    value === "double-forfeit" ||
+    value === "flag-catch" ||
+    value === "target-score" ||
+    value === "concede"
+  );
 }
 
 function recordReleasedPenalty({

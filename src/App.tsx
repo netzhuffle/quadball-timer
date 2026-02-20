@@ -58,6 +58,11 @@ type PendingReleaseAction = {
   expireMs: number;
 };
 
+type PendingWinConfirmation = {
+  label: string;
+  command: GameCommand;
+};
+
 const LOCAL_ONLY_MESSAGE = "Server does not know this game. Continuing locally on this device.";
 const NORMAL_RECONNECT_DELAY_MS = 1_000;
 const LOCAL_ONLY_RETRY_DELAY_MS = 60_000;
@@ -248,7 +253,14 @@ function HomePage() {
                           {game.homeName} vs {game.awayName}
                         </p>
                         <p className="text-xs text-muted-foreground">
-                          {game.isFinished ? "Past" : "Running"} • {formatClock(displayClock)}
+                          {game.isFinished
+                            ? "Past"
+                            : game.isSuspended
+                              ? "Suspended"
+                              : game.isRunning
+                                ? "Running"
+                                : "Paused"}{" "}
+                          • {formatClock(displayClock)}
                         </p>
                       </div>
                       <p className="text-lg font-semibold tabular-nums">
@@ -301,6 +313,8 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
   });
   const [clockAdjustOpen, setClockAdjustOpen] = useState(false);
   const [renamingTeam, setRenamingTeam] = useState<TeamId | null>(null);
+  const [pendingWinConfirmation, setPendingWinConfirmation] =
+    useState<PendingWinConfirmation | null>(null);
 
   const nowMs = useNow(250);
 
@@ -354,6 +368,8 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
     gameView !== null &&
     !gameView.state.isRunning &&
     !gameView.state.isFinished &&
+    !gameView.state.isSuspended &&
+    !gameView.state.isOvertime &&
     gameView.seekerReleased &&
     gameView.state.flagCatch === null;
   const pendingReleaseByPlayer = useMemo(() => {
@@ -436,6 +452,19 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
     setRenamingTeam(null);
   }, [awayName, controller, dispatchCommand, homeName]);
 
+  const requestWinConfirmation = useCallback((label: string, command: GameCommand) => {
+    setPendingWinConfirmation({ label, command });
+  }, []);
+
+  const confirmWinAction = useCallback(() => {
+    if (pendingWinConfirmation === null) {
+      return;
+    }
+
+    dispatchCommand(pendingWinConfirmation.command);
+    setPendingWinConfirmation(null);
+  }, [dispatchCommand, pendingWinConfirmation]);
+
   const wallNowMs = nowMs + clockOffsetMs;
   const homeRecentReleases = useMemo(
     () => getTeamRecentReleases(liveState, "home", wallNowMs),
@@ -445,6 +474,16 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
     () => getTeamRecentReleases(liveState, "away", wallNowMs),
     [liveState, wallNowMs],
   );
+
+  useEffect(() => {
+    if (pendingWinConfirmation === null) {
+      return;
+    }
+
+    if (liveState?.isFinished || liveState?.isSuspended) {
+      setPendingWinConfirmation(null);
+    }
+  }, [pendingWinConfirmation, liveState?.isFinished, liveState?.isSuspended]);
 
   const appendCardDigit = useCallback((digit: string) => {
     setCardDraft((previous) => {
@@ -486,17 +525,50 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
     state.gameClockMs >= SEEKER_STATUS_SHOW_FROM_MS &&
     state.gameClockMs <= SEEKER_STATUS_HIDE_AFTER_MS;
   const seekerRemainingMs = Math.max(0, SEEKER_RELEASE_MS - state.gameClockMs);
+  const statusLabel = state.isFinished
+    ? "Finished"
+    : state.isSuspended
+      ? "Suspended"
+      : state.isRunning
+        ? "Running"
+        : state.isOvertime
+          ? "Overtime paused"
+          : "Paused";
+  const winnerName =
+    state.winner === null ? null : state.winner === "home" ? state.homeName : state.awayName;
+  const finishSummary =
+    !state.isFinished || state.finishReason === null
+      ? null
+      : state.finishReason === "double-forfeit"
+        ? "Double forfeit"
+        : winnerName === null
+          ? "Game ended"
+          : `${winnerName} won by ${formatFinishReason(state.finishReason)}`;
+  const canSuspendGame = controller && !state.isFinished && !state.isSuspended && !state.isRunning;
+  const canResumeGame = controller && !state.isFinished && state.isSuspended;
+  const winConfirmationActive = pendingWinConfirmation !== null;
+  const canUseEndingActions =
+    controller &&
+    !state.isFinished &&
+    !state.isSuspended &&
+    !state.isRunning &&
+    !winConfirmationActive;
+
   const cardEntryStarted =
     cardDraft.cardType !== null ||
     cardDraft.team !== null ||
     cardDraft.digits.length > 0 ||
     cardDraft.startedGameClockMs !== null;
   const canSelectCardType =
-    controller && !state.isFinished && (!state.isRunning || cardEntryStarted);
+    controller && !state.isFinished && !state.isSuspended && (!state.isRunning || cardEntryStarted);
   const canSelectCardTeam = canSelectCardType && cardDraft.cardType !== null;
   const canEditCardDigits = canSelectCardTeam;
   const canSubmitCard =
-    controller && !state.isFinished && cardDraft.cardType !== null && cardDraft.team !== null;
+    controller &&
+    !state.isFinished &&
+    !state.isSuspended &&
+    cardDraft.cardType !== null &&
+    cardDraft.team !== null;
   const cardPlayerLabel = cardDraft.digits.length > 0 ? `#${cardDraft.digits}` : "No #";
   const cardBasePenaltyMs =
     cardDraft.cardType === "red"
@@ -624,7 +696,7 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
           <div className="grid grid-cols-[1fr_auto] items-center gap-2">
             <div>
               <p className="text-[10px] font-semibold tracking-wide text-muted-foreground uppercase">
-                {state.isFinished ? "Finished" : state.isRunning ? "Running" : "Paused"}
+                {statusLabel}
               </p>
               <button
                 type="button"
@@ -639,6 +711,9 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
               {controller ? (
                 <p className="text-[10px] text-muted-foreground">Tap game time to adjust</p>
               ) : null}
+              {finishSummary !== null ? (
+                <p className="text-[10px] font-medium text-muted-foreground">{finishSummary}</p>
+              ) : null}
             </div>
             <div>
               <Button
@@ -650,7 +725,7 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
                     running: !state.isRunning,
                   })
                 }
-                disabled={!controller || state.isFinished}
+                disabled={!controller || state.isFinished || state.isSuspended}
               >
                 {state.isRunning ? (
                   <>
@@ -1214,6 +1289,7 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
                       disabled={
                         !controller ||
                         state.isRunning ||
+                        state.isSuspended ||
                         state.timeouts.home.used ||
                         state.isFinished
                       }
@@ -1228,6 +1304,7 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
                       disabled={
                         !controller ||
                         state.isRunning ||
+                        state.isSuspended ||
                         state.timeouts.away.used ||
                         state.isFinished
                       }
@@ -1298,37 +1375,218 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
 
             {activePanel === "game" ? (
               <div className="col-start-1 row-start-1 flex min-h-0 flex-col gap-1 py-1">
-                {canRecordFlagCatch ? (
-                  <div className="grid grid-cols-2 gap-1">
-                    <Button
-                      size="sm"
-                      onClick={() => dispatchCommand({ type: "record-flag-catch", team: "home" })}
-                      disabled={!controller}
-                    >
-                      Home flag +30
-                    </Button>
-                    <Button
-                      size="sm"
-                      onClick={() => dispatchCommand({ type: "record-flag-catch", team: "away" })}
-                      disabled={!controller}
-                    >
-                      Away flag +30
-                    </Button>
+                {pendingWinConfirmation !== null ? (
+                  <div className="mb-1 rounded border border-amber-300 bg-amber-50 p-2 text-[10px] text-amber-900">
+                    <p className="font-semibold">Confirm result</p>
+                    <p className="mt-0.5">{pendingWinConfirmation.label}</p>
+                    <div className="mt-2 grid grid-cols-2 gap-1">
+                      <Button
+                        size="sm"
+                        className="h-7"
+                        onClick={confirmWinAction}
+                        disabled={!controller}
+                      >
+                        Confirm
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        className="h-7"
+                        onClick={() => setPendingWinConfirmation(null)}
+                        disabled={!controller}
+                      >
+                        Cancel
+                      </Button>
+                    </div>
                   </div>
-                ) : (
-                  <p className="text-[11px] text-muted-foreground">
-                    Flag catch appears here once seeker release has happened and play is paused.
-                  </p>
-                )}
-                {controller ? (
-                  <Button
-                    size="sm"
-                    variant="ghost"
-                    onClick={() => dispatchCommand({ type: "finish-game" })}
-                  >
-                    Finish game
-                  </Button>
                 ) : null}
+                {state.isFinished ? (
+                  <p className="text-[11px] text-muted-foreground">
+                    {finishSummary ?? "Game finished."}
+                  </p>
+                ) : state.isSuspended ? (
+                  <>
+                    <p className="text-[11px] text-muted-foreground">
+                      Game suspended. Resume when continuing this game.
+                    </p>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="h-8"
+                      onClick={() => dispatchCommand({ type: "resume-game" })}
+                      disabled={!canResumeGame}
+                    >
+                      Resume game
+                    </Button>
+                  </>
+                ) : (
+                  <>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="h-8"
+                      onClick={() => dispatchCommand({ type: "suspend-game" })}
+                      disabled={!canSuspendGame}
+                    >
+                      Suspend game
+                    </Button>
+                    <div className="grid grid-cols-2 gap-1">
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        className="h-8"
+                        onClick={() =>
+                          requestWinConfirmation(`${state.awayName} wins by forfeit penalty.`, {
+                            type: "record-forfeit",
+                            team: "home",
+                          })
+                        }
+                        disabled={!canUseEndingActions}
+                      >
+                        {state.homeName} forfeit
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        className="h-8"
+                        onClick={() =>
+                          requestWinConfirmation(`${state.homeName} wins by forfeit penalty.`, {
+                            type: "record-forfeit",
+                            team: "away",
+                          })
+                        }
+                        disabled={!canUseEndingActions}
+                      >
+                        {state.awayName} forfeit
+                      </Button>
+                    </div>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="h-8"
+                      onClick={() => dispatchCommand({ type: "record-double-forfeit" })}
+                      disabled={!canUseEndingActions}
+                    >
+                      Double forfeit
+                    </Button>
+
+                    {state.isOvertime ? (
+                      <>
+                        <div className="grid grid-cols-2 gap-1">
+                          <Button
+                            size="sm"
+                            className="h-8"
+                            onClick={() =>
+                              requestWinConfirmation(
+                                `${state.homeName} reached target score and wins.`,
+                                {
+                                  type: "record-target-score",
+                                  team: "home",
+                                },
+                              )
+                            }
+                            disabled={!canUseEndingActions}
+                          >
+                            {state.homeName} reached target
+                          </Button>
+                          <Button
+                            size="sm"
+                            className="h-8"
+                            onClick={() =>
+                              requestWinConfirmation(
+                                `${state.awayName} reached target score and wins.`,
+                                {
+                                  type: "record-target-score",
+                                  team: "away",
+                                },
+                              )
+                            }
+                            disabled={!canUseEndingActions}
+                          >
+                            {state.awayName} reached target
+                          </Button>
+                        </div>
+                        <div className="grid grid-cols-2 gap-1">
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            className="h-8"
+                            onClick={() =>
+                              requestWinConfirmation(
+                                `${state.homeName} conceded. ${state.awayName} wins.`,
+                                {
+                                  type: "record-concede",
+                                  team: "home",
+                                },
+                              )
+                            }
+                            disabled={!canUseEndingActions}
+                          >
+                            {state.homeName} concedes
+                          </Button>
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            className="h-8"
+                            onClick={() =>
+                              requestWinConfirmation(
+                                `${state.awayName} conceded. ${state.homeName} wins.`,
+                                {
+                                  type: "record-concede",
+                                  team: "away",
+                                },
+                              )
+                            }
+                            disabled={!canUseEndingActions}
+                          >
+                            {state.awayName} concedes
+                          </Button>
+                        </div>
+                      </>
+                    ) : canRecordFlagCatch ? (
+                      <div className="grid grid-cols-2 gap-1">
+                        <Button
+                          size="sm"
+                          onClick={() => {
+                            if (willFlagCatchWin(state, "home")) {
+                              requestWinConfirmation(`${state.homeName} wins on flag catch.`, {
+                                type: "record-flag-catch",
+                                team: "home",
+                              });
+                              return;
+                            }
+
+                            dispatchCommand({ type: "record-flag-catch", team: "home" });
+                          }}
+                          disabled={!canUseEndingActions}
+                        >
+                          {state.homeName} flag +30
+                        </Button>
+                        <Button
+                          size="sm"
+                          onClick={() => {
+                            if (willFlagCatchWin(state, "away")) {
+                              requestWinConfirmation(`${state.awayName} wins on flag catch.`, {
+                                type: "record-flag-catch",
+                                team: "away",
+                              });
+                              return;
+                            }
+
+                            dispatchCommand({ type: "record-flag-catch", team: "away" });
+                          }}
+                          disabled={!canUseEndingActions}
+                        >
+                          {state.awayName} flag +30
+                        </Button>
+                      </div>
+                    ) : (
+                      <p className="text-[11px] text-muted-foreground">
+                        Flag catch appears after seeker release while play is paused.
+                      </p>
+                    )}
+                  </>
+                )}
               </div>
             ) : null}
           </CardContent>
@@ -1801,6 +2059,28 @@ function applyLocalEnvelope(state: GameState, envelope: ClientCommandEnvelope): 
 function navigateTo(path: string) {
   window.history.pushState(null, "", path);
   window.dispatchEvent(new PopStateEvent("popstate"));
+}
+
+function willFlagCatchWin(state: GameState, team: TeamId) {
+  const opposingTeam = team === "home" ? "away" : "home";
+  return state.score[team] + 30 > state.score[opposingTeam];
+}
+
+function formatFinishReason(reason: GameState["finishReason"]) {
+  switch (reason) {
+    case "forfeit":
+      return "forfeit";
+    case "double-forfeit":
+      return "double forfeit";
+    case "flag-catch":
+      return "flag catch";
+    case "target-score":
+      return "target score";
+    case "concede":
+      return "concession";
+    default:
+      return "result";
+  }
 }
 
 function formatClock(ms: number) {
