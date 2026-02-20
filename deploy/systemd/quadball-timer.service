@@ -6,10 +6,10 @@ After=network.target
 Type=simple
 User=quadball-timer
 Group=quadball-timer
-WorkingDirectory=/srv/quadball-timer/current
+WorkingDirectory=/srv/quadball-timer/current/dist
 Environment=NODE_ENV=production
 Environment=PORT=3000
-ExecStart=/home/quadball-timer/.bun/bin/bun dist/index.js
+ExecStart=/home/quadball-timer/.bun/bin/bun index.js
 Restart=always
 RestartSec=3
 NoNewPrivileges=true
