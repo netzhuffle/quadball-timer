@@ -1,0 +1,93 @@
+# AGENTS.md
+
+## Project
+- Name: `OpenStory`
+- Stack: `bun` + `TypeScript` + `React` + `TailwindCSS` + `shadcn/ui`
+- Quality tooling: `oxfmt` + `oxlint` + `oxlint-tsgolint`
+- Package manager/runtime: `bun`
+- Tests: `bun test` with colocated `*.test.ts` files
+- VCS: `git`
+
+## Goal
+Provide clear, low-friction defaults so OpenAI Codex can make safe, high-quality changes quickly in this repo.
+
+## Working Defaults For Codex
+- Keep changes focused and minimal; avoid unrelated refactors.
+- Prefer small, reviewable commits.
+- Do not edit generated artifacts unless the task explicitly requires it.
+- Every change must keep both tests and documentation up to date for the touched behavior/surfaces.
+- Before handoff, always run `bun run check` and `bun run test` (and `bun run build` when frontend/module resolution may be affected).
+- Fix bugs at root cause, not only symptoms. Identify the exact leak/failure path and add regression tests that cover both internal/state behavior and user-visible outcomes.
+
+## Commands
+- Install deps: `bun install`
+- Dev server: `bun dev`
+- Production run: `bun start`
+- Build: `bun run build.ts`
+- Run all tests: `bun run test`
+- Run a single test file: `bun test path/to/file.test.ts`
+- Format code: `bun run format`
+- Check formatting only: `bun run format:check`
+- Lint (type-aware + type-check): `bun run lint`
+- Full quality gate: `bun run check`
+
+## Command Usage
+- Use `bun run format` before large reviews or commits to normalize formatting.
+- Use `bun run format:check` in CI or pre-merge validation to ensure formatting is clean.
+- Use `bun run lint` for strict type-aware and type-check linting with `oxlint`.
+- Use `bun run check` as the default pre-merge command. It runs:
+  1. `format:check`
+  2. `lint`
+
+## Test Conventions
+- Place tests next to source files using `*.test.ts` naming.
+- Add/update tests for behavioral changes and bug fixes.
+- Prefer deterministic tests (no real network, no time flakiness).
+- Keep tests fast; mock/stub expensive boundaries.
+- Changes in `src/lib/agent-runtime.ts` must include/update direct runtime tests (tool flow, state transitions, and main/subagent message propagation).
+- Changes in websocket event parsing/contract (`/ws` flow) must include parser/contract tests for valid events and rejection of unsupported event types.
+- Concurrency bug fixes must include a regression test that asserts the exact undesired behavior does not recur (for example duplicate final replies).
+
+## Code Style
+- TypeScript first: prefer explicit, narrow types at public boundaries.
+- React: functional components and hooks; keep components focused.
+- Tailwind: use utility classes directly; extract repeated patterns only when helpful.
+- shadcn/ui: prefer existing primitives/components before introducing new UI patterns.
+- Keep comments concise and only where intent is not obvious from code.
+
+## File/Structure Guidelines
+- Respect existing aliases from `components.json`:
+  - `@/components`
+  - `@/components/ui`
+  - `@/lib`
+  - `@/hooks`
+- Keep business logic out of presentation-only components when practical.
+- Co-locate small helper utilities near usage; promote to shared `lib` only when reused.
+- Keep non-UI orchestration logic in focused modules under `src/lib` (not inside large React components) so it can be tested directly.
+
+## Orchestration Guardrails
+- For concurrency-sensitive loops, avoid boolean queue flags; use monotonic version/counter state to decide reruns.
+- Compare rerun decisions against the exact input version used for the model request, not an earlier snapshot from loop start.
+- For each user turn, ensure at most one final main-agent reply unless new input actually arrived.
+- Add regression tests for race conditions whenever scheduler/orchestration code changes.
+
+## Common Pitfalls
+- Avoid `return` inside `finally` blocks (`no-unsafe-finally`); compute restart/cleanup decisions and apply them after `finally`.
+- Avoid unnecessary escapes in template strings (e.g. `\"`) to keep lint clean.
+- In strict TS tests, prefer explicit runtime guards and typed locals over nullable optional chaining on captured values.
+- `bun run build` is mandatory for frontend/module-path changes; do not rely on lint/tests alone for import-resolution safety.
+
+## Git Workflow
+- Before finishing, run relevant checks/tests for touched areas.
+- Include a concise change summary and any follow-up risks in PR/hand-off notes.
+
+## Safety Rules
+- Never run destructive git/file commands unless explicitly requested.
+- Never commit secrets or environment-specific credentials.
+- If requirements are ambiguous, choose the safest minimal interpretation and document assumptions.
+
+## Preferred Change Output
+When completing a task, provide:
+1. What changed (files + behavior)
+2. Validation performed (tests/commands)
+3. Any assumptions or remaining risks
