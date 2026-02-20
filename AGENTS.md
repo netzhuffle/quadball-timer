@@ -66,6 +66,13 @@ Provide clear, low-friction defaults so OpenAI Codex can make safe, high-quality
 - Co-locate small helper utilities near usage; promote to shared `lib` only when reused.
 - Keep non-UI orchestration logic in focused modules under `src/lib` (not inside large React components) so it can be tested directly.
 
+## Controller UI Priorities
+- Treat the controller view as phone-first: keep the main game screen usable without page scrolling.
+- Keep game-time visibility and play/pause access persistent; these controls must not be obscured by secondary workflows.
+- Use contextual reveal for low-frequency actions (for example clock correction or rename flows) instead of showing all controls at once.
+- Prefer showing actionable/urgent information only; hide neutral status text when nothing requires attention.
+- Keep high-frequency actions single-tap with clear, compact controls suitable for quick glances during live play.
+
 ## Sync Guardrails
 - For offline command queueing, include a client timestamp per command and replay in order when reconnecting.
 - Keep idempotent command IDs on the server to avoid duplicate state application during reconnect/resend.

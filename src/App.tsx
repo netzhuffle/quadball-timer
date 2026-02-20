@@ -11,6 +11,22 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import {
+  AlertTriangle,
+  Clock3,
+  CloudOff,
+  Eye,
+  Flag,
+  Info,
+  Minus,
+  Pause,
+  Play,
+  Plus,
+  Settings,
+  Timer,
+  Wifi,
+  WifiOff,
+} from "lucide-react";
+import {
   createPersistedControllerSession,
   getControllerSessionStorageKey,
   parsePersistedControllerSession,
@@ -23,7 +39,6 @@ import type {
   GameState,
   GameSummary,
   GameView,
-  PendingPenaltyExpiration,
   PlayerPenaltyState,
   TeamId,
 } from "@/lib/game-types";
@@ -44,6 +59,10 @@ type ConnectionState = "connecting" | "online" | "offline" | "local-only";
 const LOCAL_ONLY_MESSAGE = "Server does not know this game. Continuing locally on this device.";
 const NORMAL_RECONNECT_DELAY_MS = 1_000;
 const LOCAL_ONLY_RETRY_DELAY_MS = 60_000;
+const ONE_MINUTE_MS = 60_000;
+const SEEKER_RELEASE_MS = 20 * ONE_MINUTE_MS;
+const SEEKER_STATUS_SHOW_FROM_MS = 18 * ONE_MINUTE_MS;
+const SEEKER_STATUS_HIDE_AFTER_MS = 21 * ONE_MINUTE_MS;
 
 export function App() {
   const route = useRoute();
@@ -263,12 +282,16 @@ function HomePage() {
 
 function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
   const controller = role === "controller";
+  const [activePanel, setActivePanel] = useState<
+    "overview" | "card" | "expire" | "timeout" | "admin"
+  >("overview");
   const [homeName, setHomeName] = useState("Home");
   const [awayName, setAwayName] = useState("Away");
   const [cardTeam, setCardTeam] = useState<TeamId>("home");
   const [cardType, setCardType] = useState<CardType>("blue");
   const [playerNumberInput, setPlayerNumberInput] = useState("");
-  const [setTimeInput, setSetTimeInput] = useState("00:00");
+  const [clockAdjustOpen, setClockAdjustOpen] = useState(false);
+  const [renamingTeam, setRenamingTeam] = useState<TeamId | null>(null);
   const [pendingSelections, setPendingSelections] = useState<Record<string, string>>({});
 
   const nowMs = useNow(250);
@@ -288,11 +311,12 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
 
   useEffect(() => {
     if (baseState !== null) {
-      setHomeName(baseState.homeName);
-      setAwayName(baseState.awayName);
-      setSetTimeInput(formatClock(baseState.gameClockMs));
+      if (renamingTeam === null) {
+        setHomeName(baseState.homeName);
+        setAwayName(baseState.awayName);
+      }
     }
-  }, [baseState]);
+  }, [baseState, renamingTeam]);
 
   const syncedState = baseState;
 
@@ -325,6 +349,7 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
     !gameView.state.isFinished &&
     gameView.seekerReleased &&
     gameView.state.flagCatch === null;
+  const pendingCount = pendingExpirations.length;
 
   const submitCard = useCallback(() => {
     if (!controller) {
@@ -342,21 +367,32 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
     setPlayerNumberInput("");
   }, [cardTeam, cardType, controller, dispatchCommand, playerNumberInput]);
 
-  const applySetClock = useCallback(() => {
+  const adjustGameClock = useCallback(
+    (deltaMs: number) => {
+      if (!controller) {
+        return;
+      }
+
+      dispatchCommand({
+        type: "adjust-game-clock",
+        deltaMs,
+      });
+    },
+    [controller, dispatchCommand],
+  );
+
+  const saveTeamRename = useCallback(() => {
     if (!controller) {
       return;
     }
 
-    const parsedMs = parseClockInput(setTimeInput);
-    if (parsedMs === null) {
-      return;
-    }
-
     dispatchCommand({
-      type: "set-game-clock",
-      gameClockMs: parsedMs,
+      type: "rename-teams",
+      homeName,
+      awayName,
     });
-  }, [controller, dispatchCommand, setTimeInput]);
+    setRenamingTeam(null);
+  }, [awayName, controller, dispatchCommand, homeName]);
 
   if (gameView === null || liveState === null) {
     return (
@@ -377,261 +413,471 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
   }
 
   const state = liveState;
+  const recentCards = state.cardEvents.slice(-3).reverse();
+  const visibleHomePenalties = homePenalties.slice(0, 1);
+  const visibleAwayPenalties = awayPenalties.slice(0, 1);
+  const activeTimeoutTeamName =
+    activeTimeout === null ? null : activeTimeout.team === "home" ? state.homeName : state.awayName;
+  const showSeekerStatus =
+    state.gameClockMs >= SEEKER_STATUS_SHOW_FROM_MS &&
+    state.gameClockMs <= SEEKER_STATUS_HIDE_AFTER_MS;
+  const seekerRemainingMs = Math.max(0, SEEKER_RELEASE_MS - state.gameClockMs);
 
   return (
-    <div className="mx-auto w-full max-w-5xl p-3 pb-20 sm:p-6">
-      <header className="sticky top-0 z-40 -mx-3 mb-4 border-b bg-background/96 px-3 py-3 shadow-sm backdrop-blur sm:-mx-6 sm:px-6">
-        <div className="flex items-start justify-between gap-3">
-          <div>
-            <p className="text-xs font-semibold tracking-wide text-muted-foreground uppercase">
-              {role}
-            </p>
-            <h1 className="text-lg font-semibold leading-tight">
-              {state.homeName} vs {state.awayName}
-            </h1>
-          </div>
-          <Button variant="outline" size="sm" onClick={() => navigateTo("/")}>
-            Games
-          </Button>
-        </div>
-
-        <div className="mt-3 grid grid-cols-[1fr_auto] items-center gap-3 rounded-xl border bg-card p-3 shadow-sm">
-          <div>
-            <p className="text-xs text-muted-foreground">Game time</p>
-            <p className="text-4xl font-semibold tabular-nums sm:text-5xl">
-              {formatClock(gameView.state.gameClockMs)}
-            </p>
-            <p className="text-xs text-muted-foreground">
-              {state.isFinished ? "Finished" : state.isRunning ? "Play running" : "Play paused"}
-            </p>
-          </div>
-          <div className="grid gap-2">
-            <Button
-              size="lg"
-              className="min-w-28"
-              onClick={() => dispatchCommand({ type: "set-running", running: !state.isRunning })}
-              disabled={!controller || state.isFinished}
-            >
-              {state.isRunning ? "Pause" : "Play"}
-            </Button>
-            <div className="grid grid-cols-2 gap-2">
+    <div className="h-[100dvh] overflow-hidden bg-background p-2">
+      <div className="mx-auto grid h-full w-full max-w-[460px] grid-rows-[auto_auto_minmax(0,1fr)_minmax(0,1fr)_auto] gap-2">
+        <section className="rounded-xl border bg-card px-3 py-2 shadow-sm">
+          <div className="flex items-start justify-between gap-2">
+            <div className="min-w-0">
+              <p className="truncate text-[11px] font-semibold">
+                {state.homeName} vs {state.awayName}
+              </p>
+              <p className="text-[10px] text-muted-foreground">{role}</p>
+            </div>
+            <div className="flex items-center gap-1.5">
+              {controller ? (
+                localOnlyMode ? (
+                  <span className="inline-flex items-center gap-1 rounded bg-amber-100 px-2 py-1 text-[10px] font-semibold text-amber-800">
+                    <CloudOff className="h-3 w-3" />
+                    Local
+                  </span>
+                ) : connectionState !== "online" ? (
+                  <span className="inline-flex items-center gap-1 rounded bg-amber-100 px-2 py-1 text-[10px] font-semibold text-amber-800">
+                    <WifiOff className="h-3 w-3" />
+                    Offline {pendingCommands}
+                  </span>
+                ) : (
+                  <span className="inline-flex items-center gap-1 rounded bg-emerald-100 px-2 py-1 text-[10px] font-semibold text-emerald-800">
+                    <Wifi className="h-3 w-3" />
+                    Live
+                  </span>
+                )
+              ) : (
+                <span className="inline-flex items-center gap-1 rounded bg-sky-100 px-2 py-1 text-[10px] font-semibold text-sky-800">
+                  <Eye className="h-3 w-3" />
+                  Read only
+                </span>
+              )}
               <Button
                 variant="outline"
                 size="sm"
-                onClick={() => dispatchCommand({ type: "adjust-game-clock", deltaMs: -10_000 })}
+                className="h-7 px-2 text-[11px]"
+                onClick={() => navigateTo("/")}
+              >
+                Games
+              </Button>
+            </div>
+          </div>
+          {controller ? (
+            localOnlyMode ? (
+              <p className="mt-1 text-[10px] font-medium text-amber-700">{LOCAL_ONLY_MESSAGE}</p>
+            ) : connectionState !== "online" ? (
+              <p className="mt-1 text-[10px] font-medium text-amber-700">
+                Offline mode active. {pendingCommands} local change(s) queued.
+              </p>
+            ) : null
+          ) : null}
+        </section>
+
+        <section className="rounded-xl border bg-card px-3 py-2 shadow-sm">
+          <div className="grid grid-cols-[1fr_auto] items-center gap-2">
+            <div>
+              <p className="text-[10px] font-semibold tracking-wide text-muted-foreground uppercase">
+                {state.isFinished ? "Finished" : state.isRunning ? "Running" : "Paused"}
+              </p>
+              <button
+                type="button"
+                className="text-left"
                 disabled={!controller}
+                onClick={() => setClockAdjustOpen((previous) => !previous)}
+              >
+                <p className="text-[clamp(2.45rem,14vw,3.2rem)] leading-none font-semibold tabular-nums">
+                  {formatClock(gameView.state.gameClockMs)}
+                </p>
+              </button>
+              {controller ? (
+                <p className="text-[10px] text-muted-foreground">Tap game time to adjust</p>
+              ) : null}
+            </div>
+            <div>
+              <Button
+                size="lg"
+                className="h-11 min-w-24 gap-1.5 text-base"
+                onClick={() =>
+                  dispatchCommand({
+                    type: "set-running",
+                    running: !state.isRunning,
+                  })
+                }
+                disabled={!controller || state.isFinished}
+              >
+                {state.isRunning ? (
+                  <>
+                    <Pause className="h-4 w-4" />
+                    Pause
+                  </>
+                ) : (
+                  <>
+                    <Play className="h-4 w-4" />
+                    Play
+                  </>
+                )}
+              </Button>
+            </div>
+          </div>
+          {clockAdjustOpen && controller ? (
+            <div className="mt-2 grid grid-cols-3 gap-1 text-[11px]">
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-8 px-1"
+                onClick={() => adjustGameClock(-60_000)}
+              >
+                -1m
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-8 px-1"
+                onClick={() => adjustGameClock(-10_000)}
               >
                 -10s
               </Button>
               <Button
-                variant="outline"
                 size="sm"
-                onClick={() => dispatchCommand({ type: "adjust-game-clock", deltaMs: 10_000 })}
-                disabled={!controller}
+                variant="outline"
+                className="h-8 px-1"
+                onClick={() => adjustGameClock(-1_000)}
+              >
+                -1s
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-8 px-1"
+                onClick={() => adjustGameClock(1_000)}
+              >
+                +1s
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-8 px-1"
+                onClick={() => adjustGameClock(10_000)}
               >
                 +10s
               </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-8 px-1"
+                onClick={() => adjustGameClock(60_000)}
+              >
+                +1m
+              </Button>
             </div>
-          </div>
-        </div>
-
-        {controller ? (
-          localOnlyMode ? (
-            <p className="mt-2 text-xs font-medium text-amber-600">{LOCAL_ONLY_MESSAGE}</p>
-          ) : connectionState !== "online" ? (
-            <p className="mt-2 text-xs font-medium text-amber-600">
-              Offline mode active. {pendingCommands} local change(s) will sync automatically.
+          ) : null}
+          {showSeekerStatus || activeTimeout !== null || pendingCount > 0 ? (
+            <div className="mt-2 flex flex-wrap gap-1 text-[10px]">
+              {showSeekerStatus ? (
+                <div
+                  className={`rounded border px-2 py-1 font-semibold tabular-nums ${
+                    !gameView.seekerReleased &&
+                    gameView.seekerReleaseCountdownMs !== null &&
+                    gameView.seekerReleaseCountdownMs > 0 &&
+                    gameView.seekerReleaseCountdownMs <= 10_000
+                      ? "border-amber-300 bg-amber-50 text-amber-800"
+                      : ""
+                  }`}
+                >
+                  <span className="inline-flex items-center gap-1">
+                    <Flag className="h-3 w-3" />
+                    {gameView.seekerReleased
+                      ? "Seek released"
+                      : `Seek ${formatRemaining(gameView.seekerReleaseCountdownMs ?? seekerRemainingMs)}`}
+                  </span>
+                </div>
+              ) : null}
+              {activeTimeout !== null ? (
+                <div
+                  className={`rounded border px-2 py-1 font-semibold tabular-nums ${
+                    gameView.timeoutWarningActive ? "border-red-300 bg-red-50 text-red-800" : ""
+                  }`}
+                >
+                  <span className="inline-flex items-center gap-1">
+                    <Clock3 className="h-3 w-3" />
+                    {activeTimeoutTeamName} {formatRemaining(activeTimeout.remainingMs)}
+                  </span>
+                </div>
+              ) : null}
+              {pendingCount > 0 ? (
+                <div className="rounded border border-amber-300 bg-amber-50 px-2 py-1 font-semibold text-amber-800">
+                  <span className="inline-flex items-center gap-1">
+                    <AlertTriangle className="h-3 w-3" />
+                    Expire {pendingCount}
+                  </span>
+                </div>
+              ) : null}
+            </div>
+          ) : null}
+          {activeTimeout !== null && gameView.timeoutReminderActive ? (
+            <p
+              className={`mt-2 rounded border px-2 py-1 text-[10px] font-medium ${
+                gameView.timeoutWarningActive
+                  ? "border-red-300 bg-red-50 text-red-800"
+                  : "border-sky-300 bg-sky-50 text-sky-800"
+              }`}
+            >
+              Reminder: tell head referee to blow their whistle at 15 seconds remaining.
             </p>
-          ) : null
-        ) : null}
-      </header>
+          ) : null}
+        </section>
 
-      <div className="grid gap-4">
-        <Card>
-          <CardHeader>
-            <CardTitle>Scoreboard</CardTitle>
-            <CardDescription>Fast score controls with undo per team.</CardDescription>
-          </CardHeader>
-          <CardContent>
-            <div className="grid gap-3 sm:grid-cols-2">
-              {(["home", "away"] as const).map((team) => (
-                <div key={team} className="rounded-xl border p-3">
-                  <p className="text-sm font-medium">
-                    {team === "home" ? state.homeName : state.awayName}
-                  </p>
-                  <p className="my-2 text-4xl font-semibold tabular-nums">{state.score[team]}</p>
-                  <div className="grid grid-cols-3 gap-2">
-                    <Button
-                      size="sm"
-                      onClick={() =>
-                        dispatchCommand({ type: "change-score", team, delta: 10, reason: "goal" })
-                      }
-                      disabled={!controller || state.isFinished}
-                    >
-                      +10
+        <section className="grid min-h-0 grid-cols-2 gap-2">
+          <Card className="h-full min-h-0 py-2">
+            <CardContent className="flex h-full min-h-0 flex-col gap-1 overflow-hidden px-2.5">
+              {controller && renamingTeam === "home" ? (
+                <div className="grid gap-1">
+                  <Input
+                    value={homeName}
+                    onChange={(event) => setHomeName(event.target.value)}
+                    className="h-8 text-xs"
+                    maxLength={40}
+                  />
+                  <div className="grid grid-cols-2 gap-1">
+                    <Button size="sm" className="h-7 text-[11px]" onClick={saveTeamRename}>
+                      Save
                     </Button>
                     <Button
                       size="sm"
                       variant="outline"
-                      onClick={() =>
-                        dispatchCommand({
-                          type: "change-score",
-                          team,
-                          delta: -10,
-                          reason: "manual",
-                        })
-                      }
-                      disabled={!controller}
+                      className="h-7 text-[11px]"
+                      onClick={() => {
+                        setHomeName(state.homeName);
+                        setAwayName(state.awayName);
+                        setRenamingTeam(null);
+                      }}
                     >
-                      -10
-                    </Button>
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      onClick={() => dispatchCommand({ type: "undo-last-score", team })}
-                      disabled={!controller}
-                    >
-                      Undo
+                      Cancel
                     </Button>
                   </div>
                 </div>
-              ))}
-            </div>
-
-            {canRecordFlagCatch ? (
-              <div className="mt-4 rounded-xl border border-emerald-200 bg-emerald-50/70 p-3">
-                <p className="text-sm font-medium text-emerald-800">
-                  Flag catch available while paused.
-                </p>
-                <div className="mt-2 flex gap-2">
-                  <Button
-                    size="sm"
-                    onClick={() => dispatchCommand({ type: "record-flag-catch", team: "home" })}
-                    disabled={!controller}
-                  >
-                    {state.homeName} flag catch (+30)
-                  </Button>
-                  <Button
-                    size="sm"
-                    onClick={() => dispatchCommand({ type: "record-flag-catch", team: "away" })}
-                    disabled={!controller}
-                  >
-                    {state.awayName} flag catch (+30)
-                  </Button>
-                </div>
-              </div>
-            ) : null}
-
-            {state.flagCatch !== null ? (
-              <p className="mt-4 rounded-lg border border-emerald-300 bg-emerald-50 p-3 text-sm font-medium text-emerald-800">
-                Flag caught by {state.flagCatch.team === "home" ? state.homeName : state.awayName}.
-                Game finished.
+              ) : (
+                <button
+                  type="button"
+                  className="truncate text-left text-[11px] font-semibold"
+                  onClick={() => {
+                    if (!controller) {
+                      return;
+                    }
+                    setHomeName(state.homeName);
+                    setAwayName(state.awayName);
+                    setRenamingTeam("home");
+                  }}
+                >
+                  {state.homeName}
+                </button>
+              )}
+              <p className="text-[clamp(2rem,11vw,3rem)] leading-none font-semibold tabular-nums">
+                {state.score.home}
               </p>
-            ) : null}
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader>
-            <CardTitle>Seeker Release</CardTitle>
-            <CardDescription>Countdown starts at 19:00 and ends at 20:00.</CardDescription>
-          </CardHeader>
-          <CardContent>
-            {gameView.seekerReleaseCountdownMs === null ? (
-              <p className="text-sm text-muted-foreground">
-                Countdown becomes visible at game time 19:00.
-              </p>
-            ) : (
-              <p
-                className={`text-2xl font-semibold tabular-nums ${
-                  gameView.seekerReleaseCountdownMs > 0 &&
-                  gameView.seekerReleaseCountdownMs <= 10_000
-                    ? "text-amber-600"
-                    : ""
-                }`}
-              >
-                {gameView.seekerReleased
-                  ? "Seekers released"
-                  : formatRemaining(gameView.seekerReleaseCountdownMs)}
-              </p>
-            )}
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader>
-            <CardTitle>Pending Penalty Expirations</CardTitle>
-            <CardDescription>
-              Confirm each score/flag-triggered expiration explicitly before removing a penalty
-              minute.
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-3">
-            {pendingExpirations.length === 0 ? (
-              <p className="text-sm text-muted-foreground">No pending expirations.</p>
-            ) : (
-              pendingExpirations.map((expiration) => (
-                <PendingExpirationRow
-                  key={expiration.id}
-                  expiration={expiration}
-                  players={state.players}
+              <div className="grid grid-cols-2 gap-1">
+                <Button
+                  size="sm"
+                  className="h-8 gap-1 px-0 text-sm"
+                  onClick={() =>
+                    dispatchCommand({
+                      type: "change-score",
+                      team: "home",
+                      delta: 10,
+                      reason: "goal",
+                    })
+                  }
+                  disabled={!controller || state.isFinished}
+                >
+                  <Plus className="h-3.5 w-3.5" />
+                  10
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="h-8 gap-1 px-0 text-sm"
+                  onClick={() => dispatchCommand({ type: "undo-last-score", team: "home" })}
                   disabled={!controller}
-                  selectedPlayerKey={pendingSelections[expiration.id] ?? ""}
-                  onSelect={(playerKey) =>
-                    setPendingSelections((previous) => ({
-                      ...previous,
-                      [expiration.id]: playerKey,
-                    }))
-                  }
-                  onConfirm={(playerKey) =>
-                    dispatchCommand({
-                      type: "confirm-penalty-expiration",
-                      pendingId: expiration.id,
-                      playerKey,
-                    })
-                  }
-                  onDismiss={() =>
-                    dispatchCommand({
-                      type: "dismiss-penalty-expiration",
-                      pendingId: expiration.id,
-                    })
-                  }
-                  teamNames={{ home: state.homeName, away: state.awayName }}
-                />
-              ))
-            )}
-          </CardContent>
-        </Card>
-
-        <div className="grid gap-4 lg:grid-cols-2">
-          <Card>
-            <CardHeader>
-              <CardTitle>Penalty Box</CardTitle>
-              <CardDescription>Clock only runs while play is running.</CardDescription>
-            </CardHeader>
-            <CardContent className="space-y-4">
-              <PenaltyList title={state.homeName} entries={homePenalties} />
-              <PenaltyList title={state.awayName} entries={awayPenalties} />
+                >
+                  <Minus className="h-3.5 w-3.5" />
+                  10
+                </Button>
+              </div>
+              <div className="mt-auto grid gap-1">
+                {visibleHomePenalties.length === 0 ? (
+                  <p className="text-[10px] text-muted-foreground">No penalties</p>
+                ) : (
+                  visibleHomePenalties.map((entry) => (
+                    <div
+                      key={entry.playerKey}
+                      className={`flex items-center justify-between rounded border px-2 py-1 text-[10px] ${
+                        entry.highlight ? "border-amber-300 bg-amber-50 text-amber-900" : ""
+                      }`}
+                    >
+                      <span>{entry.label}</span>
+                      <span className="font-semibold tabular-nums">{entry.remaining}</span>
+                    </div>
+                  ))
+                )}
+                {homePenalties.length > visibleHomePenalties.length ? (
+                  <p className="text-[10px] text-muted-foreground">
+                    +{homePenalties.length - visibleHomePenalties.length} more
+                  </p>
+                ) : null}
+              </div>
             </CardContent>
           </Card>
 
-          <Card>
-            <CardHeader>
-              <CardTitle>Cards</CardTitle>
-              <CardDescription>
-                Blue/yellow add 1 minute, red adds 2 minutes, ejection adds no penalty time.
-              </CardDescription>
-            </CardHeader>
-            <CardContent className="space-y-3">
-              <div className="grid grid-cols-2 gap-2">
-                <div className="space-y-1">
-                  <Label>Team</Label>
+          <Card className="h-full min-h-0 py-2">
+            <CardContent className="flex h-full min-h-0 flex-col gap-1 overflow-hidden px-2.5">
+              {controller && renamingTeam === "away" ? (
+                <div className="grid gap-1">
+                  <Input
+                    value={awayName}
+                    onChange={(event) => setAwayName(event.target.value)}
+                    className="h-8 text-xs"
+                    maxLength={40}
+                  />
+                  <div className="grid grid-cols-2 gap-1">
+                    <Button size="sm" className="h-7 text-[11px]" onClick={saveTeamRename}>
+                      Save
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="h-7 text-[11px]"
+                      onClick={() => {
+                        setHomeName(state.homeName);
+                        setAwayName(state.awayName);
+                        setRenamingTeam(null);
+                      }}
+                    >
+                      Cancel
+                    </Button>
+                  </div>
+                </div>
+              ) : (
+                <button
+                  type="button"
+                  className="truncate text-left text-[11px] font-semibold"
+                  onClick={() => {
+                    if (!controller) {
+                      return;
+                    }
+                    setHomeName(state.homeName);
+                    setAwayName(state.awayName);
+                    setRenamingTeam("away");
+                  }}
+                >
+                  {state.awayName}
+                </button>
+              )}
+              <p className="text-[clamp(2rem,11vw,3rem)] leading-none font-semibold tabular-nums">
+                {state.score.away}
+              </p>
+              <div className="grid grid-cols-2 gap-1">
+                <Button
+                  size="sm"
+                  className="h-8 gap-1 px-0 text-sm"
+                  onClick={() =>
+                    dispatchCommand({
+                      type: "change-score",
+                      team: "away",
+                      delta: 10,
+                      reason: "goal",
+                    })
+                  }
+                  disabled={!controller || state.isFinished}
+                >
+                  <Plus className="h-3.5 w-3.5" />
+                  10
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="h-8 gap-1 px-0 text-sm"
+                  onClick={() => dispatchCommand({ type: "undo-last-score", team: "away" })}
+                  disabled={!controller}
+                >
+                  <Minus className="h-3.5 w-3.5" />
+                  10
+                </Button>
+              </div>
+              <div className="mt-auto grid gap-1">
+                {visibleAwayPenalties.length === 0 ? (
+                  <p className="text-[10px] text-muted-foreground">No penalties</p>
+                ) : (
+                  visibleAwayPenalties.map((entry) => (
+                    <div
+                      key={entry.playerKey}
+                      className={`flex items-center justify-between rounded border px-2 py-1 text-[10px] ${
+                        entry.highlight ? "border-amber-300 bg-amber-50 text-amber-900" : ""
+                      }`}
+                    >
+                      <span>{entry.label}</span>
+                      <span className="font-semibold tabular-nums">{entry.remaining}</span>
+                    </div>
+                  ))
+                )}
+                {awayPenalties.length > visibleAwayPenalties.length ? (
+                  <p className="text-[10px] text-muted-foreground">
+                    +{awayPenalties.length - visibleAwayPenalties.length} more
+                  </p>
+                ) : null}
+              </div>
+            </CardContent>
+          </Card>
+        </section>
+
+        <Card className="min-h-0 py-2">
+          <CardContent className="flex h-full flex-col gap-2 overflow-hidden px-2.5">
+            {activePanel === "overview" ? (
+              <>
+                <div className="grid gap-1 text-[10px]">
+                  {pendingCount > 0 ? (
+                    <p className="rounded border border-amber-300 bg-amber-50 px-2 py-1 font-medium text-amber-800">
+                      {pendingCount} pending expiration{pendingCount > 1 ? "s" : ""}.
+                    </p>
+                  ) : null}
+                  {state.flagCatch !== null ? (
+                    <p className="rounded border border-emerald-300 bg-emerald-50 px-2 py-1 font-medium text-emerald-800">
+                      Flag catch:{" "}
+                      {state.flagCatch.team === "home" ? state.homeName : state.awayName}
+                    </p>
+                  ) : null}
+                  {recentCards.length > 0 ? (
+                    recentCards.map((card) => (
+                      <p key={card.id} className="truncate">
+                        {card.team === "home" ? state.homeName : state.awayName} •{" "}
+                        {card.playerNumber === null ? "Unknown" : `#${card.playerNumber}`} •{" "}
+                        {card.cardType}
+                      </p>
+                    ))
+                  ) : pendingCount === 0 && state.flagCatch === null ? (
+                    <p className="text-muted-foreground">No active alerts.</p>
+                  ) : null}
+                </div>
+                {error !== null && !localOnlyMode ? (
+                  <p className="mt-auto text-[10px] font-medium text-destructive">{error}</p>
+                ) : null}
+              </>
+            ) : null}
+
+            {activePanel === "card" ? (
+              <>
+                <div className="grid grid-cols-2 gap-1">
                   <Select
                     value={cardTeam}
                     onValueChange={(value) => setCardTeam(value as TeamId)}
                     disabled={!controller}
                   >
-                    <SelectTrigger className="w-full">
+                    <SelectTrigger className="h-8 w-full">
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
@@ -639,15 +885,12 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
                       <SelectItem value="away">{state.awayName}</SelectItem>
                     </SelectContent>
                   </Select>
-                </div>
-                <div className="space-y-1">
-                  <Label>Card</Label>
                   <Select
                     value={cardType}
                     onValueChange={(value) => setCardType(value as CardType)}
                     disabled={!controller}
                   >
-                    <SelectTrigger className="w-full">
+                    <SelectTrigger className="h-8 w-full">
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
@@ -658,314 +901,288 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
                     </SelectContent>
                   </Select>
                 </div>
-              </div>
-
-              <div className="space-y-1">
-                <Label htmlFor="player-number">Player number (0-99, optional)</Label>
                 <Input
-                  id="player-number"
                   value={playerNumberInput}
                   onChange={(event) => setPlayerNumberInput(event.target.value)}
-                  placeholder="e.g. 42"
+                  placeholder="Player # (optional)"
                   inputMode="numeric"
+                  className="h-8"
                   disabled={!controller}
                 />
-              </div>
-
-              <Button
-                className="w-full"
-                onClick={submitCard}
-                disabled={!controller || state.isFinished}
-              >
-                Add card
-              </Button>
-
-              <div className="space-y-2 border-t pt-3">
-                <p className="text-xs font-medium text-muted-foreground">Latest cards</p>
-                <div className="max-h-44 space-y-1 overflow-auto">
-                  {state.cardEvents
-                    .slice(-12)
-                    .reverse()
-                    .map((card) => (
-                      <p key={card.id} className="text-xs">
-                        <span className="font-medium">
-                          {card.team === "home" ? state.homeName : state.awayName}
-                        </span>{" "}
-                        • {card.playerNumber === null ? "Unknown" : `#${card.playerNumber}`} •{" "}
-                        {card.cardType}
-                      </p>
-                    ))}
-                </div>
-              </div>
-            </CardContent>
-          </Card>
-        </div>
-
-        <Card>
-          <CardHeader>
-            <CardTitle>Timeouts</CardTitle>
-            <CardDescription>Timeout clock runs only while game clock is paused.</CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-3">
-            {activeTimeout === null ? (
-              <div className="flex flex-wrap gap-2">
                 <Button
-                  variant="outline"
-                  onClick={() => dispatchCommand({ type: "start-timeout", team: "home" })}
-                  disabled={
-                    !controller || state.isRunning || state.timeouts.home.used || state.isFinished
-                  }
+                  className="h-9"
+                  onClick={submitCard}
+                  disabled={!controller || state.isFinished}
                 >
-                  {state.homeName} timeout {state.timeouts.home.used ? "(used)" : "(start)"}
+                  <Plus className="h-4 w-4" />
+                  Add card
                 </Button>
-                <Button
-                  variant="outline"
-                  onClick={() => dispatchCommand({ type: "start-timeout", team: "away" })}
-                  disabled={
-                    !controller || state.isRunning || state.timeouts.away.used || state.isFinished
-                  }
-                >
-                  {state.awayName} timeout {state.timeouts.away.used ? "(used)" : "(start)"}
-                </Button>
-              </div>
-            ) : (
-              <div className="rounded-xl border p-3">
-                <p className="text-sm">
-                  Active timeout:{" "}
-                  <strong>{activeTimeout.team === "home" ? state.homeName : state.awayName}</strong>
-                </p>
-                <p
-                  className={`text-3xl font-semibold tabular-nums ${
-                    gameView.timeoutFinalCountdown
-                      ? "text-red-700"
-                      : gameView.timeoutWarningActive
-                        ? "text-red-600"
-                        : ""
-                  }`}
-                >
-                  {formatRemaining(activeTimeout.remainingMs)}
-                </p>
-                <div className="mt-2 flex flex-wrap gap-2">
-                  {!activeTimeout.running ? (
-                    <>
-                      <Button
-                        size="sm"
-                        onClick={() =>
-                          dispatchCommand({
-                            type: "set-timeout-running",
-                            running: true,
-                          })
-                        }
-                        disabled={!controller || state.isRunning || activeTimeout.remainingMs <= 0}
-                      >
-                        Start timeout
-                      </Button>
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        onClick={() => dispatchCommand({ type: "undo-timeout-start" })}
-                        disabled={!controller}
-                      >
-                        Undo timeout start
-                      </Button>
-                    </>
-                  ) : (
-                    <>
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        onClick={() => dispatchCommand({ type: "cancel-timeout" })}
-                        disabled={!controller}
-                      >
-                        End timeout early
-                      </Button>
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        onClick={() => dispatchCommand({ type: "undo-timeout-start" })}
-                        disabled={!controller}
-                      >
-                        Undo timeout start
-                      </Button>
-                    </>
-                  )}
-                </div>
-                {gameView.timeoutReminderActive ? (
-                  <p
-                    className={`mt-2 rounded-md border p-2 text-xs font-medium ${
-                      gameView.timeoutFinalCountdown
-                        ? "border-red-400 bg-red-100 text-red-900"
-                        : gameView.timeoutWarningActive
-                          ? "border-red-300 bg-red-50 text-red-800"
-                          : "border-sky-300 bg-sky-50 text-sky-800"
-                    }`}
-                  >
-                    Reminder: tell head referee to blow their whistle at 15 seconds remaining.
+              </>
+            ) : null}
+
+            {activePanel === "expire" ? (
+              <>
+                {pendingExpirations.length === 0 ? (
+                  <p className="text-[11px] text-muted-foreground">Nothing pending.</p>
+                ) : (
+                  pendingExpirations.slice(0, 2).map((expiration) => {
+                    const candidates = expiration.candidatePlayerKeys.filter(
+                      (playerKey) => state.players[playerKey] !== undefined,
+                    );
+                    const selected = pendingSelections[expiration.id] ?? "";
+                    const auto = candidates.length === 1 ? (candidates[0] ?? "") : "";
+                    const effective = selected.length > 0 ? selected : auto;
+
+                    return (
+                      <div key={expiration.id} className="rounded border p-2 text-[10px]">
+                        <p className="font-medium">
+                          {expiration.reason === "score" ? "Goal" : "Flag"} •{" "}
+                          {expiration.penalizedTeam === "home" ? state.homeName : state.awayName}
+                        </p>
+                        {candidates.length > 1 ? (
+                          <Select
+                            value={effective}
+                            onValueChange={(playerKey) =>
+                              setPendingSelections((previous) => ({
+                                ...previous,
+                                [expiration.id]: playerKey,
+                              }))
+                            }
+                            disabled={!controller}
+                          >
+                            <SelectTrigger className="mt-1 h-7 w-full">
+                              <SelectValue placeholder="Choose player" />
+                            </SelectTrigger>
+                            <SelectContent>
+                              {candidates.map((playerKey) => (
+                                <SelectItem key={playerKey} value={playerKey}>
+                                  {formatPlayerLabel(state.players[playerKey])}
+                                </SelectItem>
+                              ))}
+                            </SelectContent>
+                          </Select>
+                        ) : (
+                          <p className="mt-1 truncate">
+                            {formatPlayerLabel(state.players[candidates[0] ?? ""])}
+                          </p>
+                        )}
+                        <div className="mt-1 grid grid-cols-2 gap-1">
+                          <Button
+                            size="sm"
+                            onClick={() =>
+                              dispatchCommand({
+                                type: "confirm-penalty-expiration",
+                                pendingId: expiration.id,
+                                playerKey: effective.length > 0 ? effective : null,
+                              })
+                            }
+                            disabled={
+                              !controller || (candidates.length > 1 && effective.length === 0)
+                            }
+                          >
+                            Confirm
+                          </Button>
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            onClick={() =>
+                              dispatchCommand({
+                                type: "dismiss-penalty-expiration",
+                                pendingId: expiration.id,
+                              })
+                            }
+                            disabled={!controller}
+                          >
+                            Dismiss
+                          </Button>
+                        </div>
+                      </div>
+                    );
+                  })
+                )}
+              </>
+            ) : null}
+
+            {activePanel === "timeout" ? (
+              <>
+                {activeTimeout === null ? (
+                  <div className="grid gap-1">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="h-8"
+                      onClick={() => dispatchCommand({ type: "start-timeout", team: "home" })}
+                      disabled={
+                        !controller ||
+                        state.isRunning ||
+                        state.timeouts.home.used ||
+                        state.isFinished
+                      }
+                    >
+                      {state.homeName} timeout
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="h-8"
+                      onClick={() => dispatchCommand({ type: "start-timeout", team: "away" })}
+                      disabled={
+                        !controller ||
+                        state.isRunning ||
+                        state.timeouts.away.used ||
+                        state.isFinished
+                      }
+                    >
+                      {state.awayName} timeout
+                    </Button>
+                  </div>
+                ) : (
+                  <>
+                    <p
+                      className={`text-2xl font-semibold tabular-nums ${
+                        gameView.timeoutFinalCountdown
+                          ? "text-red-700"
+                          : gameView.timeoutWarningActive
+                            ? "text-red-600"
+                            : ""
+                      }`}
+                    >
+                      {formatRemaining(activeTimeout.remainingMs)}
+                    </p>
+                    {!activeTimeout.running ? (
+                      <div className="grid grid-cols-2 gap-1">
+                        <Button
+                          size="sm"
+                          onClick={() =>
+                            dispatchCommand({
+                              type: "set-timeout-running",
+                              running: true,
+                            })
+                          }
+                          disabled={!controller}
+                        >
+                          Start
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          onClick={() => dispatchCommand({ type: "undo-timeout-start" })}
+                          disabled={!controller}
+                        >
+                          Undo
+                        </Button>
+                      </div>
+                    ) : (
+                      <div className="grid grid-cols-2 gap-1">
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          onClick={() => dispatchCommand({ type: "cancel-timeout" })}
+                          disabled={!controller}
+                        >
+                          End early
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          onClick={() => dispatchCommand({ type: "undo-timeout-start" })}
+                          disabled={!controller}
+                        >
+                          Undo
+                        </Button>
+                      </div>
+                    )}
+                  </>
+                )}
+              </>
+            ) : null}
+
+            {activePanel === "admin" ? (
+              <>
+                {canRecordFlagCatch ? (
+                  <div className="grid grid-cols-2 gap-1">
+                    <Button
+                      size="sm"
+                      onClick={() => dispatchCommand({ type: "record-flag-catch", team: "home" })}
+                      disabled={!controller}
+                    >
+                      Home flag +30
+                    </Button>
+                    <Button
+                      size="sm"
+                      onClick={() => dispatchCommand({ type: "record-flag-catch", team: "away" })}
+                      disabled={!controller}
+                    >
+                      Away flag +30
+                    </Button>
+                  </div>
+                ) : (
+                  <p className="text-[11px] text-muted-foreground">
+                    Flag catch appears here once seeker release has happened and play is paused.
                   </p>
+                )}
+                {controller ? (
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    onClick={() => dispatchCommand({ type: "finish-game" })}
+                  >
+                    Finish game
+                  </Button>
                 ) : null}
-              </div>
-            )}
+              </>
+            ) : null}
           </CardContent>
         </Card>
 
-        <Card>
-          <CardHeader>
-            <CardTitle>Manual Clock + Team Names</CardTitle>
-            <CardDescription>For corrections after timing or naming mistakes.</CardDescription>
-          </CardHeader>
-          <CardContent className="grid gap-3 sm:grid-cols-2">
-            <div className="space-y-1">
-              <Label htmlFor="set-clock">Set game time (MM:SS)</Label>
-              <div className="flex gap-2">
-                <Input
-                  id="set-clock"
-                  value={setTimeInput}
-                  onChange={(event) => setSetTimeInput(event.target.value)}
-                  disabled={!controller}
-                />
-                <Button variant="outline" onClick={applySetClock} disabled={!controller}>
-                  Apply
-                </Button>
-              </div>
-            </div>
-
-            <div className="space-y-1">
-              <Label>Rename teams</Label>
-              <div className="grid gap-2">
-                <Input
-                  value={homeName}
-                  onChange={(event) => setHomeName(event.target.value)}
-                  disabled={!controller}
-                />
-                <Input
-                  value={awayName}
-                  onChange={(event) => setAwayName(event.target.value)}
-                  disabled={!controller}
-                />
-                <Button
-                  variant="outline"
-                  onClick={() => dispatchCommand({ type: "rename-teams", homeName, awayName })}
-                  disabled={!controller}
-                >
-                  Save names
-                </Button>
-              </div>
-            </div>
-          </CardContent>
-        </Card>
-
-        {controller ? (
-          <div className="flex justify-end">
-            <Button variant="ghost" onClick={() => dispatchCommand({ type: "finish-game" })}>
-              Mark game as finished
-            </Button>
-          </div>
-        ) : null}
-
-        {error !== null && !localOnlyMode ? (
-          <p className="text-sm text-destructive">{error}</p>
-        ) : null}
+        <section className="grid grid-cols-5 gap-1">
+          <Button
+            variant={activePanel === "overview" ? "default" : "outline"}
+            size="sm"
+            className="h-8 gap-1 px-1 text-[11px]"
+            onClick={() => setActivePanel("overview")}
+          >
+            <Info className="h-3.5 w-3.5" />
+            Info
+          </Button>
+          <Button
+            variant={activePanel === "card" ? "default" : "outline"}
+            size="sm"
+            className="h-8 gap-1 px-1 text-[11px]"
+            onClick={() => setActivePanel("card")}
+          >
+            <Flag className="h-3.5 w-3.5" />
+            Card
+          </Button>
+          <Button
+            variant={activePanel === "expire" ? "default" : "outline"}
+            size="sm"
+            className="h-8 gap-1 px-1 text-[11px]"
+            onClick={() => setActivePanel("expire")}
+          >
+            <Timer className="h-3.5 w-3.5" />
+            Exp {pendingCount > 0 ? pendingCount : ""}
+          </Button>
+          <Button
+            variant={activePanel === "timeout" ? "default" : "outline"}
+            size="sm"
+            className="h-8 gap-1 px-1 text-[11px]"
+            onClick={() => setActivePanel("timeout")}
+          >
+            <Clock3 className="h-3.5 w-3.5" />
+            TO
+          </Button>
+          <Button
+            variant={activePanel === "admin" ? "default" : "outline"}
+            size="sm"
+            className="h-8 gap-1 px-1 text-[11px]"
+            onClick={() => setActivePanel("admin")}
+          >
+            <Settings className="h-3.5 w-3.5" />
+            Admin
+          </Button>
+        </section>
       </div>
-    </div>
-  );
-}
-
-function PendingExpirationRow({
-  expiration,
-  players,
-  selectedPlayerKey,
-  onSelect,
-  onConfirm,
-  onDismiss,
-  disabled,
-  teamNames,
-}: {
-  expiration: PendingPenaltyExpiration;
-  players: Record<string, PlayerPenaltyState>;
-  selectedPlayerKey: string;
-  onSelect: (playerKey: string) => void;
-  onConfirm: (playerKey: string | null) => void;
-  onDismiss: () => void;
-  disabled: boolean;
-  teamNames: Record<TeamId, string>;
-}) {
-  const candidates = expiration.candidatePlayerKeys.filter(
-    (playerKey) => players[playerKey] !== undefined,
-  );
-  const defaultPlayerKey = candidates.length === 1 ? (candidates[0] ?? "") : "";
-  const effectiveSelection = selectedPlayerKey.length > 0 ? selectedPlayerKey : defaultPlayerKey;
-
-  return (
-    <div className="rounded-xl border p-3">
-      <p className="text-sm font-medium">
-        {expiration.reason === "score" ? "Goal" : "Flag catch"} by{" "}
-        {teamNames[expiration.benefitingTeam]} against {teamNames[expiration.penalizedTeam]}
-      </p>
-
-      {candidates.length > 1 ? (
-        <div className="mt-2 flex flex-wrap items-center gap-2">
-          <Select value={effectiveSelection} onValueChange={onSelect} disabled={disabled}>
-            <SelectTrigger className="w-48">
-              <SelectValue placeholder="Choose player" />
-            </SelectTrigger>
-            <SelectContent>
-              {candidates.map((playerKey) => (
-                <SelectItem key={playerKey} value={playerKey}>
-                  {formatPlayerLabel(players[playerKey])}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-          <Button
-            size="sm"
-            onClick={() => onConfirm(effectiveSelection.length > 0 ? effectiveSelection : null)}
-            disabled={disabled || effectiveSelection.length === 0}
-          >
-            Confirm expiration
-          </Button>
-        </div>
-      ) : (
-        <div className="mt-2 flex flex-wrap gap-2">
-          <Button
-            size="sm"
-            onClick={() => onConfirm(candidates[0] ?? null)}
-            disabled={disabled || candidates.length === 0}
-          >
-            Confirm expiration{" "}
-            {candidates[0] !== undefined
-              ? `(${formatPlayerLabel(players[candidates[0]] ?? null)})`
-              : ""}
-          </Button>
-          <Button size="sm" variant="outline" onClick={onDismiss} disabled={disabled}>
-            Dismiss
-          </Button>
-        </div>
-      )}
-    </div>
-  );
-}
-
-function PenaltyList({ title, entries }: { title: string; entries: PlayerPenaltyView[] }) {
-  return (
-    <div>
-      <p className="mb-2 text-sm font-semibold">{title}</p>
-      {entries.length === 0 ? (
-        <p className="text-sm text-muted-foreground">No active penalties.</p>
-      ) : (
-        <div className="space-y-1">
-          {entries.map((entry) => (
-            <div
-              key={entry.playerKey}
-              className={`flex items-center justify-between rounded-md border px-3 py-2 text-sm ${
-                entry.highlight ? "border-amber-300 bg-amber-50/70 text-amber-900" : ""
-              }`}
-            >
-              <span>{entry.label}</span>
-              <span className="font-semibold tabular-nums">{entry.remaining}</span>
-            </div>
-          ))}
-        </div>
-      )}
     </div>
   );
 }
@@ -1403,27 +1620,6 @@ function applyLocalEnvelope(state: GameState, envelope: ClientCommandEnvelope): 
 function navigateTo(path: string) {
   window.history.pushState(null, "", path);
   window.dispatchEvent(new PopStateEvent("popstate"));
-}
-
-function parseClockInput(value: string): number | null {
-  const parts = value.trim().split(":");
-  if (parts.length !== 2) {
-    return null;
-  }
-
-  const minutes = Number(parts[0]);
-  const seconds = Number(parts[1]);
-  if (
-    !Number.isInteger(minutes) ||
-    !Number.isInteger(seconds) ||
-    minutes < 0 ||
-    seconds < 0 ||
-    seconds >= 60
-  ) {
-    return null;
-  }
-
-  return (minutes * 60 + seconds) * 1_000;
 }
 
 function parsePlayerNumber(value: string): number | null {
