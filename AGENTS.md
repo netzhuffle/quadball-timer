@@ -1,7 +1,7 @@
 # AGENTS.md
 
 ## Project
-- Name: `OpenStory`
+- Name: `Quadball Timer`
 - Stack: `bun` + `TypeScript` + `React` + `TailwindCSS` + `shadcn/ui`
 - Quality tooling: `oxfmt` + `oxlint` + `oxlint-tsgolint`
 - Package manager/runtime: `bun`
@@ -44,9 +44,9 @@ Provide clear, low-friction defaults so OpenAI Codex can make safe, high-quality
 - Add/update tests for behavioral changes and bug fixes.
 - Prefer deterministic tests (no real network, no time flakiness).
 - Keep tests fast; mock/stub expensive boundaries.
-- Changes in `src/lib/agent-runtime.ts` must include/update direct runtime tests (tool flow, state transitions, and main/subagent message propagation).
 - Changes in websocket event parsing/contract (`/ws` flow) must include parser/contract tests for valid events and rejection of unsupported event types.
-- Concurrency bug fixes must include a regression test that asserts the exact undesired behavior does not recur (for example duplicate final replies).
+- Changes in `src/lib/game-engine.ts` must include/update direct rule tests (clock/penalty ticking, timeout behavior, score-triggered expiration, flag-catch behavior).
+- Concurrency/offline-sync bug fixes must include a regression test that asserts the exact undesired behavior does not recur.
 
 ## Code Style
 - TypeScript first: prefer explicit, narrow types at public boundaries.
@@ -65,17 +65,24 @@ Provide clear, low-friction defaults so OpenAI Codex can make safe, high-quality
 - Co-locate small helper utilities near usage; promote to shared `lib` only when reused.
 - Keep non-UI orchestration logic in focused modules under `src/lib` (not inside large React components) so it can be tested directly.
 
-## Orchestration Guardrails
-- For concurrency-sensitive loops, avoid boolean queue flags; use monotonic version/counter state to decide reruns.
-- Compare rerun decisions against the exact input version used for the model request, not an earlier snapshot from loop start.
-- For each user turn, ensure at most one final main-agent reply unless new input actually arrived.
-- Add regression tests for race conditions whenever scheduler/orchestration code changes.
+## Sync Guardrails
+- For offline command queueing, include a client timestamp per command and replay in order when reconnecting.
+- Keep idempotent command IDs on the server to avoid duplicate state application during reconnect/resend.
+- Live timer UIs must render from projected state (`projectGameView`) against `now`, not only from last synced snapshot.
 
 ## Common Pitfalls
 - Avoid `return` inside `finally` blocks (`no-unsafe-finally`); compute restart/cleanup decisions and apply them after `finally`.
 - Avoid unnecessary escapes in template strings (e.g. `\"`) to keep lint clean.
 - In strict TS tests, prefer explicit runtime guards and typed locals over nullable optional chaining on captured values.
 - `bun run build` is mandatory for frontend/module-path changes; do not rely on lint/tests alone for import-resolution safety.
+- For any live timer/clock display, render from projected state against `now`, not only from last synced snapshot.
+
+## Commit Message Style
+- Use a concise imperative subject in sentence case (capitalize the first word, e.g. `Implement websocket command replay`).
+- Do not use prefix tags like `feat:` or `fix:` unless explicitly requested.
+- Keep the title behavior-focused (what changed for users/system), not file-focused.
+- Optional body is recommended for larger changes: explain major areas touched and key rules/constraints added.
+- Keep tone factual and avoid filler language.
 
 ## Git Workflow
 - Before finishing, run relevant checks/tests for touched areas.
