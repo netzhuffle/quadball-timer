@@ -4,19 +4,17 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
+  ChevronDown,
+  ChevronUp,
   Check,
   Clock3,
   CloudOff,
   Delete,
   Eye,
   Flag,
-  Minus,
   OctagonX,
-  Pause,
-  Play,
-  Plus,
-  Settings,
   Shield,
+  Trophy,
   TriangleAlert,
   UserX,
   Wifi,
@@ -70,6 +68,9 @@ const ONE_MINUTE_MS = 60_000;
 const SEEKER_RELEASE_MS = 20 * ONE_MINUTE_MS;
 const SEEKER_STATUS_SHOW_FROM_MS = 18 * ONE_MINUTE_MS;
 const SEEKER_STATUS_HIDE_AFTER_MS = 21 * ONE_MINUTE_MS;
+const FLAG_RELEASE_MS = 19 * ONE_MINUTE_MS;
+const FLAG_STATUS_SHOW_FROM_MS = 18 * ONE_MINUTE_MS;
+const FLAG_STATUS_HIDE_AFTER_MS = FLAG_RELEASE_MS + 30_000;
 const RELEASE_EVENT_VISIBLE_MS = 30_000;
 
 export function App() {
@@ -315,6 +316,15 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
   const [renamingTeam, setRenamingTeam] = useState<TeamId | null>(null);
   const [pendingWinConfirmation, setPendingWinConfirmation] =
     useState<PendingWinConfirmation | null>(null);
+  const [scorePulse, setScorePulse] = useState<{ home: -1 | 0 | 1; away: -1 | 0 | 1 }>({
+    home: 0,
+    away: 0,
+  });
+  const previousScoreRef = useRef<{ home: number; away: number } | null>(null);
+  const scorePulseTimersRef = useRef<{ home: number | null; away: number | null }>({
+    home: null,
+    away: null,
+  });
 
   const nowMs = useNow(250);
 
@@ -485,6 +495,79 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
     }
   }, [pendingWinConfirmation, liveState?.isFinished, liveState?.isSuspended]);
 
+  useEffect(() => {
+    if (liveState === null) {
+      return;
+    }
+
+    const previous = previousScoreRef.current;
+    previousScoreRef.current = { home: liveState.score.home, away: liveState.score.away };
+
+    if (previous === null) {
+      return;
+    }
+
+    const updates: Partial<{ home: -1 | 0 | 1; away: -1 | 0 | 1 }> = {};
+    const teams: TeamId[] = ["home", "away"];
+    for (const team of teams) {
+      const delta = liveState.score[team] - previous[team];
+      if (delta === 0) {
+        continue;
+      }
+
+      updates[team] = delta > 0 ? 1 : -1;
+      const currentTimer = scorePulseTimersRef.current[team];
+      if (currentTimer !== null) {
+        window.clearTimeout(currentTimer);
+      }
+
+      scorePulseTimersRef.current[team] = window.setTimeout(() => {
+        setScorePulse((current) => ({ ...current, [team]: 0 }));
+        scorePulseTimersRef.current[team] = null;
+      }, 420);
+    }
+
+    if (Object.keys(updates).length > 0) {
+      setScorePulse((current) => ({ ...current, ...updates }));
+    }
+  }, [liveState]);
+
+  useEffect(() => {
+    return () => {
+      const teams: TeamId[] = ["home", "away"];
+      for (const team of teams) {
+        const timer = scorePulseTimersRef.current[team];
+        if (timer !== null) {
+          window.clearTimeout(timer);
+          scorePulseTimersRef.current[team] = null;
+        }
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!clockAdjustOpen) {
+      return;
+    }
+
+    const onPointerDown = (event: PointerEvent) => {
+      const target = event.target;
+      if (!(target instanceof Element)) {
+        setClockAdjustOpen(false);
+        return;
+      }
+
+      if (target.closest('[data-clock-adjust-keep="true"]') !== null) {
+        return;
+      }
+
+      setClockAdjustOpen(false);
+    };
+
+    window.addEventListener("pointerdown", onPointerDown);
+    return () => window.removeEventListener("pointerdown", onPointerDown);
+  }, [clockAdjustOpen]);
+
   const appendCardDigit = useCallback((digit: string) => {
     setCardDraft((previous) => {
       if (previous.digits.length >= 2) {
@@ -524,7 +607,16 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
   const showSeekerStatus =
     state.gameClockMs >= SEEKER_STATUS_SHOW_FROM_MS &&
     state.gameClockMs <= SEEKER_STATUS_HIDE_AFTER_MS;
+  const showFlagStatus =
+    state.gameClockMs >= FLAG_STATUS_SHOW_FROM_MS && state.gameClockMs <= FLAG_STATUS_HIDE_AFTER_MS;
+  const flagReleased = state.gameClockMs >= FLAG_RELEASE_MS;
   const seekerRemainingMs = Math.max(0, SEEKER_RELEASE_MS - state.gameClockMs);
+  const flagRemainingMs = Math.max(0, FLAG_RELEASE_MS - state.gameClockMs);
+  const seekerCountdownMs = gameView.seekerReleaseCountdownMs ?? seekerRemainingMs;
+  const seekerWarningRed =
+    !gameView.seekerReleased && seekerCountdownMs > 0 && seekerCountdownMs <= 10_000;
+  const seekerWarningYellow =
+    !gameView.seekerReleased && seekerCountdownMs > 10_000 && seekerCountdownMs <= 30_000;
   const statusLabel = state.isFinished
     ? "Finished"
     : state.isSuspended
@@ -635,17 +727,60 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
       idleClassName: "border-violet-200 bg-violet-50 text-violet-800",
     },
   ];
+  const scoreColumns: Array<{
+    team: TeamId;
+    name: string;
+    score: number;
+    accentClassName: string;
+    borderClassName: string;
+  }> = [
+    {
+      team: "home",
+      name: state.homeName,
+      score: state.score.home,
+      accentClassName: "from-sky-500/80 to-cyan-400/80",
+      borderClassName: "border-cyan-300/50",
+    },
+    {
+      team: "away",
+      name: state.awayName,
+      score: state.score.away,
+      accentClassName: "from-orange-500/80 to-rose-500/80",
+      borderClassName: "border-amber-300/50",
+    },
+  ];
+  const homeScoreColumn = scoreColumns[0]!;
+  const awayScoreColumn = scoreColumns[1]!;
+  const penaltyColumns: Array<{
+    team: TeamId;
+    penalties: PlayerPenaltyView[];
+    visiblePenalties: PlayerPenaltyView[];
+    recentReleases: ReleasedPenaltyView[];
+  }> = [
+    {
+      team: "home",
+      penalties: homePenalties,
+      visiblePenalties: visibleHomePenalties,
+      recentReleases: homeRecentReleases,
+    },
+    {
+      team: "away",
+      penalties: awayPenalties,
+      visiblePenalties: visibleAwayPenalties,
+      recentReleases: awayRecentReleases,
+    },
+  ];
 
   return (
-    <div className="h-[100dvh] overflow-hidden bg-background p-2">
+    <div className="h-[100dvh] overflow-hidden bg-slate-100 p-2 text-slate-900">
       <div className="mx-auto grid h-full w-full max-w-[460px] grid-rows-[auto_auto_minmax(0,1fr)_auto_auto] gap-2">
-        <section className="rounded-xl border bg-card px-3 py-2 shadow-sm">
+        <section className="rounded-2xl border border-slate-300 bg-white px-3 py-2 shadow-[0_8px_18px_rgba(15,23,42,0.08)]">
           <div className="flex items-start justify-between gap-2">
             <div className="min-w-0">
-              <p className="truncate text-[11px] font-semibold">
+              <p className="truncate text-xs font-semibold tracking-wide text-slate-900">
                 {state.homeName} vs {state.awayName}
               </p>
-              <p className="text-[10px] text-muted-foreground">{role}</p>
+              <p className="text-[10px] text-slate-500">{role}</p>
             </div>
             <div className="flex items-center gap-1.5">
               {controller ? (
@@ -674,7 +809,7 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
               <Button
                 variant="outline"
                 size="sm"
-                className="h-7 px-2 text-[11px]"
+                className="h-7 border-slate-300 bg-white px-2 text-[11px] text-slate-800 hover:bg-slate-100"
                 onClick={() => navigateTo("/")}
               >
                 Games
@@ -692,442 +827,440 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
           ) : null}
         </section>
 
-        <section className="rounded-xl border bg-card px-3 py-2 shadow-sm">
-          <div className="grid grid-cols-[1fr_auto] items-center gap-2">
-            <div>
-              <p className="text-[10px] font-semibold tracking-wide text-muted-foreground uppercase">
-                {statusLabel}
-              </p>
-              <button
-                type="button"
-                className="text-left"
-                disabled={!controller}
-                onClick={() => setClockAdjustOpen((previous) => !previous)}
-              >
-                <p className="text-[clamp(2.45rem,14vw,3.2rem)] leading-none font-semibold tabular-nums">
-                  {formatClock(gameView.state.gameClockMs)}
-                </p>
-              </button>
-              {controller ? (
-                <p className="text-[10px] text-muted-foreground">Tap game time to adjust</p>
-              ) : null}
-              {finishSummary !== null ? (
-                <p className="text-[10px] font-medium text-muted-foreground">{finishSummary}</p>
-              ) : null}
-            </div>
-            <div>
+        <section className="relative overflow-visible rounded-[1.75rem] border border-slate-300 bg-[radial-gradient(circle_at_50%_28%,#dbeafe_0%,#eff6ff_38%,#ffffff_76%)] px-2 py-2 shadow-[0_10px_24px_rgba(15,23,42,0.12)]">
+          <div className="grid grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-start gap-1">
+            <div className="flex min-w-0 flex-col items-center gap-1">
+              {controller && renamingTeam === "home" ? (
+                <div className="grid w-full gap-1">
+                  <Input
+                    value={homeName}
+                    onChange={(event) => setHomeName(event.target.value)}
+                    className="h-7 border-slate-300 bg-white text-[10px] text-slate-900"
+                    maxLength={40}
+                  />
+                  <div className="grid grid-cols-2 gap-1">
+                    <Button size="sm" className="h-6 text-[10px]" onClick={saveTeamRename}>
+                      Save
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="h-6 border-slate-300 bg-white text-[10px] text-slate-800"
+                      onClick={() => {
+                        setHomeName(state.homeName);
+                        setAwayName(state.awayName);
+                        setRenamingTeam(null);
+                      }}
+                    >
+                      Cancel
+                    </Button>
+                  </div>
+                </div>
+              ) : (
+                <button
+                  type="button"
+                  className="w-[calc(100%+0.75rem)] min-h-[2.6rem] max-w-none whitespace-normal px-1 py-0.5 text-center text-[clamp(1.05rem,3.8vw,1.35rem)] leading-[1.03] font-extrabold tracking-tight text-slate-900 [overflow-wrap:normal] [word-break:keep-all] transition-opacity hover:opacity-70"
+                  onClick={() => {
+                    if (!controller) {
+                      return;
+                    }
+
+                    setHomeName(state.homeName);
+                    setAwayName(state.awayName);
+                    setRenamingTeam(homeScoreColumn.team);
+                  }}
+                >
+                  {homeScoreColumn.name}
+                </button>
+              )}
+
               <Button
-                size="lg"
-                className="h-11 min-w-24 gap-1.5 text-base"
+                size="sm"
+                className="h-8 w-full rounded-2xl border border-sky-300 bg-gradient-to-br from-sky-500 to-cyan-500 text-white shadow-sm"
                 onClick={() =>
                   dispatchCommand({
-                    type: "set-running",
-                    running: !state.isRunning,
+                    type: "change-score",
+                    team: homeScoreColumn.team,
+                    delta: 10,
+                    reason: "goal",
                   })
                 }
-                disabled={!controller || state.isFinished || state.isSuspended}
+                disabled={!controller || state.isFinished}
               >
-                {state.isRunning ? (
-                  <>
-                    <Pause className="h-4 w-4" />
-                    Pause
-                  </>
-                ) : (
-                  <>
-                    <Play className="h-4 w-4" />
-                    Play
-                  </>
-                )}
+                <ChevronUp className="h-4 w-4" />
+              </Button>
+              <div className="w-full rounded-2xl border border-sky-200 bg-white px-2 py-2 text-center shadow-[inset_0_0_12px_rgba(14,165,233,0.18)]">
+                <p
+                  className={`text-[clamp(1.75rem,9.4vw,2.45rem)] leading-none font-semibold tabular-nums transition-all duration-300 ${
+                    scorePulse.home === 1
+                      ? "score-pop-up text-emerald-700"
+                      : scorePulse.home === -1
+                        ? "score-pop-down text-rose-700"
+                        : "text-slate-900"
+                  }`}
+                >
+                  {homeScoreColumn.score}
+                </p>
+              </div>
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-8 w-full rounded-2xl border-sky-200 bg-white text-sky-700 hover:bg-sky-50"
+                onClick={() =>
+                  dispatchCommand({ type: "undo-last-score", team: homeScoreColumn.team })
+                }
+                disabled={!controller}
+              >
+                <ChevronDown className="h-4 w-4" />
+              </Button>
+            </div>
+
+            <div className="relative">
+              <div className="relative flex aspect-square w-[min(47vw,206px)] flex-col items-center overflow-hidden rounded-full border border-sky-300/60 bg-[radial-gradient(circle,#ffffff_34%,#dbeafe_70%,#bfdbfe_100%)] p-2 pt-3 shadow-[0_0_0_1px_rgba(125,211,252,0.5),0_0_24px_rgba(14,165,233,0.22)]">
+                <div
+                  className="clock-rotor pointer-events-none absolute inset-0 rounded-full bg-[conic-gradient(from_0deg,rgba(14,165,233,0.22),rgba(251,146,60,0.18),rgba(14,165,233,0.22))]"
+                  style={{ animationPlayState: state.isRunning ? "running" : "paused" }}
+                />
+                <div
+                  className="clock-rotor-slow pointer-events-none absolute inset-3 rounded-full bg-[conic-gradient(from_180deg,rgba(255,255,255,0.8),rgba(14,165,233,0.14),rgba(255,255,255,0.8))]"
+                  style={{ animationPlayState: state.isRunning ? "running" : "paused" }}
+                />
+                <div className="pointer-events-none absolute inset-2 rounded-full border border-sky-300/50" />
+
+                <div className="relative z-10 mt-6 text-center">
+                  <p className="text-[10px] font-semibold tracking-[0.18em] text-slate-700 uppercase">
+                    {statusLabel}
+                  </p>
+                  <button
+                    type="button"
+                    className="mt-1 text-center"
+                    data-clock-adjust-keep="true"
+                    disabled={!controller}
+                    onClick={() => setClockAdjustOpen((previous) => !previous)}
+                  >
+                    <p className="text-[clamp(2.55rem,14vw,3.5rem)] leading-none font-semibold tabular-nums text-slate-950">
+                      {formatClock(gameView.state.gameClockMs)}
+                    </p>
+                  </button>
+                </div>
+
+                <button
+                  type="button"
+                  aria-label={state.isRunning ? "Pause game" : "Start game"}
+                  className="absolute inset-x-2 top-[53%] bottom-2 flex items-center justify-center rounded-b-full rounded-t-[42%] transition disabled:opacity-35"
+                  onClick={() =>
+                    dispatchCommand({
+                      type: "set-running",
+                      running: !state.isRunning,
+                    })
+                  }
+                  disabled={!controller || state.isFinished || state.isSuspended}
+                >
+                  <span className="relative h-20 w-20">
+                    <PauseFilledGlyph
+                      className={`absolute inset-0 h-20 w-20 fill-slate-900 transition-all duration-200 ${
+                        state.isRunning
+                          ? "scale-100 rotate-0 opacity-100"
+                          : "scale-70 -rotate-10 opacity-0"
+                      }`}
+                    />
+                    <PlayFilledGlyph
+                      className={`absolute inset-0 h-20 w-20 fill-slate-900 transition-all duration-200 ${
+                        state.isRunning
+                          ? "scale-70 rotate-10 opacity-0"
+                          : "scale-100 rotate-0 opacity-100"
+                      }`}
+                    />
+                  </span>
+                </button>
+              </div>
+
+              {showFlagStatus ? (
+                <div
+                  className={`pointer-events-none absolute -left-3 -bottom-0.5 w-[94px] rounded-2xl border px-2 py-1 text-center shadow-[0_6px_14px_rgba(15,23,42,0.18)] ${
+                    !flagReleased && flagRemainingMs <= 10_000
+                      ? "border-amber-300 bg-amber-100 text-amber-900"
+                      : "border-sky-300 bg-white text-slate-800"
+                  }`}
+                >
+                  <p className="text-[9px] font-semibold tracking-[0.14em] uppercase">Flag</p>
+                  <p className="text-xs font-semibold tabular-nums">
+                    {flagReleased ? "Released" : formatRemaining(flagRemainingMs)}
+                  </p>
+                </div>
+              ) : null}
+
+              {showSeekerStatus ? (
+                <div
+                  className={`pointer-events-none absolute -right-3 -bottom-0.5 w-[94px] rounded-2xl border px-2 py-1 text-center shadow-[0_6px_14px_rgba(15,23,42,0.18)] ${
+                    seekerWarningRed
+                      ? "animate-pulse border-red-300 bg-red-100 text-red-900"
+                      : seekerWarningYellow
+                        ? "border-amber-300 bg-amber-100 text-amber-900"
+                        : "border-sky-300 bg-white text-slate-800"
+                  }`}
+                >
+                  <p className="text-[9px] font-semibold tracking-[0.14em] uppercase">Seekers</p>
+                  <p className="text-xs font-semibold tabular-nums">
+                    {gameView.seekerReleased ? "Released" : formatRemaining(seekerCountdownMs)}
+                  </p>
+                </div>
+              ) : null}
+            </div>
+
+            <div className="flex min-w-0 flex-col items-center gap-1">
+              {controller && renamingTeam === "away" ? (
+                <div className="grid w-full gap-1">
+                  <Input
+                    value={awayName}
+                    onChange={(event) => setAwayName(event.target.value)}
+                    className="h-7 border-slate-300 bg-white text-[10px] text-slate-900"
+                    maxLength={40}
+                  />
+                  <div className="grid grid-cols-2 gap-1">
+                    <Button size="sm" className="h-6 text-[10px]" onClick={saveTeamRename}>
+                      Save
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="h-6 border-slate-300 bg-white text-[10px] text-slate-800"
+                      onClick={() => {
+                        setHomeName(state.homeName);
+                        setAwayName(state.awayName);
+                        setRenamingTeam(null);
+                      }}
+                    >
+                      Cancel
+                    </Button>
+                  </div>
+                </div>
+              ) : (
+                <button
+                  type="button"
+                  className="w-[calc(100%+0.75rem)] min-h-[2.6rem] max-w-none whitespace-normal px-1 py-0.5 text-center text-[clamp(1.05rem,3.8vw,1.35rem)] leading-[1.03] font-extrabold tracking-tight text-slate-900 [overflow-wrap:normal] [word-break:keep-all] transition-opacity hover:opacity-70"
+                  onClick={() => {
+                    if (!controller) {
+                      return;
+                    }
+
+                    setHomeName(state.homeName);
+                    setAwayName(state.awayName);
+                    setRenamingTeam(awayScoreColumn.team);
+                  }}
+                >
+                  {awayScoreColumn.name}
+                </button>
+              )}
+
+              <Button
+                size="sm"
+                className="h-8 w-full rounded-2xl border border-orange-300 bg-gradient-to-br from-orange-500 to-rose-500 text-white shadow-sm"
+                onClick={() =>
+                  dispatchCommand({
+                    type: "change-score",
+                    team: awayScoreColumn.team,
+                    delta: 10,
+                    reason: "goal",
+                  })
+                }
+                disabled={!controller || state.isFinished}
+              >
+                <ChevronUp className="h-4 w-4" />
+              </Button>
+              <div className="w-full rounded-2xl border border-orange-200 bg-white px-2 py-2 text-center shadow-[inset_0_0_12px_rgba(249,115,22,0.16)]">
+                <p
+                  className={`text-[clamp(1.75rem,9.4vw,2.45rem)] leading-none font-semibold tabular-nums transition-all duration-300 ${
+                    scorePulse.away === 1
+                      ? "score-pop-up text-emerald-700"
+                      : scorePulse.away === -1
+                        ? "score-pop-down text-rose-700"
+                        : "text-slate-900"
+                  }`}
+                >
+                  {awayScoreColumn.score}
+                </p>
+              </div>
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-8 w-full rounded-2xl border-orange-200 bg-white text-orange-700 hover:bg-orange-50"
+                onClick={() =>
+                  dispatchCommand({ type: "undo-last-score", team: awayScoreColumn.team })
+                }
+                disabled={!controller}
+              >
+                <ChevronDown className="h-4 w-4" />
               </Button>
             </div>
           </div>
-          {clockAdjustOpen && controller ? (
-            <div className="mt-2 grid grid-cols-3 gap-1 text-[11px]">
-              <Button
-                size="sm"
-                variant="outline"
-                className="h-8 px-1"
-                onClick={() => adjustGameClock(-60_000)}
-              >
-                -1m
-              </Button>
-              <Button
-                size="sm"
-                variant="outline"
-                className="h-8 px-1"
-                onClick={() => adjustGameClock(-10_000)}
-              >
-                -10s
-              </Button>
-              <Button
-                size="sm"
-                variant="outline"
-                className="h-8 px-1"
-                onClick={() => adjustGameClock(-1_000)}
-              >
-                -1s
-              </Button>
-              <Button
-                size="sm"
-                variant="outline"
-                className="h-8 px-1"
-                onClick={() => adjustGameClock(1_000)}
-              >
-                +1s
-              </Button>
-              <Button
-                size="sm"
-                variant="outline"
-                className="h-8 px-1"
-                onClick={() => adjustGameClock(10_000)}
-              >
-                +10s
-              </Button>
-              <Button
-                size="sm"
-                variant="outline"
-                className="h-8 px-1"
-                onClick={() => adjustGameClock(60_000)}
-              >
-                +1m
-              </Button>
-            </div>
+
+          {finishSummary !== null ? (
+            <p className="mt-1 text-center text-[10px] font-medium text-slate-600">
+              {finishSummary}
+            </p>
           ) : null}
-          {showSeekerStatus || activeTimeout !== null ? (
-            <div className="mt-2 flex flex-wrap gap-1 text-[10px]">
-              {showSeekerStatus ? (
-                <div
-                  className={`rounded border px-2 py-1 font-semibold tabular-nums ${
-                    !gameView.seekerReleased &&
-                    gameView.seekerReleaseCountdownMs !== null &&
-                    gameView.seekerReleaseCountdownMs > 0 &&
-                    gameView.seekerReleaseCountdownMs <= 10_000
-                      ? "border-amber-300 bg-amber-50 text-amber-800"
-                      : ""
-                  }`}
+          {controller ? (
+            clockAdjustOpen ? (
+              <div
+                className="mt-2 grid grid-cols-6 gap-1 text-[11px] animate-in fade-in-0 slide-in-from-bottom-2"
+                data-clock-adjust-keep="true"
+              >
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="h-7 border-slate-300 bg-white text-slate-800"
+                  onClick={() => adjustGameClock(-60_000)}
                 >
-                  <span className="inline-flex items-center gap-1">
-                    <Flag className="h-3 w-3" />
-                    {gameView.seekerReleased
-                      ? "Seek released"
-                      : `Seek ${formatRemaining(gameView.seekerReleaseCountdownMs ?? seekerRemainingMs)}`}
-                  </span>
-                </div>
-              ) : null}
-              {activeTimeout !== null ? (
-                <div
-                  className={`rounded border px-2 py-1 font-semibold tabular-nums ${
-                    gameView.timeoutWarningActive ? "border-red-300 bg-red-50 text-red-800" : ""
-                  }`}
+                  -1m
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="h-7 border-slate-300 bg-white text-slate-800"
+                  onClick={() => adjustGameClock(-10_000)}
                 >
-                  <span className="inline-flex items-center gap-1">
-                    <Clock3 className="h-3 w-3" />
-                    {activeTimeoutTeamName} {formatRemaining(activeTimeout.remainingMs)}
-                  </span>
-                </div>
-              ) : null}
-            </div>
+                  -10s
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="h-7 border-slate-300 bg-white text-slate-800"
+                  onClick={() => adjustGameClock(-1_000)}
+                >
+                  -1s
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="h-7 border-slate-300 bg-white text-slate-800"
+                  onClick={() => adjustGameClock(1_000)}
+                >
+                  +1s
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="h-7 border-slate-300 bg-white text-slate-800"
+                  onClick={() => adjustGameClock(10_000)}
+                >
+                  +10s
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="h-7 border-slate-300 bg-white text-slate-800"
+                  onClick={() => adjustGameClock(60_000)}
+                >
+                  +1m
+                </Button>
+              </div>
+            ) : (
+              <p className="mt-2 text-center text-[11px] font-medium text-slate-600">
+                Tap game time or team names to adjust.
+              </p>
+            )
           ) : null}
           {activeTimeout !== null && gameView.timeoutReminderActive ? (
             <p
-              className={`mt-2 rounded border px-2 py-1 text-[10px] font-medium ${
+              className={`mt-2 rounded-xl border px-2 py-1 text-[10px] font-medium ${
                 gameView.timeoutWarningActive
-                  ? "border-red-300 bg-red-50 text-red-800"
-                  : "border-sky-300 bg-sky-50 text-sky-800"
+                  ? "border-red-300 bg-red-100 text-red-900"
+                  : "border-sky-300 bg-sky-100 text-sky-900"
               }`}
             >
               Reminder: tell head referee to blow their whistle at 15 seconds remaining.
+              {activeTimeoutTeamName !== null
+                ? ` (${activeTimeoutTeamName}: ${formatRemaining(activeTimeout.remainingMs)})`
+                : null}
             </p>
           ) : null}
         </section>
 
         <section className="grid min-h-0 grid-cols-2 gap-2">
-          <Card className="h-full min-h-0 py-2">
-            <CardContent className="flex h-full min-h-0 flex-col gap-1 overflow-hidden px-2.5">
-              {controller && renamingTeam === "home" ? (
-                <div className="grid gap-1">
-                  <Input
-                    value={homeName}
-                    onChange={(event) => setHomeName(event.target.value)}
-                    className="h-8 text-xs"
-                    maxLength={40}
-                  />
-                  <div className="grid grid-cols-2 gap-1">
-                    <Button size="sm" className="h-7 text-[11px]" onClick={saveTeamRename}>
-                      Save
-                    </Button>
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      className="h-7 text-[11px]"
-                      onClick={() => {
-                        setHomeName(state.homeName);
-                        setAwayName(state.awayName);
-                        setRenamingTeam(null);
-                      }}
-                    >
-                      Cancel
-                    </Button>
-                  </div>
-                </div>
-              ) : (
-                <button
-                  type="button"
-                  className="truncate text-left text-[11px] font-semibold"
-                  onClick={() => {
-                    if (!controller) {
-                      return;
-                    }
-                    setHomeName(state.homeName);
-                    setAwayName(state.awayName);
-                    setRenamingTeam("home");
-                  }}
-                >
-                  {state.homeName}
-                </button>
-              )}
-              <p className="text-[clamp(2rem,11vw,3rem)] leading-none font-semibold tabular-nums">
-                {state.score.home}
-              </p>
-              <div className="grid grid-cols-2 gap-1">
-                <Button
-                  size="sm"
-                  className="h-8 gap-1 px-0 text-sm"
-                  onClick={() =>
-                    dispatchCommand({
-                      type: "change-score",
-                      team: "home",
-                      delta: 10,
-                      reason: "goal",
-                    })
-                  }
-                  disabled={!controller || state.isFinished}
-                >
-                  <Plus className="h-3.5 w-3.5" />
-                  10
-                </Button>
-                <Button
-                  size="sm"
-                  variant="outline"
-                  className="h-8 gap-1 px-0 text-sm"
-                  onClick={() => dispatchCommand({ type: "undo-last-score", team: "home" })}
-                  disabled={!controller}
-                >
-                  <Minus className="h-3.5 w-3.5" />
-                  10
-                </Button>
-              </div>
-              <div className="mt-auto grid gap-1">
-                {visibleHomePenalties.length === 0 ? (
-                  <p className="text-[10px] text-muted-foreground">No penalties</p>
-                ) : (
-                  visibleHomePenalties.map((entry) => {
-                    const releaseActions = pendingReleaseByPlayer[entry.playerKey] ?? [];
-                    const playerState = state.players[entry.playerKey] ?? null;
+          {penaltyColumns.map((column) => (
+            <Card
+              key={column.team}
+              className="h-full min-h-0 rounded-2xl border-slate-300 bg-white py-1 shadow-[0_8px_20px_rgba(15,23,42,0.1)]"
+            >
+              <CardContent className="flex h-full min-h-0 flex-col gap-1 overflow-hidden px-2">
+                <p className="truncate text-[10px] font-semibold tracking-[0.14em] text-slate-700 uppercase">
+                  {column.team === "home" ? state.homeName : state.awayName} penalties
+                </p>
+                <div className="grid min-h-0 gap-1 overflow-hidden">
+                  {column.visiblePenalties.length === 0 ? (
+                    <p className="text-[10px] text-slate-500">No penalties</p>
+                  ) : (
+                    column.visiblePenalties.map((entry) => {
+                      const releaseActions = pendingReleaseByPlayer[entry.playerKey] ?? [];
+                      const playerState = state.players[entry.playerKey] ?? null;
 
-                    return (
-                      <div
-                        key={entry.playerKey}
-                        className={`rounded border px-2 py-1 text-[10px] ${
-                          releaseActions.length > 0
-                            ? "animate-pulse border-red-300 bg-red-50 text-red-900"
-                            : entry.highlight
-                              ? "border-amber-300 bg-amber-50 text-amber-900"
-                              : ""
-                        }`}
-                      >
-                        <div className="flex items-center justify-between">
-                          <span>{entry.label}</span>
-                          <span className="font-semibold tabular-nums">{entry.remaining}</span>
-                        </div>
-                        {releaseActions.length > 0 ? (
-                          <div className="mt-1 grid gap-1">
-                            {releaseActions.map((action) => (
-                              <Button
-                                key={action.pendingId}
-                                size="sm"
-                                className="h-6 justify-start px-1.5 text-[10px]"
-                                onClick={() =>
-                                  dispatchCommand({
-                                    type: "confirm-penalty-expiration",
-                                    pendingId: action.pendingId,
-                                    playerKey: entry.playerKey,
-                                  })
-                                }
-                                disabled={!controller}
-                              >
-                                {formatPendingReleaseActionLabel(action, playerState)}
-                              </Button>
-                            ))}
+                      return (
+                        <div
+                          key={entry.playerKey}
+                          className={`rounded-xl border px-2 py-1 text-[10px] ${
+                            releaseActions.length > 0
+                              ? "animate-pulse border-red-300 bg-red-100 text-red-900"
+                              : entry.highlight
+                                ? "border-amber-300 bg-amber-100 text-amber-900"
+                                : "border-slate-300 bg-slate-50 text-slate-900"
+                          }`}
+                        >
+                          <div className="flex items-center justify-between gap-1">
+                            <span>{entry.label}</span>
+                            <span className="font-semibold tabular-nums">{entry.remaining}</span>
                           </div>
-                        ) : null}
-                      </div>
-                    );
-                  })
-                )}
-                {homePenalties.length > visibleHomePenalties.length ? (
-                  <p className="text-[10px] text-muted-foreground">
-                    +{homePenalties.length - visibleHomePenalties.length} more
-                  </p>
-                ) : null}
-                {homeRecentReleases.slice(0, 2).map((release) => (
-                  <div
-                    key={release.id}
-                    className="rounded border border-emerald-300 bg-emerald-50 px-2 py-1 text-[10px] text-emerald-900"
-                  >
-                    <span>{release.label} released</span>
-                  </div>
-                ))}
-              </div>
-            </CardContent>
-          </Card>
-
-          <Card className="h-full min-h-0 py-2">
-            <CardContent className="flex h-full min-h-0 flex-col gap-1 overflow-hidden px-2.5">
-              {controller && renamingTeam === "away" ? (
-                <div className="grid gap-1">
-                  <Input
-                    value={awayName}
-                    onChange={(event) => setAwayName(event.target.value)}
-                    className="h-8 text-xs"
-                    maxLength={40}
-                  />
-                  <div className="grid grid-cols-2 gap-1">
-                    <Button size="sm" className="h-7 text-[11px]" onClick={saveTeamRename}>
-                      Save
-                    </Button>
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      className="h-7 text-[11px]"
-                      onClick={() => {
-                        setHomeName(state.homeName);
-                        setAwayName(state.awayName);
-                        setRenamingTeam(null);
-                      }}
-                    >
-                      Cancel
-                    </Button>
-                  </div>
-                </div>
-              ) : (
-                <button
-                  type="button"
-                  className="truncate text-left text-[11px] font-semibold"
-                  onClick={() => {
-                    if (!controller) {
-                      return;
-                    }
-                    setHomeName(state.homeName);
-                    setAwayName(state.awayName);
-                    setRenamingTeam("away");
-                  }}
-                >
-                  {state.awayName}
-                </button>
-              )}
-              <p className="text-[clamp(2rem,11vw,3rem)] leading-none font-semibold tabular-nums">
-                {state.score.away}
-              </p>
-              <div className="grid grid-cols-2 gap-1">
-                <Button
-                  size="sm"
-                  className="h-8 gap-1 px-0 text-sm"
-                  onClick={() =>
-                    dispatchCommand({
-                      type: "change-score",
-                      team: "away",
-                      delta: 10,
-                      reason: "goal",
-                    })
-                  }
-                  disabled={!controller || state.isFinished}
-                >
-                  <Plus className="h-3.5 w-3.5" />
-                  10
-                </Button>
-                <Button
-                  size="sm"
-                  variant="outline"
-                  className="h-8 gap-1 px-0 text-sm"
-                  onClick={() => dispatchCommand({ type: "undo-last-score", team: "away" })}
-                  disabled={!controller}
-                >
-                  <Minus className="h-3.5 w-3.5" />
-                  10
-                </Button>
-              </div>
-              <div className="mt-auto grid gap-1">
-                {visibleAwayPenalties.length === 0 ? (
-                  <p className="text-[10px] text-muted-foreground">No penalties</p>
-                ) : (
-                  visibleAwayPenalties.map((entry) => {
-                    const releaseActions = pendingReleaseByPlayer[entry.playerKey] ?? [];
-                    const playerState = state.players[entry.playerKey] ?? null;
-
-                    return (
-                      <div
-                        key={entry.playerKey}
-                        className={`rounded border px-2 py-1 text-[10px] ${
-                          releaseActions.length > 0
-                            ? "animate-pulse border-red-300 bg-red-50 text-red-900"
-                            : entry.highlight
-                              ? "border-amber-300 bg-amber-50 text-amber-900"
-                              : ""
-                        }`}
-                      >
-                        <div className="flex items-center justify-between">
-                          <span>{entry.label}</span>
-                          <span className="font-semibold tabular-nums">{entry.remaining}</span>
+                          {releaseActions.length > 0 ? (
+                            <div className="mt-1 grid gap-1">
+                              {releaseActions.map((action) => (
+                                <Button
+                                  key={action.pendingId}
+                                  size="sm"
+                                  className="h-6 justify-start rounded-lg bg-red-500 px-1.5 text-[10px] text-white hover:bg-red-600"
+                                  onClick={() =>
+                                    dispatchCommand({
+                                      type: "confirm-penalty-expiration",
+                                      pendingId: action.pendingId,
+                                      playerKey: entry.playerKey,
+                                    })
+                                  }
+                                  disabled={!controller}
+                                >
+                                  {formatPendingReleaseActionLabel(action, playerState)}
+                                </Button>
+                              ))}
+                            </div>
+                          ) : null}
                         </div>
-                        {releaseActions.length > 0 ? (
-                          <div className="mt-1 grid gap-1">
-                            {releaseActions.map((action) => (
-                              <Button
-                                key={action.pendingId}
-                                size="sm"
-                                className="h-6 justify-start px-1.5 text-[10px]"
-                                onClick={() =>
-                                  dispatchCommand({
-                                    type: "confirm-penalty-expiration",
-                                    pendingId: action.pendingId,
-                                    playerKey: entry.playerKey,
-                                  })
-                                }
-                                disabled={!controller}
-                              >
-                                {formatPendingReleaseActionLabel(action, playerState)}
-                              </Button>
-                            ))}
-                          </div>
-                        ) : null}
-                      </div>
-                    );
-                  })
-                )}
-                {awayPenalties.length > visibleAwayPenalties.length ? (
-                  <p className="text-[10px] text-muted-foreground">
-                    +{awayPenalties.length - visibleAwayPenalties.length} more
-                  </p>
-                ) : null}
-                {awayRecentReleases.slice(0, 2).map((release) => (
-                  <div
-                    key={release.id}
-                    className="rounded border border-emerald-300 bg-emerald-50 px-2 py-1 text-[10px] text-emerald-900"
-                  >
-                    <span>{release.label} released</span>
-                  </div>
-                ))}
-              </div>
-            </CardContent>
-          </Card>
+                      );
+                    })
+                  )}
+                  {column.penalties.length > column.visiblePenalties.length ? (
+                    <p className="text-[10px] text-slate-500">
+                      +{column.penalties.length - column.visiblePenalties.length} more
+                    </p>
+                  ) : null}
+                  {column.recentReleases.slice(0, 2).map((release) => (
+                    <div
+                      key={release.id}
+                      className="rounded-xl border border-emerald-300 bg-emerald-100 px-2 py-1 text-[10px] text-emerald-900"
+                    >
+                      <span>
+                        {release.label} released ({formatRemaining(release.remainingMs)})
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </CardContent>
+            </Card>
+          ))}
         </section>
 
-        <Card className="py-2">
-          <CardContent className="grid min-h-0 overflow-hidden px-2.5">
+        <Card className="relative min-h-0 overflow-hidden rounded-[1.5rem] border border-slate-300 bg-white py-1 shadow-[0_12px_26px_rgba(15,23,42,0.1)]">
+          <CardContent className="overflow-hidden px-2">
             <div
-              className={`col-start-1 row-start-1 flex min-h-0 flex-col gap-1 py-1 ${
-                activePanel === "card" ? "" : "pointer-events-none opacity-0"
+              className={`flex min-h-0 flex-col gap-1.5 rounded-2xl border border-slate-200 bg-slate-50 p-2 ${
+                activePanel === "card" ? "animate-in fade-in-0 slide-in-from-bottom-2" : "hidden"
               }`}
             >
               <div className="grid grid-cols-2 gap-1">
@@ -1140,7 +1273,7 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
                       key={option.type}
                       size="sm"
                       variant="outline"
-                      className={`h-6 justify-start gap-1.5 px-2 text-[10px] ${
+                      className={`h-7 justify-start gap-1.5 rounded-xl px-2 text-[10px] ${
                         active ? option.activeClassName : option.idleClassName
                       }`}
                       onClick={() =>
@@ -1165,7 +1298,7 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
                 <Button
                   size="sm"
                   variant={cardDraft.team === "home" ? "default" : "outline"}
-                  className="h-6 text-[10px]"
+                  className="h-7 rounded-xl text-[10px]"
                   onClick={() =>
                     setCardDraft((previous) => ({
                       ...previous,
@@ -1179,7 +1312,7 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
                 <Button
                   size="sm"
                   variant={cardDraft.team === "away" ? "default" : "outline"}
-                  className="h-6 text-[10px]"
+                  className="h-7 rounded-xl text-[10px]"
                   onClick={() =>
                     setCardDraft((previous) => ({
                       ...previous,
@@ -1191,14 +1324,13 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
                   {state.awayName}
                 </Button>
               </div>
-              <div className="grid grid-cols-[auto_1fr_auto] items-center gap-2 rounded border px-2 py-1 text-[10px] font-medium">
+              <div className="grid grid-cols-[auto_1fr_auto] items-center gap-2 rounded-xl border border-slate-300 bg-white px-2 py-1 text-[10px] font-medium">
                 {cardDraft.cardType === null ? (
-                  <span className="text-muted-foreground">Card?</span>
+                  <span className="text-slate-500">Card?</span>
                 ) : (
                   <>
                     <span className="uppercase">{cardDraft.cardType}</span>
-                    <span className="truncate text-muted-foreground">
-                      •{" "}
+                    <span className="truncate text-slate-600">
                       {cardDraft.team === null
                         ? "team?"
                         : cardDraft.team === "home"
@@ -1211,7 +1343,7 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
                 <Button
                   size="sm"
                   variant="ghost"
-                  className="h-5 px-1.5 text-[10px]"
+                  className="h-5 px-1.5 text-[10px] text-slate-700"
                   onClick={() =>
                     setCardDraft({
                       cardType: null,
@@ -1225,14 +1357,14 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
                   Reset
                 </Button>
               </div>
-              <p className="h-4 text-[10px] text-muted-foreground">{cardAddStatusText}</p>
+              <p className="h-4 text-[10px] text-slate-600">{cardAddStatusText}</p>
               <div className="grid grid-cols-3 gap-1">
                 {["1", "2", "3", "4", "5", "6", "7", "8", "9"].map((digit) => (
                   <Button
                     key={digit}
                     size="sm"
                     variant="outline"
-                    className="h-6 text-sm"
+                    className="h-7 rounded-xl border-slate-300 bg-white text-sm text-slate-900"
                     onClick={() => appendCardDigit(digit)}
                     disabled={!canEditCardDigits}
                   >
@@ -1242,7 +1374,7 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
                 <Button
                   size="sm"
                   variant="outline"
-                  className="h-6"
+                  className="h-7 rounded-xl border-slate-300 bg-white text-slate-900"
                   onClick={() =>
                     setCardDraft((previous) => ({
                       ...previous,
@@ -1256,7 +1388,7 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
                 <Button
                   size="sm"
                   variant="outline"
-                  className="h-6 text-sm"
+                  className="h-7 rounded-xl border-slate-300 bg-white text-sm text-slate-900"
                   onClick={() => appendCardDigit("0")}
                   disabled={!canEditCardDigits}
                 >
@@ -1264,7 +1396,7 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
                 </Button>
                 <Button
                   size="sm"
-                  className="h-6 gap-1"
+                  className="h-7 gap-1 rounded-xl bg-emerald-600 text-white hover:bg-emerald-500"
                   onClick={submitCard}
                   disabled={!canSubmitCard}
                 >
@@ -1272,354 +1404,375 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
                   OK
                 </Button>
               </div>
-              {state.isRunning && !cardEntryStarted ? (
-                <p className="text-[10px] text-muted-foreground">Pause play to start card entry.</p>
-              ) : null}
             </div>
 
-            {activePanel === "timeout" ? (
-              <div className="col-start-1 row-start-1 flex min-h-0 flex-col gap-1 py-1">
-                {activeTimeout === null ? (
-                  <div className="grid gap-1">
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      className="h-8"
-                      onClick={() => dispatchCommand({ type: "start-timeout", team: "home" })}
-                      disabled={
-                        !controller ||
-                        state.isRunning ||
-                        state.isSuspended ||
-                        state.timeouts.home.used ||
-                        state.isFinished
-                      }
-                    >
-                      {state.homeName} timeout
-                    </Button>
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      className="h-8"
-                      onClick={() => dispatchCommand({ type: "start-timeout", team: "away" })}
-                      disabled={
-                        !controller ||
-                        state.isRunning ||
-                        state.isSuspended ||
-                        state.timeouts.away.used ||
-                        state.isFinished
-                      }
-                    >
-                      {state.awayName} timeout
-                    </Button>
-                  </div>
-                ) : (
-                  <>
-                    <p
-                      className={`text-2xl font-semibold tabular-nums ${
-                        gameView.timeoutFinalCountdown
-                          ? "text-red-700"
-                          : gameView.timeoutWarningActive
-                            ? "text-red-600"
-                            : ""
-                      }`}
-                    >
-                      {formatRemaining(activeTimeout.remainingMs)}
-                    </p>
-                    {!activeTimeout.running ? (
-                      <div className="grid grid-cols-2 gap-1">
-                        <Button
-                          size="sm"
-                          onClick={() =>
-                            dispatchCommand({
-                              type: "set-timeout-running",
-                              running: true,
-                            })
-                          }
-                          disabled={!controller}
-                        >
-                          Start
-                        </Button>
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          onClick={() => dispatchCommand({ type: "undo-timeout-start" })}
-                          disabled={!controller}
-                        >
-                          Undo
-                        </Button>
-                      </div>
-                    ) : (
-                      <div className="grid grid-cols-2 gap-1">
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          onClick={() => dispatchCommand({ type: "cancel-timeout" })}
-                          disabled={!controller}
-                        >
-                          End early
-                        </Button>
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          onClick={() => dispatchCommand({ type: "undo-timeout-start" })}
-                          disabled={!controller}
-                        >
-                          Undo
-                        </Button>
-                      </div>
-                    )}
-                  </>
-                )}
-              </div>
-            ) : null}
-
-            {activePanel === "game" ? (
-              <div className="col-start-1 row-start-1 flex min-h-0 flex-col gap-1 py-1">
-                {pendingWinConfirmation !== null ? (
-                  <div className="mb-1 rounded border border-amber-300 bg-amber-50 p-2 text-[10px] text-amber-900">
-                    <p className="font-semibold">Confirm result</p>
-                    <p className="mt-0.5">{pendingWinConfirmation.label}</p>
-                    <div className="mt-2 grid grid-cols-2 gap-1">
+            <div
+              className={`flex min-h-0 flex-col gap-1.5 rounded-2xl border border-slate-200 bg-slate-50 p-2 ${
+                activePanel === "timeout" ? "animate-in fade-in-0 slide-in-from-bottom-2" : "hidden"
+              }`}
+            >
+              {activeTimeout === null ? (
+                <div className="grid gap-1">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-9 rounded-xl border-slate-300 bg-white text-slate-900"
+                    onClick={() => dispatchCommand({ type: "start-timeout", team: "home" })}
+                    disabled={
+                      !controller ||
+                      state.isRunning ||
+                      state.isSuspended ||
+                      state.timeouts.home.used ||
+                      state.isFinished
+                    }
+                  >
+                    {state.homeName} timeout
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-9 rounded-xl border-slate-300 bg-white text-slate-900"
+                    onClick={() => dispatchCommand({ type: "start-timeout", team: "away" })}
+                    disabled={
+                      !controller ||
+                      state.isRunning ||
+                      state.isSuspended ||
+                      state.timeouts.away.used ||
+                      state.isFinished
+                    }
+                  >
+                    {state.awayName} timeout
+                  </Button>
+                </div>
+              ) : (
+                <>
+                  <p
+                    className={`text-center text-3xl font-semibold tabular-nums ${
+                      gameView.timeoutFinalCountdown
+                        ? "text-red-700"
+                        : gameView.timeoutWarningActive
+                          ? "text-red-600"
+                          : "text-slate-900"
+                    }`}
+                  >
+                    {formatRemaining(activeTimeout.remainingMs)}
+                  </p>
+                  {!activeTimeout.running ? (
+                    <div className="grid grid-cols-2 gap-1">
                       <Button
                         size="sm"
-                        className="h-7"
-                        onClick={confirmWinAction}
+                        className="h-9 rounded-xl bg-emerald-600 text-white hover:bg-emerald-500"
+                        onClick={() =>
+                          dispatchCommand({
+                            type: "set-timeout-running",
+                            running: true,
+                          })
+                        }
                         disabled={!controller}
                       >
-                        Confirm
+                        Start
                       </Button>
                       <Button
                         size="sm"
                         variant="outline"
-                        className="h-7"
-                        onClick={() => setPendingWinConfirmation(null)}
+                        className="h-9 rounded-xl border-slate-300 bg-white text-slate-900"
+                        onClick={() => dispatchCommand({ type: "undo-timeout-start" })}
                         disabled={!controller}
                       >
-                        Cancel
+                        Undo
                       </Button>
                     </div>
-                  </div>
-                ) : null}
-                {state.isFinished ? (
-                  <p className="text-[11px] text-muted-foreground">
-                    {finishSummary ?? "Game finished."}
-                  </p>
-                ) : state.isSuspended ? (
-                  <>
-                    <p className="text-[11px] text-muted-foreground">
-                      Game suspended. Resume when continuing this game.
-                    </p>
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      className="h-8"
-                      onClick={() => dispatchCommand({ type: "resume-game" })}
-                      disabled={!canResumeGame}
-                    >
-                      Resume game
-                    </Button>
-                  </>
-                ) : (
-                  <>
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      className="h-8"
-                      onClick={() => dispatchCommand({ type: "suspend-game" })}
-                      disabled={!canSuspendGame}
-                    >
-                      Suspend game
-                    </Button>
+                  ) : (
                     <div className="grid grid-cols-2 gap-1">
                       <Button
                         size="sm"
                         variant="outline"
-                        className="h-8"
-                        onClick={() =>
-                          requestWinConfirmation(`${state.awayName} wins by forfeit penalty.`, {
-                            type: "record-forfeit",
-                            team: "home",
-                          })
-                        }
-                        disabled={!canUseEndingActions}
+                        className="h-9 rounded-xl border-slate-300 bg-white text-slate-900"
+                        onClick={() => dispatchCommand({ type: "cancel-timeout" })}
+                        disabled={!controller}
                       >
-                        {state.homeName} forfeit
+                        End early
                       </Button>
                       <Button
                         size="sm"
                         variant="outline"
-                        className="h-8"
-                        onClick={() =>
-                          requestWinConfirmation(`${state.homeName} wins by forfeit penalty.`, {
-                            type: "record-forfeit",
-                            team: "away",
-                          })
-                        }
-                        disabled={!canUseEndingActions}
+                        className="h-9 rounded-xl border-slate-300 bg-white text-slate-900"
+                        onClick={() => dispatchCommand({ type: "undo-timeout-start" })}
+                        disabled={!controller}
                       >
-                        {state.awayName} forfeit
+                        Undo
                       </Button>
                     </div>
+                  )}
+                </>
+              )}
+            </div>
+
+            <div
+              className={`flex min-h-0 flex-col gap-1.5 rounded-2xl border border-slate-200 bg-slate-50 p-2 ${
+                activePanel === "game" ? "animate-in fade-in-0 slide-in-from-bottom-2" : "hidden"
+              }`}
+            >
+              {pendingWinConfirmation !== null ? (
+                <div className="mb-1 rounded-xl border border-amber-300 bg-amber-100 p-2 text-[10px] text-amber-900">
+                  <p className="font-semibold">Confirm result</p>
+                  <p className="mt-0.5">{pendingWinConfirmation.label}</p>
+                  <div className="mt-2 grid grid-cols-2 gap-1">
+                    <Button
+                      size="sm"
+                      className="h-7 rounded-xl"
+                      onClick={confirmWinAction}
+                      disabled={!controller}
+                    >
+                      Confirm
+                    </Button>
                     <Button
                       size="sm"
                       variant="outline"
-                      className="h-8"
-                      onClick={() => dispatchCommand({ type: "record-double-forfeit" })}
+                      className="h-7 rounded-xl border-slate-300 bg-white text-slate-900"
+                      onClick={() => setPendingWinConfirmation(null)}
+                      disabled={!controller}
+                    >
+                      Cancel
+                    </Button>
+                  </div>
+                </div>
+              ) : null}
+              {state.isFinished ? (
+                <p className="text-[11px] text-slate-600">{finishSummary ?? "Game finished."}</p>
+              ) : state.isSuspended ? (
+                <>
+                  <p className="text-[11px] text-slate-600">
+                    Game suspended. Resume when continuing this game.
+                  </p>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="h-8 rounded-xl border-slate-300 bg-white text-slate-900"
+                    onClick={() => dispatchCommand({ type: "resume-game" })}
+                    disabled={!canResumeGame}
+                  >
+                    Resume game
+                  </Button>
+                </>
+              ) : (
+                <>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="h-8 rounded-xl border-slate-300 bg-white text-slate-900"
+                    onClick={() => dispatchCommand({ type: "suspend-game" })}
+                    disabled={!canSuspendGame}
+                  >
+                    Suspend game
+                  </Button>
+                  <div className="grid grid-cols-2 gap-1">
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="h-8 rounded-xl border-slate-300 bg-white text-slate-900"
+                      onClick={() =>
+                        requestWinConfirmation(`${state.awayName} wins by forfeit penalty.`, {
+                          type: "record-forfeit",
+                          team: "home",
+                        })
+                      }
                       disabled={!canUseEndingActions}
                     >
-                      Double forfeit
+                      {state.homeName} forfeit
                     </Button>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="h-8 rounded-xl border-slate-300 bg-white text-slate-900"
+                      onClick={() =>
+                        requestWinConfirmation(`${state.homeName} wins by forfeit penalty.`, {
+                          type: "record-forfeit",
+                          team: "away",
+                        })
+                      }
+                      disabled={!canUseEndingActions}
+                    >
+                      {state.awayName} forfeit
+                    </Button>
+                  </div>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="h-8 rounded-xl border-slate-300 bg-white text-slate-900"
+                    onClick={() => dispatchCommand({ type: "record-double-forfeit" })}
+                    disabled={!canUseEndingActions}
+                  >
+                    Double forfeit
+                  </Button>
 
-                    {state.isOvertime ? (
-                      <>
-                        <div className="grid grid-cols-2 gap-1">
-                          <Button
-                            size="sm"
-                            className="h-8"
-                            onClick={() =>
-                              requestWinConfirmation(
-                                `${state.homeName} reached target score and wins.`,
-                                {
-                                  type: "record-target-score",
-                                  team: "home",
-                                },
-                              )
-                            }
-                            disabled={!canUseEndingActions}
-                          >
-                            {state.homeName} reached target
-                          </Button>
-                          <Button
-                            size="sm"
-                            className="h-8"
-                            onClick={() =>
-                              requestWinConfirmation(
-                                `${state.awayName} reached target score and wins.`,
-                                {
-                                  type: "record-target-score",
-                                  team: "away",
-                                },
-                              )
-                            }
-                            disabled={!canUseEndingActions}
-                          >
-                            {state.awayName} reached target
-                          </Button>
-                        </div>
-                        <div className="grid grid-cols-2 gap-1">
-                          <Button
-                            size="sm"
-                            variant="outline"
-                            className="h-8"
-                            onClick={() =>
-                              requestWinConfirmation(
-                                `${state.homeName} conceded. ${state.awayName} wins.`,
-                                {
-                                  type: "record-concede",
-                                  team: "home",
-                                },
-                              )
-                            }
-                            disabled={!canUseEndingActions}
-                          >
-                            {state.homeName} concedes
-                          </Button>
-                          <Button
-                            size="sm"
-                            variant="outline"
-                            className="h-8"
-                            onClick={() =>
-                              requestWinConfirmation(
-                                `${state.awayName} conceded. ${state.homeName} wins.`,
-                                {
-                                  type: "record-concede",
-                                  team: "away",
-                                },
-                              )
-                            }
-                            disabled={!canUseEndingActions}
-                          >
-                            {state.awayName} concedes
-                          </Button>
-                        </div>
-                      </>
-                    ) : canRecordFlagCatch ? (
+                  {state.isOvertime ? (
+                    <>
                       <div className="grid grid-cols-2 gap-1">
                         <Button
                           size="sm"
-                          onClick={() => {
-                            if (willFlagCatchWin(state, "home")) {
-                              requestWinConfirmation(`${state.homeName} wins on flag catch.`, {
-                                type: "record-flag-catch",
+                          className="h-8 rounded-xl"
+                          onClick={() =>
+                            requestWinConfirmation(
+                              `${state.homeName} reached target score and wins.`,
+                              {
+                                type: "record-target-score",
                                 team: "home",
-                              });
-                              return;
-                            }
-
-                            dispatchCommand({ type: "record-flag-catch", team: "home" });
-                          }}
+                              },
+                            )
+                          }
                           disabled={!canUseEndingActions}
                         >
-                          {state.homeName} flag +30
+                          {state.homeName} reached target
                         </Button>
                         <Button
                           size="sm"
-                          onClick={() => {
-                            if (willFlagCatchWin(state, "away")) {
-                              requestWinConfirmation(`${state.awayName} wins on flag catch.`, {
-                                type: "record-flag-catch",
+                          className="h-8 rounded-xl"
+                          onClick={() =>
+                            requestWinConfirmation(
+                              `${state.awayName} reached target score and wins.`,
+                              {
+                                type: "record-target-score",
                                 team: "away",
-                              });
-                              return;
-                            }
-
-                            dispatchCommand({ type: "record-flag-catch", team: "away" });
-                          }}
+                              },
+                            )
+                          }
                           disabled={!canUseEndingActions}
                         >
-                          {state.awayName} flag +30
+                          {state.awayName} reached target
                         </Button>
                       </div>
-                    ) : (
-                      <p className="text-[11px] text-muted-foreground">
-                        Flag catch appears after seeker release while play is paused.
-                      </p>
-                    )}
-                  </>
-                )}
-              </div>
-            ) : null}
+                      <div className="grid grid-cols-2 gap-1">
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          className="h-8 rounded-xl border-slate-300 bg-white text-slate-900"
+                          onClick={() =>
+                            requestWinConfirmation(
+                              `${state.homeName} conceded. ${state.awayName} wins.`,
+                              {
+                                type: "record-concede",
+                                team: "home",
+                              },
+                            )
+                          }
+                          disabled={!canUseEndingActions}
+                        >
+                          {state.homeName} concedes
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          className="h-8 rounded-xl border-slate-300 bg-white text-slate-900"
+                          onClick={() =>
+                            requestWinConfirmation(
+                              `${state.awayName} conceded. ${state.homeName} wins.`,
+                              {
+                                type: "record-concede",
+                                team: "away",
+                              },
+                            )
+                          }
+                          disabled={!canUseEndingActions}
+                        >
+                          {state.awayName} concedes
+                        </Button>
+                      </div>
+                    </>
+                  ) : canRecordFlagCatch ? (
+                    <div className="grid grid-cols-2 gap-1">
+                      <Button
+                        size="sm"
+                        className="h-8 rounded-xl"
+                        onClick={() => {
+                          if (willFlagCatchWin(state, "home")) {
+                            requestWinConfirmation(`${state.homeName} wins on flag catch.`, {
+                              type: "record-flag-catch",
+                              team: "home",
+                            });
+                            return;
+                          }
+
+                          dispatchCommand({ type: "record-flag-catch", team: "home" });
+                        }}
+                        disabled={!canUseEndingActions}
+                      >
+                        {state.homeName} flag +30
+                      </Button>
+                      <Button
+                        size="sm"
+                        className="h-8 rounded-xl"
+                        onClick={() => {
+                          if (willFlagCatchWin(state, "away")) {
+                            requestWinConfirmation(`${state.awayName} wins on flag catch.`, {
+                              type: "record-flag-catch",
+                              team: "away",
+                            });
+                            return;
+                          }
+
+                          dispatchCommand({ type: "record-flag-catch", team: "away" });
+                        }}
+                        disabled={!canUseEndingActions}
+                      >
+                        {state.awayName} flag +30
+                      </Button>
+                    </div>
+                  ) : (
+                    <p className="text-[11px] text-slate-600">
+                      Flag catch appears after seeker release while play is paused.
+                    </p>
+                  )}
+                </>
+              )}
+            </div>
           </CardContent>
         </Card>
 
-        <section className="grid grid-cols-3 gap-1">
-          <Button
-            variant={activePanel === "card" ? "default" : "outline"}
-            size="sm"
-            className="h-8 gap-1 px-1 text-[11px]"
-            onClick={() => setActivePanel("card")}
-          >
-            <Flag className="h-3.5 w-3.5" />
-            Card
-          </Button>
-          <Button
-            variant={activePanel === "timeout" ? "default" : "outline"}
-            size="sm"
-            className="h-8 gap-1 px-1 text-[11px]"
-            onClick={() => setActivePanel("timeout")}
-          >
-            <Clock3 className="h-3.5 w-3.5" />
-            Timeout
-          </Button>
-          <Button
-            variant={activePanel === "game" ? "default" : "outline"}
-            size="sm"
-            className="h-8 gap-1 px-1 text-[11px]"
-            onClick={() => setActivePanel("game")}
-          >
-            <Settings className="h-3.5 w-3.5" />
-            Game
-          </Button>
+        <section className="rounded-2xl border border-slate-300 bg-white p-1 shadow-[0_8px_20px_rgba(15,23,42,0.1)]">
+          <div className="grid grid-cols-3 gap-1">
+            <Button
+              variant="ghost"
+              size="sm"
+              className={`h-10 gap-1 rounded-xl px-1 text-[11px] transition-all ${
+                activePanel === "card"
+                  ? "bg-gradient-to-br from-cyan-500 to-sky-600 text-white shadow-[0_0_14px_rgba(56,189,248,0.55)]"
+                  : "bg-slate-100 text-slate-700"
+              }`}
+              onClick={() => setActivePanel("card")}
+            >
+              <Flag className={`h-3.5 w-3.5 ${activePanel === "card" ? "animate-pulse" : ""}`} />
+              Cards
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              className={`h-10 gap-1 rounded-xl px-1 text-[11px] transition-all ${
+                activePanel === "timeout"
+                  ? "bg-gradient-to-br from-orange-500 to-amber-500 text-white shadow-[0_0_14px_rgba(251,146,60,0.5)]"
+                  : "bg-slate-100 text-slate-700"
+              }`}
+              onClick={() => setActivePanel("timeout")}
+            >
+              <Clock3
+                className={`h-3.5 w-3.5 ${activePanel === "timeout" ? "animate-pulse" : ""}`}
+              />
+              Timeout
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              className={`h-10 gap-1 rounded-xl px-1 text-[11px] transition-all ${
+                activePanel === "game"
+                  ? "bg-gradient-to-br from-rose-500 to-fuchsia-600 text-white shadow-[0_0_14px_rgba(244,63,94,0.55)]"
+                  : "bg-slate-100 text-slate-700"
+              }`}
+              onClick={() => setActivePanel("game")}
+            >
+              <Trophy className={`h-3.5 w-3.5 ${activePanel === "game" ? "animate-pulse" : ""}`} />
+              Game end
+            </Button>
+          </div>
         </section>
       </div>
     </div>
@@ -2129,6 +2282,7 @@ type ReleasedPenaltyView = {
   id: string;
   label: string;
   releasedAtMs: number;
+  remainingMs: number;
 };
 
 function getTeamPenalties(state: GameState | null | undefined, team: TeamId): PlayerPenaltyView[] {
@@ -2242,6 +2396,7 @@ function getTeamRecentReleases(
             ? `Unknown (${entry.playerKey.split(":").slice(2).join(":") || "penalty"})`
             : `#${entry.playerNumber}`,
         releasedAtMs: entry.releasedAtMs,
+        remainingMs,
       };
     })
     .filter((entry): entry is ReleasedPenaltyView => entry !== null)
@@ -2258,6 +2413,23 @@ function formatPlayerLabel(player: PlayerPenaltyState | null | undefined) {
   }
 
   return `#${player.playerNumber}`;
+}
+
+function PlayFilledGlyph({ className }: { className?: string }) {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" className={className}>
+      <path d="M8 5.5C8 4.7 8.9 4.2 9.6 4.7L19.2 11.2C19.9 11.7 19.9 12.8 19.2 13.3L9.6 19.8C8.9 20.3 8 19.8 8 19V5.5Z" />
+    </svg>
+  );
+}
+
+function PauseFilledGlyph({ className }: { className?: string }) {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true" className={className}>
+      <rect x="6.5" y="4.5" width="4.8" height="15" rx="1.6" />
+      <rect x="12.7" y="4.5" width="4.8" height="15" rx="1.6" />
+    </svg>
+  );
 }
 
 export default App;

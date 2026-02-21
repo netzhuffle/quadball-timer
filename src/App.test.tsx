@@ -144,7 +144,7 @@ describe("App", () => {
         await Promise.resolve();
       });
 
-      expect(container.textContent).toContain("Tap game time to adjust");
+      expect(container.textContent).toContain("Tap game time or team names to adjust.");
       const hasHookOrderError = errors.some((message) =>
         message.includes("Rendered more hooks than during the previous render"),
       );
@@ -152,5 +152,37 @@ describe("App", () => {
     } finally {
       console.error = originalConsoleError;
     }
+  });
+
+  test("clock adjust controls replace helper text and can be closed from the clock toggle", async () => {
+    await act(async () => {
+      root.render(<App />);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(container.textContent).toContain("Tap game time or team names to adjust.");
+    expect(container.textContent).not.toContain("-1m");
+
+    const clockToggleButton = Array.from(container.getElementsByTagName("button")).find(
+      (button) => button.getAttribute("data-clock-adjust-keep") === "true",
+    );
+    expect(clockToggleButton).not.toBeNull();
+
+    await act(async () => {
+      clockToggleButton?.click();
+      await Promise.resolve();
+    });
+
+    expect(container.textContent).toContain("-1m");
+    expect(container.textContent).not.toContain("Tap game time or team names to adjust.");
+
+    await act(async () => {
+      clockToggleButton?.click();
+      await Promise.resolve();
+    });
+
+    expect(container.textContent).toContain("Tap game time or team names to adjust.");
+    expect(container.textContent).not.toContain("-1m");
   });
 });

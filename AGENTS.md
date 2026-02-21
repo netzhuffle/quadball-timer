@@ -48,6 +48,7 @@ Provide clear, low-friction defaults so OpenAI Codex can make safe, high-quality
 - Changes in `src/lib/game-engine.ts` must include/update direct rule tests (clock/penalty ticking, timeout behavior, score-triggered expiration, flag-catch behavior).
 - Concurrency/offline-sync bug fixes must include a regression test that asserts the exact undesired behavior does not recur.
 - Changes to controller persistence/recovery (`src/lib/controller-session.ts` and controller sync flow in `src/App.tsx`) must include tests for corrupted payload rejection and safe local recovery behavior.
+- Changes to contextual controller interactions in `src/App.tsx` (for example clock-adjust open/close and helper-text swapping) must include `src/App.test.tsx` coverage for both activation and outside-tap dismissal.
 
 ## Code Style
 - TypeScript first: prefer explicit, narrow types at public boundaries.
@@ -85,6 +86,7 @@ Provide clear, low-friction defaults so OpenAI Codex can make safe, high-quality
 - Avoid `return` inside `finally` blocks (`no-unsafe-finally`); compute restart/cleanup decisions and apply them after `finally`.
 - Avoid unnecessary escapes in template strings (e.g. `\"`) to keep lint clean.
 - In strict TS tests, prefer explicit runtime guards and typed locals over nullable optional chaining on captured values.
+- In `happy-dom` UI tests, avoid relying on `querySelector` for complex attribute selectors; prefer iterating elements and checking attributes directly. For pointer/outside-tap dismissal flows, prefer browser-level coverage (Playwright) when possible, because `happy-dom` event bubbling can be unreliable.
 - `bun run build` is mandatory for frontend/module-path changes; do not rely on lint/tests alone for import-resolution safety.
 - For any live timer/clock display, render from projected state against `now`, not only from last synced snapshot.
 
