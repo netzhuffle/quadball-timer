@@ -190,6 +190,36 @@ describe("ws-protocol", () => {
     expect(parsed.message.commands[0]?.command.type).toBe("undo-timeout-start");
   });
 
+  test("parses set-display-sides-swapped command", () => {
+    const parsed = parseClientWsMessage(
+      JSON.stringify({
+        type: "apply-commands",
+        gameId: "game-123",
+        commands: [
+          {
+            id: "cmd-display-sides",
+            clientSentAtMs: 1,
+            command: {
+              type: "set-display-sides-swapped",
+              swapped: true,
+            },
+          },
+        ],
+      }),
+    );
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok || parsed.message.type !== "apply-commands") {
+      return;
+    }
+
+    expect(parsed.message.commands[0]?.command.type).toBe("set-display-sides-swapped");
+    if (parsed.message.commands[0]?.command.type !== "set-display-sides-swapped") {
+      return;
+    }
+    expect(parsed.message.commands[0].command.swapped).toBe(true);
+  });
+
   test("parses suspend-game command", () => {
     const parsed = parseClientWsMessage(
       JSON.stringify({

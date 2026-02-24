@@ -20,6 +20,25 @@ function getPlayerRemainingMs(state: GameState, key: string) {
 }
 
 describe("game-engine", () => {
+  test("display side swap is stored in game state and can be toggled", () => {
+    let state = createInitialGameState({ id: "game-display-sides", nowMs: 0 });
+    expect(state.displaySidesSwapped).toBe(false);
+
+    state = applyGameCommand({
+      state,
+      command: { type: "set-display-sides-swapped", swapped: true },
+      nowMs: 0,
+    });
+    expect(state.displaySidesSwapped).toBe(true);
+
+    state = applyGameCommand({
+      state,
+      command: { type: "set-display-sides-swapped", swapped: false },
+      nowMs: 1,
+    });
+    expect(state.displaySidesSwapped).toBe(false);
+  });
+
   test("penalties tick only while game is running", () => {
     const makeId = createIdGenerator();
     let state = createInitialGameState({ id: "game-1", nowMs: 0 });

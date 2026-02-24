@@ -37,6 +37,7 @@ export function createInitialGameState({
     updatedAtMs: nowMs,
     homeName,
     awayName,
+    displaySidesSwapped: false,
     gameClockMs: 0,
     isRunning: false,
     isFinished: false,
@@ -88,6 +89,9 @@ export function cloneGameState(state: GameState): GameState {
   }
   if (typeof cloned.isOvertime !== "boolean") {
     cloned.isOvertime = false;
+  }
+  if (typeof cloned.displaySidesSwapped !== "boolean") {
+    cloned.displaySidesSwapped = false;
   }
   if (cloned.winner !== "home" && cloned.winner !== "away" && cloned.winner !== null) {
     cloned.winner = null;
@@ -180,6 +184,11 @@ export function applyGameCommand({
   const next = advanceGameState(state, nowMs);
 
   switch (command.type) {
+    case "set-display-sides-swapped": {
+      next.displaySidesSwapped = command.swapped;
+      return next;
+    }
+
     case "set-running": {
       if (next.isFinished) {
         return next;

@@ -94,6 +94,9 @@ Provide clear, low-friction defaults so OpenAI Codex can make safe, high-quality
 - Use a concise imperative subject in sentence case (capitalize the first word, e.g. `Implement websocket command replay`).
 - Do not use prefix tags like `feat:` or `fix:` unless explicitly requested.
 - Keep the title behavior-focused (what changed for users/system), not file-focused.
+- Before writing the commit message, check the staged diff (`git diff --cached --stat` and/or `git diff --cached`) and make sure the subject/body cover the full staged change scope, not only the most recent tweak discussed.
+- In the subject, lead with the primary user-visible behavior change; avoid leading with qualities that are expected defaults in this app (for example `synced`) unless sync behavior itself is the main change.
+- Do not describe the committed change relative to an uncommitted attempt (for example `instead of ...`); describe only what is actually in the staged diff/history.
 - Optional body is recommended for larger changes: explain major areas touched and key rules/constraints added.
 - Keep tone factual and avoid filler language.
 

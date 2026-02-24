@@ -223,6 +223,23 @@ function parseGameCommand(payload: Record<string, unknown>):
     };
   }
 
+  if (payload.type === "set-display-sides-swapped") {
+    if (typeof payload.swapped !== "boolean") {
+      return {
+        ok: false,
+        error: "set-display-sides-swapped requires swapped boolean.",
+      };
+    }
+
+    return {
+      ok: true,
+      command: {
+        type: "set-display-sides-swapped",
+        swapped: payload.swapped,
+      },
+    };
+  }
+
   if (payload.type === "change-score") {
     if (
       !isTeam(payload.team) ||

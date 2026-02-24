@@ -83,6 +83,7 @@ export type GameState = {
   updatedAtMs: number;
   homeName: string;
   awayName: string;
+  displaySidesSwapped: boolean;
   gameClockMs: number;
   isRunning: boolean;
   isFinished: boolean;
@@ -125,6 +126,10 @@ export type GameSummary = {
 };
 
 export type GameCommand =
+  | {
+      type: "set-display-sides-swapped";
+      swapped: boolean;
+    }
   | {
       type: "set-running";
       running: boolean;

@@ -12,6 +12,7 @@ import {
   Delete,
   Eye,
   Flag,
+  ArrowLeftRight,
   OctagonX,
   Shield,
   Trophy,
@@ -462,6 +463,17 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
     setRenamingTeam(null);
   }, [awayName, controller, dispatchCommand, homeName]);
 
+  const swapDisplayedTeamSides = useCallback(() => {
+    if (!controller) {
+      return;
+    }
+
+    dispatchCommand({
+      type: "set-display-sides-swapped",
+      swapped: !(liveState?.displaySidesSwapped ?? false),
+    });
+  }, [controller, dispatchCommand, liveState]);
+
   const requestWinConfirmation = useCallback((label: string, command: GameCommand) => {
     setPendingWinConfirmation({ label, command });
   }, []);
@@ -727,49 +739,92 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
       idleClassName: "border-violet-200 bg-violet-50 text-violet-800",
     },
   ];
+  const scoreColumnsByTeam: Record<
+    TeamId,
+    {
+      team: TeamId;
+      name: string;
+      score: number;
+      accentClassName: string;
+      borderClassName: string;
+      scoreBoxClassName: string;
+      scoreValueBorderClassName: string;
+      scoreValueGlowClassName: string;
+      scoreDownButtonClassName: string;
+    }
+  > = {
+    home: {
+      team: "home",
+      name: state.homeName,
+      score: state.score.home,
+      accentClassName: "from-sky-500/80 to-cyan-400/80",
+      borderClassName: "border-cyan-300/50",
+      scoreBoxClassName:
+        "h-8 w-full rounded-2xl border border-sky-300 bg-gradient-to-br from-sky-500 to-cyan-500 text-white shadow-sm",
+      scoreValueBorderClassName: "border-sky-200",
+      scoreValueGlowClassName: "shadow-[inset_0_0_12px_rgba(14,165,233,0.18)]",
+      scoreDownButtonClassName:
+        "h-8 w-full rounded-2xl border-sky-200 bg-white text-sky-700 hover:bg-sky-50",
+    },
+    away: {
+      team: "away",
+      name: state.awayName,
+      score: state.score.away,
+      accentClassName: "from-orange-500/80 to-rose-500/80",
+      borderClassName: "border-amber-300/50",
+      scoreBoxClassName:
+        "h-8 w-full rounded-2xl border border-orange-300 bg-gradient-to-br from-orange-500 to-rose-500 text-white shadow-sm",
+      scoreValueBorderClassName: "border-orange-200",
+      scoreValueGlowClassName: "shadow-[inset_0_0_12px_rgba(249,115,22,0.16)]",
+      scoreDownButtonClassName:
+        "h-8 w-full rounded-2xl border-orange-200 bg-white text-orange-700 hover:bg-orange-50",
+    },
+  };
+  const leftTeam: TeamId = state.displaySidesSwapped ? "away" : "home";
+  const rightTeam: TeamId = state.displaySidesSwapped ? "home" : "away";
+  const displayTeamOrder: [TeamId, TeamId] = [leftTeam, rightTeam];
   const scoreColumns: Array<{
     team: TeamId;
     name: string;
     score: number;
     accentClassName: string;
     borderClassName: string;
-  }> = [
-    {
-      team: "home",
-      name: state.homeName,
-      score: state.score.home,
-      accentClassName: "from-sky-500/80 to-cyan-400/80",
-      borderClassName: "border-cyan-300/50",
-    },
-    {
-      team: "away",
-      name: state.awayName,
-      score: state.score.away,
-      accentClassName: "from-orange-500/80 to-rose-500/80",
-      borderClassName: "border-amber-300/50",
-    },
-  ];
+    scoreBoxClassName: string;
+    scoreValueBorderClassName: string;
+    scoreValueGlowClassName: string;
+    scoreDownButtonClassName: string;
+  }> = displayTeamOrder.map((team) => scoreColumnsByTeam[team]);
   const homeScoreColumn = scoreColumns[0]!;
   const awayScoreColumn = scoreColumns[1]!;
-  const penaltyColumns: Array<{
-    team: TeamId;
-    penalties: PlayerPenaltyView[];
-    visiblePenalties: PlayerPenaltyView[];
-    recentReleases: ReleasedPenaltyView[];
-  }> = [
+  const penaltyColumnsByTeam: Record<
+    TeamId,
     {
+      team: TeamId;
+      penalties: PlayerPenaltyView[];
+      visiblePenalties: PlayerPenaltyView[];
+      recentReleases: ReleasedPenaltyView[];
+    }
+  > = {
+    home: {
       team: "home",
       penalties: homePenalties,
       visiblePenalties: visibleHomePenalties,
       recentReleases: homeRecentReleases,
     },
-    {
+    away: {
       team: "away",
       penalties: awayPenalties,
       visiblePenalties: visibleAwayPenalties,
       recentReleases: awayRecentReleases,
     },
-  ];
+  };
+  const penaltyColumns: Array<{
+    team: TeamId;
+    penalties: PlayerPenaltyView[];
+    visiblePenalties: PlayerPenaltyView[];
+    recentReleases: ReleasedPenaltyView[];
+  }> = displayTeamOrder.map((team) => penaltyColumnsByTeam[team]);
+  const displayTeamName = (team: TeamId) => (team === "home" ? state.homeName : state.awayName);
 
   return (
     <div className="h-[100dvh] overflow-hidden bg-slate-100 p-2 text-slate-900">
@@ -830,29 +885,37 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
         <section className="relative overflow-visible rounded-[1.75rem] border border-slate-300 bg-[radial-gradient(circle_at_50%_28%,#dbeafe_0%,#eff6ff_38%,#ffffff_76%)] px-2 py-2 shadow-[0_10px_24px_rgba(15,23,42,0.12)]">
           <div className="grid grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-start gap-1">
             <div className="flex min-w-0 flex-col items-center gap-1">
-              {controller && renamingTeam === "home" ? (
+              {controller && renamingTeam === homeScoreColumn.team ? (
                 <div className="grid w-full gap-1">
                   <Input
-                    value={homeName}
-                    onChange={(event) => setHomeName(event.target.value)}
+                    value={homeScoreColumn.team === "home" ? homeName : awayName}
+                    onChange={(event) => {
+                      if (homeScoreColumn.team === "home") {
+                        setHomeName(event.target.value);
+                      } else {
+                        setAwayName(event.target.value);
+                      }
+                    }}
                     className="h-7 border-slate-300 bg-white text-[10px] text-slate-900"
                     maxLength={40}
                   />
-                  <div className="grid grid-cols-2 gap-1">
-                    <Button size="sm" className="h-6 text-[10px]" onClick={saveTeamRename}>
+                  <div className="grid grid-cols-[minmax(0,1fr)_2rem] gap-1">
+                    <Button
+                      size="sm"
+                      className="h-6 min-w-0 px-1 text-[10px]"
+                      onClick={saveTeamRename}
+                    >
                       Save
                     </Button>
                     <Button
                       size="sm"
                       variant="outline"
-                      className="h-6 border-slate-300 bg-white text-[10px] text-slate-800"
-                      onClick={() => {
-                        setHomeName(state.homeName);
-                        setAwayName(state.awayName);
-                        setRenamingTeam(null);
-                      }}
+                      className="h-6 w-8 min-w-0 border-slate-300 bg-white px-0 text-slate-800"
+                      onClick={swapDisplayedTeamSides}
+                      aria-label="Swap team sides"
+                      title="Swap team sides"
                     >
-                      Cancel
+                      <ArrowLeftRight className="h-3.5 w-3.5" />
                     </Button>
                   </div>
                 </div>
@@ -876,7 +939,7 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
 
               <Button
                 size="sm"
-                className="h-8 w-full rounded-2xl border border-sky-300 bg-gradient-to-br from-sky-500 to-cyan-500 text-white shadow-sm"
+                className={homeScoreColumn.scoreBoxClassName}
                 onClick={() =>
                   dispatchCommand({
                     type: "change-score",
@@ -889,12 +952,14 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
               >
                 <ChevronUp className="h-4 w-4" />
               </Button>
-              <div className="w-full rounded-2xl border border-sky-200 bg-white px-2 py-2 text-center shadow-[inset_0_0_12px_rgba(14,165,233,0.18)]">
+              <div
+                className={`w-full rounded-2xl border bg-white px-2 py-2 text-center ${homeScoreColumn.scoreValueBorderClassName} ${homeScoreColumn.scoreValueGlowClassName}`}
+              >
                 <p
                   className={`text-[clamp(1.75rem,9.4vw,2.45rem)] leading-none font-semibold tabular-nums transition-all duration-300 ${
-                    scorePulse.home === 1
+                    scorePulse[homeScoreColumn.team] === 1
                       ? "score-pop-up text-emerald-700"
-                      : scorePulse.home === -1
+                      : scorePulse[homeScoreColumn.team] === -1
                         ? "score-pop-down text-rose-700"
                         : "text-slate-900"
                   }`}
@@ -905,7 +970,7 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
               <Button
                 size="sm"
                 variant="outline"
-                className="h-8 w-full rounded-2xl border-sky-200 bg-white text-sky-700 hover:bg-sky-50"
+                className={homeScoreColumn.scoreDownButtonClassName}
                 onClick={() =>
                   dispatchCommand({ type: "undo-last-score", team: homeScoreColumn.team })
                 }
@@ -1009,29 +1074,37 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
             </div>
 
             <div className="flex min-w-0 flex-col items-center gap-1">
-              {controller && renamingTeam === "away" ? (
+              {controller && renamingTeam === awayScoreColumn.team ? (
                 <div className="grid w-full gap-1">
                   <Input
-                    value={awayName}
-                    onChange={(event) => setAwayName(event.target.value)}
+                    value={awayScoreColumn.team === "home" ? homeName : awayName}
+                    onChange={(event) => {
+                      if (awayScoreColumn.team === "home") {
+                        setHomeName(event.target.value);
+                      } else {
+                        setAwayName(event.target.value);
+                      }
+                    }}
                     className="h-7 border-slate-300 bg-white text-[10px] text-slate-900"
                     maxLength={40}
                   />
-                  <div className="grid grid-cols-2 gap-1">
-                    <Button size="sm" className="h-6 text-[10px]" onClick={saveTeamRename}>
+                  <div className="grid grid-cols-[minmax(0,1fr)_2rem] gap-1">
+                    <Button
+                      size="sm"
+                      className="h-6 min-w-0 px-1 text-[10px]"
+                      onClick={saveTeamRename}
+                    >
                       Save
                     </Button>
                     <Button
                       size="sm"
                       variant="outline"
-                      className="h-6 border-slate-300 bg-white text-[10px] text-slate-800"
-                      onClick={() => {
-                        setHomeName(state.homeName);
-                        setAwayName(state.awayName);
-                        setRenamingTeam(null);
-                      }}
+                      className="h-6 w-8 min-w-0 border-slate-300 bg-white px-0 text-slate-800"
+                      onClick={swapDisplayedTeamSides}
+                      aria-label="Swap team sides"
+                      title="Swap team sides"
                     >
-                      Cancel
+                      <ArrowLeftRight className="h-3.5 w-3.5" />
                     </Button>
                   </div>
                 </div>
@@ -1055,7 +1128,7 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
 
               <Button
                 size="sm"
-                className="h-8 w-full rounded-2xl border border-orange-300 bg-gradient-to-br from-orange-500 to-rose-500 text-white shadow-sm"
+                className={awayScoreColumn.scoreBoxClassName}
                 onClick={() =>
                   dispatchCommand({
                     type: "change-score",
@@ -1068,12 +1141,14 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
               >
                 <ChevronUp className="h-4 w-4" />
               </Button>
-              <div className="w-full rounded-2xl border border-orange-200 bg-white px-2 py-2 text-center shadow-[inset_0_0_12px_rgba(249,115,22,0.16)]">
+              <div
+                className={`w-full rounded-2xl border bg-white px-2 py-2 text-center ${awayScoreColumn.scoreValueBorderClassName} ${awayScoreColumn.scoreValueGlowClassName}`}
+              >
                 <p
                   className={`text-[clamp(1.75rem,9.4vw,2.45rem)] leading-none font-semibold tabular-nums transition-all duration-300 ${
-                    scorePulse.away === 1
+                    scorePulse[awayScoreColumn.team] === 1
                       ? "score-pop-up text-emerald-700"
-                      : scorePulse.away === -1
+                      : scorePulse[awayScoreColumn.team] === -1
                         ? "score-pop-down text-rose-700"
                         : "text-slate-900"
                   }`}
@@ -1084,7 +1159,7 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
               <Button
                 size="sm"
                 variant="outline"
-                className="h-8 w-full rounded-2xl border-orange-200 bg-white text-orange-700 hover:bg-orange-50"
+                className={awayScoreColumn.scoreDownButtonClassName}
                 onClick={() =>
                   dispatchCommand({ type: "undo-last-score", team: awayScoreColumn.team })
                 }
@@ -1185,7 +1260,7 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
             >
               <CardContent className="flex h-full min-h-0 flex-col gap-1 overflow-hidden px-2">
                 <p className="truncate text-[10px] font-semibold tracking-[0.14em] text-slate-700 uppercase">
-                  {column.team === "home" ? state.homeName : state.awayName} penalties
+                  {displayTeamName(column.team)} penalties
                 </p>
                 <div className="grid min-h-0 gap-1 overflow-hidden">
                   {column.visiblePenalties.length === 0 ? (
@@ -1295,34 +1370,23 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
                 })}
               </div>
               <div className="grid grid-cols-2 gap-1">
-                <Button
-                  size="sm"
-                  variant={cardDraft.team === "home" ? "default" : "outline"}
-                  className="h-7 rounded-xl text-[10px]"
-                  onClick={() =>
-                    setCardDraft((previous) => ({
-                      ...previous,
-                      team: "home",
-                    }))
-                  }
-                  disabled={!canSelectCardTeam}
-                >
-                  {state.homeName}
-                </Button>
-                <Button
-                  size="sm"
-                  variant={cardDraft.team === "away" ? "default" : "outline"}
-                  className="h-7 rounded-xl text-[10px]"
-                  onClick={() =>
-                    setCardDraft((previous) => ({
-                      ...previous,
-                      team: "away",
-                    }))
-                  }
-                  disabled={!canSelectCardTeam}
-                >
-                  {state.awayName}
-                </Button>
+                {displayTeamOrder.map((team) => (
+                  <Button
+                    key={team}
+                    size="sm"
+                    variant={cardDraft.team === team ? "default" : "outline"}
+                    className="h-7 rounded-xl text-[10px]"
+                    onClick={() =>
+                      setCardDraft((previous) => ({
+                        ...previous,
+                        team,
+                      }))
+                    }
+                    disabled={!canSelectCardTeam}
+                  >
+                    {displayTeamName(team)}
+                  </Button>
+                ))}
               </div>
               <div className="grid grid-cols-[auto_1fr_auto] items-center gap-2 rounded-xl border border-slate-300 bg-white px-2 py-1 text-[10px] font-medium">
                 {cardDraft.cardType === null ? (
@@ -1413,36 +1477,24 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
             >
               {activeTimeout === null ? (
                 <div className="grid gap-1">
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    className="h-9 rounded-xl border-slate-300 bg-white text-slate-900"
-                    onClick={() => dispatchCommand({ type: "start-timeout", team: "home" })}
-                    disabled={
-                      !controller ||
-                      state.isRunning ||
-                      state.isSuspended ||
-                      state.timeouts.home.used ||
-                      state.isFinished
-                    }
-                  >
-                    {state.homeName} timeout
-                  </Button>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    className="h-9 rounded-xl border-slate-300 bg-white text-slate-900"
-                    onClick={() => dispatchCommand({ type: "start-timeout", team: "away" })}
-                    disabled={
-                      !controller ||
-                      state.isRunning ||
-                      state.isSuspended ||
-                      state.timeouts.away.used ||
-                      state.isFinished
-                    }
-                  >
-                    {state.awayName} timeout
-                  </Button>
+                  {displayTeamOrder.map((team) => (
+                    <Button
+                      key={team}
+                      variant="outline"
+                      size="sm"
+                      className="h-9 rounded-xl border-slate-300 bg-white text-slate-900"
+                      onClick={() => dispatchCommand({ type: "start-timeout", team })}
+                      disabled={
+                        !controller ||
+                        state.isRunning ||
+                        state.isSuspended ||
+                        state.timeouts[team].used ||
+                        state.isFinished
+                      }
+                    >
+                      {displayTeamName(team)} timeout
+                    </Button>
+                  ))}
                 </div>
               ) : (
                 <>
@@ -1567,34 +1619,29 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
                     Suspend game
                   </Button>
                   <div className="grid grid-cols-2 gap-1">
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      className="h-8 rounded-xl border-slate-300 bg-white text-slate-900"
-                      onClick={() =>
-                        requestWinConfirmation(`${state.awayName} wins by forfeit penalty.`, {
-                          type: "record-forfeit",
-                          team: "home",
-                        })
-                      }
-                      disabled={!canUseEndingActions}
-                    >
-                      {state.homeName} forfeit
-                    </Button>
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      className="h-8 rounded-xl border-slate-300 bg-white text-slate-900"
-                      onClick={() =>
-                        requestWinConfirmation(`${state.homeName} wins by forfeit penalty.`, {
-                          type: "record-forfeit",
-                          team: "away",
-                        })
-                      }
-                      disabled={!canUseEndingActions}
-                    >
-                      {state.awayName} forfeit
-                    </Button>
+                    {displayTeamOrder.map((team) => {
+                      const winner = team === "home" ? "away" : "home";
+                      return (
+                        <Button
+                          key={`forfeit-${team}`}
+                          size="sm"
+                          variant="outline"
+                          className="h-8 rounded-xl border-slate-300 bg-white text-slate-900"
+                          onClick={() =>
+                            requestWinConfirmation(
+                              `${displayTeamName(winner)} wins by forfeit penalty.`,
+                              {
+                                type: "record-forfeit",
+                                team,
+                              },
+                            )
+                          }
+                          disabled={!canUseEndingActions}
+                        >
+                          {displayTeamName(team)} forfeit
+                        </Button>
+                      );
+                    })}
                   </div>
                   <Button
                     size="sm"
@@ -1609,114 +1656,78 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
                   {state.isOvertime ? (
                     <>
                       <div className="grid grid-cols-2 gap-1">
-                        <Button
-                          size="sm"
-                          className="h-8 rounded-xl"
-                          onClick={() =>
-                            requestWinConfirmation(
-                              `${state.homeName} reached target score and wins.`,
-                              {
-                                type: "record-target-score",
-                                team: "home",
-                              },
-                            )
-                          }
-                          disabled={!canUseEndingActions}
-                        >
-                          {state.homeName} reached target
-                        </Button>
-                        <Button
-                          size="sm"
-                          className="h-8 rounded-xl"
-                          onClick={() =>
-                            requestWinConfirmation(
-                              `${state.awayName} reached target score and wins.`,
-                              {
-                                type: "record-target-score",
-                                team: "away",
-                              },
-                            )
-                          }
-                          disabled={!canUseEndingActions}
-                        >
-                          {state.awayName} reached target
-                        </Button>
+                        {displayTeamOrder.map((team) => (
+                          <Button
+                            key={`target-${team}`}
+                            size="sm"
+                            className="h-8 rounded-xl"
+                            onClick={() =>
+                              requestWinConfirmation(
+                                `${displayTeamName(team)} reached target score and wins.`,
+                                {
+                                  type: "record-target-score",
+                                  team,
+                                },
+                              )
+                            }
+                            disabled={!canUseEndingActions}
+                          >
+                            {displayTeamName(team)} reached target
+                          </Button>
+                        ))}
                       </div>
                       <div className="grid grid-cols-2 gap-1">
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          className="h-8 rounded-xl border-slate-300 bg-white text-slate-900"
-                          onClick={() =>
-                            requestWinConfirmation(
-                              `${state.homeName} conceded. ${state.awayName} wins.`,
-                              {
-                                type: "record-concede",
-                                team: "home",
-                              },
-                            )
-                          }
-                          disabled={!canUseEndingActions}
-                        >
-                          {state.homeName} concedes
-                        </Button>
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          className="h-8 rounded-xl border-slate-300 bg-white text-slate-900"
-                          onClick={() =>
-                            requestWinConfirmation(
-                              `${state.awayName} conceded. ${state.homeName} wins.`,
-                              {
-                                type: "record-concede",
-                                team: "away",
-                              },
-                            )
-                          }
-                          disabled={!canUseEndingActions}
-                        >
-                          {state.awayName} concedes
-                        </Button>
+                        {displayTeamOrder.map((team) => {
+                          const winner = team === "home" ? "away" : "home";
+                          return (
+                            <Button
+                              key={`concede-${team}`}
+                              size="sm"
+                              variant="outline"
+                              className="h-8 rounded-xl border-slate-300 bg-white text-slate-900"
+                              onClick={() =>
+                                requestWinConfirmation(
+                                  `${displayTeamName(team)} conceded. ${displayTeamName(winner)} wins.`,
+                                  {
+                                    type: "record-concede",
+                                    team,
+                                  },
+                                )
+                              }
+                              disabled={!canUseEndingActions}
+                            >
+                              {displayTeamName(team)} concedes
+                            </Button>
+                          );
+                        })}
                       </div>
                     </>
                   ) : canRecordFlagCatch ? (
                     <div className="grid grid-cols-2 gap-1">
-                      <Button
-                        size="sm"
-                        className="h-8 rounded-xl"
-                        onClick={() => {
-                          if (willFlagCatchWin(state, "home")) {
-                            requestWinConfirmation(`${state.homeName} wins on flag catch.`, {
-                              type: "record-flag-catch",
-                              team: "home",
-                            });
-                            return;
-                          }
+                      {displayTeamOrder.map((team) => (
+                        <Button
+                          key={`flag-catch-${team}`}
+                          size="sm"
+                          className="h-8 rounded-xl"
+                          onClick={() => {
+                            if (willFlagCatchWin(state, team)) {
+                              requestWinConfirmation(
+                                `${displayTeamName(team)} wins on flag catch.`,
+                                {
+                                  type: "record-flag-catch",
+                                  team,
+                                },
+                              );
+                              return;
+                            }
 
-                          dispatchCommand({ type: "record-flag-catch", team: "home" });
-                        }}
-                        disabled={!canUseEndingActions}
-                      >
-                        {state.homeName} flag +30
-                      </Button>
-                      <Button
-                        size="sm"
-                        className="h-8 rounded-xl"
-                        onClick={() => {
-                          if (willFlagCatchWin(state, "away")) {
-                            requestWinConfirmation(`${state.awayName} wins on flag catch.`, {
-                              type: "record-flag-catch",
-                              team: "away",
-                            });
-                            return;
-                          }
-
-                          dispatchCommand({ type: "record-flag-catch", team: "away" });
-                        }}
-                        disabled={!canUseEndingActions}
-                      >
-                        {state.awayName} flag +30
-                      </Button>
+                            dispatchCommand({ type: "record-flag-catch", team });
+                          }}
+                          disabled={!canUseEndingActions}
+                        >
+                          {displayTeamName(team)} flag +30
+                        </Button>
+                      ))}
                     </div>
                   ) : (
                     <p className="text-[11px] text-slate-600">

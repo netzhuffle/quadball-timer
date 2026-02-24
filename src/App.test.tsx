@@ -185,4 +185,51 @@ describe("App", () => {
     expect(container.textContent).toContain("Tap game time or team names to adjust.");
     expect(container.textContent).not.toContain("-1m");
   });
+
+  test("team rename editor can swap displayed team sides without renaming teams", async () => {
+    await act(async () => {
+      root.render(<App />);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const getTopTeamNameButtons = () =>
+      Array.from(container.getElementsByTagName("button")).filter((button) =>
+        button.className.includes("font-extrabold"),
+      );
+
+    const beforeButtons = getTopTeamNameButtons();
+    expect(beforeButtons[0]?.textContent?.trim()).toBe("Home");
+    expect(beforeButtons[1]?.textContent?.trim()).toBe("Away");
+
+    await act(async () => {
+      beforeButtons[0]?.click();
+      await Promise.resolve();
+    });
+
+    const swapButton = Array.from(container.getElementsByTagName("button")).find(
+      (button) => button.textContent?.trim() === "Swap sides",
+    );
+    expect(swapButton).not.toBeNull();
+
+    await act(async () => {
+      swapButton?.click();
+      await Promise.resolve();
+    });
+
+    const saveButton = Array.from(container.getElementsByTagName("button")).find(
+      (button) => button.textContent?.trim() === "Save",
+    );
+    expect(saveButton).not.toBeNull();
+
+    await act(async () => {
+      saveButton?.click();
+      await Promise.resolve();
+    });
+
+    const afterButtons = getTopTeamNameButtons();
+    expect(afterButtons[0]?.textContent?.trim()).toBe("Away");
+    expect(afterButtons[1]?.textContent?.trim()).toBe("Home");
+    expect(container.textContent).toContain("Home vs Away");
+  });
 });
