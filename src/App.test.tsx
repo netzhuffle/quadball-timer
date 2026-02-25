@@ -3,7 +3,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { Window } from "happy-dom";
 import { App } from "./App";
-import { createInitialGameState } from "@/lib/game-engine";
+import { createInitialGameState, projectGameView } from "@/lib/game-engine";
 
 class MockWebSocket {
   static CONNECTING = 0;
@@ -208,7 +208,7 @@ describe("App", () => {
     });
 
     const swapButton = Array.from(container.getElementsByTagName("button")).find(
-      (button) => button.textContent?.trim() === "Swap sides",
+      (button) => button.getAttribute("aria-label") === "Swap team sides",
     );
     expect(swapButton).not.toBeNull();
 
@@ -231,5 +231,171 @@ describe("App", () => {
     expect(afterButtons[0]?.textContent?.trim()).toBe("Away");
     expect(afterButtons[1]?.textContent?.trim()).toBe("Home");
     expect(container.textContent).toContain("Home vs Away");
+  });
+
+  test("side switch closes team editor when no unsaved rename draft exists", async () => {
+    await act(async () => {
+      root.render(<App />);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const getTopTeamNameButtons = () =>
+      Array.from(container.getElementsByTagName("button")).filter((button) =>
+        button.className.includes("font-extrabold"),
+      );
+    const getSwapSidesButton = () =>
+      Array.from(container.getElementsByTagName("button")).find(
+        (button) => button.getAttribute("aria-label") === "Swap team sides",
+      );
+    const hasSaveButton = () =>
+      Array.from(container.getElementsByTagName("button")).some(
+        (button) => button.textContent?.trim() === "Save",
+      );
+    let topButtons = getTopTeamNameButtons();
+    await act(async () => {
+      topButtons[0]?.click();
+      await Promise.resolve();
+    });
+    expect(hasSaveButton()).toBe(true);
+
+    const swapWithoutDraft = getSwapSidesButton();
+    expect(swapWithoutDraft).not.toBeNull();
+    await act(async () => {
+      swapWithoutDraft?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(hasSaveButton()).toBe(false);
+    topButtons = getTopTeamNameButtons();
+    expect(topButtons).toHaveLength(2);
+  });
+
+  test("team name display height remeasures when team names become longer and shorter", async () => {
+    // eslint-disable-next-line typescript-eslint/unbound-method
+    const originalPrototypeGetBoundingClientRect = testWindow.HTMLElement.prototype
+      .getBoundingClientRect as unknown as (this: unknown) => unknown;
+    const originalGetBoundingClientRect = (
+      element: unknown,
+    ): ReturnType<HTMLElement["getBoundingClientRect"]> =>
+      originalPrototypeGetBoundingClientRect.call(element) as ReturnType<
+        HTMLElement["getBoundingClientRect"]
+      >;
+
+    const createMockRect = (height: number): ReturnType<HTMLElement["getBoundingClientRect"]> =>
+      ({
+        x: 0,
+        y: 0,
+        top: 0,
+        left: 0,
+        bottom: height,
+        right: 100,
+        width: 100,
+        height,
+        toJSON() {
+          return {};
+        },
+      }) as unknown as ReturnType<HTMLElement["getBoundingClientRect"]>;
+
+    testWindow.HTMLElement.prototype.getBoundingClientRect = function (this: unknown) {
+      const element = this as unknown;
+      if (
+        element instanceof testWindow.HTMLButtonElement &&
+        element.className.includes("font-extrabold")
+      ) {
+        const inlineHeight = element.style.height;
+        if (inlineHeight.length > 0 && inlineHeight !== "auto") {
+          const parsed = Number.parseFloat(inlineHeight);
+          return createMockRect(parsed);
+        }
+
+        const text = element.textContent?.trim() ?? "";
+        const intrinsicHeight = text.length > 18 ? 68 : 28;
+        return createMockRect(intrinsicHeight);
+      }
+
+      return originalGetBoundingClientRect(element);
+    } as unknown as typeof testWindow.HTMLElement.prototype.getBoundingClientRect;
+
+    try {
+      await act(async () => {
+        root.render(<App />);
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      const getTopTeamNameButtons = () =>
+        Array.from(container.getElementsByTagName("button")).filter((button) =>
+          button.className.includes("font-extrabold"),
+        );
+
+      const flushRaf = async () => {
+        await act(async () => {
+          await new Promise((resolve) => testWindow.setTimeout(resolve, 0));
+        });
+      };
+      const pushSnapshot = async (names: { homeName: string; awayName: string }) => {
+        const ws = MockWebSocket.instances[0];
+        expect(ws).toBeDefined();
+        if (ws === undefined) {
+          return;
+        }
+
+        const state = createInitialGameState({
+          id: "test-game",
+          nowMs: Date.now(),
+          homeName: names.homeName,
+          awayName: names.awayName,
+        });
+        const game = projectGameView(state, state.updatedAtMs);
+
+        await act(async () => {
+          ws.onmessage?.(
+            new MessageEvent("message", {
+              data: JSON.stringify({
+                type: "game-snapshot",
+                game,
+                serverNowMs: state.updatedAtMs,
+                ackedCommandIds: [],
+              }),
+            }),
+          );
+          await Promise.resolve();
+          await Promise.resolve();
+        });
+      };
+
+      await flushRaf();
+
+      let topButtons = getTopTeamNameButtons();
+      expect(topButtons[0]?.style.height).toBe("28px");
+      expect(topButtons[1]?.style.height).toBe("28px");
+
+      await pushSnapshot({
+        homeName: "Very Long Team Name Here",
+        awayName: "Away",
+      });
+
+      await flushRaf();
+
+      topButtons = getTopTeamNameButtons();
+      expect(topButtons[0]?.style.height).toBe("68px");
+      expect(topButtons[1]?.style.height).toBe("68px");
+
+      await pushSnapshot({
+        homeName: "A",
+        awayName: "Away",
+      });
+
+      await flushRaf();
+
+      topButtons = getTopTeamNameButtons();
+      expect(topButtons[0]?.style.height).toBe("28px");
+      expect(topButtons[1]?.style.height).toBe("28px");
+    } finally {
+      testWindow.HTMLElement.prototype.getBoundingClientRect =
+        originalPrototypeGetBoundingClientRect as unknown as typeof testWindow.HTMLElement.prototype.getBoundingClientRect;
+    }
   });
 });

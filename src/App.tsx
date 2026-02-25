@@ -326,6 +326,16 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
     home: null,
     away: null,
   });
+  const activeTeamRenameInputRef = useRef<HTMLInputElement | null>(null);
+  const refocusRenameInputAfterSideSwapRef = useRef(false);
+  const renameInputSelectionAfterSideSwapRef = useRef<{
+    start: number | null;
+    end: number | null;
+    direction: "forward" | "backward" | "none" | null;
+  } | null>(null);
+  const leftTeamNameButtonRef = useRef<HTMLButtonElement | null>(null);
+  const rightTeamNameButtonRef = useRef<HTMLButtonElement | null>(null);
+  const [displayTeamNameHeightPx, setDisplayTeamNameHeightPx] = useState<number | null>(null);
 
   const nowMs = useNow(250);
 
@@ -463,16 +473,48 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
     setRenamingTeam(null);
   }, [awayName, controller, dispatchCommand, homeName]);
 
+  const handleTeamRenameInputKeyDown = useCallback(
+    (event: React.KeyboardEvent<HTMLInputElement>) => {
+      if (event.key !== "Enter") {
+        return;
+      }
+
+      event.preventDefault();
+      saveTeamRename();
+    },
+    [saveTeamRename],
+  );
+
   const swapDisplayedTeamSides = useCallback(() => {
-    if (!controller) {
+    if (!controller || liveState === null) {
       return;
+    }
+
+    const hasUnsavedRenameDraft =
+      renamingTeam !== null && (homeName !== liveState.homeName || awayName !== liveState.awayName);
+    refocusRenameInputAfterSideSwapRef.current = hasUnsavedRenameDraft;
+    if (hasUnsavedRenameDraft) {
+      const input = activeTeamRenameInputRef.current;
+      renameInputSelectionAfterSideSwapRef.current =
+        input === null
+          ? null
+          : {
+              start: input.selectionStart,
+              end: input.selectionEnd,
+              direction: input.selectionDirection,
+            };
+    } else {
+      renameInputSelectionAfterSideSwapRef.current = null;
+    }
+    if (!hasUnsavedRenameDraft) {
+      setRenamingTeam(null);
     }
 
     dispatchCommand({
       type: "set-display-sides-swapped",
-      swapped: !(liveState?.displaySidesSwapped ?? false),
+      swapped: !liveState.displaySidesSwapped,
     });
-  }, [controller, dispatchCommand, liveState]);
+  }, [awayName, controller, dispatchCommand, homeName, liveState, renamingTeam]);
 
   const requestWinConfirmation = useCallback((label: string, command: GameCommand) => {
     setPendingWinConfirmation({ label, command });
@@ -579,6 +621,82 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
     window.addEventListener("pointerdown", onPointerDown);
     return () => window.removeEventListener("pointerdown", onPointerDown);
   }, [clockAdjustOpen]);
+
+  useEffect(() => {
+    if (!refocusRenameInputAfterSideSwapRef.current) {
+      return;
+    }
+
+    if (renamingTeam === null) {
+      refocusRenameInputAfterSideSwapRef.current = false;
+      return;
+    }
+
+    const input = activeTeamRenameInputRef.current;
+    if (input === null) {
+      return;
+    }
+
+    input.focus();
+    if (typeof input.setSelectionRange === "function") {
+      const savedSelection = renameInputSelectionAfterSideSwapRef.current;
+      if (savedSelection !== null && savedSelection.start !== null && savedSelection.end !== null) {
+        const maxPosition = input.value.length;
+        const start = Math.min(savedSelection.start, maxPosition);
+        const end = Math.min(savedSelection.end, maxPosition);
+        input.setSelectionRange(start, end, savedSelection.direction ?? "none");
+      } else {
+        const cursorPosition = input.value.length;
+        input.setSelectionRange(cursorPosition, cursorPosition);
+      }
+    }
+    renameInputSelectionAfterSideSwapRef.current = null;
+    refocusRenameInputAfterSideSwapRef.current = false;
+  }, [liveState?.displaySidesSwapped, renamingTeam]);
+
+  useEffect(() => {
+    if (liveState === null) {
+      return;
+    }
+
+    let frameId: number | null = null;
+
+    const measure = () => {
+      const left = leftTeamNameButtonRef.current;
+      const right = rightTeamNameButtonRef.current;
+      if (left === null || right === null) {
+        return;
+      }
+
+      // Measure intrinsic clamped text height, not the previously synchronized inline height.
+      const previousLeftHeight = left.style.height;
+      const previousRightHeight = right.style.height;
+      left.style.height = "auto";
+      right.style.height = "auto";
+      const nextHeight = Math.ceil(
+        Math.max(left.getBoundingClientRect().height, right.getBoundingClientRect().height),
+      );
+      left.style.height = previousLeftHeight;
+      right.style.height = previousRightHeight;
+      setDisplayTeamNameHeightPx((previous) => (previous === nextHeight ? previous : nextHeight));
+    };
+
+    const scheduleMeasure = () => {
+      if (frameId !== null) {
+        window.cancelAnimationFrame(frameId);
+      }
+      frameId = window.requestAnimationFrame(measure);
+    };
+
+    scheduleMeasure();
+    window.addEventListener("resize", scheduleMeasure);
+    return () => {
+      if (frameId !== null) {
+        window.cancelAnimationFrame(frameId);
+      }
+      window.removeEventListener("resize", scheduleMeasure);
+    };
+  }, [liveState?.awayName, liveState?.displaySidesSwapped, liveState?.homeName, renamingTeam]);
 
   const appendCardDigit = useCallback((digit: string) => {
     setCardDraft((previous) => {
@@ -888,6 +1006,7 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
               {controller && renamingTeam === homeScoreColumn.team ? (
                 <div className="grid w-full gap-1">
                   <Input
+                    ref={activeTeamRenameInputRef}
                     value={homeScoreColumn.team === "home" ? homeName : awayName}
                     onChange={(event) => {
                       if (homeScoreColumn.team === "home") {
@@ -896,6 +1015,7 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
                         setAwayName(event.target.value);
                       }
                     }}
+                    onKeyDown={handleTeamRenameInputKeyDown}
                     className="h-7 border-slate-300 bg-white text-[10px] text-slate-900"
                     maxLength={40}
                   />
@@ -922,7 +1042,13 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
               ) : (
                 <button
                   type="button"
-                  className="w-[calc(100%+0.75rem)] min-h-[2.6rem] max-w-none whitespace-normal px-1 py-0.5 text-center text-[clamp(1.05rem,3.8vw,1.35rem)] leading-[1.03] font-extrabold tracking-tight text-slate-900 [overflow-wrap:normal] [word-break:keep-all] transition-opacity hover:opacity-70"
+                  ref={leftTeamNameButtonRef}
+                  style={
+                    displayTeamNameHeightPx === null
+                      ? undefined
+                      : { height: `${displayTeamNameHeightPx}px` }
+                  }
+                  className="w-[calc(100%+0.75rem)] min-h-[2.6rem] max-w-none overflow-hidden whitespace-normal px-1 pt-0.5 pb-0 text-center text-[clamp(1.05rem,3.8vw,1.35rem)] leading-[1.03] font-extrabold tracking-tight text-slate-900 [display:-webkit-box] [overflow-wrap:normal] [word-break:keep-all] [-webkit-box-orient:vertical] [-webkit-line-clamp:3] transition-opacity hover:opacity-70"
                   onClick={() => {
                     if (!controller) {
                       return;
@@ -1077,6 +1203,7 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
               {controller && renamingTeam === awayScoreColumn.team ? (
                 <div className="grid w-full gap-1">
                   <Input
+                    ref={activeTeamRenameInputRef}
                     value={awayScoreColumn.team === "home" ? homeName : awayName}
                     onChange={(event) => {
                       if (awayScoreColumn.team === "home") {
@@ -1085,6 +1212,7 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
                         setAwayName(event.target.value);
                       }
                     }}
+                    onKeyDown={handleTeamRenameInputKeyDown}
                     className="h-7 border-slate-300 bg-white text-[10px] text-slate-900"
                     maxLength={40}
                   />
@@ -1111,7 +1239,13 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
               ) : (
                 <button
                   type="button"
-                  className="w-[calc(100%+0.75rem)] min-h-[2.6rem] max-w-none whitespace-normal px-1 py-0.5 text-center text-[clamp(1.05rem,3.8vw,1.35rem)] leading-[1.03] font-extrabold tracking-tight text-slate-900 [overflow-wrap:normal] [word-break:keep-all] transition-opacity hover:opacity-70"
+                  ref={rightTeamNameButtonRef}
+                  style={
+                    displayTeamNameHeightPx === null
+                      ? undefined
+                      : { height: `${displayTeamNameHeightPx}px` }
+                  }
+                  className="w-[calc(100%+0.75rem)] min-h-[2.6rem] max-w-none overflow-hidden whitespace-normal px-1 pt-0.5 pb-0 text-center text-[clamp(1.05rem,3.8vw,1.35rem)] leading-[1.03] font-extrabold tracking-tight text-slate-900 [display:-webkit-box] [overflow-wrap:normal] [word-break:keep-all] [-webkit-box-orient:vertical] [-webkit-line-clamp:3] transition-opacity hover:opacity-70"
                   onClick={() => {
                     if (!controller) {
                       return;
