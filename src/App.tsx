@@ -921,6 +921,10 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
       penalties: PlayerPenaltyView[];
       visiblePenalties: PlayerPenaltyView[];
       recentReleases: ReleasedPenaltyView[];
+      panelBorderClassName: string;
+      panelTintClassName: string;
+      headerTextClassName: string;
+      neutralChipClassName: string;
     }
   > = {
     home: {
@@ -928,12 +932,22 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
       penalties: homePenalties,
       visiblePenalties: visibleHomePenalties,
       recentReleases: homeRecentReleases,
+      panelBorderClassName: "border-sky-200",
+      panelTintClassName:
+        "bg-[radial-gradient(circle_at_12%_18%,rgba(14,165,233,0.14),rgba(14,165,233,0.05)_34%,rgba(255,255,255,0)_68%),linear-gradient(180deg,rgba(240,249,255,0.9),rgba(255,255,255,0.95)_32%,rgba(255,255,255,0.98))]",
+      headerTextClassName: "text-sky-800",
+      neutralChipClassName: "border-sky-200 bg-sky-50/80 text-slate-900",
     },
     away: {
       team: "away",
       penalties: awayPenalties,
       visiblePenalties: visibleAwayPenalties,
       recentReleases: awayRecentReleases,
+      panelBorderClassName: "border-orange-200",
+      panelTintClassName:
+        "bg-[radial-gradient(circle_at_88%_18%,rgba(249,115,22,0.16),rgba(249,115,22,0.05)_34%,rgba(255,255,255,0)_68%),linear-gradient(180deg,rgba(255,247,237,0.88),rgba(255,255,255,0.95)_32%,rgba(255,255,255,0.98))]",
+      headerTextClassName: "text-orange-800",
+      neutralChipClassName: "border-orange-200 bg-orange-50/75 text-slate-900",
     },
   };
   const penaltyColumns: Array<{
@@ -941,6 +955,10 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
     penalties: PlayerPenaltyView[];
     visiblePenalties: PlayerPenaltyView[];
     recentReleases: ReleasedPenaltyView[];
+    panelBorderClassName: string;
+    panelTintClassName: string;
+    headerTextClassName: string;
+    neutralChipClassName: string;
   }> = displayTeamOrder.map((team) => penaltyColumnsByTeam[team]);
   const displayTeamName = (team: TeamId) => (team === "home" ? state.homeName : state.awayName);
 
@@ -1390,10 +1408,16 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
           {penaltyColumns.map((column) => (
             <Card
               key={column.team}
-              className="h-full min-h-0 rounded-2xl border-slate-300 bg-white py-1 shadow-[0_8px_20px_rgba(15,23,42,0.1)]"
+              className={`relative h-full min-h-0 overflow-hidden rounded-2xl ${column.panelBorderClassName} bg-white py-1 shadow-[0_8px_20px_rgba(15,23,42,0.1)]`}
             >
-              <CardContent className="flex h-full min-h-0 flex-col gap-1 overflow-hidden px-2">
-                <p className="truncate text-[10px] font-semibold tracking-[0.14em] text-slate-700 uppercase">
+              <div
+                aria-hidden="true"
+                className={`pointer-events-none absolute inset-0 ${column.panelTintClassName}`}
+              />
+              <CardContent className="relative z-10 flex h-full min-h-0 flex-col gap-1 overflow-hidden px-2">
+                <p
+                  className={`truncate text-[10px] font-semibold tracking-[0.14em] uppercase ${column.headerTextClassName}`}
+                >
                   {displayTeamName(column.team)} penalties
                 </p>
                 <div className="grid min-h-0 gap-1 overflow-hidden">
@@ -1412,7 +1436,7 @@ function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
                               ? "animate-pulse border-red-300 bg-red-100 text-red-900"
                               : entry.highlight
                                 ? "border-amber-300 bg-amber-100 text-amber-900"
-                                : "border-slate-300 bg-slate-50 text-slate-900"
+                                : column.neutralChipClassName
                           }`}
                         >
                           <div className="flex items-center justify-between gap-1">
