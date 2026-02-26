@@ -701,7 +701,21 @@ export function GamePage({ gameId, role }: { gameId: string; role: ControllerRol
     panelTintClassName: string;
     headerTextClassName: string;
     neutralChipClassName: string;
-  }> = displayTeamOrder.map((team) => penaltyColumnsByTeam[team]);
+  }> = displayTeamOrder.map((team, index) => {
+    const sideAnchoredTintClassName =
+      team === "home"
+        ? index === 0
+          ? "bg-[radial-gradient(circle_at_12%_18%,rgba(14,165,233,0.14),rgba(14,165,233,0.05)_34%,rgba(255,255,255,0)_68%),linear-gradient(180deg,rgba(240,249,255,0.9),rgba(255,255,255,0.95)_32%,rgba(255,255,255,0.98))]"
+          : "bg-[radial-gradient(circle_at_88%_18%,rgba(14,165,233,0.14),rgba(14,165,233,0.05)_34%,rgba(255,255,255,0)_68%),linear-gradient(180deg,rgba(240,249,255,0.9),rgba(255,255,255,0.95)_32%,rgba(255,255,255,0.98))]"
+        : index === 0
+          ? "bg-[radial-gradient(circle_at_12%_18%,rgba(249,115,22,0.16),rgba(249,115,22,0.05)_34%,rgba(255,255,255,0)_68%),linear-gradient(180deg,rgba(255,247,237,0.88),rgba(255,255,255,0.95)_32%,rgba(255,255,255,0.98))]"
+          : "bg-[radial-gradient(circle_at_88%_18%,rgba(249,115,22,0.16),rgba(249,115,22,0.05)_34%,rgba(255,255,255,0)_68%),linear-gradient(180deg,rgba(255,247,237,0.88),rgba(255,255,255,0.95)_32%,rgba(255,255,255,0.98))]";
+
+    return {
+      ...penaltyColumnsByTeam[team],
+      panelTintClassName: sideAnchoredTintClassName,
+    };
+  });
   const displayTeamName = (team: TeamId) => (team === "home" ? state.homeName : state.awayName);
   const timeoutReminder =
     activeTimeout !== null && gameView.timeoutReminderActive
@@ -872,7 +886,6 @@ export function GamePage({ gameId, role }: { gameId: string; role: ControllerRol
           getPendingReleaseActionLabel={(action, playerKey) =>
             formatPendingReleaseActionLabel(action, state.players[playerKey] ?? null)
           }
-          formatRemaining={formatRemaining}
         />
 
         <GameControllerActionPanels

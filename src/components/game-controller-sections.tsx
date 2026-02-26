@@ -380,7 +380,6 @@ export function PenaltyColumnsSection({
   controller,
   onConfirmPenaltyExpiration,
   getPendingReleaseActionLabel,
-  formatRemaining,
 }: {
   penaltyColumns: PenaltyColumnView[];
   displayTeamName: (team: TeamId) => string;
@@ -388,7 +387,6 @@ export function PenaltyColumnsSection({
   controller: boolean;
   onConfirmPenaltyExpiration: (pendingId: string, playerKey: string) => void;
   getPendingReleaseActionLabel: (action: PendingReleaseActionView, playerKey: string) => string;
-  formatRemaining: (ms: number) => string;
 }) {
   return (
     <section className="grid min-h-0 grid-cols-2 gap-2">
@@ -460,9 +458,7 @@ export function PenaltyColumnsSection({
                   key={release.id}
                   className="rounded-xl border border-emerald-300 bg-emerald-100 px-2 py-1 text-[10px] text-emerald-900"
                 >
-                  <span>
-                    {release.label} released ({formatRemaining(release.remainingMs)})
-                  </span>
+                  <span>{release.label} released</span>
                 </div>
               ))}
             </div>
