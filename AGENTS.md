@@ -58,6 +58,7 @@ Provide clear, low-friction defaults so OpenAI Codex can make safe, high-quality
 - Keep comments concise and only where intent is not obvious from code.
 
 ## File/Structure Guidelines
+- Target a soft limit of ~700 lines per file. If a file grows beyond that, prefer splitting by cohesive responsibility (for example extracting presentational React sections/components or moving orchestration/helpers into `src/lib`).
 - Respect existing aliases from `components.json`:
   - `@/components`
   - `@/components/ui`

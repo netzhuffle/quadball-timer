@@ -233,6 +233,75 @@ describe("App", () => {
     expect(container.textContent).toContain("Home vs Away");
   });
 
+  test("team side swap sends synced display-side command", async () => {
+    await act(async () => {
+      root.render(<App />);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const getTopTeamNameButtons = () =>
+      Array.from(container.getElementsByTagName("button")).filter((button) =>
+        button.className.includes("font-extrabold"),
+      );
+
+    await act(async () => {
+      getTopTeamNameButtons()[0]?.click();
+      await Promise.resolve();
+    });
+
+    const swapButton = Array.from(container.getElementsByTagName("button")).find(
+      (button) => button.getAttribute("aria-label") === "Swap team sides",
+    );
+    expect(swapButton).not.toBeNull();
+
+    const ws = MockWebSocket.instances[0];
+    expect(ws).toBeDefined();
+    if (ws === undefined) {
+      return;
+    }
+
+    const snapshotState = createInitialGameState({
+      id: "test-game",
+      nowMs: Date.now(),
+      homeName: "Home",
+      awayName: "Away",
+    });
+    const snapshotGame = projectGameView(snapshotState, snapshotState.updatedAtMs);
+    await act(async () => {
+      ws.onmessage?.(
+        new MessageEvent("message", {
+          data: JSON.stringify({
+            type: "game-snapshot",
+            game: snapshotGame,
+            serverNowMs: snapshotState.updatedAtMs,
+            ackedCommandIds: [],
+          }),
+        }),
+      );
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const sentBefore = ws.sentMessages.length;
+    await act(async () => {
+      swapButton?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+      await new Promise((resolve) => testWindow.setTimeout(resolve, 0));
+      await Promise.resolve();
+    });
+
+    expect(ws.sentMessages.length).toBeGreaterThan(sentBefore);
+    const parsed = JSON.parse(ws.sentMessages.at(-1) ?? "{}") as {
+      type?: string;
+      commands?: Array<{ command?: { type?: string; swapped?: boolean } }>;
+    };
+    expect(parsed.type).toBe("apply-commands");
+    expect(parsed.commands?.[0]?.command?.type).toBe("set-display-sides-swapped");
+    expect(typeof parsed.commands?.[0]?.command?.swapped).toBe("boolean");
+  });
+
   test("side switch closes team editor when no unsaved rename draft exists", async () => {
     await act(async () => {
       root.render(<App />);
@@ -397,5 +466,28 @@ describe("App", () => {
       testWindow.HTMLElement.prototype.getBoundingClientRect =
         originalPrototypeGetBoundingClientRect as unknown as typeof testWindow.HTMLElement.prototype.getBoundingClientRect;
     }
+  });
+
+  test("penalty panels keep team-tinted header styling", async () => {
+    await act(async () => {
+      root.render(<App />);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const headings = Array.from(container.getElementsByTagName("p")).filter((node) =>
+      (node.textContent ?? "").toLowerCase().includes("penalties"),
+    );
+    const homeHeading = headings.find((node) =>
+      (node.textContent ?? "").toLowerCase().includes("home penalties"),
+    );
+    const awayHeading = headings.find((node) =>
+      (node.textContent ?? "").toLowerCase().includes("away penalties"),
+    );
+
+    expect(homeHeading).not.toBeNull();
+    expect(awayHeading).not.toBeNull();
+    expect(homeHeading?.className).toContain("text-sky-800");
+    expect(awayHeading?.className).toContain("text-orange-800");
   });
 });
