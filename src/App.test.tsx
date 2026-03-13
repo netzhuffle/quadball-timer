@@ -421,9 +421,21 @@ describe("App", () => {
   });
 
   test("team name display height remeasures when team names become longer and shorter", async () => {
-    // eslint-disable-next-line typescript-eslint/unbound-method
-    const originalPrototypeGetBoundingClientRect = testWindow.HTMLElement.prototype
-      .getBoundingClientRect as unknown as (this: unknown) => unknown;
+    let prototype: object | null = testWindow.HTMLElement.prototype;
+    let boundingClientRectDescriptor: PropertyDescriptor | undefined;
+    while (prototype !== null && boundingClientRectDescriptor === undefined) {
+      boundingClientRectDescriptor = Object.getOwnPropertyDescriptor(
+        prototype,
+        "getBoundingClientRect",
+      );
+      prototype = Object.getPrototypeOf(prototype);
+    }
+    const originalPrototypeGetBoundingClientRect = boundingClientRectDescriptor?.value as
+      | ((this: unknown) => unknown)
+      | undefined;
+    if (originalPrototypeGetBoundingClientRect === undefined) {
+      throw new Error("Expected HTMLElement#getBoundingClientRect to exist");
+    }
     const originalGetBoundingClientRect = (
       element: unknown,
     ): ReturnType<HTMLElement["getBoundingClientRect"]> =>
