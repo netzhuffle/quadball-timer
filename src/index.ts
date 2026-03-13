@@ -228,6 +228,8 @@ function createGame(req: Request) {
         typeof payload.awayName === "string" && payload.awayName.trim().length > 0
           ? payload.awayName
           : "Away";
+      const homeColor = typeof payload.homeColor === "string" ? payload.homeColor : undefined;
+      const awayColor = typeof payload.awayColor === "string" ? payload.awayColor : undefined;
 
       const id = createGameId();
       const nowMs = Date.now();
@@ -237,6 +239,8 @@ function createGame(req: Request) {
           nowMs,
           homeName,
           awayName,
+          homeColor,
+          awayColor,
         }),
         appliedCommandIds: new Set(),
         appliedCommandOrder: [],

@@ -497,6 +497,20 @@ function parseGameCommand(payload: Record<string, unknown>):
         error: "rename-teams requires homeName and awayName.",
       };
     }
+    if (payload.homeColor !== undefined && !isHexTeamColor(payload.homeColor)) {
+      return {
+        ok: false,
+        error: "rename-teams homeColor must be 6-digit hex when provided.",
+      };
+    }
+    if (payload.awayColor !== undefined && !isHexTeamColor(payload.awayColor)) {
+      return {
+        ok: false,
+        error: "rename-teams awayColor must be 6-digit hex when provided.",
+      };
+    }
+    const homeColor = isHexTeamColor(payload.homeColor) ? payload.homeColor : undefined;
+    const awayColor = isHexTeamColor(payload.awayColor) ? payload.awayColor : undefined;
 
     return {
       ok: true,
@@ -504,6 +518,8 @@ function parseGameCommand(payload: Record<string, unknown>):
         type: "rename-teams",
         homeName: payload.homeName,
         awayName: payload.awayName,
+        homeColor,
+        awayColor,
       },
     };
   }
@@ -528,4 +544,8 @@ function isScoreReason(value: unknown): value is "goal" | "manual" {
 
 function isCardType(value: unknown): value is "blue" | "yellow" | "red" | "ejection" {
   return value === "blue" || value === "yellow" || value === "red" || value === "ejection";
+}
+
+function isHexTeamColor(value: unknown): value is string {
+  return typeof value === "string" && /^#?[0-9a-fA-F]{6}$/.test(value.trim());
 }

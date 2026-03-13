@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { CloudOff, Eye, OctagonX, Shield, TriangleAlert, UserX, Wifi, WifiOff } from "lucide-react";
@@ -32,6 +32,25 @@ import {
   useNow,
   willFlagCatchWin,
 } from "@/lib/game-page-support";
+import {
+  DEFAULT_AWAY_TEAM_COLOR,
+  DEFAULT_HOME_TEAM_COLOR,
+  hexToOklch,
+  normalizeTeamColor,
+  oklchToHex,
+  shiftOklch,
+  withColorAlpha,
+} from "@/lib/team-colors";
+import {
+  buildActionPanelTabStyle,
+  buildPenaltyHeaderStyle,
+  buildPenaltyNeutralChipStyle,
+  buildPenaltyPanelBorderStyle,
+  buildPenaltyPanelTintStyle,
+  buildScoreDownButtonStyle,
+  buildScoreUpButtonStyle,
+  buildScoreValueStyle,
+} from "@/lib/score-color-theme";
 import "../index.css";
 
 type PendingWinConfirmation = {
@@ -44,6 +63,8 @@ export function GamePage({ gameId, role }: { gameId: string; role: ControllerRol
   const [activePanel, setActivePanel] = useState<"card" | "timeout" | "game">("card");
   const [homeName, setHomeName] = useState("Home");
   const [awayName, setAwayName] = useState("Away");
+  const [homeColor, setHomeColor] = useState(DEFAULT_HOME_TEAM_COLOR);
+  const [awayColor, setAwayColor] = useState(DEFAULT_AWAY_TEAM_COLOR);
   const [cardDraft, setCardDraft] = useState<{
     cardType: CardType | null;
     team: TeamId | null;
@@ -98,6 +119,8 @@ export function GamePage({ gameId, role }: { gameId: string; role: ControllerRol
       if (renamingTeam === null) {
         setHomeName(baseState.homeName);
         setAwayName(baseState.awayName);
+        setHomeColor(baseState.homeColor);
+        setAwayColor(baseState.awayColor);
       }
     }
   }, [baseState, renamingTeam]);
@@ -211,9 +234,11 @@ export function GamePage({ gameId, role }: { gameId: string; role: ControllerRol
       type: "rename-teams",
       homeName,
       awayName,
+      homeColor,
+      awayColor,
     });
     setRenamingTeam(null);
-  }, [awayName, controller, dispatchCommand, homeName]);
+  }, [awayColor, awayName, controller, dispatchCommand, homeColor, homeName]);
 
   const handleTeamRenameInputKeyDown = useCallback(
     (event: React.KeyboardEvent<HTMLInputElement>) => {
@@ -233,7 +258,11 @@ export function GamePage({ gameId, role }: { gameId: string; role: ControllerRol
     }
 
     const hasUnsavedRenameDraft =
-      renamingTeam !== null && (homeName !== liveState.homeName || awayName !== liveState.awayName);
+      renamingTeam !== null &&
+      (homeName !== liveState.homeName ||
+        awayName !== liveState.awayName ||
+        homeColor !== liveState.homeColor ||
+        awayColor !== liveState.awayColor);
     refocusRenameInputAfterSideSwapRef.current = hasUnsavedRenameDraft;
     if (hasUnsavedRenameDraft) {
       const input = activeTeamRenameInputRef.current;
@@ -256,7 +285,16 @@ export function GamePage({ gameId, role }: { gameId: string; role: ControllerRol
       type: "set-display-sides-swapped",
       swapped: !liveState.displaySidesSwapped,
     });
-  }, [awayName, controller, dispatchCommand, homeName, liveState, renamingTeam]);
+  }, [
+    awayColor,
+    awayName,
+    controller,
+    dispatchCommand,
+    homeColor,
+    homeName,
+    liveState,
+    renamingTeam,
+  ]);
 
   const requestWinConfirmation = useCallback((label: string, command: GameCommand) => {
     setPendingWinConfirmation({ label, command });
@@ -599,45 +637,36 @@ export function GamePage({ gameId, role }: { gameId: string; role: ControllerRol
       idleClassName: "border-violet-200 bg-violet-50 text-violet-800",
     },
   ];
+  const teamColorsByTeam: Record<TeamId, string> = {
+    home: normalizeTeamColor(state.homeColor, DEFAULT_HOME_TEAM_COLOR),
+    away: normalizeTeamColor(state.awayColor, DEFAULT_AWAY_TEAM_COLOR),
+  };
   const scoreColumnsByTeam: Record<
     TeamId,
     {
       team: TeamId;
       name: string;
       score: number;
-      accentClassName: string;
-      borderClassName: string;
-      scoreBoxClassName: string;
-      scoreValueBorderClassName: string;
-      scoreValueGlowClassName: string;
-      scoreDownButtonClassName: string;
+      scoreBoxStyle: CSSProperties;
+      scoreValueStyle: CSSProperties;
+      scoreDownButtonStyle: CSSProperties;
     }
   > = {
     home: {
       team: "home",
       name: state.homeName,
       score: state.score.home,
-      accentClassName: "from-sky-500/80 to-cyan-400/80",
-      borderClassName: "border-cyan-300/50",
-      scoreBoxClassName:
-        "h-8 w-full rounded-2xl border border-sky-300 bg-gradient-to-br from-sky-500 to-cyan-500 text-white shadow-sm",
-      scoreValueBorderClassName: "border-sky-200",
-      scoreValueGlowClassName: "shadow-[inset_0_0_12px_rgba(14,165,233,0.18)]",
-      scoreDownButtonClassName:
-        "h-8 w-full rounded-2xl border-sky-200 bg-white text-sky-700 hover:bg-sky-50",
+      scoreBoxStyle: buildScoreUpButtonStyle(teamColorsByTeam.home),
+      scoreValueStyle: buildScoreValueStyle(teamColorsByTeam.home),
+      scoreDownButtonStyle: buildScoreDownButtonStyle(teamColorsByTeam.home),
     },
     away: {
       team: "away",
       name: state.awayName,
       score: state.score.away,
-      accentClassName: "from-orange-500/80 to-rose-500/80",
-      borderClassName: "border-amber-300/50",
-      scoreBoxClassName:
-        "h-8 w-full rounded-2xl border border-orange-300 bg-gradient-to-br from-orange-500 to-rose-500 text-white shadow-sm",
-      scoreValueBorderClassName: "border-orange-200",
-      scoreValueGlowClassName: "shadow-[inset_0_0_12px_rgba(249,115,22,0.16)]",
-      scoreDownButtonClassName:
-        "h-8 w-full rounded-2xl border-orange-200 bg-white text-orange-700 hover:bg-orange-50",
+      scoreBoxStyle: buildScoreUpButtonStyle(teamColorsByTeam.away),
+      scoreValueStyle: buildScoreValueStyle(teamColorsByTeam.away),
+      scoreDownButtonStyle: buildScoreDownButtonStyle(teamColorsByTeam.away),
     },
   };
   const leftTeam: TeamId = state.displaySidesSwapped ? "away" : "home";
@@ -647,15 +676,17 @@ export function GamePage({ gameId, role }: { gameId: string; role: ControllerRol
     team: TeamId;
     name: string;
     score: number;
-    accentClassName: string;
-    borderClassName: string;
-    scoreBoxClassName: string;
-    scoreValueBorderClassName: string;
-    scoreValueGlowClassName: string;
-    scoreDownButtonClassName: string;
+    scoreBoxStyle: CSSProperties;
+    scoreValueStyle: CSSProperties;
+    scoreDownButtonStyle: CSSProperties;
   }> = displayTeamOrder.map((team) => scoreColumnsByTeam[team]);
   const homeScoreColumn = scoreColumns[0]!;
   const awayScoreColumn = scoreColumns[1]!;
+  const clockTheme = buildClockTheme(teamColorsByTeam[leftTeam], teamColorsByTeam[rightTeam]);
+  const homeTabTheme = { activeStyle: buildActionPanelTabStyle("card", teamColorsByTeam.home) };
+  const awayTabTheme = {
+    activeStyle: buildActionPanelTabStyle("timeout", teamColorsByTeam.away),
+  };
   const penaltyColumnsByTeam: Record<
     TeamId,
     {
@@ -663,10 +694,10 @@ export function GamePage({ gameId, role }: { gameId: string; role: ControllerRol
       penalties: PlayerPenaltyView[];
       visiblePenalties: PlayerPenaltyView[];
       recentReleases: ReleasedPenaltyView[];
-      panelBorderClassName: string;
-      panelTintClassName: string;
-      headerTextClassName: string;
-      neutralChipClassName: string;
+      panelBorderStyle: CSSProperties;
+      panelTintStyle: CSSProperties;
+      headerTextStyle: CSSProperties;
+      neutralChipStyle: CSSProperties;
     }
   > = {
     home: {
@@ -674,22 +705,20 @@ export function GamePage({ gameId, role }: { gameId: string; role: ControllerRol
       penalties: homePenalties,
       visiblePenalties: visibleHomePenalties,
       recentReleases: homeRecentReleases,
-      panelBorderClassName: "border-sky-200",
-      panelTintClassName:
-        "bg-[radial-gradient(circle_at_12%_18%,rgba(14,165,233,0.14),rgba(14,165,233,0.05)_34%,rgba(255,255,255,0)_68%),linear-gradient(180deg,rgba(240,249,255,0.9),rgba(255,255,255,0.95)_32%,rgba(255,255,255,0.98))]",
-      headerTextClassName: "text-sky-800",
-      neutralChipClassName: "border-sky-200 bg-sky-50/80 text-slate-900",
+      panelBorderStyle: buildPenaltyPanelBorderStyle(teamColorsByTeam.home),
+      panelTintStyle: buildPenaltyPanelTintStyle(teamColorsByTeam.home, "left"),
+      headerTextStyle: buildPenaltyHeaderStyle(teamColorsByTeam.home),
+      neutralChipStyle: buildPenaltyNeutralChipStyle(teamColorsByTeam.home),
     },
     away: {
       team: "away",
       penalties: awayPenalties,
       visiblePenalties: visibleAwayPenalties,
       recentReleases: awayRecentReleases,
-      panelBorderClassName: "border-orange-200",
-      panelTintClassName:
-        "bg-[radial-gradient(circle_at_88%_18%,rgba(249,115,22,0.16),rgba(249,115,22,0.05)_34%,rgba(255,255,255,0)_68%),linear-gradient(180deg,rgba(255,247,237,0.88),rgba(255,255,255,0.95)_32%,rgba(255,255,255,0.98))]",
-      headerTextClassName: "text-orange-800",
-      neutralChipClassName: "border-orange-200 bg-orange-50/75 text-slate-900",
+      panelBorderStyle: buildPenaltyPanelBorderStyle(teamColorsByTeam.away),
+      panelTintStyle: buildPenaltyPanelTintStyle(teamColorsByTeam.away, "right"),
+      headerTextStyle: buildPenaltyHeaderStyle(teamColorsByTeam.away),
+      neutralChipStyle: buildPenaltyNeutralChipStyle(teamColorsByTeam.away),
     },
   };
   const penaltyColumns: Array<{
@@ -697,23 +726,16 @@ export function GamePage({ gameId, role }: { gameId: string; role: ControllerRol
     penalties: PlayerPenaltyView[];
     visiblePenalties: PlayerPenaltyView[];
     recentReleases: ReleasedPenaltyView[];
-    panelBorderClassName: string;
-    panelTintClassName: string;
-    headerTextClassName: string;
-    neutralChipClassName: string;
+    panelBorderStyle: CSSProperties;
+    panelTintStyle: CSSProperties;
+    headerTextStyle: CSSProperties;
+    neutralChipStyle: CSSProperties;
   }> = displayTeamOrder.map((team, index) => {
-    const sideAnchoredTintClassName =
-      team === "home"
-        ? index === 0
-          ? "bg-[radial-gradient(circle_at_12%_18%,rgba(14,165,233,0.14),rgba(14,165,233,0.05)_34%,rgba(255,255,255,0)_68%),linear-gradient(180deg,rgba(240,249,255,0.9),rgba(255,255,255,0.95)_32%,rgba(255,255,255,0.98))]"
-          : "bg-[radial-gradient(circle_at_88%_18%,rgba(14,165,233,0.14),rgba(14,165,233,0.05)_34%,rgba(255,255,255,0)_68%),linear-gradient(180deg,rgba(240,249,255,0.9),rgba(255,255,255,0.95)_32%,rgba(255,255,255,0.98))]"
-        : index === 0
-          ? "bg-[radial-gradient(circle_at_12%_18%,rgba(249,115,22,0.16),rgba(249,115,22,0.05)_34%,rgba(255,255,255,0)_68%),linear-gradient(180deg,rgba(255,247,237,0.88),rgba(255,255,255,0.95)_32%,rgba(255,255,255,0.98))]"
-          : "bg-[radial-gradient(circle_at_88%_18%,rgba(249,115,22,0.16),rgba(249,115,22,0.05)_34%,rgba(255,255,255,0)_68%),linear-gradient(180deg,rgba(255,247,237,0.88),rgba(255,255,255,0.95)_32%,rgba(255,255,255,0.98))]";
+    const side = index === 0 ? "left" : "right";
 
     return {
       ...penaltyColumnsByTeam[team],
-      panelTintClassName: sideAnchoredTintClassName,
+      panelTintStyle: buildPenaltyPanelTintStyle(teamColorsByTeam[team], side),
     };
   });
   const displayTeamName = (team: TeamId) => (team === "home" ? state.homeName : state.awayName);
@@ -823,6 +845,8 @@ export function GamePage({ gameId, role }: { gameId: string; role: ControllerRol
             renamingTeam,
             homeName,
             awayName,
+            homeColor,
+            awayColor,
             activeTeamRenameInputRef,
             leftTeamNameButtonRef,
             rightTeamNameButtonRef,
@@ -834,6 +858,8 @@ export function GamePage({ gameId, role }: { gameId: string; role: ControllerRol
 
               setHomeName(state.homeName);
               setAwayName(state.awayName);
+              setHomeColor(state.homeColor);
+              setAwayColor(state.awayColor);
               setRenamingTeam(team);
             },
             onRenameInputChange: (team, value) => {
@@ -841,6 +867,13 @@ export function GamePage({ gameId, role }: { gameId: string; role: ControllerRol
                 setHomeName(value);
               } else {
                 setAwayName(value);
+              }
+            },
+            onRenameColorChange: (team, value) => {
+              if (team === "home") {
+                setHomeColor(value);
+              } else {
+                setAwayColor(value);
               }
             },
             onRenameInputKeyDown: handleTeamRenameInputKeyDown,
@@ -869,6 +902,7 @@ export function GamePage({ gameId, role }: { gameId: string; role: ControllerRol
           timeoutReminder={timeoutReminder}
           flagStatus={flagStatus}
           seekersStatus={seekersStatus}
+          clockTheme={clockTheme}
         />
 
         <PenaltyColumnsSection
@@ -899,6 +933,17 @@ export function GamePage({ gameId, role }: { gameId: string; role: ControllerRol
           }}
           displayTeamOrder={displayTeamOrder}
           displayTeamName={displayTeamName}
+          tabThemes={{
+            card: homeTabTheme,
+            timeout: awayTabTheme,
+            game: {
+              activeStyle: buildActionPanelTabStyle(
+                "game",
+                teamColorsByTeam.home,
+                teamColorsByTeam.away,
+              ),
+            },
+          }}
           cardTypeOptions={cardTypeOptions}
           cardDraft={cardDraft}
           setCardDraft={setCardDraft}
@@ -973,4 +1018,39 @@ export function GamePage({ gameId, role }: { gameId: string; role: ControllerRol
       </div>
     </div>
   );
+}
+
+function buildClockTheme(leftTeamColor: string, rightTeamColor: string) {
+  const left = normalizeTeamColor(leftTeamColor, DEFAULT_HOME_TEAM_COLOR);
+  const right = normalizeTeamColor(rightTeamColor, DEFAULT_AWAY_TEAM_COLOR);
+  const shellBorder = shiftColorHex(left, { dl: 0.142899263, dc: -0.046591806, dh: -7.004624547 });
+  const shellMid = shiftColorHex(left, { dl: 0.247230661, dc: -0.116277213, dh: 18.262960722 });
+  const shellOuter = shiftColorHex(left, { dl: 0.197656183, dc: -0.090811681, dh: 16.805863076 });
+  const rotorHotspot = shiftColorHex(right, { dl: 0.052768544, dc: -0.027683619, dh: 8.329994208 });
+
+  return {
+    shellStyle: {
+      borderColor: withColorAlpha(shellBorder, 0.6),
+      backgroundImage: `radial-gradient(circle,#ffffff 34%,${shellMid} 70%,${shellOuter} 100%)`,
+      boxShadow: `0 0 0 1px ${withColorAlpha(shellBorder, 0.5)}, 0 0 24px ${withColorAlpha(left, 0.22)}`,
+    } satisfies CSSProperties,
+    rotorStyle: {
+      backgroundImage: `conic-gradient(from 0deg, ${withColorAlpha(left, 0.22)}, ${withColorAlpha(rotorHotspot, 0.18)}, ${withColorAlpha(left, 0.22)})`,
+    } satisfies CSSProperties,
+    rotorInnerStyle: {
+      backgroundImage: `conic-gradient(from 180deg, rgba(255,255,255,0.8), ${withColorAlpha(left, 0.14)}, rgba(255,255,255,0.8))`,
+    } satisfies CSSProperties,
+    ringStyle: {
+      borderColor: withColorAlpha(shellBorder, 0.5),
+    } satisfies CSSProperties,
+  };
+}
+
+function shiftColorHex(color: string, shift: { dl: number; dc: number; dh: number }) {
+  const oklch = hexToOklch(color);
+  if (oklch === null) {
+    return color;
+  }
+
+  return oklchToHex(shiftOklch(oklch, shift));
 }

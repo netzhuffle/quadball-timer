@@ -302,6 +302,85 @@ describe("App", () => {
     expect(typeof parsed.commands?.[0]?.command?.swapped).toBe("boolean");
   });
 
+  test("team rename save sends synced color fields", async () => {
+    await act(async () => {
+      root.render(<App />);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const getTopTeamNameButtons = () =>
+      Array.from(container.getElementsByTagName("button")).filter((button) =>
+        button.className.includes("font-extrabold"),
+      );
+
+    await act(async () => {
+      getTopTeamNameButtons()[0]?.click();
+      await Promise.resolve();
+    });
+
+    const homeColorInput = Array.from(container.getElementsByTagName("input")).find(
+      (input) => input.getAttribute("aria-label") === "home team color",
+    );
+    expect(homeColorInput).toBeDefined();
+
+    const saveButton = Array.from(container.getElementsByTagName("button")).find(
+      (button) => button.textContent?.trim() === "Save",
+    );
+    expect(saveButton).toBeDefined();
+
+    if (homeColorInput === undefined || saveButton === undefined) {
+      return;
+    }
+
+    const ws = MockWebSocket.instances[0];
+    expect(ws).toBeDefined();
+    if (ws === undefined) {
+      return;
+    }
+
+    const snapshotState = createInitialGameState({
+      id: "test-game",
+      nowMs: Date.now(),
+      homeName: "Home",
+      awayName: "Away",
+    });
+    const snapshotGame = projectGameView(snapshotState, snapshotState.updatedAtMs);
+    await act(async () => {
+      ws.onmessage?.(
+        new MessageEvent("message", {
+          data: JSON.stringify({
+            type: "game-snapshot",
+            game: snapshotGame,
+            serverNowMs: snapshotState.updatedAtMs,
+            ackedCommandIds: [],
+          }),
+        }),
+      );
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const sentBefore = ws.sentMessages.length;
+    await act(async () => {
+      saveButton.click();
+      await Promise.resolve();
+      await Promise.resolve();
+      await new Promise((resolve) => testWindow.setTimeout(resolve, 0));
+      await Promise.resolve();
+    });
+
+    expect(ws.sentMessages.length).toBeGreaterThan(sentBefore);
+    const parsed = JSON.parse(ws.sentMessages.at(-1) ?? "{}") as {
+      type?: string;
+      commands?: Array<{ command?: { type?: string; homeColor?: string; awayColor?: string } }>;
+    };
+    expect(parsed.type).toBe("apply-commands");
+    expect(parsed.commands?.[0]?.command?.type).toBe("rename-teams");
+    expect(parsed.commands?.[0]?.command?.homeColor).toBe("#0ea5e9");
+    expect(parsed.commands?.[0]?.command?.awayColor).toBe("#f97316");
+  });
+
   test("side switch closes team editor when no unsaved rename draft exists", async () => {
     await act(async () => {
       root.render(<App />);
@@ -485,9 +564,107 @@ describe("App", () => {
       (node.textContent ?? "").toLowerCase().includes("away penalties"),
     );
 
-    expect(homeHeading).not.toBeNull();
-    expect(awayHeading).not.toBeNull();
-    expect(homeHeading?.className).toContain("text-sky-800");
-    expect(awayHeading?.className).toContain("text-orange-800");
+    expect(homeHeading).toBeDefined();
+    expect(awayHeading).toBeDefined();
+    const tintLayers = Array.from(container.getElementsByTagName("div")).filter((node) =>
+      (node.getAttribute("style") ?? "").includes("radial-gradient(circle at"),
+    );
+    expect(tintLayers.length).toBeGreaterThanOrEqual(2);
+    expect(
+      tintLayers.some((node) => (node.getAttribute("style") ?? "").includes("12% 18%")),
+    ).toBeTrue();
+    expect(
+      tintLayers.some((node) => (node.getAttribute("style") ?? "").includes("88% 18%")),
+    ).toBeTrue();
+  });
+
+  test("create game posts team color fields", async () => {
+    testWindow.history.replaceState(null, "", "/");
+
+    const requests: Array<{ url: string; body: string | null }> = [];
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url =
+        typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      const method = init?.method ?? "GET";
+
+      if (url.endsWith("/api/games") && method === "GET") {
+        return new Response(JSON.stringify({ games: [] }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+
+      if (url.endsWith("/api/games") && method === "POST") {
+        requests.push({ url, body: typeof init?.body === "string" ? init.body : null });
+        return new Response(JSON.stringify({ gameId: "created-1" }), {
+          status: 201,
+          headers: { "content-type": "application/json" },
+        });
+      }
+
+      if (url.endsWith("/api/games/created-1")) {
+        const state = createInitialGameState({
+          id: "created-1",
+          nowMs: Date.now(),
+          homeName: "Home",
+          awayName: "Away",
+        });
+        return new Response(JSON.stringify({ game: { state } }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+
+      return new Response("Not found", { status: 404 });
+    }) as typeof fetch;
+
+    await act(async () => {
+      root.render(<App />);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const homeColor = document.getElementById("home-color");
+    const awayColor = document.getElementById("away-color");
+    expect(homeColor).not.toBeNull();
+    expect(awayColor).not.toBeNull();
+    if (homeColor === null || awayColor === null) {
+      return;
+    }
+
+    const createButton = Array.from(container.getElementsByTagName("button")).find((button) =>
+      (button.textContent ?? "").includes("Create new game"),
+    );
+    expect(createButton).not.toBeNull();
+
+    await act(async () => {
+      createButton?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(requests).toHaveLength(1);
+    const payload = JSON.parse(requests[0]?.body ?? "{}") as {
+      homeColor?: string;
+      awayColor?: string;
+    };
+    expect(payload.homeColor).toBe("#0ea5e9");
+    expect(payload.awayColor).toBe("#f97316");
+  });
+
+  test("color test route renders 100 color samples", async () => {
+    testWindow.history.replaceState(null, "", "/color-test");
+
+    await act(async () => {
+      root.render(<App />);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(container.textContent).toContain("Score Button Color Test");
+    const previews = Array.from(container.getElementsByTagName("section")).filter(
+      (section) => section.getAttribute("data-color-preview") === "true",
+    );
+    expect(previews).toHaveLength(100);
   });
 });

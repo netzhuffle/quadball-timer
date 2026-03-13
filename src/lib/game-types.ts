@@ -83,6 +83,8 @@ export type GameState = {
   updatedAtMs: number;
   homeName: string;
   awayName: string;
+  homeColor: string;
+  awayColor: string;
   displaySidesSwapped: boolean;
   gameClockMs: number;
   isRunning: boolean;
@@ -114,6 +116,8 @@ export type GameSummary = {
   id: string;
   homeName: string;
   awayName: string;
+  homeColor: string;
+  awayColor: string;
   score: Record<TeamId, number>;
   gameClockMs: number;
   isRunning: boolean;
@@ -207,6 +211,8 @@ export type GameCommand =
       type: "rename-teams";
       homeName: string;
       awayName: string;
+      homeColor?: string;
+      awayColor?: string;
     };
 
 export type GameView = {

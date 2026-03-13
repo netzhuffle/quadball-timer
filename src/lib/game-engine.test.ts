@@ -20,6 +20,46 @@ function getPlayerRemainingMs(state: GameState, key: string) {
 }
 
 describe("game-engine", () => {
+  test("initial state includes default team colors", () => {
+    const state = createInitialGameState({ id: "game-colors-default", nowMs: 0 });
+    expect(state.homeColor).toBe("#0ea5e9");
+    expect(state.awayColor).toBe("#f97316");
+  });
+
+  test("rename-teams updates names and colors while preserving invalid color values", () => {
+    let state = createInitialGameState({ id: "game-colors-rename", nowMs: 0 });
+    state = applyGameCommand({
+      state,
+      command: {
+        type: "rename-teams",
+        homeName: "Thunder",
+        awayName: "Sparrows",
+        homeColor: "#112233",
+        awayColor: "aabbcc",
+      },
+      nowMs: 100,
+    });
+
+    expect(state.homeName).toBe("Thunder");
+    expect(state.awayName).toBe("Sparrows");
+    expect(state.homeColor).toBe("#112233");
+    expect(state.awayColor).toBe("#aabbcc");
+
+    state = applyGameCommand({
+      state,
+      command: {
+        type: "rename-teams",
+        homeName: "Thunder",
+        awayName: "Sparrows",
+        homeColor: "#12zzzz",
+      },
+      nowMs: 200,
+    });
+
+    expect(state.homeColor).toBe("#112233");
+    expect(state.awayColor).toBe("#aabbcc");
+  });
+
   test("display side swap is stored in game state and can be toggled", () => {
     let state = createInitialGameState({ id: "game-display-sides", nowMs: 0 });
     expect(state.displaySidesSwapped).toBe(false);

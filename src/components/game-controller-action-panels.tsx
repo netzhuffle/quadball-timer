@@ -1,4 +1,4 @@
-import type { Dispatch, SetStateAction } from "react";
+import type { CSSProperties, ComponentType, Dispatch, SetStateAction } from "react";
 import { Check, Clock3, Delete, Flag, Trophy } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -16,7 +16,7 @@ type CardDraft = {
 type CardTypeOption = {
   type: CardType;
   label: string;
-  icon: React.ComponentType<{ className?: string }>;
+  icon: ComponentType<{ className?: string }>;
   activeClassName: string;
   idleClassName: string;
 };
@@ -24,6 +24,10 @@ type CardTypeOption = {
 type PendingWinConfirmationView = {
   label: string;
 } | null;
+
+type PanelTabTheme = {
+  activeStyle: CSSProperties;
+};
 
 export function GameControllerActionPanels({
   activePanel,
@@ -33,6 +37,7 @@ export function GameControllerActionPanels({
   gameView,
   displayTeamOrder,
   displayTeamName,
+  tabThemes,
   cardTypeOptions,
   cardDraft,
   setCardDraft,
@@ -77,6 +82,11 @@ export function GameControllerActionPanels({
   };
   displayTeamOrder: [TeamId, TeamId];
   displayTeamName: (team: TeamId) => string;
+  tabThemes: {
+    card: PanelTabTheme;
+    timeout: PanelTabTheme;
+    game: PanelTabTheme;
+  };
   cardTypeOptions: CardTypeOption[];
   cardDraft: CardDraft;
   setCardDraft: Dispatch<SetStateAction<CardDraft>>;
@@ -480,10 +490,9 @@ export function GameControllerActionPanels({
             variant="ghost"
             size="sm"
             className={`h-10 gap-1 rounded-xl px-1 text-[11px] transition-all ${
-              activePanel === "card"
-                ? "bg-gradient-to-br from-cyan-500 to-sky-600 text-white shadow-[0_0_14px_rgba(56,189,248,0.55)]"
-                : "bg-slate-100 text-slate-700"
+              activePanel === "card" ? "" : "bg-slate-100 text-slate-700"
             }`}
+            style={activePanel === "card" ? tabThemes.card.activeStyle : undefined}
             onClick={() => setActivePanel("card")}
           >
             <Flag className={`h-3.5 w-3.5 ${activePanel === "card" ? "animate-pulse" : ""}`} />
@@ -493,10 +502,9 @@ export function GameControllerActionPanels({
             variant="ghost"
             size="sm"
             className={`h-10 gap-1 rounded-xl px-1 text-[11px] transition-all ${
-              activePanel === "timeout"
-                ? "bg-gradient-to-br from-orange-500 to-amber-500 text-white shadow-[0_0_14px_rgba(251,146,60,0.5)]"
-                : "bg-slate-100 text-slate-700"
+              activePanel === "timeout" ? "" : "bg-slate-100 text-slate-700"
             }`}
+            style={activePanel === "timeout" ? tabThemes.timeout.activeStyle : undefined}
             onClick={() => setActivePanel("timeout")}
           >
             <Clock3 className={`h-3.5 w-3.5 ${activePanel === "timeout" ? "animate-pulse" : ""}`} />
@@ -506,10 +514,9 @@ export function GameControllerActionPanels({
             variant="ghost"
             size="sm"
             className={`h-10 gap-1 rounded-xl px-1 text-[11px] transition-all ${
-              activePanel === "game"
-                ? "bg-gradient-to-br from-rose-500 to-fuchsia-600 text-white shadow-[0_0_14px_rgba(244,63,94,0.55)]"
-                : "bg-slate-100 text-slate-700"
+              activePanel === "game" ? "" : "bg-slate-100 text-slate-700"
             }`}
+            style={activePanel === "game" ? tabThemes.game.activeStyle : undefined}
             onClick={() => setActivePanel("game")}
           >
             <Trophy className={`h-3.5 w-3.5 ${activePanel === "game" ? "animate-pulse" : ""}`} />

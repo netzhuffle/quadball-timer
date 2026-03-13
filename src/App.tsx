@@ -4,12 +4,17 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import type { ControllerRole, GameSummary } from "@/lib/game-types";
+import { DEFAULT_AWAY_TEAM_COLOR, DEFAULT_HOME_TEAM_COLOR } from "@/lib/team-colors";
+import { ColorTestPage } from "@/pages/color-test-page";
 import { GamePage } from "@/pages/game-page";
 import "./index.css";
 
 type Route =
   | {
       type: "home";
+    }
+  | {
+      type: "color-test";
     }
   | {
       type: "game";
@@ -26,6 +31,10 @@ export function App() {
     return <HomePage />;
   }
 
+  if (route.type === "color-test") {
+    return <ColorTestPage />;
+  }
+
   return <GamePage gameId={route.gameId} role={route.role} />;
 }
 
@@ -36,6 +45,8 @@ function HomePage() {
   const [connectionState, setConnectionState] = useState<ConnectionState>("connecting");
   const [homeName, setHomeName] = useState("Home");
   const [awayName, setAwayName] = useState("Away");
+  const [homeColor, setHomeColor] = useState(DEFAULT_HOME_TEAM_COLOR);
+  const [awayColor, setAwayColor] = useState(DEFAULT_AWAY_TEAM_COLOR);
   const reconnectTimeoutRef = useRef<number | null>(null);
 
   const wsUrl = useMemo(createWebSocketUrl, []);
@@ -122,6 +133,8 @@ function HomePage() {
       body: JSON.stringify({
         homeName,
         awayName,
+        homeColor,
+        awayColor,
       }),
     });
 
@@ -133,7 +146,7 @@ function HomePage() {
     if (typeof payload.gameId === "string") {
       navigateTo(`/game/${payload.gameId}?mode=controller`);
     }
-  }, [awayName, homeName]);
+  }, [awayColor, awayName, homeColor, homeName]);
 
   return (
     <div className="mx-auto w-full max-w-5xl p-4 pb-12 sm:p-6">
@@ -147,6 +160,11 @@ function HomePage() {
         <p className="mt-2 text-sm text-muted-foreground">
           Mobile-first control for game time, scores, cards, penalty timers, and spectator sync.
         </p>
+        <div className="mt-3">
+          <Button size="sm" variant="outline" onClick={() => navigateTo("/color-test")}>
+            Open color test page
+          </Button>
+        </div>
       </header>
 
       <div className="grid gap-4 lg:grid-cols-[1fr_2fr]">
@@ -171,6 +189,28 @@ function HomePage() {
                 value={awayName}
                 onChange={(event) => setAwayName(event.target.value)}
               />
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <div className="space-y-2">
+                <Label htmlFor="home-color">Home color</Label>
+                <Input
+                  id="home-color"
+                  type="color"
+                  value={homeColor}
+                  onChange={(event) => setHomeColor(event.target.value)}
+                  className="h-10 cursor-pointer p-1"
+                />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="away-color">Away color</Label>
+                <Input
+                  id="away-color"
+                  type="color"
+                  value={awayColor}
+                  onChange={(event) => setAwayColor(event.target.value)}
+                  className="h-10 cursor-pointer p-1"
+                />
+              </div>
             </div>
             <Button className="w-full" onClick={handleCreateGame}>
               Create new game
@@ -265,6 +305,10 @@ function useRoute(): Route {
 }
 
 function parseRoute(pathname: string, search: string): Route {
+  if (pathname === "/color-test") {
+    return { type: "color-test" };
+  }
+
   const match = pathname.match(/^\/game\/([a-zA-Z0-9-]+)$/);
   if (match === null) {
     return { type: "home" };

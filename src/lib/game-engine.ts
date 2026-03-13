@@ -11,6 +11,11 @@ import type {
   ScoreEvent,
   TeamId,
 } from "@/lib/game-types";
+import {
+  DEFAULT_AWAY_TEAM_COLOR,
+  DEFAULT_HOME_TEAM_COLOR,
+  normalizeTeamColor,
+} from "@/lib/team-colors";
 
 const ONE_MINUTE_MS = 60_000;
 const SEEKER_RELEASE_MS = 20 * ONE_MINUTE_MS;
@@ -25,11 +30,15 @@ export function createInitialGameState({
   nowMs,
   homeName = "Home",
   awayName = "Away",
+  homeColor = DEFAULT_HOME_TEAM_COLOR,
+  awayColor = DEFAULT_AWAY_TEAM_COLOR,
 }: {
   id: string;
   nowMs: number;
   homeName?: string;
   awayName?: string;
+  homeColor?: string;
+  awayColor?: string;
 }): GameState {
   return {
     id,
@@ -37,6 +46,8 @@ export function createInitialGameState({
     updatedAtMs: nowMs,
     homeName,
     awayName,
+    homeColor: normalizeTeamColor(homeColor, DEFAULT_HOME_TEAM_COLOR),
+    awayColor: normalizeTeamColor(awayColor, DEFAULT_AWAY_TEAM_COLOR),
     displaySidesSwapped: false,
     gameClockMs: 0,
     isRunning: false,
@@ -93,6 +104,14 @@ export function cloneGameState(state: GameState): GameState {
   if (typeof cloned.displaySidesSwapped !== "boolean") {
     cloned.displaySidesSwapped = false;
   }
+  if (typeof cloned.homeColor !== "string") {
+    cloned.homeColor = DEFAULT_HOME_TEAM_COLOR;
+  }
+  if (typeof cloned.awayColor !== "string") {
+    cloned.awayColor = DEFAULT_AWAY_TEAM_COLOR;
+  }
+  cloned.homeColor = normalizeTeamColor(cloned.homeColor, DEFAULT_HOME_TEAM_COLOR);
+  cloned.awayColor = normalizeTeamColor(cloned.awayColor, DEFAULT_AWAY_TEAM_COLOR);
   if (cloned.winner !== "home" && cloned.winner !== "away" && cloned.winner !== null) {
     cloned.winner = null;
   }
@@ -130,6 +149,8 @@ export function projectGameSummary(state: GameState, nowMs: number): GameSummary
     id: advanced.id,
     homeName: advanced.homeName,
     awayName: advanced.awayName,
+    homeColor: advanced.homeColor,
+    awayColor: advanced.awayColor,
     score: advanced.score,
     gameClockMs: advanced.gameClockMs,
     isRunning: advanced.isRunning,
@@ -443,6 +464,12 @@ export function applyGameCommand({
       }
       if (awayName.length > 0) {
         next.awayName = awayName;
+      }
+      if (typeof command.homeColor === "string") {
+        next.homeColor = normalizeTeamColor(command.homeColor, next.homeColor);
+      }
+      if (typeof command.awayColor === "string") {
+        next.awayColor = normalizeTeamColor(command.awayColor, next.awayColor);
       }
       return next;
     }

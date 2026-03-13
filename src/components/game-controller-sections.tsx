@@ -1,4 +1,4 @@
-import type { KeyboardEventHandler, RefObject } from "react";
+import type { CSSProperties, KeyboardEventHandler, RefObject } from "react";
 import { ArrowLeftRight, ChevronDown, ChevronUp } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -9,10 +9,9 @@ type ScoreColumnView = {
   team: TeamId;
   name: string;
   score: number;
-  scoreBoxClassName: string;
-  scoreValueBorderClassName: string;
-  scoreValueGlowClassName: string;
-  scoreDownButtonClassName: string;
+  scoreBoxStyle: CSSProperties;
+  scoreValueStyle: CSSProperties;
+  scoreDownButtonStyle: CSSProperties;
 };
 
 type ScorePulseState = { home: -1 | 0 | 1; away: -1 | 0 | 1 };
@@ -53,10 +52,10 @@ type PenaltyColumnView = {
   penalties: PenaltyEntryView[];
   visiblePenalties: PenaltyEntryView[];
   recentReleases: ReleasedPenaltyView[];
-  panelBorderClassName: string;
-  panelTintClassName: string;
-  headerTextClassName: string;
-  neutralChipClassName: string;
+  panelBorderStyle: CSSProperties;
+  panelTintStyle: CSSProperties;
+  headerTextStyle: CSSProperties;
+  neutralChipStyle: CSSProperties;
 };
 
 type TeamNameEditorState = {
@@ -64,15 +63,25 @@ type TeamNameEditorState = {
   renamingTeam: TeamId | null;
   homeName: string;
   awayName: string;
+  homeColor: string;
+  awayColor: string;
   activeTeamRenameInputRef: RefObject<HTMLInputElement | null>;
   leftTeamNameButtonRef: RefObject<HTMLButtonElement | null>;
   rightTeamNameButtonRef: RefObject<HTMLButtonElement | null>;
   displayTeamNameHeightPx: number | null;
   onOpenRename: (team: TeamId) => void;
   onRenameInputChange: (team: TeamId, value: string) => void;
+  onRenameColorChange: (team: TeamId, value: string) => void;
   onRenameInputKeyDown: KeyboardEventHandler<HTMLInputElement>;
   onSaveRename: () => void;
   onSwapDisplayedTeamSides: () => void;
+};
+
+type ClockThemeView = {
+  shellStyle: CSSProperties;
+  rotorStyle: CSSProperties;
+  rotorInnerStyle: CSSProperties;
+  ringStyle: CSSProperties;
 };
 
 export function ControllerTopSection({
@@ -96,6 +105,7 @@ export function ControllerTopSection({
   timeoutReminder,
   flagStatus,
   seekersStatus,
+  clockTheme,
 }: {
   controller: boolean;
   stateIsRunning: boolean;
@@ -117,6 +127,7 @@ export function ControllerTopSection({
   timeoutReminder: TimeoutReminderView;
   flagStatus: ClockAttachmentView;
   seekersStatus: ClockAttachmentView;
+  clockTheme: ClockThemeView;
 }) {
   return (
     <section className="rounded-2xl border border-slate-300 bg-white px-3 py-2 shadow-[0_8px_18px_rgba(15,23,42,0.08)]">
@@ -133,16 +144,28 @@ export function ControllerTopSection({
         />
 
         <div className="relative">
-          <div className="relative flex aspect-square w-[min(47vw,206px)] flex-col items-center overflow-hidden rounded-full border border-sky-300/60 bg-[radial-gradient(circle,#ffffff_34%,#dbeafe_70%,#bfdbfe_100%)] p-2 pt-3 shadow-[0_0_0_1px_rgba(125,211,252,0.5),0_0_24px_rgba(14,165,233,0.22)]">
+          <div
+            className="relative flex aspect-square w-[min(47vw,206px)] flex-col items-center overflow-hidden rounded-full border p-2 pt-3"
+            style={clockTheme.shellStyle}
+          >
             <div
-              className="clock-rotor pointer-events-none absolute inset-0 rounded-full bg-[conic-gradient(from_0deg,rgba(14,165,233,0.22),rgba(251,146,60,0.18),rgba(14,165,233,0.22))]"
-              style={{ animationPlayState: stateIsRunning ? "running" : "paused" }}
+              className="clock-rotor pointer-events-none absolute inset-0 rounded-full"
+              style={{
+                ...clockTheme.rotorStyle,
+                animationPlayState: stateIsRunning ? "running" : "paused",
+              }}
             />
             <div
-              className="clock-rotor-slow pointer-events-none absolute inset-3 rounded-full bg-[conic-gradient(from_180deg,rgba(255,255,255,0.8),rgba(14,165,233,0.14),rgba(255,255,255,0.8))]"
-              style={{ animationPlayState: stateIsRunning ? "running" : "paused" }}
+              className="clock-rotor-slow pointer-events-none absolute inset-3 rounded-full"
+              style={{
+                ...clockTheme.rotorInnerStyle,
+                animationPlayState: stateIsRunning ? "running" : "paused",
+              }}
             />
-            <div className="pointer-events-none absolute inset-2 rounded-full border border-sky-300/50" />
+            <div
+              className="pointer-events-none absolute inset-2 rounded-full border"
+              style={clockTheme.ringStyle}
+            />
 
             <div className="relative z-10 mt-6 text-center">
               <p className="text-[10px] font-semibold tracking-[0.18em] text-slate-700 uppercase">
@@ -282,14 +305,23 @@ function TeamScoreColumn({
     <div className="flex min-w-0 flex-col items-center gap-1">
       {isRenamingThis ? (
         <div className="grid w-full gap-1">
-          <Input
-            ref={editor.activeTeamRenameInputRef}
-            value={draftValue}
-            onChange={(event) => editor.onRenameInputChange(column.team, event.target.value)}
-            onKeyDown={editor.onRenameInputKeyDown}
-            className="h-7 border-slate-300 bg-white text-[10px] text-slate-900"
-            maxLength={40}
-          />
+          <div className="grid grid-cols-[minmax(0,1fr)_2rem] gap-1">
+            <Input
+              ref={editor.activeTeamRenameInputRef}
+              value={draftValue}
+              onChange={(event) => editor.onRenameInputChange(column.team, event.target.value)}
+              onKeyDown={editor.onRenameInputKeyDown}
+              className="h-7 border-slate-300 bg-white text-[10px] text-slate-900"
+              maxLength={40}
+            />
+            <input
+              type="color"
+              aria-label={`${column.team} team color`}
+              value={column.team === "home" ? editor.homeColor : editor.awayColor}
+              onChange={(event) => editor.onRenameColorChange(column.team, event.target.value)}
+              className="h-7 w-8 cursor-pointer rounded border border-slate-300 bg-white p-0.5"
+            />
+          </div>
           <div className="grid grid-cols-[minmax(0,1fr)_2rem] gap-1">
             <Button
               size="sm"
@@ -328,14 +360,16 @@ function TeamScoreColumn({
 
       <Button
         size="sm"
-        className={column.scoreBoxClassName}
+        className="h-8 w-full rounded-2xl border shadow-sm"
+        style={column.scoreBoxStyle}
         onClick={() => onAddScore(column.team)}
         disabled={scoreUpDisabled}
       >
         <ChevronUp className="h-4 w-4" />
       </Button>
       <div
-        className={`w-full rounded-2xl border bg-white px-2 py-2 text-center ${column.scoreValueBorderClassName} ${column.scoreValueGlowClassName}`}
+        className="w-full rounded-2xl border bg-white px-2 py-2 text-center"
+        style={column.scoreValueStyle}
       >
         <p
           className={`text-[clamp(1.75rem,9.4vw,2.45rem)] leading-none font-semibold tabular-nums transition-all duration-300 ${
@@ -352,7 +386,8 @@ function TeamScoreColumn({
       <Button
         size="sm"
         variant="outline"
-        className={column.scoreDownButtonClassName}
+        className="h-8 w-full rounded-2xl bg-white"
+        style={column.scoreDownButtonStyle}
         onClick={() => onUndoScore(column.team)}
         disabled={scoreDownDisabled}
       >
@@ -393,15 +428,18 @@ export function PenaltyColumnsSection({
       {penaltyColumns.map((column) => (
         <Card
           key={column.team}
-          className={`relative h-full min-h-0 overflow-hidden rounded-2xl ${column.panelBorderClassName} bg-white py-1 shadow-[0_8px_20px_rgba(15,23,42,0.1)]`}
+          className="relative h-full min-h-0 overflow-hidden rounded-2xl border bg-white py-1 shadow-[0_8px_20px_rgba(15,23,42,0.1)]"
+          style={column.panelBorderStyle}
         >
           <div
             aria-hidden="true"
-            className={`pointer-events-none absolute inset-0 ${column.panelTintClassName}`}
+            className="pointer-events-none absolute inset-0"
+            style={column.panelTintStyle}
           />
           <CardContent className="relative z-10 flex h-full min-h-0 flex-col gap-1 overflow-hidden px-2">
             <p
-              className={`truncate text-[10px] font-semibold tracking-[0.14em] uppercase ${column.headerTextClassName}`}
+              className="truncate text-[10px] font-semibold tracking-[0.14em] uppercase"
+              style={column.headerTextStyle}
             >
               {displayTeamName(column.team)} penalties
             </p>
@@ -420,8 +458,13 @@ export function PenaltyColumnsSection({
                           ? "animate-pulse border-red-300 bg-red-100 text-red-900"
                           : entry.highlight
                             ? "border-amber-300 bg-amber-100 text-amber-900"
-                            : column.neutralChipClassName
+                            : ""
                       }`}
+                      style={
+                        releaseActions.length > 0 || entry.highlight
+                          ? undefined
+                          : column.neutralChipStyle
+                      }
                     >
                       <div className="flex items-center justify-between gap-1">
                         <span>{entry.label}</span>

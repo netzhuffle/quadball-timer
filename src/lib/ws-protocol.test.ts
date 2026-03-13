@@ -296,6 +296,68 @@ describe("ws-protocol", () => {
     expect(parsed.error).toContain("Unsupported command type");
   });
 
+  test("parses rename-teams with optional colors", () => {
+    const parsed = parseClientWsMessage(
+      JSON.stringify({
+        type: "apply-commands",
+        gameId: "game-123",
+        commands: [
+          {
+            id: "cmd-rename-colors",
+            clientSentAtMs: 42,
+            command: {
+              type: "rename-teams",
+              homeName: "A",
+              awayName: "B",
+              homeColor: "#123abc",
+              awayColor: "fedcba",
+            },
+          },
+        ],
+      }),
+    );
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok || parsed.message.type !== "apply-commands") {
+      return;
+    }
+
+    expect(parsed.message.commands[0]?.command.type).toBe("rename-teams");
+    if (parsed.message.commands[0]?.command.type !== "rename-teams") {
+      return;
+    }
+    expect(parsed.message.commands[0].command.homeColor).toBe("#123abc");
+    expect(parsed.message.commands[0].command.awayColor).toBe("fedcba");
+  });
+
+  test("rejects rename-teams with invalid color", () => {
+    const parsed = parseClientWsMessage(
+      JSON.stringify({
+        type: "apply-commands",
+        gameId: "game-123",
+        commands: [
+          {
+            id: "cmd-rename-colors-invalid",
+            clientSentAtMs: 42,
+            command: {
+              type: "rename-teams",
+              homeName: "A",
+              awayName: "B",
+              homeColor: "#12zzzz",
+            },
+          },
+        ],
+      }),
+    );
+
+    expect(parsed.ok).toBe(false);
+    if (parsed.ok) {
+      return;
+    }
+
+    expect(parsed.error).toContain("homeColor");
+  });
+
   test("rejects command envelopes without client timestamp", () => {
     const parsed = parseClientWsMessage(
       JSON.stringify({
