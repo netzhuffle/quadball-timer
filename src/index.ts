@@ -39,6 +39,7 @@ const sockets = new Set<ServerWebSocket<SessionData>>();
 const MAX_TRACKED_COMMAND_IDS = 5_000;
 
 const server = serve<SessionData>({
+  hostname: process.env.HOST ?? "127.0.0.1",
   port: Number(process.env.PORT ?? 3000),
   routes: {
     "/ws": (req: Bun.BunRequest<"/ws">, routeServer: Bun.Server<SessionData>) => {
