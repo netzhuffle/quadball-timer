@@ -7,6 +7,7 @@ import {
   projectGameView,
 } from "@/lib/game-engine";
 import type { ControllerRole, GameCommand, GameState } from "@/lib/game-types";
+import { isInternalHealthHost } from "@/lib/internal-health";
 import { parseClientWsMessage, type ServerWsMessage } from "@/lib/ws-protocol";
 
 type ManagedGame = {
@@ -89,6 +90,15 @@ const server = serve<SessionData>({
         }
 
         return json({ game: projectGameView(game.state, Date.now()) });
+      },
+    },
+    "/internal/healthz": {
+      GET(req: Request) {
+        if (!isInternalHealthHost(req.headers.get("host"))) {
+          return json({ error: "Not found." }, 404);
+        }
+
+        return json({ ok: true, bunVersion: Bun.version });
       },
     },
     "/*": index,

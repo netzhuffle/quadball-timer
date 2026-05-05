@@ -83,13 +83,22 @@ restart_service() {
 
 check_health() {
   local api_health_url="http://127.0.0.1:${port}/api/games"
+  local internal_health_url="http://127.0.0.1:${port}/internal/healthz"
   local root_url="http://127.0.0.1:${port}/"
   local attempt
+  local internal_health_body
 
   for attempt in $(seq 1 20); do
     if curl --fail --silent --show-error --max-time 2 "$api_health_url" >/dev/null &&
+      internal_health_body="$(curl --fail --silent --show-error --max-time 2 "$internal_health_url")" &&
       curl --fail --silent --show-error --max-time 2 "$root_url" | grep -qi "<!doctype html"
     then
+      if [[ "$internal_health_body" != *"\"bunVersion\":\"${expected_bun_version}\""* ]]; then
+        echo "Runtime Bun version mismatch in internal health check: expected ${expected_bun_version}." >&2
+        echo "Health response: ${internal_health_body}" >&2
+        return 1
+      fi
+
       return 0
     fi
     sleep 1
