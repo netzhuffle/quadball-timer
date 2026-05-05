@@ -20,7 +20,7 @@ describe("team-colors", () => {
   });
 
   test("parses normalized hex color channels", () => {
-    expect(parseHexColor("#0ea5e9")).toEqual({ r: 14, g: 165, b: 233 });
+    expect(parseHexColor(DEFAULT_HOME_TEAM_COLOR)).toEqual({ r: 0, g: 175, b: 232 });
     expect(parseHexColor("nope")).toBeNull();
   });
 
@@ -36,7 +36,7 @@ describe("team-colors", () => {
   });
 
   test("builds rgba color strings", () => {
-    expect(withColorAlpha("#0ea5e9", 0.25)).toBe("rgba(14,165,233,0.25)");
+    expect(withColorAlpha(DEFAULT_HOME_TEAM_COLOR, 0.25)).toBe("rgba(0,175,232,0.25)");
     expect(withColorAlpha("bad", 1.5)).toBe("rgba(15,23,42,1)");
   });
 
@@ -60,9 +60,9 @@ describe("team-colors", () => {
     expect(
       oklchToHex(
         shiftOklch(homeOklch, {
-          dl: 0.216312767,
-          dc: -0.089868614,
-          dh: -6.420517928,
+          dl: 0.194166550952,
+          dc: -0.084024072372,
+          dh: 0.177204098138,
         }),
       ),
     ).toBe("#b8e6fe");

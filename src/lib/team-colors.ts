@@ -1,5 +1,5 @@
-export const DEFAULT_HOME_TEAM_COLOR = "#0ea5e9";
-export const DEFAULT_AWAY_TEAM_COLOR = "#f97316";
+export const DEFAULT_HOME_TEAM_COLOR = "#00afe8";
+export const DEFAULT_AWAY_TEAM_COLOR = "#ff4d35";
 
 const HEX_COLOR_PATTERN = /^#?([0-9a-fA-F]{6})$/;
 

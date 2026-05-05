@@ -647,41 +647,40 @@ export function GamePage({ gameId, role }: { gameId: string; role: ControllerRol
       team: TeamId;
       name: string;
       score: number;
-      scoreBoxStyle: CSSProperties;
-      scoreValueStyle: CSSProperties;
-      scoreDownButtonStyle: CSSProperties;
     }
   > = {
     home: {
       team: "home",
       name: state.homeName,
       score: state.score.home,
-      scoreBoxStyle: buildScoreUpButtonStyle(teamColorsByTeam.home),
-      scoreValueStyle: buildScoreValueStyle(teamColorsByTeam.home),
-      scoreDownButtonStyle: buildScoreDownButtonStyle(teamColorsByTeam.home),
     },
     away: {
       team: "away",
       name: state.awayName,
       score: state.score.away,
-      scoreBoxStyle: buildScoreUpButtonStyle(teamColorsByTeam.away),
-      scoreValueStyle: buildScoreValueStyle(teamColorsByTeam.away),
-      scoreDownButtonStyle: buildScoreDownButtonStyle(teamColorsByTeam.away),
     },
   };
   const leftTeam: TeamId = state.displaySidesSwapped ? "away" : "home";
   const rightTeam: TeamId = state.displaySidesSwapped ? "home" : "away";
   const displayTeamOrder: [TeamId, TeamId] = [leftTeam, rightTeam];
-  const scoreColumns: Array<{
+  const scoreColumnsWithStyles: Array<{
     team: TeamId;
     name: string;
     score: number;
     scoreBoxStyle: CSSProperties;
     scoreValueStyle: CSSProperties;
     scoreDownButtonStyle: CSSProperties;
-  }> = displayTeamOrder.map((team) => scoreColumnsByTeam[team]);
-  const homeScoreColumn = scoreColumns[0]!;
-  const awayScoreColumn = scoreColumns[1]!;
+  }> = displayTeamOrder.map((team, index) => {
+    const side = index === 0 ? "left" : "right";
+    return {
+      ...scoreColumnsByTeam[team],
+      scoreBoxStyle: buildScoreUpButtonStyle(teamColorsByTeam[team], side),
+      scoreValueStyle: buildScoreValueStyle(teamColorsByTeam[team]),
+      scoreDownButtonStyle: buildScoreDownButtonStyle(teamColorsByTeam[team]),
+    };
+  });
+  const homeScoreColumn = scoreColumnsWithStyles[0]!;
+  const awayScoreColumn = scoreColumnsWithStyles[1]!;
   const clockTheme = buildClockTheme(teamColorsByTeam[leftTeam], teamColorsByTeam[rightTeam]);
   const homeTabTheme = { activeStyle: buildActionPanelTabStyle("card", teamColorsByTeam.home) };
   const awayTabTheme = {

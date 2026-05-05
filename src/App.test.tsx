@@ -4,6 +4,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { Window } from "happy-dom";
 import { App } from "./App";
 import { createInitialGameState, projectGameView } from "@/lib/game-engine";
+import { DEFAULT_AWAY_TEAM_COLOR, DEFAULT_HOME_TEAM_COLOR } from "@/lib/team-colors";
 
 class MockWebSocket {
   static CONNECTING = 0;
@@ -377,8 +378,8 @@ describe("App", () => {
     };
     expect(parsed.type).toBe("apply-commands");
     expect(parsed.commands?.[0]?.command?.type).toBe("rename-teams");
-    expect(parsed.commands?.[0]?.command?.homeColor).toBe("#0ea5e9");
-    expect(parsed.commands?.[0]?.command?.awayColor).toBe("#f97316");
+    expect(parsed.commands?.[0]?.command?.homeColor).toBe(DEFAULT_HOME_TEAM_COLOR);
+    expect(parsed.commands?.[0]?.command?.awayColor).toBe(DEFAULT_AWAY_TEAM_COLOR);
   });
 
   test("side switch closes team editor when no unsaved rename draft exists", async () => {
@@ -660,8 +661,8 @@ describe("App", () => {
       homeColor?: string;
       awayColor?: string;
     };
-    expect(payload.homeColor).toBe("#0ea5e9");
-    expect(payload.awayColor).toBe("#f97316");
+    expect(payload.homeColor).toBe(DEFAULT_HOME_TEAM_COLOR);
+    expect(payload.awayColor).toBe(DEFAULT_AWAY_TEAM_COLOR);
   });
 
   test("color test route renders 100 color samples", async () => {

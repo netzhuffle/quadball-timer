@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { applyGameCommand, createInitialGameState, projectGameView } from "@/lib/game-engine";
 import type { GameState } from "@/lib/game-types";
+import { DEFAULT_AWAY_TEAM_COLOR, DEFAULT_HOME_TEAM_COLOR } from "@/lib/team-colors";
 
 function createIdGenerator() {
   let counter = 0;
@@ -22,8 +23,8 @@ function getPlayerRemainingMs(state: GameState, key: string) {
 describe("game-engine", () => {
   test("initial state includes default team colors", () => {
     const state = createInitialGameState({ id: "game-colors-default", nowMs: 0 });
-    expect(state.homeColor).toBe("#0ea5e9");
-    expect(state.awayColor).toBe("#f97316");
+    expect(state.homeColor).toBe(DEFAULT_HOME_TEAM_COLOR);
+    expect(state.awayColor).toBe(DEFAULT_AWAY_TEAM_COLOR);
   });
 
   test("rename-teams updates names and colors while preserving invalid color values", () => {

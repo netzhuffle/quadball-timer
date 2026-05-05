@@ -5,7 +5,11 @@ import {
   buildScoreUpButtonStyle,
   buildScoreValueStyle,
 } from "@/lib/score-color-theme";
-import { normalizeTeamColor } from "@/lib/team-colors";
+import {
+  DEFAULT_AWAY_TEAM_COLOR,
+  DEFAULT_HOME_TEAM_COLOR,
+  normalizeTeamColor,
+} from "@/lib/team-colors";
 import "../index.css";
 
 export function ColorTestPage() {
@@ -37,7 +41,7 @@ export function ColorTestPage() {
                   style={{ backgroundColor: color }}
                 />
                 <span className="truncate text-[11px] font-mono text-slate-700">
-                  {normalizeTeamColor(color, "#0ea5e9")}
+                  {normalizeTeamColor(color, DEFAULT_HOME_TEAM_COLOR)}
                 </span>
               </div>
 
@@ -76,8 +80,8 @@ export function ColorTestPage() {
 
 function buildColorPalette() {
   const seeded: string[] = [
-    "#0ea5e9",
-    "#f97316",
+    DEFAULT_HOME_TEAM_COLOR,
+    DEFAULT_AWAY_TEAM_COLOR,
     "#22c55e",
     "#000000",
     "#ffffff",

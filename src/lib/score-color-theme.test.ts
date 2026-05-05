@@ -13,8 +13,8 @@ import { DEFAULT_AWAY_TEAM_COLOR, DEFAULT_HOME_TEAM_COLOR } from "@/lib/team-col
 
 describe("score-color-theme", () => {
   test("matches previous default up-button visuals through algorithmic family mapping", () => {
-    const home = buildScoreUpButtonStyle(DEFAULT_HOME_TEAM_COLOR);
-    const away = buildScoreUpButtonStyle(DEFAULT_AWAY_TEAM_COLOR);
+    const home = buildScoreUpButtonStyle(DEFAULT_HOME_TEAM_COLOR, "left");
+    const away = buildScoreUpButtonStyle(DEFAULT_AWAY_TEAM_COLOR, "right");
 
     expect(home.borderColor).toBe("oklch(82.8% 0.111 230.318)");
     expect(home.backgroundImage).toBe(
@@ -27,6 +27,18 @@ describe("score-color-theme", () => {
       "linear-gradient(to bottom right in oklab, oklch(70.5% 0.213 47.604), oklch(64.5% 0.246 16.439))",
     );
     expect(away.color).toBe("#ffffff");
+  });
+
+  test("flips up-button gradient direction by display side", () => {
+    const leftSide = buildScoreUpButtonStyle("#f67a1c", "left");
+    const rightSide = buildScoreUpButtonStyle("#f67a1c", "right");
+
+    expect(leftSide.backgroundImage).toBe(
+      "linear-gradient(to bottom right in oklab, oklch(68.587% 0.206 35.971), oklch(74.587% 0.173 67.136))",
+    );
+    expect(rightSide.backgroundImage).toBe(
+      "linear-gradient(to bottom right in oklab, oklch(74.587% 0.173 67.136), oklch(68.587% 0.206 35.971))",
+    );
   });
 
   test("matches previous default down and value box visuals through algorithmic family mapping", () => {
@@ -101,8 +113,8 @@ describe("score-color-theme", () => {
   });
 
   test("uses the same structural algorithm for near-default colors", () => {
-    const nearHome = buildScoreUpButtonStyle("#14a2e6");
-    const nearAway = buildScoreUpButtonStyle("#f67a1c");
+    const nearHome = buildScoreUpButtonStyle("#14a2e6", "left");
+    const nearAway = buildScoreUpButtonStyle("#f67a1c", "right");
     expect(nearHome.backgroundImage).toContain("linear-gradient(to bottom right in oklab");
     expect(nearAway.backgroundImage).toContain("linear-gradient(to bottom right in oklab");
     expect(nearHome.backgroundImage).toContain("oklch(");

@@ -1,5 +1,6 @@
 import type { CSSProperties } from "react";
 import {
+  DEFAULT_AWAY_TEAM_COLOR,
   DEFAULT_HOME_TEAM_COLOR,
   getReadableTextColor,
   hexToOklch,
@@ -7,12 +8,12 @@ import {
   normalizeTeamColor,
   oklchToCss,
   oklchToHex,
-  parseHexColor,
+  type OklchColor,
   shiftOklch,
 } from "@/lib/team-colors";
 
 export type ActionPanelTabKind = "card" | "timeout" | "game";
-type ColorFamily = "neutral" | "cool" | "warm" | "green" | "yellow";
+type ThemeFamily = "home" | "away";
 
 type ColorShift = {
   dl: number;
@@ -20,7 +21,8 @@ type ColorShift = {
   dh: number;
 };
 
-type ColorProfile = {
+type ThemeProfile = {
+  base: ColorShift;
   upLead: ColorShift;
   upBorder: ColorShift;
   upTrail: ColorShift;
@@ -39,7 +41,8 @@ type ColorProfile = {
   chipBackgroundAlpha: number;
 };
 
-const COOL_PROFILE: ColorProfile = {
+const HOME_PROFILE: ThemeProfile = {
+  base: { dl: -0.022146216048, dc: 0.005844541628, dh: 6.597722026138 },
   upLead: { dl: 0.000312767, dc: 0.021131386, dh: 0.000482072 },
   upBorder: { dl: 0.143312767, dc: -0.036868614, dh: -7.004517928 },
   upTrail: { dl: 0.030312767, dc: -0.004868614, dh: -22.101517928 },
@@ -58,7 +61,8 @@ const COOL_PROFILE: ColorProfile = {
   chipBackgroundAlpha: 0.8,
 };
 
-const WARM_PROFILE: ColorProfile = {
+const AWAY_PROFILE: ThemeProfile = {
+  base: { dl: 0.034660517055, dc: -0.031250483754, dh: 16.652347502065 },
   upLead: { dl: 0.000128747, dc: 0.026278916, dh: -0.000420862 },
   upBorder: { dl: 0.132128747, dc: -0.058721084, dh: 18.685579138 },
   upTrail: { dl: -0.059871253, dc: 0.059278916, dh: -31.165420862 },
@@ -77,67 +81,31 @@ const WARM_PROFILE: ColorProfile = {
   chipBackgroundAlpha: 0.75,
 };
 
-const GREEN_PROFILE: ColorProfile = {
-  ...COOL_PROFILE,
-  upLead: { dl: 0.001, dc: 0.02, dh: 0 },
-  upBorder: { dl: 0.14, dc: -0.05, dh: 4 },
-  upTrail: { dl: 0.03, dc: -0.02, dh: 16 },
-  downBorder: { dl: 0.21, dc: -0.09, dh: 6 },
-  downText: { dl: -0.17, dc: -0.02, dh: -4 },
-  header: { dl: -0.24, dc: -0.045, dh: -7 },
-  panelTop: { dl: 0.275, dc: -0.155, dh: 8 },
-  tabCardTrail: { dl: -0.09, dc: -0.01, dh: 14 },
-  tabTimeoutTrail: { dl: 0.055, dc: -0.02, dh: 18 },
-  tabCardGlow: { dl: 0.07, dc: -0.01, dh: 8 },
-  tabTimeoutGlow: { dl: 0.055, dc: -0.025, dh: 8 },
-};
-
-const YELLOW_PROFILE: ColorProfile = {
-  ...WARM_PROFILE,
-  upLead: { dl: 0.001, dc: 0.022, dh: 0 },
-  upBorder: { dl: 0.13, dc: -0.06, dh: 12 },
-  upTrail: { dl: 0.015, dc: -0.015, dh: -12 },
-  downBorder: { dl: 0.2, dc: -0.11, dh: 18 },
-  downText: { dl: -0.16, dc: -0.02, dh: -4 },
-  header: { dl: -0.23, dc: -0.045, dh: -7 },
-  panelTop: { dl: 0.28, dc: -0.16, dh: 18 },
-  tabTimeoutTrail: { dl: 0.05, dc: -0.015, dh: 14 },
-  tabTimeoutGlow: { dl: 0.055, dc: -0.025, dh: 8 },
-};
-
 const GAME_PROFILE = {
   lead: { dl: 0.015163126, dc: 0.195453798, dh: -118.546895753 },
   trail: { dl: -0.038397437, dc: 0.236926392, dh: -172.090080395 },
   glow: { dl: 0.015163126, dc: 0.195453798, dh: -118.546895753 },
 };
 
-export function buildScoreUpButtonStyle(teamColor: string): CSSProperties {
-  const normalized = normalizeTeamColor(teamColor, DEFAULT_HOME_TEAM_COLOR);
-  const family = getColorFamily(normalized);
-  if (family === "neutral") {
-    if (isDarkTone(normalized)) {
-      return {
-        borderColor: "rgba(100,116,139,0.58)",
-        backgroundImage: "linear-gradient(135deg, #334155, #111827)",
-        color: "#ffffff",
-        boxShadow: "0 1px 2px rgba(15,23,42,0.2)",
-      };
-    }
+const DEFAULT_HOME_OKLCH = requireValidOklch(DEFAULT_HOME_TEAM_COLOR);
+const DEFAULT_AWAY_OKLCH = requireValidOklch(DEFAULT_AWAY_TEAM_COLOR);
 
-    return {
-      borderColor: "rgba(148,163,184,0.58)",
-      backgroundImage: "linear-gradient(135deg, #f8fafc, #e2e8f0)",
-      color: "#0f172a",
-      boxShadow: "0 1px 2px rgba(15,23,42,0.08)",
-    };
-  }
-
-  const profile = getFamilyProfile(family);
-  const lead = shiftColorCss(normalized, profile.upLead);
-  const trail = shiftColorCss(normalized, profile.upTrail);
-  const border = shiftColorCss(normalized, profile.upBorder);
-  const leadHex = shiftColorHex(normalized, profile.upLead);
-  const trailHex = shiftColorHex(normalized, profile.upTrail);
+export function buildScoreUpButtonStyle(
+  teamColor: string,
+  side: "left" | "right" = "left",
+): CSSProperties {
+  const { themeBase, profile } = resolveTheme(teamColor);
+  const leadColor = shiftOklch(themeBase, profile.upLead);
+  const trailColor = shiftOklch(themeBase, profile.upTrail);
+  const [darkerColor, brighterColor] =
+    leadColor.l <= trailColor.l ? [leadColor, trailColor] : [trailColor, leadColor];
+  const startColor = side === "left" ? darkerColor : brighterColor;
+  const endColor = side === "left" ? brighterColor : darkerColor;
+  const lead = oklchToCss(startColor);
+  const trail = oklchToCss(endColor);
+  const border = shiftColorCss(themeBase, profile.upBorder);
+  const leadHex = oklchToHex(startColor);
+  const trailHex = oklchToHex(endColor);
 
   return {
     borderColor: border,
@@ -147,104 +115,42 @@ export function buildScoreUpButtonStyle(teamColor: string): CSSProperties {
 }
 
 export function buildScoreValueStyle(teamColor: string): CSSProperties {
-  const normalized = normalizeTeamColor(teamColor, DEFAULT_HOME_TEAM_COLOR);
-  const family = getColorFamily(normalized);
-  if (family === "neutral") {
-    if (isDarkTone(normalized)) {
-      return {
-        borderColor: "rgba(100,116,139,0.5)",
-        boxShadow: "inset 0 0 10px rgba(30,41,59,0.16)",
-      };
-    }
-
-    return {
-      borderColor: "rgba(148,163,184,0.5)",
-      boxShadow: "inset 0 0 10px rgba(148,163,184,0.12)",
-    };
-  }
-
-  const profile = getFamilyProfile(family);
+  const { themeBase, profile } = resolveTheme(teamColor);
   return {
-    borderColor: shiftColorCss(normalized, profile.downBorder),
-    boxShadow: `inset 0 0 12px ${baseColorCss(normalized, profile.scoreGlowAlpha)}`,
+    borderColor: shiftColorCss(themeBase, profile.downBorder),
+    boxShadow: `inset 0 0 12px ${baseColorCss(themeBase, profile.scoreGlowAlpha)}`,
   };
 }
 
 export function buildScoreDownButtonStyle(teamColor: string): CSSProperties {
-  const normalized = normalizeTeamColor(teamColor, DEFAULT_HOME_TEAM_COLOR);
-  const family = getColorFamily(normalized);
-  if (family === "neutral") {
-    if (isDarkTone(normalized)) {
-      return {
-        borderColor: "rgba(100,116,139,0.5)",
-        backgroundColor: "rgba(241,245,249,0.7)",
-        color: "#475569",
-        boxShadow: "none",
-      };
-    }
-
-    return {
-      borderColor: "rgba(148,163,184,0.5)",
-      backgroundColor: "rgba(248,250,252,0.92)",
-      color: "#64748b",
-      boxShadow: "none",
-    };
-  }
-
-  const profile = getFamilyProfile(family);
+  const { themeBase, profile } = resolveTheme(teamColor);
   return {
-    borderColor: shiftColorCss(normalized, profile.downBorder),
+    borderColor: shiftColorCss(themeBase, profile.downBorder),
     backgroundColor: "#ffffff",
-    color: shiftColorCss(normalized, profile.downText),
+    color: shiftColorCss(themeBase, profile.downText),
     boxShadow: "none",
   };
 }
 
 export function buildPenaltyPanelBorderStyle(teamColor: string): CSSProperties {
-  const normalized = normalizeTeamColor(teamColor, DEFAULT_HOME_TEAM_COLOR);
-  const family = getColorFamily(normalized);
-  if (family === "neutral") {
-    return {
-      borderColor: "rgba(148,163,184,0.5)",
-    };
-  }
-
-  const profile = getFamilyProfile(family);
+  const { themeBase, profile } = resolveTheme(teamColor);
   return {
-    borderColor: shiftColorCss(normalized, profile.downBorder),
+    borderColor: shiftColorCss(themeBase, profile.downBorder),
   };
 }
 
 export function buildPenaltyHeaderStyle(teamColor: string): CSSProperties {
-  const normalized = normalizeTeamColor(teamColor, DEFAULT_HOME_TEAM_COLOR);
-  const family = getColorFamily(normalized);
-  if (family === "neutral") {
-    return {
-      color: "#334155",
-    };
-  }
-
-  const profile = getFamilyProfile(family);
+  const { themeBase, profile } = resolveTheme(teamColor);
   return {
-    color: shiftColorCss(normalized, profile.header),
+    color: shiftColorCss(themeBase, profile.header),
   };
 }
 
 export function buildPenaltyNeutralChipStyle(teamColor: string): CSSProperties {
-  const normalized = normalizeTeamColor(teamColor, DEFAULT_HOME_TEAM_COLOR);
-  const family = getColorFamily(normalized);
-  if (family === "neutral") {
-    return {
-      borderColor: "rgba(148,163,184,0.5)",
-      backgroundColor: "rgba(248,250,252,0.85)",
-      color: "#0f172a",
-    };
-  }
-
-  const profile = getFamilyProfile(family);
+  const { themeBase, profile } = resolveTheme(teamColor);
   return {
-    borderColor: shiftColorCss(normalized, profile.downBorder),
-    backgroundColor: shiftColorCss(normalized, profile.panelTop, profile.chipBackgroundAlpha),
+    borderColor: shiftColorCss(themeBase, profile.downBorder),
+    backgroundColor: shiftColorCss(themeBase, profile.panelTop, profile.chipBackgroundAlpha),
     color: "#0f172a",
   };
 }
@@ -253,20 +159,11 @@ export function buildPenaltyPanelTintStyle(
   teamColor: string,
   side: "left" | "right",
 ): CSSProperties {
-  const normalized = normalizeTeamColor(teamColor, DEFAULT_HOME_TEAM_COLOR);
-  const family = getColorFamily(normalized);
+  const { themeBase, profile } = resolveTheme(teamColor);
   const anchor = side === "left" ? "12%" : "88%";
-
-  if (family === "neutral") {
-    return {
-      backgroundImage: `radial-gradient(circle at ${anchor} 18%, rgba(148,163,184,0.14), rgba(148,163,184,0.05) 34%, rgba(255,255,255,0) 68%), linear-gradient(180deg, rgba(248,250,252,0.9), rgba(255,255,255,0.95) 32%, rgba(255,255,255,0.98))`,
-    };
-  }
-
-  const profile = getFamilyProfile(family);
-  const tintStart = baseColorCss(normalized, profile.tintStartAlpha);
-  const tintMid = baseColorCss(normalized, profile.tintMidAlpha);
-  const topTone = shiftColorCss(normalized, profile.panelTop, profile.topToneAlpha);
+  const tintStart = baseColorCss(themeBase, profile.tintStartAlpha);
+  const tintMid = baseColorCss(themeBase, profile.tintMidAlpha);
+  const topTone = shiftColorCss(themeBase, profile.panelTop, profile.topToneAlpha);
 
   return {
     backgroundImage: `radial-gradient(circle at ${anchor} 18%, ${tintStart}, ${tintMid} 34%, rgba(255,255,255,0) 68%), linear-gradient(180deg, ${topTone}, rgba(255,255,255,0.95) 32%, rgba(255,255,255,0.98))`,
@@ -288,37 +185,37 @@ export function buildActionPanelTabStyle(
   let trailHex: string;
 
   if (kind === "game") {
-    const blend = mixHexColors(normalizedPrimary, normalizedSecondary, 0.5);
-    lead = shiftColorCss(blend, GAME_PROFILE.lead);
-    trail = shiftColorCss(blend, GAME_PROFILE.trail);
-    glow = shiftColorCss(blend, GAME_PROFILE.glow, 0.55);
-    leadHex = shiftColorHex(blend, GAME_PROFILE.lead);
-    trailHex = shiftColorHex(blend, GAME_PROFILE.trail);
+    const primaryTheme = shiftColorHex(resolveTheme(normalizedPrimary).themeBase, {
+      dl: 0,
+      dc: 0,
+      dh: 0,
+    });
+    const secondaryTheme = shiftColorHex(resolveTheme(normalizedSecondary).themeBase, {
+      dl: 0,
+      dc: 0,
+      dh: 0,
+    });
+    const blend = mixHexColors(primaryTheme, secondaryTheme, 0.5);
+    const blendOklch = toOklchOrDefault(blend);
+    lead = shiftColorCss(blendOklch, GAME_PROFILE.lead);
+    trail = shiftColorCss(blendOklch, GAME_PROFILE.trail);
+    glow = shiftColorCss(blendOklch, GAME_PROFILE.glow, 0.55);
+    leadHex = shiftColorHex(blendOklch, GAME_PROFILE.lead);
+    trailHex = shiftColorHex(blendOklch, GAME_PROFILE.trail);
   } else {
-    const family = getColorFamily(normalizedPrimary);
-    if (family === "neutral") {
-      const neutralLead = isDarkTone(normalizedPrimary) ? "#334155" : "#64748b";
-      const neutralTrail = isDarkTone(normalizedPrimary) ? "#1e293b" : "#475569";
-      return {
-        backgroundImage: `linear-gradient(135deg, ${neutralLead}, ${neutralTrail})`,
-        color: "#ffffff",
-        boxShadow: "0 0 12px rgba(15,23,42,0.18)",
-      };
-    }
-
-    const profile = getFamilyProfile(family);
+    const { themeBase, profile } = resolveTheme(normalizedPrimary);
     if (kind === "card") {
-      lead = shiftColorCss(normalizedPrimary, profile.upTrail);
-      trail = shiftColorCss(normalizedPrimary, profile.tabCardTrail);
-      glow = shiftColorCss(normalizedPrimary, profile.tabCardGlow, 0.55);
-      leadHex = shiftColorHex(normalizedPrimary, profile.upTrail);
-      trailHex = shiftColorHex(normalizedPrimary, profile.tabCardTrail);
+      lead = shiftColorCss(themeBase, profile.upTrail);
+      trail = shiftColorCss(themeBase, profile.tabCardTrail);
+      glow = shiftColorCss(themeBase, profile.tabCardGlow, 0.55);
+      leadHex = shiftColorHex(themeBase, profile.upTrail);
+      trailHex = shiftColorHex(themeBase, profile.tabCardTrail);
     } else {
-      lead = shiftColorCss(normalizedPrimary, profile.upLead);
-      trail = shiftColorCss(normalizedPrimary, profile.tabTimeoutTrail);
-      glow = shiftColorCss(normalizedPrimary, profile.tabTimeoutGlow, 0.5);
-      leadHex = shiftColorHex(normalizedPrimary, profile.upLead);
-      trailHex = shiftColorHex(normalizedPrimary, profile.tabTimeoutTrail);
+      lead = shiftColorCss(themeBase, profile.upLead);
+      trail = shiftColorCss(themeBase, profile.tabTimeoutTrail);
+      glow = shiftColorCss(themeBase, profile.tabTimeoutGlow, 0.5);
+      leadHex = shiftColorHex(themeBase, profile.upLead);
+      trailHex = shiftColorHex(themeBase, profile.tabTimeoutTrail);
     }
   }
 
@@ -329,85 +226,53 @@ export function buildActionPanelTabStyle(
   };
 }
 
-function getColorFamily(color: string): ColorFamily {
+function resolveTheme(teamColor: string) {
+  const source = toOklchOrDefault(teamColor);
+  const family = getThemeFamily(source);
+  const profile = getThemeProfile(family);
+  return {
+    themeBase: shiftOklch(source, profile.base),
+    profile,
+  };
+}
+
+function getThemeFamily(color: OklchColor): ThemeFamily {
+  const homeDistance = getHueDistance(color.h, DEFAULT_HOME_OKLCH.h);
+  const awayDistance = getHueDistance(color.h, DEFAULT_AWAY_OKLCH.h);
+  return homeDistance <= awayDistance ? "home" : "away";
+}
+
+function getThemeProfile(family: ThemeFamily) {
+  return family === "home" ? HOME_PROFILE : AWAY_PROFILE;
+}
+
+function baseColorCss(color: OklchColor, alpha?: number) {
+  return oklchToCss(color, alpha);
+}
+
+function shiftColorCss(color: OklchColor, shift: ColorShift, alpha?: number) {
+  return oklchToCss(shiftOklch(color, shift), alpha);
+}
+
+function shiftColorHex(color: OklchColor, shift: ColorShift) {
+  return oklchToHex(shiftOklch(color, shift));
+}
+
+function toOklchOrDefault(color: string) {
+  const normalized = normalizeTeamColor(color, DEFAULT_HOME_TEAM_COLOR);
+  return hexToOklch(normalized) ?? DEFAULT_HOME_OKLCH;
+}
+
+function requireValidOklch(color: string) {
   const oklch = hexToOklch(color);
-  if (oklch === null || oklch.c <= 0.03) {
-    return "neutral";
+  if (oklch !== null) {
+    return oklch;
   }
 
-  const hue = oklch.h;
-  if (isHueInRange(hue, 70, 115)) {
-    return "yellow";
-  }
-  if (isHueInRange(hue, 115, 185)) {
-    return "green";
-  }
-  if (isHueInRange(hue, 185, 305)) {
-    return "cool";
-  }
-
-  return "warm";
+  throw new Error(`Invalid default team color: ${color}`);
 }
 
-function getFamilyProfile(family: Exclude<ColorFamily, "neutral">) {
-  if (family === "cool") {
-    return COOL_PROFILE;
-  }
-  if (family === "warm") {
-    return WARM_PROFILE;
-  }
-  if (family === "yellow") {
-    return YELLOW_PROFILE;
-  }
-
-  return GREEN_PROFILE;
-}
-
-function baseColorCss(color: string, alpha?: number) {
-  const oklch = hexToOklch(color);
-  if (oklch === null) {
-    return alpha === undefined
-      ? normalizeTeamColor(color, DEFAULT_HOME_TEAM_COLOR)
-      : "rgba(15,23,42,0.2)";
-  }
-
-  return oklchToCss(oklch, alpha);
-}
-
-function shiftColorCss(color: string, shift: ColorShift, alpha?: number) {
-  const oklch = hexToOklch(color);
-  if (oklch === null) {
-    return alpha === undefined
-      ? normalizeTeamColor(color, DEFAULT_HOME_TEAM_COLOR)
-      : "rgba(15,23,42,0.2)";
-  }
-
-  return oklchToCss(shiftOklch(oklch, shift), alpha);
-}
-
-function shiftColorHex(color: string, shift: ColorShift) {
-  const oklch = hexToOklch(color);
-  if (oklch === null) {
-    return normalizeTeamColor(color, DEFAULT_HOME_TEAM_COLOR);
-  }
-
-  return oklchToHex(shiftOklch(oklch, shift));
-}
-
-function isDarkTone(color: string) {
-  const parsed = parseHexColor(color);
-  if (parsed === null) {
-    return false;
-  }
-
-  const luma = 0.2126 * parsed.r + 0.7152 * parsed.g + 0.0722 * parsed.b;
-  return luma < 90;
-}
-
-function isHueInRange(hue: number, start: number, end: number) {
-  if (start <= end) {
-    return hue >= start && hue < end;
-  }
-
-  return hue >= start || hue < end;
+function getHueDistance(a: number, b: number) {
+  const direct = Math.abs(a - b);
+  return Math.min(direct, 360 - direct);
 }
