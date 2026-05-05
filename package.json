@@ -3,15 +3,18 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "packageManager": "bun@1.3.13",
   "scripts": {
     "dev": "bun --hot src/index.ts",
     "start": "cd dist && NODE_ENV=production bun index.js",
     "build": "bun run build.ts",
-    "test": "bun test",
+    "test": "bun test --isolate",
+    "test:changed": "bun test --changed",
     "format": "bunx --bun oxfmt \"**/*.{js,jsx,ts,tsx,mjs,cjs}\"",
     "format:check": "bunx --bun oxfmt \"**/*.{js,jsx,ts,tsx,mjs,cjs}\" --check",
     "lint": "bunx --bun oxlint --type-aware --type-check",
-    "check": "bun run format:check && bun run lint"
+    "check:bun-version": "bun scripts/check-bun-version.ts",
+    "check": "bun run check:bun-version && bun run format:check && bun run lint"
   },
   "dependencies": {
     "@radix-ui/react-label": "^2.1.8",
@@ -26,9 +29,10 @@
     "tailwind-merge": "^3.5.0"
   },
   "devDependencies": {
-    "@types/bun": "^1.3.10",
+    "@types/bun": "1.3.13",
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",
+    "bun": "1.3.13",
     "happy-dom": "^20.8.4",
     "oxfmt": "^0.40.0",
     "oxlint": "^1.55.0",

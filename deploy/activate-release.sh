@@ -62,6 +62,17 @@ if [[ -L "$current_link" || -d "$current_link" ]]; then
 fi
 
 cd "$release_dir"
+
+expected_bun_version="$(
+  bun --print 'const packageJson = await Bun.file("package.json").json(); const packageManager = packageJson.packageManager; if (typeof packageManager !== "string" || !packageManager.startsWith("bun@")) throw new Error("package.json must pin Bun with packageManager"); packageManager.slice("bun@".length);'
+)"
+actual_bun_version="$(bun --version)"
+
+if [[ "$actual_bun_version" != "$expected_bun_version" ]]; then
+  echo "Bun version mismatch: packageManager pins ${expected_bun_version}, but server has ${actual_bun_version}." >&2
+  exit 1
+fi
+
 bun install --frozen-lockfile --production
 
 ln -sfn "$release_dir" "$current_link"
