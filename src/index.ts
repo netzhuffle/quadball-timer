@@ -8,6 +8,7 @@ import {
 } from "@/lib/game-engine";
 import type { ControllerRole, GameCommand, GameState } from "@/lib/game-types";
 import { isInternalHealthHost } from "@/lib/internal-health";
+import { isAllowedWebSocketOrigin } from "@/lib/ws-origin";
 import { parseClientWsMessage, type ServerWsMessage } from "@/lib/ws-protocol";
 
 type ManagedGame = {
@@ -44,6 +45,15 @@ const server = serve<SessionData>({
   port: Number(process.env.PORT ?? 3000),
   routes: {
     "/ws": (req: Bun.BunRequest<"/ws">, routeServer: Bun.Server<SessionData>) => {
+      if (!isAllowedWebSocketOrigin(req.headers.get("origin"), req.headers.get("host"))) {
+        return json(
+          {
+            error: "WebSocket origin not allowed.",
+          },
+          403,
+        );
+      }
+
       const upgraded = routeServer.upgrade(req, {
         data: {
           id: crypto.randomUUID(),
@@ -98,7 +108,7 @@ const server = serve<SessionData>({
           return json({ error: "Not found." }, 404);
         }
 
-        return json({ ok: true, bunVersion: Bun.version });
+        return json({ ok: true });
       },
     },
     "/*": index,

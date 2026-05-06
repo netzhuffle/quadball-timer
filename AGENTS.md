@@ -7,7 +7,7 @@
 - Package manager/runtime: `bun`
 - Tests: `bun test` with colocated `*.test.ts` files
 - VCS: `git`
-- Bun version pin: `packageManager` in `package.json`; `bun` and `@types/bun` devDependencies must exactly match it.
+- Bun version pin: `packageManager` in `package.json`; `@types/bun` must exactly match it.
 
 ## Goal
 Provide clear, low-friction defaults so OpenAI Codex can make safe, high-quality changes quickly in this repo.
@@ -25,6 +25,7 @@ Provide clear, low-friction defaults so OpenAI Codex can make safe, high-quality
 - Dev server: `bun dev`
 - Production run: `bun start`
 - Build: `bun run build.ts`
+- Production executable build: `bun run build:executable`
 - Run all tests: `bun run test`
 - Run tests affected by local changes: `bun run test:changed`
 - Run a single test file: `bun test path/to/file.test.ts`
@@ -37,7 +38,8 @@ Provide clear, low-friction defaults so OpenAI Codex can make safe, high-quality
 - Use `bun run format` before large reviews or commits to normalize formatting.
 - Use `bun run format:check` in CI or pre-merge validation to ensure formatting is clean.
 - Use `bun run lint` for strict type-aware and type-check linting with `oxlint`.
-- Keep the Bun runtime version pinned via `packageManager`; when upgrading Bun, update `packageManager`, the `bun` devDependency, `@types/bun`, and `bun.lock` together.
+- Keep the Bun runtime version pinned via `packageManager`; when upgrading Bun, update `packageManager`, `@types/bun`, and `bun.lock` together.
+- Production deploy runs the compiled Linux executable as `current/quadball-timer` using the `bun-linux-x64-modern` target; do not reintroduce a server-side Bun runtime dependency without a strong reason.
 - Use `bun run check` as the default pre-merge command. It runs:
   1. `check:bun-version`
   2. `format:check`

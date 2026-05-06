@@ -8,13 +8,15 @@
     "dev": "bun --hot src/index.ts",
     "start": "cd dist && NODE_ENV=production bun index.js",
     "build": "bun run build.ts",
+    "build:executable": "bun run build.ts --compile --compile-target=bun-linux-x64-modern --outfile=dist/quadball-timer",
     "test": "bun test --isolate",
     "test:changed": "bun test --changed",
     "format": "bunx --bun oxfmt \"**/*.{js,jsx,ts,tsx,mjs,cjs}\"",
     "format:check": "bunx --bun oxfmt \"**/*.{js,jsx,ts,tsx,mjs,cjs}\" --check",
     "lint": "bunx --bun oxlint --type-aware --type-check",
+    "lint:shell": "shellcheck deploy/activate-release.sh",
     "check:bun-version": "bun scripts/check-bun-version.ts",
-    "check": "bun run check:bun-version && bun run format:check && bun run lint"
+    "check": "bun run check:bun-version && bun run format:check && bun run lint && bun run lint:shell"
   },
   "dependencies": {
     "@radix-ui/react-label": "^2.1.8",
@@ -32,8 +34,7 @@
     "@types/bun": "1.3.13",
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",
-    "bun": "1.3.13",
-    "happy-dom": "^20.8.4",
+    "happy-dom": "^20.9.0",
     "oxfmt": "^0.40.0",
     "oxlint": "^1.55.0",
     "oxlint-tsgolint": "^0.16.0",

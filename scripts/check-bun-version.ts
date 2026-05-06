@@ -23,18 +23,10 @@ if (actualBunVersion !== expectedBunVersion) {
 }
 
 const bunTypesVersion = packageJson.devDependencies?.["@types/bun"];
-const bunPackageVersion = packageJson.devDependencies?.bun;
-
 if (bunTypesVersion !== expectedBunVersion) {
   throw new Error(
     `@types/bun must exactly match packageManager Bun version ${expectedBunVersion}; found ${bunTypesVersion ?? "missing"}.`,
   );
 }
 
-if (bunPackageVersion !== expectedBunVersion) {
-  throw new Error(
-    `bun devDependency must exactly match packageManager Bun version ${expectedBunVersion}; found ${bunPackageVersion ?? "missing"}.`,
-  );
-}
-
-console.log(`Bun runtime, bun package, and @types/bun are pinned to ${expectedBunVersion}.`);
+console.log(`Bun runtime and @types/bun are pinned to ${expectedBunVersion}.`);

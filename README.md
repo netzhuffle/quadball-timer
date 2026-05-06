@@ -29,10 +29,24 @@ bun install
 bun dev
 ```
 
+## Deployment
+
+Production deploys upload a compiled Linux executable and activate it under
+`/srv/quadball-timer/current`. The deploy SSH user is expected to have only the
+sudo access needed to restart the app service:
+
+```sudoers
+deploy-quadball-timer ALL=NOPASSWD: /bin/systemctl restart quadball-timer
+```
+
+The app itself binds to `127.0.0.1:3000`; public HTTPS and WebSocket traffic is
+terminated by Caddy and proxied to that localhost backend.
+
 ## Quality checks
 
 ```bash
 bun run check
 bun run test
-bun run build.ts
+bun run build
+bun run build:executable
 ```

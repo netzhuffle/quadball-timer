@@ -6,6 +6,7 @@ release_id=""
 service_name="quadball-timer"
 port="3000"
 keep_releases=5
+executable_path="quadball-timer"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -41,10 +42,18 @@ if [[ -z "$release_id" ]]; then
   exit 1
 fi
 
-export PATH="$HOME/.bun/bin:$PATH"
+if [[ ! "$release_id" =~ ^[A-Za-z0-9._-]+$ ]]; then
+  echo "Invalid release value: ${release_id}" >&2
+  exit 1
+fi
 
-if ! command -v bun >/dev/null 2>&1; then
-  echo "bun not found in PATH." >&2
+if [[ ! "$service_name" =~ ^[A-Za-z0-9_.@-]+$ ]]; then
+  echo "Invalid service value: ${service_name}" >&2
+  exit 1
+fi
+
+if [[ ! "$port" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
+  echo "Invalid port value: ${port}" >&2
   exit 1
 fi
 
@@ -63,17 +72,24 @@ fi
 
 cd "$release_dir"
 
-expected_bun_version="$(
-  bun --print 'const packageJson = await Bun.file("package.json").json(); const packageManager = packageJson.packageManager; if (typeof packageManager !== "string" || !packageManager.startsWith("bun@")) throw new Error("package.json must pin Bun with packageManager"); packageManager.slice("bun@".length);'
-)"
-actual_bun_version="$(bun --version)"
-
-if [[ "$actual_bun_version" != "$expected_bun_version" ]]; then
-  echo "Bun version mismatch: packageManager pins ${expected_bun_version}, but server has ${actual_bun_version}." >&2
+if [[ ! -x "${release_dir}/${executable_path}" ]]; then
+  echo "Compiled executable is missing or not executable: ${release_dir}/${executable_path}" >&2
   exit 1
 fi
 
-bun install --frozen-lockfile --production
+if ! grep -qw avx2 /proc/cpuinfo; then
+  echo "Server CPU does not support AVX2, but this release uses bun-linux-x64-modern." >&2
+  exit 1
+fi
+
+expected_exec_start="${current_link}/${executable_path}"
+actual_exec_start="$(systemctl show "$service_name" --property=ExecStart --value 2>/dev/null || true)"
+
+if [[ "$actual_exec_start" != *"$expected_exec_start"* ]]; then
+  echo "Systemd service ${service_name} does not run ${expected_exec_start}." >&2
+  echo "Current ExecStart: ${actual_exec_start:-<unavailable>}" >&2
+  exit 1
+fi
 
 ln -sfn "$release_dir" "$current_link"
 
@@ -82,23 +98,12 @@ restart_service() {
 }
 
 check_health() {
-  local api_health_url="http://127.0.0.1:${port}/api/games"
   local internal_health_url="http://127.0.0.1:${port}/internal/healthz"
   local root_url="http://127.0.0.1:${port}/"
-  local attempt
-  local internal_health_body
-
-  for attempt in $(seq 1 20); do
-    if curl --fail --silent --show-error --max-time 2 "$api_health_url" >/dev/null &&
-      internal_health_body="$(curl --fail --silent --show-error --max-time 2 "$internal_health_url")" &&
+  for ((attempt = 1; attempt <= 20; attempt++)); do
+    if curl --fail --silent --show-error --max-time 2 "$internal_health_url" >/dev/null &&
       curl --fail --silent --show-error --max-time 2 "$root_url" | grep -qi "<!doctype html"
     then
-      if [[ "$internal_health_body" != *"\"bunVersion\":\"${expected_bun_version}\""* ]]; then
-        echo "Runtime Bun version mismatch in internal health check: expected ${expected_bun_version}." >&2
-        echo "Health response: ${internal_health_body}" >&2
-        return 1
-      fi
-
       return 0
     fi
     sleep 1
@@ -107,7 +112,7 @@ check_health() {
   return 1
 }
 
-if restart_service && check_health; then
+activate_release() {
   if [[ -d "${base_dir}/releases" ]]; then
     mapfile -t all_releases < <(ls -1dt "${base_dir}"/releases/* 2>/dev/null || true)
     release_count=0
@@ -121,12 +126,22 @@ if restart_service && check_health; then
 
   echo "Activated release ${release_id}."
   exit 0
+}
+
+if restart_service && check_health; then
+  activate_release
 fi
 
 echo "Deploy failed; attempting rollback." >&2
 if [[ -n "$previous_release" && -d "$previous_release" ]]; then
   ln -sfn "$previous_release" "$current_link"
-  sudo systemctl restart "$service_name" || true
+  if restart_service && check_health; then
+    echo "Rolled back to ${previous_release}." >&2
+  else
+    echo "Rollback to ${previous_release} failed health checks." >&2
+  fi
+else
+  echo "No previous release available for rollback." >&2
 fi
 
 exit 1

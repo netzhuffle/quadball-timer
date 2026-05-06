@@ -11,6 +11,9 @@ if (process.argv.includes("--help") || process.argv.includes("-h")) {
 Usage: bun run build.ts [options]
 
 Common Options:
+  --compile               Generate a standalone executable
+  --compile-target <name> Compile target for executable builds (default: bun-linux-x64-modern)
+  --outfile <path>        Executable output path when compiling (default: dist/quadball-timer)
   --outdir <path>          Output directory (default: "dist")
   --minify                 Enable minification (or --minify.whitespace, --minify.syntax, etc)
   --sourcemap <type>      Sourcemap type: none|linked|inline|external
@@ -27,11 +30,18 @@ Common Options:
   --define <obj>           Define global constants (e.g. --define.VERSION=1.0.0)
   --help, -h               Show this help message
 
-Example:
+Examples:
   bun run build.ts --outdir=dist --target=bun --minify --sourcemap=linked
+  bun run build.ts --compile --compile-target=bun-linux-x64-modern --outfile=dist/quadball-timer
 `);
   process.exit(0);
 }
+
+type ParsedBuildConfig = Partial<Bun.BuildConfig> & {
+  compileTarget?: Bun.Build.CompileTarget;
+  outfile?: string;
+  outdir?: string;
+};
 
 const toCamelCase = (str: string): string =>
   str.replace(/-([a-z])/g, (_fullMatch, letter: string) => letter.toUpperCase());
@@ -48,7 +58,7 @@ const parseValue = (value: string): unknown => {
   return value;
 };
 
-function parseArgs(): Partial<Bun.BuildConfig> {
+function parseArgs(): ParsedBuildConfig {
   const config: Record<string, unknown> = {};
   const args = process.argv.slice(2);
 
@@ -100,7 +110,7 @@ function parseArgs(): Partial<Bun.BuildConfig> {
     }
   }
 
-  return config as Partial<Bun.BuildConfig>;
+  return config as ParsedBuildConfig;
 }
 
 const formatFileSize = (bytes: number): string => {
@@ -119,7 +129,23 @@ const formatFileSize = (bytes: number): string => {
 console.log("\n🚀 Starting build process...\n");
 
 const cliConfig = parseArgs();
-const outdir = cliConfig.outdir || path.join(process.cwd(), "dist");
+const {
+  compile: compileOption,
+  compileTarget,
+  outdir: cliOutdir,
+  outfile: cliOutfile,
+  ...buildConfigOverrides
+} = cliConfig;
+const shouldCompile = compileOption !== undefined && compileOption !== false;
+const outputPath =
+  shouldCompile && typeof cliOutfile === "string"
+    ? path.resolve(cliOutfile)
+    : path.join(process.cwd(), "dist", "quadball-timer");
+const outdir = shouldCompile
+  ? path.dirname(outputPath)
+  : typeof cliOutdir === "string"
+    ? cliOutdir
+    : path.join(process.cwd(), "dist");
 
 if (existsSync(outdir)) {
   console.log(`🗑️ Cleaning previous build at ${outdir}`);
@@ -133,18 +159,39 @@ console.log(
   `📄 Bundling full-stack entrypoint ${path.relative(process.cwd(), serverEntrypoint)}\n`,
 );
 
-const result = await Bun.build({
+const compileConfig =
+  typeof compileOption === "object" && compileOption !== null && !Array.isArray(compileOption)
+    ? (compileOption as Bun.CompileBuildOptions)
+    : {};
+const executableTarget = compileTarget ?? compileConfig.target ?? "bun-linux-x64-modern";
+
+const buildConfig: Bun.BuildConfig = {
   entrypoints,
-  outdir,
   plugins: [plugin],
   minify: true,
+  bytecode: shouldCompile,
   target: "bun",
-  sourcemap: "linked",
+  sourcemap: shouldCompile ? "none" : "linked",
   define: {
     "process.env.NODE_ENV": JSON.stringify("production"),
   },
-  ...cliConfig,
-});
+  ...(shouldCompile
+    ? {
+        compile: {
+          ...compileConfig,
+          target: executableTarget,
+          outfile: outputPath,
+          autoloadDotenv: false,
+          autoloadBunfig: false,
+        },
+      }
+    : {
+        outdir,
+      }),
+  ...buildConfigOverrides,
+};
+
+const result = await Bun.build(buildConfig);
 
 const end = performance.now();
 
