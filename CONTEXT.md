@@ -16,6 +16,14 @@ _Avoid_: Event session, event time window
 A participant admitted to control a game. Every controller has equal authority over the full game, and multiple controllers may collaborate or change during play.
 _Avoid_: Scorekeeper role, timekeeper role, primary controller
 
+**Head Referee**:
+The game official with final on-pitch authority to make and correct calls, stop or resume play, and direct game timekeeping and scorekeeping.
+_Avoid_: HR, referee admin
+
+**Official Override**:
+A Head Referee-directed action that intentionally departs from a normal rule-derived guardrail while remaining part of the game's authoritative operational record.
+_Avoid_: Rule exception, forced command
+
 **Control Grant**:
 A game-specific secret that admits a Controller. Its QR link and verbally transmissible code are interchangeable ways to present the same authority, without an account or login.
 _Avoid_: User account, controller account, controller role
