@@ -6,11 +6,17 @@ It summarizes the Codex Security Standard scan of revision
 `caa5dac848e9e865524e44f30becae725048bcdc` against the
 [passwordless Event and game control threat model](passwordless-control-threat-model.md).
 
-The scan reviewed the current public HTTP and WebSocket implementation and the
-planned production design seams for Control Grants, object scope, offline
-replay and recovery, public projections, durable state and audit, denial of
-service, secret handling, and the Caddy/systemd deployment boundary. It did not
-implement fixes.
+The scan reviewed the current public HTTP and WebSocket implementation. It did
+not fully review the planned production design seams for grants and object
+scope, offline replay and recovery, public projections, durable state and
+audit, denial of service, secret handling, or the Caddy/systemd deployment
+boundary. That planned-design review is tracked separately in
+[issue #39](https://github.com/netzhuffle/quadball-timer/issues/39). No fixes
+were implemented.
+
+The detailed root-cause analysis, validation limits, and bounded local PoCs for
+the five current-implementation findings are preserved in
+[Security evidence](../security/README.md).
 
 ## Findings
 
