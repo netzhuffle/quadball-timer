@@ -6,6 +6,7 @@ import { Label } from "@/components/ui/label";
 import type { ControllerRole, GameSummary } from "@/lib/game-types";
 import { DEFAULT_AWAY_TEAM_COLOR, DEFAULT_HOME_TEAM_COLOR } from "@/lib/team-colors";
 import { ColorTestPage } from "@/pages/color-test-page";
+import { EventOperationsPrototypePage } from "@/pages/event-operations-prototype-page";
 import { GamePage } from "@/pages/game-page";
 import "./index.css";
 
@@ -15,6 +16,9 @@ type Route =
     }
   | {
       type: "color-test";
+    }
+  | {
+      type: "event-operations-prototype";
     }
   | {
       type: "game";
@@ -33,6 +37,10 @@ export function App() {
 
   if (route.type === "color-test") {
     return <ColorTestPage />;
+  }
+
+  if (route.type === "event-operations-prototype") {
+    return <EventOperationsPrototypePage />;
   }
 
   return <GamePage gameId={route.gameId} role={route.role} />;
@@ -307,6 +315,10 @@ function useRoute(): Route {
 function parseRoute(pathname: string, search: string): Route {
   if (pathname === "/color-test") {
     return { type: "color-test" };
+  }
+
+  if (pathname === "/prototype/event-operations") {
+    return { type: "event-operations-prototype" };
   }
 
   const match = pathname.match(/^\/game\/([a-zA-Z0-9-]+)$/);

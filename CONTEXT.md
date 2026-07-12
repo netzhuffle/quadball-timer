@@ -12,6 +12,22 @@ _Avoid_: Tournament, event window
 A calendar date on which an Event holds games. Game Days have no event-level start or end time.
 _Avoid_: Event session, event time window
 
+**Game Slot**:
+A scheduled point on a Game Day that groups concurrent Event Games across Pitches. Later Game Slots may contain bracket-dependent games whose Event Teams become known only after earlier results.
+_Avoid_: Round, timeslot, batch
+
+**Schedule Shift**:
+An Event Admin-directed change to the scheduled start time of one Game Slot or one Event Game. It may include later Game Slots or later Event Games on the same Pitch while preserving their relative spacing.
+_Avoid_: Delay, reschedule
+
+**Pitch Reassignment**:
+An Event Admin-directed change of Pitch for an Event Game. If the target Pitch already has another Event Game in the same Game Slot, the Event Admin may swap the games or deliberately leave a Schedule Conflict for later resolution.
+_Avoid_: New game, duplicate game
+
+**Schedule Conflict**:
+Two or more Event Games assigned to the same Pitch in one Game Slot. It remains visible to Event Admins until the games are reassigned or their schedules no longer overlap.
+_Avoid_: Double booking, invalid game
+
 **Controller**:
 A participant admitted to control a game. Every controller has equal authority over the full game, and multiple controllers may collaborate or change during play.
 _Avoid_: Scorekeeper role, timekeeper role, primary controller
