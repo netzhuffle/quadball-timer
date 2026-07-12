@@ -24,6 +24,18 @@ _Avoid_: HR, referee admin
 A Head Referee-directed action that intentionally departs from a normal rule-derived guardrail while remaining part of the game's authoritative operational record.
 _Avoid_: Rule exception, forced command
 
+**Controller Device**:
+A Controller's personally supplied, working, sufficiently charged phone used to access the app. Each Controller arranges their own device and power; no phone is designated as the primary or backup device, and another person's phone may take over through the same Control Grant.
+_Avoid_: Primary phone, backup phone, dedicated timer phone
+
+**Timekeeper**:
+The event official responsible for tracking game time, penalty times, and seeker release. A Timekeeper may be a Controller and may also perform Scorekeeper duties, but has no distinct authority within the app.
+_Avoid_: Timekeeper app role, primary Controller
+
+**Scorekeeper**:
+The event official responsible for tracking the score, operating the scoreboard, and completing the Official Score Sheet during play. A Scorekeeper may be a Controller, but has no distinct authority within the app.
+_Avoid_: Scorekeeper app role, score-only Controller
+
 **Control Grant**:
 A game-specific secret that admits a Controller. Its QR link and verbally transmissible code are interchangeable ways to present the same authority, without an account or login.
 _Avoid_: User account, controller account, controller role
@@ -39,6 +51,10 @@ _Avoid_: Pitch Manager, Controller
 **Technical Admin**:
 The operator authorized to create events and change event-level metadata such as their names, dates, and Event Admin Grants. This authority may be exercised through server administration rather than the event interface.
 _Avoid_: Event Admin, Pitch Manager
+
+**Production Acceptance Authority**:
+Either of the two people who must approve production use for an Event: the repository maintainer for technical readiness and the organizing association's president for operational readiness. Both approvals are required, and either authority may require fallback to the Official Score Sheet and manual timing.
+_Avoid_: Technical Admin, Event Admin
 
 **Event Admin Grant**:
 The event-specific shared secret that admits Event Admins. It is created and managed by the Technical Admin without individual accounts.
