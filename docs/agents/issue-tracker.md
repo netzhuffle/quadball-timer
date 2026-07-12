@@ -29,6 +29,8 @@ GitHub shares one number space across issues and pull requests. For an ambiguous
 
 - **Map:** one issue labelled `wayfinder:map`, containing Notes, Decisions so far, and Fog.
 - **Child:** a GitHub sub-issue labelled `wayfinder:research`, `wayfinder:prototype`, `wayfinder:grilling`, or `wayfinder:task`. If sub-issues are unavailable, use a task-list link and add `Part of #<map>` to the child.
+- **Planning scope:** children resolve decisions, investigations, or throwaway prototypes until the implementation-ready route is clear. A `wayfinder:task` may perform only manual work required to unblock a decision; it is not a delivery or implementation ticket.
+- **Delivery handoff:** implementation, migration, dependency-update, provisioning, deployment, rehearsal, and cutover issues live outside the map. When created before planning finishes, block them natively on the map so they cannot start until the map closes.
 - **Blocking:** use native issue dependencies. If unavailable, add `Blocked by: #<number>` near the top of the child body. A child is unblocked when every blocker is closed.
 - **Frontier:** choose the first open child in map order that has no open blocker and no assignee.
 - **Claim:** assign the issue to yourself before starting work.

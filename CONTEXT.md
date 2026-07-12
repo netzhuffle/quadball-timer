@@ -1,6 +1,6 @@
 # Quadball Game Operations
 
-This context describes the shared language for preparing, controlling, and recording quadball games at events.
+This context describes the target domain language being planned for preparing, controlling, and recording quadball games at events. A term here defines the intended model; it does not claim that the behavior is already implemented.
 
 ## Language
 
