@@ -52,6 +52,10 @@ _Avoid_: Timekeeper app role, primary Controller
 The event official responsible for tracking the score, operating the scoreboard, and completing the Official Score Sheet during play. A Scorekeeper may be a Controller, but has no distinct authority within the app.
 _Avoid_: Scorekeeper app role, score-only Controller
 
+**Penalty Reason**:
+An optional broad classification of why a penalty card was issued in the app, supplementary to the exact foul recorded on the Official Score Sheet.
+_Avoid_: Foul text, official penalty record
+
 **Control Grant**:
 A game-specific secret that admits a Controller. Its QR link and verbally transmissible code are interchangeable ways to present the same authority, without an account or login.
 _Avoid_: User account, controller account, controller role
