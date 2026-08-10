@@ -53,8 +53,24 @@ The game official with final on-pitch authority to make and correct calls, stop 
 _Avoid_: HR, referee admin
 
 **Official Override**:
-A Head Referee-directed action that intentionally departs from a normal rule-derived guardrail while remaining part of the game's authoritative operational record.
+A Head Referee-directed Control Action that intentionally departs from a normal rule-derived guardrail. It records the direction, guardrail, and reason in the Control Audit Trail while keeping the game operable.
 _Avoid_: Rule exception, forced command
+
+**Game Fact**:
+An accepted sporting or operational occurrence, such as a goal, card, catch, result, or stoppage, that may contribute to the current game state.
+_Avoid_: Mutable event, current value
+
+**Correction**:
+A Control Action that names one stable Game Fact and makes it ineffective or effective again without removing either the fact or earlier Corrections from the Control Audit Trail.
+_Avoid_: Delete, edit history, undo latest
+
+**Control Action**:
+An immutable Controller-submitted record accepted for an Event Game. It records either a Game Fact or a Correction and may carry an Official Override.
+_Avoid_: Mutable command, audit entry
+
+**Derived Game State**:
+The current score, phase, overtime target, result, stoppages, and other game state rebuilt from effective Game Facts whenever a Correction changes the record.
+_Avoid_: Stored result, patched state
 
 **Controller Device**:
 A Controller's personally supplied, working, sufficiently charged phone used to access the app. Each Controller arranges their own device and power; no phone is designated as the primary or backup device, and another person's phone may take over through the same Control Grant.
