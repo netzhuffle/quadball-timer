@@ -1,0 +1,1088 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Corrections and Official Overrides — Logic Prototype</title>
+    <style>
+      :root {
+        color-scheme: light;
+        font-family:
+          Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        color: #18201c;
+        background: #f3f5ef;
+        --accent: #0d766e;
+        --accent-soft: #d8eeea;
+        --ink-soft: #56615b;
+        --line: #ccd4cd;
+        --paper: #fffef9;
+        --warn: #9a4d0b;
+        --warn-soft: #fff0d6;
+        --danger: #a33131;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+      }
+
+      main {
+        width: min(1180px, calc(100% - 28px));
+        margin: 0 auto;
+        padding: 32px 0 64px;
+      }
+
+      h1,
+      h2,
+      h3,
+      p {
+        margin-top: 0;
+      }
+
+      h1 {
+        max-width: 820px;
+        margin-bottom: 10px;
+        font-size: clamp(2rem, 5vw, 3.8rem);
+        line-height: 0.98;
+        letter-spacing: -0.045em;
+      }
+
+      h2 {
+        margin-bottom: 14px;
+        font-size: 1.05rem;
+      }
+
+      h3 {
+        margin-bottom: 6px;
+        font-size: 0.94rem;
+      }
+
+      .eyebrow,
+      .label {
+        color: var(--accent);
+        font-size: 0.72rem;
+        font-weight: 800;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+      }
+
+      .intro {
+        max-width: 880px;
+        color: var(--ink-soft);
+        font-size: 1rem;
+        line-height: 1.55;
+      }
+
+      .prototype-note {
+        display: inline-block;
+        margin: 2px 0 26px;
+        padding: 6px 10px;
+        border: 1px solid var(--warn);
+        border-radius: 999px;
+        color: var(--warn);
+        font-size: 0.76rem;
+        font-weight: 750;
+      }
+
+      .grid {
+        display: grid;
+        grid-template-columns: minmax(0, 1.3fr) minmax(300px, 0.7fr);
+        gap: 18px;
+      }
+
+      .panel {
+        padding: 18px;
+        border: 1px solid var(--line);
+        border-radius: 16px;
+        background: var(--paper);
+        box-shadow: 0 8px 24px rgb(28 49 37 / 5%);
+      }
+
+      .summary-grid {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 10px;
+      }
+
+      .metric {
+        min-height: 82px;
+        padding: 12px;
+        border-radius: 12px;
+        background: #edf1eb;
+      }
+
+      .metric strong {
+        display: block;
+        margin-top: 5px;
+        font-size: 1.18rem;
+      }
+
+      .change-note,
+      .warning {
+        margin: 14px 0 0;
+        padding: 11px 13px;
+        border-radius: 10px;
+        line-height: 1.45;
+      }
+
+      .change-note {
+        background: var(--accent-soft);
+        color: #174d48;
+      }
+
+      .warning {
+        border: 1px solid #e5b763;
+        background: var(--warn-soft);
+        color: #6f3a0d;
+      }
+
+      .warning strong {
+        display: block;
+      }
+
+      button {
+        min-height: 42px;
+        padding: 9px 12px;
+        border: 1px solid #aeb9b1;
+        border-radius: 10px;
+        color: #1b2a22;
+        background: #fff;
+        font: inherit;
+        font-size: 0.86rem;
+        font-weight: 720;
+        cursor: pointer;
+      }
+
+      button:hover:not(:disabled) {
+        border-color: var(--accent);
+        color: var(--accent);
+      }
+
+      button:focus-visible {
+        outline: 3px solid #79c9c1;
+        outline-offset: 2px;
+      }
+
+      button:disabled {
+        cursor: not-allowed;
+        opacity: 0.42;
+      }
+
+      .primary {
+        border-color: var(--accent);
+        color: #fff;
+        background: var(--accent);
+      }
+
+      .button-grid {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 8px;
+      }
+
+      .button-group + .button-group {
+        margin-top: 16px;
+      }
+
+      .tabs {
+        display: flex;
+        gap: 7px;
+        overflow-x: auto;
+        padding-bottom: 4px;
+      }
+
+      .tabs button {
+        flex: 0 0 auto;
+      }
+
+      .tabs button[aria-selected="true"] {
+        border-color: var(--accent);
+        color: #fff;
+        background: var(--accent);
+      }
+
+      .walkthrough {
+        margin-top: 14px;
+      }
+
+      .step-list {
+        display: grid;
+        gap: 8px;
+        margin-top: 14px;
+      }
+
+      .step {
+        display: grid;
+        grid-template-columns: 28px minmax(0, 1fr);
+        gap: 9px;
+        align-items: center;
+      }
+
+      .step-number {
+        display: grid;
+        width: 27px;
+        height: 27px;
+        place-items: center;
+        border-radius: 50%;
+        color: var(--ink-soft);
+        background: #e8ece7;
+        font-size: 0.78rem;
+        font-weight: 800;
+      }
+
+      .step.done .step-number {
+        color: #fff;
+        background: var(--accent);
+      }
+
+      .step button {
+        width: 100%;
+        text-align: left;
+      }
+
+      .lists {
+        display: grid;
+        grid-template-columns: 0.85fr 1.15fr;
+        gap: 18px;
+        margin-top: 18px;
+      }
+
+      ol,
+      ul {
+        margin: 0;
+        padding: 0;
+        list-style: none;
+      }
+
+      .record {
+        padding: 11px 0;
+        border-top: 1px solid #e0e5df;
+      }
+
+      .record:first-child {
+        border-top: 0;
+        padding-top: 0;
+      }
+
+      .record-line {
+        display: flex;
+        gap: 8px;
+        align-items: baseline;
+        justify-content: space-between;
+      }
+
+      .record small {
+        display: block;
+        margin-top: 3px;
+        color: var(--ink-soft);
+        line-height: 1.35;
+      }
+
+      .pill {
+        flex: 0 0 auto;
+        padding: 2px 7px;
+        border-radius: 999px;
+        background: #e4e9e4;
+        font-size: 0.7rem;
+        font-weight: 800;
+      }
+
+      .pill.live,
+      .pill.governing {
+        color: #145249;
+        background: #d5eee7;
+      }
+
+      .pill.voided,
+      .pill.superseded {
+        color: #6c7270;
+        text-decoration: line-through;
+      }
+
+      .pill.override {
+        color: #7a3d09;
+        background: #ffe2ac;
+      }
+
+      .empty {
+        color: var(--ink-soft);
+        font-style: italic;
+      }
+
+      .audit-count {
+        color: var(--ink-soft);
+        font-weight: 500;
+      }
+
+      @media (max-width: 820px) {
+        .grid,
+        .lists {
+          grid-template-columns: 1fr;
+        }
+
+        .summary-grid {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+      }
+
+      @media (max-width: 520px) {
+        main {
+          width: min(100% - 18px, 1180px);
+          padding-top: 22px;
+        }
+
+        .button-grid {
+          grid-template-columns: 1fr 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <div class="eyebrow">Logic prototype · Wayfinder</div>
+      <h1>Correct the record without erasing history.</h1>
+      <p class="intro">
+        This throwaway demo asks whether immutable game facts plus target-specific correction
+        operations can keep every Controller operable, rebuild score and overtime state after late
+        information, and distinguish a Head Referee-directed Official Override from ordinary play.
+      </p>
+      <div class="prototype-note">PROTOTYPE — not production behavior</div>
+
+      <div class="grid">
+        <section class="panel" aria-labelledby="current-state-heading">
+          <h2 id="current-state-heading">Current operational state</h2>
+          <div class="summary-grid" id="summary"></div>
+          <div id="change-note" class="change-note" role="status"></div>
+          <div id="guardrail"></div>
+        </section>
+
+        <section class="panel" aria-labelledby="free-play-heading">
+          <h2 id="free-play-heading">Free play</h2>
+          <div class="button-group">
+            <div class="label">Accept a fact</div>
+            <div class="button-grid" id="fact-buttons"></div>
+          </div>
+          <div class="button-group">
+            <div class="label">Correct the record</div>
+            <div class="button-grid" id="correction-buttons"></div>
+          </div>
+        </section>
+      </div>
+
+      <section class="panel" style="margin-top: 18px" aria-labelledby="walkthrough-heading">
+        <h2 id="walkthrough-heading">Dangerous-case walkthroughs</h2>
+        <div class="tabs" id="scenario-tabs" role="tablist"></div>
+        <div class="walkthrough">
+          <h3 id="scenario-title"></h3>
+          <p class="intro" id="scenario-description"></p>
+          <div class="step-list" id="scenario-steps"></div>
+        </div>
+      </section>
+
+      <div class="lists">
+        <section class="panel" aria-labelledby="timeline-heading">
+          <h2 id="timeline-heading">Game Timeline</h2>
+          <p class="intro">Only effective sporting events appear here, in adjudicated game order.</p>
+          <ol id="timeline"></ol>
+        </section>
+
+        <section class="panel" aria-labelledby="audit-heading">
+          <h2 id="audit-heading">
+            Control Audit Trail <span class="audit-count" id="audit-count"></span>
+          </h2>
+          <p class="intro">
+            Accepted originals and every correction remain permanent, including offline sync,
+            automatic conflict outcomes, and Official Override details.
+          </p>
+          <ol id="audit"></ol>
+        </section>
+      </div>
+    </main>
+
+    <script>
+      // Portable model: pure reducer + projections. The DOM shell starts after this module.
+      const CorrectionModel = (() => {
+        const initialState = () => ({
+          operations: [],
+          nextId: 1,
+          nextOrder: 10,
+          nextMoment: 1000,
+          pendingGuardrail: null,
+          lastChange: "Choose a walkthrough or accept a fact.",
+        });
+
+        const compareCorrections = (left, right) =>
+          left.revision - right.revision ||
+          left.acceptedAtMs - right.acceptedAtMs ||
+          left.id.localeCompare(right.id);
+
+        const correctionsFor = (state, targetId) =>
+          state.operations
+            .filter((operation) => operation.kind === "correction" && operation.targetId === targetId)
+            .sort(compareCorrections);
+
+        const governingCorrection = (state, targetId) => correctionsFor(state, targetId).at(-1) ?? null;
+
+        const isEffective = (state, operation) => {
+          if (operation.kind !== "fact") return true;
+          const correction = governingCorrection(state, operation.id);
+          return correction ? correction.directive === "reinstate" : true;
+        };
+
+        const addFact = (state, action) => {
+          const id = action.id ?? `op-${String(state.nextId).padStart(3, "0")}`;
+          if (state.operations.some((operation) => operation.id === id)) {
+            return { ...state, lastChange: `${id} was resent; idempotency kept one accepted action.` };
+          }
+          const fact = {
+            id,
+            kind: "fact",
+            factType: action.factType,
+            controller: action.controller ?? "Controller A",
+            gameTime: action.gameTime ?? "20:00",
+            order: action.order ?? state.nextOrder,
+            acceptedAtMs: action.acceptedAtMs ?? state.nextMoment,
+            syncState: action.syncState ?? "connected",
+            data: action.data ?? {},
+            override: action.override ?? null,
+          };
+          return {
+            ...state,
+            operations: [...state.operations, fact],
+            nextId: state.nextId + (action.id ? 0 : 1),
+            nextOrder: Math.max(state.nextOrder + 10, fact.order + 10),
+            nextMoment: Math.max(state.nextMoment + 1000, fact.acceptedAtMs + 1000),
+            pendingGuardrail: null,
+            lastChange: action.message ?? `Accepted ${describeFact(fact)}.`,
+          };
+        };
+
+        const addCorrection = (state, action) => {
+          const target = state.operations.find(
+            (operation) => operation.id === action.targetId && operation.kind === "fact",
+          );
+          if (!target) return { ...state, lastChange: "No accepted original matches that correction." };
+          const existing = correctionsFor(state, target.id);
+          const revision = action.revision ?? (existing.at(-1)?.revision ?? 0) + 1;
+          const id = action.id ?? `op-${String(state.nextId).padStart(3, "0")}`;
+          if (state.operations.some((operation) => operation.id === id)) {
+            return { ...state, lastChange: `${id} was resent; idempotency kept one correction.` };
+          }
+          const correction = {
+            id,
+            kind: "correction",
+            targetId: target.id,
+            directive: action.directive,
+            revision,
+            controller: action.controller ?? "Controller A",
+            gameTime: action.gameTime ?? target.gameTime,
+            acceptedAtMs: action.acceptedAtMs ?? state.nextMoment,
+            syncState: action.syncState ?? "connected",
+            reason: action.reason ?? "Mistaken entry",
+            override: action.override ?? null,
+          };
+          return {
+            ...state,
+            operations: [...state.operations, correction],
+            nextId: state.nextId + (action.id ? 0 : 1),
+            nextMoment: Math.max(state.nextMoment + 1000, correction.acceptedAtMs + 1000),
+            pendingGuardrail: null,
+            lastChange:
+              action.message ??
+              `${correction.directive === "void" ? "Reversed" : "Reinstated"} ${describeFact(target)}; history was retained.`,
+          };
+        };
+
+        const reduce = (state, action) => {
+          if (action.type === "reset") return action.state ?? initialState();
+          if (action.type === "fact") return addFact(state, action);
+          if (action.type === "correction") return addCorrection(state, action);
+          if (action.type === "warn-early-end") {
+            return {
+              ...state,
+              pendingGuardrail: {
+                title: "Nominal heat stoppage time has not elapsed",
+                detail:
+                  "Ordinary completion is guarded until 4:00. Continue only when the Head Referee directs an early end and the Controller records the reason.",
+                targetId: action.targetId,
+              },
+              lastChange: "The guardrail warned without making the game inoperable.",
+            };
+          }
+          if (action.type === "sync-all") {
+            return {
+              ...state,
+              operations: state.operations.map((operation) => ({ ...operation, syncState: "connected" })),
+              lastChange:
+                "Offline operations synchronized. Causal revision wins first; concurrent opposites use accepted time, then operation ID.",
+            };
+          }
+          return state;
+        };
+
+        const activeFacts = (state) =>
+          state.operations
+            .filter((operation) => operation.kind === "fact" && isEffective(state, operation))
+            .sort((left, right) => left.order - right.order || left.id.localeCompare(right.id));
+
+        const project = (state) => {
+          const facts = activeFacts(state);
+          const goals = facts.filter((fact) => fact.factType === "goal");
+          const catchFact = facts.find((fact) => fact.factType === "catch") ?? null;
+          const score = { home: 0, away: 0 };
+          for (const goal of goals) score[goal.data.team] += 10;
+          if (catchFact) score[catchFact.data.team] += 30;
+
+          let phase = "regulation";
+          let target = null;
+          let winner = null;
+          if (catchFact) {
+            const atCatch = { home: 0, away: 0 };
+            for (const goal of goals.filter((goal) => goal.order < catchFact.order)) {
+              atCatch[goal.data.team] += 10;
+            }
+            atCatch[catchFact.data.team] += 30;
+            const other = catchFact.data.team === "home" ? "away" : "home";
+            if (atCatch[catchFact.data.team] > atCatch[other]) {
+              phase = "finished";
+              winner = catchFact.data.team;
+            } else {
+              phase = "overtime";
+              target = atCatch[other] + 30;
+              if (score.home >= target || score.away >= target) {
+                phase = "finished";
+                winner = score.home >= target ? "home" : "away";
+              }
+            }
+          }
+
+          const declaredResult = facts.filter((fact) => fact.factType === "result").at(-1);
+          if (declaredResult) {
+            phase = "finished";
+            winner = declaredResult.data.winner;
+          }
+
+          const starts = facts.filter((fact) => fact.factType === "stoppage-start");
+          const latestStart = starts.at(-1) ?? null;
+          const end = latestStart
+            ? facts.find(
+                (fact) => fact.factType === "stoppage-end" && fact.data.stoppageId === latestStart.id,
+              ) ?? null
+            : null;
+          const stoppage = latestStart
+            ? {
+                status: end ? "ended" : "active",
+                nominalSeconds: latestStart.data.nominalSeconds,
+                actualSeconds: end?.data.elapsedSeconds ?? null,
+                override: end?.override ?? null,
+              }
+            : null;
+
+          const conflicts = [];
+          for (const fact of state.operations.filter((operation) => operation.kind === "fact")) {
+            const corrections = correctionsFor(state, fact.id);
+            const byRevision = new Map();
+            for (const correction of corrections) {
+              const group = byRevision.get(correction.revision) ?? [];
+              group.push(correction);
+              byRevision.set(correction.revision, group);
+            }
+            for (const [revision, group] of byRevision) {
+              if (new Set(group.map((correction) => correction.directive)).size > 1) {
+                conflicts.push({ targetId: fact.id, revision, winner: group.sort(compareCorrections).at(-1) });
+              }
+            }
+          }
+
+          return { facts, score, phase, target, winner, stoppage, conflicts };
+        };
+
+        function describeFact(fact) {
+          const team = fact.data.team === "home" ? "Home" : fact.data.team === "away" ? "Away" : "";
+          if (fact.factType === "goal") return `${team} goal at ${fact.gameTime}`;
+          if (fact.factType === "card") return `${fact.data.card} card for ${team}`;
+          if (fact.factType === "catch") return `${team} flag catch`;
+          if (fact.factType === "result") return `${team} declared result`;
+          if (fact.factType === "stoppage-start") return `heat stoppage start (${fact.data.nominalSeconds / 60}:00 nominal)`;
+          if (fact.factType === "stoppage-end") return `heat stoppage end at ${formatSeconds(fact.data.elapsedSeconds)}`;
+          return fact.factType;
+        }
+
+        const formatSeconds = (seconds) =>
+          `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
+
+        return {
+          initialState,
+          reduce,
+          project,
+          isEffective,
+          correctionsFor,
+          governingCorrection,
+          describeFact,
+          formatSeconds,
+        };
+      })();
+
+      // Throwaway interaction shell.
+      const M = CorrectionModel;
+      const fact = (factType, data, extra = {}) => ({ type: "fact", factType, data, ...extra });
+      const correction = (targetId, directive, extra = {}) => ({
+        type: "correction",
+        targetId,
+        directive,
+        ...extra,
+      });
+
+      function applyAll(actions, startingState = M.initialState()) {
+        return actions.reduce(M.reduce, startingState);
+      }
+
+      const seedGoals = (home, away, maxOrder = 60) => {
+        const actions = [];
+        let order = 10;
+        for (let index = 0; index < home / 10; index += 1) {
+          actions.push(fact("goal", { team: "home" }, { order, gameTime: `0${index + 8}:00` }));
+          order += 5;
+        }
+        for (let index = 0; index < away / 10; index += 1) {
+          actions.push(fact("goal", { team: "away" }, { order, gameTime: `1${index + 2}:00` }));
+          order += 5;
+        }
+        return actions.map((action, index) => ({ ...action, order: Math.min(action.order, maxOrder - 10 + index) }));
+      };
+
+      const scenarios = [
+        {
+          id: "late-goal",
+          tab: "Late goal",
+          title: "A missing pre-catch goal changes the overtime target",
+          description:
+            "The Away catch creates overtime at 50–40 with a target of 80. A late-confirmed Home goal belongs before the catch, so the full derived state must rebuild: 60–40 and target 90. Reversing and reinstating that goal must rebuild it again without deleting anything.",
+          seed: () => applyAll(seedGoals(50, 10, 70)),
+          steps: [
+            {
+              label: "Record the Away catch at 20:00",
+              run: (state) => M.reduce(state, fact("catch", { team: "away" }, { order: 80, gameTime: "20:00" })),
+            },
+            {
+              label: "Insert a late-confirmed Home goal before the catch",
+              run: (state) =>
+                M.reduce(
+                  state,
+                  fact("goal", { team: "home" }, {
+                    order: 75,
+                    gameTime: "19:58",
+                    controller: "Controller B",
+                    message: "Accepted a late-confirmed Home goal at 19:58; score and overtime target were rebuilt.",
+                  }),
+                ),
+            },
+            {
+              label: "Reverse the late-confirmed goal",
+              run: (state) => correctionLatest(state, "goal", "void", "Official corrected the goal call"),
+            },
+            {
+              label: "Undo that correction by reinstating the same goal",
+              run: (state) => correctionByTarget(state, latestOriginal(state, "goal")?.id, "reinstate", {
+                reason: "The reversal was mistaken",
+              }),
+            },
+          ],
+        },
+        {
+          id: "reverse-actions",
+          tab: "Reverse actions",
+          title: "Every accepted action has a target-specific reversal",
+          description:
+            "Each reversal points to a stable accepted action, never to “whatever happened last.” Watch the Game Timeline shed effective facts while the Control Audit Trail preserves each original and correction.",
+          seed: () => {
+            let state = applyAll(seedGoals(20, 10));
+            state = M.reduce(state, fact("card", { team: "away", card: "Yellow" }, { gameTime: "12:10" }));
+            state = M.reduce(state, fact("catch", { team: "home" }, { gameTime: "20:15" }));
+            state = M.reduce(state, fact("result", { winner: "home", team: "home" }, { gameTime: "20:16" }));
+            state = M.reduce(
+              state,
+              fact("stoppage-start", { nominalSeconds: 240 }, { id: "heat-1", gameTime: "15:00" }),
+            );
+            return M.reduce(
+              state,
+              fact("stoppage-end", { stoppageId: "heat-1", elapsedSeconds: 240 }, { gameTime: "15:00" }),
+            );
+          },
+          steps: [
+            { label: "Reverse the Home goal", run: (state) => correctionFirst(state, "goal", "void") },
+            { label: "Reverse the Yellow card", run: (state) => correctionLatest(state, "card", "void") },
+            { label: "Reverse the flag catch", run: (state) => correctionLatest(state, "catch", "void") },
+            { label: "Reverse the declared result", run: (state) => correctionLatest(state, "result", "void") },
+            { label: "Reverse the stoppage completion", run: (state) => correctionLatest(state, "stoppage-end", "void") },
+          ],
+        },
+        {
+          id: "heat-override",
+          tab: "Heat override",
+          title: "A guardrail warns, then records the Head Referee’s direction",
+          description:
+            "The first heat stoppage is nominally four minutes. An ordinary end at 2:00 is guarded, but the game remains operable: deliberate confirmation accepts an Official Override with the direction and reason. Reversing it resumes the original stoppage record.",
+          seed: () =>
+            M.reduce(
+              M.initialState(),
+              fact("stoppage-start", { nominalSeconds: 240 }, { id: "heat-1", gameTime: "15:00" }),
+            ),
+          steps: [
+            {
+              label: "Try to end the four-minute stoppage at 2:00",
+              run: (state) => M.reduce(state, { type: "warn-early-end", targetId: "heat-1" }),
+            },
+            {
+              label: "Confirm the Head Referee-directed early end",
+              run: (state) => acceptEarlyEnd(state),
+            },
+            {
+              label: "Reverse the early end and resume the stoppage",
+              run: (state) => correctionLatest(state, "stoppage-end", "void", "Early end was entered for the wrong stoppage"),
+            },
+            {
+              label: "Reinstate the same Official Override",
+              run: (state) => correctionByTarget(state, latestOriginal(state, "stoppage-end")?.id, "reinstate", {
+                reason: "Head Referee confirmed the original direction",
+              }),
+            },
+          ],
+        },
+        {
+          id: "offline-race",
+          tab: "Offline race",
+          title: "Concurrent offline corrections converge without deleting either intent",
+          description:
+            "Two Controllers independently correct the same Away goal. Both corrections use causal revision 1. Their synchronized occurrence time and stable operation ID select one visible result; a later ordinary correction at revision 2 remains available if that automatic outcome is wrong.",
+          seed: () =>
+            M.reduce(
+              M.initialState(),
+              fact("goal", { team: "away" }, { id: "away-goal", gameTime: "08:20" }),
+            ),
+          steps: [
+            {
+              label: "Controller A reverses the goal while offline",
+              run: (state) =>
+                M.reduce(
+                  state,
+                  correction("away-goal", "void", {
+                    id: "offline-a",
+                    revision: 1,
+                    acceptedAtMs: 5000,
+                    syncState: "offline",
+                    controller: "Controller A",
+                    reason: "Goal was waved off",
+                  }),
+                ),
+            },
+            {
+              label: "Controller B concurrently reinstates it while offline",
+              run: (state) =>
+                M.reduce(
+                  state,
+                  correction("away-goal", "reinstate", {
+                    id: "offline-b",
+                    revision: 1,
+                    acceptedAtMs: 5001,
+                    syncState: "offline",
+                    controller: "Controller B",
+                    reason: "Head Referee confirmed the goal",
+                  }),
+                ),
+            },
+            { label: "Synchronize both Controller operation sets", run: (state) => M.reduce(state, { type: "sync-all" }) },
+            {
+              label: "Apply a causally later ordinary reversal",
+              run: (state) =>
+                M.reduce(
+                  state,
+                  correction("away-goal", "void", {
+                    revision: 2,
+                    controller: "Controller C",
+                    reason: "Final on-pitch ruling: no goal",
+                  }),
+                ),
+            },
+          ],
+        },
+      ];
+
+      let activeScenario = scenarios[0];
+      let completedSteps = 0;
+      let state = activeScenario.seed();
+      state = { ...state, lastChange: "Scenario prepared. Start with step 1." };
+
+      function latestOriginal(current, factType, onlyEffective = false) {
+        return current.operations
+          .filter(
+            (operation) =>
+              operation.kind === "fact" &&
+              operation.factType === factType &&
+              (!onlyEffective || M.isEffective(current, operation)),
+          )
+          .at(-1);
+      }
+
+      function firstOriginal(current, factType, onlyEffective = false) {
+        return current.operations.find(
+          (operation) =>
+            operation.kind === "fact" &&
+            operation.factType === factType &&
+            (!onlyEffective || M.isEffective(current, operation)),
+        );
+      }
+
+      function correctionByTarget(current, targetId, directive, extra = {}) {
+        if (!targetId) return { ...current, lastChange: "There is no matching accepted action to correct." };
+        return M.reduce(current, correction(targetId, directive, extra));
+      }
+
+      function correctionLatest(current, factType, directive, reason = "Mistaken entry") {
+        return correctionByTarget(current, latestOriginal(current, factType, directive === "void")?.id, directive, {
+          reason,
+        });
+      }
+
+      function correctionFirst(current, factType, directive) {
+        return correctionByTarget(current, firstOriginal(current, factType, directive === "void")?.id, directive);
+      }
+
+      function acceptEarlyEnd(current) {
+        const start = latestOriginal(current, "stoppage-start", true);
+        if (!start) return { ...current, lastChange: "There is no active heat stoppage to end." };
+        return M.reduce(
+          current,
+          fact(
+            "stoppage-end",
+            { stoppageId: start.id, elapsedSeconds: 120 },
+            {
+              gameTime: start.gameTime,
+              override: {
+                directedBy: "Head Referee",
+                guardrail: "First heat stoppage nominal duration is 4:00",
+                reason: "Conditions improved; resume play after 2:00",
+              },
+              message: "Accepted an Official Override: the Head Referee ended the 4:00 heat stoppage at 2:00.",
+            },
+          ),
+        );
+      }
+
+      const factButtons = [
+        ["Home goal", () => M.reduce(state, fact("goal", { team: "home" }))],
+        ["Away goal", () => M.reduce(state, fact("goal", { team: "away" }))],
+        ["Away yellow", () => M.reduce(state, fact("card", { team: "away", card: "Yellow" }))],
+        ["Home catch", () => M.reduce(state, fact("catch", { team: "home" }))],
+        ["Home result", () => M.reduce(state, fact("result", { team: "home", winner: "home" }))],
+        [
+          "Start heat stop",
+          () => M.reduce(state, fact("stoppage-start", { nominalSeconds: 240 }, { id: `heat-${state.nextId}` })),
+        ],
+        [
+          "Try early end",
+          () => {
+            const start = latestOriginal(state, "stoppage-start", true);
+            return start ? M.reduce(state, { type: "warn-early-end", targetId: start.id }) : state;
+          },
+        ],
+        ["Confirm override", () => acceptEarlyEnd(state)],
+        [
+          "Resend last",
+          () => {
+            const last = state.operations.at(-1);
+            if (!last || last.kind !== "fact") return { ...state, lastChange: "No original action is available to resend." };
+            return M.reduce(state, { type: "fact", ...last });
+          },
+        ],
+      ];
+
+      const correctionButtons = [
+        ["Reverse goal", () => correctionLatest(state, "goal", "void")],
+        ["Reverse card", () => correctionLatest(state, "card", "void")],
+        ["Reverse catch", () => correctionLatest(state, "catch", "void")],
+        ["Reverse result", () => correctionLatest(state, "result", "void")],
+        ["Reverse stop end", () => correctionLatest(state, "stoppage-end", "void")],
+        [
+          "Reinstate last void",
+          () => {
+            const target = state.operations
+              .filter((operation) => operation.kind === "fact" && !M.isEffective(state, operation))
+              .at(-1);
+            return correctionByTarget(state, target?.id, "reinstate", { reason: "Undo the mistaken correction" });
+          },
+        ],
+        ["Reset free play", () => M.initialState()],
+      ];
+
+      function renderButtons(containerId, definitions) {
+        const container = document.getElementById(containerId);
+        container.replaceChildren(
+          ...definitions.map(([label, run]) => {
+            const button = document.createElement("button");
+            button.textContent = label;
+            button.addEventListener("click", () => {
+              state = run();
+              completedSteps = 0;
+              render();
+            });
+            return button;
+          }),
+        );
+      }
+
+      function renderSummary(projection) {
+        const metrics = [
+          ["Score", `${projection.score.home} – ${projection.score.away}`],
+          ["Phase", projection.phase],
+          ["Overtime target", projection.target ?? "—"],
+          ["Winner", projection.winner ? `${capitalize(projection.winner)} Team` : "—"],
+          [
+            "Heat stoppage",
+            projection.stoppage
+              ? projection.stoppage.status === "active"
+                ? `Active · ${M.formatSeconds(projection.stoppage.nominalSeconds)} nominal`
+                : `Ended at ${M.formatSeconds(projection.stoppage.actualSeconds)}`
+              : "—",
+          ],
+          ["Effective facts", String(projection.facts.length)],
+          ["Accepted operations", String(state.operations.length)],
+          ["Automatic conflicts", String(projection.conflicts.length)],
+        ];
+        document.getElementById("summary").innerHTML = metrics
+          .map(([label, value]) => `<div class="metric"><span class="label">${label}</span><strong>${value}</strong></div>`)
+          .join("");
+        const note = document.getElementById("change-note");
+        note.textContent = state.lastChange;
+
+        const guardrail = document.getElementById("guardrail");
+        guardrail.innerHTML = state.pendingGuardrail
+          ? `<div class="warning"><strong>${state.pendingGuardrail.title}</strong>${state.pendingGuardrail.detail}</div>`
+          : projection.conflicts.length
+            ? `<div class="warning"><strong>Concurrent correction resolved automatically</strong>The governing operation is visible below. A causally later ordinary correction can still replace that outcome.</div>`
+            : "";
+      }
+
+      function renderTimeline(projection) {
+        const timeline = document.getElementById("timeline");
+        timeline.replaceChildren(
+          ...(projection.facts.length
+            ? projection.facts.map((entry) => recordElement(M.describeFact(entry), `${entry.gameTime} · ${entry.controller}`, "live"))
+            : [emptyElement("No effective sporting or stoppage facts.")]),
+        );
+      }
+
+      function renderAudit() {
+        const audit = document.getElementById("audit");
+        const facts = state.operations.filter((operation) => operation.kind === "fact");
+        const entries = state.operations.map((operation) => {
+          if (operation.kind === "fact") {
+            const live = M.isEffective(state, operation);
+            const detail = [
+              `${operation.id} · ${operation.controller} · ${operation.syncState}`,
+              operation.override
+                ? `Official Override directed by ${operation.override.directedBy}: ${operation.override.reason}. Guardrail: ${operation.override.guardrail}.`
+                : null,
+            ]
+              .filter(Boolean)
+              .join(" · ");
+            return recordElement(
+              M.describeFact(operation),
+              detail,
+              operation.override ? "override" : live ? "live" : "voided",
+              operation.override ? "Official Override" : live ? "effective" : "voided",
+            );
+          }
+          const target = facts.find((fact) => fact.id === operation.targetId);
+          const governing = M.governingCorrection(state, operation.targetId)?.id === operation.id;
+          const detail = `${operation.id} · ${operation.controller} · revision ${operation.revision} · ${operation.syncState} · ${operation.reason}`;
+          return recordElement(
+            `${operation.directive === "void" ? "Reverse" : "Reinstate"} “${target ? M.describeFact(target) : operation.targetId}”`,
+            detail,
+            governing ? "governing" : "superseded",
+            governing ? "governing" : "superseded",
+          );
+        });
+        audit.replaceChildren(...(entries.length ? entries.reverse() : [emptyElement("No accepted operations yet.")]));
+        document.getElementById("audit-count").textContent = `(${entries.length})`;
+      }
+
+      function recordElement(title, detail, statusClass, statusText = "effective") {
+        const item = document.createElement("li");
+        item.className = "record";
+        item.innerHTML = `<div class="record-line"><strong>${title}</strong><span class="pill ${statusClass}">${statusText}</span></div><small>${detail}</small>`;
+        return item;
+      }
+
+      function emptyElement(message) {
+        const item = document.createElement("li");
+        item.className = "empty";
+        item.textContent = message;
+        return item;
+      }
+
+      function renderScenarios() {
+        const tabs = document.getElementById("scenario-tabs");
+        tabs.replaceChildren(
+          ...scenarios.map((scenario) => {
+            const button = document.createElement("button");
+            button.textContent = scenario.tab;
+            button.setAttribute("role", "tab");
+            button.setAttribute("aria-selected", String(scenario.id === activeScenario.id));
+            button.addEventListener("click", () => selectScenario(scenario));
+            return button;
+          }),
+        );
+        document.getElementById("scenario-title").textContent = activeScenario.title;
+        document.getElementById("scenario-description").textContent = activeScenario.description;
+        const steps = document.getElementById("scenario-steps");
+        steps.replaceChildren(
+          ...activeScenario.steps.map((step, index) => {
+            const row = document.createElement("div");
+            row.className = `step ${index < completedSteps ? "done" : ""}`;
+            const number = document.createElement("div");
+            number.className = "step-number";
+            number.textContent = index < completedSteps ? "✓" : String(index + 1);
+            const button = document.createElement("button");
+            button.textContent = step.label;
+            button.disabled = index !== completedSteps;
+            if (index === completedSteps) button.className = "primary";
+            button.addEventListener("click", () => {
+              state = step.run(state);
+              completedSteps += 1;
+              render();
+            });
+            row.append(number, button);
+            return row;
+          }),
+        );
+      }
+
+      function selectScenario(scenario) {
+        activeScenario = scenario;
+        completedSteps = 0;
+        state = { ...scenario.seed(), lastChange: "Scenario prepared. Start with step 1." };
+        render();
+      }
+
+      function capitalize(value) {
+        return value.charAt(0).toUpperCase() + value.slice(1);
+      }
+
+      function render() {
+        const projection = M.project(state);
+        renderSummary(projection);
+        renderTimeline(projection);
+        renderAudit();
+        renderScenarios();
+      }
+
+      renderButtons("fact-buttons", factButtons);
+      renderButtons("correction-buttons", correctionButtons);
+      render();
+    </script>
+  </body>
+</html>
