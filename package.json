@@ -11,9 +11,9 @@
     "build:executable": "bun run build.ts --compile --compile-target=bun-linux-x64-modern --outfile=dist/quadball-timer",
     "test": "bun test --isolate",
     "test:changed": "bun test --changed",
-    "format": "bunx --bun oxfmt \"**/*.{js,jsx,ts,tsx,mjs,cjs}\"",
-    "format:check": "bunx --bun oxfmt \"**/*.{js,jsx,ts,tsx,mjs,cjs}\" --check",
-    "lint": "bunx --bun oxlint --type-aware --type-check",
+    "format": "bunx --bun oxfmt \"**/*.{js,jsx,ts,tsx,mjs,cjs}\" \"!docs/**\"",
+    "format:check": "bunx --bun oxfmt \"**/*.{js,jsx,ts,tsx,mjs,cjs}\" \"!docs/**\" --check",
+    "lint": "bunx --bun oxlint --type-aware --type-check --ignore-pattern \"docs/**\"",
     "lint:shell": "shellcheck deploy/activate-release.sh",
     "check:bun-version": "bun scripts/check-bun-version.ts",
     "check": "bun run check:bun-version && bun run format:check && bun run lint && bun run lint:shell"

@@ -42,6 +42,12 @@ deploy-quadball-timer ALL=NOPASSWD: /bin/systemctl restart quadball-timer
 The app itself binds to `127.0.0.1:3000`; public HTTPS and WebSocket traffic is
 terminated by Caddy and proxied to that localhost backend.
 
+Pushes to `main` skip CI and deployment when every changed path is limited to
+`AGENTS.md`, `CONTEXT.md`, `README.md`, `docs/`, or `.github/dependabot.yml`.
+Files under `docs/` are also excluded from formatting, linting, and type-aware
+validation. Manually dispatch the workflow to force CI; production deployment
+still occurs only when the selected ref is `main`.
+
 ## Quality checks
 
 ```bash
