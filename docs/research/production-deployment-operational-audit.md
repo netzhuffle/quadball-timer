@@ -46,7 +46,7 @@ The remaining gaps are production controls and evidence: production has no appro
 
 ### 2. Separate production promotion from ordinary `main` pushes
 
-- Keep CI on every push, but require an explicit production promotion of the accepted release candidate by 2 August. Use required reviewers on the GitHub `production` environment or an equivalent manual promotion gate if environment reviewers are unavailable.
+- Keep CI on every push, but require an explicit production promotion of the accepted release candidate after feature completion on the afternoon of 13 August and before the joint go/no-go decision on the evening of 14 August. Use required reviewers on the GitHub `production` environment or an equivalent manual promotion gate if environment reviewers are unavailable.
 - Preserve the non-cancelling production concurrency group.
 - Record the exact approved commit, artifact digest, deployment run, and live release identity in the durable acceptance record.
 - From feature freeze through SQM, do not deploy merely because documentation or unrelated code lands on `main`. No event-day deployment is planned; an exceptional event-day deploy or rollback remains the repository maintainer's onsite judgment.
@@ -92,7 +92,7 @@ The check must fail the deployment when the release identity does not equal the 
 
 These checks require the deployed server and, where noted, a deliberate outage. They should be captured in the acceptance record rather than inferred from source.
 
-### Before the 26 July rehearsal baseline
+### Before testing begins after feature freeze on 13 August
 
 - Verify `current` resolves to an immutable release whose manifest and executable digest match the selected Actions artifact.
 - Inspect `systemctl cat`, `systemctl show`, service status, restart count, journal errors, runtime/deploy users, directory ownership, sudoers, AVX2 support, loopback listener, free disk space, and Caddy upstream configuration.
@@ -100,7 +100,7 @@ These checks require the deployed server and, where noted, a deliberate outage. 
 - Confirm one-minute external HTTP/API and functional-WebSocket monitoring, plus alerts for sustained failure, repeated restarts, low disk, and backup failure.
 - Confirm a production-data backup can be restored into an isolated rehearsal deployment before destructive recovery testing.
 
-### In the isolated 3–9 August rehearsal window
+### From the afternoon of 13 August through 14 August
 
 - Deploy the exact release-candidate artifact to the separate rehearsal deployment and database.
 - Re-run the same artifact without overwriting the first release; prove both remain byte-identical and independently selectable.
@@ -109,12 +109,13 @@ These checks require the deployed server and, where noted, a deliberate outage. 
 - Exercise the accepted offline, concurrent-action, lost-phone, and server-unavailable drills, while monitoring and alerting are observed by the maintainer.
 - Restore rehearsal data from backup and compare Event Games, operations, grants, and idempotency records with the pre-failure checkpoint.
 
-### Before the 12 August go/no-go decision
+### Before the evening of 14 August go/no-go decision
 
 - Promote the already-rehearsed artifact through the production approval gate; do not rebuild it.
 - Match the live release identity and digest to the acceptance record.
 - Run non-mutating public HTTP/API/WebSocket and internal readiness checks, verify monitoring is green, and inspect recent service/Caddy errors.
 - Record both Production Acceptance Authority approvals. Any state-loss, convergence, grant, monitoring, or restoration failure remains a no-go defect.
+- In that joint decision, record which remaining blockers, if any, may be fixed on 15 August without reconvening both authorities. A permitted fix still requires its focused regression evidence, but no new shared approval; anything outside the approved boundary remains a no-go.
 
 ## Current live snapshot
 

@@ -2,18 +2,18 @@
 
 ## Question and deadline
 
-Which runtime, frontend, UI, test, formatter, linter, GitHub Actions, and transitive dependency upgrades should Quadball Timer complete before SQM on 16 August 2026, and which changes should wait until after the accepted feature freeze on 2 August 2026?
+Which runtime, frontend, UI, test, formatter, linter, GitHub Actions, and transitive dependency upgrades should Quadball Timer complete before SQM on 16 August 2026, and which changes should wait until after the accepted feature freeze on the afternoon of 13 August 2026?
 
 Research was performed on 12 July 2026 against the repository, the npm registry, official project release notes, and GitHub's advisory database. Version claims below are snapshots as of that date.
 
 ## Recommendation
 
-Complete one dependency-refresh sequence now, while there are three weeks before feature freeze, then stop routine dependency movement on 2 August. The sequence should be:
+Complete one dependency-refresh sequence before the afternoon of 13 August, then stop routine dependency movement through SQM. The sequence should be:
 
 1. **Security and runtime first:** regenerate `bun.lock` so `ws` resolves to 8.21.0, then move the Bun runtime, `@types/bun`, and the lockfile's Bun package to 1.3.14 together.
 2. **Current direct releases:** update the existing frontend, UI, test-DOM, Tailwind, and Oxc packages listed below. Keep this as dependency maintenance, not a UI redesign.
 3. **Low-risk Actions maintenance:** move `actions/checkout` from v6.0.2 to v6.0.3 by immutable SHA. Keep the already-current `setup-bun`, `upload-artifact` v6, and `download-artifact` v7 pins.
-4. Run the complete local gate and one real production deployment early enough to observe it before 2 August. From feature freeze through SQM, accept only a security fix or a release-blocking compatibility fix, each with the same gate and deployment rehearsal.
+4. Run the complete local gate and one real production deployment before the afternoon of 13 August. From feature freeze through SQM, accept only a security fix or a release-blocking compatibility fix, each with the same gate and deployment rehearsal.
 
 Do **not** introduce Vite, Vitest, Testing Library, a standalone TypeScript compiler, a new shadcn package/layout, or new major GitHub Actions before SQM. None is required by the current architecture, and each expands the failure surface without closing a known event-readiness gap.
 
@@ -38,7 +38,7 @@ These choices make a targeted in-place refresh substantially safer than a toolch
 | Tailwind stack | Tailwind 4.2.4; tailwind-merge 3.5.0 | Tailwind 4.3.2; tailwind-merge 3.6.0 | Both stay within their current major versions and the existing CSS-first configuration. `bun-plugin-tailwind` 0.1.2 and `tw-animate-css` 1.4.0 are already current. Build output and every active controller tab need visual verification because utility generation and class conflict resolution can change appearance without a type error. | [Tailwind release](https://github.com/tailwindlabs/tailwindcss/releases/tag/v4.3.2), [Tailwind registry](https://registry.npmjs.org/tailwindcss/latest), [tailwind-merge release](https://github.com/dcastil/tailwind-merge/releases/tag/v3.6.0), [plugin registry](https://registry.npmjs.org/bun-plugin-tailwind/latest), [animation registry](https://registry.npmjs.org/tw-animate-css/latest) |
 | Icons | lucide-react 1.14.0 | 1.24.0 | Imported icon names used by the app still resolve in the rehearsal. Treat any visual glyph change as a manual controller QA item; do not use this refresh to replace icons. | [Lucide release](https://github.com/lucide-icons/lucide/releases/tag/1.24.0), [registry](https://registry.npmjs.org/lucide-react/latest) |
 | Test DOM | Happy DOM 20.9.0 | 20.10.6 | This remains within major 20 and preserves the existing direct React DOM test approach. Its updated manifest requires `ws ^8.21.0`, making it the durable route to the patched transitive version. Run all contextual interaction tests; do not infer that it makes pointer/outside-tap browser-equivalent. | [Happy DOM release](https://github.com/capricorn86/happy-dom/releases/tag/v20.10.6), [20.10.6 manifest](https://registry.npmjs.org/happy-dom/20.10.6) |
-| Formatter and linter | oxfmt 0.48.0; oxlint 1.63.0; oxlint-tsgolint 0.22.1 | oxfmt 0.58.0; oxlint 1.73.0; oxlint-tsgolint 0.24.0 | The current commands and repository pass unchanged at the targets. Oxfmt is still pre-1.0 and its releases intentionally adjust formatting, so take any mechanical rewrite in its own reviewed commit and freeze the version after 2 August. Oxlint adds/fixes rules; review new diagnostics instead of suppressing them wholesale. | [Oxc combined release](https://github.com/oxc-project/oxc/releases/tag/oxlint_v1.73.0), [oxfmt registry](https://registry.npmjs.org/oxfmt/latest), [oxlint registry](https://registry.npmjs.org/oxlint/latest), [tsgolint registry](https://registry.npmjs.org/oxlint-tsgolint/latest) |
+| Formatter and linter | oxfmt 0.48.0; oxlint 1.63.0; oxlint-tsgolint 0.22.1 | oxfmt 0.58.0; oxlint 1.73.0; oxlint-tsgolint 0.24.0 | The current commands and repository pass unchanged at the targets. Oxfmt is still pre-1.0 and its releases intentionally adjust formatting, so take any mechanical rewrite in its own reviewed commit and freeze the version after the afternoon of 13 August. Oxlint adds/fixes rules; review new diagnostics instead of suppressing them wholesale. | [Oxc combined release](https://github.com/oxc-project/oxc/releases/tag/oxlint_v1.73.0), [oxfmt registry](https://registry.npmjs.org/oxfmt/latest), [oxlint registry](https://registry.npmjs.org/oxlint/latest), [tsgolint registry](https://registry.npmjs.org/oxlint-tsgolint/latest) |
 | Other direct packages | `@types/react-dom` 19.2.3, `bun-plugin-tailwind` 0.1.2, CVA 0.7.1, clsx 2.1.1, tw-animate-css 1.4.0 | no change | The first-party registry reports these as current. Avoid churn where there is no upgrade. | [React DOM types](https://registry.npmjs.org/%40types%2freact-dom/latest), [CVA](https://registry.npmjs.org/class-variance-authority/latest), [clsx](https://registry.npmjs.org/clsx/latest) |
 
 ### Lockfile requirement
@@ -70,7 +70,7 @@ Revisit the three deferred majors together after SQM, when the complete upload/d
 - **Standalone `typescript` / `tsc`:** defer. Bun executes TypeScript and the required repository gate is Oxlint type-aware/type-check mode. Adding a second compiler is a policy and diagnostics change, not a version refresh.
 - **Bulk shadcn regeneration or migration to the `radix-ui` umbrella package:** defer. The current UI primitives are checked-in application source. Regeneration can change markup, focus behavior, Tailwind classes, and mobile layout all at once.
 - **Bun canary, Bun 2, React 20 prereleases, Tailwind 5 prereleases, or any other new major:** defer until after SQM and evaluate as separate compatibility work.
-- **Routine upgrades after 2 August:** defer until after SQM. Security advisories remain exceptions, but require an isolated patch, full gate, compiled build, phone-width QA, and deployment rehearsal.
+- **Routine upgrades after the afternoon of 13 August:** defer until after SQM. Security advisories remain exceptions, but require an isolated patch, full gate, compiled build, phone-width QA, and deployment rehearsal.
 
 ## Isolated compatibility rehearsal
 
