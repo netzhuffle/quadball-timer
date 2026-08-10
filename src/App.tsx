@@ -7,6 +7,7 @@ import type { ControllerRole, GameSummary } from "@/lib/game-types";
 import { DEFAULT_AWAY_TEAM_COLOR, DEFAULT_HOME_TEAM_COLOR } from "@/lib/team-colors";
 import { ColorTestPage } from "@/pages/color-test-page";
 import { GamePage } from "@/pages/game-page";
+import { PublicExperiencePrototype } from "@/pages/public-experience-prototype";
 import "./index.css";
 
 type Route =
@@ -15,6 +16,9 @@ type Route =
     }
   | {
       type: "color-test";
+    }
+  | {
+      type: "public-experience-prototype";
     }
   | {
       type: "game";
@@ -33,6 +37,10 @@ export function App() {
 
   if (route.type === "color-test") {
     return <ColorTestPage />;
+  }
+
+  if (route.type === "public-experience-prototype") {
+    return <PublicExperiencePrototype />;
   }
 
   return <GamePage gameId={route.gameId} role={route.role} />;
@@ -305,6 +313,10 @@ function useRoute(): Route {
 }
 
 function parseRoute(pathname: string, search: string): Route {
+  if (pathname === "/prototype/public-experience") {
+    return { type: "public-experience-prototype" };
+  }
+
   if (pathname === "/color-test") {
     return { type: "color-test" };
   }

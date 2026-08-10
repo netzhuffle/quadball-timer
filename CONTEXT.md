@@ -76,6 +76,14 @@ _Avoid_: Court
 A game scheduled within an event between Event Teams and assigned to a Pitch. Controllers cannot rename its Teams, but an Event Admin may correct which Event Team occupies either side even after control begins.
 _Avoid_: Assigned game, scheduled match
 
+**Game Phase**:
+The rules-defined stage of a game: Seeker Floor, Seekers Released, or Overtime. It is independent of whether play is running or stopped.
+_Avoid_: Game Status, period
+
+**Game Status**:
+Whether a game is Running, Paused, Suspended, or Finished, independently of its Game Phase.
+_Avoid_: Game Phase, play phase
+
 **Ad Hoc Game**:
 A disposable game started outside any event for a friendly or spontaneous session. Its team names remain editable, and it has neither a Game Lock nor a durable Control Audit Trail.
 _Avoid_: Game from scratch, unassigned game
