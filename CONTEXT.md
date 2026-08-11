@@ -129,8 +129,12 @@ A person holding the Event's shared Event Admin Grant. Event Admins create and m
 _Avoid_: Pitch Manager, Controller
 
 **Technical Admin**:
-The operator authorized to create events and change event-level metadata such as their names, dates, and Event Admin Grants. This authority may be exercised through server administration rather than the event interface.
+The sole operator authorized to create Events, change event-level metadata, and manage Event Admin Grants. Routine administration uses the passkey-authenticated browser interface; a host-local CLI additionally provides selected administration and recovery workflows.
 _Avoid_: Event Admin, Pitch Manager
+
+**Technical Admin Passkey**:
+The environment-specific WebAuthn credential that authenticates the Technical Admin without an account, username, or Grant. Each environment has at most one active registered credential; provider-synchronized copies remain one credential rather than separate passkeys.
+_Avoid_: Technical Admin account, Technical Admin Grant, administrator password
 
 **Production Acceptance Authority**:
 Either of the two people who must approve production use for an Event: the repository maintainer for technical readiness and the organizing association's president for operational readiness. Both approvals are required, and either authority may require fallback to the Official Score Sheet and manual timing.
