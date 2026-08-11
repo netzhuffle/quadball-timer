@@ -48,6 +48,22 @@ _Avoid_: Double booking, invalid game
 A participant admitted by a Control Grant to operate an Event Game. Controllers share equal authority over the full Game; Timekeepers and Scorekeepers have no distinct app roles.
 _Avoid_: Scorekeeper role, timekeeper role, primary controller
 
+**Offline Clock Holder**:
+The Grant Session whose clock action the server most recently accepted, and the only one permitted to continue submitting official clock actions while disconnected. A later clock action transfers this continuity and may simply mean the same Timekeeper changed devices.
+_Avoid_: Authority device, Primary Controller, primary phone
+
+**Clock Baseline**:
+The accepted game time and running or paused state from which Clock Projections advance. An emergency takeover establishes a new baseline without implying that the Timekeeper changed.
+_Avoid_: Clock snapshot, device time
+
+**Clock Projection**:
+An informational game-time display derived from the current Clock Baseline. When the Offline Clock Holder cannot be observed, it may remain visible as a clearly labelled stale or estimated value rather than presenting itself as currently synchronized.
+_Avoid_: Official Field Clock Display, synchronized clock
+
+**Official Field Clock Display**:
+A pitch-facing clock intended to guide players and controlled by the Timekeeper. Controller and spectator Clock Projections are informational and are not Official Field Clock Displays.
+_Avoid_: Spectator clock, Controller clock
+
 **Head Referee**:
 The game official with final on-pitch authority to make and correct calls, stop or resume play, and direct game timekeeping and scorekeeping.
 _Avoid_: HR, referee admin
