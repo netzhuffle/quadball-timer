@@ -60,6 +60,10 @@ _Avoid_: Clock snapshot, device time
 An informational game-time display derived from the current Clock Baseline. When the Offline Clock Holder cannot be observed, it may remain visible as a clearly labelled stale or estimated value rather than presenting itself as currently synchronized.
 _Avoid_: Official Field Clock Display, synchronized clock
 
+**Audience Projection**:
+An allowlisted view of Event and Event Game information for one audience: public spectators, Controllers, Pitch Managers, Event Admins, or Technical Admins. It contains only information that audience may see and preserves relevant stale or estimated status.
+_Avoid_: Game State, full snapshot, generic response
+
 **Official Field Clock Display**:
 A pitch-facing clock intended to guide players and controlled by the Timekeeper. Controller and spectator Clock Projections are informational and are not Official Field Clock Displays.
 _Avoid_: Spectator clock, Controller clock
@@ -159,6 +163,10 @@ _Avoid_: Game ID, game identification, Game Designation
 **Event Game**:
 An Event-managed game with an optional Game Designation and Game Code, two assigned Event Teams, exactly one Gameplay Slot, and exactly one Pitch Slot within it. Its state and history remain with it through Pitch Reassignment; Controllers cannot rename its Teams, but an Event Admin may correct which Event Team occupies either side even after control begins.
 _Avoid_: Assigned game, scheduled match
+
+**Event Game Record**:
+The app-authoritative operational history of one Event Game, comprising its accepted Control Actions and the Derived Game State rebuilt from their effective Game Facts. It supports live operations and audit but does not replace the authoritative Official Score Sheet.
+_Avoid_: Official game record, mutable Game State, Official Score Sheet
 
 **Ad Hoc Game**:
 A disposable game started outside any event for a friendly or spontaneous session. Its team names remain editable, and it has neither a Game Lock nor a durable Control Audit Trail.
