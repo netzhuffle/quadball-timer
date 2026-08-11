@@ -85,7 +85,7 @@ A Control Action that names one stable Game Fact and makes it ineffective or eff
 _Avoid_: Delete, edit history, undo latest
 
 **Control Action**:
-An immutable Controller-submitted record accepted for an Event Game. It records either a Game Fact or a Correction and may carry an Official Override.
+An immutable Controller-submitted record accepted for an Event Game. It has a stable identity within that Event Game across submission, replay, and recovery, records either a Game Fact or a Correction, and may carry an Official Override.
 _Avoid_: Mutable command, audit entry
 
 **Derived Game State**:
@@ -169,11 +169,11 @@ An Event-managed game with an optional Game Designation and Game Code, two assig
 _Avoid_: Assigned game, scheduled match
 
 **Event Game Record**:
-The app-authoritative operational history of one Event Game, comprising its accepted Control Actions and the Derived Game State rebuilt from their effective Game Facts. It supports live operations and audit but does not replace the authoritative Official Score Sheet.
+The app-authoritative operational history of one Event Game, whose permanent authority is its accepted Control Actions and whose Derived Game State is rebuilt from their effective Game Facts. It supports live operations and audit but does not replace the authoritative Official Score Sheet.
 _Avoid_: Official game record, mutable Game State, Official Score Sheet
 
 **Ad Hoc Game**:
-A disposable game started outside any event for a friendly or spontaneous session. Its team names remain editable, and it has neither a Game Lock nor a durable Control Audit Trail.
+A disposable game started outside any event for a friendly or spontaneous session. Its current state survives ordinary restarts, but it has neither a Game Lock nor a durable Control Audit Trail and may be pruned only when stopped, inactive for 30 days, and older than 49 other Ad Hoc Games.
 _Avoid_: Game from scratch, unassigned game
 
 **Game Timeline**:
@@ -187,6 +187,10 @@ _Avoid_: First play tap, current running state, game creation
 **Control Audit Trail**:
 The permanent record of accepted control actions, corrections, originating Controllers, synchronization, and conflict outcomes for an Event Game. It is operational evidence visible only to Event Admins and Technical Admins, rather than the spectator-facing history.
 _Avoid_: Game Timeline
+
+**Recovery Gap**:
+An explicit marker that operational or audit evidence could not be recovered after catastrophic data loss. It identifies what is missing without replacing it with inferred or reconstructed evidence.
+_Avoid_: Recovered action, assumed history
 
 **Grant Audit Trail**:
 The permanent record of Grant credential, session, rotation, expiry, reactivation, and recovery events without raw credentials or claimed human identities. Like every Audit Trail, it is visible only to Event Admins and Technical Admins.
