@@ -136,6 +136,14 @@ _Avoid_: Event Admin, Pitch Manager
 The environment-specific WebAuthn credential that authenticates the Technical Admin without an account, username, or Grant. Each environment has at most one active registered credential; provider-synchronized copies remain one credential rather than separate passkeys.
 _Avoid_: Technical Admin account, Technical Admin Grant, administrator password
 
+**Production Environment**:
+The live Quadball Timer environment whose Events, authority, and operational records may be used for real event operations.
+_Avoid_: Live database, production instance
+
+**Test Environment**:
+The permanent non-production Quadball Timer environment used for rehearsals, demonstrations, and testing. Its Events, credentials, authority, and operational records are separate from and never authoritative in the Production Environment.
+_Avoid_: Rehearsal Environment, staging environment, test database
+
 **Production Acceptance Authority**:
 Either of the two people who must approve production use for an Event: the repository maintainer for technical readiness and the organizing association's president for operational readiness. Both approvals are required, and either authority may require fallback to the Official Score Sheet and manual timing.
 _Avoid_: Technical Admin, Event Admin
