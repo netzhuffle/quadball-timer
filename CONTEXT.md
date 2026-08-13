@@ -64,6 +64,10 @@ _Avoid_: New game, duplicate game
 Two or more Event Games assigned to one Pitch Slot. It remains visible to Event Admins until the Event Games are reassigned.
 _Avoid_: Double booking, invalid game
 
+**Team Schedule Conflict**:
+One Event Team assigned to Event Games whose expected playing periods overlap. It remains visible to Event Admins but does not prevent an Event Team Assignment Correction from recording which team is actually playing.
+_Avoid_: Schedule Conflict, invalid team assignment
+
 **Controller**:
 A participant admitted by a Control Grant to operate an Event Game. Controllers share equal authority over the full Game; Timekeepers and Scorekeepers have no distinct app roles.
 _Avoid_: Scorekeeper role, timekeeper role, primary controller
@@ -201,8 +205,28 @@ The Pitch-and-Game-Day-scoped shared capability that admits Pitch Managers witho
 _Avoid_: Pitch Manager account
 
 **Event Team**:
-A team registered within an event, with an Event Admin-managed name and default color. Its name remains fixed during a game, while its displayed color may change and its playing side may be flipped.
+A team registered within an event, with an Event Admin-managed name and default color. Its name remains fixed during a game, while its Displayed Team Color and Pitch Orientation may change without changing its identity.
 _Avoid_: Home team, away team
+
+**Game Side**:
+One of the two stable participant positions within an Event Game. Game Facts remain attached to the Game Side; correcting its assigned Event Team changes how the whole record is identified without moving or rewriting those facts.
+_Avoid_: Home team, away team, display side, physical end
+
+**Event Team Assignment Correction**:
+An Event Admin correction that replaces the mistakenly selected Event Team on one Game Side with the Event Team actually playing that side for the whole Event Game. It takes the corrected Event Team's current name as that Game's fixed team name, but is not a substitution and does not move or rewrite Game Facts.
+_Avoid_: Team substitution, rename team, swap teams
+
+**Displayed Team Color**:
+The presentation color used for one Event Team in one Event Game. It defaults from the Event Team, may be changed to match the team's appearance, and never changes team identity or Game Facts.
+_Avoid_: Team identity, Game Side color
+
+**Pitch Orientation**:
+The Event Game-wide assignment of its two Event Teams to the opposite physical ends they defend. Flipping it swaps those defended ends for every Controller and spectator without changing Game Sides, Event Team identity, Displayed Team Colors, or Game Facts.
+_Avoid_: Team swap, side correction, display preference
+
+**Game Presentation Change**:
+An Event Game-wide change to Pitch Orientation or a Displayed Team Color by a Controller or Event Admin. It is permanently attributable and synchronized to every Controller and spectator but is neither a Game Fact, Correction, nor Official Override.
+_Avoid_: Control Action, Event Team Assignment Correction, display preference
 
 **Pitch**:
 A named playing area within an Event whose Game Day schedule consists of numbered Pitch Slots and whose scope bounds Pitch Manager access.
@@ -217,7 +241,7 @@ An optional compact event-facing identifier for an Event Game, such as `UB.QF.1`
 _Avoid_: Game ID, game identification, Game Designation
 
 **Event Game**:
-An Event-managed game with an optional Game Designation and Game Code, two assigned Event Teams, exactly one Gameplay Slot, and exactly one Pitch Slot within it. Its state and history remain with it through Pitch Reassignment; Controllers cannot rename its Teams, but an Event Admin may correct which Event Team occupies either side even after control begins.
+An Event-managed game with an optional Game Designation and Game Code, two Game Sides each assigned a distinct Event Team, exactly one Gameplay Slot, and exactly one Pitch Slot within it. Its state and history remain with it through Pitch Reassignment; Controllers cannot rename its Teams, but an Event Admin may correct a mistaken Event Team assignment even after control begins.
 _Avoid_: Assigned game, scheduled match
 
 **Event Game Record**:
@@ -253,8 +277,12 @@ The irreversible boundary between provisional clock setup and an Event Game whos
 _Avoid_: First play tap, current running state, game creation
 
 **Control Audit Trail**:
-The permanent record of accepted Control Actions, Corrections, originating Grant Sessions, synchronization, conflict outcomes, Locked-Game Corrections, Game Reopenings, Game Locks, rejected locked-game replay counts, and Official Overrides for an Event Game. It records previous and resulting values but requires no correction or reopening basis. It is operational evidence visible only to Event Admins and Technical Admins, rather than the spectator-facing history.
+The permanent record of accepted Control Actions, Corrections, Controller-originated Game Presentation Changes, originating Grant Sessions, synchronization, conflict outcomes, Locked-Game Corrections, Game Reopenings, Game Locks, rejected locked-game replay counts, Official Overrides, and references to Event Administration Audit Trail entries that change how its Game Sides are identified or presented. It records previous and resulting values but requires no correction or reopening basis. It is operational evidence visible only to Event Admins and Technical Admins, rather than the spectator-facing history.
 _Avoid_: Game Timeline
+
+**Event Administration Audit Trail**:
+The permanent record of Event Admin changes that affect Event structure or the identity, interpretation, or shared presentation of Event Games, including their originating Grant Sessions, before-and-after values, lifecycle context, and required reasons. It is visible only to Event Admins and Technical Admins.
+_Avoid_: Control Audit Trail, Game Timeline
 
 **Recovery Gap**:
 An explicit marker that operational or audit evidence could not be recovered after catastrophic data loss. It identifies what is missing without replacing it with inferred or reconstructed evidence.
