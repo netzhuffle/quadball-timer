@@ -124,6 +124,22 @@ _Avoid_: Controller code, written code, verbal code
 Device-specific, pseudonymous authority admitted by presenting an Event Admin Grant, Pitch Manager Grant, or Control Grant. It carries the Grant's type and scope but does not identify a natural person.
 _Avoid_: Login session, user session, account session
 
+**Event Admin Access Sheet**:
+A QR-only physical or digital handoff artifact for the Event's shared Event Admin Grant, shared among Event Admins for access when needed.
+_Avoid_: Event Team sheet, recovery-code sheet
+
+**Pitch Manager Access Sheet**:
+A QR-only physical or digital handoff artifact containing the Pitch Manager Grant for every Pitch and Game Day in an Event.
+_Avoid_: Pitch Manager code sheet, individual manager sheet
+
+**Control Grant Access Sheet**:
+A QR-only physical or digital handoff artifact for one Pitch and Game Day, kept by its Pitch Managers and containing every Pitch Slot's Control Grant whether or not an Event Game is assigned. An assigned Event Game is identified by a convenience snapshot of its Scheduled Start, Event Teams, and any Game Code or Game Designation; live admission remains authoritative.
+_Avoid_: Pitch Grant sheet, Controller code sheet
+
+**Access Sheet Version**:
+The non-secret generation identity printed on every physical or digital reproduction of one generated Access Sheet. It identifies the Environment, sheet scope, and generation time without inventorying copies or tracking the sheet's contents.
+_Avoid_: Sheet copy, Copy ID, print serial
+
 **Pitch Manager**:
 The person responsible for keeping one Pitch operating during an Event. A Pitch Manager can access that Pitch's Pitch Slots, assigned Event Games, and Control Grants and may rotate those Control Grants, but cannot create, edit, or delete Pitch Slots or Event Games.
 _Avoid_: Event Admin, Controller
@@ -157,7 +173,7 @@ The Event-scoped shared capability that admits Event Admins without individual a
 _Avoid_: Event Admin account, organizer account
 
 **Pitch Manager Grant**:
-The Pitch-scoped shared capability that admits Pitch Managers without individual accounts. It is created and managed by Event Admins.
+The Pitch-and-Game-Day-scoped shared capability that admits Pitch Managers without individual accounts. It is created and managed by Event Admins.
 _Avoid_: Pitch Manager account
 
 **Event Team**:
