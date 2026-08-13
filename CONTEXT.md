@@ -8,6 +8,10 @@ This context describes the target domain language being planned for preparing, c
 A named quadball gathering configured by the Technical Admin with a local timezone and one or more Game Days. It is current on each Game Day, future before its next Game Day, and past after its final Game Day.
 _Avoid_: Tournament, event window
 
+**Publication Status**:
+An Event-level visibility state of Unpublished, Published, or Event Cancelled. Only Published Events have a public Audience Projection; the other two statuses are indistinguishable from unknown Events to public audiences and do not change private operational authority.
+_Avoid_: Draft, withdrawn
+
 **Game Day**:
 A calendar date on which an Event holds games. Game Days have no event-level start or end time.
 _Avoid_: Event session, event time window
@@ -61,7 +65,7 @@ An informational game-time display derived from the current Clock Baseline. When
 _Avoid_: Official Field Clock Display, synchronized clock
 
 **Audience Projection**:
-An allowlisted view of Event and Event Game information for one audience: public spectators, Controllers, Pitch Managers, Event Admins, or Technical Admins. It contains only information that audience may see and preserves relevant stale or estimated status.
+An allowlisted view of Event and Event Game information for one audience—public spectators, Controllers, Pitch Managers, Event Admins, or Technical Admins—that contains only information that audience may see and preserves relevant stale or estimated status. The complete Event is the public publication unit, and its public Audience Projection continuously reflects eligible changes while Published.
 _Avoid_: Game State, full snapshot, generic response
 
 **Official Field Clock Display**:
@@ -125,11 +129,11 @@ The person responsible for keeping one Pitch operating during an Event. A Pitch 
 _Avoid_: Event Admin, Controller
 
 **Event Admin**:
-A person holding the Event's shared Event Admin Grant. Event Admins create and manage the Event's Teams, Pitches, Pitch Slots, Event Games, Pitch Manager Grants, and Control Grants, but cannot change event-level metadata.
+A person holding the Event's shared Event Admin Grant. Event Admins create and manage the Event's Teams, Pitches, Pitch Slots, Event Games, Pitch Manager Grants, Control Grants, and Publication Status, but cannot change other event-level metadata.
 _Avoid_: Pitch Manager, Controller
 
 **Technical Admin**:
-The sole operator authorized to create Events, change event-level metadata, and manage Event Admin Grants. Routine administration uses the passkey-authenticated browser interface; a host-local CLI additionally provides selected administration and recovery workflows.
+The sole operator authorized to create Events, change event-level metadata and Publication Status, and manage Event Admin Grants. Routine administration uses the passkey-authenticated browser interface; a host-local CLI additionally provides selected administration and recovery workflows.
 _Avoid_: Event Admin, Pitch Manager
 
 **Technical Admin Passkey**:
