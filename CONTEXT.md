@@ -225,7 +225,7 @@ The app-authoritative operational history of one Event Game, whose permanent aut
 _Avoid_: Official game record, mutable Game State, Official Score Sheet
 
 **Ad Hoc Game**:
-A publicly listed, disposable game created without an account or Event Grant for a friendly or spontaneous session. Its current state and control authority survive ordinary restarts and return as ordinary data after a full restore, but it has neither a Game Lock nor a durable Control Audit Trail; it cannot be manually removed and remains public until capacity cleanup prunes it.
+A controller-only, disposable game created without an account or Event Grant for a friendly or spontaneous session. Its current state and control authority survive ordinary restarts and return as ordinary data after a full restore, but it has neither a spectator experience, a Game Lock, nor a durable Control Audit Trail; it cannot be manually removed and remains retained until capacity cleanup prunes it.
 _Avoid_: Game from scratch, unassigned game
 
 **Ad Hoc Controller**:
@@ -235,10 +235,6 @@ _Avoid_: Ad Hoc Game owner, creator role, primary Controller
 **Ad Hoc Control QR**:
 A reusable, non-rotatable, high-entropy capability QR that any Ad Hoc Controller may display while the Game is unfinished to admit another Ad Hoc Controller without an account, Event Grant, or claimed identity. Finishing the Game stops display and new admission but does not revoke existing Ad Hoc Controllers; correcting it back to unfinished enables the same QR again.
 _Avoid_: Control Grant, Grant Code, controller login, game identifier
-
-**Ad Hoc Public Link**:
-A stable, opaque, non-secret spectator link to one publicly listed Ad Hoc Game. It is deliberately separate from the Ad Hoc Control QR and never admits control.
-_Avoid_: Ad Hoc Control QR, secret game link
 
 **Ad Hoc Capacity Cleanup**:
 Automatic removal when creating an Ad Hoc Game would exceed the 50-Game capacity. It prunes the oldest-created Game with no connected Ad Hoc Controller and whose last Controller connection ended at least five minutes earlier, regardless of finish state or age; creation is refused only while all 50 Games are protected by a current or recent Controller connection.
