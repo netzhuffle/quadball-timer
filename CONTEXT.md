@@ -16,6 +16,14 @@ _Avoid_: Draft, withdrawn
 A calendar date on which an Event holds games. Game Days have no event-level start or end time.
 _Avoid_: Event session, event time window
 
+**Heat Stoppage Configuration**:
+A Game Day-scoped on/off operational setting managed by Event Admins that determines the Heat Stoppage Mode of Event Games that have not commenced. Changing it does not affect commenced Games and requires no recorded forecast evidence or explanation. A Technical Admin may manage it through the Event Admin interface.
+_Avoid_: Event-wide heat setting, per-game heat configuration, event director setting
+
+**Heat Stoppage Mode**:
+The effective on/off heat-stoppage state of one Event Game. Before Game Commencement it follows the Game Day's Heat Stoppage Configuration; at commencement its value becomes independent of later configuration changes. During the Game, a Controller may change it only on Head Referee direction through an Official Override.
+_Avoid_: Heat Stoppage Configuration, game heat setting
+
 **Gameplay Slot**:
 A tournament-system-defined row in a Game Day schedule that groups up to one Event Game per Pitch, usually under one Scheduled Start. A general Expected Delay can move its Games together while allowing a more-delayed Pitch Slot to remain later.
 _Avoid_: Game Slot, round, timeslot, batch
@@ -145,11 +153,11 @@ The person responsible for keeping one Pitch operating during an Event. A Pitch 
 _Avoid_: Event Admin, Controller
 
 **Event Admin**:
-A person holding the Event's shared Event Admin Grant. Event Admins create and manage the Event's Teams, Pitches, Pitch Slots, Event Games, Pitch Manager Grants, Control Grants, and Publication Status, but cannot change other event-level metadata.
+A person holding the Event's shared Event Admin Grant. Event Admins create and manage the Event's Teams, Pitches, Pitch Slots, Event Games, Pitch Manager Grants, Control Grants, Publication Status, and Heat Stoppage Configuration, but cannot change other event-level metadata.
 _Avoid_: Pitch Manager, Controller
 
 **Technical Admin**:
-The sole operator authorized to create Events, change event-level metadata and Publication Status, and manage Event Admin Grants. Routine administration uses the passkey-authenticated browser interface; a host-local CLI additionally provides selected administration and recovery workflows.
+The sole operator authorized to create Events, change event-level metadata and Publication Status, and manage Event Admin Grants. A Technical Admin may enter the Event Admin interface and exercise every Event Admin capability. Routine administration uses the passkey-authenticated browser interface; a host-local CLI additionally provides selected administration and recovery workflows.
 _Avoid_: Event Admin, Pitch Manager
 
 **Technical Admin Passkey**:
