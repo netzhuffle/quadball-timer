@@ -93,7 +93,7 @@ The game official with final on-pitch authority to make and correct calls, stop 
 _Avoid_: HR, referee admin
 
 **Official Override**:
-A Head Referee-directed Control Action that intentionally departs from a normal rule-derived guardrail. It records the direction, affected guardrail, confirmation, and audit provenance in the Control Audit Trail while keeping the game operable; no reason is required.
+A Head Referee-directed Control Action that intentionally departs from a normal rule-derived guardrail. It records the direction, affected guardrail, confirmation, audit provenance, and any reason required by the applicable workflow in the Control Audit Trail while keeping the game operable.
 _Avoid_: Rule exception, forced command
 
 **Game Fact**:
