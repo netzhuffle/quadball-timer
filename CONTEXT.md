@@ -17,12 +17,20 @@ A calendar date on which an Event holds games. Game Days have no event-level sta
 _Avoid_: Event session, event time window
 
 **Heat Stoppage Configuration**:
-A Game Day-scoped on/off operational setting managed by Event Admins that determines the Heat Stoppage Mode of Event Games that have not commenced. Changing it does not affect commenced Games and requires no recorded forecast evidence or explanation. A Technical Admin may manage it through the Event Admin interface.
+A Game Day-scoped on/off operational setting managed by Event Admins that defaults to off and determines the Heat Stoppage Mode of Event Games that have not commenced. Changing it does not affect commenced Games and requires no recorded forecast evidence or explanation. A Technical Admin may manage it through the Event Admin interface.
 _Avoid_: Event-wide heat setting, per-game heat configuration, event director setting
 
 **Heat Stoppage Mode**:
 The effective on/off heat-stoppage state of one Event Game. Before Game Commencement it follows the Game Day's Heat Stoppage Configuration; at commencement its value becomes independent of later configuration changes. During the Game, a Controller may change it only on Head Referee direction through an Official Override.
 _Avoid_: Heat Stoppage Configuration, game heat setting
+
+**Heat Stoppage Trigger**:
+A Game-time decision point at 15:00, 25:00, and every five minutes thereafter while Heat Stoppage Mode is on. Reaching it makes the trigger pending without pausing play until the Head Referee's decision is recorded. Enabling the mode during a Game starts with the next future trigger rather than recreating passed triggers; disabling it cancels a pending trigger.
+_Avoid_: Automatic stoppage, heat timer
+
+**Heat Stoppage**:
+A complete stoppage started by a Controller on Head Referee direction after a Heat Stoppage Trigger. The first actual Heat Stoppage normally lasts four minutes and later ones two minutes. A required within-one-goal skip and the permitted following extension are ordinary rule operation; suppressing another required trigger, ending early, or extending beyond the rulebook allowance is an Official Override. Disabling Heat Stoppage Mode ends an active heat timer but does not resume play.
+_Avoid_: Team timeout, automatic clock pause
 
 **Gameplay Slot**:
 A tournament-system-defined row in a Game Day schedule that groups up to one Event Game per Pitch, usually under one Scheduled Start. A general Expected Delay can move its Games together while allowing a more-delayed Pitch Slot to remain later.
