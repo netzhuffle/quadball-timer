@@ -93,7 +93,7 @@ The game official with final on-pitch authority to make and correct calls, stop 
 _Avoid_: HR, referee admin
 
 **Official Override**:
-A Head Referee-directed Control Action that intentionally departs from a normal rule-derived guardrail. It records the direction, guardrail, and reason in the Control Audit Trail while keeping the game operable.
+A Head Referee-directed Control Action that intentionally departs from a normal rule-derived guardrail. It records the direction, affected guardrail, confirmation, and audit provenance in the Control Audit Trail while keeping the game operable; no reason is required.
 _Avoid_: Rule exception, forced command
 
 **Game Fact**:
@@ -104,12 +104,20 @@ _Avoid_: Mutable event, current value
 A Control Action that names one stable Game Fact and makes it ineffective or effective again without removing either the fact or earlier Corrections from the Control Audit Trail.
 _Avoid_: Delete, edit history, undo latest
 
+**Locked-Game Correction**:
+An Event Admin-submitted Control Action that directly reconciles a locked Event Game's current score, flag-catching team, catch time, end time, or other displayed end-state fact without reopening Controller operation. It atomically states the corrected values, preserves the previous values in the Control Audit Trail, and requires no reason or stated basis. A rule-inconsistent value receives one confirmation and records an Official Override.
+_Avoid_: Reopen Game, edit history, correction reason
+
+**Game Reopening**:
+An Event Admin-submitted Control Action that removes Game Lock without changing the Event Game's existing facts. It restores ordinary Controller operation and fresh admission through the existing Control Grant QR, while sessions terminated by the previous lock and its expired Grant Code remain invalid. A reopened, still-finished Game starts a new 15-minute closing timer; making it unfinished stops that timer until it finishes again.
+_Avoid_: Locked-Game Correction, revive session, rotate Control Grant
+
 **Control Action**:
-An immutable Controller-submitted record accepted for an Event Game. It has a stable identity within that Event Game across submission, replay, and recovery, records either a Game Fact or a Correction, and may carry an Official Override.
+An immutable Controller-submitted or Event Admin-submitted record accepted for an Event Game. It has a stable identity within that Event Game across submission, replay, and recovery, records a Game Fact, Correction, Locked-Game Correction, or Game Reopening, and may carry an Official Override.
 _Avoid_: Mutable command, audit entry
 
 **Derived Game State**:
-The current score, phase, overtime target, result, stoppages, and other game state rebuilt from effective Game Facts whenever a Correction changes the record.
+The current score, phase, overtime target, result, stoppages, and other game state rebuilt from effective Game Facts and Locked-Game Corrections whenever either changes the record.
 _Avoid_: Stored result, patched state
 
 **Controller Device**:
@@ -161,7 +169,7 @@ The person responsible for keeping one Pitch operating during an Event. A Pitch 
 _Avoid_: Event Admin, Controller
 
 **Event Admin**:
-A person holding the Event's shared Event Admin Grant. Event Admins create and manage the Event's Teams, Pitches, Pitch Slots, Event Games, Pitch Manager Grants, Control Grants, Publication Status, and Heat Stoppage Configuration, but cannot change other event-level metadata.
+A person holding the Event's shared Event Admin Grant. Event Admins create and manage the Event's Teams, Pitches, Pitch Slots, Event Games, Pitch Manager Grants, Control Grants, Publication Status, and Heat Stoppage Configuration. They may directly correct a locked Event Game without reopening it, or reopen it for ordinary Controller operation, but cannot change other event-level metadata.
 _Avoid_: Pitch Manager, Controller
 
 **Technical Admin**:
@@ -245,7 +253,7 @@ The irreversible boundary between provisional clock setup and an Event Game whos
 _Avoid_: First play tap, current running state, game creation
 
 **Control Audit Trail**:
-The permanent record of accepted control actions, corrections, originating Controllers, synchronization, and conflict outcomes for an Event Game. It is operational evidence visible only to Event Admins and Technical Admins, rather than the spectator-facing history.
+The permanent record of accepted Control Actions, Corrections, originating Grant Sessions, synchronization, conflict outcomes, Locked-Game Corrections, Game Reopenings, Game Locks, rejected locked-game replay counts, and Official Overrides for an Event Game. It records previous and resulting values but requires no correction or reopening basis. It is operational evidence visible only to Event Admins and Technical Admins, rather than the spectator-facing history.
 _Avoid_: Game Timeline
 
 **Recovery Gap**:
@@ -253,11 +261,11 @@ An explicit marker that operational or audit evidence could not be recovered aft
 _Avoid_: Recovered action, assumed history
 
 **Grant Audit Trail**:
-The permanent record of Grant credential, session, rotation, expiry, reactivation, and recovery events without raw credentials or claimed human identities. Like every Audit Trail, it is visible only to Event Admins and Technical Admins.
+The permanent record of Grant credential, session, rotation, expiry, reactivation, recovery, and locked-game authority-use events without raw credentials, sporting details, or claimed human identities. Locked-game authority use links to the corresponding Control Audit Trail entry. Like every Audit Trail, it is visible only to Event Admins and Technical Admins.
 _Avoid_: Control Audit Trail, security log, access log
 
 **Game Lock**:
-The automatic safeguard that blocks control and further Grant admission for a finished Event Game 15 minutes after its last accepted control action. Paused, suspended, unfinished, and Ad Hoc Games never lock due to inactivity.
+The automatic safeguard that blocks control and further Grant admission for a finished Event Game 15 minutes after its last accepted Control Action. An Event Admin may apply a Locked-Game Correction without reopening control or restarting the closing timer, or may use Game Reopening so ordinary Controller operation and closing behavior resume. Queued offline actions rejected because the Game locked are discarded after confirmed rejection; the Control Audit Trail retains only their count, originating Grant Session, Game, and rejection time. Paused, suspended, unfinished, and Ad Hoc Games never lock due to inactivity.
 _Avoid_: Finalization, inactivity timeout
 
 **Official Score Sheet**:
