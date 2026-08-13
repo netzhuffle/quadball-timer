@@ -1,4 +1,15 @@
 import type { ControllerRole, GameCommand, GameSummary, GameView } from "@/lib/game-types";
+import {
+  SHARED_LIMITS,
+  validateClockAdjustmentMs,
+  validateGameClockMs,
+  validateIntegerInRange,
+  validateOnlineOccurrenceMs,
+  validateOpaqueIdentifier,
+  validatePlayerNumber,
+  normalizeBoundedText,
+  utf8ByteLength,
+} from "@/lib/validation-policy";
 
 export type ClientCommandEnvelope = {
   id: string;
@@ -24,6 +35,10 @@ export type ApplyCommandsMessage = {
 
 export type ClientWsMessage = SubscribeLobbyMessage | SubscribeGameMessage | ApplyCommandsMessage;
 
+export type ParseClientWsMessageOptions = {
+  serverNowMs?: number;
+};
+
 export type ServerWsMessage =
   | {
       type: "error";
@@ -41,7 +56,10 @@ export type ServerWsMessage =
       ackedCommandIds: string[];
     };
 
-export function parseClientWsMessage(raw: string):
+export function parseClientWsMessage(
+  raw: string,
+  options: ParseClientWsMessageOptions = {},
+):
   | {
       ok: true;
       message: ClientWsMessage;
@@ -50,6 +68,14 @@ export function parseClientWsMessage(raw: string):
       ok: false;
       error: string;
     } {
+  if (utf8ByteLength(raw) > SHARED_LIMITS.transport.websocketTextFrameBytes) {
+    return {
+      ok: false,
+      error: "WebSocket text frame exceeds the configured byte limit.",
+    };
+  }
+
+  const serverNowMs = options.serverNowMs ?? Date.now();
   let payload: unknown;
 
   try {
@@ -78,10 +104,11 @@ export function parseClientWsMessage(raw: string):
   }
 
   if (payload.type === "subscribe-game") {
-    if (typeof payload.gameId !== "string" || payload.gameId.length === 0) {
+    const gameId = validateOpaqueIdentifier(payload.gameId, "gameId");
+    if (!gameId.ok) {
       return {
         ok: false,
-        error: "subscribe-game requires a non-empty gameId.",
+        error: `subscribe-game ${gameId.error}`,
       };
     }
 
@@ -96,17 +123,18 @@ export function parseClientWsMessage(raw: string):
       ok: true,
       message: {
         type: "subscribe-game",
-        gameId: payload.gameId,
+        gameId: gameId.value,
         role: payload.role,
       },
     };
   }
 
   if (payload.type === "apply-commands") {
-    if (typeof payload.gameId !== "string" || payload.gameId.length === 0) {
+    const gameId = validateOpaqueIdentifier(payload.gameId, "gameId");
+    if (!gameId.ok) {
       return {
         ok: false,
-        error: "apply-commands requires a non-empty gameId.",
+        error: `apply-commands ${gameId.error}`,
       };
     }
 
@@ -117,7 +145,22 @@ export function parseClientWsMessage(raw: string):
       };
     }
 
+    if (payload.commands.length === 0) {
+      return {
+        ok: false,
+        error: "apply-commands requires at least one command.",
+      };
+    }
+
+    if (payload.commands.length > SHARED_LIMITS.replay.maxControlActions) {
+      return {
+        ok: false,
+        error: `apply-commands accepts at most ${SHARED_LIMITS.replay.maxControlActions} commands.`,
+      };
+    }
+
     const commands: ClientCommandEnvelope[] = [];
+    const commandIds = new Set<string>();
     for (const entry of payload.commands) {
       if (
         !isRecord(entry) ||
@@ -132,6 +175,29 @@ export function parseClientWsMessage(raw: string):
         };
       }
 
+      const commandId = validateOpaqueIdentifier(entry.id, "command id");
+      if (!commandId.ok) {
+        return {
+          ok: false,
+          error: commandId.error,
+        };
+      }
+
+      if (commandIds.has(commandId.value)) {
+        return {
+          ok: false,
+          error: "apply-commands requires unique command identities.",
+        };
+      }
+
+      const clientSentAtMs = validateOnlineOccurrenceMs(entry.clientSentAtMs, serverNowMs);
+      if (!clientSentAtMs.ok) {
+        return {
+          ok: false,
+          error: clientSentAtMs.error,
+        };
+      }
+
       const parsedCommand = parseGameCommand(entry.command);
       if (!parsedCommand.ok) {
         return {
@@ -141,17 +207,18 @@ export function parseClientWsMessage(raw: string):
       }
 
       commands.push({
-        id: entry.id,
-        clientSentAtMs: entry.clientSentAtMs,
+        id: commandId.value,
+        clientSentAtMs: clientSentAtMs.value,
         command: parsedCommand.command,
       });
+      commandIds.add(commandId.value);
     }
 
     return {
       ok: true,
       message: {
         type: "apply-commands",
-        gameId: payload.gameId,
+        gameId: gameId.value,
         commands,
       },
     };
@@ -197,11 +264,19 @@ function parseGameCommand(payload: Record<string, unknown>):
       };
     }
 
+    const deltaMs = validateClockAdjustmentMs(payload.deltaMs);
+    if (!deltaMs.ok) {
+      return {
+        ok: false,
+        error: deltaMs.error,
+      };
+    }
+
     return {
       ok: true,
       command: {
         type: "adjust-game-clock",
-        deltaMs: payload.deltaMs,
+        deltaMs: deltaMs.value,
       },
     };
   }
@@ -214,11 +289,19 @@ function parseGameCommand(payload: Record<string, unknown>):
       };
     }
 
+    const gameClockMs = validateGameClockMs(payload.gameClockMs);
+    if (!gameClockMs.ok) {
+      return {
+        ok: false,
+        error: gameClockMs.error,
+      };
+    }
+
     return {
       ok: true,
       command: {
         type: "set-game-clock",
-        gameClockMs: payload.gameClockMs,
+        gameClockMs: gameClockMs.value,
       },
     };
   }
@@ -252,12 +335,25 @@ function parseGameCommand(payload: Record<string, unknown>):
       };
     }
 
+    const delta = validateIntegerInRange(
+      payload.delta,
+      -SHARED_LIMITS.score.max,
+      SHARED_LIMITS.score.max,
+      "score delta",
+    );
+    if (!delta.ok) {
+      return {
+        ok: false,
+        error: delta.error,
+      };
+    }
+
     return {
       ok: true,
       command: {
         type: "change-score",
         team: payload.team,
-        delta: payload.delta,
+        delta: delta.value,
         reason: payload.reason,
       },
     };
@@ -295,6 +391,15 @@ function parseGameCommand(payload: Record<string, unknown>):
       };
     }
 
+    const playerNumber =
+      payload.playerNumber === null ? null : validatePlayerNumber(payload.playerNumber);
+    if (playerNumber !== null && !playerNumber.ok) {
+      return {
+        ok: false,
+        error: playerNumber.error,
+      };
+    }
+
     if (
       payload.startedGameClockMs !== undefined &&
       typeof payload.startedGameClockMs !== "number"
@@ -305,24 +410,35 @@ function parseGameCommand(payload: Record<string, unknown>):
       };
     }
 
+    const startedGameClockMs =
+      payload.startedGameClockMs === undefined
+        ? undefined
+        : validateGameClockMs(payload.startedGameClockMs);
+    if (startedGameClockMs !== undefined && !startedGameClockMs.ok) {
+      return {
+        ok: false,
+        error: startedGameClockMs.error,
+      };
+    }
+
     return {
       ok: true,
       command: {
         type: "add-card",
         team: payload.team,
-        playerNumber: payload.playerNumber,
+        playerNumber: playerNumber === null ? null : playerNumber.value,
         cardType: payload.cardType,
-        startedGameClockMs:
-          typeof payload.startedGameClockMs === "number" ? payload.startedGameClockMs : undefined,
+        startedGameClockMs: startedGameClockMs === undefined ? undefined : startedGameClockMs.value,
       },
     };
   }
 
   if (payload.type === "confirm-penalty-expiration") {
-    if (typeof payload.pendingId !== "string") {
+    const pendingId = validateOpaqueIdentifier(payload.pendingId, "pendingId");
+    if (!pendingId.ok) {
       return {
         ok: false,
-        error: "confirm-penalty-expiration requires pendingId.",
+        error: `confirm-penalty-expiration ${pendingId.error}`,
       };
     }
 
@@ -333,12 +449,21 @@ function parseGameCommand(payload: Record<string, unknown>):
       };
     }
 
+    const playerKey =
+      payload.playerKey === null ? null : validateOpaqueIdentifier(payload.playerKey, "playerKey");
+    if (playerKey !== null && !playerKey.ok) {
+      return {
+        ok: false,
+        error: playerKey.error,
+      };
+    }
+
     return {
       ok: true,
       command: {
         type: "confirm-penalty-expiration",
-        pendingId: payload.pendingId,
-        playerKey: payload.playerKey,
+        pendingId: pendingId.value,
+        playerKey: playerKey === null ? null : playerKey.value,
       },
     };
   }
@@ -497,6 +622,30 @@ function parseGameCommand(payload: Record<string, unknown>):
         error: "rename-teams requires homeName and awayName.",
       };
     }
+
+    const homeName = normalizeBoundedText(
+      payload.homeName,
+      SHARED_LIMITS.names.teamAndPitchMaxCodePoints,
+      "homeName",
+    );
+    const awayName = normalizeBoundedText(
+      payload.awayName,
+      SHARED_LIMITS.names.teamAndPitchMaxCodePoints,
+      "awayName",
+    );
+    if (!homeName.ok) {
+      return {
+        ok: false,
+        error: `rename-teams ${homeName.error}`,
+      };
+    }
+    if (!awayName.ok) {
+      return {
+        ok: false,
+        error: `rename-teams ${awayName.error}`,
+      };
+    }
+
     if (payload.homeColor !== undefined && !isHexTeamColor(payload.homeColor)) {
       return {
         ok: false,
@@ -516,8 +665,8 @@ function parseGameCommand(payload: Record<string, unknown>):
       ok: true,
       command: {
         type: "rename-teams",
-        homeName: payload.homeName,
-        awayName: payload.awayName,
+        homeName: homeName.value,
+        awayName: awayName.value,
         homeColor,
         awayColor,
       },

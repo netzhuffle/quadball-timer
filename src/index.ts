@@ -7,7 +7,15 @@ import {
   projectGameView,
 } from "@/lib/game-engine";
 import type { ControllerRole, GameCommand, GameState } from "@/lib/game-types";
+import { readJsonBodyWithinLimit } from "@/lib/http-body";
 import { isInternalHealthHost } from "@/lib/internal-health";
+import { normalizeBoundedText, SHARED_LIMITS } from "@/lib/validation-policy";
+import {
+  parseSqliteProbeInvocation,
+  runSqliteFoundationProbe,
+  runSqliteFoundationProbeWorker,
+  type SqliteProbeInvocation,
+} from "@/lib/sqlite-foundation-probe";
 import { isAllowedWebSocketOrigin } from "@/lib/ws-origin";
 import { parseClientWsMessage, type ServerWsMessage } from "@/lib/ws-protocol";
 
@@ -40,244 +48,334 @@ const sockets = new Set<ServerWebSocket<SessionData>>();
 
 const MAX_TRACKED_COMMAND_IDS = 5_000;
 
-const server = serve<SessionData>({
-  hostname: process.env.HOST ?? "127.0.0.1",
-  port: Number(process.env.PORT ?? 3000),
-  routes: {
-    "/ws": (req: Bun.BunRequest<"/ws">, routeServer: Bun.Server<SessionData>) => {
-      if (!isAllowedWebSocketOrigin(req.headers.get("origin"), req.headers.get("host"))) {
+const probeInvocation = parseSqliteProbeInvocation(process.argv.slice(1));
+
+async function main() {
+  if (probeInvocation.kind === "invalid") {
+    console.error(probeInvocation.error);
+    process.exitCode = 1;
+    return;
+  }
+
+  if (probeInvocation.kind !== "none") {
+    await runProbeMode(probeInvocation);
+    return;
+  }
+
+  startServer();
+}
+
+function startServer() {
+  const server = serve<SessionData>({
+    hostname: process.env.HOST ?? "127.0.0.1",
+    port: Number(process.env.PORT ?? 3000),
+    routes: {
+      "/ws": (req: Bun.BunRequest<"/ws">, routeServer: Bun.Server<SessionData>) => {
+        if (!isAllowedWebSocketOrigin(req.headers.get("origin"), req.headers.get("host"))) {
+          return json(
+            {
+              error: "WebSocket origin not allowed.",
+            },
+            403,
+          );
+        }
+
+        const upgraded = routeServer.upgrade(req, {
+          data: {
+            id: crypto.randomUUID(),
+            subscription: { type: "none" },
+          },
+        });
+
+        if (upgraded) {
+          return;
+        }
+
+        console.warn("WebSocket upgrade failed", {
+          url: req.url,
+          upgrade: req.headers.get("upgrade"),
+          connection: req.headers.get("connection"),
+        });
+
         return json(
           {
-            error: "WebSocket origin not allowed.",
+            error: "WebSocket upgrade failed.",
           },
-          403,
+          400,
         );
-      }
+      },
+      "/api/games": {
+        GET() {
+          const nowMs = Date.now();
+          const snapshots = [...games.values()]
+            .map((game) => projectGameSummary(game.state, nowMs))
+            .sort((a, b) => b.updatedAtMs - a.updatedAtMs);
 
-      const upgraded = routeServer.upgrade(req, {
-        data: {
-          id: crypto.randomUUID(),
-          subscription: { type: "none" },
+          return json({ games: snapshots });
         },
-      });
-
-      if (upgraded) {
-        return;
-      }
-
-      console.warn("WebSocket upgrade failed", {
-        url: req.url,
-        upgrade: req.headers.get("upgrade"),
-        connection: req.headers.get("connection"),
-      });
-
-      return json(
-        {
-          error: "WebSocket upgrade failed.",
+        POST(req: Request) {
+          return createGame(req);
         },
-        400,
-      );
-    },
-    "/api/games": {
-      GET() {
-        const nowMs = Date.now();
-        const snapshots = [...games.values()]
-          .map((game) => projectGameSummary(game.state, nowMs))
-          .sort((a, b) => b.updatedAtMs - a.updatedAtMs);
-
-        return json({ games: snapshots });
       },
-      POST(req: Request) {
-        return createGame(req);
-      },
-    },
-    "/api/games/:gameId": {
-      GET(req: Request) {
-        const gameId = new URL(req.url).pathname.replace("/api/games/", "");
-        const game = games.get(gameId);
-        if (game === undefined) {
-          return json({ error: "Game not found." }, 404);
-        }
-
-        return json({ game: projectGameView(game.state, Date.now()) });
-      },
-    },
-    "/internal/healthz": {
-      GET(req: Request) {
-        if (!isInternalHealthHost(req.headers.get("host"))) {
-          return json({ error: "Not found." }, 404);
-        }
-
-        return json({ ok: true });
-      },
-    },
-    "/*": index,
-  },
-  development: process.env.NODE_ENV !== "production" && {
-    hmr: true,
-    console: true,
-  },
-  websocket: {
-    open(ws) {
-      sockets.add(ws);
-    },
-    close(ws) {
-      sockets.delete(ws);
-    },
-    message(ws, message) {
-      if (typeof message !== "string") {
-        sendMessage(ws, {
-          type: "error",
-          message: "Unsupported message format.",
-        });
-        return;
-      }
-
-      const parsed = parseClientWsMessage(message);
-      if (!parsed.ok) {
-        sendMessage(ws, {
-          type: "error",
-          message: parsed.error,
-        });
-        return;
-      }
-
-      switch (parsed.message.type) {
-        case "subscribe-lobby": {
-          ws.data.subscription = {
-            type: "lobby",
-          };
-          sendLobbySnapshot(ws);
-          return;
-        }
-
-        case "subscribe-game": {
-          const game = games.get(parsed.message.gameId);
+      "/api/games/:gameId": {
+        GET(req: Request) {
+          const gameId = new URL(req.url).pathname.replace("/api/games/", "");
+          const game = games.get(gameId);
           if (game === undefined) {
-            sendMessage(ws, {
-              type: "error",
-              message: "Game not found.",
-            });
-            return;
+            return json({ error: "Game not found." }, 404);
           }
 
-          ws.data.subscription = {
-            type: "game",
-            gameId: parsed.message.gameId,
-            role: parsed.message.role,
-          };
-
-          sendGameSnapshot({
-            ws,
-            game,
-            ackedCommandIds: [],
-          });
-          return;
-        }
-
-        case "apply-commands": {
-          if (ws.data.subscription.type !== "game") {
-            sendMessage(ws, {
-              type: "error",
-              message: "Not subscribed to a game.",
-            });
-            return;
-          }
-
-          if (ws.data.subscription.role !== "controller") {
-            sendMessage(ws, {
-              type: "error",
-              message: "Spectators cannot apply commands.",
-            });
-            return;
-          }
-
-          if (ws.data.subscription.gameId !== parsed.message.gameId) {
-            sendMessage(ws, {
-              type: "error",
-              message: "Command gameId mismatch.",
-            });
-            return;
-          }
-
-          const game = games.get(parsed.message.gameId);
-          if (game === undefined) {
-            sendMessage(ws, {
-              type: "error",
-              message: "Game not found.",
-            });
-            return;
-          }
-
-          const ackedCommandIds = applyCommandsToGame({
-            managedGame: game,
-            commands: parsed.message.commands,
-          });
-
-          broadcastGameSnapshot({
-            gameId: parsed.message.gameId,
-            game,
-            sender: ws,
-            senderAckedCommandIds: ackedCommandIds,
-          });
-          broadcastLobbySnapshot();
-          return;
-        }
-
-        default: {
-          const _never: never = parsed.message;
-          return _never;
-        }
-      }
-    },
-  },
-});
-
-console.log(`Server running at ${server.url}`);
-
-function createGame(req: Request) {
-  return req
-    .json()
-    .catch(() => ({}))
-    .then((body) => {
-      const payload = isRecord(body) ? body : {};
-      const homeName =
-        typeof payload.homeName === "string" && payload.homeName.trim().length > 0
-          ? payload.homeName
-          : "Home";
-      const awayName =
-        typeof payload.awayName === "string" && payload.awayName.trim().length > 0
-          ? payload.awayName
-          : "Away";
-      const homeColor = typeof payload.homeColor === "string" ? payload.homeColor : undefined;
-      const awayColor = typeof payload.awayColor === "string" ? payload.awayColor : undefined;
-
-      const id = createGameId();
-      const nowMs = Date.now();
-      const managedGame: ManagedGame = {
-        state: createInitialGameState({
-          id,
-          nowMs,
-          homeName,
-          awayName,
-          homeColor,
-          awayColor,
-        }),
-        appliedCommandIds: new Set(),
-        appliedCommandOrder: [],
-      };
-
-      games.set(id, managedGame);
-      broadcastLobbySnapshot();
-
-      return json(
-        {
-          gameId: id,
-          game: projectGameView(managedGame.state, nowMs),
+          return json({ game: projectGameView(game.state, Date.now()) });
         },
-        201,
-      );
-    });
+      },
+      "/internal/healthz": {
+        GET(req: Request) {
+          if (!isInternalHealthHost(req.headers.get("host"))) {
+            return json({ error: "Not found." }, 404);
+          }
+
+          return json({ ok: true });
+        },
+      },
+      "/*": index,
+    },
+    development: process.env.NODE_ENV !== "production" && {
+      hmr: true,
+      console: true,
+    },
+    websocket: {
+      open(ws) {
+        sockets.add(ws);
+      },
+      close(ws) {
+        sockets.delete(ws);
+      },
+      message(ws, message) {
+        if (typeof message !== "string") {
+          sendMessage(ws, {
+            type: "error",
+            message: "Unsupported message format.",
+          });
+          return;
+        }
+
+        const parsed = parseClientWsMessage(message, {
+          serverNowMs: Date.now(),
+        });
+        if (!parsed.ok) {
+          sendMessage(ws, {
+            type: "error",
+            message: parsed.error,
+          });
+          return;
+        }
+
+        switch (parsed.message.type) {
+          case "subscribe-lobby": {
+            ws.data.subscription = {
+              type: "lobby",
+            };
+            sendLobbySnapshot(ws);
+            return;
+          }
+
+          case "subscribe-game": {
+            const game = games.get(parsed.message.gameId);
+            if (game === undefined) {
+              sendMessage(ws, {
+                type: "error",
+                message: "Game not found.",
+              });
+              return;
+            }
+
+            ws.data.subscription = {
+              type: "game",
+              gameId: parsed.message.gameId,
+              role: parsed.message.role,
+            };
+
+            sendGameSnapshot({
+              ws,
+              game,
+              ackedCommandIds: [],
+            });
+            return;
+          }
+
+          case "apply-commands": {
+            if (ws.data.subscription.type !== "game") {
+              sendMessage(ws, {
+                type: "error",
+                message: "Not subscribed to a game.",
+              });
+              return;
+            }
+
+            if (ws.data.subscription.role !== "controller") {
+              sendMessage(ws, {
+                type: "error",
+                message: "Spectators cannot apply commands.",
+              });
+              return;
+            }
+
+            if (ws.data.subscription.gameId !== parsed.message.gameId) {
+              sendMessage(ws, {
+                type: "error",
+                message: "Command gameId mismatch.",
+              });
+              return;
+            }
+
+            const game = games.get(parsed.message.gameId);
+            if (game === undefined) {
+              sendMessage(ws, {
+                type: "error",
+                message: "Game not found.",
+              });
+              return;
+            }
+
+            const ackedCommandIds = applyCommandsToGame({
+              managedGame: game,
+              commands: parsed.message.commands,
+            });
+
+            broadcastGameSnapshot({
+              gameId: parsed.message.gameId,
+              game,
+              sender: ws,
+              senderAckedCommandIds: ackedCommandIds,
+            });
+            broadcastLobbySnapshot();
+            return;
+          }
+
+          default: {
+            const _never: never = parsed.message;
+            return _never;
+          }
+        }
+      },
+    },
+  });
+
+  console.log(`Server running at ${server.url}`);
+}
+
+void main();
+
+async function runProbeMode(
+  invocation: Exclude<SqliteProbeInvocation, { kind: "none" } | { kind: "invalid" }>,
+) {
+  try {
+    switch (invocation.kind) {
+      case "outer": {
+        const report = await runSqliteFoundationProbe();
+        console.log(JSON.stringify(report));
+        return;
+      }
+      case "writer": {
+        await runSqliteFoundationProbeWorker(
+          "writer",
+          invocation.directoryPath,
+          invocation.capability,
+          invocation.writerId,
+        );
+        return;
+      }
+      case "checkpoint": {
+        await runSqliteFoundationProbeWorker(
+          "checkpoint",
+          invocation.directoryPath,
+          invocation.capability,
+        );
+        return;
+      }
+      default: {
+        const _never: never = invocation;
+        return _never;
+      }
+    }
+  } catch (error) {
+    console.error(
+      error instanceof Error
+        ? error.message
+        : "SQLite probe failed; return the database choice to a human.",
+    );
+    process.exitCode = 1;
+  }
+}
+
+async function createGame(req: Request) {
+  const body = await readJsonBodyWithinLimit(req, SHARED_LIMITS.transport.httpJsonBodyBytes);
+  if (!body.ok) {
+    return json({ error: body.error }, body.status);
+  }
+
+  if (!isRecord(body.body)) {
+    return json({ error: "JSON body must be an object." }, 400);
+  }
+
+  const payload = body.body;
+  const homeName =
+    payload.homeName === undefined
+      ? { ok: true as const, value: "Home" }
+      : normalizeBoundedText(
+          payload.homeName,
+          SHARED_LIMITS.names.teamAndPitchMaxCodePoints,
+          "homeName",
+        );
+  const awayName =
+    payload.awayName === undefined
+      ? { ok: true as const, value: "Away" }
+      : normalizeBoundedText(
+          payload.awayName,
+          SHARED_LIMITS.names.teamAndPitchMaxCodePoints,
+          "awayName",
+        );
+
+  if (!homeName.ok) {
+    return json(
+      {
+        error: homeName.error,
+      },
+      400,
+    );
+  }
+  if (!awayName.ok) {
+    return json({ error: awayName.error }, 400);
+  }
+
+  const homeColor = typeof payload.homeColor === "string" ? payload.homeColor : undefined;
+  const awayColor = typeof payload.awayColor === "string" ? payload.awayColor : undefined;
+
+  const id = createGameId();
+  const nowMs = Date.now();
+  const managedGame: ManagedGame = {
+    state: createInitialGameState({
+      id,
+      nowMs,
+      homeName: homeName.value,
+      awayName: awayName.value,
+      homeColor,
+      awayColor,
+    }),
+    appliedCommandIds: new Set(),
+    appliedCommandOrder: [],
+  };
+
+  games.set(id, managedGame);
+  broadcastLobbySnapshot();
+
+  return json(
+    {
+      gameId: id,
+      game: projectGameView(managedGame.state, nowMs),
+    },
+    201,
+  );
 }
 
 function createGameId() {

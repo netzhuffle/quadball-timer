@@ -21,6 +21,31 @@ function getPlayerRemainingMs(state: GameState, key: string) {
 }
 
 describe("game-engine", () => {
+  test("rejects out-of-domain clock and score inputs without clamping", () => {
+    const initial = createInitialGameState({ id: "game-validation", nowMs: 0 });
+
+    const overClock = applyGameCommand({
+      state: initial,
+      command: { type: "set-game-clock", gameClockMs: 120 * 60 * 1000 + 1 },
+      nowMs: 0,
+    });
+    expect(overClock.gameClockMs).toBe(0);
+
+    const negativeClock = applyGameCommand({
+      state: initial,
+      command: { type: "adjust-game-clock", deltaMs: -1 },
+      nowMs: 0,
+    });
+    expect(negativeClock.gameClockMs).toBe(0);
+
+    const overScore = applyGameCommand({
+      state: createInitialGameState({ id: "game-score-validation", nowMs: 0 }),
+      command: { type: "change-score", team: "home", delta: 1_010, reason: "manual" },
+      nowMs: 0,
+    });
+    expect(overScore.score.home).toBe(0);
+  });
+
   test("initial state includes default team colors", () => {
     const state = createInitialGameState({ id: "game-colors-default", nowMs: 0 });
     expect(state.homeColor).toBe(DEFAULT_HOME_TEAM_COLOR);
