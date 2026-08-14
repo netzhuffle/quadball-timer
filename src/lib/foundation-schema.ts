@@ -40,9 +40,14 @@ import {
   FOUNDATION_GRANT_AUDIT_NO_LEGACY_TAG_INSERT_TRIGGER_SQL,
   FOUNDATION_EVENT_CATALOG_EVENTS_TABLE_SQL,
   FOUNDATION_EVENT_CATALOG_GAME_DAYS_TABLE_SQL,
-  FOUNDATION_EVENT_CATALOG_AUDIT_TABLE_SQL,
+  FOUNDATION_EVENT_CATALOG_AUDIT_TABLE_V2_SQL,
+  FOUNDATION_EVENT_CATALOG_TEAMS_TABLE_SQL,
+  FOUNDATION_EVENT_CATALOG_ROSTER_TABLE_SQL,
+  FOUNDATION_EVENT_CATALOG_PITCHES_TABLE_SQL,
   FOUNDATION_EVENT_CATALOG_GAME_DAYS_EVENT_INDEX_SQL,
   FOUNDATION_EVENT_CATALOG_AUDIT_EVENT_INDEX_SQL,
+  FOUNDATION_EVENT_CATALOG_ROSTER_TEAM_INDEX_SQL,
+  FOUNDATION_EVENT_CATALOG_PITCHES_EVENT_INDEX_SQL,
 } from "@/lib/foundation-migrations";
 import {
   computeGrantAuditIntegrityTag,
@@ -136,6 +141,9 @@ const GRANT_AUDIT_PROVENANCE_TABLE = "foundation_grant_audit_provenance";
 const EVENT_CATALOG_EVENTS_TABLE = "foundation_event_catalog_events";
 const EVENT_CATALOG_GAME_DAYS_TABLE = "foundation_event_catalog_game_days";
 const EVENT_CATALOG_AUDIT_TABLE = "foundation_event_catalog_audit";
+const EVENT_CATALOG_TEAMS_TABLE = "foundation_event_catalog_teams";
+const EVENT_CATALOG_ROSTER_TABLE = "foundation_event_catalog_roster";
+const EVENT_CATALOG_PITCHES_TABLE = "foundation_event_catalog_pitches";
 const GRANT_CODE_TABLE = "foundation_grant_codes";
 const GRANT_ADMISSION_TELEMETRY_TABLE = "foundation_grant_admission_telemetry";
 const GRANT_ADMISSION_GLOBAL_TABLE = "foundation_grant_admission_global_windows";
@@ -257,7 +265,25 @@ const expectedManifest: FoundationSchemaManifest = {
       "table",
       EVENT_CATALOG_AUDIT_TABLE,
       EVENT_CATALOG_AUDIT_TABLE,
-      FOUNDATION_EVENT_CATALOG_AUDIT_TABLE_SQL,
+      FOUNDATION_EVENT_CATALOG_AUDIT_TABLE_V2_SQL,
+    ),
+    object(
+      "table",
+      EVENT_CATALOG_TEAMS_TABLE,
+      EVENT_CATALOG_TEAMS_TABLE,
+      FOUNDATION_EVENT_CATALOG_TEAMS_TABLE_SQL,
+    ),
+    object(
+      "table",
+      EVENT_CATALOG_ROSTER_TABLE,
+      EVENT_CATALOG_ROSTER_TABLE,
+      FOUNDATION_EVENT_CATALOG_ROSTER_TABLE_SQL,
+    ),
+    object(
+      "table",
+      EVENT_CATALOG_PITCHES_TABLE,
+      EVENT_CATALOG_PITCHES_TABLE,
+      FOUNDATION_EVENT_CATALOG_PITCHES_TABLE_SQL,
     ),
     object(
       "trigger",
@@ -390,6 +416,18 @@ const expectedManifest: FoundationSchemaManifest = {
       "foundation_event_catalog_audit_event_id",
       EVENT_CATALOG_AUDIT_TABLE,
       FOUNDATION_EVENT_CATALOG_AUDIT_EVENT_INDEX_SQL,
+    ),
+    object(
+      "index",
+      "foundation_event_catalog_roster_team_id",
+      EVENT_CATALOG_ROSTER_TABLE,
+      FOUNDATION_EVENT_CATALOG_ROSTER_TEAM_INDEX_SQL,
+    ),
+    object(
+      "index",
+      "foundation_event_catalog_pitches_event_id",
+      EVENT_CATALOG_PITCHES_TABLE,
+      FOUNDATION_EVENT_CATALOG_PITCHES_EVENT_INDEX_SQL,
     ),
   ].sort(compareNamed),
   tables: [
@@ -866,6 +904,85 @@ const expectedManifest: FoundationSchemaManifest = {
         column("after_json", "TEXT", 1, 0),
       ],
       foreignKeys: [],
+    },
+    {
+      name: EVENT_CATALOG_TEAMS_TABLE,
+      columns: [
+        column("event_team_id", "TEXT", 1, 1),
+        column("event_id", "TEXT", 1, 0),
+        column("name", "TEXT", 1, 0),
+        column("default_color", "TEXT", 1, 0),
+        column("created_at_ms", "INTEGER", 1, 0),
+        column("updated_at_ms", "INTEGER", 1, 0),
+      ],
+      foreignKeys: [
+        {
+          id: 0,
+          sequence: 0,
+          table: EVENT_CATALOG_EVENTS_TABLE,
+          from: "event_id",
+          to: "event_id",
+          onUpdate: "NO ACTION",
+          onDelete: "CASCADE",
+          match: "NONE",
+        },
+      ],
+    },
+    {
+      name: EVENT_CATALOG_ROSTER_TABLE,
+      columns: [
+        column("roster_entry_id", "TEXT", 1, 1),
+        column("event_id", "TEXT", 1, 0),
+        column("event_team_id", "TEXT", 1, 0),
+        column("player_number", "INTEGER", 1, 0),
+        column("public_name", "TEXT", 1, 0),
+        column("created_at_ms", "INTEGER", 1, 0),
+        column("updated_at_ms", "INTEGER", 1, 0),
+      ],
+      foreignKeys: [
+        {
+          id: 0,
+          sequence: 0,
+          table: EVENT_CATALOG_TEAMS_TABLE,
+          from: "event_team_id",
+          to: "event_team_id",
+          onUpdate: "NO ACTION",
+          onDelete: "CASCADE",
+          match: "NONE",
+        },
+        {
+          id: 1,
+          sequence: 0,
+          table: EVENT_CATALOG_EVENTS_TABLE,
+          from: "event_id",
+          to: "event_id",
+          onUpdate: "NO ACTION",
+          onDelete: "CASCADE",
+          match: "NONE",
+        },
+      ],
+    },
+    {
+      name: EVENT_CATALOG_PITCHES_TABLE,
+      columns: [
+        column("pitch_id", "TEXT", 1, 1),
+        column("event_id", "TEXT", 1, 0),
+        column("name", "TEXT", 1, 0),
+        column("created_at_ms", "INTEGER", 1, 0),
+        column("updated_at_ms", "INTEGER", 1, 0),
+      ],
+      foreignKeys: [
+        {
+          id: 0,
+          sequence: 0,
+          table: EVENT_CATALOG_EVENTS_TABLE,
+          from: "event_id",
+          to: "event_id",
+          onUpdate: "NO ACTION",
+          onDelete: "CASCADE",
+          match: "NONE",
+        },
+      ],
     },
     {
       name: GRANT_ADMISSION_GLOBAL_TABLE,
@@ -2093,6 +2210,9 @@ function readSchemaManifest(database: Database): FoundationSchemaManifest {
     EVENT_CATALOG_EVENTS_TABLE,
     EVENT_CATALOG_GAME_DAYS_TABLE,
     EVENT_CATALOG_AUDIT_TABLE,
+    EVENT_CATALOG_TEAMS_TABLE,
+    EVENT_CATALOG_ROSTER_TABLE,
+    EVENT_CATALOG_PITCHES_TABLE,
     GRANT_CODE_TABLE,
     GRANT_ADMISSION_TELEMETRY_TABLE,
     GRANT_ADMISSION_GLOBAL_TABLE,
@@ -2116,6 +2236,8 @@ function readSchemaManifest(database: Database): FoundationSchemaManifest {
     "foundation_grant_audit_provenance_grant_id",
     "foundation_event_catalog_game_days_event_id",
     "foundation_event_catalog_audit_event_id",
+    "foundation_event_catalog_roster_team_id",
+    "foundation_event_catalog_pitches_event_id",
   ].map((name) => readIndex(database, name));
 
   return {
@@ -2214,6 +2336,9 @@ function readIndex(database: Database, name: string): SchemaIndex {
 function indexTable(name: string): string {
   if (name.startsWith("foundation_event_catalog_game_days")) return EVENT_CATALOG_GAME_DAYS_TABLE;
   if (name.startsWith("foundation_event_catalog_audit")) return EVENT_CATALOG_AUDIT_TABLE;
+  if (name.startsWith("foundation_event_catalog_roster")) return EVENT_CATALOG_ROSTER_TABLE;
+  if (name.startsWith("foundation_event_catalog_pitches")) return EVENT_CATALOG_PITCHES_TABLE;
+  if (name.startsWith("foundation_event_catalog_teams")) return EVENT_CATALOG_TEAMS_TABLE;
   if (name.startsWith("foundation_grant_sessions")) return GRANT_SESSION_TABLE;
   if (name.startsWith("foundation_grant_audit_provenance")) return GRANT_AUDIT_PROVENANCE_TABLE;
   if (name.startsWith("foundation_grant_audit")) return GRANT_AUDIT_TABLE;
