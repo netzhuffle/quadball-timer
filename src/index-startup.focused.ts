@@ -11,29 +11,28 @@ describe("server startup", () => {
     await mkdir(releaseDirectory, { mode: 0o750 });
     await mkdir(stateDirectory, { mode: 0o750 });
     await chmod(releaseDirectory, 0o550);
-    const port = 39_000 + Math.floor(Math.random() * 500);
-    const server = Bun.spawn(["bun", "run", join(process.cwd(), "src/index.ts")], {
+    const server = Bun.spawn([process.execPath, "run", join(process.cwd(), "src/index.ts")], {
       cwd: releaseDirectory,
       env: {
-        ...process.env,
         NODE_ENV: "production",
         QUADBALL_ENVIRONMENT: "test",
         PUBLIC_ORIGIN: "https://localhost.test",
         TECHNICAL_ADMIN_DATABASE: join(stateDirectory, "technical-admin.sqlite"),
         FOUNDATION_DATABASE: join(stateDirectory, "foundation.sqlite"),
         HOST: "127.0.0.1",
-        PORT: String(port),
+        PORT: "0",
       },
       stdout: "pipe",
       stderr: "pipe",
     });
 
     try {
+      const serverUrl = await readServerUrl(server.stdout);
       let response: Response | null = null;
       for (let attempt = 0; attempt < 100; attempt += 1) {
         await Bun.sleep(25);
-        response = await fetch(`http://127.0.0.1:${port}/internal/healthz`, {
-          headers: { host: `127.0.0.1:${port}` },
+        response = await fetch(new URL("/internal/healthz", serverUrl), {
+          headers: { host: serverUrl.host },
         }).catch(() => null);
         if (response?.status === 200) break;
       }
@@ -46,3 +45,29 @@ describe("server startup", () => {
     }
   });
 });
+
+async function readServerUrl(stdout: ReadableStream<Uint8Array>): Promise<URL> {
+  const reader = stdout.getReader();
+  const decoder = new TextDecoder();
+  const readUrl = (async () => {
+    let output = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) throw new Error("Server exited before reporting its bound URL.");
+      output += decoder.decode(value, { stream: true });
+      const match = output.match(/Server running at (http:\/\/[^\s]+)/);
+      if (match?.[1]) return new URL(match[1]);
+    }
+  })();
+
+  try {
+    return await Promise.race([
+      readUrl,
+      Bun.sleep(2_500).then(() => {
+        throw new Error("Server did not report its bound URL within 2.5 seconds.");
+      }),
+    ]);
+  } finally {
+    reader.releaseLock();
+  }
+}
