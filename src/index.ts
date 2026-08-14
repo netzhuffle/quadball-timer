@@ -18,6 +18,19 @@ import {
 } from "@/lib/sqlite-foundation-probe";
 import { isAllowedWebSocketOrigin } from "@/lib/ws-origin";
 import { parseClientWsMessage, type ServerWsMessage } from "@/lib/ws-protocol";
+import {
+  clearTechnicalAdminCookie,
+  clearTechnicalAdminCsrfCookie,
+  createSqliteTechnicalAdminAuthRepository,
+  createTechnicalAdminAuth,
+  createTechnicalAdminRetentionScheduler,
+  technicalAdminCsrfCookie,
+  technicalAdminCookie,
+  type AuthResult,
+  type CeremonyBinding,
+  type TechnicalAdminAuth,
+} from "@/lib/technical-admin-auth";
+import { readTechnicalAdminConfig } from "@/lib/technical-admin-config";
 
 type ManagedGame = {
   state: GameState;
@@ -66,9 +79,40 @@ async function main() {
 }
 
 function startServer() {
-  const server = serve<SessionData>({
+  const port = Number(process.env.PORT ?? 3000);
+  const technicalAdminConfig = readTechnicalAdminConfig();
+  const { environment } = technicalAdminConfig;
+  const databasePath =
+    technicalAdminConfig.databasePath ?? `data/${environment}/technical-admin.sqlite`;
+  const technicalAdminRepository = createSqliteTechnicalAdminAuthRepository(databasePath, {
+    environment: technicalAdminConfig.environment,
+    origin: technicalAdminConfig.origin,
+    rpId: technicalAdminConfig.rpId,
+  });
+  const technicalAdminAuth = createTechnicalAdminAuth(
+    technicalAdminConfig,
+    technicalAdminRepository,
+  );
+  technicalAdminAuth.storageStatus();
+  technicalAdminAuth.startRetentionMaintenance(createTechnicalAdminRetentionScheduler());
+  const tls =
+    process.env.TLS_CERT_FILE && process.env.TLS_KEY_FILE
+      ? { cert: Bun.file(process.env.TLS_CERT_FILE), key: Bun.file(process.env.TLS_KEY_FILE) }
+      : undefined;
+
+  let server: Bun.Server<SessionData> | undefined;
+  const shutdown = () => {
+    technicalAdminAuth.close();
+    technicalAdminRepository.close();
+    void server?.stop();
+  };
+  process.once("SIGTERM", shutdown);
+  process.once("SIGINT", shutdown);
+
+  server = serve<SessionData>({
     hostname: process.env.HOST ?? "127.0.0.1",
-    port: Number(process.env.PORT ?? 3000),
+    port,
+    ...(tls ? { tls } : {}),
     routes: {
       "/ws": (req: Bun.BunRequest<"/ws">, routeServer: Bun.Server<SessionData>) => {
         if (!isAllowedWebSocketOrigin(req.headers.get("origin"), req.headers.get("host"))) {
@@ -126,6 +170,161 @@ function startServer() {
           }
 
           return json({ game: projectGameView(game.state, Date.now()) });
+        },
+      },
+      "/api/admin/enrollment/options": {
+        async POST(req: Request) {
+          const body = await readJsonRecord(req);
+          const token = body?.token;
+          if (typeof token !== "string") return genericAuthFailure(400);
+          const result = technicalAdminAuth.beginEnrollment(token, requestBinding(req));
+          return result.ok
+            ? sensitiveJson(result.value)
+            : genericAuthFailure(result.error === "not-enrollable" ? 409 : 401);
+        },
+      },
+      "/api/admin/enrollment/complete": {
+        async POST(req: Request) {
+          const body = await readCeremonyBody(req);
+          if (body === null) {
+            return genericAuthFailure(400);
+          }
+          const result = await technicalAdminAuth.completeEnrollment(
+            body.challengeId,
+            body.response,
+            requestBinding(req),
+            technicalAdminAuth.correlateSource(
+              requestSource(req, technicalAdminConfig.trustProxyHeaders),
+            ),
+          );
+          return result.ok ? sensitiveJson({ enrolled: true }) : authFailureResponse(result);
+        },
+      },
+      "/api/admin/authentication/options": {
+        POST(req: Request) {
+          const result = technicalAdminAuth.beginAuthentication(requestBinding(req));
+          return result.ok ? sensitiveJson(result.value) : genericAuthFailure(401);
+        },
+      },
+      "/api/admin/authentication/complete": {
+        async POST(req: Request) {
+          const body = await readCeremonyBody(req);
+          if (body === null) {
+            return genericAuthFailure(400);
+          }
+          const result = await technicalAdminAuth.completeAuthentication(
+            body.challengeId,
+            body.response,
+            requestBinding(req),
+            technicalAdminAuth.correlateSource(
+              requestSource(req, technicalAdminConfig.trustProxyHeaders),
+            ),
+          );
+          if (!result.ok) return authFailureResponse(result);
+          return sensitiveJson({ authenticated: true }, 200, [
+            ["set-cookie", technicalAdminCookie(result.value.token)],
+            ["set-cookie", technicalAdminCsrfCookie(result.value.csrfToken)],
+          ]);
+        },
+      },
+      "/api/admin/session": {
+        GET(req: Request) {
+          const token = readTechnicalAdminCookie(req.headers.get("cookie"));
+          if (token === null || !technicalAdminAuth.authenticateSession(token))
+            return genericAuthFailure(401);
+          return sensitiveJson({
+            authenticated: true,
+            environment,
+            activeSessionCount: technicalAdminAuth.activeSessionCount(),
+          });
+        },
+      },
+      "/api/admin/logout": {
+        POST(req: Request) {
+          const token = requireAdminMutation(req, technicalAdminAuth);
+          if (token === null) return genericAuthFailure(401);
+          technicalAdminAuth.logout(token);
+          return sensitiveJson({ loggedOut: true }, 200, [
+            ["set-cookie", clearTechnicalAdminCookie()],
+            ["set-cookie", clearTechnicalAdminCsrfCookie()],
+          ]);
+        },
+      },
+      "/api/admin/step-up/options": {
+        async POST(req: Request) {
+          const token = requireAdminMutation(req, technicalAdminAuth);
+          if (token === null) return genericAuthFailure(401);
+          const body = await readJsonRecord(req);
+          const purpose = body?.purpose;
+          if (purpose !== "replace-credential" && purpose !== "revoke-other-sessions") {
+            return genericAuthFailure(400);
+          }
+          const result = technicalAdminAuth.beginFreshVerification(
+            token,
+            purpose,
+            requestBinding(req),
+          );
+          return result.ok ? sensitiveJson(result.value) : genericAuthFailure(401);
+        },
+      },
+      "/api/admin/step-up/complete": {
+        async POST(req: Request) {
+          const token = requireAdminMutation(req, technicalAdminAuth);
+          if (token === null) return genericAuthFailure(401);
+          const body = await readCeremonyBody(req);
+          if (body === null) {
+            return genericAuthFailure(400);
+          }
+          const result = await technicalAdminAuth.completeFreshVerification(
+            token,
+            body.challengeId,
+            body.response,
+            requestBinding(req),
+            technicalAdminAuth.correlateSource(
+              requestSource(req, technicalAdminConfig.trustProxyHeaders),
+            ),
+          );
+          return result.ok ? sensitiveJson({ verified: true }) : authFailureResponse(result);
+        },
+      },
+      "/api/admin/replacement/options": {
+        POST(req: Request) {
+          const token = requireAdminMutation(req, technicalAdminAuth);
+          if (token === null) return genericAuthFailure(401);
+          const result = technicalAdminAuth.beginReplacement(token, requestBinding(req));
+          return result.ok ? sensitiveJson(result.value) : genericAuthFailure(401);
+        },
+      },
+      "/api/admin/replacement/complete": {
+        async POST(req: Request) {
+          const token = requireAdminMutation(req, technicalAdminAuth);
+          if (token === null) return genericAuthFailure(401);
+          const body = await readCeremonyBody(req);
+          if (body === null) {
+            return genericAuthFailure(400);
+          }
+          const result = await technicalAdminAuth.completeReplacement(
+            token,
+            body.challengeId,
+            body.response,
+            requestBinding(req),
+            technicalAdminAuth.correlateSource(
+              requestSource(req, technicalAdminConfig.trustProxyHeaders),
+            ),
+          );
+          if (!result.ok) return authFailureResponse(result);
+          return sensitiveJson({ replaced: true }, 200, [
+            ["set-cookie", technicalAdminCookie(result.value.token)],
+            ["set-cookie", technicalAdminCsrfCookie(result.value.csrfToken)],
+          ]);
+        },
+      },
+      "/api/admin/sessions/revoke-others": {
+        POST(req: Request) {
+          const token = requireAdminMutation(req, technicalAdminAuth);
+          if (token === null) return genericAuthFailure(401);
+          const result = technicalAdminAuth.revokeOtherSessions(token);
+          return result.ok ? sensitiveJson(result.value) : authFailureResponse(result);
         },
       },
       "/internal/healthz": {
@@ -489,13 +688,96 @@ function sendMessage(ws: ServerWebSocket<SessionData>, payload: ServerWsMessage)
   ws.send(JSON.stringify(payload));
 }
 
-function json(payload: unknown, status = 200) {
+function json(payload: unknown, status = 200, extraHeaders: Iterable<[string, string]> = []) {
+  const headers = new Headers(Array.from(extraHeaders));
+  headers.set("content-type", "application/json");
   return new Response(JSON.stringify(payload), {
     status,
-    headers: {
-      "content-type": "application/json",
-    },
+    headers,
   });
+}
+
+function sensitiveJson(
+  payload: unknown,
+  status = 200,
+  extraHeaders: Iterable<[string, string]> = [],
+) {
+  const headers = new Headers(Array.from(extraHeaders));
+  headers.set("cache-control", "no-store");
+  headers.set("referrer-policy", "no-referrer");
+  return json(payload, status, headers.entries());
+}
+
+async function readJsonRecord(req: Request): Promise<Record<string, unknown> | null> {
+  try {
+    const value: unknown = await req.json();
+    return isRecord(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+async function readCeremonyBody(
+  req: Request,
+): Promise<{ challengeId: string; response: unknown } | null> {
+  const body = await readJsonRecord(req);
+  if (body === null || typeof body.challengeId !== "string" || body.response === undefined) {
+    return null;
+  }
+  return { challengeId: body.challengeId, response: body.response };
+}
+
+function requestBinding(req: Request): CeremonyBinding {
+  return {
+    origin: req.headers.get("origin") ?? "",
+    host: req.headers.get("host") ?? "",
+  };
+}
+
+function requestSource(req: Request, trustProxyHeaders = false) {
+  return (
+    (trustProxyHeaders ? req.headers.get("x-forwarded-for") : null) ??
+    req.headers.get("user-agent") ??
+    "unknown"
+  );
+}
+
+function requireAdminMutation(req: Request, auth: TechnicalAdminAuth): string | null {
+  if (!auth.isExpectedBinding(requestBinding(req))) return null;
+  const contentType = req.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase();
+  if (contentType !== "application/json") {
+    return null;
+  }
+  const token = readTechnicalAdminCookie(req.headers.get("cookie"));
+  const csrfToken = req.headers.get("x-technical-admin-csrf");
+  if (token === null || csrfToken === null) return null;
+  return auth.authenticateSession(token) && auth.verifyCsrf(token, csrfToken) ? token : null;
+}
+
+function genericAuthFailure(status: number) {
+  return json({ error: "Authentication failed." }, status);
+}
+
+function authFailureResponse(result: AuthResult<unknown>) {
+  if (result.ok) return sensitiveJson(result.value);
+  const headers: Array<[string, string]> = [];
+  if (result.retryAfterMs !== undefined) {
+    headers.push(["retry-after", String(Math.max(1, Math.ceil(result.retryAfterMs / 1_000)))]);
+  }
+  return sensitiveJson(
+    { error: "Authentication failed." },
+    result.error === "throttled" ? 429 : 401,
+    headers,
+  );
+}
+
+function readTechnicalAdminCookie(header: string | null): string | null {
+  if (header === null) return null;
+  for (const part of header.split(";")) {
+    const [name, ...value] = part.trim().split("=");
+    if (name === "__Host-technical-admin" && value.length > 0) return value.join("=");
+  }
+  return null;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
