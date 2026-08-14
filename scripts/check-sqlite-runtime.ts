@@ -22,9 +22,16 @@ const executablePath = cliArguments[0] ?? "dist/quadball-timer";
 if (!(await Bun.file(executablePath).exists())) {
   throw new Error(`Compiled executable does not exist: ${executablePath}`);
 }
+if (process.platform !== "linux" || process.arch !== "x64") {
+  throw new Error("SQLite runtime qualification requires native Linux x86-64.");
+}
 
 const result = await runCompiledSqliteFoundationProbe(executablePath, {
   timeoutMs: SQLITE_FOUNDATION_PROBE_TIMEOUT_MS,
+  command: "bun run check:sqlite-runtime [compiled-executable]",
+  emitResult: (qualificationResult) => {
+    console.log(JSON.stringify(qualificationResult));
+  },
 });
 const report = JSON.parse(result.stdout.trim()) as {
   bunVersion: string;

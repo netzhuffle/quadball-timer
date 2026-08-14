@@ -2,13 +2,9 @@ import { Database } from "bun:sqlite";
 import {
   buildProbeWorkerCommand,
   capDiagnosticOutput,
+  createProbeOutputBudget,
   installProbeSignalHandlers,
-  ProbeInterruptedError,
-  ProbeReapTimeoutError,
-  ProbeTimeoutError,
-  ProbeWorkerFailureError,
   readSingleValueFromWorker,
-  spawnProbeCommand,
   spawnProbeWorker,
   SQLITE_FOUNDATION_PROBE_INNER_TIMEOUT_MS,
   SQLITE_FOUNDATION_PROBE_MAX_OUTPUT_BYTES,
@@ -16,9 +12,23 @@ import {
   SQLITE_FOUNDATION_PROBE_TIMEOUT_MS,
   superviseProbeWorkers,
   type ProbeSupervisionOptions,
-  type ProbeWorkerHandle,
   type ProbeWorkerResult,
 } from "@/lib/sqlite-foundation-probe-process";
+export {
+  buildNoNetworkProbeCommand,
+  createProbeNetworkBoundary,
+  ProbeNetworkBoundaryError,
+} from "@/lib/sqlite-foundation-probe-network";
+export {
+  countProbeDescendants,
+  createProbeResourceController,
+  ProbeResourceControlError,
+  ProbeResourceLimitError,
+} from "@/lib/sqlite-foundation-probe-resources";
+import {
+  SqliteFoundationGateError,
+  translateProbeError,
+} from "@/lib/sqlite-foundation-probe-errors";
 import {
   cleanupOwnedProbeWorkspace,
   cleanupOwnedProbeWorkspaceContainer,
@@ -40,10 +50,12 @@ import {
 export {
   buildProbeWorkerCommand,
   capDiagnosticOutput,
+  createProbeOutputBudget,
   cleanupOwnedProbeWorkspace,
   cleanupOwnedProbeWorkspaceContainer,
   createProbeWorkspace,
   createProbeWorkspaceContainer,
+  createProbeOuterEnvironment,
   parseSqliteProbeInvocation,
   validateOwnedProbeWorkspace,
   validateOwnedProbeWorkerWorkspace,
@@ -65,6 +77,19 @@ export type {
   ProbeWorkspaceState,
   SqliteProbeInvocation,
 } from "@/lib/sqlite-foundation-probe-containment";
+export {
+  SQLITE_FOUNDATION_PROBE_COMMAND,
+  SQLITE_FOUNDATION_PROBE_MAX_DISK_BYTES,
+  SQLITE_FOUNDATION_PROBE_MAX_MEMORY_BYTES,
+  SQLITE_FOUNDATION_PROBE_MAX_PROCESS_COUNT,
+} from "@/lib/sqlite-foundation-probe-result";
+export type { ProbeQualificationResult, ProbeOutcome } from "@/lib/sqlite-foundation-probe-result";
+export { runCompiledSqliteFoundationProbe } from "@/lib/sqlite-foundation-probe-runner";
+export type {
+  CompiledSqliteFoundationProbeOptions,
+  CompiledSqliteFoundationProbeResult,
+} from "@/lib/sqlite-foundation-probe-runner";
+export { SqliteFoundationGateError } from "@/lib/sqlite-foundation-probe-errors";
 
 const SQLITE_MINIMUM_VERSION = [3, 51, 3] as const;
 const SQLITE_OWNERSHIP_TABLE = "foundation_probe_ownership";
@@ -96,15 +121,6 @@ export type SqliteFoundationProbeReport = {
   foreignKeyViolations: number;
   duplicateKeys: number;
 };
-
-export class SqliteFoundationGateError extends Error {
-  readonly decisionRequired = true;
-
-  constructor(message: string) {
-    super(message);
-    this.name = "SqliteFoundationGateError";
-  }
-}
 
 export function isSupportedSqliteVersion(version: string): boolean {
   const parsed = parseSqliteVersion(version);
@@ -161,18 +177,22 @@ export async function runSqliteFoundationProbe(
       );
     }
 
+    const outputBudget = createProbeOutputBudget();
     const workers = [
       ...Array.from({ length: SQLITE_FOUNDATION_PROBE_WORKLOAD.writerCount }, (_, writer) =>
-        spawnProbeWorker(executablePath, "--sqlite-foundation-probe-writer", [
-          probeWorkspace.directoryPath,
-          probeWorkspace.capability,
-          String(writer),
-        ]),
+        spawnProbeWorker(
+          executablePath,
+          "--sqlite-foundation-probe-writer",
+          [probeWorkspace.directoryPath, probeWorkspace.capability, String(writer)],
+          { outputBudget },
+        ),
       ),
-      spawnProbeWorker(executablePath, "--sqlite-foundation-probe-checkpoint", [
-        probeWorkspace.directoryPath,
-        probeWorkspace.capability,
-      ]),
+      spawnProbeWorker(
+        executablePath,
+        "--sqlite-foundation-probe-checkpoint",
+        [probeWorkspace.directoryPath, probeWorkspace.capability],
+        { outputBudget },
+      ),
     ];
     const results = await superviseProbeWorkers(workers, supervisionOptions);
     report = await verifyProbeDatabase(probeWorkspace, runtime, results);
@@ -220,78 +240,6 @@ export async function runSqliteFoundationProbe(
     );
   }
   return report;
-}
-
-export type CompiledSqliteFoundationProbeOptions = ProbeSupervisionOptions & {
-  createWorkspaceContainer?: () => Promise<ProbeWorkspaceContainer>;
-  cleanupWorkspaceContainer?: (container: ProbeWorkspaceContainer) => Promise<void>;
-  spawnOuter?: (executablePath: string, container: ProbeWorkspaceContainer) => ProbeWorkerHandle;
-};
-
-export async function runCompiledSqliteFoundationProbe(
-  executablePath: string,
-  options: CompiledSqliteFoundationProbeOptions = {},
-): Promise<ProbeWorkerResult> {
-  const signalScope = options.signal === undefined ? installProbeSignalHandlers() : null;
-  const supervisionOptions = {
-    ...options,
-    timeoutMs: options.timeoutMs ?? SQLITE_FOUNDATION_PROBE_TIMEOUT_MS,
-    ...(signalScope === null ? {} : { signal: signalScope.signal }),
-  };
-  let container: ProbeWorkspaceContainer | undefined;
-  let result: ProbeWorkerResult | undefined;
-  let probeError: SqliteFoundationGateError | undefined;
-  try {
-    container = await (options.createWorkspaceContainer ?? createProbeWorkspaceContainer)();
-    const worker =
-      options.spawnOuter?.(executablePath, container) ??
-      spawnProbeCommand([executablePath, "--sqlite-foundation-probe"], {
-        detached: true,
-        env: createProbeOuterEnvironment(container),
-      });
-    const [workerResult] = await superviseProbeWorkers([worker], supervisionOptions);
-    if (workerResult === undefined) {
-      throw new SqliteFoundationGateError(
-        "SQLite runtime probe returned no result; return the database choice to a human.",
-      );
-    }
-    if (workerResult.exitCode !== 0 || workerResult.outputExceeded) {
-      throw new SqliteFoundationGateError(
-        "SQLite runtime probe failed or exceeded its diagnostic output limit; return the database choice to a human.",
-      );
-    }
-    result = workerResult;
-  } catch (error) {
-    probeError = translateProbeError(error);
-  }
-
-  let cleanupError: SqliteFoundationGateError | undefined;
-  if (container !== undefined) {
-    try {
-      await (
-        options.cleanupWorkspaceContainer ??
-        ((owned) => cleanupOwnedProbeWorkspaceContainer(owned.directoryPath, owned.capability))
-      )(container);
-    } catch {
-      cleanupError = new SqliteFoundationGateError(
-        "SQLite integrity probe cleanup could not be verified; return the database choice to a human.",
-      );
-    }
-  }
-  signalScope?.cleanup();
-
-  if (probeError !== undefined) {
-    throw probeError;
-  }
-  if (cleanupError !== undefined) {
-    throw cleanupError;
-  }
-  if (result === undefined) {
-    throw new SqliteFoundationGateError(
-      "SQLite runtime probe returned no result; return the database choice to a human.",
-    );
-  }
-  return result;
 }
 
 export async function runSqliteFoundationProbeWorker(
@@ -537,21 +485,4 @@ function parseSqliteVersion(version: string): [number, number, number] | null {
 
 function isBusyError(error: unknown): boolean {
   return error instanceof Error && /busy|locked/i.test(error.message);
-}
-
-function translateProbeError(error: unknown): SqliteFoundationGateError {
-  if (error instanceof SqliteFoundationGateError) {
-    return error;
-  }
-  if (
-    error instanceof ProbeTimeoutError ||
-    error instanceof ProbeInterruptedError ||
-    error instanceof ProbeReapTimeoutError ||
-    error instanceof ProbeWorkerFailureError
-  ) {
-    return new SqliteFoundationGateError(error.message);
-  }
-  return new SqliteFoundationGateError(
-    "SQLite integrity probe could not complete. Return the database choice to a human; do not substitute a canary or custom Bun build.",
-  );
 }

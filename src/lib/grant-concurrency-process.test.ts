@@ -134,6 +134,8 @@ function fakeWorker(): ProbeWorkerHandle {
     exitCode: 0,
     stdout: "{}",
     stderr: "",
+    stdoutBytes: 2,
+    stderrBytes: 0,
     outputExceeded: false,
   };
   return {

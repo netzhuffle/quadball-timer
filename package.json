@@ -10,6 +10,8 @@
     "build": "bun run build.ts",
     "build:executable": "bun run build.ts --compile --compile-target=bun-linux-x64-modern --outfile=dist/quadball-timer",
     "check:sqlite-runtime": "bun scripts/check-sqlite-runtime.ts",
+    "test:focused-signal": "bun scripts/test-focused-signal.ts",
+    "test:focused-admission": "bun scripts/test-focused-admission.ts",
     "test": "bun test --isolate",
     "test:focused:sqlite": "bun test --isolate ./src/lib/event-game-actions-sqlite.focused.ts",
     "test:focused:grant": "bun test ./src/lib/grant-authority.focused.ts",

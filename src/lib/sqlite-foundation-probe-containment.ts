@@ -1,6 +1,7 @@
 import {
   chmod,
   lstat,
+  mkdir,
   mkdtemp,
   readFile,
   readdir,
@@ -47,6 +48,7 @@ export type ProbeWorkspace = {
 
 export type ProbeWorkspaceContainer = {
   directoryPath: string;
+  workspaceDirectoryPath?: string;
   capabilityPath: string;
   capability: string;
 };
@@ -112,7 +114,7 @@ export async function createProbeWorkspace(
           configuredContainer.directoryPath,
           configuredContainer.capability,
         );
-  const parentDirectory = ownedContainer?.directoryPath;
+  const parentDirectory = ownedContainer?.workspaceDirectoryPath ?? ownedContainer?.directoryPath;
   const directoryPath = await mkdtemp(
     path.join(parentDirectory ?? tmpdir(), PROBE_DIRECTORY_PREFIX),
   );
@@ -125,22 +127,30 @@ export async function createProbeWorkspace(
     await chmod(capabilityPath, 0o600);
     return await validateOwnedProbeWorkspace(canonicalDirectoryPath, capability, "fresh");
   } catch (error) {
-    await rm(directoryPath, { recursive: true, force: true }).catch(() => undefined);
+    await removeOwnedPath(directoryPath);
     throw error;
   }
 }
 
-export async function createProbeWorkspaceContainer(): Promise<ProbeWorkspaceContainer> {
+export async function createProbeWorkspaceContainer(
+  signal?: AbortSignal,
+): Promise<ProbeWorkspaceContainer> {
+  throwIfProbeAborted(signal);
   const directoryPath = await mkdtemp(path.join(tmpdir(), PROBE_CONTAINER_DIRECTORY_PREFIX));
   try {
+    throwIfProbeAborted(signal);
     await chmod(directoryPath, 0o700);
     const capability = crypto.randomUUID();
     const capabilityPath = path.join(directoryPath, CONTAINER_CAPABILITY_FILE_NAME);
     await writeFile(capabilityPath, capability, { encoding: "utf8", flag: "wx", mode: 0o600 });
     await chmod(capabilityPath, 0o600);
+    const workspaceDirectoryPath = path.join(directoryPath, "workspace");
+    await mkdir(workspaceDirectoryPath, { mode: 0o700 });
+    await chmod(workspaceDirectoryPath, 0o700);
+    throwIfProbeAborted(signal);
     return await validateOwnedProbeWorkspaceContainer(directoryPath, capability);
   } catch (error) {
-    await rm(directoryPath, { recursive: true, force: true }).catch(() => undefined);
+    await removeOwnedPath(directoryPath);
     throw error;
   }
 }
@@ -160,20 +170,26 @@ export async function readProbeWorkspaceContainerFromEnv(): Promise<ProbeWorkspa
 export async function cleanupOwnedProbeWorkspaceContainer(
   directoryPath: string,
   capability: string,
+  signal?: AbortSignal,
 ): Promise<void> {
   const container = await validateOwnedProbeWorkspaceContainer(directoryPath, capability);
-  await rm(container.directoryPath, { recursive: true, force: true });
+  throwIfProbeAborted(signal);
+  await removeOwnedPath(container.directoryPath);
+}
+
+function throwIfProbeAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw new ProbeOwnershipError();
 }
 
 export function createProbeOuterEnvironment(
   container: ProbeWorkspaceContainer,
 ): Record<string, string> {
   const environment: Record<string, string> = {};
-  for (const [key, value] of Object.entries(process.env)) {
-    if (value !== undefined) {
-      environment[key] = value;
-    }
+  for (const key of ["LANG", "LC_ALL", "PATH", "TMPDIR", "TZ"]) {
+    const value = process.env[key];
+    if (value !== undefined) environment[key] = value;
   }
+  environment.NODE_ENV = "test";
   environment[SQLITE_FOUNDATION_PROBE_PARENT_DIRECTORY_ENV] = container.directoryPath;
   environment[SQLITE_FOUNDATION_PROBE_PARENT_CAPABILITY_ENV] = container.capability;
   environment[SQLITE_FOUNDATION_PROBE_SHARED_GROUP_ENV] = "1";
@@ -260,7 +276,10 @@ export async function validateOwnedProbeWorkerWorkspace(
     throw new ProbeOwnershipError();
   }
   const workspace = await validateOwnedProbeWorkspace(directoryPath, capability, state);
-  if (path.dirname(workspace.directoryPath) !== container.directoryPath) {
+  if (
+    path.dirname(workspace.directoryPath) !==
+    (container.workspaceDirectoryPath ?? container.directoryPath)
+  ) {
     throw new ProbeOwnershipError();
   }
   return workspace;
@@ -274,7 +293,7 @@ export async function cleanupOwnedProbeWorkspace(
   await rm(workspace.directoryPath, { recursive: true, force: true });
 }
 
-async function validateOwnedProbeWorkspaceContainer(
+export async function validateOwnedProbeWorkspaceContainer(
   directoryPath: string,
   capability: string,
 ): Promise<ProbeWorkspaceContainer> {
@@ -294,7 +313,22 @@ async function validateOwnedProbeWorkspaceContainer(
   if (storedCapability !== capability) {
     throw new ProbeOwnershipError();
   }
-  return { directoryPath: canonicalDirectoryPath, capabilityPath, capability };
+  const workspaceDirectoryPath = path.join(canonicalDirectoryPath, "workspace");
+  const workspaceStat = await safeLstat(workspaceDirectoryPath);
+  if (
+    workspaceStat === null ||
+    !workspaceStat.isDirectory() ||
+    workspaceStat.isSymbolicLink() ||
+    (workspaceStat.mode & 0o077) !== 0
+  ) {
+    throw new ProbeOwnershipError();
+  }
+  return {
+    directoryPath: canonicalDirectoryPath,
+    workspaceDirectoryPath,
+    capabilityPath,
+    capability,
+  };
 }
 
 async function validateProbeDirectory(directoryPath: string): Promise<string> {
@@ -323,7 +357,8 @@ async function validateProbeDirectory(directoryPath: string): Promise<string> {
     temporaryRoot === null ||
     canonicalParentPath === null ||
     (canonicalParentPath !== temporaryRoot &&
-      !(await isOwnedProbeContainerDirectory(canonicalParentPath)))
+      !(await isOwnedProbeContainerDirectory(canonicalParentPath)) &&
+      !(await isOwnedProbeContainerWorkspaceDirectory(canonicalParentPath)))
   ) {
     throw new ProbeOwnershipError();
   }
@@ -380,8 +415,45 @@ async function isOwnedProbeContainerDirectory(directoryPath: string): Promise<bo
   }
 }
 
+async function isOwnedProbeContainerWorkspaceDirectory(directoryPath: string): Promise<boolean> {
+  try {
+    const workspacePath = path.resolve(directoryPath);
+    if (path.basename(workspacePath) !== "workspace") return false;
+    const containerPath = path.dirname(workspacePath);
+    const container = await validateOwnedProbeWorkspaceContainerByDirectory(containerPath);
+    return container.workspaceDirectoryPath === workspacePath;
+  } catch {
+    return false;
+  }
+}
+
+async function validateOwnedProbeWorkspaceContainerByDirectory(
+  directoryPath: string,
+): Promise<ProbeWorkspaceContainer> {
+  const canonicalDirectoryPath = await validateProbeContainerDirectory(directoryPath);
+  const capabilityPath = path.join(canonicalDirectoryPath, CONTAINER_CAPABILITY_FILE_NAME);
+  const capability = await readFile(capabilityPath, "utf8").catch(() => null);
+  if (capability === null) throw new ProbeOwnershipError();
+  return validateOwnedProbeWorkspaceContainer(canonicalDirectoryPath, capability);
+}
+
 async function safeLstat(filePath: string) {
   return lstat(filePath).catch(() => null);
+}
+
+async function removeOwnedPath(directoryPath: string): Promise<void> {
+  try {
+    await rm(directoryPath, { recursive: true, force: true });
+  } catch {
+    throw new ProbeOwnershipError();
+  }
+  try {
+    await lstat(directoryPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw new ProbeOwnershipError();
+  }
+  throw new ProbeOwnershipError();
 }
 
 function stripEntrypointArgument(rawArguments: readonly string[]): string[] {

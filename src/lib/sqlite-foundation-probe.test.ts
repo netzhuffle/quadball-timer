@@ -11,7 +11,6 @@ import {
   createProbeWorkspaceContainer,
   isSupportedSqliteVersion,
   parseSqliteProbeInvocation,
-  runCompiledSqliteFoundationProbe,
   SQLITE_FOUNDATION_PROBE_MAX_OUTPUT_BYTES,
   SQLITE_FOUNDATION_PROBE_WORKLOAD,
   superviseProbeWorkers,
@@ -19,7 +18,6 @@ import {
   type ProbeWorkerHandle,
   type ProbeWorkerResult,
   SqliteFoundationGateError,
-  type ProbeWorkspaceContainer,
   validateOwnedProbeWorkspace,
   validateOwnedProbeWorkerWorkspace,
 } from "@/lib/sqlite-foundation-probe";
@@ -250,7 +248,14 @@ describe("sqlite-foundation-probe", () => {
     const second = createFakeWorker(102, false);
     const workers = [first.worker, second.worker];
     const signals: string[] = [];
-    first.complete({ exitCode: 1, stdout: "", stderr: "", outputExceeded: false });
+    first.complete({
+      exitCode: 1,
+      stdout: "",
+      stderr: "",
+      stdoutBytes: 0,
+      stderrBytes: 0,
+      outputExceeded: false,
+    });
 
     expect(
       await captureRejection(() =>
@@ -286,6 +291,12 @@ describe("sqlite-foundation-probe", () => {
         exitCode: 1,
         stdout: `worker opened ${secretPath}; then "${quotedPosixPath}".\n${"x".repeat(10_000)}`,
         stderr: `capability=${secretCapability}; failed at '${quotedWindowsPath}',`,
+        stdoutBytes: new TextEncoder().encode(
+          `worker opened ${secretPath}; then "${quotedPosixPath}".\n${"x".repeat(10_000)}`,
+        ).byteLength,
+        stderrBytes: new TextEncoder().encode(
+          `capability=${secretCapability}; failed at '${quotedWindowsPath}',`,
+        ).byteLength,
         outputExceeded: false,
       });
       return captureRejection(() =>
@@ -329,6 +340,12 @@ describe("sqlite-foundation-probe", () => {
       exitCode: 1,
       stdout: `${"x".repeat(perStreamBoundary - 6)}${capabilityPrefix}-1234-1234-123456789abc`,
       stderr: `${"y".repeat(perStreamBoundary - 6)}${pathPrefix}/probe.sqlite`,
+      stdoutBytes: new TextEncoder().encode(
+        `${"x".repeat(perStreamBoundary - 6)}${capabilityPrefix}-1234-1234-123456789abc`,
+      ).byteLength,
+      stderrBytes: new TextEncoder().encode(
+        `${"y".repeat(perStreamBoundary - 6)}${pathPrefix}/probe.sqlite`,
+      ).byteLength,
       outputExceeded: false,
     });
 
@@ -352,7 +369,14 @@ describe("sqlite-foundation-probe", () => {
     const first = createFakeWorker(501, false, 500);
     const second = createFakeWorker(502, false, 500);
     const signals: string[] = [];
-    first.complete({ exitCode: 1, stdout: "", stderr: "", outputExceeded: false });
+    first.complete({
+      exitCode: 1,
+      stdout: "",
+      stderr: "",
+      stdoutBytes: 0,
+      stderrBytes: 0,
+      outputExceeded: false,
+    });
 
     expect(
       await captureRejection(() =>
@@ -458,68 +482,6 @@ describe("sqlite-foundation-probe", () => {
 
     expect(signals).toEqual(["301:SIGTERM"]);
   });
-
-  test("bounds nested wrapper cleanup for success, failure, timeout, and interruption", async () => {
-    const cases = [
-      { label: "success", outcome: "success" as const, expectedSignals: [] },
-      { label: "failure", outcome: "failure" as const, expectedSignals: ["701:SIGTERM"] },
-      {
-        label: "timeout",
-        outcome: "timeout" as const,
-        expectedSignals: ["701:SIGTERM", "701:SIGKILL"],
-      },
-      {
-        label: "interruption",
-        outcome: "interruption" as const,
-        expectedSignals: ["701:SIGTERM", "701:SIGKILL"],
-      },
-    ];
-
-    for (const testCase of cases) {
-      const nested = createNestedProbe(testCase.outcome);
-      const controller = new AbortController();
-      if (testCase.outcome === "interruption") {
-        controller.abort();
-      }
-
-      let workspaceRemoved = false;
-      const signals: string[] = [];
-      const options = {
-        signal: controller.signal,
-        timeoutMs: 15_000,
-        scheduleTimeout: (callback: () => void) => {
-          if (testCase.outcome === "timeout") {
-            callback();
-          }
-          return 0;
-        },
-        clearTimeout: () => {},
-        sleep: async () => {},
-        signalProcessGroup: (pid: number, signal: NodeJS.Signals) => {
-          signals.push(`${pid}:${signal}`);
-          nested.terminateGroup(signal);
-          return true;
-        },
-        createWorkspaceContainer: async () => nested.container,
-        cleanupWorkspaceContainer: async () => {
-          workspaceRemoved = true;
-        },
-        spawnOuter: () => nested.outer,
-      };
-
-      const operation = () => runCompiledSqliteFoundationProbe("compiled-probe", options);
-      if (testCase.outcome === "success") {
-        await operation();
-      } else {
-        await captureRejection(operation);
-      }
-
-      expect(signals, `${testCase.label} TERM/KILL order`).toEqual(testCase.expectedSignals);
-      expect(nested.outer.process.exitCode, `${testCase.label} outer reaped`).not.toBeNull();
-      expect(nested.childReaped, `${testCase.label} descendants reaped`).toBe(true);
-      expect(workspaceRemoved, `${testCase.label} workspace removed`).toBe(true);
-    }
-  });
 });
 
 function createFakeWorker(
@@ -572,88 +534,13 @@ function createFakeWorker(
       exitCode: signal === "SIGKILL" ? 137 : 143,
       stdout: "",
       stderr: "",
+      stdoutBytes: 0,
+      stderrBytes: 0,
       outputExceeded: false,
     });
   }
 
   return { worker, complete, terminate };
-}
-
-function createNestedProbe(outcome: "success" | "failure" | "timeout" | "interruption"): {
-  outer: ProbeWorkerHandle;
-  container: ProbeWorkspaceContainer;
-  childReaped: boolean;
-  terminateGroup: (signal: NodeJS.Signals) => void;
-} {
-  let exitCode: number | null = null;
-  let resolveExited: (code: number) => void = () => {};
-  let resolveResult: (result: ProbeWorkerResult) => void = () => {};
-  let childReaped = outcome === "success";
-  const exited = new Promise<number>((resolve) => {
-    resolveExited = resolve;
-  });
-  const result = new Promise<ProbeWorkerResult>((resolve) => {
-    resolveResult = resolve;
-  });
-  const process: ProbeProcess = {
-    pid: 701,
-    processGroupOwned: true,
-    get exitCode() {
-      return exitCode;
-    },
-    get killed() {
-      return exitCode !== null;
-    },
-    exited,
-    kill(signal) {
-      if (signal !== undefined) {
-        terminateGroup(signal);
-      }
-    },
-  };
-  const outer = { process, result };
-  const container: ProbeWorkspaceContainer = {
-    directoryPath: "/tmp/fake-probe-container",
-    capabilityPath: "/tmp/fake-probe-container/.capability",
-    capability: CAPABILITY,
-  };
-
-  if (outcome === "success") {
-    completeOuter(0);
-  } else if (outcome === "failure") {
-    completeOuter(1);
-  }
-
-  function completeOuter(code: number) {
-    if (exitCode !== null) {
-      return;
-    }
-    exitCode = code;
-    resolveExited(code);
-    resolveResult({
-      exitCode: code,
-      stdout: "{}",
-      stderr: "",
-      outputExceeded: false,
-    });
-  }
-
-  function terminateGroup(signal: NodeJS.Signals) {
-    if (signal === "SIGTERM" && (outcome === "timeout" || outcome === "interruption")) {
-      return;
-    }
-    childReaped = true;
-    completeOuter(signal === "SIGKILL" ? 137 : 143);
-  }
-
-  return {
-    outer,
-    container,
-    get childReaped() {
-      return childReaped;
-    },
-    terminateGroup,
-  };
 }
 
 async function captureRejection(operation: () => Promise<unknown>): Promise<Error> {
