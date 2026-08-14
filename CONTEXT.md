@@ -5,8 +5,12 @@ This context describes the target domain language being planned for preparing, c
 ## Language
 
 **Event**:
-A named quadball gathering configured by the Technical Admin with a local timezone and one or more Game Days. It is current on each Game Day, future before its next Game Day, and past after its final Game Day.
+A named quadball gathering configured by the Technical Admin with a local timezone and zero or more Game Days. It may remain Unpublished without a Game Day; once scheduled, it is current on each Game Day, future before its next Game Day, and past after its final Game Day.
 _Avoid_: Tournament, event window
+
+**Event Catalog Removal**:
+A Technical Admin may remove an empty Event, and an Event Admin may remove an unreferenced Event Team, Game Day, Pitch, Gameplay Slot, or Pitch Slot, or an Event Game before Game Commencement and before it has any accepted Control Action. Removal atomically retires attached authority and records its evidence; commenced Games and referenced structure remain and use their ordinary correction, reassignment, Publication Status, Game Lock, or Game Reopening workflows.
+_Avoid_: Cascade delete, history cleanup
 
 **Publication Status**:
 An Event-level visibility state of Unpublished, Published, or Event Cancelled. Only Published Events have a public Audience Projection; the other two statuses are indistinguishable from unknown Events to public audiences and do not change private operational authority.
