@@ -3,7 +3,9 @@ import {
   createControlActionCodecRegistry,
   createDeterministicTestIqaInterpreter,
   prepareControlAction,
+  sha256,
   type ControlActionInput,
+  type ControlAuditEntry,
 } from "@/lib/event-game-actions";
 import {
   createEventGameRecord,
@@ -331,6 +333,81 @@ describe("immutable Event Game actions", () => {
     }
   });
 
+  test("binds retained memory collision evidence to the rejected Control Action input", async () => {
+    const root = createRoot("record-collision-evidence");
+    const baseStorage = createInMemoryFoundationStorage();
+    const writer = createEventGameRecord(baseStorage, {
+      externalScopeResolver: createScopeResolver(root),
+      clock: () => 10_000,
+      interpreter: createDeterministicTestIqaInterpreter("rules-v1"),
+    });
+    expect(await writer.registerRoot(root)).toMatchObject({ status: "registered" });
+    const accepted = createFact(root, "operation-collision", 1_000);
+    expect(await writer.acceptAction(accepted)).toMatchObject({ status: "accepted" });
+    expect(
+      await writer.acceptAction({
+        ...accepted,
+        payload: { ...(accepted.payload as Record<string, unknown>), data: { rejected: true } },
+      }),
+    ).toMatchObject({ status: "rejected", reason: "operation-conflict" });
+    expect(await writer.readiness()).toMatchObject({ ok: true, actionCount: 1 });
+    expect(
+      await writer.acceptAction(createFact(root, "operation-after-collision", 2_000)),
+    ).toMatchObject({ status: "accepted" });
+
+    const corruptions: readonly [string, (entry: ControlAuditEntry) => void][] = [
+      [
+        "interpretation",
+        (entry) => {
+          const rejected = requiredCollision(entry).rejectedAttempt;
+          if (rejected.interpretation.type !== "fact") throw new Error("Expected Fact evidence.");
+          rejected.interpretation = {
+            ...rejected.interpretation,
+            factType: "tampered-fact-type",
+          };
+        },
+      ],
+      [
+        "canonical-content",
+        (entry) => {
+          requiredCollision(entry).rejectedAttempt.canonicalContent = "{}";
+        },
+      ],
+      [
+        "fingerprint",
+        (entry) => {
+          const rejected = requiredCollision(entry).rejectedAttempt;
+          rejected.contentFingerprint = "f".repeat(64);
+          entry.auditId = `audit-${sha256(`${root.recordId}:operation-conflict:${entry.operationId}:${rejected.contentFingerprint}`)}`;
+        },
+      ],
+    ];
+
+    for (const [label, mutate] of corruptions) {
+      const corruptStorage = createCorruptingStorage(baseStorage, (snapshot) => ({
+        ...snapshot,
+        listAuditEntries: (recordId) =>
+          snapshot.listAuditEntries(recordId).map((entry) => {
+            if (entry.kind !== "action-conflict") return entry;
+            const corrupted = structuredClone(entry);
+            mutate(corrupted);
+            return corrupted;
+          }),
+      }));
+      const record = createEventGameRecord(corruptStorage, {
+        externalScopeResolver: createScopeResolver(root),
+        clock: () => 10_000,
+        interpreter: createDeterministicTestIqaInterpreter("rules-v1"),
+      });
+      expect(await record.registerRoot(root)).toMatchObject({ status: "idempotent" });
+      expect(await record.readiness(), label).toMatchObject({
+        ok: false,
+        status: "rebuild-failure",
+      });
+    }
+    baseStorage.close();
+  });
+
   test("retains explicit recovery provenance with the immutable action", async () => {
     const root = createRoot("record-recovery-provenance");
     const record = await createRecord(root);
@@ -410,6 +487,12 @@ function createCorruptingStorage(
     readiness: () => storage.readiness(),
     close: () => storage.close(),
   };
+}
+
+function requiredCollision(entry: ControlAuditEntry) {
+  const collision = entry.links?.collision;
+  if (collision === undefined) throw new Error("Expected rejected collision evidence.");
+  return collision;
 }
 
 async function readSnapshot(
@@ -552,6 +635,11 @@ function createScopeResolver(root: EventGameRecordRoot): ExternalScopeResolver {
       return JSON.stringify(scope) === JSON.stringify(root.externalScope)
         ? { status: "resolved", scope: structuredClone(scope) }
         : { status: "mismatch", detail: "The external scope does not match the root." };
+    },
+    resolveEventTeam(eventId, eventTeamId) {
+      return eventId === root.eventId && eventTeamId.length > 0
+        ? { status: "resolved" }
+        : { status: "mismatch", detail: "The Event Team is outside the Event scope." };
     },
   };
 }

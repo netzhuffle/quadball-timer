@@ -56,7 +56,7 @@ describe("SQLite foundation storage", () => {
       first.close();
 
       const reopened = openSqliteFoundationStorage(databasePath);
-      expect(await reopened.readiness()).toMatchObject({ ok: true, schemaVersion: "6" });
+      expect(await reopened.readiness()).toMatchObject({ ok: true, schemaVersion: "9" });
       const reopenedRecord = createEventGameRecord(reopened, {
         externalScopeResolver: createScopeResolver(root),
       });
@@ -74,12 +74,12 @@ describe("SQLite foundation storage", () => {
       const storage = openSqliteFoundationStorage(databasePath);
       const candidate = await storage.validateCandidate();
       expect(candidate.ready).toBe(true);
-      expect(candidate.readiness).toMatchObject({ ok: true, schemaVersion: "6" });
+      expect(candidate.readiness).toMatchObject({ ok: true, schemaVersion: "9" });
       expect(existsSync(candidate.candidatePath)).toBe(false);
       expect(await storage.readiness()).toMatchObject({ ok: false, status: "pending" });
 
       const migration = await storage.applyMigrations({ requireCandidate: true });
-      expect(migration.schemaVersion).toBe(6);
+      expect(migration.schemaVersion).toBe(9);
       expect(await storage.readiness()).toMatchObject({ ok: true });
       storage.close();
     });
@@ -118,8 +118,11 @@ describe("SQLite foundation storage", () => {
         grantMigration.id,
         expiryMigration.id,
         erasureMigration.id,
+        FOUNDATION_MIGRATIONS[6]!.id,
+        FOUNDATION_MIGRATIONS[7]!.id,
+        FOUNDATION_MIGRATIONS[8]!.id,
       ]);
-      expect(await current.readiness()).toMatchObject({ ok: true, schemaVersion: "6" });
+      expect(await current.readiness()).toMatchObject({ ok: true, schemaVersion: "9" });
       current.close();
     });
   });
@@ -128,9 +131,9 @@ describe("SQLite foundation storage", () => {
     await withDatabase(async (databasePath) => {
       const baseMigrations = FOUNDATION_MIGRATIONS;
       const failingMigration = createMigration(
-        "007-failing-test-migration",
-        7,
-        7,
+        "010-failing-test-migration",
+        10,
+        10,
         "CREATE TABLE migration_failure_probe (id TEXT) STRICT; THIS IS NOT SQL;",
       );
       const store = openSqliteFoundationStorage(databasePath, {
@@ -150,7 +153,7 @@ describe("SQLite foundation storage", () => {
       });
       expect(await priorBinary.readiness()).toMatchObject({
         ok: true,
-        schemaVersion: "6",
+        schemaVersion: "9",
       });
       priorBinary.close();
 
@@ -222,7 +225,7 @@ describe("SQLite foundation storage", () => {
         .query(
           "INSERT INTO foundation_migration_ledger (migration_id, ordinal, schema_version, checksum, status, applied_at_ms) VALUES (?, ?, ?, ?, ?, ?)",
         )
-        .run("future-999", 7, 7, "future-checksum", "complete", 2_000);
+        .run("future-999", 10, 10, "future-checksum", "complete", 2_000);
       futureDatabase.close();
       const future = openSqliteFoundationStorage(databasePath);
       expect(await future.readiness()).toMatchObject({ ok: false });
@@ -373,6 +376,11 @@ function createScopeResolver(root: EventGameRecordRoot): ExternalScopeResolver {
       return JSON.stringify(scope) === JSON.stringify(root.externalScope)
         ? { status: "resolved", scope: structuredClone(scope) }
         : { status: "mismatch", detail: "The external scope does not match the root." };
+    },
+    resolveEventTeam(eventId, eventTeamId) {
+      return eventId === root.eventId && eventTeamId.length > 0
+        ? { status: "resolved" }
+        : { status: "mismatch", detail: "The Event Team is outside the Event scope." };
     },
   };
 }

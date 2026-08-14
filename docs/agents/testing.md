@@ -24,6 +24,10 @@ Classify an executable test by its purpose, risk, and execution boundary. Durati
 
 The timing values are review targets, not hard assertions. Crossing one requires investigation and an explicit decision; elapsed time alone does not reclassify a test or justify weakening or removing it.
 
+### Issue #75 generated convergence coverage
+
+The fixed-seed 1,000-sequence Event Game correction test remains a Fast Test: it uses the in-memory adapter, injected clocks, and deterministic action fixtures. After splitting the correction tests, the generated file measured 2.54 seconds on Darwin arm64 with Bun 1.3.14, narrowly over the two-second per-file review target while remaining within the ten-second ordinary-suite target. The test retains the required 1,000 sequences and is not weakened; revisit the implementation if the file grows materially or the ordinary suite approaches its ten-second target.
+
 The reference environment for timing review is the supported Bun version from `package.json` on a native development environment. Record the operating system, architecture, Bun version, and relevant resource measurements when investigating a target overrun.
 
 ## Ordinary execution boundary

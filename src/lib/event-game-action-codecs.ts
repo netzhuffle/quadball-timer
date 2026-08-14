@@ -46,7 +46,7 @@ export function createControlActionCodecRegistry(
 }
 
 export function createDefaultControlActionCodecs(): readonly ControlActionCodec[] {
-  return [createGameFactCodec(), createCorrectionCodec()];
+  return [createGameFactCodec(), createCorrectionCodec(), createTeamAssignmentCorrectionCodec()];
 }
 
 export function createDeterministicTestIqaInterpreter(version: string): IqaGameRulesInterpreter {
@@ -74,6 +74,13 @@ type CorrectionPayload = {
   correctionId: string;
   targetFactId: string;
   effective: boolean;
+};
+
+type TeamAssignmentCorrectionPayload = {
+  correctionId: string;
+  gameSideId: string;
+  eventTeamId: string;
+  teamInterpretationRef: string;
 };
 
 function createGameFactCodec(): ControlActionCodec<GameFactPayload> {
@@ -164,6 +171,49 @@ function createCorrectionCodec(): ControlActionCodec<CorrectionPayload> {
         correctionId: payload.correctionId,
         targetFactId: payload.targetFactId,
         effective: payload.effective,
+      };
+    },
+  };
+}
+
+function createTeamAssignmentCorrectionCodec(): ControlActionCodec<TeamAssignmentCorrectionPayload> {
+  return {
+    kind: "team-assignment-correction",
+    version: "1",
+    decode(payload) {
+      if (!isRecord(payload))
+        return invalid("Team Assignment Correction payload must be an object.");
+      const correctionId = validateId(payload.correctionId, "payload.correctionId");
+      const gameSideId = validateId(payload.gameSideId, "payload.gameSideId");
+      const eventTeamId = validateId(payload.eventTeamId, "payload.eventTeamId");
+      const teamInterpretationRef = validateId(
+        payload.teamInterpretationRef,
+        "payload.teamInterpretationRef",
+      );
+      if (!correctionId.ok) return correctionId;
+      if (!gameSideId.ok) return gameSideId;
+      if (!eventTeamId.ok) return eventTeamId;
+      if (!teamInterpretationRef.ok) return teamInterpretationRef;
+      return valid({
+        correctionId: correctionId.value,
+        gameSideId: gameSideId.value,
+        eventTeamId: eventTeamId.value,
+        teamInterpretationRef: teamInterpretationRef.value,
+      });
+    },
+    canonicalize(payload) {
+      return canonicalizeJson(payload);
+    },
+    fingerprint(payload) {
+      return sha256(canonicalizeJson(payload));
+    },
+    interpret(payload) {
+      return {
+        type: "team-assignment-correction",
+        correctionId: payload.correctionId,
+        gameSideId: payload.gameSideId,
+        eventTeamId: payload.eventTeamId,
+        teamInterpretationRef: payload.teamInterpretationRef,
       };
     },
   };
@@ -337,7 +387,7 @@ export function validateRecoveryProvenance(
   return shape;
 }
 
-function validateRecoveryProvenanceShape(
+export function validateRecoveryProvenanceShape(
   value: unknown,
 ): ValidationResult<ControlActionRecoveryProvenance | undefined> {
   if (value === undefined) return valid(undefined);
@@ -425,6 +475,26 @@ export function validateInterpretation(
       correctionId: correctionId.value,
       targetFactId: targetFactId.value,
       effective: value.effective,
+    });
+  }
+  if (value.type === "team-assignment-correction") {
+    const correctionId = validateId(value.correctionId, "interpretation.correctionId");
+    const gameSideId = validateId(value.gameSideId, "interpretation.gameSideId");
+    const eventTeamId = validateId(value.eventTeamId, "interpretation.eventTeamId");
+    const teamInterpretationRef = validateId(
+      value.teamInterpretationRef,
+      "interpretation.teamInterpretationRef",
+    );
+    if (!correctionId.ok) return correctionId;
+    if (!gameSideId.ok) return gameSideId;
+    if (!eventTeamId.ok) return eventTeamId;
+    if (!teamInterpretationRef.ok) return teamInterpretationRef;
+    return valid({
+      type: "team-assignment-correction",
+      correctionId: correctionId.value,
+      gameSideId: gameSideId.value,
+      eventTeamId: eventTeamId.value,
+      teamInterpretationRef: teamInterpretationRef.value,
     });
   }
   if (value.type === "non-fact") {

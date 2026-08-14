@@ -157,6 +157,9 @@ function runStorageContract(name: string, factory: StorageFactory): void {
                   detail: "missing: the external scope catalog is temporarily unavailable.",
                 };
           },
+          resolveEventTeam() {
+            return { status: "resolved" };
+          },
         };
         const record = createEventGameRecord(harness.storage, {
           externalScopeResolver: resolver,
@@ -222,6 +225,9 @@ function runStorageContract(name: string, factory: StorageFactory): void {
             };
           }
           return { status: "resolved", scope: structuredClone(scope) };
+        },
+        resolveEventTeam() {
+          return { status: "resolved" };
         },
       };
       const cases: readonly [string, Partial<EventGameRecordRoot["externalScope"]>, string][] = [
@@ -423,6 +429,11 @@ function createScopeResolver(root: EventGameRecordRoot): ExternalScopeResolver {
             status: "mismatch",
             detail: "The external scope does not match the registered hierarchy.",
           };
+    },
+    resolveEventTeam(eventId, eventTeamId) {
+      return eventId === root.eventId && eventTeamId.length > 0
+        ? { status: "resolved" }
+        : { status: "mismatch", detail: "The Event Team is outside the Event scope." };
     },
   };
 }

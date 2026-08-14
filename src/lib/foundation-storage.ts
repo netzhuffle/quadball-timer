@@ -15,10 +15,17 @@ export type StoredEventGameRecordRoot = {
   canonicalContent: string;
 };
 
+export type DurableEvidenceFormat = "current" | "legacy";
+
+export const DURABLE_EVIDENCE_PROVENANCE = Symbol("durable-evidence-provenance");
+
 export type StoredControlAction = {
   action: ControlAction;
   canonicalContent: string;
   contentFingerprint: string;
+  /** Storage-owned provenance; unlike action JSON, this marker is not supplied by callers. */
+  durableFormat?: DurableEvidenceFormat;
+  [DURABLE_EVIDENCE_PROVENANCE]?: DurableEvidenceFormat;
 };
 
 export type StoredControlIdempotencyEntry = {
@@ -29,7 +36,11 @@ export type StoredControlIdempotencyEntry = {
   acceptedAtMs: number;
 };
 
-export type StoredControlAuditEntry = ControlAuditEntry;
+export type StoredControlAuditEntry = ControlAuditEntry & {
+  /** Storage-owned provenance; unlike audit JSON, this marker is not supplied by callers. */
+  durableFormat?: DurableEvidenceFormat;
+  [DURABLE_EVIDENCE_PROVENANCE]?: DurableEvidenceFormat;
+};
 
 export type StoredEventGameRecordMetadata = EventGameRecordMetadata;
 

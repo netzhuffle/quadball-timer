@@ -2,9 +2,9 @@ import { createHash } from "node:crypto";
 import { Database } from "bun:sqlite";
 import {
   FOUNDATION_ACTION_RECORD_INDEX_SQL,
-  FOUNDATION_ACTION_TABLE_SQL,
+  FOUNDATION_CURRENT_ACTION_TABLE_SQL,
   FOUNDATION_AUDIT_RECORD_INDEX_SQL,
-  FOUNDATION_AUDIT_TABLE_SQL,
+  FOUNDATION_CURRENT_AUDIT_TABLE_SQL,
   FOUNDATION_LEDGER_TABLE_SQL,
   FOUNDATION_IDEMPOTENCY_RECORD_INDEX_SQL,
   FOUNDATION_IDEMPOTENCY_TABLE_SQL,
@@ -20,6 +20,9 @@ import {
   FOUNDATION_GRANT_SESSION_GRANT_INDEX_SQL,
   FOUNDATION_GRANT_SESSION_TABLE_SQL,
   FOUNDATION_GRANT_TABLE_SQL,
+  FOUNDATION_EVIDENCE_PROVENANCE_TABLE_SQL,
+  FOUNDATION_EVIDENCE_PROVENANCE_UPDATE_TRIGGER_SQL,
+  FOUNDATION_EVIDENCE_PROVENANCE_DELETE_TRIGGER_SQL,
 } from "@/lib/foundation-migrations";
 import {
   canonicalizeEventGameRecordRoot,
@@ -80,19 +83,33 @@ const AUDIT_TABLE = "foundation_event_game_record_audit";
 const GRANT_TABLE = "foundation_grant_roots";
 const GRANT_SESSION_TABLE = "foundation_grant_sessions";
 const GRANT_AUDIT_TABLE = "foundation_grant_audit";
+const PROVENANCE_TABLE = "foundation_control_evidence_provenance";
 
 const expectedManifest: FoundationSchemaManifest = {
   objects: [
     object("table", LEDGER_TABLE, LEDGER_TABLE, FOUNDATION_LEDGER_TABLE_SQL),
     object("table", ROOT_TABLE, ROOT_TABLE, FOUNDATION_ROOT_TABLE_SQL),
     object("table", SIDE_TABLE, SIDE_TABLE, FOUNDATION_SIDE_TABLE_SQL),
-    object("table", ACTION_TABLE, ACTION_TABLE, FOUNDATION_ACTION_TABLE_SQL),
+    object("table", ACTION_TABLE, ACTION_TABLE, FOUNDATION_CURRENT_ACTION_TABLE_SQL),
     object("table", IDEMPOTENCY_TABLE, IDEMPOTENCY_TABLE, FOUNDATION_IDEMPOTENCY_TABLE_SQL),
     object("table", METADATA_TABLE, METADATA_TABLE, FOUNDATION_METADATA_TABLE_SQL),
-    object("table", AUDIT_TABLE, AUDIT_TABLE, FOUNDATION_AUDIT_TABLE_SQL),
+    object("table", AUDIT_TABLE, AUDIT_TABLE, FOUNDATION_CURRENT_AUDIT_TABLE_SQL),
     object("table", GRANT_TABLE, GRANT_TABLE, FOUNDATION_GRANT_TABLE_SQL),
     object("table", GRANT_SESSION_TABLE, GRANT_SESSION_TABLE, FOUNDATION_GRANT_SESSION_TABLE_SQL),
     object("table", GRANT_AUDIT_TABLE, GRANT_AUDIT_TABLE, FOUNDATION_GRANT_AUDIT_TABLE_SQL),
+    object("table", PROVENANCE_TABLE, PROVENANCE_TABLE, FOUNDATION_EVIDENCE_PROVENANCE_TABLE_SQL),
+    object(
+      "trigger",
+      "foundation_control_evidence_provenance_no_update",
+      PROVENANCE_TABLE,
+      FOUNDATION_EVIDENCE_PROVENANCE_UPDATE_TRIGGER_SQL,
+    ),
+    object(
+      "trigger",
+      "foundation_control_evidence_provenance_no_delete",
+      PROVENANCE_TABLE,
+      FOUNDATION_EVIDENCE_PROVENANCE_DELETE_TRIGGER_SQL,
+    ),
     object(
       "index",
       "foundation_event_game_record_roots_event_id",
@@ -225,6 +242,8 @@ const expectedManifest: FoundationSchemaManifest = {
         column("content_fingerprint", "TEXT", 1, 0),
         column("canonical_content", "TEXT", 1, 0),
         column("action_json", "TEXT", 1, 0),
+        column("control_action_version", "TEXT", 1, 0, "'control-action-legacy-v0'"),
+        column("action_evidence_format", "TEXT", 1, 0, "'legacy'"),
       ],
       foreignKeys: [
         {
@@ -371,6 +390,8 @@ const expectedManifest: FoundationSchemaManifest = {
         column("created_at_ms", "INTEGER", 1, 0),
         column("redacted_detail", "TEXT", 1, 0),
         column("audit_json", "TEXT", 1, 0),
+        column("audit_version", "TEXT", 1, 0, "'control-audit-legacy-v0'"),
+        column("audit_evidence_format", "TEXT", 1, 0, "'legacy'"),
       ],
       foreignKeys: [
         {
@@ -420,6 +441,16 @@ const expectedManifest: FoundationSchemaManifest = {
           match: "NONE",
         },
       ],
+    },
+    {
+      name: PROVENANCE_TABLE,
+      columns: [
+        column("evidence_kind", "TEXT", 1, 1),
+        column("evidence_id", "TEXT", 1, 2),
+        column("evidence_format", "TEXT", 1, 0),
+        column("origin", "TEXT", 1, 0),
+      ],
+      foreignKeys: [],
     },
   ].sort(compareNamed),
   indexes: [
@@ -663,6 +694,7 @@ function readSchemaManifest(database: Database): FoundationSchemaManifest {
     GRANT_TABLE,
     GRANT_SESSION_TABLE,
     GRANT_AUDIT_TABLE,
+    PROVENANCE_TABLE,
   ].map((name) => ({
     name,
     columns: readColumns(database, name),
@@ -797,12 +829,13 @@ function column(
   type: string,
   notNull: number,
   primaryKeyPosition: number,
+  defaultValue: string | null = null,
 ): SchemaColumn {
   return {
     name,
     type,
     notNull,
-    defaultValue: null,
+    defaultValue,
     primaryKeyPosition,
   };
 }

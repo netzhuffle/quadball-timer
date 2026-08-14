@@ -1,4 +1,25 @@
-import { parseStoredControlAction, sha256 } from "@/lib/event-game-actions";
+import {
+  parseStoredControlAction,
+  CONTROL_ACTION_VERSION,
+  LEGACY_CONTROL_ACTION_VERSION,
+  LEGACY_CONTROL_AUDIT_VERSION,
+  CONTROL_AUDIT_VERSION,
+  sha256,
+  type ControlAuditLinkage,
+  type ControlAuditProvenance,
+} from "@/lib/event-game-actions";
+import {
+  validateGrant,
+  validateLifecycle,
+  validateOccurrenceWithoutClock,
+  validateOverride,
+  validatePredecessors,
+  validateRecoveryProvenanceShape,
+  validateId,
+  validateTimestamp,
+  validateInterpretation,
+  validateStoredInput,
+} from "@/lib/event-game-action-codecs";
 import {
   FoundationStorageConstraintError,
   type StoredControlAction,
@@ -6,6 +27,7 @@ import {
   type StoredControlIdempotencyEntry,
   type StoredEventGameRecordMetadata,
 } from "@/lib/foundation-storage";
+import { DURABLE_EVIDENCE_PROVENANCE } from "@/lib/foundation-storage";
 
 export type RootRow = Record<string, unknown>;
 
@@ -51,10 +73,27 @@ export function readStoredAction(row: RootRow): StoredControlAction {
   if (action.value.acceptedAtMs !== readInteger(row.accepted_at_ms)) {
     throw new Error("Stored Control Action acceptance time is inconsistent.");
   }
+  if (action.value.controlActionVersion !== readText(row.control_action_version)) {
+    throw new Error("Stored Control Action compatibility version is inconsistent.");
+  }
+  const durableFormat = readEvidenceFormat(row.action_evidence_format, "action");
+  const provenanceFormat = readEvidenceFormat(row.action_provenance_format, "action");
+  if (provenanceFormat !== durableFormat) {
+    throw new Error("Stored Control Action immutable provenance is inconsistent.");
+  }
+  if (
+    (durableFormat === "current" && action.value.controlActionVersion !== CONTROL_ACTION_VERSION) ||
+    (durableFormat === "legacy" &&
+      action.value.controlActionVersion !== LEGACY_CONTROL_ACTION_VERSION)
+  ) {
+    throw new Error("Stored Control Action durable format marker is inconsistent.");
+  }
   return {
     action: action.value,
     canonicalContent: readText(row.canonical_content),
     contentFingerprint: readText(row.content_fingerprint),
+    durableFormat,
+    [DURABLE_EVIDENCE_PROVENANCE]: provenanceFormat,
   };
 }
 
@@ -88,15 +127,50 @@ export function readAudit(row: RootRow): StoredControlAuditEntry {
   ) {
     throw new Error("Stored Control Audit entry kind is invalid.");
   }
+  const durableAuditVersion = readText(row.audit_version);
+  const durableFormat = readEvidenceFormat(row.audit_evidence_format, "audit");
+  const provenanceFormat = readEvidenceFormat(row.audit_provenance_format, "audit");
+  if (provenanceFormat !== durableFormat) {
+    throw new Error("Stored Control Audit immutable provenance is inconsistent.");
+  }
+  const jsonAuditVersion =
+    entry.auditVersion === undefined ? undefined : readText(entry.auditVersion);
+  if (jsonAuditVersion !== undefined && jsonAuditVersion !== durableAuditVersion) {
+    throw new Error("Stored Control Audit compatibility version is inconsistent.");
+  }
+  const auditVersion = durableAuditVersion;
+  if (auditVersion !== CONTROL_AUDIT_VERSION && auditVersion !== LEGACY_CONTROL_AUDIT_VERSION) {
+    throw new Error("Stored Control Audit version is invalid.");
+  }
+  if (
+    (durableFormat === "current" && auditVersion !== CONTROL_AUDIT_VERSION) ||
+    (durableFormat === "legacy" && auditVersion !== LEGACY_CONTROL_AUDIT_VERSION)
+  ) {
+    throw new Error("Stored Control Audit durable format marker is inconsistent.");
+  }
+  if (
+    auditVersion === CONTROL_AUDIT_VERSION &&
+    (entry.links === undefined || entry.provenance === undefined)
+  ) {
+    throw new Error("Stored #75 Control Audit evidence is incomplete.");
+  }
   const result: StoredControlAuditEntry = {
-    auditId: readText(entry.auditId),
-    recordId: readText(entry.recordId),
-    eventGameId: readText(entry.eventGameId),
-    operationId: entry.operationId === null ? null : readText(entry.operationId),
+    auditVersion,
+    durableFormat,
+    [DURABLE_EVIDENCE_PROVENANCE]: provenanceFormat,
+    auditId: readRequiredId(entry.auditId, "auditId"),
+    recordId: readRequiredId(entry.recordId, "recordId"),
+    eventGameId: readRequiredId(entry.eventGameId, "eventGameId"),
+    operationId:
+      entry.operationId === null ? null : readRequiredId(entry.operationId, "operationId"),
     kind,
     outcome: readText(entry.outcome),
-    createdAtMs: readInteger(entry.createdAtMs),
+    createdAtMs: readRequiredTimestamp(entry.createdAtMs, "createdAtMs"),
     redactedDetail: readText(entry.redactedDetail),
+    ...(entry.links === undefined ? {} : { links: readAuditLinks(entry.links) }),
+    ...(entry.provenance === undefined
+      ? {}
+      : { provenance: readAuditProvenance(entry.provenance) }),
   };
   if (
     result.auditId !== readText(row.audit_id) ||
@@ -111,6 +185,153 @@ export function readAudit(row: RootRow): StoredControlAuditEntry {
     throw new Error("Stored Control Audit entry projection is inconsistent.");
   }
   return result;
+}
+
+function readEvidenceFormat(value: unknown, kind: "action" | "audit"): "current" | "legacy" {
+  if (value === "current" || value === "legacy") return value;
+  throw new Error(`Stored Control ${kind} evidence format is invalid.`);
+}
+
+function readAuditLinks(value: unknown): ControlAuditLinkage {
+  if (!isObject(value)) throw new Error("Stored Control Audit linkage is invalid.");
+  const actionId = readValidatedNullableId(value.actionId, "actionId");
+  const targetFactId = readValidatedNullableId(value.targetFactId, "targetFactId");
+  const causalPredecessorIds = validatePredecessors(value.causalPredecessorIds);
+  const relatedOperationIds = readValidatedIdArray(
+    value.relatedOperationIds,
+    "relatedOperationIds",
+  );
+  if (!causalPredecessorIds.ok)
+    throw new Error("Stored Control Audit causal predecessors are invalid.");
+  const collision = value.collision === undefined ? undefined : readAuditCollision(value.collision);
+  return {
+    actionId,
+    targetFactId,
+    causalPredecessorIds: causalPredecessorIds.value,
+    relatedOperationIds,
+    ordering: readAuditOrdering(value.ordering),
+    ...(collision === undefined ? {} : { collision }),
+  };
+}
+
+function readAuditCollision(value: unknown): ControlAuditLinkage["collision"] {
+  if (!isObject(value)) throw new Error("Stored Control Audit collision is invalid.");
+  const acceptedActionId = readRequiredId(value.acceptedActionId, "acceptedActionId");
+  const acceptedOperationId = readRequiredId(value.acceptedOperationId, "acceptedOperationId");
+  const acceptedContentFingerprint = readFingerprint(
+    value.acceptedContentFingerprint,
+    "acceptedContentFingerprint",
+  );
+  if (!isObject(value.rejectedAttempt)) {
+    throw new Error("Stored Control Audit rejected attempt is invalid.");
+  }
+  const rejectedAttempt = value.rejectedAttempt;
+  if (!isObject(rejectedAttempt.input)) {
+    throw new Error("Stored Control Audit rejected attempt input is invalid.");
+  }
+  const input = validateStoredInput(rejectedAttempt.input);
+  const interpretation = validateInterpretation(rejectedAttempt.interpretation);
+  if (!input.ok || !interpretation.ok) {
+    throw new Error("Stored Control Audit rejected attempt is invalid.");
+  }
+  return {
+    acceptedActionId,
+    acceptedOperationId,
+    acceptedContentFingerprint,
+    rejectedAttempt: {
+      input: input.value,
+      canonicalContent: readText(rejectedAttempt.canonicalContent),
+      contentFingerprint: readFingerprint(
+        rejectedAttempt.contentFingerprint,
+        "rejectedContentFingerprint",
+      ),
+      interpretation: interpretation.value,
+    },
+  };
+}
+
+function readFingerprint(value: unknown, field: string): string {
+  if (typeof value !== "string" || !/^[0-9a-f]{64}$/.test(value)) {
+    throw new Error(`Stored Control Audit ${field} is invalid.`);
+  }
+  return value;
+}
+
+function readAuditOrdering(value: unknown): ControlAuditLinkage["ordering"] {
+  if (value === null) return null;
+  if (!isObject(value)) {
+    throw new Error("Stored Control Audit ordering is invalid.");
+  }
+  const trustedAtMs = validateTimestamp(value.trustedAtMs, "audit ordering trustedAtMs");
+  const operationId = validateId(value.operationId, "audit ordering operationId");
+  if (!trustedAtMs.ok || !operationId.ok)
+    throw new Error("Stored Control Audit ordering is invalid.");
+  return { trustedAtMs: trustedAtMs.value, operationId: operationId.value };
+}
+
+function readAuditProvenance(value: unknown): ControlAuditProvenance {
+  if (!isObject(value)) throw new Error("Stored Control Audit provenance is invalid.");
+  for (const field of ["occurrence", "grant", "lifecycle", "override", "recoveryProvenance"]) {
+    if (!Object.hasOwn(value, field)) {
+      throw new Error("Stored Control Audit provenance is incomplete.");
+    }
+  }
+  const occurrence = validateOccurrenceWithoutClock(value.occurrence);
+  const grant = validateGrant(value.grant);
+  const lifecycle = validateLifecycle(value.lifecycle);
+  const override = validateOverride(value.override === null ? undefined : value.override);
+  const recoveryProvenance =
+    value.recoveryProvenance === null
+      ? { ok: true as const, value: null }
+      : validateRecoveryProvenanceShape(value.recoveryProvenance);
+  if (!occurrence.ok || !grant.ok || !lifecycle.ok || !override.ok || !recoveryProvenance.ok) {
+    throw new Error("Stored Control Audit provenance is invalid.");
+  }
+  return {
+    occurrence: occurrence.value,
+    grant: grant.value,
+    lifecycle: lifecycle.value,
+    override: override.value ?? null,
+    recoveryProvenance: recoveryProvenance.value ?? null,
+  };
+}
+
+function readValidatedNullableId(value: unknown, field: string): string | null {
+  if (value === null) return null;
+  const result = validateId(value, `audit linkage ${field}`);
+  if (!result.ok) throw new Error(`Stored Control Audit ${field} is invalid.`);
+  return result.value;
+}
+
+function readRequiredId(value: unknown, field: string): string {
+  const result = validateId(value, `audit ${field}`);
+  if (!result.ok) throw new Error(`Stored Control Audit ${field} is invalid.`);
+  return result.value;
+}
+
+function readRequiredTimestamp(value: unknown, field: string): number {
+  const result = validateTimestamp(value, `audit ${field}`);
+  if (!result.ok) throw new Error(`Stored Control Audit ${field} is invalid.`);
+  return result.value;
+}
+
+function readValidatedIdArray(value: unknown, field: string): string[] {
+  if (!Array.isArray(value) || value.length > 2) {
+    throw new Error(`Stored Control Audit ${field} is invalid.`);
+  }
+  const result = value.map((item, index) => validateId(item, `audit ${field}[${index}]`));
+  const values: string[] = [];
+  for (const item of result) {
+    if (!item.ok) throw new Error(`Stored Control Audit ${field} is invalid.`);
+    values.push(item.value);
+  }
+  if (new Set(values).size !== values.length)
+    throw new Error(`Stored Control Audit ${field} is invalid.`);
+  return values;
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 export function readIdempotency(row: RootRow): StoredControlIdempotencyEntry {

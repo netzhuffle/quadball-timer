@@ -108,6 +108,7 @@ type RootStatements = {
   auditByRecordId: SqlStatement;
   idempotencyByRecordId: SqlStatement;
   insertAudit: SqlStatement;
+  insertEvidenceProvenance: SqlStatement;
 };
 
 const ROOT_SELECT_COLUMNS = `
@@ -467,7 +468,10 @@ export class SqliteFoundationStorage implements FoundationStorage {
       storedAction.contentFingerprint,
       storedAction.canonicalContent,
       JSON.stringify(action),
+      action.controlActionVersion,
+      "current",
     );
+    statements.insertEvidenceProvenance.run("action", actionId);
     statements.insertIdempotency.run(
       actionId,
       action.recordId,
@@ -501,7 +505,10 @@ export class SqliteFoundationStorage implements FoundationStorage {
       entry.createdAtMs,
       entry.redactedDetail,
       JSON.stringify(entry),
+      entry.auditVersion,
+      "current",
     );
+    statements.insertEvidenceProvenance.run("audit", entry.auditId);
   }
 
   private readRootByStatement(
@@ -578,14 +585,20 @@ export class SqliteFoundationStorage implements FoundationStorage {
         ) VALUES (?, ?, ?, ?, ?)
       `),
       actionByOperationId: this.database.query(`
-        SELECT action_json, action_kind, action_version, accepted_at_ms,
-               canonical_content, content_fingerprint
+        SELECT action_id, action_json, action_kind, action_version, accepted_at_ms,
+               canonical_content, content_fingerprint, control_action_version,
+               action_evidence_format,
+               (SELECT evidence_format FROM foundation_control_evidence_provenance
+                WHERE evidence_kind = 'action' AND evidence_id = foundation_event_game_record_actions.action_id) AS action_provenance_format
         FROM foundation_event_game_record_actions
         WHERE record_id = ? AND operation_id = ?
       `),
       actionsByRecordId: this.database.query(`
-        SELECT action_json, action_kind, action_version, accepted_at_ms,
-               canonical_content, content_fingerprint
+        SELECT action_id, action_json, action_kind, action_version, accepted_at_ms,
+               canonical_content, content_fingerprint, control_action_version,
+               action_evidence_format,
+               (SELECT evidence_format FROM foundation_control_evidence_provenance
+                WHERE evidence_kind = 'action' AND evidence_id = foundation_event_game_record_actions.action_id) AS action_provenance_format
         FROM foundation_event_game_record_actions
         WHERE record_id = ?
         ORDER BY rowid
@@ -593,8 +606,9 @@ export class SqliteFoundationStorage implements FoundationStorage {
       insertAction: this.database.query(`
         INSERT INTO foundation_event_game_record_actions (
           action_id, record_id, event_game_id, operation_id, action_kind, action_version,
-          accepted_at_ms, content_fingerprint, canonical_content, action_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          accepted_at_ms, content_fingerprint, canonical_content, action_json,
+          control_action_version, action_evidence_format
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `),
       insertIdempotency: this.database.query(`
         INSERT INTO foundation_event_game_record_idempotency (
@@ -618,7 +632,10 @@ export class SqliteFoundationStorage implements FoundationStorage {
       `),
       auditByRecordId: this.database.query(`
         SELECT audit_id, record_id, event_game_id, operation_id, audit_kind, outcome,
-               created_at_ms, redacted_detail, audit_json
+               created_at_ms, redacted_detail, audit_json, audit_version,
+               audit_evidence_format,
+               (SELECT evidence_format FROM foundation_control_evidence_provenance
+                WHERE evidence_kind = 'audit' AND evidence_id = foundation_event_game_record_audit.audit_id) AS audit_provenance_format
         FROM foundation_event_game_record_audit
         WHERE record_id = ?
         ORDER BY rowid
@@ -632,8 +649,14 @@ export class SqliteFoundationStorage implements FoundationStorage {
       insertAudit: this.database.query(`
         INSERT INTO foundation_event_game_record_audit (
           audit_id, record_id, event_game_id, operation_id, audit_kind, outcome,
-          created_at_ms, redacted_detail, audit_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+               created_at_ms, redacted_detail, audit_json, audit_version,
+               audit_evidence_format
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `),
+      insertEvidenceProvenance: this.database.query(`
+        INSERT INTO foundation_control_evidence_provenance
+          (evidence_kind, evidence_id, evidence_format, origin)
+        VALUES (?, ?, 'current', 'post-75-current')
       `),
     };
     return this.statements;

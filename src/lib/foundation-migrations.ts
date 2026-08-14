@@ -149,6 +149,16 @@ export const FOUNDATION_AUDIT_TABLE_SQL = `
   ) STRICT
 `;
 
+export const FOUNDATION_CURRENT_ACTION_TABLE_SQL = FOUNDATION_ACTION_TABLE_SQL.replace(
+  "    action_json TEXT NOT NULL CHECK (json_valid(action_json)),",
+  "    action_json TEXT NOT NULL CHECK (json_valid(action_json)),\n    control_action_version TEXT NOT NULL DEFAULT 'control-action-legacy-v0' CHECK (control_action_version IN ('control-action-v1', 'control-action-legacy-v0')),\n    action_evidence_format TEXT NOT NULL DEFAULT 'legacy' CHECK (action_evidence_format IN ('current', 'legacy')),",
+);
+
+export const FOUNDATION_CURRENT_AUDIT_TABLE_SQL = FOUNDATION_AUDIT_TABLE_SQL.replace(
+  "    audit_json TEXT NOT NULL CHECK (json_valid(audit_json)),",
+  "    audit_json TEXT NOT NULL CHECK (json_valid(audit_json)),\n    audit_version TEXT NOT NULL DEFAULT 'control-audit-legacy-v0' CHECK (audit_version IN ('control-audit-v1', 'control-audit-legacy-v0')),\n    audit_evidence_format TEXT NOT NULL DEFAULT 'legacy' CHECK (audit_evidence_format IN ('current', 'legacy')),",
+);
+
 export const FOUNDATION_ROOT_EVENT_INDEX_SQL = `
   CREATE INDEX foundation_event_game_record_roots_event_id
     ON foundation_event_game_record_roots (event_id)
@@ -556,6 +566,72 @@ const FOUNDATION_GRANT_ERASURE_MIGRATION_SQL = createFoundationGrantErasureMigra
   auditGrantIndexSql: FOUNDATION_GRANT_AUDIT_GRANT_INDEX_SQL,
 });
 
+const FOUNDATION_CONTROL_VERSION_PROJECTION_MIGRATION_SQL = `
+  ALTER TABLE foundation_event_game_record_actions
+    ADD COLUMN control_action_version TEXT NOT NULL DEFAULT 'control-action-legacy-v0'
+      CHECK (control_action_version IN ('control-action-v1', 'control-action-legacy-v0'));
+  ALTER TABLE foundation_event_game_record_audit
+    ADD COLUMN audit_version TEXT NOT NULL DEFAULT 'control-audit-legacy-v0'
+      CHECK (audit_version IN ('control-audit-v1', 'control-audit-legacy-v0'));
+`;
+
+const FOUNDATION_EVIDENCE_FORMAT_MIGRATION_SQL = `
+  ALTER TABLE foundation_event_game_record_actions
+    ADD COLUMN action_evidence_format TEXT NOT NULL DEFAULT 'legacy'
+      CHECK (action_evidence_format IN ('current', 'legacy'));
+  ALTER TABLE foundation_event_game_record_audit
+    ADD COLUMN audit_evidence_format TEXT NOT NULL DEFAULT 'legacy'
+      CHECK (audit_evidence_format IN ('current', 'legacy'));
+  UPDATE foundation_event_game_record_actions
+    SET action_evidence_format = 'current'
+    WHERE control_action_version = 'control-action-v1';
+  UPDATE foundation_event_game_record_audit
+    SET audit_evidence_format = 'current'
+    WHERE audit_version = 'control-audit-v1';
+`;
+
+export const FOUNDATION_EVIDENCE_PROVENANCE_TABLE_SQL = `
+  CREATE TABLE foundation_control_evidence_provenance (
+    evidence_kind TEXT NOT NULL CHECK (evidence_kind IN ('action', 'audit')),
+    evidence_id TEXT NOT NULL,
+    evidence_format TEXT NOT NULL CHECK (evidence_format IN ('current', 'legacy')),
+    origin TEXT NOT NULL CHECK (origin IN ('pre-75-migration', 'post-75-current')),
+    PRIMARY KEY (evidence_kind, evidence_id)
+  ) STRICT
+`;
+
+export const FOUNDATION_EVIDENCE_PROVENANCE_UPDATE_TRIGGER_SQL = `
+  CREATE TRIGGER foundation_control_evidence_provenance_no_update
+  BEFORE UPDATE ON foundation_control_evidence_provenance
+  BEGIN
+    SELECT RAISE(ABORT, 'Control evidence provenance is immutable');
+  END
+`;
+
+export const FOUNDATION_EVIDENCE_PROVENANCE_DELETE_TRIGGER_SQL = `
+  CREATE TRIGGER foundation_control_evidence_provenance_no_delete
+  BEFORE DELETE ON foundation_control_evidence_provenance
+  BEGIN
+    SELECT RAISE(ABORT, 'Control evidence provenance is immutable');
+  END
+`;
+
+const FOUNDATION_EVIDENCE_PROVENANCE_MIGRATION_SQL = `
+  ${FOUNDATION_EVIDENCE_PROVENANCE_TABLE_SQL};
+  INSERT INTO foundation_control_evidence_provenance (evidence_kind, evidence_id, evidence_format, origin)
+  SELECT 'action', action_id,
+         CASE WHEN control_action_version = 'control-action-v1' THEN 'current' ELSE 'legacy' END,
+         CASE WHEN control_action_version = 'control-action-v1' THEN 'post-75-current' ELSE 'pre-75-migration' END
+  FROM foundation_event_game_record_actions;
+  INSERT INTO foundation_control_evidence_provenance (evidence_kind, evidence_id, evidence_format, origin)
+  SELECT 'audit', audit_id,
+         CASE WHEN audit_version = 'control-audit-v1' THEN 'current' ELSE 'legacy' END,
+         CASE WHEN audit_version = 'control-audit-v1' THEN 'post-75-current' ELSE 'pre-75-migration' END
+  FROM foundation_event_game_record_audit;
+  ${FOUNDATION_EVIDENCE_PROVENANCE_UPDATE_TRIGGER_SQL};
+  ${FOUNDATION_EVIDENCE_PROVENANCE_DELETE_TRIGGER_SQL};
+`;
+
 export const FOUNDATION_MIGRATIONS: readonly FoundationMigration[] = Object.freeze([
   createMigration({
     id: "001-foundation-event-game-record-roots",
@@ -592,6 +668,24 @@ export const FOUNDATION_MIGRATIONS: readonly FoundationMigration[] = Object.free
     ordinal: 6,
     schemaVersion: 6,
     sql: FOUNDATION_GRANT_ERASURE_MIGRATION_SQL,
+  }),
+  createMigration({
+    id: "007-anchor-control-action-audit-versions",
+    ordinal: 7,
+    schemaVersion: 7,
+    sql: FOUNDATION_CONTROL_VERSION_PROJECTION_MIGRATION_SQL,
+  }),
+  createMigration({
+    id: "008-anchor-current-evidence-format",
+    ordinal: 8,
+    schemaVersion: 8,
+    sql: FOUNDATION_EVIDENCE_FORMAT_MIGRATION_SQL,
+  }),
+  createMigration({
+    id: "009-immutable-control-evidence-provenance",
+    ordinal: 9,
+    schemaVersion: 9,
+    sql: FOUNDATION_EVIDENCE_PROVENANCE_MIGRATION_SQL,
   }),
 ]);
 

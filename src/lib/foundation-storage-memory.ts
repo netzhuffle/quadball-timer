@@ -25,8 +25,16 @@ import {
   type StoredEventGameRecordMetadata,
   type StoredEventGameRecordRoot,
   isThenable,
+  DURABLE_EVIDENCE_PROVENANCE,
 } from "@/lib/foundation-storage";
-import { actionIdentity, parseStoredControlAction } from "@/lib/event-game-actions";
+import {
+  CONTROL_AUDIT_VERSION,
+  CONTROL_ACTION_VERSION,
+  LEGACY_CONTROL_AUDIT_VERSION,
+  LEGACY_CONTROL_ACTION_VERSION,
+  actionIdentity,
+  parseStoredControlAction,
+} from "@/lib/event-game-actions";
 
 type MemoryState = {
   roots: Map<string, StoredEventGameRecordRoot>;
@@ -34,6 +42,8 @@ type MemoryState = {
   idempotency: Map<string, Map<string, StoredControlIdempotencyEntry>>;
   metadata: Map<string, StoredEventGameRecordMetadata>;
   controlAudits: Map<string, Map<string, StoredControlAuditEntry>>;
+  actionProvenance: Map<string, Map<string, "current" | "legacy">>;
+  auditProvenance: Map<string, Map<string, "current" | "legacy">>;
   grants: Map<string, StoredControlGrant>;
   sessions: Map<string, StoredGrantSession>;
   grantAudits: Map<string, StoredGrantAuditEntry>;
@@ -50,6 +60,8 @@ class InMemoryFoundationStorage implements FoundationStorage {
     idempotency: new Map(),
     metadata: new Map(),
     controlAudits: new Map(),
+    actionProvenance: new Map(),
+    auditProvenance: new Map(),
     grants: new Map(),
     sessions: new Map(),
     grantAudits: new Map(),
@@ -92,7 +104,10 @@ class InMemoryFoundationStorage implements FoundationStorage {
   readActions(recordId: string): Promise<StoredControlAction[]> {
     return this.writerTail.then(() => {
       this.assertOpen();
-      return cloneActions(this.state.actions.get(recordId));
+      return cloneActions(
+        this.state.actions.get(recordId),
+        this.state.actionProvenance.get(recordId),
+      );
     });
   }
 
@@ -116,8 +131,9 @@ class InMemoryFoundationStorage implements FoundationStorage {
   readAuditEntries(recordId: string): Promise<StoredControlAuditEntry[]> {
     return this.writerTail.then(() => {
       this.assertOpen();
-      return [...(this.state.controlAudits.get(recordId)?.values() ?? [])].map((entry) =>
-        structuredClone(entry),
+      return cloneAudits(
+        this.state.controlAudits.get(recordId),
+        this.state.auditProvenance.get(recordId),
       );
     });
   }
@@ -146,13 +162,46 @@ class InMemoryFoundationStorage implements FoundationStorage {
           } satisfies FoundationStorageReadiness;
         }
       }
-      for (const actions of this.state.actions.values()) {
+      for (const [recordId, actions] of this.state.actions) {
         for (const stored of actions.values()) {
           if (!parseStoredControlAction(stored.action).ok) {
             return {
               ok: false,
               status: "integrity-failure",
               detail: "An in-memory Control Action failed structural validation.",
+              storage: "memory",
+            } satisfies FoundationStorageReadiness;
+          }
+          const provenance = this.state.actionProvenance
+            .get(recordId)
+            ?.get(stored.action.operationId);
+          if (provenance !== "current" && provenance !== "legacy") {
+            return {
+              ok: false,
+              status: "integrity-failure",
+              detail: "In-memory evidence provenance is missing.",
+              storage: "memory",
+            } satisfies FoundationStorageReadiness;
+          }
+          if (
+            provenance === "current" &&
+            stored.action.controlActionVersion !== CONTROL_ACTION_VERSION
+          ) {
+            return {
+              ok: false,
+              status: "integrity-failure",
+              detail: "Current in-memory action evidence was downgraded.",
+              storage: "memory",
+            } satisfies FoundationStorageReadiness;
+          }
+          if (
+            provenance === "legacy" &&
+            stored.action.controlActionVersion !== LEGACY_CONTROL_ACTION_VERSION
+          ) {
+            return {
+              ok: false,
+              status: "integrity-failure",
+              detail: "Legacy in-memory action evidence is inconsistent.",
               storage: "memory",
             } satisfies FoundationStorageReadiness;
           }
@@ -183,6 +232,22 @@ class InMemoryFoundationStorage implements FoundationStorage {
               ok: false,
               status: "integrity-failure",
               detail: "In-memory action and idempotency state is inconsistent.",
+              storage: "memory",
+            } satisfies FoundationStorageReadiness;
+          }
+        }
+      }
+      for (const [recordId, audits] of this.state.controlAudits) {
+        for (const entry of audits.values()) {
+          const provenance = this.state.auditProvenance.get(recordId)?.get(entry.auditId);
+          if (
+            (provenance === "current" && entry.auditVersion !== CONTROL_AUDIT_VERSION) ||
+            (provenance === "legacy" && entry.auditVersion !== LEGACY_CONTROL_AUDIT_VERSION)
+          ) {
+            return {
+              ok: false,
+              status: "integrity-failure",
+              detail: "In-memory audit evidence format is inconsistent.",
               storage: "memory",
             } satisfies FoundationStorageReadiness;
           }
@@ -240,10 +305,13 @@ function createTransaction(
       );
     },
     findActionByOperationId(recordId, operationId) {
-      return cloneAction(state.actions.get(recordId)?.get(operationId));
+      return cloneAction(
+        state.actions.get(recordId)?.get(operationId),
+        state.actionProvenance.get(recordId)?.get(operationId),
+      );
     },
     listActions(recordId) {
-      return cloneActions(state.actions.get(recordId));
+      return cloneActions(state.actions.get(recordId), state.actionProvenance.get(recordId));
     },
     listIdempotencyEntries(recordId) {
       return [...(state.idempotency.get(recordId)?.values() ?? [])].map((entry) =>
@@ -255,9 +323,7 @@ function createTransaction(
       return metadata === undefined ? null : structuredClone(metadata);
     },
     listAuditEntries(recordId) {
-      return [...(state.controlAudits.get(recordId)?.values() ?? [])].map((entry) =>
-        structuredClone(entry),
-      );
+      return cloneAudits(state.controlAudits.get(recordId), state.auditProvenance.get(recordId));
     },
     insertRoot(storedRoot) {
       if (state.roots.has(storedRoot.root.recordId)) {
@@ -306,7 +372,18 @@ function createTransaction(
       if (actions.has(action.operationId)) {
         throw new FoundationStorageConstraintError("operation-id");
       }
-      actions.set(action.operationId, structuredClone(storedAction));
+      actions.set(action.operationId, {
+        ...structuredClone(storedAction),
+        durableFormat: "current",
+      });
+      let provenance = state.actionProvenance.get(action.recordId);
+      if (provenance === undefined) {
+        provenance = new Map();
+        state.actionProvenance.set(action.recordId, provenance);
+        undo.push(() => state.actionProvenance.delete(action.recordId));
+      }
+      provenance.set(action.operationId, "current");
+      undo.push(() => provenance?.delete(action.operationId));
       undo.push(() => actions?.delete(action.operationId));
       const actionId = actionIdentity(action.recordId, action.operationId);
       let idempotency = state.idempotency.get(action.recordId);
@@ -345,7 +422,18 @@ function createTransaction(
       if (audits.has(entry.auditId)) {
         throw new FoundationStorageConstraintError("audit-id");
       }
-      audits.set(entry.auditId, structuredClone(entry));
+      audits.set(entry.auditId, {
+        ...structuredClone(entry),
+        durableFormat: "current",
+      });
+      let provenance = state.auditProvenance.get(entry.recordId);
+      if (provenance === undefined) {
+        provenance = new Map();
+        state.auditProvenance.set(entry.recordId, provenance);
+        undo.push(() => state.auditProvenance.delete(entry.recordId));
+      }
+      provenance.set(entry.auditId, "current");
+      undo.push(() => provenance?.delete(entry.auditId));
       undo.push(() => audits?.delete(entry.auditId));
     },
     findGrantById(grantId) {
@@ -548,14 +636,38 @@ function cloneRoot(stored: StoredEventGameRecordRoot | undefined): EventGameReco
   return stored === undefined ? null : cloneEventGameRecordRoot(stored.root);
 }
 
-function cloneAction(stored: StoredControlAction | undefined): StoredControlAction | null {
-  return stored === undefined ? null : structuredClone(stored);
+function cloneAction(
+  stored: StoredControlAction | undefined,
+  provenance: "current" | "legacy" | undefined,
+): StoredControlAction | null {
+  return stored === undefined
+    ? null
+    : {
+        ...structuredClone(stored),
+        durableFormat: provenance ?? stored.durableFormat,
+        [DURABLE_EVIDENCE_PROVENANCE]: provenance ?? stored[DURABLE_EVIDENCE_PROVENANCE],
+      };
 }
 
 function cloneActions(
   actions: Map<string, StoredControlAction> | undefined,
+  provenance: Map<string, "current" | "legacy"> | undefined,
 ): StoredControlAction[] {
-  return [...(actions?.values() ?? [])].map((stored) => structuredClone(stored));
+  return [...(actions?.values() ?? [])].map((stored) =>
+    cloneAction(stored, provenance?.get(stored.action.operationId))!,
+  );
+}
+
+function cloneAudits(
+  audits: Map<string, StoredControlAuditEntry> | undefined,
+  provenance: Map<string, "current" | "legacy"> | undefined,
+): StoredControlAuditEntry[] {
+  return [...(audits?.values() ?? [])].map((entry) => ({
+    ...structuredClone(entry),
+    durableFormat: provenance?.get(entry.auditId) ?? entry.durableFormat,
+    [DURABLE_EVIDENCE_PROVENANCE]:
+      provenance?.get(entry.auditId) ?? entry[DURABLE_EVIDENCE_PROVENANCE],
+  }));
 }
 
 function findGrant(

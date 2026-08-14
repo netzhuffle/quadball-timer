@@ -9,6 +9,7 @@ import {
   FoundationStorageNotReadyError,
   type FoundationStorage,
   type FoundationStorageSnapshot,
+  type FoundationStorageTransaction,
   type StoredControlAction,
 } from "@/lib/foundation-storage";
 import {
@@ -16,6 +17,8 @@ import {
   acceptedAuditId,
   classifyRootConflict,
   constraintToConflict,
+  createConflictAuditEntry,
+  createTeamAssignmentConflictAuditEntry,
   createAuditEntry,
   ensureRecordMetadata,
   findFactById,
@@ -28,6 +31,8 @@ import {
 import {
   CONTROL_ACTION_ORDERING_VERSION,
   createControlActionCodecRegistry,
+  findConcurrentCorrectionConflicts,
+  findConcurrentTeamAssignmentConflicts,
   materializeControlAction,
   prepareControlAction,
   rebuildControlActionHistory,
@@ -63,6 +68,10 @@ export type ExternalScopeResolution =
       detail: string;
     };
 
+export type ExternalEventTeamResolution =
+  | { status: "resolved" }
+  | { status: "missing" | "mismatch"; detail: string };
+
 /**
  * Resolves the external Event hierarchy without exposing external storage rows.
  * The transaction capability is the same synchronous snapshot used to accept the owned root.
@@ -72,6 +81,11 @@ export type ExternalScopeResolver = {
     scope: EventGameRecordRoot["externalScope"],
     snapshot: FoundationStorageSnapshot,
   ): ExternalScopeResolution;
+  resolveEventTeam(
+    eventId: string,
+    eventTeamId: string,
+    snapshot: FoundationStorageSnapshot,
+  ): ExternalEventTeamResolution;
 };
 
 export type EventGameRecordOptions = {
@@ -198,7 +212,7 @@ function rebuildRecordSnapshot(
   if (idempotencyFailure !== null) {
     return { status: "failed", reason: "invalid-history", detail: idempotencyFailure };
   }
-  const auditFailure = validateAuditHistory(root, storedActions, auditEntries);
+  const auditFailure = validateAuditHistory(root, storedActions, auditEntries, registry);
   if (auditFailure !== null) {
     return { status: "failed", reason: "invalid-history", detail: auditFailure };
   }
@@ -221,6 +235,9 @@ export function createEventGameRecord(
     options.actionCodecRegistry ?? createControlActionCodecRegistry(options.actionCodecs);
   let activeRecordId: string | undefined;
   let verifiedRevision: number | undefined;
+  let stableIdentityRevision: number | undefined;
+  const factIds = new Set<string>();
+  const correctionIds = new Set<string>();
 
   function currentRecordId(): string {
     if (activeRecordId === undefined) {
@@ -370,6 +387,9 @@ export function createEventGameRecord(
         if (outcome.status === "registered" || outcome.status === "idempotent") {
           activeRecordId = root.recordId;
           verifiedRevision = undefined;
+          stableIdentityRevision = undefined;
+          factIds.clear();
+          correctionIds.clear();
         }
         return outcome;
       } catch (error) {
@@ -435,7 +455,9 @@ export function createEventGameRecord(
             } satisfies ControlActionAcceptanceOutcome;
           }
 
-          const prepared = prepareControlAction(input, root, codecRegistry, nowMs);
+          const prepared = prepareControlAction(input, root, codecRegistry, nowMs, {
+            allowConcurrentTeamAssignment: true,
+          });
           if (!prepared.ok) {
             return {
               status: "rejected",
@@ -463,6 +485,14 @@ export function createEventGameRecord(
               "action-conflict",
               "operation identity is already bound to different content",
               nowMs,
+              {
+                interpretation: prepared.value.interpretation,
+                collision: {
+                  acceptedAction: existing.action,
+                  acceptedContentFingerprint: existing.contentFingerprint,
+                  rejectedAttempt: prepared.value,
+                },
+              },
             );
             transaction.appendAuditEntry(audit);
             return {
@@ -479,6 +509,7 @@ export function createEventGameRecord(
               "action-rejected",
               dependencyReason.detail,
               nowMs,
+              { interpretation: prepared.value.interpretation },
             );
             transaction.appendAuditEntry(audit);
             return {
@@ -488,17 +519,59 @@ export function createEventGameRecord(
             } satisfies ControlActionAcceptanceOutcome;
           }
 
+          let correctionTarget: StoredControlAction | null = null;
+          const interpretation = prepared.value.interpretation;
+          if (stableIdentityRevision !== transaction.revision) {
+            factIds.clear();
+            correctionIds.clear();
+            for (const stored of transaction.listActions(root.recordId)) {
+              if (stored.action.interpretation.type === "fact") {
+                factIds.add(stored.action.interpretation.factId);
+              } else if (
+                stored.action.interpretation.type === "correction" ||
+                stored.action.interpretation.type === "team-assignment-correction"
+              ) {
+                correctionIds.add(stored.action.interpretation.correctionId);
+              }
+            }
+            stableIdentityRevision = transaction.revision;
+          }
+          const duplicateIdentity =
+            interpretation.type === "fact"
+              ? factIds.has(interpretation.factId)
+              : interpretation.type === "correction"
+                ? correctionIds.has(interpretation.correctionId)
+                : interpretation.type === "team-assignment-correction"
+                  ? correctionIds.has(interpretation.correctionId)
+                  : false;
+          if (duplicateIdentity) {
+            const audit = createAuditEntry(
+              prepared.value.input,
+              "action-rejected",
+              "stable Game Fact or Correction identity is already retained",
+              nowMs,
+              { interpretation: prepared.value.interpretation },
+            );
+            transaction.appendAuditEntry(audit);
+            return {
+              status: "rejected",
+              reason: "invalid-action",
+              detail: "The stable Game Fact or Correction identity is already retained.",
+            } satisfies ControlActionAcceptanceOutcome;
+          }
           if (prepared.value.interpretation.type === "correction") {
-            const target = findFactById(
-              transaction.listActions(root.recordId),
+            const retainedActions = transaction.listActions(root.recordId);
+            correctionTarget = findFactById(
+              retainedActions,
               prepared.value.interpretation.targetFactId,
             );
-            if (target === null) {
+            if (correctionTarget === null) {
               const audit = createAuditEntry(
                 prepared.value.input,
                 "action-rejected",
                 "correction target is not a retained Game Fact",
                 nowMs,
+                { interpretation: prepared.value.interpretation },
               );
               transaction.appendAuditEntry(audit);
               return {
@@ -510,6 +583,44 @@ export function createEventGameRecord(
           }
 
           const action = materializeControlAction(prepared.value, nowMs);
+          if (action.interpretation.type === "team-assignment-correction") {
+            const teamInterpretation = action.interpretation;
+            const teamResolution = options.externalScopeResolver.resolveEventTeam(
+              root.eventId,
+              teamInterpretation.eventTeamId,
+              transaction,
+            );
+            if (teamResolution.status !== "resolved") {
+              return {
+                status: "rejected",
+                reason: "invalid-action",
+                detail: teamResolution.detail,
+              } satisfies ControlActionAcceptanceOutcome;
+            }
+            const candidateHistory = rebuildControlActionHistory(
+              root,
+              [
+                ...transaction.listActions(root.recordId),
+                {
+                  action,
+                  canonicalContent: prepared.value.canonicalContent,
+                  contentFingerprint: prepared.value.contentFingerprint,
+                },
+              ],
+              codecRegistry,
+              options.interpreter!,
+            );
+            if (candidateHistory.status !== "ready") {
+              return {
+                status: "rejected",
+                reason:
+                  candidateHistory.reason === "invalid-history"
+                    ? "invalid-action"
+                    : "storage-not-ready",
+                detail: candidateHistory.detail,
+              } satisfies ControlActionAcceptanceOutcome;
+            }
+          }
           transaction.insertAction({
             action,
             canonicalContent: prepared.value.canonicalContent,
@@ -519,8 +630,8 @@ export function createEventGameRecord(
           const lastAcceptedAtMs =
             previousMetadata?.lastAcceptedAtMs === null ||
             previousMetadata?.lastAcceptedAtMs === undefined
-              ? nowMs
-              : Math.max(previousMetadata.lastAcceptedAtMs, nowMs);
+              ? action.acceptedAtMs
+              : Math.max(previousMetadata.lastAcceptedAtMs, action.acceptedAtMs);
           transaction.upsertRecordMetadata({
             recordId: root.recordId,
             actionCount: (previousMetadata?.actionCount ?? 0) + 1,
@@ -533,8 +644,19 @@ export function createEventGameRecord(
             "action-accepted",
             ACCEPTED_AUDIT_DETAIL,
             nowMs,
+            {
+              interpretation: prepared.value.interpretation,
+              relatedOperationIds:
+                correctionTarget === null ? [] : [correctionTarget.action.operationId],
+            },
           );
           transaction.appendAuditEntry(audit);
+          if (
+            action.interpretation.type === "correction" ||
+            action.interpretation.type === "team-assignment-correction"
+          ) {
+            appendConcurrentCorrectionAudits(transaction, root.recordId, nowMs);
+          }
           nextVerifiedRevision = transaction.revision + 1;
           return {
             status: "accepted",
@@ -544,8 +666,18 @@ export function createEventGameRecord(
         });
         if (outcome.status === "accepted" && nextVerifiedRevision !== undefined) {
           verifiedRevision = nextVerifiedRevision;
+          stableIdentityRevision = nextVerifiedRevision;
+          if (outcome.action.interpretation.type === "fact") {
+            factIds.add(outcome.action.interpretation.factId);
+          } else if (
+            outcome.action.interpretation.type === "correction" ||
+            outcome.action.interpretation.type === "team-assignment-correction"
+          ) {
+            correctionIds.add(outcome.action.interpretation.correctionId);
+          }
         } else if (outcome.status !== "duplicate-accepted") {
           verifiedRevision = undefined;
+          stableIdentityRevision = undefined;
         }
         return outcome;
       } catch (error) {
@@ -601,7 +733,8 @@ export function createEventGameRecord(
       if (!verified) {
         throw new Error("A trusted Event Admin or Technical Admin audit authority is required.");
       }
-      return storage.readAuditEntries(currentRecordId());
+      const entries = await storage.readAuditEntries(currentRecordId());
+      return entries.sort(compareAuditEntries);
     },
 
     readMetadata() {
@@ -664,4 +797,63 @@ export function createEventGameRecord(
       } satisfies EventGameRecordReadiness;
     },
   };
+}
+
+function appendConcurrentCorrectionAudits(
+  transaction: FoundationStorageTransaction,
+  recordId: string,
+  acceptedAtMs: number,
+): void {
+  const actions = transaction.listActions(recordId).map((stored) => stored.action);
+  const audits = transaction.listAuditEntries(recordId);
+  const auditIds = new Set(audits.map((entry) => entry.auditId));
+  const actionsByOperationId = new Map(actions.map((action) => [action.operationId, action]));
+  for (const conflict of findConcurrentCorrectionConflicts(actions)) {
+    if (conflict.targetFactId === null) continue;
+    const left = actionsByOperationId.get(conflict.operationIds[0]);
+    const right = actionsByOperationId.get(conflict.operationIds[1]);
+    if (left === undefined || right === undefined) continue;
+    const entry = createConflictAuditEntry(
+      left,
+      right,
+      conflict.targetFactId,
+      conflict.winnerOperationId,
+      acceptedAtMs,
+    );
+    if (auditIds.has(entry.auditId)) continue;
+    transaction.appendAuditEntry(entry);
+    auditIds.add(entry.auditId);
+  }
+  for (const conflict of findConcurrentTeamAssignmentConflicts(actions)) {
+    const left = actionsByOperationId.get(conflict.operationIds[0]);
+    const right = actionsByOperationId.get(conflict.operationIds[1]);
+    if (left === undefined || right === undefined || conflict.eventTeamId === undefined) continue;
+    const entry = createTeamAssignmentConflictAuditEntry(
+      left,
+      right,
+      conflict.eventTeamId,
+      conflict.winnerOperationId,
+      acceptedAtMs,
+    );
+    if (auditIds.has(entry.auditId)) continue;
+    transaction.appendAuditEntry(entry);
+    auditIds.add(entry.auditId);
+  }
+}
+
+function compareAuditEntries(left: ControlAuditEntry, right: ControlAuditEntry): number {
+  const leftOccurrence = left.provenance?.occurrence?.trustedAtMs ?? Number.MAX_SAFE_INTEGER;
+  const rightOccurrence = right.provenance?.occurrence?.trustedAtMs ?? Number.MAX_SAFE_INTEGER;
+  const leftOperation = left.operationId ?? left.links?.relatedOperationIds.join(":") ?? "";
+  const rightOperation = right.operationId ?? right.links?.relatedOperationIds.join(":") ?? "";
+  return (
+    (leftOccurrence === rightOccurrence ? 0 : leftOccurrence < rightOccurrence ? -1 : 1) ||
+    compareOpaqueIdentifiers(leftOperation, rightOperation) ||
+    compareOpaqueIdentifiers(left.kind, right.kind) ||
+    compareOpaqueIdentifiers(left.auditId, right.auditId)
+  );
+}
+
+function compareOpaqueIdentifiers(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
 }

@@ -18,6 +18,7 @@ import {
   validateTimestamp,
   valid,
 } from "@/lib/event-game-action-codecs";
+import { DURABLE_EVIDENCE_PROVENANCE } from "@/lib/foundation-storage";
 
 export { canonicalizeJson, sha256 } from "@/lib/event-game-action-json";
 export {
@@ -107,6 +108,14 @@ export type CorrectionInterpretation = {
   effective: boolean;
 };
 
+export type TeamAssignmentCorrectionInterpretation = {
+  type: "team-assignment-correction";
+  correctionId: string;
+  gameSideId: string;
+  eventTeamId: string;
+  teamInterpretationRef: string;
+};
+
 export type NonFactInterpretation = {
   type: "non-fact";
   stableId: string;
@@ -115,14 +124,65 @@ export type NonFactInterpretation = {
 export type ControlActionInterpretation =
   | FactInterpretation
   | CorrectionInterpretation
+  | TeamAssignmentCorrectionInterpretation
   | NonFactInterpretation;
 
+export type ControlAuditCollisionEvidence = {
+  acceptedActionId: string;
+  acceptedOperationId: string;
+  acceptedContentFingerprint: string;
+  rejectedAttempt: {
+    input: ControlActionInput;
+    canonicalContent: string;
+    contentFingerprint: string;
+    interpretation: ControlActionInterpretation;
+  };
+};
+
+export type ControlAuditLinkage = {
+  actionId: string | null;
+  targetFactId: string | null;
+  causalPredecessorIds: readonly string[];
+  relatedOperationIds: readonly string[];
+  ordering: {
+    trustedAtMs: number;
+    operationId: string;
+  } | null;
+  collision?: ControlAuditCollisionEvidence;
+};
+
+export type ControlAuditProvenance = {
+  occurrence: ControlActionOccurrence | null;
+  grant: ControlActionGrantProvenance | null;
+  lifecycle: ControlActionLifecycleContext | null;
+  override: OfficialOverrideMetadata | null;
+  recoveryProvenance: ControlActionRecoveryProvenance | null;
+};
+
+/**
+ * Audit rows written by #75 carry complete action linkage and provenance.
+ * Rows from the pre-#75 durable format are read as LEGACY and are validated
+ * by the explicit compatibility path in validateAuditHistory.
+ */
+export const CONTROL_AUDIT_VERSION = "control-audit-v1";
+export const LEGACY_CONTROL_AUDIT_VERSION = "control-audit-legacy-v0";
+export type ControlAuditVersion =
+  | typeof CONTROL_AUDIT_VERSION
+  | typeof LEGACY_CONTROL_AUDIT_VERSION;
+export const CONTROL_ACTION_VERSION = "control-action-v1";
+export const LEGACY_CONTROL_ACTION_VERSION = "control-action-legacy-v0";
+export type ControlActionVersion =
+  | typeof CONTROL_ACTION_VERSION
+  | typeof LEGACY_CONTROL_ACTION_VERSION;
+
 export type ControlAction = ControlActionInput & {
+  controlActionVersion: ControlActionVersion;
   acceptedAtMs: number;
   interpretation: ControlActionInterpretation;
 };
 
 export type ControlAuditEntry = {
+  auditVersion: ControlAuditVersion;
   auditId: string;
   recordId: string;
   eventGameId: string;
@@ -131,6 +191,8 @@ export type ControlAuditEntry = {
   outcome: string;
   createdAtMs: number;
   redactedDetail: string;
+  links?: ControlAuditLinkage;
+  provenance?: ControlAuditProvenance;
 };
 
 export type EventGameRecordMetadata = {
@@ -149,10 +211,26 @@ export type EffectiveGameFact = {
   interpretation: FactInterpretation;
 };
 
+export type EffectiveGameSideAssignment = {
+  gameSideId: string;
+  eventTeamId: string;
+  teamInterpretationRef: string;
+};
+
+export type ControlActionConflict = {
+  targetFactId: string | null;
+  operationIds: readonly [string, string];
+  winnerOperationId: string;
+  reason: "opposing-concurrent-corrections" | "opposing-concurrent-team-assignments";
+  eventTeamId?: string;
+  gameSideIds?: readonly [string, string];
+};
+
 export type IqaGameRulesRebuildInput = {
   root: EventGameRecordRoot;
   canonicalActions: readonly ControlAction[];
   effectiveFacts: readonly EffectiveGameFact[];
+  effectiveTeamAssignments: readonly EffectiveGameSideAssignment[];
 };
 
 export type IqaGameRulesInterpreter = {
@@ -189,7 +267,9 @@ export type ActionRebuildResult =
       status: "ready";
       canonicalActions: readonly ControlAction[];
       effectiveFacts: readonly EffectiveGameFact[];
+      effectiveTeamAssignments: readonly EffectiveGameSideAssignment[];
       derivedGameState: unknown;
+      conflicts: readonly ControlActionConflict[];
     }
   | {
       status: "failed";
@@ -209,6 +289,7 @@ export function prepareControlAction(
   root: EventGameRecordRoot,
   registry: ControlActionCodecRegistry,
   serverNowMs: number,
+  options: { allowConcurrentTeamAssignment?: boolean } = {},
 ): ValidationResult<PreparedControlAction> {
   if (!isRecord(input)) return invalid("Control Action must be an object.");
 
@@ -256,6 +337,20 @@ export function prepareControlAction(
     const { gameSideId } = interpretationResult.value;
     if (gameSideId !== null && !root.gameSides.some((side) => side.id === gameSideId)) {
       return invalid("Game Fact references an unknown stable Game Side.");
+    }
+  }
+  if (interpretationResult.value.type === "team-assignment-correction") {
+    const { gameSideId, eventTeamId } = interpretationResult.value;
+    if (!root.gameSides.some((candidate) => candidate.id === gameSideId)) {
+      return invalid("Team Assignment Correction references an unknown stable Game Side.");
+    }
+    if (
+      !options.allowConcurrentTeamAssignment &&
+      root.gameSides.some(
+        (candidate) => candidate.id !== gameSideId && candidate.eventTeamId === eventTeamId,
+      )
+    ) {
+      return invalid("Team Assignment Correction would assign both Game Sides to one Event Team.");
     }
   }
 
@@ -311,6 +406,7 @@ export function materializeControlAction(
 ): ControlAction {
   return {
     ...structuredClone(prepared.input),
+    controlActionVersion: CONTROL_ACTION_VERSION,
     acceptedAtMs,
     interpretation: structuredClone(prepared.interpretation),
   };
@@ -328,8 +424,19 @@ export function parseStoredControlAction(value: unknown): ValidationResult<Contr
   if (!inputResult.ok) return inputResult;
   const interpretationResult = validateInterpretation(value.interpretation);
   if (!interpretationResult.ok) return interpretationResult;
+  const controlActionVersion =
+    value.controlActionVersion === undefined
+      ? LEGACY_CONTROL_ACTION_VERSION
+      : value.controlActionVersion;
+  if (
+    controlActionVersion !== CONTROL_ACTION_VERSION &&
+    controlActionVersion !== LEGACY_CONTROL_ACTION_VERSION
+  ) {
+    return invalid("Stored Control Action version is unsupported.");
+  }
   return valid({
     ...inputResult.value,
+    controlActionVersion,
     acceptedAtMs: acceptedAtMs.value,
     interpretation: interpretationResult.value,
   });
@@ -342,7 +449,9 @@ export function validateStoredControlAction(
   root: EventGameRecordRoot,
   registry: ControlActionCodecRegistry,
 ): ActionHistoryReadiness {
-  const prepared = prepareControlAction(action, root, registry, action.occurrence.trustedAtMs);
+  const prepared = prepareControlAction(action, root, registry, action.occurrence.trustedAtMs, {
+    allowConcurrentTeamAssignment: true,
+  });
   if (!prepared.ok) return { ok: false, detail: prepared.error };
   if (prepared.value.canonicalContent !== canonicalContent) {
     return { ok: false, detail: "Stored Control Action canonical content is inconsistent." };
@@ -362,6 +471,8 @@ export function rebuildControlActionHistory(
     action: ControlAction;
     canonicalContent: string;
     contentFingerprint: string;
+    durableFormat?: "current" | "legacy";
+    [DURABLE_EVIDENCE_PROVENANCE]?: "current" | "legacy";
   }[],
   registry: ControlActionCodecRegistry,
   interpreter: IqaGameRulesInterpreter,
@@ -376,6 +487,18 @@ export function rebuildControlActionHistory(
 
   const actions: ControlAction[] = [];
   for (const stored of storedActions) {
+    if (
+      (stored[DURABLE_EVIDENCE_PROVENANCE] === "current" &&
+        stored.action.controlActionVersion !== CONTROL_ACTION_VERSION) ||
+      (stored[DURABLE_EVIDENCE_PROVENANCE] === "legacy" &&
+        stored.action.controlActionVersion !== LEGACY_CONTROL_ACTION_VERSION)
+    ) {
+      return {
+        status: "failed",
+        reason: "invalid-history",
+        detail: "Durable Control Action evidence was downgraded across its storage boundary.",
+      };
+    }
     const validity = validateStoredControlAction(
       stored.action,
       stored.canonicalContent,
@@ -419,6 +542,22 @@ export function rebuildControlActionHistory(
   }
 
   const effectiveByFactId = new Map([...factsById.keys()].map((factId) => [factId, true]));
+  const effectiveTeamAssignments = new Map(
+    root.gameSides.map((side) => [
+      side.id,
+      {
+        gameSideId: side.id,
+        eventTeamId: side.eventTeamId,
+        teamInterpretationRef: side.teamInterpretationRef,
+      },
+    ]),
+  );
+  const actionMap = actionsByOperationId(actions);
+  const conflicts = [
+    ...findConcurrentCorrectionConflictsInOrder(ordered.actions, actionMap),
+    ...findConcurrentTeamAssignmentConflictsInOrder(ordered.actions, actionMap),
+  ];
+  const teamConflictWinners = globalTeamConflictWinners(ordered.actions, conflicts);
   for (const action of ordered.actions) {
     if (action.interpretation.type !== "correction") continue;
     if (!factsById.has(action.interpretation.targetFactId)) {
@@ -429,6 +568,39 @@ export function rebuildControlActionHistory(
       };
     }
     effectiveByFactId.set(action.interpretation.targetFactId, action.interpretation.effective);
+  }
+  for (const action of ordered.actions) {
+    if (action.interpretation.type !== "team-assignment-correction") continue;
+    const { gameSideId, eventTeamId, teamInterpretationRef } = action.interpretation;
+    const current = effectiveTeamAssignments.get(gameSideId);
+    if (current === undefined) {
+      return {
+        status: "failed",
+        reason: "invalid-history",
+        detail: "A Team Assignment Correction targets a missing stable Game Side.",
+      };
+    }
+    const teamConflictWinner = teamConflictWinners.get(action.operationId);
+    if (teamConflictWinner !== undefined && teamConflictWinner !== action.operationId) {
+      continue;
+    }
+    if (
+      [...effectiveTeamAssignments.values()].some(
+        (assignment) =>
+          assignment.gameSideId !== gameSideId && assignment.eventTeamId === eventTeamId,
+      )
+    ) {
+      return {
+        status: "failed",
+        reason: "invalid-history",
+        detail: "Effective Game Side assignments must reference distinct Event Teams.",
+      };
+    }
+    effectiveTeamAssignments.set(gameSideId, {
+      ...current,
+      eventTeamId,
+      teamInterpretationRef,
+    });
   }
 
   const effectiveFacts: EffectiveGameFact[] = [];
@@ -450,11 +622,13 @@ export function rebuildControlActionHistory(
       root: structuredClone(root),
       canonicalActions: structuredClone(ordered.actions),
       effectiveFacts: structuredClone(effectiveFacts),
+      effectiveTeamAssignments: structuredClone([...effectiveTeamAssignments.values()]),
     });
     secondState = interpreter.rebuild({
       root: structuredClone(root),
       canonicalActions: structuredClone(ordered.actions),
       effectiveFacts: structuredClone(effectiveFacts),
+      effectiveTeamAssignments: structuredClone([...effectiveTeamAssignments.values()]),
     });
   } catch {
     return {
@@ -487,8 +661,172 @@ export function rebuildControlActionHistory(
     status: "ready",
     canonicalActions: ordered.actions,
     effectiveFacts,
+    effectiveTeamAssignments: [...effectiveTeamAssignments.values()],
     derivedGameState: firstState,
+    conflicts,
   };
+}
+
+export function findConcurrentCorrectionConflicts(
+  actions: readonly ControlAction[],
+): readonly ControlActionConflict[] {
+  const ordered = canonicalizeActionHistory(actions);
+  return ordered.ok
+    ? findConcurrentCorrectionConflictsInOrder(ordered.actions, actionsByOperationId(actions))
+    : [];
+}
+
+export function findConcurrentTeamAssignmentConflicts(
+  actions: readonly ControlAction[],
+): readonly ControlActionConflict[] {
+  const ordered = canonicalizeActionHistory(actions);
+  return ordered.ok
+    ? findConcurrentTeamAssignmentConflictsInOrder(ordered.actions, actionsByOperationId(actions))
+    : [];
+}
+
+function findConcurrentCorrectionConflictsInOrder(
+  orderedActions: readonly ControlAction[],
+  actions: ReadonlyMap<string, ControlAction>,
+): ControlActionConflict[] {
+  const conflicts: ControlActionConflict[] = [];
+  for (let leftIndex = 0; leftIndex < orderedActions.length; leftIndex += 1) {
+    const left = orderedActions[leftIndex];
+    if (left === undefined || left.interpretation.type !== "correction") continue;
+    for (let rightIndex = leftIndex + 1; rightIndex < orderedActions.length; rightIndex += 1) {
+      const right = orderedActions[rightIndex];
+      if (
+        right === undefined ||
+        right.interpretation.type !== "correction" ||
+        left.interpretation.targetFactId !== right.interpretation.targetFactId ||
+        left.interpretation.effective === right.interpretation.effective ||
+        causallyRelated(left, right, actions)
+      ) {
+        continue;
+      }
+      conflicts.push({
+        targetFactId: left.interpretation.targetFactId,
+        operationIds: [left.operationId, right.operationId],
+        winnerOperationId: right.operationId,
+        reason: "opposing-concurrent-corrections",
+      });
+    }
+  }
+  return conflicts;
+}
+
+function findConcurrentTeamAssignmentConflictsInOrder(
+  orderedActions: readonly ControlAction[],
+  actions: ReadonlyMap<string, ControlAction>,
+): ControlActionConflict[] {
+  const conflicts: ControlActionConflict[] = [];
+  for (let leftIndex = 0; leftIndex < orderedActions.length; leftIndex += 1) {
+    const left = orderedActions[leftIndex];
+    if (left === undefined || left.interpretation.type !== "team-assignment-correction") continue;
+    for (let rightIndex = leftIndex + 1; rightIndex < orderedActions.length; rightIndex += 1) {
+      const right = orderedActions[rightIndex];
+      if (
+        right === undefined ||
+        right.interpretation.type !== "team-assignment-correction" ||
+        left.interpretation.eventTeamId !== right.interpretation.eventTeamId ||
+        left.interpretation.gameSideId === right.interpretation.gameSideId ||
+        causallyRelated(left, right, actions)
+      )
+        continue;
+      conflicts.push({
+        targetFactId: null,
+        eventTeamId: left.interpretation.eventTeamId,
+        gameSideIds: [left.interpretation.gameSideId, right.interpretation.gameSideId],
+        operationIds: [left.operationId, right.operationId],
+        winnerOperationId: right.operationId,
+        reason: "opposing-concurrent-team-assignments",
+      });
+    }
+  }
+  return conflicts;
+}
+
+function globalTeamConflictWinners(
+  orderedActions: readonly ControlAction[],
+  conflicts: readonly ControlActionConflict[],
+): ReadonlyMap<string, string> {
+  const adjacency = new Map<string, Set<string>>();
+  for (const conflict of conflicts) {
+    if (conflict.reason !== "opposing-concurrent-team-assignments") continue;
+    const [left, right] = conflict.operationIds;
+    if (left === undefined || right === undefined) continue;
+    const leftNeighbours = adjacency.get(left) ?? new Set<string>();
+    const rightNeighbours = adjacency.get(right) ?? new Set<string>();
+    leftNeighbours.add(right);
+    rightNeighbours.add(left);
+    adjacency.set(left, leftNeighbours);
+    adjacency.set(right, rightNeighbours);
+  }
+
+  const canonicalIndex = new Map(
+    orderedActions.map((action, index) => [action.operationId, index] as const),
+  );
+  const winners = new Map<string, string>();
+  const visited = new Set<string>();
+  for (const operationId of adjacency.keys()) {
+    if (visited.has(operationId)) continue;
+    const component: string[] = [];
+    const pending = [operationId];
+    while (pending.length > 0) {
+      const current = pending.pop();
+      if (current === undefined || visited.has(current)) continue;
+      visited.add(current);
+      component.push(current);
+      for (const neighbour of adjacency.get(current) ?? []) pending.push(neighbour);
+    }
+    const winner = component.reduce((latest, candidate) =>
+      (canonicalIndex.get(candidate) ?? -1) > (canonicalIndex.get(latest) ?? -1)
+        ? candidate
+        : latest,
+    );
+    for (const member of component) winners.set(member, winner);
+  }
+  return winners;
+}
+
+function actionsByOperationId(actions: readonly ControlAction[]): Map<string, ControlAction> {
+  return new Map(actions.map((action) => [action.operationId, action]));
+}
+
+function causallyRelated(
+  left: ControlAction,
+  right: ControlAction,
+  actions: ReadonlyMap<string, ControlAction>,
+): boolean {
+  return (
+    reaches(left.operationId, right.operationId, actions) ||
+    reaches(right.operationId, left.operationId, actions)
+  );
+}
+
+/** Shared canonical reachability predicate for conflict and audit validation. */
+export function isCausallyRelated(
+  left: ControlAction,
+  right: ControlAction,
+  actions: ReadonlyMap<string, ControlAction>,
+): boolean {
+  return causallyRelated(left, right, actions);
+}
+
+function reaches(
+  predecessorOperationId: string,
+  descendantOperationId: string,
+  actions: ReadonlyMap<string, ControlAction>,
+): boolean {
+  const pending = [...(actions.get(descendantOperationId)?.causalPredecessorIds ?? [])];
+  const visited = new Set<string>();
+  while (pending.length > 0) {
+    const operationId = pending.pop();
+    if (operationId === undefined || !visited.add(operationId)) continue;
+    if (operationId === predecessorOperationId) return true;
+    pending.push(...(actions.get(operationId)?.causalPredecessorIds ?? []));
+  }
+  return false;
 }
 
 function canonicalizeActionHistory(actions: readonly ControlAction[]):
@@ -568,8 +906,12 @@ function canonicalizeActionHistory(actions: readonly ControlAction[]):
 }
 
 function compareCanonicalActions(left: ControlAction, right: ControlAction): number {
-  return (
-    left.occurrence.trustedAtMs - right.occurrence.trustedAtMs ||
-    left.operationId.localeCompare(right.operationId)
-  );
+  if (left.occurrence.trustedAtMs !== right.occurrence.trustedAtMs) {
+    return left.occurrence.trustedAtMs < right.occurrence.trustedAtMs ? -1 : 1;
+  }
+  return compareOpaqueIdentifiers(left.operationId, right.operationId);
+}
+
+function compareOpaqueIdentifiers(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
 }

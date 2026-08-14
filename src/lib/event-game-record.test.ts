@@ -135,5 +135,10 @@ function createScopeResolver(root: EventGameRecordRoot): ExternalScopeResolver {
         ? { status: "resolved", scope: structuredClone(scope) }
         : { status: "mismatch", detail: "The external scope does not match the root." };
     },
+    resolveEventTeam(eventId, eventTeamId) {
+      return eventId === root.eventId && eventTeamId.length > 0
+        ? { status: "resolved" }
+        : { status: "mismatch", detail: "The Event Team is outside the Event scope." };
+    },
   };
 }
