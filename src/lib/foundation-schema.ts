@@ -1,7 +1,14 @@
 import { createHash } from "node:crypto";
 import { Database } from "bun:sqlite";
 import {
+  FOUNDATION_ACTION_RECORD_INDEX_SQL,
+  FOUNDATION_ACTION_TABLE_SQL,
+  FOUNDATION_AUDIT_RECORD_INDEX_SQL,
+  FOUNDATION_AUDIT_TABLE_SQL,
   FOUNDATION_LEDGER_TABLE_SQL,
+  FOUNDATION_IDEMPOTENCY_RECORD_INDEX_SQL,
+  FOUNDATION_IDEMPOTENCY_TABLE_SQL,
+  FOUNDATION_METADATA_TABLE_SQL,
   FOUNDATION_ROOT_EVENT_INDEX_SQL,
   FOUNDATION_ROOT_GAME_DAY_INDEX_SQL,
   FOUNDATION_ROOT_TABLE_SQL,
@@ -60,12 +67,20 @@ type FoundationSchemaManifest = {
 const ROOT_TABLE = "foundation_event_game_record_roots";
 const SIDE_TABLE = "foundation_event_game_record_sides";
 const LEDGER_TABLE = "foundation_migration_ledger";
+const ACTION_TABLE = "foundation_event_game_record_actions";
+const IDEMPOTENCY_TABLE = "foundation_event_game_record_idempotency";
+const METADATA_TABLE = "foundation_event_game_record_metadata";
+const AUDIT_TABLE = "foundation_event_game_record_audit";
 
 const expectedManifest: FoundationSchemaManifest = {
   objects: [
     object("table", LEDGER_TABLE, LEDGER_TABLE, FOUNDATION_LEDGER_TABLE_SQL),
     object("table", ROOT_TABLE, ROOT_TABLE, FOUNDATION_ROOT_TABLE_SQL),
     object("table", SIDE_TABLE, SIDE_TABLE, FOUNDATION_SIDE_TABLE_SQL),
+    object("table", ACTION_TABLE, ACTION_TABLE, FOUNDATION_ACTION_TABLE_SQL),
+    object("table", IDEMPOTENCY_TABLE, IDEMPOTENCY_TABLE, FOUNDATION_IDEMPOTENCY_TABLE_SQL),
+    object("table", METADATA_TABLE, METADATA_TABLE, FOUNDATION_METADATA_TABLE_SQL),
+    object("table", AUDIT_TABLE, AUDIT_TABLE, FOUNDATION_AUDIT_TABLE_SQL),
     object(
       "index",
       "foundation_event_game_record_roots_event_id",
@@ -83,6 +98,24 @@ const expectedManifest: FoundationSchemaManifest = {
       "foundation_event_game_record_sides_record_id",
       SIDE_TABLE,
       FOUNDATION_SIDE_RECORD_INDEX_SQL,
+    ),
+    object(
+      "index",
+      "foundation_event_game_record_actions_record_id",
+      ACTION_TABLE,
+      FOUNDATION_ACTION_RECORD_INDEX_SQL,
+    ),
+    object(
+      "index",
+      "foundation_event_game_record_idempotency_record_id",
+      IDEMPOTENCY_TABLE,
+      FOUNDATION_IDEMPOTENCY_RECORD_INDEX_SQL,
+    ),
+    object(
+      "index",
+      "foundation_event_game_record_audit_record_id",
+      AUDIT_TABLE,
+      FOUNDATION_AUDIT_RECORD_INDEX_SQL,
     ),
   ].sort(compareNamed),
   tables: [
@@ -149,11 +182,131 @@ const expectedManifest: FoundationSchemaManifest = {
         },
       ],
     },
+    {
+      name: ACTION_TABLE,
+      columns: [
+        column("action_id", "TEXT", 1, 1),
+        column("record_id", "TEXT", 1, 0),
+        column("event_game_id", "TEXT", 1, 0),
+        column("operation_id", "TEXT", 1, 0),
+        column("action_kind", "TEXT", 1, 0),
+        column("action_version", "TEXT", 1, 0),
+        column("accepted_at_ms", "INTEGER", 1, 0),
+        column("content_fingerprint", "TEXT", 1, 0),
+        column("canonical_content", "TEXT", 1, 0),
+        column("action_json", "TEXT", 1, 0),
+      ],
+      foreignKeys: [
+        {
+          id: 0,
+          sequence: 0,
+          table: ROOT_TABLE,
+          from: "record_id",
+          to: "record_id",
+          onUpdate: "NO ACTION",
+          onDelete: "CASCADE",
+          match: "NONE",
+        },
+      ],
+    },
+    {
+      name: IDEMPOTENCY_TABLE,
+      columns: [
+        column("action_id", "TEXT", 1, 1),
+        column("record_id", "TEXT", 1, 0),
+        column("operation_id", "TEXT", 1, 0),
+        column("content_fingerprint", "TEXT", 1, 0),
+        column("accepted_at_ms", "INTEGER", 1, 0),
+      ],
+      foreignKeys: [
+        {
+          id: 0,
+          sequence: 0,
+          table: "foundation_event_game_record_actions",
+          from: "record_id",
+          to: "record_id",
+          onUpdate: "NO ACTION",
+          onDelete: "CASCADE",
+          match: "NONE",
+        },
+        {
+          id: 0,
+          sequence: 1,
+          table: "foundation_event_game_record_actions",
+          from: "operation_id",
+          to: "operation_id",
+          onUpdate: "NO ACTION",
+          onDelete: "CASCADE",
+          match: "NONE",
+        },
+        {
+          id: 1,
+          sequence: 0,
+          table: ACTION_TABLE,
+          from: "action_id",
+          to: "action_id",
+          onUpdate: "NO ACTION",
+          onDelete: "CASCADE",
+          match: "NONE",
+        },
+      ],
+    },
+    {
+      name: METADATA_TABLE,
+      columns: [
+        column("record_id", "TEXT", 1, 1),
+        column("action_count", "INTEGER", 1, 0),
+        column("ordering_version", "TEXT", 1, 0),
+        column("last_accepted_at_ms", "INTEGER", 0, 0),
+        column("updated_at_ms", "INTEGER", 1, 0),
+      ],
+      foreignKeys: [
+        {
+          id: 0,
+          sequence: 0,
+          table: ROOT_TABLE,
+          from: "record_id",
+          to: "record_id",
+          onUpdate: "NO ACTION",
+          onDelete: "CASCADE",
+          match: "NONE",
+        },
+      ],
+    },
+    {
+      name: AUDIT_TABLE,
+      columns: [
+        column("audit_id", "TEXT", 1, 1),
+        column("record_id", "TEXT", 1, 0),
+        column("event_game_id", "TEXT", 1, 0),
+        column("operation_id", "TEXT", 0, 0),
+        column("audit_kind", "TEXT", 1, 0),
+        column("outcome", "TEXT", 1, 0),
+        column("created_at_ms", "INTEGER", 1, 0),
+        column("redacted_detail", "TEXT", 1, 0),
+        column("audit_json", "TEXT", 1, 0),
+      ],
+      foreignKeys: [
+        {
+          id: 0,
+          sequence: 0,
+          table: ROOT_TABLE,
+          from: "record_id",
+          to: "record_id",
+          onUpdate: "NO ACTION",
+          onDelete: "CASCADE",
+          match: "NONE",
+        },
+      ],
+    },
   ].sort(compareNamed),
   indexes: [
     index("foundation_event_game_record_roots_event_id", 0, ["event_id"]),
     index("foundation_event_game_record_roots_game_day_id", 0, ["scope_event_id", "game_day_id"]),
     index("foundation_event_game_record_sides_record_id", 0, ["record_id"]),
+    index("foundation_event_game_record_actions_record_id", 0, ["record_id", "accepted_at_ms"]),
+    index("foundation_event_game_record_idempotency_record_id", 0, ["record_id"]),
+    index("foundation_event_game_record_audit_record_id", 0, ["record_id", "created_at_ms"]),
   ].sort(compareNamed),
 };
 
@@ -350,7 +503,15 @@ function readSchemaManifest(database: Database): FoundationSchemaManifest {
     );
   });
 
-  const tables = [LEDGER_TABLE, ROOT_TABLE, SIDE_TABLE].map((name) => ({
+  const tables = [
+    LEDGER_TABLE,
+    ROOT_TABLE,
+    SIDE_TABLE,
+    ACTION_TABLE,
+    IDEMPOTENCY_TABLE,
+    METADATA_TABLE,
+    AUDIT_TABLE,
+  ].map((name) => ({
     name,
     columns: readColumns(database, name),
     foreignKeys: readForeignKeys(database, name),
@@ -359,6 +520,9 @@ function readSchemaManifest(database: Database): FoundationSchemaManifest {
     "foundation_event_game_record_roots_event_id",
     "foundation_event_game_record_roots_game_day_id",
     "foundation_event_game_record_sides_record_id",
+    "foundation_event_game_record_actions_record_id",
+    "foundation_event_game_record_idempotency_record_id",
+    "foundation_event_game_record_audit_record_id",
   ].map((name) => readIndex(database, name));
 
   return {
@@ -377,6 +541,7 @@ function tableExists(database: Database, name: string): boolean {
 }
 
 function canBeginWrite(database: Database): boolean {
+  if (database.inTransaction) return true;
   try {
     database.exec("BEGIN IMMEDIATE; ROLLBACK;");
     return true;
@@ -454,7 +619,11 @@ function readIndex(database: Database, name: string): SchemaIndex {
 }
 
 function indexTable(name: string): string {
-  return name.includes("sides") ? SIDE_TABLE : ROOT_TABLE;
+  if (name.includes("sides")) return SIDE_TABLE;
+  if (name.includes("actions")) return ACTION_TABLE;
+  if (name.includes("idempotency")) return IDEMPOTENCY_TABLE;
+  if (name.includes("audit")) return AUDIT_TABLE;
+  return ROOT_TABLE;
 }
 
 function object(

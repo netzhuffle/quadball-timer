@@ -14,19 +14,37 @@ import {
 import { verifyFoundationSchema, readValidatedFoundationRoot } from "@/lib/foundation-schema";
 import {
   FoundationStorageClosedError,
-  FoundationStorageConstraintError,
   FoundationStorageNotReadyError,
   isThenable,
   type FoundationStorage,
   type FoundationStorageReadiness,
   type FoundationStorageTransaction,
   type FoundationStorageTransactionWork,
+  type StoredControlAction,
+  type StoredControlAuditEntry,
+  type StoredControlIdempotencyEntry,
+  type StoredEventGameRecordMetadata,
   type StoredEventGameRecordRoot,
 } from "@/lib/foundation-storage";
+import {
+  actionIdentity,
+  asRecord,
+  quoteSqliteString,
+  readAudit,
+  readIdempotency,
+  readInteger,
+  readMetadata,
+  readStoredAction,
+  readText,
+  translateSqliteConstraint,
+  type RootRow,
+} from "@/lib/foundation-storage-sqlite-helpers";
 
 export type SqliteFoundationStorageOptions = {
   migrations?: readonly FoundationMigration[];
   busyTimeoutMs?: number;
+  /** Test-only synchronization seam immediately before acquiring the writer lock. */
+  beforeWriteTransactionLock?: () => void;
 };
 
 export type SqliteFoundationSettings = {
@@ -60,8 +78,6 @@ export class FoundationMigrationError extends Error {
 
 type SqlStatement = ReturnType<Database["query"]>;
 
-type RootRow = Record<string, unknown>;
-
 type RootStatements = {
   byRecordId: SqlStatement;
   byEventGameId: SqlStatement;
@@ -69,6 +85,15 @@ type RootStatements = {
   byGameSideId: SqlStatement;
   insertRoot: SqlStatement;
   insertSide: SqlStatement;
+  actionByOperationId: SqlStatement;
+  actionsByRecordId: SqlStatement;
+  insertAction: SqlStatement;
+  insertIdempotency: SqlStatement;
+  metadataByRecordId: SqlStatement;
+  upsertMetadata: SqlStatement;
+  auditByRecordId: SqlStatement;
+  idempotencyByRecordId: SqlStatement;
+  insertAudit: SqlStatement;
 };
 
 const ROOT_SELECT_COLUMNS = `
@@ -92,32 +117,44 @@ export class SqliteFoundationStorage implements FoundationStorage {
   private readonly database: Database;
   private readonly migrations: readonly FoundationMigration[];
   private readonly busyTimeoutMs: number;
+  private readonly beforeWriteTransactionLock: (() => void) | undefined;
   private writerTail: Promise<void> = Promise.resolve();
   private statements: RootStatements | undefined;
   private closed = false;
+  private revision = 0;
+  private dataVersion: number;
 
   constructor(databasePath: string, options: SqliteFoundationStorageOptions = {}) {
     this.databasePath = databasePath;
     this.migrations = options.migrations ?? FOUNDATION_MIGRATIONS;
     this.busyTimeoutMs = options.busyTimeoutMs ?? 5_000;
+    this.beforeWriteTransactionLock = options.beforeWriteTransactionLock;
     this.database = new Database(databasePath);
     this.configureDatabase();
+    this.dataVersion = this.readDataVersion();
   }
 
   transaction<T>(work: FoundationStorageTransactionWork<T>): Promise<T> {
     return this.enqueue(() => {
-      const readiness = this.readinessSync();
-      if (!readiness.ok) {
-        throw new FoundationStorageNotReadyError(readiness);
-      }
-
+      this.beforeWriteTransactionLock?.();
       this.database.exec("BEGIN IMMEDIATE;");
       try {
+        // The write lock fixes the snapshot before both the external revision
+        // token and semantic readiness are derived. A commit from another
+        // connection cannot land between these operations and be hidden by
+        // the verified-revision cache.
+        this.refreshExternalRevision();
+        const readiness = this.readinessSync();
+        if (!readiness.ok) {
+          throw new FoundationStorageNotReadyError(readiness);
+        }
         const result = work(this.createTransaction());
         if (isThenable(result)) {
           throw new TypeError("Foundation storage transactions must complete synchronously.");
         }
         this.database.exec("COMMIT;");
+        this.revision += 1;
+        this.dataVersion = this.readDataVersion();
         return result;
       } catch (error) {
         this.rollbackQuietly();
@@ -133,6 +170,39 @@ export class SqliteFoundationStorage implements FoundationStorage {
         throw new FoundationStorageNotReadyError(readiness);
       }
       return this.readRootByStatement(this.getStatements().byRecordId, recordId);
+    });
+  }
+
+  readActions(recordId: string): Promise<StoredControlAction[]> {
+    return this.enqueue(() => {
+      const readiness = this.readinessSync();
+      if (!readiness.ok) throw new FoundationStorageNotReadyError(readiness);
+      return this.readActionsByRecordId(this.getStatements().actionsByRecordId, recordId);
+    });
+  }
+
+  readRecordMetadata(recordId: string): Promise<StoredEventGameRecordMetadata | null> {
+    return this.enqueue(() => {
+      const readiness = this.readinessSync();
+      if (!readiness.ok) throw new FoundationStorageNotReadyError(readiness);
+      const row = this.getStatements().metadataByRecordId.get(recordId) as RootRow | null;
+      return row === null ? null : readMetadata(row);
+    });
+  }
+
+  readIdempotencyEntries(recordId: string): Promise<StoredControlIdempotencyEntry[]> {
+    return this.enqueue(() => {
+      const readiness = this.readinessSync();
+      if (!readiness.ok) throw new FoundationStorageNotReadyError(readiness);
+      return this.readIdempotencyByRecordId(this.getStatements().idempotencyByRecordId, recordId);
+    });
+  }
+
+  readAuditEntries(recordId: string): Promise<StoredControlAuditEntry[]> {
+    return this.enqueue(() => {
+      const readiness = this.readinessSync();
+      if (!readiness.ok) throw new FoundationStorageNotReadyError(readiness);
+      return this.readAuditByRecordId(this.getStatements().auditByRecordId, recordId);
     });
   }
 
@@ -274,6 +344,7 @@ export class SqliteFoundationStorage implements FoundationStorage {
   private createTransaction(): FoundationStorageTransaction {
     const statements = this.getStatements();
     return {
+      revision: this.revision,
       findRootByRecordId: (recordId) => this.readRootByStatement(statements.byRecordId, recordId),
       findRootByEventGameId: (eventGameId) =>
         this.readRootByStatement(statements.byEventGameId, eventGameId),
@@ -282,6 +353,20 @@ export class SqliteFoundationStorage implements FoundationStorage {
       findRootByGameSideId: (gameSideId) =>
         this.readRootByStatement(statements.byGameSideId, gameSideId),
       insertRoot: (storedRoot) => this.insertRoot(statements, storedRoot),
+      findActionByOperationId: (recordId, operationId) =>
+        this.readActionByStatement(statements.actionByOperationId, recordId, operationId),
+      listActions: (recordId) => this.readActionsByRecordId(statements.actionsByRecordId, recordId),
+      listIdempotencyEntries: (recordId) =>
+        this.readIdempotencyByRecordId(statements.idempotencyByRecordId, recordId),
+      readRecordMetadata: (recordId) => {
+        const row = statements.metadataByRecordId.get(recordId) as RootRow | null;
+        return row === null ? null : readMetadata(row);
+      },
+      listAuditEntries: (recordId) =>
+        this.readAuditByRecordId(statements.auditByRecordId, recordId),
+      insertAction: (storedAction) => this.insertAction(statements, storedAction),
+      upsertRecordMetadata: (metadata) => this.upsertRecordMetadata(statements, metadata),
+      appendAuditEntry: (entry) => this.appendAuditEntry(statements, entry),
     };
   }
 
@@ -329,6 +414,57 @@ export class SqliteFoundationStorage implements FoundationStorage {
     );
   }
 
+  private insertAction(statements: RootStatements, storedAction: StoredControlAction): void {
+    const { action } = storedAction;
+    const actionId = actionIdentity(action.recordId, action.operationId);
+    statements.insertAction.run(
+      actionId,
+      action.recordId,
+      action.eventGameId,
+      action.operationId,
+      action.kind.id,
+      action.kind.version,
+      action.acceptedAtMs,
+      storedAction.contentFingerprint,
+      storedAction.canonicalContent,
+      JSON.stringify(action),
+    );
+    statements.insertIdempotency.run(
+      actionId,
+      action.recordId,
+      action.operationId,
+      storedAction.contentFingerprint,
+      action.acceptedAtMs,
+    );
+  }
+
+  private upsertRecordMetadata(
+    statements: RootStatements,
+    metadata: StoredEventGameRecordMetadata,
+  ): void {
+    statements.upsertMetadata.run(
+      metadata.recordId,
+      metadata.actionCount,
+      metadata.orderingVersion,
+      metadata.lastAcceptedAtMs,
+      metadata.updatedAtMs,
+    );
+  }
+
+  private appendAuditEntry(statements: RootStatements, entry: StoredControlAuditEntry): void {
+    statements.insertAudit.run(
+      entry.auditId,
+      entry.recordId,
+      entry.eventGameId,
+      entry.operationId,
+      entry.kind,
+      entry.outcome,
+      entry.createdAtMs,
+      entry.redactedDetail,
+      JSON.stringify(entry),
+    );
+  }
+
   private readRootByStatement(
     statement: SqlStatement,
     ...parameters: string[]
@@ -336,6 +472,36 @@ export class SqliteFoundationStorage implements FoundationStorage {
     const row = statement.get(...parameters) as RootRow | null;
     if (row === null) return null;
     return readValidatedFoundationRoot(this.database, row);
+  }
+
+  private readActionByStatement(
+    statement: SqlStatement,
+    recordId: string,
+    operationId: string,
+  ): StoredControlAction | null {
+    const row = statement.get(recordId, operationId) as RootRow | null;
+    return row === null ? null : readStoredAction(row);
+  }
+
+  private readActionsByRecordId(statement: SqlStatement, recordId: string): StoredControlAction[] {
+    const rows = statement.all(recordId) as unknown[];
+    return rows.map((value) => readStoredAction(asRecord(value)));
+  }
+
+  private readIdempotencyByRecordId(
+    statement: SqlStatement,
+    recordId: string,
+  ): StoredControlIdempotencyEntry[] {
+    const rows = statement.all(recordId) as unknown[];
+    return rows.map((value) => readIdempotency(asRecord(value)));
+  }
+
+  private readAuditByRecordId(
+    statement: SqlStatement,
+    recordId: string,
+  ): StoredControlAuditEntry[] {
+    const rows = statement.all(recordId) as unknown[];
+    return rows.map((value) => readAudit(asRecord(value)));
   }
 
   private getStatements(): RootStatements {
@@ -371,6 +537,64 @@ export class SqliteFoundationStorage implements FoundationStorage {
         INSERT INTO foundation_event_game_record_sides (
           side_id, record_id, side_position, event_team_id, team_interpretation_ref
         ) VALUES (?, ?, ?, ?, ?)
+      `),
+      actionByOperationId: this.database.query(`
+        SELECT action_json, action_kind, action_version, accepted_at_ms,
+               canonical_content, content_fingerprint
+        FROM foundation_event_game_record_actions
+        WHERE record_id = ? AND operation_id = ?
+      `),
+      actionsByRecordId: this.database.query(`
+        SELECT action_json, action_kind, action_version, accepted_at_ms,
+               canonical_content, content_fingerprint
+        FROM foundation_event_game_record_actions
+        WHERE record_id = ?
+        ORDER BY rowid
+      `),
+      insertAction: this.database.query(`
+        INSERT INTO foundation_event_game_record_actions (
+          action_id, record_id, event_game_id, operation_id, action_kind, action_version,
+          accepted_at_ms, content_fingerprint, canonical_content, action_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `),
+      insertIdempotency: this.database.query(`
+        INSERT INTO foundation_event_game_record_idempotency (
+          action_id, record_id, operation_id, content_fingerprint, accepted_at_ms
+        ) VALUES (?, ?, ?, ?, ?)
+      `),
+      metadataByRecordId: this.database.query(`
+        SELECT record_id, action_count, ordering_version, last_accepted_at_ms, updated_at_ms
+        FROM foundation_event_game_record_metadata
+        WHERE record_id = ?
+      `),
+      upsertMetadata: this.database.query(`
+        INSERT INTO foundation_event_game_record_metadata (
+          record_id, action_count, ordering_version, last_accepted_at_ms, updated_at_ms
+        ) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(record_id) DO UPDATE SET
+          action_count = excluded.action_count,
+          ordering_version = excluded.ordering_version,
+          last_accepted_at_ms = excluded.last_accepted_at_ms,
+          updated_at_ms = excluded.updated_at_ms
+      `),
+      auditByRecordId: this.database.query(`
+        SELECT audit_id, record_id, event_game_id, operation_id, audit_kind, outcome,
+               created_at_ms, redacted_detail, audit_json
+        FROM foundation_event_game_record_audit
+        WHERE record_id = ?
+        ORDER BY rowid
+      `),
+      idempotencyByRecordId: this.database.query(`
+        SELECT action_id, record_id, operation_id, content_fingerprint, accepted_at_ms
+        FROM foundation_event_game_record_idempotency
+        WHERE record_id = ?
+        ORDER BY rowid
+      `),
+      insertAudit: this.database.query(`
+        INSERT INTO foundation_event_game_record_audit (
+          audit_id, record_id, event_game_id, operation_id, audit_kind, outcome,
+          created_at_ms, redacted_detail, audit_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       `),
     };
     return this.statements;
@@ -435,6 +659,15 @@ export class SqliteFoundationStorage implements FoundationStorage {
       if (!schemaVerification.ok) {
         return { ...schemaVerification, storage: "sqlite" };
       }
+      const idempotencyFailure = this.verifyIdempotencyParity();
+      if (idempotencyFailure !== null) {
+        return {
+          ok: false,
+          status: "integrity-failure",
+          detail: idempotencyFailure,
+          storage: "sqlite",
+        };
+      }
 
       return {
         ok: true,
@@ -468,11 +701,84 @@ export class SqliteFoundationStorage implements FoundationStorage {
     };
   }
 
+  private readDataVersion(): number {
+    return readInteger(this.database.query("PRAGMA data_version").get());
+  }
+
+  private refreshExternalRevision(): void {
+    const currentDataVersion = this.readDataVersion();
+    if (currentDataVersion !== this.dataVersion) {
+      this.revision += 1;
+      this.dataVersion = currentDataVersion;
+    }
+  }
+
   private tableExists(name: string): boolean {
     const row = this.database
       .query("SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = ?")
       .get(name) as RootRow | null;
     return row !== null;
+  }
+
+  private verifyIdempotencyParity(): string | null {
+    const actionCount = readInteger(
+      this.database
+        .query("SELECT COUNT(*) AS count FROM foundation_event_game_record_actions")
+        .get(),
+    );
+    const idempotencyCount = readInteger(
+      this.database
+        .query("SELECT COUNT(*) AS count FROM foundation_event_game_record_idempotency")
+        .get(),
+    );
+    if (actionCount !== idempotencyCount) {
+      return "SQLite action and idempotency row counts are inconsistent.";
+    }
+    const rows = this.database
+      .query(`
+        SELECT
+          actions.action_id AS action_action_id,
+          actions.record_id AS action_record_id,
+          actions.operation_id AS action_operation_id,
+          actions.content_fingerprint AS action_content_fingerprint,
+          actions.accepted_at_ms AS action_accepted_at_ms,
+          idempotency.action_id AS idempotency_action_id,
+          idempotency.record_id AS idempotency_record_id,
+          idempotency.operation_id AS idempotency_operation_id,
+          idempotency.content_fingerprint AS idempotency_content_fingerprint,
+          idempotency.accepted_at_ms AS idempotency_accepted_at_ms
+        FROM foundation_event_game_record_actions AS actions
+        LEFT JOIN foundation_event_game_record_idempotency AS idempotency
+          ON idempotency.action_id = actions.action_id
+      `)
+      .all() as unknown[];
+    for (const value of rows) {
+      const row = asRecord(value);
+      if (row.idempotency_action_id === null) {
+        return "SQLite action and idempotency state is missing a paired row.";
+      }
+      if (
+        readText(row.action_action_id) !== readText(row.idempotency_action_id) ||
+        readText(row.action_record_id) !== readText(row.idempotency_record_id) ||
+        readText(row.action_operation_id) !== readText(row.idempotency_operation_id) ||
+        readText(row.action_content_fingerprint) !==
+          readText(row.idempotency_content_fingerprint) ||
+        readInteger(row.action_accepted_at_ms) !== readInteger(row.idempotency_accepted_at_ms)
+      ) {
+        return "SQLite action and idempotency columns are inconsistent.";
+      }
+    }
+    const extra = this.database
+      .query(`
+        SELECT idempotency.action_id
+        FROM foundation_event_game_record_idempotency AS idempotency
+        LEFT JOIN foundation_event_game_record_actions AS actions
+          ON actions.action_id = idempotency.action_id
+        WHERE actions.action_id IS NULL
+        LIMIT 1
+      `)
+      .get() as RootRow | null;
+    return extra === null ? null : "SQLite idempotency state has an extra row.";
   }
 
   private configureDatabase(): void {
@@ -521,66 +827,4 @@ export async function validateFoundationMigrationCandidate(
   options: { retainCandidate?: boolean } = {},
 ): Promise<FoundationMigrationCandidateReport> {
   return storage.validateCandidate(options);
-}
-
-function translateSqliteConstraint(error: unknown): unknown {
-  if (!(error instanceof Error)) return error;
-  const message = error.message.toLowerCase();
-  if (message.includes("record_id")) {
-    return new FoundationStorageConstraintError("record-id");
-  }
-  if (message.includes("event_game_id")) {
-    return new FoundationStorageConstraintError("event-game-id");
-  }
-  if (message.includes("pitch_slot_id")) {
-    return new FoundationStorageConstraintError("pitch-slot-id");
-  }
-  if (message.includes("side_id")) {
-    return new FoundationStorageConstraintError("game-side-id");
-  }
-  return error;
-}
-
-function quoteSqliteString(value: string): string {
-  return `'${value.replaceAll("'", "''")}'`;
-}
-
-function asRecord(value: unknown): RootRow {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    throw new Error("SQLite returned an invalid row.");
-  }
-  return value as RootRow;
-}
-
-function readText(value: unknown): string {
-  if (typeof value === "string") return value;
-  if (typeof value === "object" && value !== null && "journal_mode" in value) {
-    return readText(value.journal_mode);
-  }
-  if (typeof value === "object" && value !== null && "synchronous" in value) {
-    return readText(value.synchronous);
-  }
-  if (typeof value === "object" && value !== null && "foreign_keys" in value) {
-    return readText(value.foreign_keys);
-  }
-  if (typeof value === "object" && value !== null && "busy_timeout" in value) {
-    return readText(value.busy_timeout);
-  }
-  if (typeof value === "object" && value !== null && "timeout" in value) {
-    return readText(value.timeout);
-  }
-  if (typeof value === "object" && value !== null && "quick_check" in value) {
-    return readText(value.quick_check);
-  }
-  if (typeof value === "object" && value !== null && "integrity_check" in value) {
-    return readText(value.integrity_check);
-  }
-  if (typeof value === "number" || typeof value === "bigint") return String(value);
-  throw new Error("SQLite returned an invalid value.");
-}
-
-function readInteger(value: unknown): number {
-  const parsed = Number(readText(value));
-  if (!Number.isSafeInteger(parsed)) throw new Error("SQLite returned an invalid integer.");
-  return parsed;
 }

@@ -88,6 +88,65 @@ export const FOUNDATION_SIDE_TABLE_SQL = `
   ) STRICT
 `;
 
+export const FOUNDATION_ACTION_TABLE_SQL = `
+  CREATE TABLE foundation_event_game_record_actions (
+    action_id TEXT PRIMARY KEY,
+    record_id TEXT NOT NULL REFERENCES foundation_event_game_record_roots(record_id) ON DELETE CASCADE,
+    event_game_id TEXT NOT NULL,
+    operation_id TEXT NOT NULL,
+    action_kind TEXT NOT NULL,
+    action_version TEXT NOT NULL,
+    accepted_at_ms INTEGER NOT NULL,
+    content_fingerprint TEXT NOT NULL,
+    canonical_content TEXT NOT NULL,
+    action_json TEXT NOT NULL CHECK (json_valid(action_json)),
+    UNIQUE (record_id, operation_id),
+    UNIQUE (record_id, content_fingerprint),
+    CHECK (length(content_fingerprint) = 64),
+    CHECK (event_game_id <> '')
+  ) STRICT
+`;
+
+export const FOUNDATION_IDEMPOTENCY_TABLE_SQL = `
+  CREATE TABLE foundation_event_game_record_idempotency (
+    action_id TEXT PRIMARY KEY REFERENCES foundation_event_game_record_actions(action_id) ON DELETE CASCADE,
+    record_id TEXT NOT NULL,
+    operation_id TEXT NOT NULL,
+    content_fingerprint TEXT NOT NULL,
+    accepted_at_ms INTEGER NOT NULL,
+    UNIQUE (record_id, operation_id),
+    UNIQUE (record_id, content_fingerprint),
+    FOREIGN KEY (record_id, operation_id)
+      REFERENCES foundation_event_game_record_actions(record_id, operation_id)
+      ON DELETE CASCADE
+  ) STRICT
+`;
+
+export const FOUNDATION_METADATA_TABLE_SQL = `
+  CREATE TABLE foundation_event_game_record_metadata (
+    record_id TEXT PRIMARY KEY REFERENCES foundation_event_game_record_roots(record_id) ON DELETE CASCADE,
+    action_count INTEGER NOT NULL CHECK (action_count >= 0),
+    ordering_version TEXT NOT NULL,
+    last_accepted_at_ms INTEGER,
+    updated_at_ms INTEGER NOT NULL
+  ) STRICT
+`;
+
+export const FOUNDATION_AUDIT_TABLE_SQL = `
+  CREATE TABLE foundation_event_game_record_audit (
+    audit_id TEXT PRIMARY KEY,
+    record_id TEXT NOT NULL REFERENCES foundation_event_game_record_roots(record_id) ON DELETE CASCADE,
+    event_game_id TEXT NOT NULL,
+    operation_id TEXT,
+    audit_kind TEXT NOT NULL CHECK (audit_kind IN ('action-accepted', 'action-conflict', 'action-rejected', 'action-duplicate')),
+    outcome TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    redacted_detail TEXT NOT NULL,
+    audit_json TEXT NOT NULL CHECK (json_valid(audit_json)),
+    CHECK (event_game_id <> '')
+  ) STRICT
+`;
+
 export const FOUNDATION_ROOT_EVENT_INDEX_SQL = `
   CREATE INDEX foundation_event_game_record_roots_event_id
     ON foundation_event_game_record_roots (event_id)
@@ -101,6 +160,21 @@ export const FOUNDATION_ROOT_GAME_DAY_INDEX_SQL = `
 export const FOUNDATION_SIDE_RECORD_INDEX_SQL = `
   CREATE INDEX foundation_event_game_record_sides_record_id
     ON foundation_event_game_record_sides (record_id)
+`;
+
+export const FOUNDATION_ACTION_RECORD_INDEX_SQL = `
+  CREATE INDEX foundation_event_game_record_actions_record_id
+    ON foundation_event_game_record_actions (record_id, accepted_at_ms)
+`;
+
+export const FOUNDATION_IDEMPOTENCY_RECORD_INDEX_SQL = `
+  CREATE INDEX foundation_event_game_record_idempotency_record_id
+    ON foundation_event_game_record_idempotency (record_id)
+`;
+
+export const FOUNDATION_AUDIT_RECORD_INDEX_SQL = `
+  CREATE INDEX foundation_event_game_record_audit_record_id
+    ON foundation_event_game_record_audit (record_id, created_at_ms)
 `;
 
 const FOUNDATION_INITIAL_ROOT_MIGRATION_SQL = `
@@ -229,6 +303,21 @@ const FOUNDATION_NORMALIZE_ROOTS_MIGRATION_SQL = `
     ON foundation_event_game_record_sides (record_id);
 `;
 
+const FOUNDATION_ACTIONS_MIGRATION_SQL = `
+  ${FOUNDATION_ACTION_TABLE_SQL};
+  ${FOUNDATION_IDEMPOTENCY_TABLE_SQL};
+  ${FOUNDATION_METADATA_TABLE_SQL};
+  ${FOUNDATION_AUDIT_TABLE_SQL};
+  INSERT INTO foundation_event_game_record_metadata (
+    record_id, action_count, ordering_version, last_accepted_at_ms, updated_at_ms
+  )
+  SELECT record_id, 0, 'causal-occurrence-operation-v1', NULL, creation_created_at_ms
+  FROM foundation_event_game_record_roots;
+  ${FOUNDATION_ACTION_RECORD_INDEX_SQL};
+  ${FOUNDATION_IDEMPOTENCY_RECORD_INDEX_SQL};
+  ${FOUNDATION_AUDIT_RECORD_INDEX_SQL};
+`;
+
 export const FOUNDATION_MIGRATIONS: readonly FoundationMigration[] = Object.freeze([
   createMigration({
     id: "001-foundation-event-game-record-roots",
@@ -241,6 +330,12 @@ export const FOUNDATION_MIGRATIONS: readonly FoundationMigration[] = Object.free
     ordinal: 2,
     schemaVersion: 2,
     sql: FOUNDATION_NORMALIZE_ROOTS_MIGRATION_SQL,
+  }),
+  createMigration({
+    id: "003-persist-event-game-actions",
+    ordinal: 3,
+    schemaVersion: 3,
+    sql: FOUNDATION_ACTIONS_MIGRATION_SQL,
   }),
 ]);
 
