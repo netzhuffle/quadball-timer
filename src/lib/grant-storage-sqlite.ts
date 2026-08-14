@@ -83,6 +83,11 @@ const AUDIT_SELECT_COLUMNS = `
   audit.previous_event_game_id AS previous_event_game_id,
   audit.replay_evidence_id AS replay_evidence_id,
   audit.terminal_reason AS terminal_reason,
+  audit.acceptance_id AS acceptance_id,
+  audit.control_audit_id AS control_audit_id,
+  audit.control_action_id AS control_action_id,
+  audit.content_fingerprint AS content_fingerprint,
+  audit.outcome_detail AS outcome_detail,
   audit.created_at_ms AS created_at_ms
 `;
 
@@ -155,9 +160,14 @@ export function createGrantSqliteStatements(database: Database): GrantSqliteStat
         event_id, game_day_id, pitch_id, pitch_slot_id, session_id, replaced_session_id,
         event_game_id, credential_kind, credential_fingerprint, before_status, after_status,
         before_expires_at_ms, after_expires_at_ms, previous_event_game_id, replay_evidence_id,
-        terminal_reason,
+        terminal_reason, acceptance_id, control_audit_id, control_action_id, content_fingerprint,
+        outcome_detail,
         audit_integrity_tag, created_at_ms
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (
+        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+      )
     `),
   };
 }
@@ -352,6 +362,11 @@ export function appendGrantAudit(
     entry.previousEventGameId ?? null,
     entry.replayEvidenceId ?? null,
     entry.terminalReason,
+    entry.acceptanceId ?? null,
+    entry.controlAuditId ?? null,
+    entry.controlActionId ?? null,
+    entry.contentFingerprint ?? null,
+    entry.outcomeDetail ?? null,
     integrityTag,
     entry.createdAtMs,
   );
@@ -586,6 +601,11 @@ export function readStoredGrantAuditEntry(row: GrantRow): StoredGrantAuditEntry 
     "session-terminated",
     "session-switched",
     "replay-authorized",
+    "control-action-accepted",
+    "control-action-duplicate",
+    "control-action-rejected",
+    "control-action-retry-later",
+    "control-action-dependency-blocked",
   ];
   if (!allowedActions.includes(action)) {
     throw new Error("Stored Grant Audit Trail action is invalid.");
@@ -647,6 +667,11 @@ export function readStoredGrantAuditEntry(row: GrantRow): StoredGrantAuditEntry 
     previousEventGameId: readNullableText(row.previous_event_game_id),
     replayEvidenceId: readNullableText(row.replay_evidence_id),
     terminalReason: terminalReason as StoredGrantAuditEntry["terminalReason"],
+    acceptanceId: readNullableText(row.acceptance_id),
+    controlAuditId: readNullableText(row.control_audit_id),
+    controlActionId: readNullableText(row.control_action_id),
+    contentFingerprint: readNullableText(row.content_fingerprint),
+    outcomeDetail: readNullableText(row.outcome_detail),
     createdAtMs: readInteger(row.created_at_ms),
   };
 }

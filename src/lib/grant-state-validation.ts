@@ -484,6 +484,11 @@ function validateAudit(
     "session-terminated",
     "session-switched",
     "replay-authorized",
+    "control-action-accepted",
+    "control-action-duplicate",
+    "control-action-rejected",
+    "control-action-retry-later",
+    "control-action-dependency-blocked",
   ];
   const allowedTerminalReasons: readonly TerminalGrantSessionReason[] = [
     "game-locked",

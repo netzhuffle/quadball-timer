@@ -46,6 +46,58 @@ export type StoredControlAuditEntry = ControlAuditEntry & {
 
 export type StoredEventGameRecordMetadata = EventGameRecordMetadata;
 
+export type StoredAcceptanceBudget = {
+  bucketId: string;
+  bucketKind: "online-session" | "online-event" | "replay-session";
+  subjectId: string;
+  capacity: number;
+  refillPerSecond: number;
+  tokens: number;
+  updatedAtMs: number;
+  stateRevision: number;
+};
+
+export type StoredReplayReservation = {
+  reservationId: string;
+  recordId: string;
+  eventGameId: string;
+  originatingSessionId: string;
+  replacementSessionId: string | null;
+  actionCount: number;
+  status: "reserved" | "committing" | "committed" | "partial" | "discarded" | "acknowledged";
+  batchDigest: string | null;
+  createdAtMs: number;
+  committedAtMs: number | null;
+  acknowledgedAtMs: number | null;
+  stateRevision: number;
+};
+
+export type StoredReplayAttempt = {
+  attemptId: string;
+  reservationId: string;
+  operationId: string;
+  status: "pending" | "accepted" | "duplicate-accepted" | "rejected" | "retry-later";
+  actionFingerprint: string | null;
+  resultJson: string | null;
+  controlAuditId: string | null;
+  grantAuditId: string | null;
+  createdAtMs: number;
+  completedAtMs: number | null;
+  stateRevision: number;
+};
+
+export type StoredReplayReceipt = {
+  receiptId: string;
+  reservationId: string;
+  receiptDigest: string;
+  receiptKeyVersion: string;
+  status: "committed" | "acknowledged";
+  actionCount: number;
+  createdAtMs: number;
+  acknowledgedAtMs: number | null;
+  stateRevision: number;
+};
+
 export type FoundationStorageReadiness =
   | {
       ok: true;
@@ -93,6 +145,28 @@ export type FoundationStorageSnapshot = {
   ): StoredGrantSession | null;
   listGrantSessions(grantId: string): StoredGrantSession[];
   listGrantAudit(grantId: string): StoredGrantAuditEntry[];
+  findAcceptanceBudget(bucketId: string): StoredAcceptanceBudget | null;
+  findReplayReservation(reservationId: string): StoredReplayReservation | null;
+  findReplayReservationByTuple(
+    recordId: string,
+    eventGameId: string,
+    originatingSessionId: string,
+    actionCount: number,
+    batchDigest: string,
+  ): StoredReplayReservation | null;
+  findReplayReservationByOriginTuple(
+    recordId: string,
+    eventGameId: string,
+    originatingSessionId: string,
+    actionCount: number,
+  ): StoredReplayReservation | null;
+  listReplayAttempts(reservationId: string): StoredReplayAttempt[];
+  findReplayReceiptByDigest(receiptDigest: string): StoredReplayReceipt | null;
+  findReplayReceiptByReservationId(reservationId: string): StoredReplayReceipt | null;
+  listAcceptanceIntegrityAnchors(
+    subjectKind: import("@/lib/foundation-acceptance-integrity").AcceptanceIntegritySubject,
+    subjectId: string,
+  ): import("@/lib/foundation-acceptance-integrity").AcceptanceIntegrityAnchor[];
 };
 
 export type FoundationStorageTransaction = FoundationStorageSnapshot & {
@@ -105,6 +179,18 @@ export type FoundationStorageTransaction = FoundationStorageSnapshot & {
   insertGrantSession(session: StoredGrantSession): void;
   updateGrantSession(session: StoredGrantSession): void;
   appendGrantAudit(entry: StoredGrantAuditEntry): void;
+  upsertAcceptanceBudget(budget: StoredAcceptanceBudget): void;
+  insertReplayReservation(reservation: StoredReplayReservation): void;
+  updateReplayReservation(reservation: StoredReplayReservation): void;
+  insertReplayAttempt(attempt: StoredReplayAttempt): void;
+  updateReplayAttempt(attempt: StoredReplayAttempt): void;
+  discardReplayAttempts(reservationId: string): void;
+  discardReplayReservation(reservationId: string): void;
+  insertReplayReceipt(receipt: StoredReplayReceipt): void;
+  updateReplayReceipt(receipt: StoredReplayReceipt): void;
+  insertAcceptanceIntegrityAnchor(
+    anchor: import("@/lib/foundation-acceptance-integrity").AcceptanceIntegrityAnchor,
+  ): void;
 };
 
 export type FoundationStorageTransactionWork<T> = (transaction: FoundationStorageTransaction) => T;
@@ -138,7 +224,13 @@ export type FoundationStorageConstraint =
   | "grant-session-id"
   | "grant-session-verifier"
   | "grant-session-context"
-  | "grant-audit-id";
+  | "grant-audit-id"
+  | "acceptance-budget-id"
+  | "replay-reservation-id"
+  | "replay-attempt-id"
+  | "replay-receipt-id"
+  | "replay-receipt-digest"
+  | "integrity-anchor-id";
 
 export class FoundationStorageConstraintError extends Error {
   readonly constraint: FoundationStorageConstraint;

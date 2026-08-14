@@ -52,6 +52,21 @@ export function translateSqliteConstraint(error: unknown): unknown {
   if (message.includes("audit_id")) {
     return new FoundationStorageConstraintError("audit-id");
   }
+  if (message.includes("bucket_id")) {
+    return new FoundationStorageConstraintError("acceptance-budget-id");
+  }
+  if (message.includes("reservation_id")) {
+    return new FoundationStorageConstraintError("replay-reservation-id");
+  }
+  if (message.includes("attempt_id")) {
+    return new FoundationStorageConstraintError("replay-attempt-id");
+  }
+  if (message.includes("receipt_digest")) {
+    return new FoundationStorageConstraintError("replay-receipt-digest");
+  }
+  if (message.includes("receipt_id")) {
+    return new FoundationStorageConstraintError("replay-receipt-id");
+  }
   return error;
 }
 
@@ -171,6 +186,9 @@ export function readAudit(row: RootRow): StoredControlAuditEntry {
     ...(entry.provenance === undefined
       ? {}
       : { provenance: readAuditProvenance(entry.provenance) }),
+    ...(entry.lockedReplay === undefined
+      ? {}
+      : { lockedReplay: readLockedReplay(entry.lockedReplay) }),
   };
   if (
     result.auditId !== readText(row.audit_id) ||
@@ -204,14 +222,53 @@ function readAuditLinks(value: unknown): ControlAuditLinkage {
   if (!causalPredecessorIds.ok)
     throw new Error("Stored Control Audit causal predecessors are invalid.");
   const collision = value.collision === undefined ? undefined : readAuditCollision(value.collision);
+  const rejectedCandidate =
+    value.rejectedCandidate === undefined
+      ? undefined
+      : readRejectedCandidate(value.rejectedCandidate);
   return {
     actionId,
     targetFactId,
     causalPredecessorIds: causalPredecessorIds.value,
     relatedOperationIds,
     ordering: readAuditOrdering(value.ordering),
+    ...(value.grantAuditId === undefined
+      ? {}
+      : { grantAuditId: readValidatedNullableId(value.grantAuditId, "grantAuditId") }),
+    ...(value.acceptanceId === undefined
+      ? {}
+      : { acceptanceId: readValidatedNullableId(value.acceptanceId, "acceptanceId") }),
+    ...(value.contentFingerprint === undefined
+      ? {}
+      : { contentFingerprint: readFingerprint(value.contentFingerprint, "contentFingerprint") }),
+    ...(value.reason === undefined ? {} : { reason: readNonEmptyText(value.reason, "reason") }),
+    ...(rejectedCandidate === undefined ? {} : { rejectedCandidate }),
     ...(collision === undefined ? {} : { collision }),
   };
+}
+
+function readRejectedCandidate(
+  value: unknown,
+): NonNullable<ControlAuditLinkage["rejectedCandidate"]> {
+  if (!isObject(value)) throw new Error("Stored Control Audit rejected candidate is invalid.");
+  return {
+    codecIdentity: readNonEmptyText(value.codecIdentity, "rejectedCodecIdentity"),
+    codecFingerprint: readNonEmptyText(value.codecFingerprint, "rejectedCodecFingerprint"),
+    canonicalContent: readText(value.canonicalContent),
+    contentFingerprint: readFingerprint(value.contentFingerprint, "rejectedContentFingerprint"),
+  };
+}
+
+function readLockedReplay(value: unknown): NonNullable<StoredControlAuditEntry["lockedReplay"]> {
+  if (!isObject(value)) throw new Error("Stored locked replay evidence is invalid.");
+  const count = typeof value.count === "number" ? value.count : NaN;
+  const originatingSessionId = readRequiredId(value.originatingSessionId, "originatingSessionId");
+  const eventGameId = readRequiredId(value.eventGameId, "eventGameId");
+  const rejectedAtMs = validateTimestamp(value.rejectedAtMs, "rejectedAtMs");
+  if (!Number.isSafeInteger(count) || count <= 0 || !rejectedAtMs.ok) {
+    throw new Error("Stored locked replay evidence is invalid.");
+  }
+  return { count, originatingSessionId, eventGameId, rejectedAtMs: rejectedAtMs.value };
 }
 
 function readAuditCollision(value: unknown): ControlAuditLinkage["collision"] {
@@ -240,6 +297,14 @@ function readAuditCollision(value: unknown): ControlAuditLinkage["collision"] {
     acceptedContentFingerprint,
     rejectedAttempt: {
       input: input.value,
+      codecIdentity:
+        rejectedAttempt.codecIdentity === undefined
+          ? undefined
+          : readNonEmptyText(rejectedAttempt.codecIdentity, "rejectedCodecIdentity"),
+      codecFingerprint:
+        rejectedAttempt.codecFingerprint === undefined
+          ? undefined
+          : readNonEmptyText(rejectedAttempt.codecFingerprint, "rejectedCodecFingerprint"),
       canonicalContent: readText(rejectedAttempt.canonicalContent),
       contentFingerprint: readFingerprint(
         rejectedAttempt.contentFingerprint,
@@ -255,6 +320,12 @@ function readFingerprint(value: unknown, field: string): string {
     throw new Error(`Stored Control Audit ${field} is invalid.`);
   }
   return value;
+}
+
+function readNonEmptyText(value: unknown, field: string): string {
+  const text = readText(value);
+  if (text.length === 0) throw new Error(`Stored Control Audit ${field} is invalid.`);
+  return text;
 }
 
 function readAuditOrdering(value: unknown): ControlAuditLinkage["ordering"] {

@@ -17,6 +17,7 @@
     "test:focused-admission": "bun scripts/test-focused-admission.ts",
     "test": "bun test --isolate",
     "test:focused:sqlite": "bun test --isolate ./src/lib/event-game-actions-sqlite.focused.ts",
+    "test:focused:acceptance": "bun test --isolate ./src/lib/foundation-acceptance-sqlite.focused.ts",
     "test:focused:grant": "bun test ./src/lib/grant-authority.focused.ts",
     "test:changed": "bun test --changed",
     "format": "bunx --bun oxfmt \"**/*.{js,jsx,ts,tsx,mjs,cjs}\" \"!docs/**\"",

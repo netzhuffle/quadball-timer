@@ -220,6 +220,20 @@ export function computeLookupDigest(
   return encodeBase64Url(hmac(key, token));
 }
 
+/** Keyed, domain-separated integrity for composed acceptance evidence. */
+export function computeAcceptanceIntegrityTag(
+  value: string,
+  keyRing: GrantKeyRing,
+  keyVersion = keyRing.audit.currentVersion,
+): string {
+  return `hmac-sha256-v1:${keyVersion}:${encodeBase64Url(
+    hmac(
+      getKey(keyRing.audit.keys, keyVersion, HMAC_KEY_MIN_BYTES),
+      `acceptance-integrity:${value}`,
+    ),
+  )}`;
+}
+
 export function computeSessionVerifier(
   bearer: string,
   keyRing: GrantKeyRing,
@@ -277,6 +291,19 @@ function computeGrantAuditIntegrityTagWithPreviousEventGameId(
     beforeExpiresAtMs: entry.beforeExpiresAtMs,
     afterExpiresAtMs: entry.afterExpiresAtMs,
     terminalReason: entry.terminalReason,
+    ...(entry.acceptanceId == null &&
+    entry.controlAuditId == null &&
+    entry.controlActionId == null &&
+    entry.contentFingerprint == null &&
+    entry.outcomeDetail == null
+      ? {}
+      : {
+          acceptanceId: entry.acceptanceId ?? null,
+          controlAuditId: entry.controlAuditId ?? null,
+          controlActionId: entry.controlActionId ?? null,
+          contentFingerprint: entry.contentFingerprint ?? null,
+          outcomeDetail: entry.outcomeDetail ?? null,
+        }),
     createdAtMs: entry.createdAtMs,
   });
   return `hmac-sha256-v1:${keyVersion}:${encodeBase64Url(
