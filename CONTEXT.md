@@ -257,7 +257,7 @@ The app-authoritative operational history of one Event Game, whose permanent aut
 _Avoid_: Official game record, mutable Game State, Official Score Sheet
 
 **Ad Hoc Game**:
-A controller-only, disposable game created without an account or Event Grant for a friendly or spontaneous session. Its current state and control authority survive ordinary restarts and return as ordinary data after a full restore, but it has neither a spectator experience, a Game Lock, nor a durable Control Audit Trail; it cannot be manually removed and remains retained until capacity cleanup prunes it.
+A controller-only, disposable game created without an account or Event Grant for a friendly or spontaneous session. Its current state and control authority survive ordinary restarts and return as ordinary data after a full restore, but it has neither a spectator experience, a Game Lock, nor a durable Control Audit Trail; it cannot be manually removed and remains retained until capacity cleanup prunes it. Its rate-limit state and resource budget are separate from Event operations: exhausting an Ad Hoc limit may affect only Ad Hoc work and never throttles, rejects, disconnects, or otherwise degrades an ongoing Event operation.
 _Avoid_: Game from scratch, unassigned game
 
 **Ad Hoc Controller**:
