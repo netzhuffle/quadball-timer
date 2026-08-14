@@ -21,6 +21,28 @@ import type {
 } from "@/lib/grant-types";
 import type { TrustedGrantAuthority } from "@/lib/grant-authority-trust";
 import { bindTrustedGrantSession } from "@/lib/grant-authority-trust";
+import { validateOpaqueIdentifier } from "@/lib/validation-policy";
+
+/**
+ * Grant-Code creation and full rotation must use the same live resolver as
+ * admission. This is deliberately a read-only policy check; callers that
+ * need lifecycle cleanup use the management authorization path instead.
+ */
+export function hasCurrentAdmissionEligibility(
+  options: GrantAuthorityOptions,
+  grant: StoredGrant,
+): boolean {
+  if (grant.grantType !== "control") return true;
+  try {
+    const resolved = options.controlScopeResolver.resolve(grant.scope as ControlGrantScope);
+    return (
+      resolved.status === "eligible" &&
+      validateOpaqueIdentifier(resolved.eventGameId, "eventGameId").ok
+    );
+  } catch {
+    return false;
+  }
+}
 
 export function canInspectInTransaction(
   transaction: FoundationStorageTransaction,

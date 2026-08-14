@@ -2,6 +2,9 @@ import { validateOpaqueIdentifier, type ValidationResult } from "@/lib/validatio
 
 export const GRANT_CREDENTIAL_FORMAT_VERSION = 1 as const;
 export const GRANT_CREDENTIAL_KIND = "qr" as const;
+export const GRANT_CODE_FORMAT_VERSION = 1 as const;
+export const GRANT_CODE_KIND = "manual-code" as const;
+export const GRANT_CODE_STATE_ABSENT = "absent" as const;
 export const GRANT_TYPE = "control" as const;
 export const EVENT_ADMIN_GRANT_TYPE = "event-admin" as const;
 export const PITCH_MANAGER_GRANT_TYPE = "pitch-manager" as const;
@@ -14,7 +17,48 @@ export type GrantType =
   | typeof EVENT_ADMIN_GRANT_TYPE
   | typeof PITCH_MANAGER_GRANT_TYPE
   | typeof GRANT_TYPE;
-export type GrantCredentialKind = typeof GRANT_CREDENTIAL_KIND;
+export type GrantCredentialKind = typeof GRANT_CREDENTIAL_KIND | typeof GRANT_CODE_KIND;
+export type GrantCodeState = "absent" | "present" | "disabled" | "erased";
+
+export type StoredGrantCode = {
+  state: Exclude<GrantCodeState, "absent">;
+  formatVersion: typeof GRANT_CODE_FORMAT_VERSION;
+  kind: typeof GRANT_CODE_KIND;
+  encryptionKeyVersion: string | null;
+  lookupKeyVersion: string | null;
+  iv: string | null;
+  ciphertext: string | null;
+  tag: string | null;
+  lookupDigest: string | null;
+  fingerprint: string;
+};
+
+export type GrantAdmissionMode = "qr" | "code";
+
+/** Admission policy is shared by both adapters and the readiness validator. */
+export const GRANT_ADMISSION_WINDOW_MS = 60_000 as const;
+export const GRANT_ADMISSION_GLOBAL_ATTEMPT_LIMITS = Object.freeze({
+  code: 120,
+  qr: 600,
+} as const);
+/** Per-source history is retained for privacy-safe diagnostics, not the global ceiling. */
+export const GRANT_ADMISSION_SOURCE_FAILURE_SATURATION = 1_000_000 as const;
+export const GRANT_ADMISSION_RETENTION_MS = 30 * 24 * 60 * 60 * 1_000;
+
+export type GrantAdmissionTelemetry = {
+  mode: GrantAdmissionMode;
+  sourceDigest: string;
+  failedAttempts: number;
+  delayUntilMs: number | null;
+  lastAttemptAtMs: number;
+  lastSuccessAtMs: number | null;
+};
+
+export type GrantAdmissionGlobalWindow = {
+  mode: GrantAdmissionMode;
+  windowStartedAtMs: number;
+  attemptCount: number;
+};
 
 export type ControlGrantScope = {
   eventId: string;
@@ -132,6 +176,7 @@ export type StoredGrant = {
   createdAtMs: number;
   expiresAtMs: number | null;
   credential: StoredGrantCredential;
+  code?: StoredGrantCode | null;
 };
 
 export type StoredControlGrant = StoredGrant & {
@@ -180,7 +225,13 @@ export type GrantAuditAction =
   | "control-action-duplicate"
   | "control-action-rejected"
   | "control-action-retry-later"
-  | "control-action-dependency-blocked";
+  | "control-action-dependency-blocked"
+  | "grant-code-created"
+  | "grant-code-replaced"
+  | "grant-code-disabled"
+  | "grant-code-erased-expiry"
+  | "grant-code-erased-game-lock"
+  | "grant-code-admitted";
 
 export type StoredGrantAuditEntry = {
   auditId: string;
@@ -209,6 +260,14 @@ export type StoredGrantAuditEntry = {
   contentFingerprint?: string | null;
   outcomeDetail?: string | null;
   createdAtMs: number;
+  auditSequence?: number;
+  predecessorAuditId?: string | null;
+  codeFormatVersion?: number | null;
+  codeEncryptionKeyVersion?: string | null;
+  codeLookupKeyVersion?: string | null;
+  codeStateBefore?: GrantCodeState | null;
+  codeState?: GrantCodeState | null;
+  previousCodeFingerprint?: string | null;
 };
 
 export type GrantSessionSummary = {

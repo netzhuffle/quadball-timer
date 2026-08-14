@@ -7,6 +7,9 @@ import type {
 import type {
   GrantKeyRing,
   StoredGrant,
+  GrantAdmissionGlobalWindow,
+  GrantAdmissionMode,
+  GrantAdmissionTelemetry,
   StoredGrantAuditEntry,
   StoredGrantSession,
 } from "@/lib/grant-types";
@@ -18,6 +21,43 @@ export type StoredEventGameRecordRoot = {
 };
 
 export type DurableEvidenceFormat = "current" | "legacy";
+
+export type GrantAdmissionStateAnchor = {
+  anchorVersion: 1;
+  stateDigest: string;
+  integrityTag: string;
+};
+
+export const GRANT_STORAGE_CAPABILITY_NAME = "authenticated-grant-storage" as const;
+export const GRANT_STORAGE_CAPABILITY_VERSION = 2 as const;
+export const GRANT_STORAGE_CAPABILITY_IMPLEMENTATION = "hmac-anchored-atomic-v2" as const;
+export type GrantStorageCapability = {
+  name: typeof GRANT_STORAGE_CAPABILITY_NAME;
+  version: typeof GRANT_STORAGE_CAPABILITY_VERSION;
+  implementation: typeof GRANT_STORAGE_CAPABILITY_IMPLEMENTATION;
+  transaction: readonly string[];
+  maintenance: readonly string[];
+  anchors: readonly string[];
+};
+
+export const REQUIRED_GRANT_STORAGE_TRANSACTION_METHODS = Object.freeze([
+  "findGrantByCodeLookupDigest",
+  "readGrantAdmissionTelemetry",
+  "readGrantAdmissionGlobalWindow",
+  "writeGrantAdmissionTelemetry",
+  "writeGrantAdmissionGlobalWindow",
+  "pruneGrantAdmissionTelemetry",
+  "readGrantAdmissionStateAnchor",
+  "writeGrantAdmissionStateAnchor",
+] as const);
+export const REQUIRED_GRANT_STORAGE_MAINTENANCE_METHODS = Object.freeze([
+  "pruneGrantAdmissionTelemetry",
+  "writeGrantAdmissionStateAnchor",
+] as const);
+export const REQUIRED_GRANT_STORAGE_ANCHOR_METHODS = Object.freeze([
+  "readGrantAdmissionStateAnchor",
+  "writeGrantAdmissionStateAnchor",
+] as const);
 
 export const DURABLE_EVIDENCE_PROVENANCE = Symbol("durable-evidence-provenance");
 
@@ -170,6 +210,7 @@ export type FoundationStorageSnapshot = {
   findGrantById(grantId: string): StoredGrant | null;
   listGrants(): StoredGrant[];
   findGrantByCredentialLookupDigest(lookupDigest: string): StoredGrant | null;
+  findGrantByCodeLookupDigest?(lookupDigest: string): StoredGrant | null;
   findActiveSessionByGrantAndContext(
     grantId: string,
     browserContextDigest: string,
@@ -206,6 +247,12 @@ export type FoundationStorageSnapshot = {
   listEvents(): StoredEventCatalogEvent[];
   listGameDays(eventId: string): StoredEventCatalogGameDay[];
   listEventAuditTrail(eventId: string): EventCatalogAuditEntry[];
+  readGrantAdmissionTelemetry?(
+    mode: GrantAdmissionMode,
+    sourceDigest: string,
+  ): GrantAdmissionTelemetry | null;
+  readGrantAdmissionGlobalWindow?(mode: GrantAdmissionMode): GrantAdmissionGlobalWindow | null;
+  readGrantAdmissionStateAnchor?(): GrantAdmissionStateAnchor | null;
 };
 
 export type FoundationStorageTransaction = FoundationStorageSnapshot & {
@@ -237,9 +284,87 @@ export type FoundationStorageTransaction = FoundationStorageSnapshot & {
   updateGameDay(gameDay: StoredEventCatalogGameDay): void;
   deleteGameDay(gameDayId: string): void;
   appendEventAudit(entry: EventCatalogAuditEntry): void;
+  writeGrantAdmissionTelemetry?(value: GrantAdmissionTelemetry): void;
+  writeGrantAdmissionGlobalWindow?(value: GrantAdmissionGlobalWindow): void;
+  pruneGrantAdmissionTelemetry?(beforeMs: number): void;
+  readGrantAdmissionStateAnchor?(): GrantAdmissionStateAnchor | null;
+  writeGrantAdmissionStateAnchor?(): void;
 };
 
 export type FoundationStorageTransactionWork<T> = (transaction: FoundationStorageTransaction) => T;
+
+/** The storage surface required by the Grant-Code authority. */
+export type GrantStorageTransaction = FoundationStorageTransaction & {
+  findGrantByCodeLookupDigest(lookupDigest: string): StoredGrant | null;
+  readGrantAdmissionTelemetry(
+    mode: GrantAdmissionMode,
+    sourceDigest: string,
+  ): GrantAdmissionTelemetry | null;
+  readGrantAdmissionGlobalWindow(mode: GrantAdmissionMode): GrantAdmissionGlobalWindow | null;
+  writeGrantAdmissionTelemetry(value: GrantAdmissionTelemetry): void;
+  writeGrantAdmissionGlobalWindow(value: GrantAdmissionGlobalWindow): void;
+  pruneGrantAdmissionTelemetry(beforeMs: number): void;
+  readGrantAdmissionStateAnchor(): GrantAdmissionStateAnchor | null;
+  writeGrantAdmissionStateAnchor(): void;
+};
+
+export type GrantCapableFoundationStorage = FoundationStorage & {
+  grantStorageCapability(): GrantStorageCapability;
+  setGrantKeyRing(keyRing: GrantKeyRing): void;
+  setGrantValidationContext(context: GrantStateValidationContext): void;
+};
+
+export class FoundationStorageCapabilityError extends Error {
+  constructor() {
+    super("Foundation storage does not implement the authenticated Grant-Code contract.");
+    this.name = "FoundationStorageCapabilityError";
+  }
+}
+
+export function requireGrantStorageCapabilities(
+  storage: FoundationStorage,
+): asserts storage is GrantCapableFoundationStorage {
+  if (
+    typeof storage.grantStorageCapability !== "function" ||
+    typeof storage.setGrantKeyRing !== "function" ||
+    typeof storage.setGrantValidationContext !== "function"
+  ) {
+    throw new FoundationStorageCapabilityError();
+  }
+  const capability = storage.grantStorageCapability();
+  if (
+    capability.name !== GRANT_STORAGE_CAPABILITY_NAME ||
+    capability.version !== GRANT_STORAGE_CAPABILITY_VERSION ||
+    capability.implementation !== GRANT_STORAGE_CAPABILITY_IMPLEMENTATION ||
+    !sameMethods(capability.transaction, REQUIRED_GRANT_STORAGE_TRANSACTION_METHODS) ||
+    !sameMethods(capability.maintenance, REQUIRED_GRANT_STORAGE_MAINTENANCE_METHODS) ||
+    !sameMethods(capability.anchors, REQUIRED_GRANT_STORAGE_ANCHOR_METHODS)
+  ) {
+    throw new FoundationStorageCapabilityError();
+  }
+}
+
+export function requireGrantStorageTransaction(
+  transaction: FoundationStorageTransaction,
+): GrantStorageTransaction {
+  if (
+    typeof transaction.findGrantByCodeLookupDigest !== "function" ||
+    typeof transaction.readGrantAdmissionTelemetry !== "function" ||
+    typeof transaction.readGrantAdmissionGlobalWindow !== "function" ||
+    typeof transaction.writeGrantAdmissionTelemetry !== "function" ||
+    typeof transaction.writeGrantAdmissionGlobalWindow !== "function" ||
+    typeof transaction.pruneGrantAdmissionTelemetry !== "function" ||
+    typeof transaction.readGrantAdmissionStateAnchor !== "function" ||
+    typeof transaction.writeGrantAdmissionStateAnchor !== "function"
+  ) {
+    throw new FoundationStorageCapabilityError();
+  }
+  return transaction as GrantStorageTransaction;
+}
+
+function sameMethods(actual: readonly string[], required: readonly string[]): boolean {
+  return actual.length === required.length && required.every((method) => actual.includes(method));
+}
 
 export interface FoundationStorage {
   transaction<T>(work: FoundationStorageTransactionWork<T>): Promise<T>;
@@ -253,6 +378,7 @@ export interface FoundationStorage {
   setGrantKeyRing?(keyRing: GrantKeyRing): void;
   /** Configure the environment and key material required for deep Grant validation. */
   setGrantValidationContext?(context: GrantStateValidationContext): void;
+  grantStorageCapability?(): GrantStorageCapability;
   close(): void;
 }
 
@@ -281,7 +407,8 @@ export type FoundationStorageConstraint =
   | "game-day-id"
   | "game-day-date"
   | "event-audit-id"
-  | "event-operation-id";
+  | "event-operation-id"
+  | "grant-code-digest";
 
 export class FoundationStorageConstraintError extends Error {
   readonly constraint: FoundationStorageConstraint;

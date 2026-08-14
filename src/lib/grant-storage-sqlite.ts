@@ -1,8 +1,13 @@
 import { Database } from "bun:sqlite";
-import { computeGrantAuditIntegrityTag } from "@/lib/grant-crypto";
+import {
+  computeGrantAdmissionStateAnchor,
+  computeGrantAuditIntegrityTag,
+  computeGrantStateAnchor,
+} from "@/lib/grant-crypto";
 import {
   GRANT_CREDENTIAL_FORMAT_VERSION,
   GRANT_CREDENTIAL_KIND,
+  GRANT_CODE_KIND,
   GRANT_TYPE,
   EVENT_ADMIN_GRANT_TYPE,
   PITCH_MANAGER_GRANT_TYPE,
@@ -15,9 +20,21 @@ import {
   type GrantScope,
   type GrantType,
   type GrantKeyRing,
+  type GrantAdmissionGlobalWindow,
+  type GrantAdmissionMode,
+  type GrantAdmissionTelemetry,
+  type StoredGrantCode,
   validateGrantScope,
 } from "@/lib/grant-types";
-import { validateGrantState, type GrantStateValidationContext } from "@/lib/grant-state-validation";
+import type { GrantAdmissionStateAnchor } from "@/lib/foundation-storage";
+import {
+  grantStateMaterial,
+  grantAdmissionStateMaterial,
+  orderGrantAudits,
+  validateGrantState,
+  type GrantStateValidationContext,
+} from "@/lib/grant-state-validation";
+import { bindGrantAuditChain } from "@/lib/grant-audit-chain";
 
 type SqlStatement = ReturnType<Database["query"]>;
 type GrantRow = Record<string, unknown>;
@@ -26,6 +43,7 @@ export type GrantSqliteStatements = {
   byGrantId: SqlStatement;
   allGrants: SqlStatement;
   byCredentialDigest: SqlStatement;
+  byCodeDigest: SqlStatement;
   activeSessionByContext: SqlStatement;
   sessionByBearer: SqlStatement;
   sessionsByGrant: SqlStatement;
@@ -35,6 +53,22 @@ export type GrantSqliteStatements = {
   insertSession: SqlStatement;
   updateSession: SqlStatement;
   insertAudit: SqlStatement;
+  codeByGrantId: SqlStatement;
+  insertCode: SqlStatement;
+  updateCode: SqlStatement;
+  deleteCode: SqlStatement;
+  telemetryBySource: SqlStatement;
+  globalWindowByMode: SqlStatement;
+  upsertTelemetry: SqlStatement;
+  upsertGlobalWindow: SqlStatement;
+  pruneTelemetry: SqlStatement;
+  anchorByGrantId: SqlStatement;
+  upsertAnchor: SqlStatement;
+  allSessions: SqlStatement;
+  allTelemetry: SqlStatement;
+  allGlobalWindows: SqlStatement;
+  admissionStateAnchor: SqlStatement;
+  upsertAdmissionStateAnchor: SqlStatement;
 };
 
 const GRANT_SELECT_COLUMNS = `
@@ -52,7 +86,12 @@ const GRANT_SELECT_COLUMNS = `
   grants.credential_ciphertext AS credential_ciphertext,
   grants.credential_tag AS credential_tag,
   grants.credential_lookup_digest AS credential_lookup_digest,
-  grants.credential_fingerprint AS credential_fingerprint
+  grants.credential_fingerprint AS credential_fingerprint,
+  codes.state AS code_state, codes.format_version AS code_format_version,
+  codes.kind AS code_kind, codes.encryption_key_version AS code_encryption_key_version,
+  codes.lookup_key_version AS code_lookup_key_version, codes.code_iv AS code_iv,
+  codes.code_ciphertext AS code_ciphertext, codes.code_tag AS code_tag,
+  codes.code_lookup_digest AS code_lookup_digest, codes.code_fingerprint AS code_fingerprint
 `;
 
 const SESSION_SELECT_COLUMNS = `
@@ -88,19 +127,30 @@ const AUDIT_SELECT_COLUMNS = `
   audit.control_action_id AS control_action_id,
   audit.content_fingerprint AS content_fingerprint,
   audit.outcome_detail AS outcome_detail,
+  audit.audit_sequence AS audit_sequence,
+  audit.predecessor_audit_id AS predecessor_audit_id,
+  audit.code_state AS code_state,
+  audit.previous_code_fingerprint AS previous_code_fingerprint,
+  audit.code_format_version AS code_format_version,
+  audit.code_encryption_key_version AS code_encryption_key_version,
+  audit.code_lookup_key_version AS code_lookup_key_version,
+  audit.code_state_before AS code_state_before,
   audit.created_at_ms AS created_at_ms
 `;
 
 export function createGrantSqliteStatements(database: Database): GrantSqliteStatements {
   return {
     byGrantId: database.query(
-      `SELECT ${GRANT_SELECT_COLUMNS} FROM foundation_grant_roots AS grants WHERE grants.grant_id = ?`,
+      `SELECT ${GRANT_SELECT_COLUMNS} FROM foundation_grant_roots AS grants LEFT JOIN foundation_grant_codes AS codes ON codes.grant_id = grants.grant_id WHERE grants.grant_id = ?`,
     ),
     allGrants: database.query(
-      `SELECT ${GRANT_SELECT_COLUMNS} FROM foundation_grant_roots AS grants ORDER BY grants.grant_id`,
+      `SELECT ${GRANT_SELECT_COLUMNS} FROM foundation_grant_roots AS grants LEFT JOIN foundation_grant_codes AS codes ON codes.grant_id = grants.grant_id ORDER BY grants.grant_id`,
     ),
     byCredentialDigest: database.query(
-      `SELECT ${GRANT_SELECT_COLUMNS} FROM foundation_grant_roots AS grants WHERE grants.credential_lookup_digest = ?`,
+      `SELECT ${GRANT_SELECT_COLUMNS} FROM foundation_grant_roots AS grants LEFT JOIN foundation_grant_codes AS codes ON codes.grant_id = grants.grant_id WHERE grants.credential_lookup_digest = ?`,
+    ),
+    byCodeDigest: database.query(
+      `SELECT ${GRANT_SELECT_COLUMNS} FROM foundation_grant_roots AS grants JOIN foundation_grant_codes AS codes ON codes.grant_id = grants.grant_id WHERE codes.code_lookup_digest = ?`,
     ),
     activeSessionByContext: database.query(
       `SELECT ${SESSION_SELECT_COLUMNS}
@@ -120,7 +170,8 @@ export function createGrantSqliteStatements(database: Database): GrantSqliteStat
     auditByGrant: database.query(
       `SELECT ${AUDIT_SELECT_COLUMNS}
        FROM foundation_grant_audit AS audit
-       WHERE audit.grant_id = ? ORDER BY audit.audit_id`,
+       WHERE audit.grant_id = ?
+       ORDER BY audit.audit_sequence IS NULL, audit.audit_sequence, audit.created_at_ms, audit.audit_id`,
     ),
     insertGrant: database.query(`
       INSERT INTO foundation_grant_roots (
@@ -162,12 +213,85 @@ export function createGrantSqliteStatements(database: Database): GrantSqliteStat
         before_expires_at_ms, after_expires_at_ms, previous_event_game_id, replay_evidence_id,
         terminal_reason, acceptance_id, control_audit_id, control_action_id, content_fingerprint,
         outcome_detail,
+        audit_sequence, predecessor_audit_id, code_state, previous_code_fingerprint,
+        code_format_version, code_encryption_key_version, code_lookup_key_version, code_state_before,
         audit_integrity_tag, created_at_ms
-      ) VALUES (
-        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-      )
+      ) VALUES (${Array.from({ length: 38 }, () => "?").join(", ")})
+    `),
+    codeByGrantId: database.query(
+      "SELECT state, format_version, kind, encryption_key_version, lookup_key_version, code_iv, code_ciphertext, code_tag, code_lookup_digest, code_fingerprint FROM foundation_grant_codes WHERE grant_id = ?",
+    ),
+    insertCode: database.query(`
+      INSERT INTO foundation_grant_codes (
+        grant_id, state, format_version, kind, encryption_key_version, lookup_key_version,
+        code_iv, code_ciphertext, code_tag, code_lookup_digest, code_fingerprint
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `),
+    updateCode: database.query(`
+      UPDATE foundation_grant_codes SET state = ?, format_version = ?, kind = ?,
+        encryption_key_version = ?, lookup_key_version = ?, code_iv = ?, code_ciphertext = ?,
+        code_tag = ?, code_lookup_digest = ?, code_fingerprint = ? WHERE grant_id = ?
+    `),
+    deleteCode: database.query("DELETE FROM foundation_grant_codes WHERE grant_id = ?"),
+    telemetryBySource: database.query(
+      "SELECT mode, source_digest, failed_attempts, delay_until_ms, last_attempt_at_ms, last_success_at_ms FROM foundation_grant_admission_telemetry WHERE mode = ? AND source_digest = ?",
+    ),
+    globalWindowByMode: database.query(
+      "SELECT mode, window_started_at_ms, attempt_count FROM foundation_grant_admission_global_windows WHERE mode = ?",
+    ),
+    upsertTelemetry: database.query(`
+      INSERT INTO foundation_grant_admission_telemetry
+        (mode, source_digest, failed_attempts, delay_until_ms, last_attempt_at_ms, last_success_at_ms)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(mode, source_digest) DO UPDATE SET
+        failed_attempts = excluded.failed_attempts,
+        delay_until_ms = excluded.delay_until_ms,
+        last_attempt_at_ms = excluded.last_attempt_at_ms,
+        last_success_at_ms = excluded.last_success_at_ms
+    `),
+    upsertGlobalWindow: database.query(`
+      INSERT INTO foundation_grant_admission_global_windows (mode, window_started_at_ms, attempt_count)
+      VALUES (?, ?, ?)
+      ON CONFLICT(mode) DO UPDATE SET
+        window_started_at_ms = excluded.window_started_at_ms,
+        attempt_count = excluded.attempt_count
+    `),
+    pruneTelemetry: database.query(
+      "DELETE FROM foundation_grant_admission_telemetry WHERE last_attempt_at_ms < ?",
+    ),
+    anchorByGrantId: database.query(
+      "SELECT anchor_version, audit_count, audit_head_id, state_digest, integrity_tag, created_at_ms FROM foundation_grant_state_anchors WHERE grant_id = ?",
+    ),
+    upsertAnchor: database.query(`
+      INSERT INTO foundation_grant_state_anchors
+        (grant_id, anchor_version, audit_count, audit_head_id, state_digest, integrity_tag, created_at_ms)
+      VALUES (?, 1, ?, ?, ?, ?, ?)
+      ON CONFLICT(grant_id) DO UPDATE SET
+        audit_count = excluded.audit_count,
+        audit_head_id = excluded.audit_head_id,
+        state_digest = excluded.state_digest,
+        integrity_tag = excluded.integrity_tag
+    `),
+    allSessions: database.query(
+      `SELECT ${SESSION_SELECT_COLUMNS} FROM foundation_grant_sessions AS sessions ORDER BY sessions.session_id`,
+    ),
+    allTelemetry: database.query(
+      "SELECT mode, source_digest, failed_attempts, delay_until_ms, last_attempt_at_ms, last_success_at_ms FROM foundation_grant_admission_telemetry ORDER BY mode, source_digest",
+    ),
+    allGlobalWindows: database.query(
+      "SELECT mode, window_started_at_ms, attempt_count FROM foundation_grant_admission_global_windows ORDER BY mode",
+    ),
+    admissionStateAnchor: database.query(
+      "SELECT anchor_version, state_digest, integrity_tag FROM foundation_grant_admission_state_anchors WHERE anchor_id = 1",
+    ),
+    upsertAdmissionStateAnchor: database.query(`
+      INSERT INTO foundation_grant_admission_state_anchors
+        (anchor_id, anchor_version, state_digest, integrity_tag, created_at_ms)
+      VALUES (1, 1, ?, ?, ?)
+      ON CONFLICT(anchor_id) DO UPDATE SET
+        anchor_version = excluded.anchor_version,
+        state_digest = excluded.state_digest,
+        integrity_tag = excluded.integrity_tag
     `),
   };
 }
@@ -178,6 +302,15 @@ export function readGrantByStatement(
 ): StoredGrant | null {
   const row = statement.get(...parameters) as GrantRow | null;
   return row === null ? null : readStoredControlGrant(row);
+}
+
+export function readGrantCodeByStatement(
+  statement: SqlStatement,
+  grantId: string,
+): StoredGrantCode | null {
+  const row = statement.get(grantId) as GrantRow | null;
+  if (row === null) return null;
+  return readStoredGrantCode(row);
 }
 
 export function listGrants(statement: SqlStatement): StoredGrant[] {
@@ -197,7 +330,104 @@ export function listGrantSessions(statement: SqlStatement, grantId: string): Sto
 }
 
 export function listGrantAudit(statement: SqlStatement, grantId: string): StoredGrantAuditEntry[] {
-  return statement.all(grantId).map((row) => readStoredGrantAuditEntry(asRecord(row)));
+  return orderGrantAudits(
+    statement.all(grantId).map((row) => readStoredGrantAuditEntry(asRecord(row))),
+  );
+}
+
+export function readGrantAdmissionTelemetry(
+  statement: SqlStatement,
+  mode: GrantAdmissionMode,
+  sourceDigest: string,
+): GrantAdmissionTelemetry | null {
+  const row = statement.get(mode, sourceDigest) as GrantRow | null;
+  if (row === null) return null;
+  return {
+    mode,
+    sourceDigest,
+    failedAttempts: readInteger(row.failed_attempts),
+    delayUntilMs: readNullableInteger(row.delay_until_ms),
+    lastAttemptAtMs: readInteger(row.last_attempt_at_ms),
+    lastSuccessAtMs: readNullableInteger(row.last_success_at_ms),
+  };
+}
+
+export function readGrantAdmissionGlobalWindow(
+  statement: SqlStatement,
+  mode: GrantAdmissionMode,
+): GrantAdmissionGlobalWindow | null {
+  const row = statement.get(mode) as GrantRow | null;
+  if (row === null) return null;
+  return {
+    mode,
+    windowStartedAtMs: readInteger(row.window_started_at_ms),
+    attemptCount: readInteger(row.attempt_count),
+  };
+}
+
+export function readGrantAdmissionStateAnchor(
+  statement: SqlStatement,
+): GrantAdmissionStateAnchor | null {
+  const row = statement.get() as GrantRow | null;
+  if (row === null) return null;
+  return {
+    anchorVersion: readInteger(row.anchor_version) as 1,
+    stateDigest: readText(row.state_digest),
+    integrityTag: readText(row.integrity_tag),
+  };
+}
+
+export function insertGrantCode(
+  statement: GrantSqliteStatements,
+  grantId: string,
+  code: StoredGrantCode,
+): void {
+  const fields = storageCodeFields(code);
+  statement.insertCode.run(
+    grantId,
+    code.state,
+    code.formatVersion,
+    code.kind,
+    fields.encryptionKeyVersion,
+    fields.lookupKeyVersion,
+    fields.iv,
+    fields.ciphertext,
+    fields.tag,
+    fields.lookupDigest,
+    code.fingerprint,
+  );
+}
+
+export function updateGrantCode(
+  statement: GrantSqliteStatements,
+  grantId: string,
+  code: StoredGrantCode,
+): void {
+  const fields = storageCodeFields(code);
+  statement.updateCode.run(
+    code.state,
+    code.formatVersion,
+    code.kind,
+    fields.encryptionKeyVersion,
+    fields.lookupKeyVersion,
+    fields.iv,
+    fields.ciphertext,
+    fields.tag,
+    fields.lookupDigest,
+    code.fingerprint,
+    grantId,
+  );
+}
+
+function storageCodeFields(code: StoredGrantCode) {
+  return {
+    encryptionKeyVersion: code.encryptionKeyVersion,
+    lookupKeyVersion: code.lookupKeyVersion,
+    iv: code.iv,
+    ciphertext: code.ciphertext,
+    tag: code.tag,
+    lookupDigest: code.lookupDigest,
+  };
 }
 
 /** Validate every persisted Grant row before the database can be authoritative. */
@@ -207,7 +437,9 @@ export function scanGrantState(
 ): void {
   const grants: StoredGrant[] = [];
   const grantRows = database
-    .query("SELECT * FROM foundation_grant_roots ORDER BY grant_id")
+    .query(`SELECT ${GRANT_SELECT_COLUMNS} FROM foundation_grant_roots AS grants
+      LEFT JOIN foundation_grant_codes AS codes ON codes.grant_id = grants.grant_id
+      ORDER BY grants.grant_id`)
     .all() as unknown[];
   for (const value of grantRows) {
     const grant = readStoredControlGrant(asRecord(value));
@@ -223,11 +455,57 @@ export function scanGrantState(
   }
 
   const audits = database
-    .query("SELECT * FROM foundation_grant_audit ORDER BY audit_id")
+    .query(
+      "SELECT * FROM foundation_grant_audit ORDER BY audit_sequence IS NULL, audit_sequence, created_at_ms, audit_id",
+    )
     .all()
     .map((value) => readStoredGrantAuditEntry(asRecord(value)));
-  const failure = validateGrantState(grants, sessions, audits, validationContext);
+  const telemetry = database
+    .query(
+      "SELECT mode, source_digest, failed_attempts, delay_until_ms, last_attempt_at_ms, last_success_at_ms FROM foundation_grant_admission_telemetry ORDER BY mode, source_digest",
+    )
+    .all()
+    .map((value) => readGrantAdmissionTelemetryFromRow(asRecord(value)));
+  const globalWindows = database
+    .query(
+      "SELECT mode, window_started_at_ms, attempt_count FROM foundation_grant_admission_global_windows ORDER BY mode",
+    )
+    .all()
+    .map((value) => readGrantAdmissionGlobalWindowFromRow(asRecord(value)));
+  if (
+    (grants.length > 0 || telemetry.length > 0 || globalWindows.length > 0) &&
+    validationContext?.keyRing === undefined &&
+    (telemetry.length > 0 ||
+      globalWindows.length > 0 ||
+      grants.some((grant) => grant.code !== null))
+  ) {
+    throw new Error("Grant key material is required for authoritative Grant state.");
+  }
+  const failure = validateGrantState(grants, sessions, audits, {
+    ...validationContext,
+    admissionTelemetry: telemetry,
+    admissionGlobalWindows: globalWindows,
+  });
   if (failure !== null) throw new Error(failure);
+}
+
+function readGrantAdmissionTelemetryFromRow(row: GrantRow): GrantAdmissionTelemetry {
+  return {
+    mode: readText(row.mode) as GrantAdmissionMode,
+    sourceDigest: readText(row.source_digest),
+    failedAttempts: readInteger(row.failed_attempts),
+    delayUntilMs: readNullableInteger(row.delay_until_ms),
+    lastAttemptAtMs: readInteger(row.last_attempt_at_ms),
+    lastSuccessAtMs: readNullableInteger(row.last_success_at_ms),
+  };
+}
+
+function readGrantAdmissionGlobalWindowFromRow(row: GrantRow): GrantAdmissionGlobalWindow {
+  return {
+    mode: readText(row.mode) as GrantAdmissionMode,
+    windowStartedAtMs: readInteger(row.window_started_at_ms),
+    attemptCount: readInteger(row.attempt_count),
+  };
 }
 
 export function insertGrant(statements: GrantSqliteStatements, grant: StoredGrant): void {
@@ -254,6 +532,8 @@ export function insertGrant(statements: GrantSqliteStatements, grant: StoredGran
     grant.credential.lookupDigest,
     grant.credential.fingerprint,
   );
+  if (grant.code !== undefined && grant.code !== null)
+    insertGrantCode(statements, grant.grantId, grant.code);
 }
 
 export function updateGrant(statements: GrantSqliteStatements, grant: StoredGrant): void {
@@ -280,6 +560,9 @@ export function updateGrant(statements: GrantSqliteStatements, grant: StoredGran
     grant.credential.fingerprint,
     grant.grantId,
   );
+  statements.deleteCode.run(grant.grantId);
+  if (grant.code !== undefined && grant.code !== null)
+    insertGrantCode(statements, grant.grantId, grant.code);
 }
 
 export function insertGrantSession(
@@ -336,39 +619,209 @@ export function appendGrantAudit(
   if (keyRing === undefined) {
     throw new Error("Grant Audit Trail integrity requires the Grant key ring.");
   }
-  const fields = storageAuditFields(entry);
-  const integrityTag = computeGrantAuditIntegrityTag(entry, keyRing);
+  const boundEntry = bindGrantAuditChain(
+    entry,
+    listGrantAudit(statements.auditByGrant, entry.grantId),
+  );
+  const fields = storageAuditFields(boundEntry);
+  const integrityTag = computeGrantAuditIntegrityTag(boundEntry, keyRing);
   statements.insertAudit.run(
-    entry.auditId,
-    entry.action,
-    entry.outcome,
-    entry.actorReference,
-    entry.grantId,
-    entry.grantType,
-    entry.grantVersion,
+    boundEntry.auditId,
+    boundEntry.action,
+    boundEntry.outcome,
+    boundEntry.actorReference,
+    boundEntry.grantId,
+    boundEntry.grantType,
+    boundEntry.grantVersion,
     fields.eventId,
     fields.gameDayId,
     fields.pitchId,
     fields.pitchSlotId,
-    entry.sessionId,
-    entry.replacedSessionId,
-    entry.eventGameId,
-    entry.credentialKind,
-    entry.credentialFingerprint,
-    entry.beforeStatus,
-    entry.afterStatus,
-    entry.beforeExpiresAtMs,
-    entry.afterExpiresAtMs,
-    entry.previousEventGameId ?? null,
-    entry.replayEvidenceId ?? null,
-    entry.terminalReason,
-    entry.acceptanceId ?? null,
-    entry.controlAuditId ?? null,
-    entry.controlActionId ?? null,
-    entry.contentFingerprint ?? null,
-    entry.outcomeDetail ?? null,
+    boundEntry.sessionId,
+    boundEntry.replacedSessionId,
+    boundEntry.eventGameId,
+    boundEntry.credentialKind,
+    boundEntry.credentialFingerprint,
+    boundEntry.beforeStatus,
+    boundEntry.afterStatus,
+    boundEntry.beforeExpiresAtMs,
+    boundEntry.afterExpiresAtMs,
+    boundEntry.previousEventGameId ?? null,
+    boundEntry.replayEvidenceId ?? null,
+    boundEntry.terminalReason,
+    boundEntry.acceptanceId ?? null,
+    boundEntry.controlAuditId ?? null,
+    boundEntry.controlActionId ?? null,
+    boundEntry.contentFingerprint ?? null,
+    boundEntry.outcomeDetail ?? null,
+    boundEntry.auditSequence ?? null,
+    boundEntry.predecessorAuditId ?? null,
+    boundEntry.codeState ?? null,
+    boundEntry.previousCodeFingerprint ?? null,
+    boundEntry.codeFormatVersion ?? null,
+    boundEntry.codeEncryptionKeyVersion ?? null,
+    boundEntry.codeLookupKeyVersion ?? null,
+    boundEntry.codeStateBefore ?? null,
     integrityTag,
-    entry.createdAtMs,
+    boundEntry.createdAtMs,
+  );
+  writeGrantStateAnchor(statements, boundEntry.grantId, keyRing);
+}
+
+export function writeGrantStateAnchor(
+  statements: GrantSqliteStatements,
+  grantId: string,
+  keyRing: GrantKeyRing,
+): void {
+  const grant = readGrantByStatement(statements.byGrantId, grantId);
+  if (grant === null) throw new Error("Grant state anchor references a missing Grant.");
+  const audits = listGrantAudit(statements.auditByGrant, grantId);
+  const head = audits.at(-1);
+  if (head === undefined) throw new Error("Grant state anchor requires Grant Audit evidence.");
+  const material = grantStateMaterial(
+    listGrants(statements.allGrants),
+    statements.allSessions.all().map((value) => readStoredGrantSession(asRecord(value))),
+    listAllGrantAudits(statements),
+    statements.allTelemetry
+      .all()
+      .map((value) => readGrantAdmissionTelemetryFromRow(asRecord(value))),
+    statements.allGlobalWindows
+      .all()
+      .map((value) => readGrantAdmissionGlobalWindowFromRow(asRecord(value))),
+  );
+  const anchor = computeGrantStateAnchor(material, keyRing);
+  statements.upsertAnchor.run(
+    grantId,
+    audits.length,
+    head.auditId,
+    anchor.stateDigest,
+    anchor.integrityTag,
+    grant.createdAtMs,
+  );
+}
+
+export function verifyGrantStateAnchors(
+  database: Database,
+  keyRing: GrantKeyRing | undefined,
+): void {
+  const statements = createGrantSqliteStatements(database);
+  const grants = listGrants(statements.allGrants);
+  if (grants.length === 0) return;
+  if (keyRing === undefined) {
+    const hasTelemetry =
+      statements.allTelemetry.all().length > 0 || statements.allGlobalWindows.all().length > 0;
+    const hasCurrentMaterial = grants.some((grant) => grant.code !== null);
+    if (hasTelemetry || hasCurrentMaterial) {
+      throw new Error("Grant key material is required for authenticated Grant anchors.");
+    }
+    for (const grant of grants) {
+      const row = statements.anchorByGrantId.get(grant.grantId) as GrantRow | null;
+      if (row === null || readText(row.integrity_tag) !== "pending-schema-20-key") {
+        throw new Error("Grant state anchor evidence is incomplete.");
+      }
+    }
+    return;
+  }
+  for (const grant of grants) {
+    const audits = listGrantAudit(statements.auditByGrant, grant.grantId);
+    const head = audits.at(-1);
+    const row = statements.anchorByGrantId.get(grant.grantId) as GrantRow | null;
+    if (head === undefined || row === null) {
+      throw new Error("Grant state anchor evidence is incomplete.");
+    }
+    const anchorVersion = readInteger(row.anchor_version);
+    const auditCount = readInteger(row.audit_count);
+    const auditHeadId = readText(row.audit_head_id);
+    const stateDigest = readText(row.state_digest);
+    const integrityTag = readText(row.integrity_tag);
+    const material = grantStateMaterial(
+      grants,
+      statements.allSessions.all().map((value) => readStoredGrantSession(asRecord(value))),
+      listAllGrantAudits(statements),
+      statements.allTelemetry
+        .all()
+        .map((value) => readGrantAdmissionTelemetryFromRow(asRecord(value))),
+      statements.allGlobalWindows
+        .all()
+        .map((value) => readGrantAdmissionGlobalWindowFromRow(asRecord(value))),
+    );
+    const computed = computeGrantStateAnchor(material, keyRing, integrityTag.split(":")[1]);
+    if (
+      anchorVersion !== 1 ||
+      auditCount !== audits.length ||
+      auditHeadId !== head.auditId ||
+      stateDigest !== computed.stateDigest ||
+      integrityTag !== computed.integrityTag
+    ) {
+      throw new Error("Grant state anchor integrity is invalid.");
+    }
+  }
+}
+
+export function writeGrantAdmissionStateAnchor(
+  statements: GrantSqliteStatements,
+  keyRing: GrantKeyRing,
+): void {
+  const telemetry = statements.allTelemetry
+    .all()
+    .map((value) => readGrantAdmissionTelemetryFromRow(asRecord(value)));
+  const globalWindows = statements.allGlobalWindows
+    .all()
+    .map((value) => readGrantAdmissionGlobalWindowFromRow(asRecord(value)));
+  const computed = computeGrantAdmissionStateAnchor(
+    grantAdmissionStateMaterial(telemetry, globalWindows),
+    keyRing,
+  );
+  statements.upsertAdmissionStateAnchor.run(
+    computed.stateDigest,
+    computed.integrityTag,
+    Date.now(),
+  );
+}
+
+export function verifyGrantAdmissionStateAnchor(
+  database: Database,
+  keyRing: GrantKeyRing | undefined,
+): void {
+  const statements = createGrantSqliteStatements(database);
+  const rows = database
+    .query(
+      "SELECT anchor_id, anchor_version, state_digest, integrity_tag FROM foundation_grant_admission_state_anchors ORDER BY anchor_id",
+    )
+    .all() as unknown[];
+  if (rows.length !== 1 || readInteger(asRecord(rows[0]).anchor_id) !== 1)
+    throw new Error("Grant admission state anchor evidence is incomplete.");
+  const anchor = readGrantAdmissionStateAnchor(statements.admissionStateAnchor);
+  if (anchor === null) throw new Error("Grant admission state anchor evidence is incomplete.");
+  if (keyRing === undefined) {
+    if (anchor.integrityTag !== "pending-schema-20-key")
+      throw new Error("Grant admission state anchor requires the Grant key ring.");
+    return;
+  }
+  const telemetry = statements.allTelemetry
+    .all()
+    .map((value) => readGrantAdmissionTelemetryFromRow(asRecord(value)));
+  const globalWindows = statements.allGlobalWindows
+    .all()
+    .map((value) => readGrantAdmissionGlobalWindowFromRow(asRecord(value)));
+  const computed = computeGrantAdmissionStateAnchor(
+    grantAdmissionStateMaterial(telemetry, globalWindows),
+    keyRing,
+    anchor.integrityTag.split(":")[1],
+  );
+  if (
+    anchor.anchorVersion !== 1 ||
+    anchor.stateDigest !== computed.stateDigest ||
+    anchor.integrityTag !== computed.integrityTag
+  )
+    throw new Error("Grant admission state anchor integrity is invalid.");
+}
+
+function listAllGrantAudits(statements: GrantSqliteStatements): StoredGrantAuditEntry[] {
+  return orderGrantAudits(
+    listGrants(statements.allGrants).flatMap((grant) =>
+      listGrantAudit(statements.auditByGrant, grant.grantId),
+    ),
   );
 }
 
@@ -456,6 +909,56 @@ function readStoredControlGrant(row: GrantRow): StoredGrant {
       lookupDigest,
       fingerprint: readText(row.credential_fingerprint),
     },
+    code: readStoredGrantCodeFromJoinedRow(row),
+  };
+}
+
+function readStoredGrantCodeFromJoinedRow(row: GrantRow): StoredGrantCode | null {
+  return row.code_state === null || row.code_state === undefined ? null : readStoredGrantCode(row);
+}
+
+function readStoredGrantCode(row: GrantRow): StoredGrantCode {
+  const state = readText(row.code_state);
+  if (state !== "present" && state !== "disabled" && state !== "erased")
+    throw new Error("Stored Grant Code state is invalid.");
+  const formatVersion = readInteger(row.code_format_version);
+  if (formatVersion !== 1 || readText(row.code_kind) !== "manual-code")
+    throw new Error("Stored Grant Code metadata is invalid.");
+  const encryptionKeyVersion = readNullableText(row.code_encryption_key_version);
+  const lookupKeyVersion = readNullableText(row.code_lookup_key_version);
+  const iv = readNullableText(row.code_iv);
+  const ciphertext = readNullableText(row.code_ciphertext);
+  const tag = readNullableText(row.code_tag);
+  const lookupDigest = readNullableText(row.code_lookup_digest);
+  const materialPresent =
+    state === "present" &&
+    encryptionKeyVersion !== null &&
+    lookupKeyVersion !== null &&
+    iv !== null &&
+    ciphertext !== null &&
+    tag !== null &&
+    lookupDigest !== null;
+  const materialErased =
+    (state === "disabled" || state === "erased") &&
+    encryptionKeyVersion === null &&
+    lookupKeyVersion === null &&
+    iv === null &&
+    ciphertext === null &&
+    tag === null &&
+    lookupDigest === null;
+  if (!materialPresent && !materialErased)
+    throw new Error("Stored Grant Code material state is invalid.");
+  return {
+    state,
+    formatVersion,
+    kind: "manual-code",
+    encryptionKeyVersion,
+    lookupKeyVersion,
+    iv,
+    ciphertext,
+    tag,
+    lookupDigest,
+    fingerprint: readText(row.code_fingerprint),
   };
 }
 
@@ -606,6 +1109,12 @@ export function readStoredGrantAuditEntry(row: GrantRow): StoredGrantAuditEntry 
     "control-action-rejected",
     "control-action-retry-later",
     "control-action-dependency-blocked",
+    "grant-code-created",
+    "grant-code-replaced",
+    "grant-code-disabled",
+    "grant-code-erased-expiry",
+    "grant-code-erased-game-lock",
+    "grant-code-admitted",
   ];
   if (!allowedActions.includes(action)) {
     throw new Error("Stored Grant Audit Trail action is invalid.");
@@ -620,7 +1129,11 @@ export function readStoredGrantAuditEntry(row: GrantRow): StoredGrantAuditEntry 
     throw new Error("Stored Grant Audit Trail outcome is invalid.");
   }
   const credentialKind = readNullableText(row.credential_kind);
-  if (credentialKind !== null && credentialKind !== GRANT_CREDENTIAL_KIND) {
+  if (
+    credentialKind !== null &&
+    credentialKind !== GRANT_CREDENTIAL_KIND &&
+    credentialKind !== GRANT_CODE_KIND
+  ) {
     throw new Error("Stored Grant Audit Trail credential kind is invalid.");
   }
   const beforeStatus = readNullableText(row.before_status);
@@ -643,7 +1156,11 @@ export function readStoredGrantAuditEntry(row: GrantRow): StoredGrantAuditEntry 
   if (action === "session-terminated" && terminalReason === null) {
     throw new Error("Stored terminal Grant Audit Trail evidence is incomplete.");
   }
-  if (action !== "session-terminated" && terminalReason !== null) {
+  if (
+    action !== "session-terminated" &&
+    !(action === "grant-code-erased-game-lock" && terminalReason === "game-locked") &&
+    terminalReason !== null
+  ) {
     throw new Error("Stored non-terminal Grant Audit Trail evidence has a terminal reason.");
   }
   return {
@@ -672,6 +1189,19 @@ export function readStoredGrantAuditEntry(row: GrantRow): StoredGrantAuditEntry 
     controlActionId: readNullableText(row.control_action_id),
     contentFingerprint: readNullableText(row.content_fingerprint),
     outcomeDetail: readNullableText(row.outcome_detail),
+    auditSequence: readNullableInteger(row.audit_sequence) ?? undefined,
+    predecessorAuditId: readNullableText(row.predecessor_audit_id) ?? undefined,
+    codeFormatVersion: readNullableInteger(row.code_format_version) ?? undefined,
+    codeEncryptionKeyVersion: readNullableText(row.code_encryption_key_version) ?? undefined,
+    codeLookupKeyVersion: readNullableText(row.code_lookup_key_version) ?? undefined,
+    codeStateBefore: (readNullableText(row.code_state_before) ??
+      undefined) as StoredGrantAuditEntry["codeStateBefore"],
+    ...(readNullableText(row.code_state) === null
+      ? {}
+      : { codeState: readNullableText(row.code_state) as StoredGrantAuditEntry["codeState"] }),
+    ...(readNullableText(row.previous_code_fingerprint) === null
+      ? {}
+      : { previousCodeFingerprint: readNullableText(row.previous_code_fingerprint) }),
     createdAtMs: readInteger(row.created_at_ms),
   };
 }

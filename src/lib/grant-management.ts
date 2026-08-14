@@ -1,4 +1,4 @@
-import type { FoundationStorage } from "@/lib/foundation-storage";
+import { requireGrantStorageCapabilities, type FoundationStorage } from "@/lib/foundation-storage";
 import type { GrantAuthorityOptions } from "@/lib/grant-authority";
 import { EVENT_ADMIN_GRANT_TYPE, GRANT_TYPE, PITCH_MANAGER_GRANT_TYPE } from "@/lib/grant-types";
 import { createGrant, reactivateGrant, updateGrantStatus } from "@/lib/grant-management-commands";
@@ -9,6 +9,7 @@ import {
 } from "@/lib/grant-management-credentials";
 import { recalculateExpiry } from "@/lib/grant-management-lifecycle";
 import { listAudit, listSessions } from "@/lib/grant-management-queries";
+import { admitGrantCode, createGrantCode, disableGrantCode } from "@/lib/grant-management-code";
 import {
   admitGrant,
   acceptControlGrantSessionSwitch,
@@ -30,6 +31,9 @@ export type {
   TypedGrantReplayAuthorization,
   TypedGrantMutation,
   TypedGrantReveal,
+  TypedGrantRotated,
+  TypedGrantAdmissionThrottled,
+  TypedGrantCodeCreated,
   TypedSessionSummary,
 } from "@/lib/grant-management-types";
 export type { GrantLifecycleMetadataCorrection } from "@/lib/grant-management-lifecycle";
@@ -39,11 +43,12 @@ export function createTypedGrantAuthority(
   storage: FoundationStorage,
   options: GrantAuthorityOptions,
 ): TypedGrantAuthority {
-  storage.setGrantValidationContext?.({
+  requireGrantStorageCapabilities(storage);
+  storage.setGrantValidationContext({
     environmentId: options.environmentId,
     keyRing: options.keyRing,
   });
-  storage.setGrantKeyRing?.(options.keyRing);
+  storage.setGrantKeyRing(options.keyRing);
   return {
     createGrant: (input) => createGrant(storage, options, input),
     createEventAdminGrant: (input) =>
@@ -52,6 +57,13 @@ export function createTypedGrantAuthority(
       createGrant(storage, options, { ...input, grantType: PITCH_MANAGER_GRANT_TYPE }),
     createControlGrant: (input) =>
       createGrant(storage, options, { ...input, grantType: GRANT_TYPE }),
+    createGrantCode: (grantId, authority) =>
+      createGrantCode(storage, options, grantId, authority, false),
+    replaceGrantCode: (grantId, authority) =>
+      createGrantCode(storage, options, grantId, authority, true),
+    disableGrantCode: (grantId, authority) =>
+      disableGrantCode(storage, options, grantId, authority),
+    admitGrantCode: (input) => admitGrantCode(storage, options, input),
     admitGrant: (input) => admitGrant(storage, options, input),
     authorizeGrant: (input) => authorizeGrant(storage, options, input),
     acceptControlGrantSessionSwitch: (input) =>

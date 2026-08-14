@@ -50,6 +50,34 @@ export type TypedGrantAdmission =
     }
   | typeof GENERIC_GRANT_ADMISSION_FAILURE;
 
+export type TypedGrantAdmissionThrottled = {
+  status: "rejected";
+  code: "grant-admission-throttled";
+  message: "Retry Grant admission later.";
+  retryAfterMs: number;
+};
+
+export type TypedGrantCodeCreated = {
+  status: "created" | "replaced";
+  grantId: string;
+  grantVersion: string;
+  code: string;
+  formatVersion: 1;
+};
+
+/** Secret-bearing full rotation material is returned once and is never durable. */
+export type TypedGrantRotated = {
+  status: "updated";
+  grantId: string;
+  grantVersion: string;
+  qrCredential: string;
+  credentialFormatVersion: typeof GRANT_CREDENTIAL_FORMAT_VERSION;
+  code: string;
+  codeFormatVersion: 1;
+  oneTime: true;
+  noStore: true;
+};
+
 export type TypedGrantAuthorization =
   | {
       status: "authorized";
@@ -135,12 +163,30 @@ export type TypedGrantAuthority = {
   createControlGrant(
     input: Omit<CreateTypedGrantInput, "grantType"> & { scope: ControlGrantScope },
   ): Promise<TypedGrantCreated | TypedGrantMutation>;
+  createGrantCode(
+    grantId: string,
+    authority: GrantManagementAuthority,
+  ): Promise<TypedGrantCodeCreated | TypedGrantMutation>;
+  replaceGrantCode(
+    grantId: string,
+    authority: GrantManagementAuthority,
+  ): Promise<TypedGrantCodeCreated | TypedGrantMutation>;
+  disableGrantCode(
+    grantId: string,
+    authority: GrantManagementAuthority,
+  ): Promise<TypedGrantMutation>;
+  admitGrantCode(input: {
+    grantCode: string;
+    browserContext: string;
+    deviceClass?: string;
+    browserClass?: string;
+  }): Promise<TypedGrantAdmission | TypedGrantAdmissionThrottled>;
   admitGrant(input: {
     qrCredential: string;
     browserContext: string;
     deviceClass?: string;
     browserClass?: string;
-  }): Promise<TypedGrantAdmission>;
+  }): Promise<TypedGrantAdmission | TypedGrantAdmissionThrottled>;
   authorizeGrant(input: {
     sessionBearer: string;
     eventGameId?: string;
@@ -162,7 +208,10 @@ export type TypedGrantAuthority = {
     grantId: string,
     authority: GrantManagementAuthority,
   ): Promise<TypedGrantMutation>;
-  rotateGrant(grantId: string, authority: GrantManagementAuthority): Promise<TypedGrantMutation>;
+  rotateGrant(
+    grantId: string,
+    authority: GrantManagementAuthority,
+  ): Promise<TypedGrantRotated | TypedGrantMutation>;
   rotateGrantCredentialKeys(
     grantId: string,
     authority: GrantManagementAuthority,

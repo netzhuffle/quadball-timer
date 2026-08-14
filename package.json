@@ -23,6 +23,7 @@
     "test:focused:grant": "bun test ./src/lib/grant-authority.focused.ts",
     "test:focused:event-catalog": "bun test --isolate ./src/lib/event-catalog.focused.ts",
     "test:focused:event-catalog-cli": "bun test --isolate ./scripts/event-catalog-cli.focused.ts",
+    "test:focused:grant-code": "bun test --isolate ./src/lib/grant-code.focused.ts",
     "test:changed": "bun test --changed",
     "format": "bunx --bun oxfmt \"**/*.{js,jsx,ts,tsx,mjs,cjs}\" \"!docs/**\"",
     "format:check": "bunx --bun oxfmt \"**/*.{js,jsx,ts,tsx,mjs,cjs}\" \"!docs/**\" --check",

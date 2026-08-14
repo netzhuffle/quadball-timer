@@ -15,6 +15,7 @@ import {
   FoundationMigrationError,
   openSqliteFoundationStorage,
 } from "@/lib/foundation-storage-sqlite";
+import { createGrantTestKeyRing } from "@/lib/grant-authority-contract";
 
 async function withDatabase<T>(work: (databasePath: string) => Promise<T>): Promise<T> {
   const directory = await mkdtemp(join(tmpdir(), "quadball-timer-sqlite-"));
@@ -56,7 +57,7 @@ describe("SQLite foundation storage", () => {
       first.close();
 
       const reopened = openSqliteFoundationStorage(databasePath);
-      expect(await reopened.readiness()).toMatchObject({ ok: true, schemaVersion: "19" });
+      expect(await reopened.readiness()).toMatchObject({ ok: true, schemaVersion: "21" });
       const reopenedRecord = createEventGameRecord(reopened, {
         externalScopeResolver: createScopeResolver(root),
       });
@@ -69,17 +70,53 @@ describe("SQLite foundation storage", () => {
     });
   });
 
+  test("keeps the empty-store admission anchor across restart and freezes raw deletion", async () => {
+    await withDatabase(async (databasePath) => {
+      const keyRing = createGrantTestKeyRing();
+      const first = openSqliteFoundationStorage(databasePath, { grantKeyRing: keyRing });
+      await first.applyMigrations();
+      expect(await first.readiness()).toMatchObject({ ok: true });
+      first.close();
+
+      const raw = new Database(databasePath);
+      raw.exec("DELETE FROM foundation_grant_admission_state_anchors WHERE anchor_id = 1");
+      raw.close();
+
+      const corrupted = openSqliteFoundationStorage(databasePath, { grantKeyRing: keyRing });
+      expect(await corrupted.readiness()).toMatchObject({ ok: false, status: "integrity-failure" });
+      corrupted.close();
+    });
+  });
+
+  test("does not key pending admission rows installed after a no-key schema-17 migration", async () => {
+    await withDatabase(async (databasePath) => {
+      const storage = openSqliteFoundationStorage(databasePath);
+      await storage.applyMigrations();
+      const raw = new Database(databasePath);
+      raw
+        .query(
+          "INSERT INTO foundation_grant_admission_telemetry (mode, source_digest, failed_attempts, delay_until_ms, last_attempt_at_ms, last_success_at_ms) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .run("code", "A".repeat(43), 1, null, 1_000, null);
+      raw.close();
+      expect(await storage.readiness()).toMatchObject({ ok: false });
+      expect(() => storage.setGrantKeyRing?.(createGrantTestKeyRing())).toThrow();
+      expect(await storage.readiness()).toMatchObject({ ok: false });
+      storage.close();
+    });
+  });
+
   test("validates a disposable candidate before production migration", async () => {
     await withDatabase(async (databasePath) => {
       const storage = openSqliteFoundationStorage(databasePath);
       const candidate = await storage.validateCandidate();
       expect(candidate.ready).toBe(true);
-      expect(candidate.readiness).toMatchObject({ ok: true, schemaVersion: "19" });
+      expect(candidate.readiness).toMatchObject({ ok: true, schemaVersion: "21" });
       expect(existsSync(candidate.candidatePath)).toBe(false);
       expect(await storage.readiness()).toMatchObject({ ok: false, status: "pending" });
 
       const migration = await storage.applyMigrations({ requireCandidate: true });
-      expect(migration.schemaVersion).toBe(19);
+      expect(migration.schemaVersion).toBe(21);
       expect(await storage.readiness()).toMatchObject({ ok: true });
       storage.close();
     });
@@ -104,6 +141,10 @@ describe("SQLite foundation storage", () => {
       const bindingMigration = FOUNDATION_MIGRATIONS[14];
       const replayProvenanceMigration = FOUNDATION_MIGRATIONS[15];
       const composedAcceptanceMigration = FOUNDATION_MIGRATIONS[16];
+      const acceptanceIntegrityHistoryMigration = FOUNDATION_MIGRATIONS[17];
+      const eventCatalogMigration = FOUNDATION_MIGRATIONS[18];
+      const grantCodeMigration = FOUNDATION_MIGRATIONS[19];
+      const grantCodeLockMigration = FOUNDATION_MIGRATIONS[20];
       if (
         initialMigration === undefined ||
         repairMigration === undefined ||
@@ -121,7 +162,11 @@ describe("SQLite foundation storage", () => {
         provenanceMigration === undefined ||
         bindingMigration === undefined ||
         replayProvenanceMigration === undefined ||
-        composedAcceptanceMigration === undefined
+        composedAcceptanceMigration === undefined ||
+        acceptanceIntegrityHistoryMigration === undefined ||
+        eventCatalogMigration === undefined ||
+        grantCodeMigration === undefined ||
+        grantCodeLockMigration === undefined
       ) {
         throw new Error("Expected the foundation migrations.");
       }
@@ -151,10 +196,12 @@ describe("SQLite foundation storage", () => {
         bindingMigration.id,
         replayProvenanceMigration.id,
         composedAcceptanceMigration.id,
-        "018-acceptance-integrity-history",
-        "019-event-catalog",
+        acceptanceIntegrityHistoryMigration.id,
+        eventCatalogMigration.id,
+        grantCodeMigration.id,
+        grantCodeLockMigration.id,
       ]);
-      expect(await current.readiness()).toMatchObject({ ok: true, schemaVersion: "19" });
+      expect(await current.readiness()).toMatchObject({ ok: true, schemaVersion: "21" });
       current.close();
     });
   });
@@ -163,9 +210,9 @@ describe("SQLite foundation storage", () => {
     await withDatabase(async (databasePath) => {
       const baseMigrations = FOUNDATION_MIGRATIONS;
       const failingMigration = createMigration(
-        "020-failing-test-migration",
-        20,
-        20,
+        "022-failing-test-migration",
+        22,
+        22,
         "CREATE TABLE migration_failure_probe (id TEXT) STRICT; THIS IS NOT SQL;",
       );
       const store = openSqliteFoundationStorage(databasePath, {
@@ -185,7 +232,7 @@ describe("SQLite foundation storage", () => {
       });
       expect(await priorBinary.readiness()).toMatchObject({
         ok: true,
-        schemaVersion: "19",
+        schemaVersion: "21",
       });
       priorBinary.close();
 
@@ -257,7 +304,7 @@ describe("SQLite foundation storage", () => {
         .query(
           "INSERT INTO foundation_migration_ledger (migration_id, ordinal, schema_version, checksum, status, applied_at_ms) VALUES (?, ?, ?, ?, ?, ?)",
         )
-        .run("future-999", 20, 20, "future-checksum", "complete", 2_000);
+        .run("future-999", 22, 22, "future-checksum", "complete", 2_000);
       futureDatabase.close();
       const future = openSqliteFoundationStorage(databasePath);
       expect(await future.readiness()).toMatchObject({ ok: false });

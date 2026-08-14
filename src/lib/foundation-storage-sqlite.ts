@@ -16,6 +16,12 @@ import {
   updateGrant,
   updateGrantSession,
   type GrantSqliteStatements,
+  readGrantAdmissionGlobalWindow,
+  readGrantAdmissionStateAnchor,
+  readGrantAdmissionTelemetry,
+  scanGrantState,
+  writeGrantStateAnchor,
+  writeGrantAdmissionStateAnchor,
 } from "@/lib/grant-storage-sqlite";
 import type { GrantKeyRing } from "@/lib/grant-types";
 import type { GrantStateValidationContext } from "@/lib/grant-state-validation";
@@ -341,6 +347,17 @@ export class SqliteFoundationStorage implements FoundationStorage {
         if (isThenable(result)) {
           throw new TypeError("Foundation storage transactions must complete synchronously.");
         }
+        scanGrantState(this.database, this.grantValidationContext);
+        const keyRing = this.grantValidationContext.keyRing;
+        const grants = listGrants(this.getGrantStatements().allGrants);
+        if (keyRing !== undefined) {
+          const grantStatements = this.getGrantStatements();
+          for (const grant of grants) {
+            if (listGrantAudit(grantStatements.auditByGrant, grant.grantId).length === 0) continue;
+            writeGrantStateAnchor(grantStatements, grant.grantId, keyRing);
+          }
+          writeGrantAdmissionStateAnchor(grantStatements, keyRing);
+        }
         this.database.exec("COMMIT;");
         this.revision += 1;
         this.dataVersion = this.readDataVersion();
@@ -467,7 +484,43 @@ export class SqliteFoundationStorage implements FoundationStorage {
   }
 
   setGrantKeyRing(keyRing: GrantKeyRing): void {
-    this.grantValidationContext = { ...this.grantValidationContext, keyRing };
+    if (
+      !this.hasInstalledGrantAdmissionAnchor() &&
+      (this.countRows("foundation_grant_admission_telemetry") > 0 ||
+        this.countRows("foundation_grant_admission_global_windows") > 0)
+    ) {
+      throw new Error(
+        "Pending schema-17 Grant admission state cannot be keyed after rows were installed.",
+      );
+    }
+    const previousContext = this.grantValidationContext;
+    this.grantValidationContext = { ...previousContext, keyRing };
+    try {
+      this.initializePendingGrantStateAnchors();
+    } catch (error) {
+      this.grantValidationContext = previousContext;
+      throw error;
+    }
+  }
+
+  grantStorageCapability() {
+    return {
+      name: "authenticated-grant-storage",
+      version: 2,
+      implementation: "hmac-anchored-atomic-v2",
+      transaction: [
+        "findGrantByCodeLookupDigest",
+        "readGrantAdmissionTelemetry",
+        "readGrantAdmissionGlobalWindow",
+        "writeGrantAdmissionTelemetry",
+        "writeGrantAdmissionGlobalWindow",
+        "pruneGrantAdmissionTelemetry",
+        "readGrantAdmissionStateAnchor",
+        "writeGrantAdmissionStateAnchor",
+      ],
+      maintenance: ["pruneGrantAdmissionTelemetry", "writeGrantAdmissionStateAnchor"],
+      anchors: ["readGrantAdmissionStateAnchor", "writeGrantAdmissionStateAnchor"],
+    } as const;
   }
 
   setGrantValidationContext(context: GrantStateValidationContext): void {
@@ -485,6 +538,9 @@ export class SqliteFoundationStorage implements FoundationStorage {
         const state = this.readMigrationState();
         const readiness = assessMigrationReadiness(true, state.entries, this.migrations);
         if (readiness.status === "ready") {
+          if (appliedMigrationIds.includes("020-grant-codes-and-admission-telemetry")) {
+            this.ensureGrantStateAnchors();
+          }
           this.database.exec("COMMIT;");
           return {
             appliedMigrationIds,
@@ -538,6 +594,92 @@ export class SqliteFoundationStorage implements FoundationStorage {
     }
   }
 
+  private ensureGrantStateAnchors(): void {
+    const grantStatements = this.getGrantStatements();
+    const grants = listGrants(grantStatements.allGrants);
+    const keyRing = this.grantValidationContext.keyRing;
+    if (keyRing !== undefined) {
+      for (const grant of grants) {
+        writeGrantStateAnchor(grantStatements, grant.grantId, keyRing);
+      }
+      writeGrantAdmissionStateAnchor(grantStatements, keyRing);
+      return;
+    }
+    for (const grant of grants) {
+      const audits = listGrantAudit(grantStatements.auditByGrant, grant.grantId);
+      const head = audits.at(-1);
+      if (head === undefined) throw new Error("Grant state anchor requires Grant Audit evidence.");
+      this.database
+        .query(`
+          INSERT OR IGNORE INTO foundation_grant_state_anchors
+            (grant_id, anchor_version, audit_count, audit_head_id, state_digest, integrity_tag, created_at_ms)
+          VALUES (?, 1, ?, ?, 'pending-schema-20-key', 'pending-schema-20-key', ?)
+        `)
+        .run(grant.grantId, audits.length, head.auditId, grant.createdAtMs);
+    }
+  }
+
+  private initializePendingGrantStateAnchors(): void {
+    if (!this.tableExists("foundation_grant_state_anchors")) return;
+    const keyRing = this.grantValidationContext.keyRing;
+    if (keyRing === undefined) return;
+    const pending = this.database
+      .query(
+        "SELECT grant_id FROM foundation_grant_state_anchors WHERE integrity_tag = 'pending-schema-20-key'",
+      )
+      .all() as unknown[];
+    const admissionPending = this.database
+      .query(
+        "SELECT anchor_id FROM foundation_grant_admission_state_anchors WHERE anchor_id = 1 AND integrity_tag = 'pending-schema-20-key'",
+      )
+      .all() as unknown[];
+    if (pending.length === 0 && admissionPending.length === 0) return;
+    if (
+      admissionPending.length > 0 &&
+      (this.countRows("foundation_grant_admission_telemetry") > 0 ||
+        this.countRows("foundation_grant_admission_global_windows") > 0)
+    ) {
+      throw new Error(
+        "Pending schema-19 Grant admission state cannot be keyed after rows were installed.",
+      );
+    }
+    const statements = this.getGrantStatements();
+    this.database.exec("BEGIN IMMEDIATE;");
+    try {
+      if (this.tableExists("foundation_grant_migration_provenance_state")) {
+        this.refreshGrantMigrationProvenance();
+      }
+      scanGrantState(this.database, this.grantValidationContext);
+      for (const value of pending) {
+        const row = asRecord(value);
+        writeGrantStateAnchor(statements, readText(row.grant_id), keyRing);
+      }
+      if (admissionPending.length > 0) writeGrantAdmissionStateAnchor(statements, keyRing);
+      this.database.exec("COMMIT;");
+    } catch (error) {
+      this.rollbackQuietly();
+      throw error;
+    }
+  }
+
+  private hasInstalledGrantAdmissionAnchor(): boolean {
+    if (!this.tableExists("foundation_grant_admission_state_anchors")) return false;
+    const row = this.database
+      .query(
+        "SELECT integrity_tag FROM foundation_grant_admission_state_anchors WHERE anchor_id = 1",
+      )
+      .get() as { integrity_tag?: unknown } | null;
+    return row !== null && row.integrity_tag !== "pending-schema-20-key";
+  }
+
+  private countRows(table: string): number {
+    if (!this.tableExists(table)) return 0;
+    const row = this.database.query(`SELECT COUNT(*) AS count FROM ${table}`).get() as {
+      count?: unknown;
+    } | null;
+    return typeof row?.count === "number" ? row.count : Number(row?.count ?? 0);
+  }
+
   private createTransaction(): FoundationStorageTransaction {
     const statements = this.getStatements();
     return {
@@ -578,6 +720,8 @@ export class SqliteFoundationStorage implements FoundationStorage {
       listGrants: () => listGrants(this.getGrantStatements().allGrants),
       findGrantByCredentialLookupDigest: (lookupDigest) =>
         readGrantByStatement(this.getGrantStatements().byCredentialDigest, lookupDigest),
+      findGrantByCodeLookupDigest: (lookupDigest) =>
+        readGrantByStatement(this.getGrantStatements().byCodeDigest, lookupDigest),
       findActiveSessionByGrantAndContext: (grantId, browserContextDigest) =>
         readSessionByStatement(
           this.getGrantStatements().activeSessionByContext,
@@ -635,6 +779,16 @@ export class SqliteFoundationStorage implements FoundationStorage {
         readReceipt(statements.receiptByReservationId.get(reservationId)),
       listAcceptanceIntegrityAnchors: (subjectKind, subjectId) =>
         statements.anchorsBySubject.all(subjectKind, subjectId).map(readIntegrityAnchor),
+      readGrantAdmissionTelemetry: (mode, sourceDigest) =>
+        readGrantAdmissionTelemetry(
+          this.getGrantStatements().telemetryBySource,
+          mode,
+          sourceDigest,
+        ),
+      readGrantAdmissionGlobalWindow: (mode) =>
+        readGrantAdmissionGlobalWindow(this.getGrantStatements().globalWindowByMode, mode),
+      readGrantAdmissionStateAnchor: () =>
+        readGrantAdmissionStateAnchor(this.getGrantStatements().admissionStateAnchor),
       insertGrant: (grant) => insertGrant(this.getGrantStatements(), grant),
       updateGrant: (grant) => updateGrant(this.getGrantStatements(), grant),
       insertGrantSession: (session) => insertGrantSession(this.getGrantStatements(), session),
@@ -796,6 +950,31 @@ export class SqliteFoundationStorage implements FoundationStorage {
           entry.before === null ? null : JSON.stringify(entry.before),
           JSON.stringify(entry.after),
         ),
+      writeGrantAdmissionTelemetry: (value) => {
+        this.getGrantStatements().upsertTelemetry.run(
+          value.mode,
+          value.sourceDigest,
+          value.failedAttempts,
+          value.delayUntilMs,
+          value.lastAttemptAtMs,
+          value.lastSuccessAtMs,
+        );
+      },
+      writeGrantAdmissionGlobalWindow: (value) => {
+        this.getGrantStatements().upsertGlobalWindow.run(
+          value.mode,
+          value.windowStartedAtMs,
+          value.attemptCount,
+        );
+      },
+      pruneGrantAdmissionTelemetry: (beforeMs) =>
+        this.getGrantStatements().pruneTelemetry.run(beforeMs),
+      writeGrantAdmissionStateAnchor: () => {
+        const keyRing = this.grantValidationContext.keyRing;
+        if (keyRing === undefined)
+          throw new Error("Grant admission anchors require the Grant key ring.");
+        writeGrantAdmissionStateAnchor(this.getGrantStatements(), keyRing);
+      },
     };
   }
 
