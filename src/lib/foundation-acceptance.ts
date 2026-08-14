@@ -185,6 +185,10 @@ export function createFoundationAcceptance(
   const registry =
     options.actionCodecRegistry ?? createControlActionCodecRegistry(options.actionCodecs);
   const limits = { ...ACCEPTANCE_LIMITS, ...options.limits };
+  storage.setGrantValidationContext?.({
+    environmentId: options.grant.environmentId,
+    keyRing: options.grant.keyRing,
+  });
 
   async function submitBatch(raw: unknown): Promise<FoundationBatchOutcome> {
     const batch = structurallyValidateBatch(raw);

@@ -294,65 +294,63 @@ export function registerGrantAuthorityContract(
       await withStorage(createStorage, async (storage) => {
         const authority = createAuthority(storage);
         const created = await createGrant(authority);
-        await storage.transaction((transaction) => {
-          const grant = transaction.findGrantById(created.grantId);
-          if (grant === null) throw new Error("Expected the stored Grant.");
-          transaction.updateGrant({
-            ...grant,
-            credential: {
-              ...grant.credential,
-              iv: "iv-current-downgrade",
-              ciphertext: "ciphertext-current-downgrade",
-              tag: "tag-current-downgrade",
-              lookupDigest: "digest-current-downgrade",
-              fingerprint: `opaque-migration-reference-v1:${"a".repeat(64)}`,
-            },
-          });
-        });
-        expect(await storage.readiness()).toMatchObject({
-          ok: false,
-          status: "integrity-failure",
-        });
+        await expect(
+          storage.transaction((transaction) => {
+            const grant = transaction.findGrantById(created.grantId);
+            if (grant === null) throw new Error("Expected the stored Grant.");
+            transaction.updateGrant({
+              ...grant,
+              credential: {
+                ...grant.credential,
+                iv: "iv-current-downgrade",
+                ciphertext: "ciphertext-current-downgrade",
+                tag: "tag-current-downgrade",
+                lookupDigest: "digest-current-downgrade",
+                fingerprint: `opaque-migration-reference-v1:${"a".repeat(64)}`,
+              },
+            });
+          }),
+        ).rejects.toThrow();
+        expect(await storage.readiness()).toMatchObject({ ok: true });
         expect(
           await authority.createControlGrant({
             scope: { ...createScope(), pitchSlotId: "slot-after-active-downgrade" },
             actor: createActor(),
           }),
-        ).toMatchObject({ status: "rejected", reason: "unavailable" });
+        ).toMatchObject({ status: "created" });
       });
 
       await withStorage(createStorage, async (storage) => {
         const authority = createAuthority(storage);
         const created = await createGrant(authority);
-        await storage.transaction((transaction) => {
-          const grant = transaction.findGrantById(created.grantId);
-          if (grant === null) throw new Error("Expected the stored Grant.");
-          transaction.updateGrant({
-            ...grant,
-            status: "expired",
-            credential: {
-              ...grant.credential,
-              materialState: "erased",
-              encryptionKeyVersion: null,
-              lookupKeyVersion: null,
-              iv: null,
-              ciphertext: null,
-              tag: null,
-              lookupDigest: null,
-              fingerprint: `opaque-migration-reference-v1:${"b".repeat(64)}`,
-            },
-          });
-        });
-        expect(await storage.readiness()).toMatchObject({
-          ok: false,
-          status: "integrity-failure",
-        });
+        await expect(
+          storage.transaction((transaction) => {
+            const grant = transaction.findGrantById(created.grantId);
+            if (grant === null) throw new Error("Expected the stored Grant.");
+            transaction.updateGrant({
+              ...grant,
+              status: "expired",
+              credential: {
+                ...grant.credential,
+                materialState: "erased",
+                encryptionKeyVersion: null,
+                lookupKeyVersion: null,
+                iv: null,
+                ciphertext: null,
+                tag: null,
+                lookupDigest: null,
+                fingerprint: `opaque-migration-reference-v1:${"b".repeat(64)}`,
+              },
+            });
+          }),
+        ).rejects.toThrow();
+        expect(await storage.readiness()).toMatchObject({ ok: true });
         expect(
           await authority.createControlGrant({
             scope: { ...createScope(), pitchSlotId: "slot-after-erased-downgrade" },
             actor: createActor(),
           }),
-        ).toMatchObject({ status: "rejected", reason: "unavailable" });
+        ).toMatchObject({ status: "created" });
       });
     },
   );
@@ -1080,6 +1078,13 @@ function createFailingStorage(storage: FoundationStorage): FoundationStorage {
     },
     readAuditEntries(): Promise<never> {
       return Promise.reject(new Error("sqlite secret failure must not escape"));
+    },
+    setGrantKeyRing() {},
+    setGrantValidationContext() {},
+    grantStorageCapability() {
+      if (typeof storage.grantStorageCapability !== "function")
+        throw new Error("Grant storage capability declaration is unavailable.");
+      return storage.grantStorageCapability();
     },
     readiness() {
       return storage.readiness();

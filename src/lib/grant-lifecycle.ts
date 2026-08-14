@@ -3,6 +3,7 @@ import type { FoundationStorageTransaction } from "@/lib/foundation-storage";
 import type { GrantAuthorityOptions } from "@/lib/grant-authority";
 import {
   GRANT_CREDENTIAL_KIND,
+  GRANT_CODE_KIND,
   OPAQUE_MIGRATION_CREDENTIAL_REFERENCE_PREFIX,
   type GrantAuthorityActor,
   type StoredGrant,
@@ -11,6 +12,7 @@ import {
   type TerminalGrantSessionReason,
 } from "@/lib/grant-types";
 import { validateOpaqueIdentifier } from "@/lib/validation-policy";
+import { eraseGrantCode } from "@/lib/grant-code";
 
 export function validateActor(
   value: unknown,
@@ -42,6 +44,13 @@ export function createAuditEntry(
     beforeExpiresAtMs?: number | null;
     afterExpiresAtMs?: number | null;
     terminalReason?: TerminalGrantSessionReason | null;
+    credentialKind?: import("@/lib/grant-types").GrantCredentialKind;
+    codeFormatVersion?: number | null;
+    codeEncryptionKeyVersion?: string | null;
+    codeLookupKeyVersion?: string | null;
+    codeStateBefore?: import("@/lib/grant-types").GrantCodeState | null;
+    codeState?: import("@/lib/grant-types").GrantCodeState | null;
+    previousCodeFingerprint?: string | null;
   },
 ): StoredGrantAuditEntry {
   const auditId = createRandomIdentifier("grant-audit", options.randomness);
@@ -59,7 +68,7 @@ export function createAuditEntry(
     eventGameId: input.eventGameId,
     previousEventGameId: input.previousEventGameId ?? null,
     replayEvidenceId: input.replayEvidenceId ?? null,
-    credentialKind: GRANT_CREDENTIAL_KIND,
+    credentialKind: input.credentialKind ?? GRANT_CREDENTIAL_KIND,
     credentialFingerprint: input.grant.credential.fingerprint.startsWith(
       OPAQUE_MIGRATION_CREDENTIAL_REFERENCE_PREFIX,
     )
@@ -71,6 +80,20 @@ export function createAuditEntry(
       input.beforeExpiresAtMs ?? (input.beforeStatus === null ? null : input.grant.expiresAtMs),
     afterExpiresAtMs: input.afterExpiresAtMs ?? input.grant.expiresAtMs,
     terminalReason: input.terminalReason ?? null,
+    ...(input.codeFormatVersion === undefined
+      ? {}
+      : { codeFormatVersion: input.codeFormatVersion }),
+    ...(input.codeEncryptionKeyVersion === undefined
+      ? {}
+      : { codeEncryptionKeyVersion: input.codeEncryptionKeyVersion }),
+    ...(input.codeLookupKeyVersion === undefined
+      ? {}
+      : { codeLookupKeyVersion: input.codeLookupKeyVersion }),
+    ...(input.codeStateBefore === undefined ? {} : { codeStateBefore: input.codeStateBefore }),
+    ...(input.codeState === undefined ? {} : { codeState: input.codeState }),
+    ...(input.previousCodeFingerprint === undefined
+      ? {}
+      : { previousCodeFingerprint: input.previousCodeFingerprint }),
     createdAtMs: readNow(options),
   };
 }
@@ -88,6 +111,8 @@ export function expireGrantIfDue(
     ...grant,
     status: "expired",
     credential: eraseGrantCredential(grant.credential),
+    code:
+      grant.code === undefined || grant.code === null ? null : eraseGrantCode(grant.code, "erased"),
   };
   transaction.updateGrant(expiredGrant);
   for (const session of transaction.listGrantSessions(grant.grantId)) {
@@ -118,6 +143,29 @@ export function expireGrantIfDue(
       afterStatus: "expired",
     }),
   );
+  if (grant.code?.state === "present" || grant.code?.state === "disabled") {
+    const codeExpiryAudit = createAuditEntry(options, {
+      action: "grant-code-erased-expiry",
+      actor: { kind: "system", value: "grant-expiry" },
+      grant,
+      sessionId: null,
+      replacedSessionId: null,
+      eventGameId: null,
+      beforeStatus: grant.status,
+      afterStatus: "expired",
+      credentialKind: GRANT_CODE_KIND,
+      codeFormatVersion: grant.code.formatVersion,
+      codeEncryptionKeyVersion: grant.code.encryptionKeyVersion,
+      codeLookupKeyVersion: grant.code.lookupKeyVersion,
+      codeStateBefore: grant.code.state,
+      codeState: expiredGrant.code?.state ?? "erased",
+      previousCodeFingerprint: grant.code.fingerprint,
+    });
+    transaction.appendGrantAudit({
+      ...codeExpiryAudit,
+      credentialFingerprint: grant.code.fingerprint,
+    });
+  }
   return expiredGrant;
 }
 

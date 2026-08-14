@@ -13,10 +13,8 @@ const migrations: readonly FoundationMigration[] = [
 ];
 
 describe("foundation migration ledger compatibility", () => {
-  test("keeps accepted migrations 001 through 016 byte-for-byte immutable", () => {
-    expect(
-      FOUNDATION_MIGRATIONS.slice(0, 16).map(({ id, checksum }) => ({ id, checksum })),
-    ).toEqual([
+  test("keeps accepted migrations 001 through 019 byte-for-byte immutable and pins 020/021", () => {
+    expect(FOUNDATION_MIGRATIONS.map(({ id, checksum }) => ({ id, checksum }))).toEqual([
       {
         id: "001-foundation-event-game-record-roots",
         checksum: "915727680c9142dc2bd5e6482b13879df1bcbfa779d6b5ad67160f7e6c3d0510",
@@ -80,6 +78,26 @@ describe("foundation migration ledger compatibility", () => {
       {
         id: "016-replay-content-provenance",
         checksum: "ec5b1d9dbead810498648018572b87635c034da1f9fbe291a31519230e1d80ee",
+      },
+      {
+        id: "017-composed-acceptance-state",
+        checksum: "4d5c4f3f93dd2c6e7e338b1be1138b709e23c3f750799cf05835e3a3b81b44e4",
+      },
+      {
+        id: "018-acceptance-integrity-history",
+        checksum: "e31684910a8a7303e037c54683f5c541d90c2a992a69695161a187f9974cab94",
+      },
+      {
+        id: "019-event-catalog",
+        checksum: "04c7e444beab018acfab2baac67cfb8d1e641f57336345fc067c34c8dc456d86",
+      },
+      {
+        id: "020-grant-codes-and-admission-telemetry",
+        checksum: "a201f58429d60e21f2baefc13786980a76354f4095b01f7a5b4dd445c18e97f0",
+      },
+      {
+        id: "021-grant-code-game-lock-erasure-evidence",
+        checksum: "d91853426ecc62a0b5a6341536fc788753604b75aef6d515de770624d403fec0",
       },
     ]);
   });

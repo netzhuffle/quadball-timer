@@ -141,7 +141,7 @@ describe("focused SQLite Grant authority boundary", () => {
           /^opaque-migration-reference-v1:[a-f0-9]{64}$/,
         );
         expect(beforeRotation.audit[0]?.credentialFingerprint).toBeNull();
-        expect(await current.readiness()).toMatchObject({ ok: true, schemaVersion: "19" });
+        expect(await current.readiness()).toMatchObject({ ok: true, schemaVersion: "21" });
 
         const forged = new Database(databasePath);
         expect(() =>
@@ -263,7 +263,7 @@ describe("focused SQLite Grant authority boundary", () => {
       const restarted = openSqliteFoundationStorage(handle.databasePath, {
         grantKeyRing: createGrantTestKeyRing(),
       });
-      expect(await restarted.readiness()).toMatchObject({ ok: true, schemaVersion: "19" });
+      expect(await restarted.readiness()).toMatchObject({ ok: true, schemaVersion: "21" });
       restarted.close();
       const database = new Database(handle.databasePath);
       database
@@ -380,7 +380,7 @@ describe("focused SQLite Grant authority boundary", () => {
       const readyRestart = openSqliteFoundationStorage(handle.databasePath, {
         grantKeyRing: keyRing,
       });
-      expect(await readyRestart.readiness()).toMatchObject({ ok: true, schemaVersion: "19" });
+      expect(await readyRestart.readiness()).toMatchObject({ ok: true, schemaVersion: "21" });
       readyRestart.close();
 
       const selfLinkDatabase = new Database(handle.databasePath);
@@ -409,7 +409,7 @@ describe("focused SQLite Grant authority boundary", () => {
       const repairedRestart = openSqliteFoundationStorage(handle.databasePath, {
         grantKeyRing: keyRing,
       });
-      expect(await repairedRestart.readiness()).toMatchObject({ ok: true, schemaVersion: "19" });
+      expect(await repairedRestart.readiness()).toMatchObject({ ok: true, schemaVersion: "21" });
       repairedRestart.close();
 
       const activeOriginDatabase = new Database(handle.databasePath);
@@ -619,7 +619,7 @@ describe("focused SQLite Grant authority boundary", () => {
       let currentClosed = false;
       try {
         const report = await current.applyMigrations({ requireCandidate: false });
-        expect(report.schemaVersion).toBe(19);
+        expect(report.schemaVersion).toBe(21);
         expect(report.appliedMigrationIds).toEqual([
           "007-anchor-control-action-audit-versions",
           "008-anchor-current-evidence-format",
@@ -634,10 +634,12 @@ describe("focused SQLite Grant authority boundary", () => {
           "017-composed-acceptance-state",
           "018-acceptance-integrity-history",
           "019-event-catalog",
+          "020-grant-codes-and-admission-telemetry",
+          "021-grant-code-game-lock-erasure-evidence",
         ]);
         expect(await current.readiness()).toMatchObject({
           ok: true,
-          schemaVersion: "19",
+          schemaVersion: "21",
         });
         const migrated = await current.transaction((transaction) => ({
           grant: transaction.findGrantById(grantId),
@@ -686,7 +688,7 @@ describe("focused SQLite Grant authority boundary", () => {
 
         const restarted = openSqliteFoundationStorage(databasePath, { grantKeyRing: keyRing });
         try {
-          expect(await restarted.readiness()).toMatchObject({ ok: true, schemaVersion: "19" });
+          expect(await restarted.readiness()).toMatchObject({ ok: true, schemaVersion: "21" });
           const restartedAudit = await restarted.transaction((transaction) =>
             transaction.listGrantAudit(grantId),
           );
@@ -1083,7 +1085,7 @@ describe("focused SQLite Grant authority boundary", () => {
         grantKeyRing: options.keyRing,
       });
       try {
-        expect(await reopened.readiness()).toMatchObject({ ok: true, schemaVersion: "19" });
+        expect(await reopened.readiness()).toMatchObject({ ok: true, schemaVersion: "21" });
         const rotated = createTypedGrantAuthority(reopened, {
           ...options,
           keyRing: createGrantTestRotatedKeyRing(keyRing),
@@ -1211,7 +1213,7 @@ describe("focused SQLite Grant authority boundary", () => {
         grantKeyRing: options.keyRing,
       });
       try {
-        expect(await reopened.readiness()).toMatchObject({ ok: true, schemaVersion: "19" });
+        expect(await reopened.readiness()).toMatchObject({ ok: true, schemaVersion: "21" });
         const reopenedAuthority = createTypedGrantAuthority(reopened, options);
         const reopenedAudit = await reopenedAuthority.listGrantAudit(control.grantId, {
           kind: "technical-admin",

@@ -7,11 +7,13 @@ import {
 } from "@/lib/grant-crypto";
 import {
   EVENT_ADMIN_GRANT_TYPE,
+  GRANT_CODE_KIND,
   GRANT_TYPE,
   PITCH_MANAGER_GRANT_TYPE,
   type StoredGrant,
   validateGrantScope,
 } from "@/lib/grant-types";
+import { eraseGrantCode } from "@/lib/grant-code";
 import { createAuditEntry, expireGrantIfDue } from "@/lib/grant-lifecycle";
 import { grantExpiryCap, resolveGrantExpiry } from "@/lib/grant-calendar";
 import {
@@ -22,6 +24,7 @@ import {
   revokeAllSessions,
 } from "@/lib/grant-management-policy";
 import { verifyGrantAuthority, type GrantAuthorityInput } from "@/lib/grant-authority-trust";
+import type { TrustedGrantAuthority } from "@/lib/grant-authority-trust";
 import { auditInput } from "@/lib/grant-management-audit";
 import type { TypedGrantMutation } from "@/lib/grant-management-types";
 
@@ -30,6 +33,39 @@ export type GrantLifecycleMetadataCorrection = {
   gameDayDate?: string;
   finalGameDayDate?: string;
 };
+
+/**
+ * A Grant Code is bound to the Grant version and scope. The public reactivation
+ * and metadata-correction contracts cannot return a replacement Code secret, so
+ * a present Code is disabled before either binding changes.
+ */
+export function disableGrantCodeForBindingChange(
+  transaction: import("@/lib/foundation-storage").FoundationStorageTransaction,
+  options: GrantAuthorityOptions,
+  grant: StoredGrant,
+  authority: TrustedGrantAuthority,
+): StoredGrant {
+  if (grant.code?.state !== "present") return grant;
+  const disabled = eraseGrantCode(grant.code, "disabled");
+  const updated = { ...grant, code: disabled };
+  transaction.updateGrant(updated);
+  const codeAudit = createAuditEntry(
+    options,
+    auditInput("grant-code-disabled", grant, authority, grant.status),
+  );
+  transaction.appendGrantAudit({
+    ...codeAudit,
+    credentialKind: GRANT_CODE_KIND,
+    credentialFingerprint: grant.code.fingerprint,
+    codeFormatVersion: grant.code.formatVersion,
+    codeEncryptionKeyVersion: grant.code.encryptionKeyVersion,
+    codeLookupKeyVersion: grant.code.lookupKeyVersion,
+    codeStateBefore: grant.code.state,
+    codeState: disabled.state,
+    previousCodeFingerprint: grant.code.fingerprint,
+  });
+  return updated;
+}
 
 export async function recalculateExpiry(
   storage: FoundationStorage,
@@ -82,7 +118,7 @@ export async function recalculateExpiry(
         return invalid("Grant lifecycle metadata correction has no effect.");
       const grantVersion = createRandomIdentifier("grant-version", options.randomness);
       const rebound = {
-        ...current,
+        ...disableGrantCodeForBindingChange(transaction, options, current, resolvedAuthority),
         grantVersion,
         scope: correctedScope.value,
         expiresAtMs: effectiveExpiry,

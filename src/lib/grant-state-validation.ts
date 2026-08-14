@@ -6,14 +6,21 @@ import {
   decryptCredential,
   parseCredentialToken,
 } from "@/lib/grant-crypto";
+import { decryptGrantCode, grantCodeFingerprint, grantCodeLookupDigest } from "@/lib/grant-code";
 import {
   GRANT_CREDENTIAL_FORMAT_VERSION,
   GRANT_CREDENTIAL_KIND,
+  GRANT_CODE_KIND,
+  GRANT_CODE_FORMAT_VERSION,
+  GRANT_ADMISSION_GLOBAL_ATTEMPT_LIMITS,
+  GRANT_ADMISSION_SOURCE_FAILURE_SATURATION,
   OPAQUE_MIGRATION_CREDENTIAL_REFERENCE_PREFIX,
   isStoredGrantSessionStatus,
   isStoredGrantStatus,
   validateGrantScope,
   type GrantKeyRing,
+  type GrantAdmissionGlobalWindow,
+  type GrantAdmissionTelemetry,
   type GrantScope,
   type StoredGrant,
   type StoredGrantAuditEntry,
@@ -29,7 +36,51 @@ export type GrantStateValidationContext = {
   migrationExpiryProvenance?: ReadonlyMap<string, number | null>;
   auditProvenance?: ReadonlyMap<string, StoredGrantAuditEntry>;
   auditIntegrityTags?: ReadonlyMap<string, string>;
+  admissionTelemetry?: Iterable<GrantAdmissionTelemetry>;
+  admissionGlobalWindows?: Iterable<GrantAdmissionGlobalWindow>;
 };
+
+export function orderGrantAudits(audits: Iterable<StoredGrantAuditEntry>): StoredGrantAuditEntry[] {
+  return [...audits].sort((left, right) => {
+    if (left.auditSequence === undefined && right.auditSequence !== undefined) return -1;
+    if (left.auditSequence !== undefined && right.auditSequence === undefined) return 1;
+    return (
+      (left.auditSequence ?? 0) - (right.auditSequence ?? 0) ||
+      left.createdAtMs - right.createdAtMs ||
+      left.auditId.localeCompare(right.auditId)
+    );
+  });
+}
+
+export function grantStateMaterial(
+  grants: Iterable<StoredGrant>,
+  sessions: Iterable<StoredGrantSession>,
+  audits: Iterable<StoredGrantAuditEntry>,
+  telemetry: Iterable<GrantAdmissionTelemetry> = [],
+  globalWindows: Iterable<GrantAdmissionGlobalWindow> = [],
+): string {
+  return JSON.stringify({
+    grants: [...grants].sort((left, right) => left.grantId.localeCompare(right.grantId)),
+    sessions: [...sessions].sort((left, right) => left.sessionId.localeCompare(right.sessionId)),
+    audits: orderGrantAudits(audits),
+    telemetry: [...telemetry].sort((left, right) =>
+      `${left.mode}:${left.sourceDigest}`.localeCompare(`${right.mode}:${right.sourceDigest}`),
+    ),
+    globalWindows: [...globalWindows].sort((left, right) => left.mode.localeCompare(right.mode)),
+  });
+}
+
+export function grantAdmissionStateMaterial(
+  telemetry: Iterable<GrantAdmissionTelemetry>,
+  globalWindows: Iterable<GrantAdmissionGlobalWindow>,
+): string {
+  return JSON.stringify({
+    telemetry: [...telemetry].sort((left, right) =>
+      `${left.mode}:${left.sourceDigest}`.localeCompare(`${right.mode}:${right.sourceDigest}`),
+    ),
+    globalWindows: [...globalWindows].sort((left, right) => left.mode.localeCompare(right.mode)),
+  });
+}
 
 export function validateGrantState(
   grants: Iterable<StoredGrant>,
@@ -40,6 +91,8 @@ export function validateGrantState(
   const keyRingFailure = validateKeyRing(context.keyRing);
   if (keyRingFailure !== null) return keyRingFailure;
   const auditEntries = [...audits];
+  const chainFailure = validateAuditChain(auditEntries);
+  if (chainFailure !== null) return chainFailure;
   if (context.auditProvenance !== undefined) {
     if (context.auditProvenance.size !== auditEntries.length) {
       return "Stored Grant Audit Trail provenance history is incomplete.";
@@ -74,6 +127,9 @@ export function validateGrantState(
       }
     }
   }
+
+  const telemetryFailure = validateAdmissionState(context);
+  if (telemetryFailure !== null) return telemetryFailure;
 
   const grantMap = new Map<string, StoredGrant>();
   for (const grant of grants) {
@@ -132,6 +188,42 @@ export function validateGrantState(
   return null;
 }
 
+function validateAuditChain(audits: readonly StoredGrantAuditEntry[]): string | null {
+  const byGrant = new Map<string, StoredGrantAuditEntry[]>();
+  for (const audit of audits) {
+    const entries = byGrant.get(audit.grantId) ?? [];
+    entries.push(audit);
+    byGrant.set(audit.grantId, entries);
+  }
+  for (const entries of byGrant.values()) {
+    const ordered = orderGrantAudits(entries);
+    const seenSequences = new Set<number>();
+    let sequenceStarted = false;
+    for (let index = 0; index < ordered.length; index += 1) {
+      const audit = ordered[index];
+      if (audit === undefined) continue;
+      if (audit.auditSequence === undefined || audit.auditSequence === null) {
+        if (sequenceStarted) return "Stored Grant Audit Trail sequence was downgraded.";
+        if ((audit.predecessorAuditId ?? null) !== null) {
+          return "Stored Grant Audit Trail legacy predecessor is invalid.";
+        }
+        continue;
+      }
+      sequenceStarted = true;
+      if (
+        !Number.isSafeInteger(audit.auditSequence) ||
+        audit.auditSequence !== index + 1 ||
+        seenSequences.has(audit.auditSequence) ||
+        (audit.predecessorAuditId ?? null) !== (ordered[index - 1]?.auditId ?? null)
+      ) {
+        return "Stored Grant Audit Trail sequence or predecessor is invalid.";
+      }
+      seenSequences.add(audit.auditSequence);
+    }
+  }
+  return null;
+}
+
 function validateGrantAuditCompleteness(
   grant: StoredGrant,
   audits: readonly StoredGrantAuditEntry[],
@@ -172,10 +264,7 @@ function validateGrantAuditCompleteness(
     return "Stored Grant creation evidence is inconsistent.";
   }
 
-  const ordered = [...audits].sort(
-    (left, right) =>
-      left.createdAtMs - right.createdAtMs || left.auditId.localeCompare(right.auditId),
-  );
+  const ordered = orderGrantAudits(audits);
   let expectedStatus: StoredGrant["status"] = creation.afterStatus;
   let expectedVersion = creation.grantVersion;
   let expectedScope = creation.scope;
@@ -222,7 +311,17 @@ function validateGrantAuditCompleteness(
     if (audit.action === "grant-expired") expiredEvidence = true;
   }
   for (const audit of ordered) {
-    if (audit.action === "grant-created" || stateActions.has(audit.action)) continue;
+    if (
+      audit.action === "grant-created" ||
+      stateActions.has(audit.action) ||
+      audit.action === "grant-code-created" ||
+      audit.action === "grant-code-replaced" ||
+      audit.action === "grant-code-disabled" ||
+      audit.action === "grant-code-erased-expiry" ||
+      audit.action === "grant-code-erased-game-lock" ||
+      audit.action === "grant-code-admitted"
+    )
+      continue;
     const historicalScope = scopeByVersion.get(audit.grantVersion);
     if (historicalScope !== undefined && !sameScope(historicalScope, audit.scope)) {
       return "Stored Grant Audit Trail scope evidence is inconsistent.";
@@ -262,6 +361,199 @@ function validateGrantAuditCompleteness(
   if (expiredEvidence !== (grant.status === "expired")) {
     return "Stored Grant Audit Trail terminal expiry evidence is incomplete.";
   }
+  const gameLockCodeFailure = validateGameLockCodeEvidence(
+    grant,
+    ordered,
+    sessions,
+    scopeByVersion,
+  );
+  if (gameLockCodeFailure !== null) return gameLockCodeFailure;
+
+  let expectedCodeState: "absent" | "present" | "disabled" | "erased" = "absent";
+  let expectedCodeFingerprint: string | null = null;
+  let expectedCodeFormatVersion: number | null = null;
+  let expectedCodeEncryptionKeyVersion: string | null = null;
+  let expectedCodeLookupKeyVersion: string | null = null;
+  for (const audit of ordered) {
+    const isCodeAction =
+      audit.action === "grant-code-created" ||
+      audit.action === "grant-code-replaced" ||
+      audit.action === "grant-code-disabled" ||
+      audit.action === "grant-code-admitted";
+    const hasCodeOnlyEvidence =
+      audit.codeFormatVersion !== undefined ||
+      audit.codeEncryptionKeyVersion !== undefined ||
+      audit.codeLookupKeyVersion !== undefined ||
+      audit.codeStateBefore !== undefined ||
+      audit.codeState !== undefined ||
+      audit.previousCodeFingerprint !== undefined;
+    const isCodeErasure =
+      audit.action === "grant-code-erased-expiry" || audit.action === "grant-code-erased-game-lock";
+    if (isCodeAction) {
+      if (audit.credentialKind !== GRANT_CODE_KIND)
+        return "Stored Grant-Code Audit Trail credential kind is invalid.";
+      if (
+        audit.codeStateBefore === null ||
+        audit.codeStateBefore === undefined ||
+        audit.codeState === null ||
+        audit.codeState === undefined ||
+        audit.codeFormatVersion !== GRANT_CODE_FORMAT_VERSION ||
+        audit.codeEncryptionKeyVersion === null ||
+        audit.codeEncryptionKeyVersion === undefined ||
+        audit.codeLookupKeyVersion === null ||
+        audit.codeLookupKeyVersion === undefined
+      ) {
+        return "Stored Grant-Code Audit Trail state evidence is incomplete.";
+      }
+      if (audit.action === "grant-code-created") {
+        if (
+          (expectedCodeState !== "absent" &&
+            expectedCodeState !== "disabled" &&
+            expectedCodeState !== "erased") ||
+          audit.codeStateBefore !== expectedCodeState ||
+          audit.codeState !== "present" ||
+          (expectedCodeState === "absent"
+            ? (audit.previousCodeFingerprint ?? null) !== null
+            : audit.previousCodeFingerprint !== expectedCodeFingerprint)
+        ) {
+          return "Stored Grant-Code creation continuity is invalid.";
+        }
+        expectedCodeFingerprint = audit.credentialFingerprint;
+        expectedCodeFormatVersion = audit.codeFormatVersion;
+        expectedCodeEncryptionKeyVersion = audit.codeEncryptionKeyVersion;
+        expectedCodeLookupKeyVersion = audit.codeLookupKeyVersion;
+      } else if (audit.action === "grant-code-replaced") {
+        const auditIndex = ordered.findIndex((candidate) => candidate.auditId === audit.auditId);
+        if (
+          expectedCodeState !== "present" ||
+          audit.codeStateBefore !== "present" ||
+          audit.codeState !== "present" ||
+          (audit.previousCodeFingerprint ?? null) !== expectedCodeFingerprint ||
+          audit.credentialFingerprint === null ||
+          (audit.credentialFingerprint === expectedCodeFingerprint &&
+            !ordered
+              .slice(0, auditIndex)
+              .some(
+                (candidate) =>
+                  candidate.action === "credential-rotated" &&
+                  candidate.grantVersion === audit.grantVersion,
+              ))
+        ) {
+          return "Stored Grant-Code replacement continuity is invalid.";
+        }
+        if (
+          expectedCodeFormatVersion === null ||
+          (audit.codeFormatVersion !== expectedCodeFormatVersion &&
+            audit.codeFormatVersion !== GRANT_CODE_FORMAT_VERSION)
+        )
+          return "Stored Grant-Code replacement envelope is invalid.";
+        expectedCodeFingerprint = audit.credentialFingerprint;
+        expectedCodeFormatVersion = audit.codeFormatVersion;
+        expectedCodeEncryptionKeyVersion = audit.codeEncryptionKeyVersion;
+        expectedCodeLookupKeyVersion = audit.codeLookupKeyVersion;
+      } else if (audit.action === "grant-code-disabled") {
+        const auditIndex = ordered.findIndex((candidate) => candidate.auditId === audit.auditId);
+        const previousCodeFingerprint =
+          [...ordered]
+            .slice(0, auditIndex)
+            .reverse()
+            .find(
+              (candidate) =>
+                candidate.action === "grant-code-created" ||
+                candidate.action === "grant-code-replaced",
+            )?.credentialFingerprint ?? null;
+        if (
+          expectedCodeState !== "present" ||
+          audit.codeStateBefore !== "present" ||
+          audit.codeState !== "disabled" ||
+          (audit.previousCodeFingerprint ?? null) !== previousCodeFingerprint ||
+          audit.credentialFingerprint !== previousCodeFingerprint
+        ) {
+          return "Stored Grant-Code disable continuity is invalid.";
+        }
+        if (
+          audit.codeFormatVersion !== expectedCodeFormatVersion ||
+          audit.codeEncryptionKeyVersion !== expectedCodeEncryptionKeyVersion ||
+          audit.codeLookupKeyVersion !== expectedCodeLookupKeyVersion
+        )
+          return "Stored Grant-Code disable envelope is invalid.";
+        expectedCodeFingerprint = previousCodeFingerprint;
+        expectedCodeEncryptionKeyVersion = null;
+        expectedCodeLookupKeyVersion = null;
+      } else if (
+        expectedCodeState !== "present" ||
+        audit.codeStateBefore !== "present" ||
+        audit.codeState !== "present" ||
+        (audit.previousCodeFingerprint ?? null) !== null ||
+        audit.credentialFingerprint !== expectedCodeFingerprint
+      ) {
+        return "Stored Grant-Code admission continuity is invalid.";
+      }
+      if (
+        audit.action === "grant-code-admitted" &&
+        (audit.codeFormatVersion !== expectedCodeFormatVersion ||
+          audit.codeEncryptionKeyVersion !== expectedCodeEncryptionKeyVersion ||
+          audit.codeLookupKeyVersion !== expectedCodeLookupKeyVersion)
+      )
+        return "Stored Grant-Code admission envelope is invalid.";
+      expectedCodeState = audit.codeState;
+    } else if (isCodeErasure) {
+      if (
+        audit.credentialKind !== GRANT_CODE_KIND ||
+        audit.codeState !== "erased" ||
+        audit.codeStateBefore !== expectedCodeState ||
+        audit.credentialFingerprint === null ||
+        audit.credentialFingerprint !== audit.previousCodeFingerprint ||
+        (expectedCodeState !== "present" && expectedCodeState !== "disabled") ||
+        (audit.previousCodeFingerprint ?? null) !== expectedCodeFingerprint
+      ) {
+        return "Stored Grant-Code expiry continuity is invalid.";
+      }
+      if (
+        audit.codeFormatVersion !== expectedCodeFormatVersion ||
+        (expectedCodeState === "present" &&
+          (audit.codeEncryptionKeyVersion !== expectedCodeEncryptionKeyVersion ||
+            audit.codeLookupKeyVersion !== expectedCodeLookupKeyVersion)) ||
+        (expectedCodeState === "disabled" &&
+          (audit.codeEncryptionKeyVersion !== null || audit.codeLookupKeyVersion !== null))
+      )
+        return "Stored Grant-Code expiry envelope is invalid.";
+      expectedCodeState = "erased";
+      expectedCodeFormatVersion = GRANT_CODE_FORMAT_VERSION;
+      expectedCodeEncryptionKeyVersion = null;
+      expectedCodeLookupKeyVersion = null;
+    } else if (hasCodeOnlyEvidence) {
+      return "Stored Grant-Code state leaked into an unrelated audit action.";
+    } else if (audit.credentialKind !== GRANT_CREDENTIAL_KIND) {
+      return "Stored non-Code Grant Audit Trail credential kind is invalid.";
+    }
+  }
+  const storedCodeState = grant.code?.state ?? "absent";
+  if (storedCodeState !== expectedCodeState) {
+    return "Stored Grant-Code Audit Trail does not reconstruct current code state.";
+  }
+  if (
+    grant.code !== undefined &&
+    grant.code !== null &&
+    grant.code.fingerprint !== expectedCodeFingerprint
+  ) {
+    return "Stored Grant-Code Audit Trail does not reconstruct current code fingerprint.";
+  }
+  if (grant.code !== undefined && grant.code !== null) {
+    if (
+      grant.code.formatVersion !== expectedCodeFormatVersion ||
+      grant.code.encryptionKeyVersion !== expectedCodeEncryptionKeyVersion ||
+      grant.code.lookupKeyVersion !== expectedCodeLookupKeyVersion
+    )
+      return "Stored Grant-Code Audit Trail does not reconstruct the current code envelope.";
+  } else if (
+    expectedCodeState === "present" ||
+    expectedCodeFormatVersion !== null ||
+    expectedCodeEncryptionKeyVersion !== null ||
+    expectedCodeLookupKeyVersion !== null
+  ) {
+    return "Stored Grant-Code Audit Trail lost current code evidence.";
+  }
 
   const grantSessionAudits = new Map<string, StoredGrantAuditEntry[]>();
   for (const audit of ordered) {
@@ -291,19 +583,296 @@ function validateGrantAuditCompleteness(
       (audit) =>
         audit.action === "session-replaced" && audit.replacedSessionId === session.sessionId,
     );
-    const grantWideTermination = ordered.some(
-      (audit) =>
+    const grantWideTermination = ordered.some((audit) => {
+      if (
         audit.action === "grant-expired" ||
         audit.action === "grant-revoked" ||
         audit.action === "grant-reactivated" ||
-        audit.action === "grant-metadata-updated" ||
-        audit.action === "credential-rotated",
-    );
+        audit.action === "grant-metadata-updated"
+      )
+        return true;
+      return audit.action === "credential-rotated" && audit.grantVersion !== session.grantVersion;
+    });
     if (!hasDirectTermination && !wasReplaced && !grantWideTermination) {
       return "Stored Grant Audit Trail is missing session revocation evidence.";
     }
   }
   return null;
+}
+
+function validateGameLockCodeEvidence(
+  grant: StoredGrant,
+  ordered: readonly StoredGrantAuditEntry[],
+  sessions: ReadonlyMap<string, StoredGrantSession>,
+  scopeByVersion: ReadonlyMap<string, GrantScope>,
+): string | null {
+  const timeline = [...ordered].sort(
+    (left, right) =>
+      (left.auditSequence ?? Number.MAX_SAFE_INTEGER) -
+        (right.auditSequence ?? Number.MAX_SAFE_INTEGER) ||
+      left.createdAtMs - right.createdAtMs ||
+      left.auditId.localeCompare(right.auditId),
+  );
+  const lockAudits = timeline.filter((audit) => audit.action === "grant-code-erased-game-lock");
+  if (lockAudits.length === 0) {
+    if (grant.status === "active" && grant.code?.state === "erased")
+      return "Stored Grant Code erasure evidence is missing.";
+    return null;
+  }
+  if (grant.grantType !== "control") return "Stored Grant Code erasure evidence is invalid.";
+
+  let codeState: "absent" | "present" | "disabled" | "erased" = "absent";
+  let codeFingerprint: string | null = null;
+  let previousLockIndex = -1;
+  const replayedSessions = new Map<string, ReplayedGrantSession>();
+  let preLockSessions = new Map<string, ReplayedGrantSession>();
+  for (const [auditIndex, audit] of timeline.entries()) {
+    const sessionReplayFailure = replayGrantSessionAudit(
+      replayedSessions,
+      audit,
+      grant.grantId,
+      sessions,
+      false,
+    );
+    if (sessionReplayFailure !== null) return sessionReplayFailure;
+    if (!(audit.action === "session-terminated" && audit.terminalReason === "game-locked")) {
+      const preLockReplayFailure = replayGrantSessionAudit(
+        preLockSessions,
+        audit,
+        grant.grantId,
+        sessions,
+        true,
+      );
+      if (preLockReplayFailure !== null) return preLockReplayFailure;
+    }
+    if (audit.action === "grant-code-created" || audit.action === "grant-code-replaced") {
+      if (audit.codeState !== "present" || audit.credentialFingerprint === null)
+        return "Stored Grant Code creation evidence is incomplete.";
+      const previousFingerprint = audit.previousCodeFingerprint ?? null;
+      if (previousFingerprint === null) {
+        if (codeState !== "absent" && codeState !== "erased")
+          return "Stored Grant Code fingerprint history is invalid.";
+      } else if (
+        codeFingerprint !== previousFingerprint ||
+        (codeState !== "present" && codeState !== "disabled" && codeState !== "erased") ||
+        (audit.credentialFingerprint === previousFingerprint &&
+          !timeline
+            .slice(0, auditIndex)
+            .some(
+              (candidate) =>
+                candidate.action === "credential-rotated" &&
+                candidate.grantVersion === audit.grantVersion,
+            ))
+      ) {
+        return "Stored Grant Code fingerprint history is invalid.";
+      }
+      if (
+        (audit.action === "grant-code-replaced" &&
+          (previousFingerprint === null || codeState !== "present")) ||
+        (audit.action === "grant-code-created" &&
+          previousFingerprint !== null &&
+          codeState !== "disabled" &&
+          codeState !== "erased")
+      )
+        return "Stored Grant Code replacement history is invalid.";
+      codeState = "present";
+      codeFingerprint = audit.credentialFingerprint;
+      continue;
+    }
+    if (audit.action === "grant-code-disabled") {
+      if (
+        audit.codeState !== "disabled" ||
+        audit.credentialFingerprint === null ||
+        (audit.previousCodeFingerprint !== undefined &&
+          audit.previousCodeFingerprint !== null &&
+          audit.previousCodeFingerprint !== codeFingerprint) ||
+        codeState !== "present" ||
+        codeFingerprint !== audit.credentialFingerprint
+      )
+        return "Stored Grant Code disable evidence is incomplete.";
+      codeState = "disabled";
+      continue;
+    }
+    if (audit.action !== "grant-code-erased-game-lock") continue;
+
+    if (
+      audit.terminalReason !== "game-locked" ||
+      audit.eventGameId === null ||
+      !validateOpaqueIdentifier(audit.eventGameId, "eventGameId").ok ||
+      audit.credentialKind !== GRANT_CODE_KIND ||
+      audit.codeFormatVersion !== GRANT_CODE_FORMAT_VERSION ||
+      audit.codeEncryptionKeyVersion === null ||
+      audit.codeLookupKeyVersion === null ||
+      audit.codeStateBefore !== "present" ||
+      audit.codeState !== "erased" ||
+      audit.credentialFingerprint === null ||
+      audit.previousCodeFingerprint !== audit.credentialFingerprint ||
+      (audit.beforeStatus !== "active" && audit.beforeStatus !== "disabled") ||
+      audit.afterStatus !== audit.beforeStatus ||
+      audit.sessionId !== null ||
+      audit.replacedSessionId !== null ||
+      codeState !== "present" ||
+      codeFingerprint !== audit.credentialFingerprint
+    )
+      return "Stored Grant Code erasure evidence is incomplete.";
+    const expectedScope = scopeByVersion.get(audit.grantVersion);
+    if (expectedScope === undefined || !sameScope(expectedScope, audit.scope))
+      return "Stored Grant Code erasure scope evidence is invalid.";
+
+    const lockIndex = timeline.indexOf(audit);
+    const interval = timeline.slice(previousLockIndex + 1, lockIndex);
+    const activeSessionIds = new Set(
+      [...preLockSessions.entries()]
+        .filter(
+          ([, session]) =>
+            session.active &&
+            session.grantVersion === audit.grantVersion &&
+            session.eventGameId === audit.eventGameId,
+        )
+        .map(([sessionId]) => sessionId),
+    );
+    const gameLockedTerminations = interval.filter(
+      (candidate) =>
+        candidate.action === "session-terminated" &&
+        candidate.terminalReason === "game-locked" &&
+        candidate.grantId === grant.grantId &&
+        candidate.grantVersion === audit.grantVersion &&
+        candidate.eventGameId === audit.eventGameId,
+    );
+    const terminatedSessionIds = new Set<string>();
+    for (const terminal of gameLockedTerminations) {
+      if (terminal.sessionId === null || terminatedSessionIds.has(terminal.sessionId))
+        return "Stored Grant Code erasure terminal session evidence is invalid.";
+      terminatedSessionIds.add(terminal.sessionId);
+    }
+    if (
+      gameLockedTerminations.length !== activeSessionIds.size ||
+      terminatedSessionIds.size !== activeSessionIds.size ||
+      [...activeSessionIds].some((sessionId) => !terminatedSessionIds.has(sessionId))
+    )
+      return "Stored Grant Code erasure session evidence is incomplete.";
+    codeState = "erased";
+    previousLockIndex = lockIndex;
+    preLockSessions = cloneReplayedGrantSessions(replayedSessions);
+  }
+
+  if (grant.code === undefined || grant.code === null) {
+    if (codeState !== "absent") return "Stored current Grant Code is missing.";
+  } else if (grant.code.state !== codeState || grant.code.fingerprint !== codeFingerprint) {
+    return "Stored current Grant Code does not match erasure evidence.";
+  }
+  return null;
+}
+
+type ReplayedGrantSession = {
+  grantVersion: string;
+  eventGameId: string;
+  active: boolean;
+};
+
+function replayGrantSessionAudit(
+  replayed: Map<string, ReplayedGrantSession>,
+  audit: StoredGrantAuditEntry,
+  grantId: string,
+  sessions: ReadonlyMap<string, StoredGrantSession>,
+  ignoreGameLockTermination: boolean,
+): string | null {
+  if (audit.grantId !== grantId) return null;
+  if (audit.action === "session-admitted" || audit.action === "session-replaced") {
+    if (
+      audit.sessionId === null ||
+      audit.eventGameId === null ||
+      !validateOpaqueIdentifier(audit.eventGameId, "eventGameId").ok ||
+      (audit.action === "session-admitted" && audit.replacedSessionId !== null) ||
+      (audit.action === "session-replaced" && audit.replacedSessionId === null)
+    )
+      return "Stored Grant Session admission evidence is invalid.";
+    const stored = sessions.get(audit.sessionId);
+    if (
+      stored === undefined ||
+      stored.grantId !== grantId ||
+      stored.grantVersion !== audit.grantVersion ||
+      replayed.has(audit.sessionId)
+    )
+      return "Stored Grant Session admission history is invalid.";
+    if (audit.replacedSessionId !== null) {
+      const replaced = replayed.get(audit.replacedSessionId);
+      if (
+        replaced === undefined ||
+        !replaced.active ||
+        replaced.grantVersion !== audit.grantVersion
+      )
+        return "Stored Grant Session replacement history is invalid.";
+      replaced.active = false;
+    }
+    replayed.set(audit.sessionId, {
+      grantVersion: audit.grantVersion,
+      eventGameId: audit.eventGameId,
+      active: true,
+    });
+    return null;
+  }
+  if (audit.action === "session-revoked") {
+    if (audit.sessionId === null) return "Stored Grant Session revocation evidence is invalid.";
+    const session = replayed.get(audit.sessionId);
+    if (session === undefined || !session.active)
+      return "Stored Grant Session revocation history is invalid.";
+    if (audit.eventGameId !== null && audit.eventGameId !== session.eventGameId)
+      return "Stored Grant Session revocation Game binding is invalid.";
+    session.active = false;
+    return null;
+  }
+  if (audit.action === "session-terminated") {
+    if (ignoreGameLockTermination && audit.terminalReason === "game-locked") return null;
+    if (audit.sessionId === null || audit.eventGameId === null || audit.terminalReason === null)
+      return "Stored terminal Grant Session evidence is incomplete.";
+    const session = replayed.get(audit.sessionId);
+    if (session === undefined || !session.active || session.eventGameId !== audit.eventGameId)
+      return "Stored terminal Grant Session history is invalid.";
+    session.active = false;
+    return null;
+  }
+  if (audit.action === "session-switched") {
+    if (
+      audit.sessionId === null ||
+      audit.previousEventGameId === null ||
+      audit.eventGameId === null ||
+      audit.previousEventGameId === audit.eventGameId
+    )
+      return "Stored Grant Session switch evidence is invalid.";
+    const session = replayed.get(audit.sessionId);
+    if (
+      session === undefined ||
+      !session.active ||
+      session.eventGameId !== audit.previousEventGameId
+    )
+      return "Stored Grant Session switch history is invalid.";
+    session.eventGameId = audit.eventGameId;
+    return null;
+  }
+  if (
+    audit.action === "grant-expired" ||
+    audit.action === "grant-revoked" ||
+    audit.action === "grant-reactivated" ||
+    audit.action === "grant-metadata-updated"
+  ) {
+    for (const session of replayed.values()) session.active = false;
+  } else if (audit.action === "credential-rotated") {
+    // Key rewraps retain the Grant version and its live sessions. Full
+    // credential rotation advances the version and revokes old sessions.
+    for (const session of replayed.values()) {
+      if (session.active && session.grantVersion !== audit.grantVersion) session.active = false;
+    }
+  }
+  return null;
+}
+
+function cloneReplayedGrantSessions(
+  sessions: ReadonlyMap<string, ReplayedGrantSession>,
+): Map<string, ReplayedGrantSession> {
+  return new Map(
+    [...sessions.entries()].map(([sessionId, session]) => [sessionId, { ...session }]),
+  );
 }
 
 function validateGrant(grant: StoredGrant, context: GrantStateValidationContext): string | null {
@@ -348,7 +917,7 @@ function validateGrant(grant: StoredGrant, context: GrantStateValidationContext)
     } else if (deepCredentialValidation && !isBase64UrlBytes(credential.fingerprint, 32)) {
       return "Stored erased Grant fingerprint is malformed.";
     }
-    return null;
+    return validateStoredGrantCode(grant, context);
   }
 
   if (
@@ -409,7 +978,7 @@ function validateGrant(grant: StoredGrant, context: GrantStateValidationContext)
       return "Stored Grant credential authentication failed.";
     }
   }
-  return null;
+  return validateStoredGrantCode(grant, context);
 }
 
 function validateSession(
@@ -460,6 +1029,109 @@ function validateSession(
   return null;
 }
 
+function validateStoredGrantCode(
+  grant: StoredGrant,
+  context: GrantStateValidationContext,
+): string | null {
+  const code = grant.code;
+  if (code === undefined || code === null) return null;
+  if (
+    !["present", "disabled", "erased"].includes(code.state) ||
+    code.formatVersion !== 1 ||
+    code.kind !== "manual-code" ||
+    !isBase64UrlBytes(code.fingerprint, 32)
+  )
+    return "Stored Grant Code metadata is invalid.";
+  const hasMaterial =
+    code.encryptionKeyVersion !== null &&
+    code.lookupKeyVersion !== null &&
+    code.iv !== null &&
+    code.ciphertext !== null &&
+    code.tag !== null &&
+    code.lookupDigest !== null;
+  if ((code.state === "present") !== hasMaterial)
+    return "Stored Grant Code material state is invalid.";
+  if (!hasMaterial) return null;
+  if (
+    context.keyRing !== undefined &&
+    (!hasAesKey(context.keyRing.encryption.keys, code.encryptionKeyVersion) ||
+      code.lookupKeyVersion !== context.keyRing.audit.currentVersion ||
+      !hasKey(context.keyRing.audit.keys, code.lookupKeyVersion, 32) ||
+      !isBase64UrlBytes(code.iv, 12) ||
+      !isBase64UrlAtLeast(code.ciphertext, 1) ||
+      !isBase64UrlBytes(code.tag, 16) ||
+      !isBase64UrlBytes(code.lookupDigest, 32))
+  )
+    return "Stored Grant Code material is malformed.";
+  if (code.state === "present") {
+    if (context.environmentId === undefined || context.keyRing === undefined) {
+      return "Grant-Code authentication context is not configured.";
+    }
+    const binding = {
+      environmentId: context.environmentId,
+      grantId: grant.grantId,
+      grantType: grant.grantType,
+      grantVersion: grant.grantVersion,
+      scope: grant.scope,
+    };
+    const codeValue = decryptGrantCode(code, binding, context.keyRing);
+    if (
+      codeValue === null ||
+      code.lookupKeyVersion !== context.keyRing.audit.currentVersion ||
+      grantCodeLookupDigest(codeValue, context.keyRing, code.lookupKeyVersion) !==
+        code.lookupDigest ||
+      grantCodeFingerprint(codeValue, context.keyRing, code.lookupKeyVersion) !== code.fingerprint
+    ) {
+      return "Stored Grant Code authentication failed.";
+    }
+  }
+  return null;
+}
+
+function validateAdmissionState(context: GrantStateValidationContext): string | null {
+  const telemetry = [...(context.admissionTelemetry ?? [])];
+  const sources = new Set<string>();
+  for (const entry of telemetry) {
+    if (
+      (entry.mode !== "qr" && entry.mode !== "code") ||
+      !isBase64UrlBytes(entry.sourceDigest, 32) ||
+      sources.has(`${entry.mode}:${entry.sourceDigest}`) ||
+      !Number.isSafeInteger(entry.failedAttempts) ||
+      entry.failedAttempts < 0 ||
+      entry.failedAttempts > GRANT_ADMISSION_SOURCE_FAILURE_SATURATION ||
+      !Number.isSafeInteger(entry.lastAttemptAtMs) ||
+      entry.lastAttemptAtMs < 0 ||
+      (entry.delayUntilMs !== null &&
+        (!Number.isSafeInteger(entry.delayUntilMs) ||
+          entry.delayUntilMs < entry.lastAttemptAtMs)) ||
+      (entry.lastSuccessAtMs !== null &&
+        (!Number.isSafeInteger(entry.lastSuccessAtMs) ||
+          entry.lastSuccessAtMs < 0 ||
+          entry.lastSuccessAtMs > entry.lastAttemptAtMs))
+    ) {
+      return "Stored Grant admission telemetry is invalid.";
+    }
+    sources.add(`${entry.mode}:${entry.sourceDigest}`);
+  }
+  const windows = [...(context.admissionGlobalWindows ?? [])];
+  const modes = new Set<string>();
+  for (const window of windows) {
+    if (
+      (window.mode !== "qr" && window.mode !== "code") ||
+      modes.has(window.mode) ||
+      !Number.isSafeInteger(window.windowStartedAtMs) ||
+      window.windowStartedAtMs < 0 ||
+      !Number.isSafeInteger(window.attemptCount) ||
+      window.attemptCount < 0 ||
+      window.attemptCount > GRANT_ADMISSION_GLOBAL_ATTEMPT_LIMITS[window.mode]
+    ) {
+      return "Stored Grant admission global throttle state is invalid.";
+    }
+    modes.add(window.mode);
+  }
+  return null;
+}
+
 function validateAudit(
   audit: StoredGrantAuditEntry,
   grant: StoredGrant,
@@ -489,6 +1161,12 @@ function validateAudit(
     "control-action-rejected",
     "control-action-retry-later",
     "control-action-dependency-blocked",
+    "grant-code-created",
+    "grant-code-replaced",
+    "grant-code-disabled",
+    "grant-code-erased-expiry",
+    "grant-code-erased-game-lock",
+    "grant-code-admitted",
   ];
   const allowedTerminalReasons: readonly TerminalGrantSessionReason[] = [
     "game-locked",
@@ -507,7 +1185,7 @@ function validateAudit(
     audit.createdAtMs < 0 ||
     audit.grantType !== grant.grantType ||
     !validateGrantScope(audit.grantType, audit.scope).ok ||
-    audit.credentialKind !== GRANT_CREDENTIAL_KIND ||
+    (audit.credentialKind !== GRANT_CREDENTIAL_KIND && audit.credentialKind !== GRANT_CODE_KIND) ||
     (audit.beforeStatus !== null && !isStoredGrantStatus(audit.beforeStatus)) ||
     (audit.afterStatus !== null && !isStoredGrantStatus(audit.afterStatus)) ||
     (audit.beforeExpiresAtMs !== null &&
@@ -518,6 +1196,24 @@ function validateAudit(
   ) {
     return "Stored Grant Audit Trail provenance is invalid.";
   }
+  const codeOnlyFieldsPresent =
+    audit.codeFormatVersion !== undefined ||
+    audit.codeEncryptionKeyVersion !== undefined ||
+    audit.codeLookupKeyVersion !== undefined ||
+    audit.codeStateBefore !== undefined ||
+    audit.codeState !== undefined ||
+    audit.previousCodeFingerprint !== undefined;
+  const codeAction =
+    audit.action === "grant-code-created" ||
+    audit.action === "grant-code-replaced" ||
+    audit.action === "grant-code-disabled" ||
+    audit.action === "grant-code-erased-expiry" ||
+    audit.action === "grant-code-erased-game-lock" ||
+    audit.action === "grant-code-admitted";
+  if (codeAction !== (audit.credentialKind === GRANT_CODE_KIND))
+    return "Stored Grant Audit Trail credential kind does not match its action.";
+  if (!codeAction && codeOnlyFieldsPresent)
+    return "Stored non-Code Grant Audit Trail contains Code-only evidence.";
   if (audit.action === "session-terminated") {
     if (audit.terminalReason === null || audit.sessionId === null || audit.eventGameId === null)
       return "Stored terminal Grant Audit Trail evidence is incomplete.";
@@ -529,6 +1225,14 @@ function validateAudit(
       session.eventGameId !== audit.eventGameId
     )
       return "Stored terminal Grant Audit Trail provenance is invalid.";
+  } else if (
+    audit.action === "grant-code-erased-game-lock" &&
+    audit.terminalReason === "game-locked" &&
+    audit.eventGameId !== null &&
+    validateOpaqueIdentifier(audit.eventGameId, "eventGameId").ok
+  ) {
+    // The Game-Lock Code evidence carries the same terminal reason as the
+    // corresponding session evidence; its complete relationship is checked below.
   } else if (audit.terminalReason !== null) {
     return "Stored non-terminal Grant Audit Trail evidence has a terminal reason.";
   }

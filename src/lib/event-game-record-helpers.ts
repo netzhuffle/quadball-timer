@@ -821,6 +821,7 @@ export function constraintToConflict(
     case "replay-attempt-id":
     case "replay-receipt-id":
     case "replay-receipt-digest":
+    case "grant-code-digest":
       return "content-conflict";
   }
   return "content-conflict";

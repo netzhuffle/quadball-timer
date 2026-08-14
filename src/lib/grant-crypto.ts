@@ -1,4 +1,10 @@
-import { createCipheriv, createDecipheriv, createHmac, timingSafeEqual } from "node:crypto";
+import {
+  createCipheriv,
+  createDecipheriv,
+  createHash,
+  createHmac,
+  timingSafeEqual,
+} from "node:crypto";
 import {
   GRANT_CREDENTIAL_FORMAT_VERSION,
   GRANT_CREDENTIAL_KIND,
@@ -304,6 +310,22 @@ function computeGrantAuditIntegrityTagWithPreviousEventGameId(
           contentFingerprint: entry.contentFingerprint ?? null,
           outcomeDetail: entry.outcomeDetail ?? null,
         }),
+    ...(entry.auditSequence === undefined
+      ? {}
+      : {
+          auditSequence: entry.auditSequence,
+          predecessorAuditId: entry.predecessorAuditId ?? null,
+        }),
+    ...(entry.codeState === undefined
+      ? {}
+      : {
+          codeFormatVersion: entry.codeFormatVersion ?? null,
+          codeEncryptionKeyVersion: entry.codeEncryptionKeyVersion ?? null,
+          codeLookupKeyVersion: entry.codeLookupKeyVersion ?? null,
+          codeStateBefore: entry.codeStateBefore ?? null,
+          codeState: entry.codeState,
+          previousCodeFingerprint: entry.previousCodeFingerprint ?? null,
+        }),
     createdAtMs: entry.createdAtMs,
   });
   return `hmac-sha256-v1:${keyVersion}:${encodeBase64Url(
@@ -317,6 +339,36 @@ export function computeBrowserContextDigest(
   keyVersion = keyRing.lookup.currentVersion,
 ): string {
   return computeLookupDigest(`browser-context:${browserContext}`, keyRing, keyVersion);
+}
+
+export function computeGrantStateAnchor(
+  material: string,
+  keyRing: GrantKeyRing,
+  keyVersion = keyRing.audit.currentVersion,
+): { stateDigest: string; integrityTag: string } {
+  const stateDigest = createHash("sha256").update(material, "utf8").digest("hex");
+  const integrityTag = `hmac-sha256-v1:${keyVersion}:${encodeBase64Url(
+    hmac(
+      getKey(keyRing.audit.keys, keyVersion, HMAC_KEY_MIN_BYTES),
+      `grant-state-anchor-v1:${stateDigest}`,
+    ),
+  )}`;
+  return { stateDigest, integrityTag };
+}
+
+export function computeGrantAdmissionStateAnchor(
+  material: string,
+  keyRing: GrantKeyRing,
+  keyVersion = keyRing.audit.currentVersion,
+): { stateDigest: string; integrityTag: string } {
+  const stateDigest = createHash("sha256").update(material, "utf8").digest("hex");
+  const integrityTag = `hmac-sha256-v1:${keyVersion}:${encodeBase64Url(
+    hmac(
+      getKey(keyRing.audit.keys, keyVersion, HMAC_KEY_MIN_BYTES),
+      `grant-admission-state-anchor-v1:${stateDigest}`,
+    ),
+  )}`;
+  return { stateDigest, integrityTag };
 }
 
 export function listLookupKeyVersions(keyRing: GrantKeyRing): string[] {

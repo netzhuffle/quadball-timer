@@ -4,12 +4,20 @@ import {
   validateEventGameRecordRoot,
   type EventGameRecordRoot,
 } from "@/lib/foundation-record-types";
-import { computeAcceptanceIntegrityTag, computeGrantAuditIntegrityTag } from "@/lib/grant-crypto";
+import {
+  computeAcceptanceIntegrityTag,
+  computeGrantAdmissionStateAnchor,
+  computeGrantAuditIntegrityTag,
+  computeGrantStateAnchor,
+} from "@/lib/grant-crypto";
 import {
   cloneStoredGrant,
   cloneStoredGrantAuditEntry,
   cloneStoredGrantSession,
   type GrantKeyRing,
+  type GrantAdmissionGlobalWindow,
+  type GrantAdmissionMode,
+  type GrantAdmissionTelemetry,
   type ControlGrantScope,
   type StoredGrant,
   type StoredGrantAuditEntry,
@@ -35,6 +43,7 @@ import {
   type StoredEventCatalogEvent,
   type StoredEventCatalogGameDay,
   type EventCatalogAuditEntry,
+  type GrantAdmissionStateAnchor,
   isThenable,
   DURABLE_EVIDENCE_PROVENANCE,
 } from "@/lib/foundation-storage";
@@ -56,7 +65,14 @@ import {
   canonicalizeJson,
   parseStoredControlAction,
 } from "@/lib/event-game-actions";
-import { validateGrantState, type GrantStateValidationContext } from "@/lib/grant-state-validation";
+import {
+  grantAdmissionStateMaterial,
+  grantStateMaterial,
+  orderGrantAudits,
+  validateGrantState,
+  type GrantStateValidationContext,
+} from "@/lib/grant-state-validation";
+import { bindGrantAuditChain } from "@/lib/grant-audit-chain";
 
 type MemoryState = {
   roots: Map<string, StoredEventGameRecordRoot>;
@@ -79,6 +95,18 @@ type MemoryState = {
   events: Map<string, StoredEventCatalogEvent>;
   gameDays: Map<string, StoredEventCatalogGameDay>;
   eventAudits: Map<string, EventCatalogAuditEntry>;
+  grantStateAnchors: Map<string, MemoryGrantStateAnchor>;
+  grantAdmissionTelemetry: Map<string, GrantAdmissionTelemetry>;
+  grantAdmissionGlobalWindows: Map<GrantAdmissionMode, GrantAdmissionGlobalWindow>;
+  grantAdmissionStateAnchor: GrantAdmissionStateAnchor | null;
+  grantAdmissionAnchorInstalled: boolean;
+};
+
+type MemoryGrantStateAnchor = {
+  auditCount: number;
+  auditHeadId: string;
+  stateDigest: string;
+  integrityTag: string;
 };
 
 export function createInMemoryFoundationStorage(): FoundationStorage {
@@ -107,6 +135,11 @@ class InMemoryFoundationStorage implements FoundationStorage {
     events: new Map(),
     gameDays: new Map(),
     eventAudits: new Map(),
+    grantStateAnchors: new Map(),
+    grantAdmissionTelemetry: new Map(),
+    grantAdmissionGlobalWindows: new Map(),
+    grantAdmissionStateAnchor: null,
+    grantAdmissionAnchorInstalled: false,
   };
   private writerTail: Promise<void> = Promise.resolve();
   private closed = false;
@@ -138,6 +171,9 @@ class InMemoryFoundationStorage implements FoundationStorage {
         });
       }
       const undo: (() => void)[] = [];
+      const previousAnchors = new Map(this.state.grantStateAnchors);
+      const previousAdmissionAnchor = this.state.grantAdmissionStateAnchor;
+      const previousAdmissionAnchorInstalled = this.state.grantAdmissionAnchorInstalled;
       try {
         const result = work(
           createTransaction(this.state, undo, this.revision, this.grantValidationContext.keyRing),
@@ -145,10 +181,30 @@ class InMemoryFoundationStorage implements FoundationStorage {
         if (isThenable(result)) {
           throw new TypeError("Foundation storage transactions must complete synchronously.");
         }
+        const semanticFailure = validateGrantState(
+          this.state.grants.values(),
+          this.state.sessions.values(),
+          this.state.grantAudits.values(),
+          {
+            ...this.grantValidationContext,
+            auditProvenance: this.state.grantAuditProvenance,
+            auditIntegrityTags: this.state.grantAuditIntegrityTags,
+            admissionTelemetry: this.state.grantAdmissionTelemetry.values(),
+            admissionGlobalWindows: this.state.grantAdmissionGlobalWindows.values(),
+          },
+        );
+        if (semanticFailure !== null) throw new Error(semanticFailure);
+        this.rebuildGrantStateAnchors();
+        this.rebuildGrantAdmissionStateAnchor();
         this.revision += 1;
         return result;
       } catch (error) {
         for (const revert of undo.reverse()) revert();
+        this.state.grantStateAnchors.clear();
+        for (const [grantId, anchor] of previousAnchors)
+          this.state.grantStateAnchors.set(grantId, anchor);
+        this.state.grantAdmissionStateAnchor = previousAdmissionAnchor;
+        this.state.grantAdmissionAnchorInstalled = previousAdmissionAnchorInstalled;
         throw error;
       }
     });
@@ -363,7 +419,43 @@ class InMemoryFoundationStorage implements FoundationStorage {
   }
 
   setGrantKeyRing(keyRing: GrantKeyRing): void {
+    if (
+      !this.state.grantAdmissionAnchorInstalled &&
+      (this.state.grantAdmissionTelemetry.size > 0 ||
+        this.state.grantAdmissionGlobalWindows.size > 0)
+    ) {
+      throw new Error(
+        "Pending schema-17 Grant admission state cannot be keyed after rows were installed.",
+      );
+    }
+    const previousContext = this.grantValidationContext;
     this.grantValidationContext = { ...this.grantValidationContext, keyRing };
+    try {
+      if (!this.state.grantAdmissionAnchorInstalled) this.rebuildGrantAdmissionStateAnchor();
+    } catch (error) {
+      this.grantValidationContext = previousContext;
+      throw error;
+    }
+  }
+
+  grantStorageCapability() {
+    return {
+      name: "authenticated-grant-storage",
+      version: 2,
+      implementation: "hmac-anchored-atomic-v2",
+      transaction: [
+        "findGrantByCodeLookupDigest",
+        "readGrantAdmissionTelemetry",
+        "readGrantAdmissionGlobalWindow",
+        "writeGrantAdmissionTelemetry",
+        "writeGrantAdmissionGlobalWindow",
+        "pruneGrantAdmissionTelemetry",
+        "readGrantAdmissionStateAnchor",
+        "writeGrantAdmissionStateAnchor",
+      ],
+      maintenance: ["pruneGrantAdmissionTelemetry", "writeGrantAdmissionStateAnchor"],
+      anchors: ["readGrantAdmissionStateAnchor", "writeGrantAdmissionStateAnchor"],
+    } as const;
   }
 
   setGrantValidationContext(context: GrantStateValidationContext): void {
@@ -381,7 +473,15 @@ class InMemoryFoundationStorage implements FoundationStorage {
   }
 
   private grantStateFailure(): string | null {
-    return validateGrantState(
+    if (
+      (this.state.grants.size > 0 ||
+        this.state.grantAdmissionTelemetry.size > 0 ||
+        this.state.grantAdmissionGlobalWindows.size > 0) &&
+      this.grantValidationContext.keyRing === undefined
+    ) {
+      return "Grant key material is required for authoritative Grant state.";
+    }
+    const failure = validateGrantState(
       this.state.grants.values(),
       this.state.sessions.values(),
       this.state.grantAudits.values(),
@@ -389,8 +489,108 @@ class InMemoryFoundationStorage implements FoundationStorage {
         ...this.grantValidationContext,
         auditProvenance: this.state.grantAuditProvenance,
         auditIntegrityTags: this.state.grantAuditIntegrityTags,
+        admissionTelemetry: this.state.grantAdmissionTelemetry.values(),
+        admissionGlobalWindows: this.state.grantAdmissionGlobalWindows.values(),
       },
     );
+    if (failure !== null) return failure;
+    const keyRing = this.grantValidationContext.keyRing;
+    if (keyRing === undefined) {
+      if (this.state.grantAdmissionStateAnchor !== null)
+        return "Grant admission state anchor requires the Grant key ring.";
+      return this.state.grants.size === 0
+        ? null
+        : "Grant key material is required for authoritative Grant state.";
+    }
+    const admissionAnchor = this.state.grantAdmissionStateAnchor;
+    if (admissionAnchor === null) return "Grant admission state anchor evidence is incomplete.";
+    const admissionMaterial = grantAdmissionStateMaterial(
+      this.state.grantAdmissionTelemetry.values(),
+      this.state.grantAdmissionGlobalWindows.values(),
+    );
+    const keyVersion = admissionAnchor.integrityTag.split(":")[1];
+    const computedAdmission = computeGrantAdmissionStateAnchor(
+      admissionMaterial,
+      keyRing,
+      keyVersion,
+    );
+    if (
+      admissionAnchor.anchorVersion !== 1 ||
+      admissionAnchor.stateDigest !== computedAdmission.stateDigest ||
+      admissionAnchor.integrityTag !== computedAdmission.integrityTag
+    )
+      return "Grant admission state anchor integrity is invalid.";
+    if (this.state.grants.size === 0) return null;
+    const material = grantStateMaterial(
+      this.state.grants.values(),
+      this.state.sessions.values(),
+      this.state.grantAudits.values(),
+      this.state.grantAdmissionTelemetry.values(),
+      this.state.grantAdmissionGlobalWindows.values(),
+    );
+    for (const grant of this.state.grants.values()) {
+      const audits = orderGrantAudits(
+        [...this.state.grantAudits.values()].filter((entry) => entry.grantId === grant.grantId),
+      );
+      const head = audits.at(-1);
+      const stored = this.state.grantStateAnchors.get(grant.grantId);
+      if (head === undefined || stored === undefined)
+        return "Grant state anchor evidence is incomplete.";
+      const keyVersion = stored.integrityTag.split(":")[1];
+      const computed = computeGrantStateAnchor(material, keyRing, keyVersion);
+      if (
+        stored.auditCount !== audits.length ||
+        stored.auditHeadId !== head.auditId ||
+        stored.stateDigest !== computed.stateDigest ||
+        stored.integrityTag !== computed.integrityTag
+      )
+        return "Grant state anchor integrity is invalid.";
+    }
+    return null;
+  }
+
+  private rebuildGrantStateAnchors(): void {
+    if (this.state.grants.size === 0) return;
+    const keyRing = this.grantValidationContext.keyRing;
+    if (keyRing === undefined) throw new Error("Grant state anchors require the Grant key ring.");
+    const material = grantStateMaterial(
+      this.state.grants.values(),
+      this.state.sessions.values(),
+      this.state.grantAudits.values(),
+      this.state.grantAdmissionTelemetry.values(),
+      this.state.grantAdmissionGlobalWindows.values(),
+    );
+    for (const grant of this.state.grants.values()) {
+      const audits = orderGrantAudits(
+        [...this.state.grantAudits.values()].filter((entry) => entry.grantId === grant.grantId),
+      );
+      const head = audits.at(-1);
+      if (head === undefined) continue;
+      const computed = computeGrantStateAnchor(material, keyRing);
+      this.state.grantStateAnchors.set(grant.grantId, {
+        auditCount: audits.length,
+        auditHeadId: head.auditId,
+        stateDigest: computed.stateDigest,
+        integrityTag: computed.integrityTag,
+      });
+    }
+  }
+
+  private rebuildGrantAdmissionStateAnchor(): void {
+    const keyRing = this.grantValidationContext.keyRing;
+    if (keyRing === undefined) return;
+    const computed = computeGrantAdmissionStateAnchor(
+      grantAdmissionStateMaterial(
+        this.state.grantAdmissionTelemetry.values(),
+        this.state.grantAdmissionGlobalWindows.values(),
+      ),
+      keyRing,
+    );
+    this.state.grantAdmissionStateAnchor = {
+      anchorVersion: 1,
+      ...computed,
+    };
+    this.state.grantAdmissionAnchorInstalled = true;
   }
 }
 
@@ -1030,6 +1230,9 @@ function createTransaction(
     findGrantByCredentialLookupDigest(lookupDigest) {
       return findGrant(state.grants, (grant) => grant.credential.lookupDigest === lookupDigest);
     },
+    findGrantByCodeLookupDigest(lookupDigest) {
+      return findGrant(state.grants, (grant) => grant.code?.lookupDigest === lookupDigest);
+    },
     findActiveSessionByGrantAndContext(grantId, browserContextDigest) {
       return findSession(
         state.sessions,
@@ -1054,10 +1257,22 @@ function createTransaction(
         .map(cloneStoredGrantSession);
     },
     listGrantAudit(grantId) {
-      return [...state.grantAudits.values()]
-        .filter((entry) => entry.grantId === grantId)
-        .sort((left, right) => left.auditId.localeCompare(right.auditId))
-        .map(cloneStoredGrantAuditEntry);
+      return orderGrantAudits(
+        [...state.grantAudits.values()].filter((entry) => entry.grantId === grantId),
+      ).map(cloneStoredGrantAuditEntry);
+    },
+    readGrantAdmissionTelemetry(mode, sourceDigest) {
+      const value = state.grantAdmissionTelemetry.get(`${mode}:${sourceDigest}`);
+      return value === undefined ? null : structuredClone(value);
+    },
+    readGrantAdmissionGlobalWindow(mode) {
+      const value = state.grantAdmissionGlobalWindows.get(mode);
+      return value === undefined ? null : structuredClone(value);
+    },
+    readGrantAdmissionStateAnchor() {
+      return state.grantAdmissionStateAnchor === null
+        ? null
+        : structuredClone(state.grantAdmissionStateAnchor);
     },
     findAcceptanceBudget(bucketId) {
       const budget = state.acceptanceBudgets.get(bucketId);
@@ -1154,6 +1369,15 @@ function createTransaction(
       ) {
         throw new FoundationStorageConstraintError("grant-pitch-slot-id");
       }
+      if (
+        grant.code?.lookupDigest !== null &&
+        grant.code?.lookupDigest !== undefined &&
+        findGrant(
+          state.grants,
+          (candidate) => candidate.code?.lookupDigest === grant.code?.lookupDigest,
+        )
+      )
+        throw new FoundationStorageConstraintError("grant-code-digest");
       state.grants.set(grant.grantId, cloneStoredGrant(grant));
       undo.push(() => state.grants.delete(grant.grantId));
     },
@@ -1193,6 +1417,17 @@ function createTransaction(
       ) {
         throw new FoundationStorageConstraintError("grant-credential-digest");
       }
+      if (
+        grant.code?.lookupDigest !== null &&
+        grant.code?.lookupDigest !== undefined &&
+        findGrant(
+          state.grants,
+          (candidate) =>
+            candidate.grantId !== grant.grantId &&
+            candidate.code?.lookupDigest === grant.code?.lookupDigest,
+        )
+      )
+        throw new FoundationStorageConstraintError("grant-code-digest");
       const previous = state.grants.get(grant.grantId);
       state.grants.set(grant.grantId, cloneStoredGrant(grant));
       undo.push(() => {
@@ -1278,13 +1513,17 @@ function createTransaction(
       if (!state.grants.has(entry.grantId)) {
         throw new FoundationStorageConstraintError("grant-id");
       }
-      state.grantAudits.set(entry.auditId, cloneStoredGrantAuditEntry(entry));
+      const chained = bindGrantAuditChain(
+        entry,
+        [...state.grantAudits.values()].filter((candidate) => candidate.grantId === entry.grantId),
+      );
+      state.grantAudits.set(entry.auditId, cloneStoredGrantAuditEntry(chained));
       undo.push(() => state.grantAudits.delete(entry.auditId));
-      state.grantAuditProvenance.set(entry.auditId, cloneStoredGrantAuditEntry(entry));
+      state.grantAuditProvenance.set(entry.auditId, cloneStoredGrantAuditEntry(chained));
       undo.push(() => state.grantAuditProvenance.delete(entry.auditId));
       state.grantAuditIntegrityTags.set(
         entry.auditId,
-        computeGrantAuditIntegrityTag(entry, keyRing),
+        computeGrantAuditIntegrityTag(chained, keyRing),
       );
       undo.push(() => state.grantAuditIntegrityTags.delete(entry.auditId));
     },
@@ -1398,6 +1637,50 @@ function createTransaction(
         throw new FoundationStorageConstraintError("replay-attempt-id");
       state.integrityAnchors.set(anchor.anchorId, structuredClone(anchor));
       undo.push(() => state.integrityAnchors.delete(anchor.anchorId));
+    },
+    writeGrantAdmissionTelemetry(value) {
+      const key = `${value.mode}:${value.sourceDigest}`;
+      const previous = state.grantAdmissionTelemetry.get(key);
+      state.grantAdmissionTelemetry.set(key, structuredClone(value));
+      undo.push(() => {
+        if (previous === undefined) state.grantAdmissionTelemetry.delete(key);
+        else state.grantAdmissionTelemetry.set(key, previous);
+      });
+    },
+    writeGrantAdmissionGlobalWindow(value) {
+      const previous = state.grantAdmissionGlobalWindows.get(value.mode);
+      state.grantAdmissionGlobalWindows.set(value.mode, structuredClone(value));
+      undo.push(() => {
+        if (previous === undefined) state.grantAdmissionGlobalWindows.delete(value.mode);
+        else state.grantAdmissionGlobalWindows.set(value.mode, previous);
+      });
+    },
+    pruneGrantAdmissionTelemetry(beforeMs) {
+      for (const [key, value] of state.grantAdmissionTelemetry) {
+        if (value.lastAttemptAtMs < beforeMs) {
+          state.grantAdmissionTelemetry.delete(key);
+          undo.push(() => state.grantAdmissionTelemetry.set(key, value));
+        }
+      }
+    },
+    writeGrantAdmissionStateAnchor() {
+      if (keyRing === undefined)
+        throw new Error("Grant admission anchors require the Grant key ring.");
+      const computed = computeGrantAdmissionStateAnchor(
+        grantAdmissionStateMaterial(
+          state.grantAdmissionTelemetry.values(),
+          state.grantAdmissionGlobalWindows.values(),
+        ),
+        keyRing,
+      );
+      const previous = state.grantAdmissionStateAnchor;
+      const previousInstalled = state.grantAdmissionAnchorInstalled;
+      state.grantAdmissionStateAnchor = { anchorVersion: 1, ...computed };
+      state.grantAdmissionAnchorInstalled = true;
+      undo.push(() => {
+        state.grantAdmissionStateAnchor = previous;
+        state.grantAdmissionAnchorInstalled = previousInstalled;
+      });
     },
   };
 }

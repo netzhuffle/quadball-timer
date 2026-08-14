@@ -11,6 +11,7 @@ import type {
   GrantAuthorityContractRegistrar,
 } from "@/lib/grant-authority-contract";
 import type { FoundationStorage } from "@/lib/foundation-storage";
+import type { GrantStateValidationContext } from "@/lib/grant-state-validation";
 import {
   createGrantTestAuthorityVerifier,
   createLegacyControlGrantTestAuthority,
@@ -158,31 +159,30 @@ async function verifyCorruptGrantState(
     const randomness = createDeterministicRandomness();
     const original = createAuthority(storage, { randomness, keyRing: originalKeyRing });
     const created = await createGrant(original);
-    await storage.transaction((transaction) => {
-      const grant = transaction.findGrantById(created.grantId);
-      if (grant === null) throw new Error("Expected the stored Grant.");
-      transaction.insertGrant({
-        ...grant,
-        grantId: "grant-rotation-collision",
-        grantVersion: "grant-version-rotation-collision",
-        scope: { ...grant.scope, pitchSlotId: "slot-rotation-collision" },
-        credential: {
-          ...grant.credential,
-          lookupDigest: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-          fingerprint: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-        },
-      });
-    });
-    expect(await storage.readiness()).toMatchObject({
-      ok: false,
-      status: "integrity-failure",
-    });
+    await expect(
+      storage.transaction((transaction) => {
+        const grant = transaction.findGrantById(created.grantId);
+        if (grant === null) throw new Error("Expected the stored Grant.");
+        transaction.insertGrant({
+          ...grant,
+          grantId: "grant-rotation-collision",
+          grantVersion: "grant-version-rotation-collision",
+          scope: { ...grant.scope, pitchSlotId: "slot-rotation-collision" },
+          credential: {
+            ...grant.credential,
+            lookupDigest: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            fingerprint: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+          },
+        });
+      }),
+    ).rejects.toThrow();
+    expect(await storage.readiness()).toMatchObject({ ok: true });
     expect(
       await original.createControlGrant({
         scope: { ...createScope(), pitchSlotId: "slot-unrelated" },
         actor: createActor(),
       }),
-    ).toEqual(expect.objectContaining({ status: "rejected", reason: "unavailable" }));
+    ).toEqual(expect.objectContaining({ status: "created" }));
   });
 }
 
@@ -275,6 +275,21 @@ function createRotationAuditFailingStorage(storage: FoundationStorage): Foundati
     readIdempotencyEntries: (recordId) => storage.readIdempotencyEntries(recordId),
     readRecordMetadata: (recordId) => storage.readRecordMetadata(recordId),
     readAuditEntries: (recordId) => storage.readAuditEntries(recordId),
+    setGrantKeyRing(keyRing) {
+      if (typeof storage.setGrantKeyRing !== "function")
+        throw new Error("Grant key ring setter is unavailable.");
+      storage.setGrantKeyRing(keyRing);
+    },
+    setGrantValidationContext(context: GrantStateValidationContext) {
+      if (typeof storage.setGrantValidationContext !== "function")
+        throw new Error("Grant validation setter is unavailable.");
+      storage.setGrantValidationContext(context);
+    },
+    grantStorageCapability() {
+      if (typeof storage.grantStorageCapability !== "function")
+        throw new Error("Grant storage capability declaration is unavailable.");
+      return storage.grantStorageCapability();
+    },
     readiness: () => storage.readiness(),
     close: () => storage.close(),
   };

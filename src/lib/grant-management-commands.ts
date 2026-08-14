@@ -12,6 +12,7 @@ import {
 } from "@/lib/grant-types";
 import { createAuditEntry, expireGrantIfDue } from "@/lib/grant-lifecycle";
 import { grantExpiryCap, resolveGrantExpiry } from "@/lib/grant-calendar";
+import { disableGrantCodeForBindingChange } from "@/lib/grant-management-lifecycle";
 import {
   bindingFor,
   canCreateInTransaction,
@@ -198,7 +199,7 @@ export async function reactivateGrant(
       const binding = { ...bindingFor(options, current), grantVersion: version };
       const token = createCredentialToken(binding, options.randomness);
       const fresh: StoredGrant = {
-        ...current,
+        ...disableGrantCodeForBindingChange(transaction, options, current, resolvedAuthority),
         grantVersion: version,
         status: "active",
         credential: encryptCredential(token, binding, options.randomness, options.keyRing),

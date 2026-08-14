@@ -7,9 +7,12 @@ import type { FoundationStorage, FoundationStorageTransaction } from "@/lib/foun
 import type { GrantAuthorityOptions } from "@/lib/grant-authority";
 import {
   EVENT_ADMIN_GRANT_TYPE,
+  GRANT_CODE_KIND,
   GRANT_TYPE,
   type ControlGrantScope,
+  type ControlGrantScopeResolution,
   type ControlGrantSessionResolution,
+  type StoredGrant,
   type StoredGrantSession,
 } from "@/lib/grant-types";
 import {
@@ -18,6 +21,11 @@ import {
 } from "@/lib/grant-authority-types";
 import { createAuditEntry, expireGrantIfDue } from "@/lib/grant-lifecycle";
 import { validateOpaqueIdentifier } from "@/lib/validation-policy";
+import {
+  beginAdmission,
+  recordAdmissionFailure,
+  recordAdmissionSuccess,
+} from "@/lib/grant-admission-throttle";
 import { DAY_MS } from "@/lib/grant-calendar";
 import {
   canManageInTransaction,
@@ -30,6 +38,7 @@ import {
   resolveManagementAuthority,
   terminateControlSessionForEventGame,
 } from "@/lib/grant-management-policy";
+import { eraseGrantCode } from "@/lib/grant-code";
 import { verifyGrantAuthority } from "@/lib/grant-authority-trust";
 import { auditInput, coarse, sessionLabel } from "@/lib/grant-management-audit";
 import type {
@@ -49,6 +58,7 @@ import {
   unauthorizedGrant,
   unavailableGrant,
 } from "@/lib/grant-management-results";
+import { grantAdmissionThrottled } from "@/lib/grant-authority-types";
 
 export async function admitGrant(
   storage: FoundationStorage,
@@ -59,43 +69,53 @@ export async function admitGrant(
     deviceClass?: string;
     browserClass?: string;
   },
-): Promise<TypedGrantAdmission> {
-  if (
-    !isGrantRecord(input) ||
-    !isValidGrantSecret(input.qrCredential) ||
-    !validateOpaqueIdentifier(input.browserContext, "browserContext").ok
-  )
-    return GENERIC_GRANT_ADMISSION_FAILURE;
+): Promise<TypedGrantAdmission | ReturnType<typeof grantAdmissionThrottled>> {
+  const record: Record<string, unknown> = isGrantRecord(input) ? input : {};
   try {
     return await storage.transaction((transaction) => {
-      const grant = findGrantByCredential(transaction, options, input.qrCredential);
-      if (grant === null) return GENERIC_GRANT_ADMISSION_FAILURE;
-      const current = expireGrantIfDue(transaction, options, grant);
-      if (current.status !== "active" || !credentialMatches(current, options, input.qrCredential))
+      const nowMs = readGrantNow(options);
+      const budget = beginAdmission(transaction, options, "qr", record.browserContext, nowMs);
+      if (budget.throttle !== null) return budget.throttle;
+      if (
+        !isValidGrantSecret(record.qrCredential) ||
+        !validateOpaqueIdentifier(record.browserContext, "browserContext").ok
+      ) {
+        recordAdmissionFailure(transaction, "qr", budget.sourceDigest, nowMs);
         return GENERIC_GRANT_ADMISSION_FAILURE;
+      }
+      const browserContext = record.browserContext as string;
+      const grant = findGrantByCredential(transaction, options, record.qrCredential);
+      if (grant === null) {
+        recordAdmissionFailure(transaction, "qr", budget.sourceDigest, nowMs);
+        return GENERIC_GRANT_ADMISSION_FAILURE;
+      }
+      const current = expireGrantIfDue(transaction, options, grant);
+      if (
+        current.status !== "active" ||
+        !credentialMatches(current, options, record.qrCredential)
+      ) {
+        recordAdmissionFailure(transaction, "qr", budget.sourceDigest, nowMs);
+        return GENERIC_GRANT_ADMISSION_FAILURE;
+      }
       let eventGameId: string | null = null;
       if (current.grantType === GRANT_TYPE) {
         const resolved = options.controlScopeResolver.resolve(current.scope as ControlGrantScope);
         if (
           resolved.status !== "eligible" ||
           !validateOpaqueIdentifier(resolved.eventGameId, "eventGameId").ok
-        )
+        ) {
+          recordAdmissionFailure(transaction, "qr", budget.sourceDigest, nowMs);
           return GENERIC_GRANT_ADMISSION_FAILURE;
+        }
         eventGameId = resolved.eventGameId;
       }
-      const nowMs = readGrantNow(options);
       const lookupVersion = options.keyRing.lookup.currentVersion;
       const contextDigest = computeBrowserContextDigest(
-        input.browserContext,
+        browserContext,
         options.keyRing,
         lookupVersion,
       );
-      const previous = findActiveContext(
-        transaction,
-        current.grantId,
-        options,
-        input.browserContext,
-      );
+      const previous = findActiveContext(transaction, current.grantId, options, browserContext);
       if (previous !== null)
         transaction.updateGrantSession({ ...previous, status: "revoked", revokedAtMs: nowMs });
       const bearer = Buffer.from(requireGrantBytes(options.randomness, 32)).toString("base64url");
@@ -113,8 +133,8 @@ export async function admitGrant(
         createdAtMs: nowMs,
         lastActiveAtMs: nowMs,
         revokedAtMs: null,
-        deviceClass: coarse(input.deviceClass),
-        browserClass: coarse(input.browserClass),
+        deviceClass: coarse(record.deviceClass),
+        browserClass: coarse(record.browserClass),
       };
       transaction.insertGrantSession(session);
       transaction.appendGrantAudit(
@@ -135,6 +155,7 @@ export async function admitGrant(
           ),
         ),
       );
+      recordAdmissionSuccess(transaction, "qr", budget.sourceDigest, nowMs);
       return {
         status: "admitted",
         grantId: current.grantId,
@@ -374,9 +395,36 @@ export async function lockControlGrantEventGame(
     return { status: "rejected", reason: "invalid-input" };
   try {
     return await storage.transaction((transaction) => {
-      let terminatedSessionCount = 0;
+      const resolvedGrants: Array<{
+        grant: StoredGrant;
+        eventGameId: string;
+      }> = [];
       for (const grant of transaction.listGrants()) {
         if (grant.grantType !== GRANT_TYPE) continue;
+        const current = expireGrantIfDue(transaction, options, grant);
+        if (current.status === "expired") continue;
+        let resolved: ControlGrantScopeResolution;
+        try {
+          resolved = options.controlScopeResolver.resolve(current.scope as ControlGrantScope);
+        } catch {
+          return { status: "rejected", reason: "unavailable" };
+        }
+        const resolvedEventGameId =
+          resolved.status === "eligible"
+            ? resolved.eventGameId
+            : resolved.status === "terminal" && resolved.reason === "game-locked"
+              ? resolved.eventGameId
+              : undefined;
+        if (
+          resolvedEventGameId === undefined ||
+          !validateOpaqueIdentifier(resolvedEventGameId, "eventGameId").ok
+        )
+          return { status: "rejected", reason: "unavailable" };
+        resolvedGrants.push({ grant: current, eventGameId: resolvedEventGameId });
+      }
+      let terminatedSessionCount = 0;
+      for (const { grant, eventGameId } of resolvedGrants) {
+        if (eventGameId !== transition.eventGameId) continue;
         terminatedSessionCount += terminateControlSessionForEventGame(
           transaction,
           options,
@@ -384,6 +432,32 @@ export async function lockControlGrantEventGame(
           "game-locked",
           transition.eventGameId,
         );
+        if (grant.code?.state === "present") {
+          const erased = eraseGrantCode(grant.code, "erased");
+          transaction.updateGrant({ ...grant, code: erased });
+          const codeAudit = createAuditEntry(options, {
+            action: "grant-code-erased-game-lock",
+            actor: { kind: "system", value: "grant-session-termination" },
+            grant,
+            sessionId: null,
+            replacedSessionId: null,
+            eventGameId: transition.eventGameId,
+            beforeStatus: grant.status,
+            afterStatus: grant.status,
+            terminalReason: "game-locked",
+          });
+          transaction.appendGrantAudit({
+            ...codeAudit,
+            credentialKind: GRANT_CODE_KIND,
+            credentialFingerprint: grant.code.fingerprint,
+            codeFormatVersion: grant.code.formatVersion,
+            codeEncryptionKeyVersion: grant.code.encryptionKeyVersion,
+            codeLookupKeyVersion: grant.code.lookupKeyVersion,
+            codeStateBefore: grant.code.state,
+            codeState: "erased",
+            previousCodeFingerprint: grant.code.fingerprint,
+          });
+        }
       }
       transition.apply(transaction);
       return { status: "locked", eventGameId: transition.eventGameId, terminatedSessionCount };

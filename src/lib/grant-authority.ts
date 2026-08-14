@@ -16,6 +16,7 @@ export {
   type TypedGrantAuthority,
   type TypedControlGrantSwitch,
   type TypedGrantReplayAuthorization,
+  type TypedGrantRotated,
 } from "@/lib/grant-management";
 export type { GrantAuthorityVerification } from "@/lib/grant-authority-trust";
 export { EVENT_ADMIN_GRANT_TYPE, GRANT_TYPE, PITCH_MANAGER_GRANT_TYPE } from "@/lib/grant-types";

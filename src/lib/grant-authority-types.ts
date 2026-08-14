@@ -26,6 +26,15 @@ export const GENERIC_GRANT_STORAGE_FAILURE = Object.freeze({
   message: "Grant authority storage is temporarily unavailable.",
 } as const);
 
+export function grantAdmissionThrottled(retryAfterMs: number) {
+  return {
+    status: "rejected" as const,
+    code: "grant-admission-throttled" as const,
+    message: "Retry Grant admission later." as const,
+    retryAfterMs,
+  };
+}
+
 export type CreateControlGrantInput = {
   scope: ControlGrantScope;
   actor: GrantAuthorityActor;

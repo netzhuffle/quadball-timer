@@ -16,7 +16,7 @@ import {
   FOUNDATION_SIDE_RECORD_INDEX_SQL,
   FOUNDATION_SIDE_TABLE_SQL,
   FOUNDATION_GRANT_AUDIT_GRANT_INDEX_SQL,
-  FOUNDATION_TYPED_GRANT_AUDIT_TABLE_V16_SQL,
+  FOUNDATION_GRANT_CODE_LOCK_AUDIT_TABLE_V18_SQL,
   FOUNDATION_GRANT_SESSION_CONTEXT_INDEX_SQL,
   FOUNDATION_GRANT_SESSION_GRANT_INDEX_SQL,
   FOUNDATION_EVIDENCE_PROVENANCE_TABLE_SQL,
@@ -26,7 +26,8 @@ import {
   FOUNDATION_TYPED_GRANT_SESSION_TABLE_SQL,
   FOUNDATION_GRANT_MIGRATION_PROVENANCE_TABLE_SQL,
   FOUNDATION_GRANT_MIGRATION_PROVENANCE_STATE_TABLE_SQL,
-  FOUNDATION_GRANT_AUDIT_PROVENANCE_TABLE_V16_SQL,
+  FOUNDATION_GRANT_CODE_LOCK_AUDIT_PROVENANCE_TABLE_V18_SQL,
+  FOUNDATION_GRANT_AUDIT_PROVENANCE_AFTER_INSERT_TRIGGER_V17_SQL,
   FOUNDATION_GRANT_AUDIT_PROVENANCE_GRANT_INDEX_SQL,
   FOUNDATION_GRANT_MIGRATION_PROVENANCE_NO_UPDATE_TRIGGER_SQL,
   FOUNDATION_GRANT_MIGRATION_PROVENANCE_NO_INSERT_TRIGGER_SQL,
@@ -36,7 +37,6 @@ import {
   FOUNDATION_GRANT_MIGRATION_PROVENANCE_STATE_NO_DELETE_TRIGGER_SQL,
   FOUNDATION_GRANT_AUDIT_PROVENANCE_NO_UPDATE_TRIGGER_SQL,
   FOUNDATION_GRANT_AUDIT_PROVENANCE_NO_DELETE_TRIGGER_SQL,
-  FOUNDATION_GRANT_AUDIT_PROVENANCE_AFTER_INSERT_TRIGGER_V16_SQL,
   FOUNDATION_GRANT_AUDIT_NO_LEGACY_TAG_INSERT_TRIGGER_SQL,
   FOUNDATION_EVENT_CATALOG_EVENTS_TABLE_SQL,
   FOUNDATION_EVENT_CATALOG_GAME_DAYS_TABLE_SQL,
@@ -49,7 +49,12 @@ import {
   computeLegacyGrantAuditIntegrityTag,
   computeAcceptanceIntegrityTag,
 } from "@/lib/grant-crypto";
-import { readStoredGrantAuditEntry, scanGrantState } from "@/lib/grant-storage-sqlite";
+import {
+  readStoredGrantAuditEntry,
+  scanGrantState,
+  verifyGrantStateAnchors,
+  verifyGrantAdmissionStateAnchor,
+} from "@/lib/grant-storage-sqlite";
 import type { GrantStateValidationContext } from "@/lib/grant-state-validation";
 import { GRANT_AUDIT_LEGACY_INTEGRITY_TAG } from "@/lib/grant-types";
 import {
@@ -131,6 +136,32 @@ const GRANT_AUDIT_PROVENANCE_TABLE = "foundation_grant_audit_provenance";
 const EVENT_CATALOG_EVENTS_TABLE = "foundation_event_catalog_events";
 const EVENT_CATALOG_GAME_DAYS_TABLE = "foundation_event_catalog_game_days";
 const EVENT_CATALOG_AUDIT_TABLE = "foundation_event_catalog_audit";
+const GRANT_CODE_TABLE = "foundation_grant_codes";
+const GRANT_ADMISSION_TELEMETRY_TABLE = "foundation_grant_admission_telemetry";
+const GRANT_ADMISSION_GLOBAL_TABLE = "foundation_grant_admission_global_windows";
+const GRANT_STATE_ANCHOR_TABLE = "foundation_grant_state_anchors";
+const GRANT_ADMISSION_STATE_ANCHOR_TABLE = "foundation_grant_admission_state_anchors";
+
+const FOUNDATION_GRANT_CODE_TABLE_SQL = `
+  CREATE TABLE foundation_grant_codes (
+    grant_id TEXT PRIMARY KEY REFERENCES foundation_grant_roots(grant_id) ON DELETE CASCADE,
+    state TEXT NOT NULL CHECK (state IN ('present', 'disabled', 'erased')),
+    format_version INTEGER NOT NULL CHECK (format_version = 1),
+    kind TEXT NOT NULL CHECK (kind = 'manual-code'),
+    encryption_key_version TEXT,
+    lookup_key_version TEXT,
+    code_iv TEXT,
+    code_ciphertext TEXT,
+    code_tag TEXT,
+    code_lookup_digest TEXT UNIQUE,
+    code_fingerprint TEXT NOT NULL,
+    CHECK ( (state = 'present' AND encryption_key_version IS NOT NULL AND lookup_key_version IS NOT NULL AND code_iv IS NOT NULL AND code_ciphertext IS NOT NULL AND code_tag IS NOT NULL AND code_lookup_digest IS NOT NULL) OR (state IN ('disabled', 'erased') AND encryption_key_version IS NULL AND lookup_key_version IS NULL AND code_iv IS NULL AND code_ciphertext IS NULL AND code_tag IS NULL AND code_lookup_digest IS NULL) )
+  ) STRICT
+`;
+const FOUNDATION_GRANT_ADMISSION_TELEMETRY_TABLE_SQL = `CREATE TABLE foundation_grant_admission_telemetry ( mode TEXT NOT NULL CHECK (mode IN ('qr', 'code')), source_digest TEXT NOT NULL, failed_attempts INTEGER NOT NULL CHECK (failed_attempts >= 0), delay_until_ms INTEGER, last_attempt_at_ms INTEGER NOT NULL, last_success_at_ms INTEGER, PRIMARY KEY (mode, source_digest) ) STRICT`;
+const FOUNDATION_GRANT_ADMISSION_GLOBAL_TABLE_SQL = `CREATE TABLE foundation_grant_admission_global_windows ( mode TEXT PRIMARY KEY CHECK (mode IN ('qr', 'code')), window_started_at_ms INTEGER NOT NULL, attempt_count INTEGER NOT NULL CHECK (attempt_count >= 0) ) STRICT`;
+const FOUNDATION_GRANT_STATE_ANCHOR_TABLE_SQL = `CREATE TABLE foundation_grant_state_anchors ( grant_id TEXT PRIMARY KEY REFERENCES foundation_grant_roots(grant_id) ON DELETE CASCADE, anchor_version INTEGER NOT NULL CHECK (anchor_version = 1), audit_count INTEGER NOT NULL CHECK (audit_count >= 1), audit_head_id TEXT NOT NULL, state_digest TEXT NOT NULL, integrity_tag TEXT NOT NULL, created_at_ms INTEGER NOT NULL ) STRICT`;
+const FOUNDATION_GRANT_ADMISSION_STATE_ANCHOR_TABLE_SQL = `CREATE TABLE foundation_grant_admission_state_anchors ( anchor_id INTEGER PRIMARY KEY CHECK (anchor_id = 1), anchor_version INTEGER NOT NULL CHECK (anchor_version = 1), state_digest TEXT NOT NULL, integrity_tag TEXT NOT NULL, created_at_ms INTEGER NOT NULL ) STRICT`;
 
 const expectedManifest: FoundationSchemaManifest = {
   objects: [
@@ -152,7 +183,7 @@ const expectedManifest: FoundationSchemaManifest = {
       "table",
       GRANT_AUDIT_TABLE,
       GRANT_AUDIT_TABLE,
-      FOUNDATION_TYPED_GRANT_AUDIT_TABLE_V16_SQL,
+      FOUNDATION_GRANT_CODE_LOCK_AUDIT_TABLE_V18_SQL,
     ),
     object("table", PROVENANCE_TABLE, PROVENANCE_TABLE, FOUNDATION_EVIDENCE_PROVENANCE_TABLE_SQL),
     object(
@@ -183,7 +214,32 @@ const expectedManifest: FoundationSchemaManifest = {
       "table",
       GRANT_AUDIT_PROVENANCE_TABLE,
       GRANT_AUDIT_PROVENANCE_TABLE,
-      FOUNDATION_GRANT_AUDIT_PROVENANCE_TABLE_V16_SQL,
+      FOUNDATION_GRANT_CODE_LOCK_AUDIT_PROVENANCE_TABLE_V18_SQL,
+    ),
+    object("table", GRANT_CODE_TABLE, GRANT_CODE_TABLE, FOUNDATION_GRANT_CODE_TABLE_SQL),
+    object(
+      "table",
+      GRANT_ADMISSION_TELEMETRY_TABLE,
+      GRANT_ADMISSION_TELEMETRY_TABLE,
+      FOUNDATION_GRANT_ADMISSION_TELEMETRY_TABLE_SQL,
+    ),
+    object(
+      "table",
+      GRANT_ADMISSION_GLOBAL_TABLE,
+      GRANT_ADMISSION_GLOBAL_TABLE,
+      FOUNDATION_GRANT_ADMISSION_GLOBAL_TABLE_SQL,
+    ),
+    object(
+      "table",
+      GRANT_STATE_ANCHOR_TABLE,
+      GRANT_STATE_ANCHOR_TABLE,
+      FOUNDATION_GRANT_STATE_ANCHOR_TABLE_SQL,
+    ),
+    object(
+      "table",
+      GRANT_ADMISSION_STATE_ANCHOR_TABLE,
+      GRANT_ADMISSION_STATE_ANCHOR_TABLE,
+      FOUNDATION_GRANT_ADMISSION_STATE_ANCHOR_TABLE_SQL,
     ),
     object(
       "table",
@@ -261,7 +317,7 @@ const expectedManifest: FoundationSchemaManifest = {
       "trigger",
       "foundation_grant_audit_provenance_after_insert",
       GRANT_AUDIT_TABLE,
-      FOUNDATION_GRANT_AUDIT_PROVENANCE_AFTER_INSERT_TRIGGER_V16_SQL,
+      FOUNDATION_GRANT_AUDIT_PROVENANCE_AFTER_INSERT_TRIGGER_V17_SQL,
     ),
     object(
       "index",
@@ -605,6 +661,14 @@ const expectedManifest: FoundationSchemaManifest = {
         column("previous_event_game_id", "TEXT", 0, 0),
         column("replay_evidence_id", "TEXT", 0, 0),
         column("terminal_reason", "TEXT", 0, 0),
+        column("audit_sequence", "INTEGER", 0, 0),
+        column("predecessor_audit_id", "TEXT", 0, 0),
+        column("code_state", "TEXT", 0, 0),
+        column("previous_code_fingerprint", "TEXT", 0, 0),
+        column("code_format_version", "INTEGER", 0, 0),
+        column("code_encryption_key_version", "TEXT", 0, 0),
+        column("code_lookup_key_version", "TEXT", 0, 0),
+        column("code_state_before", "TEXT", 0, 0),
         column("audit_integrity_tag", "TEXT", 1, 0),
         column("created_at_ms", "INTEGER", 1, 0),
       ],
@@ -690,6 +754,14 @@ const expectedManifest: FoundationSchemaManifest = {
         column("previous_event_game_id", "TEXT", 0, 0),
         column("replay_evidence_id", "TEXT", 0, 0),
         column("terminal_reason", "TEXT", 0, 0),
+        column("audit_sequence", "INTEGER", 0, 0),
+        column("predecessor_audit_id", "TEXT", 0, 0),
+        column("code_state", "TEXT", 0, 0),
+        column("previous_code_fingerprint", "TEXT", 0, 0),
+        column("code_format_version", "INTEGER", 0, 0),
+        column("code_encryption_key_version", "TEXT", 0, 0),
+        column("code_lookup_key_version", "TEXT", 0, 0),
+        column("code_state_before", "TEXT", 0, 0),
         column("audit_integrity_tag", "TEXT", 1, 0),
         column("created_at_ms", "INTEGER", 1, 0),
       ],
@@ -705,6 +777,46 @@ const expectedManifest: FoundationSchemaManifest = {
           match: "NONE",
         },
       ],
+    },
+    {
+      name: GRANT_CODE_TABLE,
+      columns: [
+        column("grant_id", "TEXT", 1, 1),
+        column("state", "TEXT", 1, 0),
+        column("format_version", "INTEGER", 1, 0),
+        column("kind", "TEXT", 1, 0),
+        column("encryption_key_version", "TEXT", 0, 0),
+        column("lookup_key_version", "TEXT", 0, 0),
+        column("code_iv", "TEXT", 0, 0),
+        column("code_ciphertext", "TEXT", 0, 0),
+        column("code_tag", "TEXT", 0, 0),
+        column("code_lookup_digest", "TEXT", 0, 0),
+        column("code_fingerprint", "TEXT", 1, 0),
+      ],
+      foreignKeys: [
+        {
+          id: 0,
+          sequence: 0,
+          table: GRANT_TABLE,
+          from: "grant_id",
+          to: "grant_id",
+          onUpdate: "NO ACTION",
+          onDelete: "CASCADE",
+          match: "NONE",
+        },
+      ],
+    },
+    {
+      name: GRANT_ADMISSION_TELEMETRY_TABLE,
+      columns: [
+        column("mode", "TEXT", 1, 1),
+        column("source_digest", "TEXT", 1, 2),
+        column("failed_attempts", "INTEGER", 1, 0),
+        column("delay_until_ms", "INTEGER", 0, 0),
+        column("last_attempt_at_ms", "INTEGER", 1, 0),
+        column("last_success_at_ms", "INTEGER", 0, 0),
+      ],
+      foreignKeys: [],
     },
     {
       name: EVENT_CATALOG_EVENTS_TABLE,
@@ -752,6 +864,50 @@ const expectedManifest: FoundationSchemaManifest = {
         column("occurred_at_ms", "INTEGER", 1, 0),
         column("before_json", "TEXT", 0, 0),
         column("after_json", "TEXT", 1, 0),
+      ],
+      foreignKeys: [],
+    },
+    {
+      name: GRANT_ADMISSION_GLOBAL_TABLE,
+      columns: [
+        column("mode", "TEXT", 1, 1),
+        column("window_started_at_ms", "INTEGER", 1, 0),
+        column("attempt_count", "INTEGER", 1, 0),
+      ],
+      foreignKeys: [],
+    },
+    {
+      name: GRANT_STATE_ANCHOR_TABLE,
+      columns: [
+        column("grant_id", "TEXT", 1, 1),
+        column("anchor_version", "INTEGER", 1, 0),
+        column("audit_count", "INTEGER", 1, 0),
+        column("audit_head_id", "TEXT", 1, 0),
+        column("state_digest", "TEXT", 1, 0),
+        column("integrity_tag", "TEXT", 1, 0),
+        column("created_at_ms", "INTEGER", 1, 0),
+      ],
+      foreignKeys: [
+        {
+          id: 0,
+          sequence: 0,
+          table: GRANT_TABLE,
+          from: "grant_id",
+          to: "grant_id",
+          onUpdate: "NO ACTION",
+          onDelete: "CASCADE",
+          match: "NONE",
+        },
+      ],
+    },
+    {
+      name: GRANT_ADMISSION_STATE_ANCHOR_TABLE,
+      columns: [
+        column("anchor_id", "INTEGER", 0, 1),
+        column("anchor_version", "INTEGER", 1, 0),
+        column("state_digest", "TEXT", 1, 0),
+        column("integrity_tag", "TEXT", 1, 0),
+        column("created_at_ms", "INTEGER", 1, 0),
       ],
       foreignKeys: [],
     },
@@ -970,6 +1126,8 @@ export function verifyFoundationSchema(
     scanFoundationGrantState(database, grantValidationContext);
     if (composedAcceptance)
       verifyComposedAcceptanceState(database, grantValidationContext?.keyRing);
+    verifyGrantStateAnchors(database, grantValidationContext?.keyRing);
+    verifyGrantAdmissionStateAnchor(database, grantValidationContext?.keyRing);
     return { ok: true };
   } catch {
     return {
@@ -1749,6 +1907,14 @@ function verifyGrantProvenance(
     "previous_event_game_id",
     "replay_evidence_id",
     "terminal_reason",
+    "audit_sequence",
+    "predecessor_audit_id",
+    "code_state",
+    "previous_code_fingerprint",
+    "code_format_version",
+    "code_encryption_key_version",
+    "code_lookup_key_version",
+    "code_state_before",
     "audit_integrity_tag",
     "created_at_ms",
   ] as const;
@@ -1927,6 +2093,11 @@ function readSchemaManifest(database: Database): FoundationSchemaManifest {
     EVENT_CATALOG_EVENTS_TABLE,
     EVENT_CATALOG_GAME_DAYS_TABLE,
     EVENT_CATALOG_AUDIT_TABLE,
+    GRANT_CODE_TABLE,
+    GRANT_ADMISSION_TELEMETRY_TABLE,
+    GRANT_ADMISSION_GLOBAL_TABLE,
+    GRANT_STATE_ANCHOR_TABLE,
+    GRANT_ADMISSION_STATE_ANCHOR_TABLE,
   ].map((name) => ({
     name,
     columns: readColumns(database, name),
