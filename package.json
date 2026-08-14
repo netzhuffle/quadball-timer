@@ -3,10 +3,11 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "packageManager": "bun@1.3.14",
   "scripts": {
     "dev": "bun --hot src/index.ts",
     "start": "cd dist && NODE_ENV=production bun index.js",
+    "admin:enroll": "bun scripts/enroll-technical-admin.ts",
+    "test:focused:technical-admin-browser": "bun scripts/test-technical-admin-browser.ts",
     "build": "bun run build.ts",
     "build:executable": "bun run build.ts --compile --compile-target=bun-linux-x64-modern --outfile=dist/quadball-timer",
     "check:sqlite-runtime": "bun scripts/check-sqlite-runtime.ts",
@@ -43,7 +44,9 @@
     "oxfmt": "^0.63.0",
     "oxlint": "^1.78.0",
     "oxlint-tsgolint": "^7.0.2001",
+    "playwright": "1.62.1",
     "tailwindcss": "^4.2.4",
     "tw-animate-css": "^1.4.0"
-  }
+  },
+  "packageManager": "bun@1.3.14"
 }

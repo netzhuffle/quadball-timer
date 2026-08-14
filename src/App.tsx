@@ -8,6 +8,7 @@ import { DEFAULT_AWAY_TEAM_COLOR, DEFAULT_HOME_TEAM_COLOR } from "@/lib/team-col
 import { ColorTestPage } from "@/pages/color-test-page";
 import { EventOperationsPrototypePage } from "@/pages/event-operations-prototype-page";
 import { GamePage } from "@/pages/game-page";
+import { TechnicalAdminPage } from "@/pages/technical-admin-page";
 import "./index.css";
 
 type Route =
@@ -19,6 +20,10 @@ type Route =
     }
   | {
       type: "event-operations-prototype";
+    }
+  | {
+      type: "technical-admin";
+      enrollment: boolean;
     }
   | {
       type: "game";
@@ -41,6 +46,10 @@ export function App() {
 
   if (route.type === "event-operations-prototype") {
     return <EventOperationsPrototypePage />;
+  }
+
+  if (route.type === "technical-admin") {
+    return <TechnicalAdminPage enrollment={route.enrollment} />;
   }
 
   return <GamePage gameId={route.gameId} role={route.role} />;
@@ -313,6 +322,14 @@ function useRoute(): Route {
 }
 
 function parseRoute(pathname: string, search: string): Route {
+  if (pathname === "/admin" || pathname === "/admin/") {
+    return { type: "technical-admin", enrollment: false };
+  }
+
+  if (pathname === "/admin/enroll" || pathname === "/admin/enroll/") {
+    return { type: "technical-admin", enrollment: true };
+  }
+
   if (pathname === "/color-test") {
     return { type: "color-test" };
   }
