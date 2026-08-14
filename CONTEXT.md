@@ -112,6 +112,10 @@ _Avoid_: Mutable event, current value
 A Control Action that names one stable Game Fact and makes it ineffective or effective again without removing either the fact or earlier Corrections from the Control Audit Trail.
 _Avoid_: Delete, edit history, undo latest
 
+**Opposing Concurrent Corrections**:
+Corrections against one stable Game Fact with opposing effectiveness values and no causal relation. Their canonical occurrence and operation identity order selects the effective outcome while retaining the conflict evidence; a later causal Correction may replace it.
+_Avoid_: Socket-arrival resolution, conflict UI, undo latest
+
 **Locked-Game Correction**:
 An Event Admin-submitted Control Action that directly reconciles a locked Event Game's current score, flag-catching team, catch time, end time, or other displayed end-state fact without reopening Controller operation. It atomically states the corrected values, preserves the previous values in the Control Audit Trail, and requires no reason or stated basis. A rule-inconsistent value receives one confirmation and records an Official Override.
 _Avoid_: Reopen Game, edit history, correction reason

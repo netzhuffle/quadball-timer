@@ -1,0 +1,136 @@
+# Typed Grant authority lifecycle
+
+The public Grant authority has one typed lifecycle for Event Admin, Pitch
+Manager, and Control Grants. The two public factory names expose the same
+trusted-authority contract; historical Control-only names exist only in test
+support. The public lifecycle is:
+
+1. Typed create methods validate the exact scope and revalidate an injected,
+   cryptographically verified Technical Admin or Grant Session authority.
+   Callers cannot create trusted authority by object shape. The new Grant
+   returns its QR credential once; durable storage keeps only the encrypted
+   envelope and keyed lookup material.
+2. `revealGrant` decrypts the credential for an authorized authority and
+   returns it without exposing stored plaintext.
+3. `rotateGrantCredentialKeys` decrypts a retained credential with its
+   recorded old encryption key, verifies its complete binding and lookup
+   digest, then re-encrypts and re-indexes it with the current keys. The Grant
+   update and permanent `credential-rotated` audit evidence commit atomically;
+   any cryptographic, collision, audit, or storage failure leaves the old
+   credential and versions usable.
+4. `admitGrant` validates the QR credential and, for a Control Grant, resolves
+   exactly one eligible Event Game for its Pitch Slot through the injected
+   scope resolver. It generically rejects missing, conflicted, or malformed
+   resolution and otherwise creates a separately random session bearer bound
+   to that Event Game. A second admission in
+   the same browser context revokes that context's active session and records a
+   replacement; other contexts remain active.
+5. `authorizeGrant` accepts the session bearer and, for a Control Grant, the
+   explicit Event Game identity of the work being authorized. It rechecks the
+   Grant version, lifecycle, scope resolution, and Grant Session state without
+   inferring a new Event Game for queued work. Before Game Commencement the
+   caller may retain the prior Event Game binding or atomically accept the
+   resolver's old/new switch relationship; after commencement the Grant
+   Session remains pinned to its unfinished Event Game.
+6. Disable, revoke, rotation, metadata correction, targeted session
+   revocation, reveal, and reads all re-resolve the current trusted authority
+   and management matrix in their transaction. Metadata correction rebinds
+   the corrected scope to a fresh Grant version and credential, revoking prior
+   sessions; an expired Grant never revives.
+7. Disable and revoke are administrative lifecycle
+   transitions. A Grant reaching its expiry time transitions every non-expired
+   Grant (including disabled and revoked Grants) and all sessions to `expired`,
+   appends exactly one `grant-expired` audit entry, and never revives. This is
+   one storage transaction: encrypted credential material, lookup digests, and
+   session bearer verifiers are erased while only non-secret metadata and a
+   domain-separated retained fingerprint remain.
+
+## Privacy and authority boundary
+
+Production callers pass inputs to an injected verifier that wraps actual
+Technical Admin Passkey or Grant Session verification and owns the internal
+trust brand. Permissive fixture authority exists only in test support. Durable
+audit reads expose a pseudonymous `actor-*` reference; QR credentials, session bearers, browser
+contexts, human identities, and caller-selected actor text are not persisted in
+Grant rows or audit evidence. Session management labels and audit provenance
+derive from each session's retained pseudonym key version, so they remain
+stable when current credential keys rotate. Grant reveal material uses
+AES-256-GCM, while
+credential lookup and session bearer verification use separately keyed HMAC
+material. Injected randomness must provide at least 256 bits for credentials
+and independently random session bearers.
+
+Invalid external credentials, unavailable scope state, disabled/revoked/expired
+Grants, and invalid sessions return generic failures. Every public authority
+operation contains storage failures at the module boundary; list operations
+return a typed unavailable result and mutations return redacted failure
+details. Storage writes for a Grant and its mandatory audit evidence are
+transactional in both adapters, including expiry erasure and audit evidence.
+Accepted Game Lock evidence drives a trusted internal lifecycle transition
+that terminates only Control Grant Sessions bound to the locked Event Game and
+atomically invokes the future Grant Code state hook. Reopening permits fresh
+admission but never revives old session or code authority. Fresh current Grant
+Sessions may authorize content-bound replay only for preserved work from a
+different, non-active originating Grant Session on the same unfinished,
+unlocked Event Game; the permanent audit binds both sessions, their Grant
+versions, and the replay evidence identity.
+Expired Grants have no credential key versions, ciphertext, IV, authentication
+tag, lookup digest, or session verifier material and cannot rotate. Migration
+006 upgrades legacy active, disabled, revoked, due, and expired rows in one
+transaction. It preserves all prior audit evidence, creates missing expiry
+evidence exactly once, erases due or terminal capability material, and replaces
+legacy digest-equal values with tagged opaque 256-bit migration references. These
+references are not credential fingerprints and are therefore never copied into
+Grant Audit Trail fingerprint fields. Runtime audit creation likewise omits them;
+only newly derived keyed credential fingerprints may occupy those fields. A
+non-expired migrated Grant replaces the compatibility reference with a keyed
+fingerprint when its retained credential keys are rotated.
+
+## Schema-006 compatibility trust transition
+
+Migration 011 is the one-time trust transition for databases that completed
+accepted migrations through schema 006 before keyed provenance existed. Its
+append-only SQL records each legacy opaque reference directly from the durable
+schema-006 Grant root, retaining only non-secret Grant metadata and the opaque
+compatibility reference. This transition is intentionally not retroactive
+cryptographic attestation: a legacy audit row or opaque-shaped value inserted
+before integrity metadata is indistinguishable from genuine legacy evidence.
+Migration 011 therefore validates every relationship derivable from the
+legacy schema—Grant, version, scope, lifecycle, credential material, expiry,
+session, and audit completeness—and freezes any inconsistency. Once 011
+completes, SQLite and memory adapters require keyed audit integrity for new
+evidence; provenance and audit history are immutable and direct writers cannot
+manufacture current trusted evidence.
+
+## Test routing
+
+The reusable semantic contract runs against in-memory storage in the ordinary
+Fast Test boundary and against disposable SQLite storage in the focused
+integration boundary. The SQLite contract covers replacement, generic failure,
+Event Game binding and switching, replay provenance, trusted Game Lock,
+atomic credential key rotation, expiry erasure, migration upgrade and rollback,
+tamper-triggered write freeze, redaction, restart, and real independent-worker
+admission contention. The
+contention harness uses an allowlisted child environment, a private owner-only
+credential file, capped streaming diagnostics, and one bounded deadline for
+barrier, work, TERM/KILL escalation, reap, and artifact cleanup. The focused
+command is intentionally outside
+ordinary Fast Test discovery, while remaining deterministic and isolated.
+
+Run the fast unit contract with:
+
+```text
+bun test src/lib/grant-authority.test.ts
+```
+
+Run the focused SQLite contract with:
+
+```text
+bun run test:focused:grant
+```
+
+The focused file is intentionally outside ordinary test discovery. This slice
+does not implement QR URL or fragment handling, cookies, React UI, Technical
+Admin Passkey authentication itself, Grant Codes, Event administration UI, or
+the Event catalog implementation behind the injected Pitch Slot/Event Game
+resolver.

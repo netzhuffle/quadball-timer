@@ -2,6 +2,211 @@ import { describe, expect, test } from "bun:test";
 import { parseClientWsMessage } from "@/lib/ws-protocol";
 
 describe("ws-protocol", () => {
+  test("rejects a WebSocket text frame over the UTF-8 byte boundary before JSON parsing", () => {
+    const parsed = parseClientWsMessage(
+      JSON.stringify({
+        type: "subscribe-lobby",
+        padding: "😀".repeat(70_000),
+      }),
+    );
+
+    expect(parsed.ok).toBe(false);
+    if (parsed.ok) {
+      return;
+    }
+
+    expect(parsed.error).toContain("WebSocket text frame");
+  });
+
+  test("accepts an exact UTF-8 frame boundary and rejects one byte over", () => {
+    const prefix = JSON.stringify({ type: "subscribe-lobby" });
+    const exact = `${prefix}${" ".repeat(
+      256 * 1024 - new TextEncoder().encode(prefix).byteLength,
+    )}`;
+    const oneOver = `${exact} `;
+
+    expect(new TextEncoder().encode(exact).byteLength).toBe(256 * 1024);
+    expect(parseClientWsMessage(exact).ok).toBe(true);
+
+    const rejected = parseClientWsMessage(oneOver);
+    expect(rejected.ok).toBe(false);
+    if (!rejected.ok) {
+      expect(rejected.error).toContain("WebSocket text frame");
+    }
+  });
+
+  test("accepts a replay batch at the shared action limit", () => {
+    const parsed = parseClientWsMessage(
+      JSON.stringify({
+        type: "apply-commands",
+        gameId: "game-123",
+        commands: Array.from({ length: 100 }, (_, index) => ({
+          id: `cmd-${index}`,
+          clientSentAtMs: 123_456,
+          command: {
+            type: "set-running",
+            running: index % 2 === 0,
+          },
+        })),
+      }),
+    );
+
+    expect(parsed.ok).toBe(true);
+  });
+
+  test("rejects a replay batch one action over the shared limit", () => {
+    const parsed = parseClientWsMessage(
+      JSON.stringify({
+        type: "apply-commands",
+        gameId: "game-123",
+        commands: Array.from({ length: 101 }, (_, index) => ({
+          id: `cmd-${index}`,
+          clientSentAtMs: 123_456,
+          command: {
+            type: "set-running",
+            running: true,
+          },
+        })),
+      }),
+    );
+
+    expect(parsed.ok).toBe(false);
+    if (parsed.ok) {
+      return;
+    }
+
+    expect(parsed.error).toContain("at most 100");
+  });
+
+  test("rejects duplicate command identities before a batch can mutate", () => {
+    const parsed = parseClientWsMessage(
+      JSON.stringify({
+        type: "apply-commands",
+        gameId: "game-123",
+        commands: [
+          {
+            id: "duplicate",
+            clientSentAtMs: 123_456,
+            command: { type: "set-running", running: true },
+          },
+          {
+            id: "duplicate",
+            clientSentAtMs: 123_456,
+            command: { type: "set-running", running: false },
+          },
+        ],
+      }),
+    );
+
+    expect(parsed.ok).toBe(false);
+    if (parsed.ok) {
+      return;
+    }
+
+    expect(parsed.error).toContain("unique command identities");
+  });
+
+  test("normalizes and bounds team names at the protocol seam", () => {
+    const normalized = parseClientWsMessage(
+      JSON.stringify({
+        type: "apply-commands",
+        gameId: "game-123",
+        commands: [
+          {
+            id: "cmd-rename",
+            clientSentAtMs: 123_456,
+            command: {
+              type: "rename-teams",
+              homeName: "  A\u0308 ",
+              awayName: "Away",
+            },
+          },
+        ],
+      }),
+    );
+
+    expect(normalized.ok).toBe(true);
+    if (normalized.ok && normalized.message.type === "apply-commands") {
+      const command = normalized.message.commands[0]?.command;
+      if (command?.type === "rename-teams") {
+        expect(command.homeName).toBe("Ä");
+      }
+    }
+
+    const oversized = parseClientWsMessage(
+      JSON.stringify({
+        type: "apply-commands",
+        gameId: "game-123",
+        commands: [
+          {
+            id: "cmd-rename-too-long",
+            clientSentAtMs: 123_456,
+            command: {
+              type: "rename-teams",
+              homeName: "a".repeat(81),
+              awayName: "Away",
+            },
+          },
+        ],
+      }),
+    );
+
+    expect(oversized.ok).toBe(false);
+    if (!oversized.ok) {
+      expect(oversized.error).toContain("homeName");
+    }
+  });
+
+  test("rejects unsafe, fractional, and out-of-domain command numbers", () => {
+    const cases = [
+      { field: "deltaMs", value: Number.NaN },
+      { field: "deltaMs", value: 1.5 },
+      { field: "deltaMs", value: 10 * 60 * 1000 + 1 },
+      { field: "gameClockMs", value: 120 * 60 * 1000 + 1 },
+      { field: "delta", value: Number.MAX_SAFE_INTEGER + 1 },
+    ];
+
+    for (const testCase of cases) {
+      const command =
+        testCase.field === "gameClockMs"
+          ? { type: "set-game-clock", gameClockMs: testCase.value }
+          : testCase.field === "delta"
+            ? { type: "change-score", team: "home", delta: testCase.value, reason: "manual" }
+            : { type: "adjust-game-clock", deltaMs: testCase.value };
+      const parsed = parseClientWsMessage(
+        JSON.stringify({
+          type: "apply-commands",
+          gameId: "game-123",
+          commands: [{ id: `cmd-${testCase.field}`, clientSentAtMs: 123_456, command }],
+        }),
+      );
+
+      expect(parsed.ok, testCase.field).toBe(false);
+    }
+  });
+
+  test("rejects an online occurrence timestamp beyond the future skew limit", () => {
+    const parsed = parseClientWsMessage(
+      JSON.stringify({
+        type: "apply-commands",
+        gameId: "game-123",
+        commands: [
+          {
+            id: "cmd-future",
+            clientSentAtMs: 121_001,
+            command: { type: "set-running", running: true },
+          },
+        ],
+      }),
+      { serverNowMs: 1_000 },
+    );
+
+    expect(parsed.ok).toBe(false);
+    if (!parsed.ok) {
+      expect(parsed.error).toContain("future");
+    }
+  });
+
   test("parses subscribe-game events", () => {
     const parsed = parseClientWsMessage(
       JSON.stringify({

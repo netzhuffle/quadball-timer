@@ -16,6 +16,14 @@ import {
   DEFAULT_HOME_TEAM_COLOR,
   normalizeTeamColor,
 } from "@/lib/team-colors";
+import {
+  SHARED_LIMITS,
+  normalizeBoundedText,
+  validateClockAdjustmentMs,
+  validateGameClockMs,
+  validateIntegerInRange,
+  validatePlayerNumber,
+} from "@/lib/validation-policy";
 
 const ONE_MINUTE_MS = 60_000;
 const SEEKER_RELEASE_MS = 20 * ONE_MINUTE_MS;
@@ -164,6 +172,10 @@ export function projectGameSummary(state: GameState, nowMs: number): GameSummary
 }
 
 export function advanceGameState(state: GameState, nowMs: number): GameState {
+  if (!Number.isSafeInteger(nowMs) || nowMs < 0) {
+    return cloneGameState(state);
+  }
+
   if (nowMs <= state.updatedAtMs) {
     return cloneGameState(state);
   }
@@ -172,7 +184,12 @@ export function advanceGameState(state: GameState, nowMs: number): GameState {
   const deltaMs = nowMs - next.updatedAtMs;
 
   if (next.isRunning && !next.isFinished && !next.isSuspended) {
-    next.gameClockMs += deltaMs;
+    const advancedGameClockMs = next.gameClockMs + deltaMs;
+    if (validateGameClockMs(advancedGameClockMs).ok) {
+      next.gameClockMs = advancedGameClockMs;
+    } else {
+      next.isRunning = false;
+    }
     tickPenaltyClock(next, deltaMs, nowMs);
   }
 
@@ -201,6 +218,10 @@ export function applyGameCommand({
   nowMs: number;
   idGenerator?: IdGenerator;
 }): GameState {
+  if (!Number.isSafeInteger(nowMs) || nowMs < 0) {
+    return cloneGameState(state);
+  }
+
   const makeId = idGenerator ?? (() => crypto.randomUUID());
   const next = advanceGameState(state, nowMs);
 
@@ -227,17 +248,34 @@ export function applyGameCommand({
     }
 
     case "adjust-game-clock": {
-      next.gameClockMs = Math.max(0, next.gameClockMs + command.deltaMs);
+      const adjustment = validateClockAdjustmentMs(command.deltaMs);
+      const nextGameClockMs = next.gameClockMs + command.deltaMs;
+      if (!adjustment.ok || !validateGameClockMs(nextGameClockMs).ok) {
+        return next;
+      }
+      next.gameClockMs = nextGameClockMs;
       return next;
     }
 
     case "set-game-clock": {
-      next.gameClockMs = Math.max(0, command.gameClockMs);
+      if (!validateGameClockMs(command.gameClockMs).ok) {
+        return next;
+      }
+      next.gameClockMs = command.gameClockMs;
       return next;
     }
 
     case "change-score": {
-      if (command.delta === 0 || command.delta % 10 !== 0) {
+      if (
+        !validateIntegerInRange(
+          command.delta,
+          -SHARED_LIMITS.score.max,
+          SHARED_LIMITS.score.max,
+          "score delta",
+        ).ok ||
+        command.delta === 0 ||
+        command.delta % 10 !== 0
+      ) {
         return next;
       }
 
@@ -345,7 +383,7 @@ export function applyGameCommand({
         return next;
       }
 
-      applyPositiveScore({
+      const scoreApplied = applyPositiveScore({
         state: next,
         team: command.team,
         points: 30,
@@ -353,6 +391,9 @@ export function applyGameCommand({
         nowMs,
         idGenerator: makeId,
       });
+      if (!scoreApplied) {
+        return next;
+      }
       next.flagCatch = {
         team: command.team,
         createdAtMs: nowMs,
@@ -395,7 +436,18 @@ export function applyGameCommand({
       const concedingTeam = command.team;
       const winner = getOpposingTeam(concedingTeam);
       if (next.score[concedingTeam] > next.score[winner]) {
-        next.score[winner] = Math.max(next.score[winner], next.score[concedingTeam] + 10);
+        const concededScore = next.score[concedingTeam] + 10;
+        if (
+          !validateIntegerInRange(
+            concededScore,
+            SHARED_LIMITS.score.min,
+            SHARED_LIMITS.score.max,
+            "derived score",
+          ).ok
+        ) {
+          return next;
+        }
+        next.score[winner] = concededScore;
       }
 
       finalizeGame({
@@ -457,14 +509,21 @@ export function applyGameCommand({
     }
 
     case "rename-teams": {
-      const homeName = command.homeName.trim();
-      const awayName = command.awayName.trim();
-      if (homeName.length > 0) {
-        next.homeName = homeName;
+      const homeName = normalizeBoundedText(
+        command.homeName,
+        SHARED_LIMITS.names.teamAndPitchMaxCodePoints,
+        "homeName",
+      );
+      const awayName = normalizeBoundedText(
+        command.awayName,
+        SHARED_LIMITS.names.teamAndPitchMaxCodePoints,
+        "awayName",
+      );
+      if (!homeName.ok || !awayName.ok) {
+        return next;
       }
-      if (awayName.length > 0) {
-        next.awayName = awayName;
-      }
+      next.homeName = homeName.value;
+      next.awayName = awayName.value;
       if (typeof command.homeColor === "string") {
         next.homeColor = normalizeTeamColor(command.homeColor, next.homeColor);
       }
@@ -495,9 +554,17 @@ function applyPositiveScore({
   reason: "goal" | "flag-catch";
   nowMs: number;
   idGenerator: IdGenerator;
-}) {
-  if (points <= 0) {
-    return;
+}): boolean {
+  if (
+    !validateIntegerInRange(points, 1, SHARED_LIMITS.score.max, "score points").ok ||
+    !validateIntegerInRange(
+      state.score[team] + points,
+      SHARED_LIMITS.score.min,
+      SHARED_LIMITS.score.max,
+      "derived score",
+    ).ok
+  ) {
+    return false;
   }
 
   const pendingExpiration = createPendingExpiration({
@@ -521,11 +588,24 @@ function applyPositiveScore({
   };
 
   state.scoreEvents.push(scoreEvent);
+  return true;
 }
 
-function applyScoreDelta(state: GameState, team: TeamId, delta: number) {
-  const nextScore = Math.max(0, state.score[team] + delta);
+function applyScoreDelta(state: GameState, team: TeamId, delta: number): boolean {
+  const nextScore = state.score[team] + delta;
+  if (
+    !validateIntegerInRange(
+      nextScore,
+      SHARED_LIMITS.score.min,
+      SHARED_LIMITS.score.max,
+      "derived score",
+    ).ok
+  ) {
+    return false;
+  }
+
   state.score[team] = nextScore;
+  return true;
 }
 
 function undoLastScoreForTeam(state: GameState, team: TeamId, nowMs: number) {
@@ -538,7 +618,18 @@ function undoLastScoreForTeam(state: GameState, team: TeamId, nowMs: number) {
   }
 
   latestEvent.undoneAtMs = nowMs;
-  state.score[team] = Math.max(0, state.score[team] - latestEvent.points);
+  const nextScore = state.score[team] - latestEvent.points;
+  if (
+    !validateIntegerInRange(
+      nextScore,
+      SHARED_LIMITS.score.min,
+      SHARED_LIMITS.score.max,
+      "derived score",
+    ).ok
+  ) {
+    return;
+  }
+  state.score[team] = nextScore;
 
   if (latestEvent.pendingExpirationId !== null) {
     const pending = state.pendingExpirations.find(
@@ -569,7 +660,10 @@ function addCardToPlayer({
   nowMs: number;
   idGenerator: IdGenerator;
 }) {
-  if (playerNumber !== null && (playerNumber < 0 || playerNumber > 99)) {
+  if (playerNumber !== null && !validatePlayerNumber(playerNumber).ok) {
+    return;
+  }
+  if (startedGameClockMs !== undefined && !validateGameClockMs(startedGameClockMs).ok) {
     return;
   }
 
@@ -595,8 +689,7 @@ function addCardToPlayer({
       newSegments.push(createPenaltySegment({ idGenerator, cardType, expirableByScore: true }));
     }
 
-    const normalizedStartedClockMs =
-      typeof startedGameClockMs === "number" ? Math.max(0, startedGameClockMs) : state.gameClockMs;
+    const normalizedStartedClockMs = startedGameClockMs ?? state.gameClockMs;
     const elapsedSinceEntryStartMs = Math.max(0, state.gameClockMs - normalizedStartedClockMs);
 
     if (!hadExistingSegments && elapsedSinceEntryStartMs > 0) {
