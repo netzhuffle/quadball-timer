@@ -1,9 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import {
   createEventCatalog,
+  createFoundationEventCatalogStorage,
   createInMemoryEventCatalogStorage,
+  createUnavailableEventCatalogStorage,
   type InMemoryEventCatalogStorage,
 } from "@/lib/event-catalog";
+import { createInMemoryFoundationStorage } from "@/lib/foundation-storage-memory";
 import {
   MemoryTechnicalAdminAuthRepository,
   createTechnicalAdminAuth,
@@ -31,6 +34,28 @@ function createFixture(storage: InMemoryEventCatalogStorage = createInMemoryEven
 }
 
 describe("Event operations catalog", () => {
+  test("requires the complete Event Catalog adapter capability at composition", () => {
+    const foundation = createInMemoryFoundationStorage();
+    const incomplete = new Proxy(foundation, {
+      get(target, property, receiver) {
+        if (property === "eventCatalogStorageCapability") return undefined;
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    expect(() => createFoundationEventCatalogStorage(incomplete)).toThrow("Event Catalog contract");
+    foundation.close();
+  });
+
+  test("keeps an unavailable catalog subsystem composable and fail-closed", async () => {
+    const catalog = createEventCatalog(
+      createUnavailableEventCatalogStorage("foundation readiness failed"),
+      {},
+    );
+    expect(await catalog.listEvents(authority)).toMatchObject({
+      status: "retryable-failure",
+    });
+  });
+
   test("creates a blank Unpublished Event and classifies Game Days in the Event timezone", async () => {
     const fixture = createFixture();
     const created = await fixture.catalog.createEvent(
@@ -356,6 +381,164 @@ describe("Event operations catalog", () => {
     expect(await fixture.catalog.inspectEvent(created.value.eventId, authority)).toMatchObject({
       status: "rejected",
       reason: "not-found",
+    });
+  });
+
+  test("configures stable Teams, current public rosters, and Pitches atomically", async () => {
+    const fixture = createFixture();
+    const event = await fixture.catalog.createEvent({ name: "Teams", timeZone: "UTC" }, authority);
+    const otherEvent = await fixture.catalog.createEvent(
+      { name: "Other", timeZone: "UTC" },
+      authority,
+    );
+    if (event.status !== "accepted" || otherEvent.status !== "accepted")
+      throw new Error("Expected Events.");
+
+    const team = await fixture.catalog.createEventTeam(
+      event.value.eventId,
+      { name: "Blue", defaultColor: "#123ABC" },
+      authority,
+    );
+    const pitch = await fixture.catalog.createPitch(
+      event.value.eventId,
+      { name: "Pitch 1" },
+      authority,
+    );
+    if (team.status !== "accepted" || pitch.status !== "accepted")
+      throw new Error("Expected catalog entries.");
+
+    expect(
+      await fixture.catalog.lookupAudienceRoster(event.value.eventId, team.value.eventTeamId, 7),
+    ).toMatchObject({ status: "accepted", value: { publicName: null } });
+    expect(
+      await fixture.catalog.upsertEventTeamRoster(
+        event.value.eventId,
+        team.value.eventTeamId,
+        { playerNumber: 7, publicName: "Ada" },
+        authority,
+      ),
+    ).toMatchObject({ status: "accepted", value: { playerNumber: 7, publicName: "Ada" } });
+    expect(
+      await fixture.catalog.lookupAudienceRoster(event.value.eventId, team.value.eventTeamId, 7),
+    ).toMatchObject({ status: "accepted", value: { publicName: "Ada" } });
+    await fixture.catalog.upsertEventTeamRoster(
+      event.value.eventId,
+      team.value.eventTeamId,
+      { playerNumber: 7, publicName: "Ada Corrected" },
+      authority,
+    );
+    expect(
+      await fixture.catalog.lookupAudienceRoster(event.value.eventId, team.value.eventTeamId, 7),
+    ).toMatchObject({ status: "accepted", value: { publicName: "Ada Corrected" } });
+    expect(
+      await fixture.catalog.updateEventTeam(
+        event.value.eventId,
+        team.value.eventTeamId,
+        { name: "Blue Updated", defaultColor: "#ABCDEF" },
+        authority,
+      ),
+    ).toMatchObject({ status: "accepted", value: { name: "Blue Updated" } });
+    expect(
+      await fixture.catalog.updatePitch(
+        event.value.eventId,
+        pitch.value.pitchId,
+        { name: "Pitch Updated" },
+        authority,
+      ),
+    ).toMatchObject({ status: "accepted", value: { name: "Pitch Updated" } });
+    expect(
+      await fixture.catalog.lookupAudienceRoster(
+        otherEvent.value.eventId,
+        team.value.eventTeamId,
+        7,
+      ),
+    ).toEqual({ status: "accepted", value: { playerNumber: 7, publicName: null } });
+
+    const otherTeam = await fixture.catalog.createEventTeam(
+      otherEvent.value.eventId,
+      { name: "Other Blue" },
+      authority,
+    );
+    const otherPitch = await fixture.catalog.createPitch(
+      otherEvent.value.eventId,
+      { name: "Other Pitch" },
+      authority,
+    );
+    if (otherTeam.status !== "accepted" || otherPitch.status !== "accepted")
+      throw new Error("Expected isolated entries.");
+    expect(
+      await fixture.catalog.updateEventTeam(
+        event.value.eventId,
+        otherTeam.value.eventTeamId,
+        { name: "Leaked Team" },
+        authority,
+      ),
+    ).toMatchObject({ status: "rejected", reason: "cross-event" });
+    expect(
+      await fixture.catalog.updatePitch(
+        event.value.eventId,
+        otherPitch.value.pitchId,
+        { name: "Leaked Pitch" },
+        authority,
+      ),
+    ).toMatchObject({ status: "rejected", reason: "cross-event" });
+
+    expect(
+      await fixture.catalog.createEventTeam(
+        event.value.eventId,
+        { name: "Blue", defaultColor: "red" },
+        authority,
+      ),
+    ).toMatchObject({ status: "rejected", reason: "invalid-input" });
+    expect(
+      await fixture.catalog.upsertEventTeamRoster(
+        event.value.eventId,
+        team.value.eventTeamId,
+        { playerNumber: 100, publicName: "Invalid" },
+        authority,
+      ),
+    ).toMatchObject({ status: "rejected", reason: "invalid-input" });
+    fixture.storage.failNextTransaction(new Error("audit unavailable"));
+    expect(
+      await fixture.catalog.updatePitch(
+        event.value.eventId,
+        pitch.value.pitchId,
+        { name: "Pitch A" },
+        authority,
+      ),
+    ).toMatchObject({ status: "retryable-failure" });
+    expect(await fixture.catalog.inspectEvent(event.value.eventId, authority)).toMatchObject({
+      status: "accepted",
+      value: {
+        teams: [{ name: "Blue Updated", defaultColor: "#abcdef" }],
+        pitches: [{ name: "Pitch Updated" }],
+      },
+    });
+    const audit = await fixture.catalog.listAuditTrail(event.value.eventId, authority);
+    expect(audit).toMatchObject({ status: "accepted" });
+    if (audit.status !== "accepted") return;
+    const rosterAudits = audit.value.filter((entry) => entry.action === "roster-updated");
+    expect(rosterAudits).toHaveLength(2);
+    expect(rosterAudits[0]).toMatchObject({ before: null, after: { publicName: "Ada" } });
+    expect(rosterAudits[1]).toMatchObject({
+      before: { publicName: "Ada" },
+      after: { publicName: "Ada Corrected" },
+    });
+    expect(audit.value.find((entry) => entry.action === "event-team-created")).toMatchObject({
+      before: null,
+      after: { name: "Blue", defaultColor: "#123abc" },
+    });
+    expect(audit.value.find((entry) => entry.action === "event-team-updated")).toMatchObject({
+      before: { name: "Blue", defaultColor: "#123abc" },
+      after: { name: "Blue Updated", defaultColor: "#abcdef" },
+    });
+    expect(audit.value.find((entry) => entry.action === "pitch-created")).toMatchObject({
+      before: null,
+      after: { name: "Pitch 1" },
+    });
+    expect(audit.value.find((entry) => entry.action === "pitch-updated")).toMatchObject({
+      before: { name: "Pitch 1" },
+      after: { name: "Pitch Updated" },
     });
   });
 });

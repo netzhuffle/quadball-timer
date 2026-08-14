@@ -1,5 +1,16 @@
 import type { FoundationStorage, FoundationStorageTransaction } from "@/lib/foundation-storage";
-import { projectEventProjection, type EventProjection } from "@/lib/event-catalog";
+import {
+  createEventCatalog,
+  createFoundationEventCatalogStorage,
+  projectEventProjection,
+  type CatalogOutcome,
+  type EventCatalog,
+  type EventCatalogMutationOperations,
+  type EventTeamProjection,
+  type EventProjection,
+  type StoredPitch,
+  type StoredRosterEntry,
+} from "@/lib/event-catalog";
 import type { TechnicalAdminAuthority } from "@/lib/technical-admin-auth";
 import type {
   TypedGrantAdmission,
@@ -45,9 +56,14 @@ export type EventAdministrationOutcome<T> =
   | { status: "rejected"; reason: "invalid-input" | "unauthorized" | "not-found"; detail: string }
   | { status: "retryable-failure"; detail: string };
 
+export type EventAdministrationMutationOutcome<T> = EventAdministrationOutcome<T> & {
+  sessionExpiresAtMs?: number | null;
+};
+
 export type EventAdministrationOptions = {
   storage: FoundationStorage;
   grants: TypedGrantAuthority;
+  catalog?: EventCatalog;
   nowMs?: () => number;
 };
 
@@ -92,12 +108,45 @@ export type EventAdministration = {
     gameDayId?: unknown;
     authority: EventAdministrationAuthority;
   }): Promise<EventAdministrationOutcome<EventHubProjection>>;
+  createEventTeam(
+    eventId: unknown,
+    input: { name: unknown; defaultColor?: unknown },
+    authority: EventAdministrationAuthority,
+  ): Promise<EventAdministrationMutationOutcome<EventTeamProjection>>;
+  updateEventTeam(
+    eventId: unknown,
+    eventTeamId: unknown,
+    input: { name?: unknown; defaultColor?: unknown },
+    authority: EventAdministrationAuthority,
+  ): Promise<EventAdministrationMutationOutcome<EventTeamProjection>>;
+  upsertEventTeamRoster(
+    eventId: unknown,
+    eventTeamId: unknown,
+    input: { playerNumber: unknown; publicName: unknown },
+    authority: EventAdministrationAuthority,
+  ): Promise<EventAdministrationMutationOutcome<StoredRosterEntry>>;
+  createPitch(
+    eventId: unknown,
+    input: { name: unknown },
+    authority: EventAdministrationAuthority,
+  ): Promise<EventAdministrationMutationOutcome<StoredPitch>>;
+  updatePitch(
+    eventId: unknown,
+    pitchId: unknown,
+    input: { name: unknown },
+    authority: EventAdministrationAuthority,
+  ): Promise<EventAdministrationMutationOutcome<StoredPitch>>;
 };
 
 export function createEventAdministration(
   options: EventAdministrationOptions,
 ): EventAdministration {
   const nowMs = options.nowMs ?? (() => Date.now());
+  const catalog =
+    options.catalog ??
+    createEventCatalog(createFoundationEventCatalogStorage(options.storage), {
+      clock: { nowMs },
+    });
 
   return {
     async createEventAdminGrant(eventIdInput, authority) {
@@ -229,6 +278,11 @@ export function createEventAdministration(
             transaction.listGameDays(eventId.value),
             transaction.listEventAuditTrail(eventId.value),
             validNow(nowMs),
+            transaction.listEventTeams(eventId.value),
+            transaction
+              .listEventTeams(eventId.value)
+              .flatMap((team) => transaction.listRoster(team.eventTeamId)),
+            transaction.listPitches(eventId.value),
           );
           if (gameDayId !== null && !event.gameDays.some((day) => day.gameDayId === gameDayId))
             return unauthorized();
@@ -244,6 +298,36 @@ export function createEventAdministration(
         return unavailable();
       }
     },
+
+    async createEventTeam(eventId, input, authority) {
+      return runCatalogMutation(catalog, options, eventId, authority, (operations) =>
+        operations.createEventTeam(eventId, input),
+      );
+    },
+
+    async updateEventTeam(eventId, eventTeamId, input, authority) {
+      return runCatalogMutation(catalog, options, eventId, authority, (operations) =>
+        operations.updateEventTeam(eventId, eventTeamId, input),
+      );
+    },
+
+    async upsertEventTeamRoster(eventId, eventTeamId, input, authority) {
+      return runCatalogMutation(catalog, options, eventId, authority, (operations) =>
+        operations.upsertEventTeamRoster(eventId, eventTeamId, input),
+      );
+    },
+
+    async createPitch(eventId, input, authority) {
+      return runCatalogMutation(catalog, options, eventId, authority, (operations) =>
+        operations.createPitch(eventId, input),
+      );
+    },
+
+    async updatePitch(eventId, pitchId, input, authority) {
+      return runCatalogMutation(catalog, options, eventId, authority, (operations) =>
+        operations.updatePitch(eventId, pitchId, input),
+      );
+    },
   };
 }
 
@@ -256,9 +340,15 @@ function authorizeEventScopeInTransaction(
   kind: "technical-admin" | "event-admin";
   sessionId: string | null;
   sessionExpiresAtMs: number | null;
+  actorReference: string;
 } | null {
   if (isTechnicalAdminAuthority(authority))
-    return { kind: "technical-admin", sessionId: null, sessionExpiresAtMs: null };
+    return {
+      kind: "technical-admin",
+      sessionId: null,
+      sessionExpiresAtMs: null,
+      actorReference: `technical-admin:${authority.environment}:${authority.sessionId}`,
+    };
   if (
     !isRecord(authority) ||
     authority.kind !== "grant-session" ||
@@ -279,7 +369,44 @@ function authorizeEventScopeInTransaction(
     kind: "event-admin",
     sessionId: result.grantSessionId,
     sessionExpiresAtMs: result.sessionExpiresAtMs ?? null,
+    actorReference: `event-admin:${result.grantSessionId}`,
   };
+}
+
+async function runCatalogMutation<T>(
+  catalog: EventCatalog,
+  options: EventAdministrationOptions,
+  eventIdInput: unknown,
+  authority: EventAdministrationAuthority,
+  operation: (operations: EventCatalogMutationOperations) => CatalogOutcome<T>,
+): Promise<EventAdministrationMutationOutcome<T>> {
+  const eventId = validateEventId(eventIdInput);
+  if (!eventId.ok) return invalid(eventId.error);
+  try {
+    return await options.storage.transaction((transaction) => {
+      const authorized = authorizeEventScopeInTransaction(
+        options,
+        transaction,
+        eventId.value,
+        authority,
+      );
+      if (authorized === null) return unauthorized();
+      const result = catalog.runMutationInTransaction(
+        transaction,
+        eventId.value,
+        authorized.actorReference,
+        operation,
+      );
+      if (result.status === "accepted")
+        return { ...accepted(result.value), sessionExpiresAtMs: authorized.sessionExpiresAtMs };
+      if (result.status === "retryable-failure") return unavailable();
+      if (result.reason === "unauthorized") return unauthorized();
+      if (result.reason === "not-found") return notFound(result.detail);
+      return invalid(result.detail);
+    });
+  } catch {
+    return unavailable();
+  }
 }
 
 async function findEventAdminGrant(
