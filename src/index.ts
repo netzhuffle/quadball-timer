@@ -305,6 +305,11 @@ async function startServer() {
             return liveEventControlTransport.submitControllerIntent(req);
           },
         },
+        "/api/event-control/replay": {
+          POST(req: Request) {
+            return liveEventControlTransport.replayControllerActions(req);
+          },
+        },
         "/api/event-control/refresh": {
           POST(req: Request) {
             return liveEventControlTransport.refreshController(req);

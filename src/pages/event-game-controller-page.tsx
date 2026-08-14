@@ -1,39 +1,63 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import type {
   ControllerProjection,
+  LiveEventGameControlResult,
   LiveEventControllerIntent,
 } from "@/lib/live-event-game-control";
-import {
-  LIVE_EVENT_CONTROL_INTENT_VERSION,
-  parseLiveEventControllerIntent,
-} from "@/lib/live-event-game-control";
+import { LIVE_EVENT_CONTROL_INTENT_VERSION } from "@/lib/live-event-game-control";
 import { readControllerDeviceContext } from "@/lib/controller-device-context";
 import {
-  retainControllerIntent,
-  type PendingControllerIntent,
-} from "@/lib/controller-intent-retry";
+  acknowledgeControllerProjection,
+  controllerReplicaStorageKey,
+  createControllerReplica,
+  dispatchControllerAction,
+  invalidateControllerReplica,
+  loadControllerReplica,
+  prepareControllerReplayBatch,
+  persistControllerReplica,
+  rebindControllerReplica,
+  reconcileControllerReplay,
+  type ControllerReplicaLoad,
+  type ControllerReplicaState,
+  type ControllerReplayBatchResponse,
+  type ControllerReplicaStorage,
+} from "@/lib/controller-reconnect";
 
 type PersistedControllerSession = { sessionBearer: string; eventGameId: string };
 type ControllerOpenResponse = {
   status: "opened";
   eventGameId: string;
-  session: { sessionBearer: string };
+  session: { sessionBearer: string; grantSessionId: string; grantVersion: string };
   projection: ControllerProjection | null;
   projectionStatus: "available" | "unavailable";
 };
 type ControllerRefreshResponse =
   | {
       status: "authorized";
-      session: { eventGameId: string };
+      session: { eventGameId: string; grantSessionId: string; grantVersion: string };
       projection: ControllerProjection | null;
       projectionStatus: "available" | "unavailable";
     }
   | { status: "switch-required"; previousEventGameId: string; currentEventGameId: string }
   | { status: "rejected"; message: string };
+
+type ReplayAuthority = {
+  ownerKey: string;
+  bearer: string;
+  bearerGeneration: number;
+  eventGameId: string;
+  replicaGeneration: string;
+  grantSessionId: string;
+  grantVersion: string;
+};
+
+type ReplayRequest = { state: ControllerReplicaState; authority: ReplayAuthority };
+
+type ActiveReplay = ReplayRequest & { requestToken: symbol };
 
 export function EventGameControllerPage() {
   const persisted = readPersistedControllerSession();
@@ -52,8 +76,17 @@ export function EventGameControllerPage() {
   const [clockRunning, setClockRunning] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  const [pendingIntent, setPendingIntent] = useState<PendingControllerIntent | null>(() =>
-    readPersistedPendingIntent(),
+  const [persistedReplicaLoad] = useState<ControllerReplicaLoad>(() =>
+    readPersistedControllerReplica(persisted?.eventGameId),
+  );
+  const [replica, setReplica] = useState<ControllerReplicaState | null>(persistedReplicaLoad.state);
+  const replicaRef = useRef<ControllerReplicaState | null>(replica);
+  const bearerGenerationRef = useRef(0);
+  const installedReplayAuthorityRef = useRef<ReplayAuthority | null>(null);
+  const activeReplayRef = useRef<ActiveReplay | null>(null);
+  const queuedReplayRef = useRef<ReplayRequest | null>(null);
+  const [durabilityWarning, setDurabilityWarning] = useState<string | null>(
+    persistedReplicaLoad.warning,
   );
   const [browserContext] = useState(() => readControllerDeviceContext());
 
@@ -69,15 +102,16 @@ export function EventGameControllerPage() {
   }, [eventGameId, sessionBearer]);
 
   useEffect(() => {
-    if (pendingIntent === null) {
-      sessionStorage.removeItem("quadball:event-controller-pending-intent");
-      return;
-    }
-    sessionStorage.setItem(
-      "quadball:event-controller-pending-intent",
-      JSON.stringify(pendingIntent),
+    replicaRef.current = replica;
+    if (replica === null) return;
+    setProjection(replica.projection);
+    setProjectionStatus("available");
+    const persistedReplica = persistControllerReplica(
+      replica,
+      browserReplicaStorage(replica.eventGameId),
     );
-  }, [pendingIntent]);
+    if (persistedReplica.warning !== null) setDurabilityWarning(persistedReplica.warning);
+  }, [replica]);
 
   useEffect(() => {
     if (persisted !== null) void refreshController(true);
@@ -85,9 +119,33 @@ export function EventGameControllerPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  useEffect(() => {
+    const reconcileWhenForegrounded = () => {
+      if (document.visibilityState === "hidden") return;
+      void (async () => {
+        const revalidated = await refreshController(true);
+        if (revalidated && replicaRef.current !== null) {
+          await flushReplica(replicaRef.current);
+        }
+      })();
+    };
+    window.addEventListener("online", reconcileWhenForegrounded);
+    document.addEventListener("visibilitychange", reconcileWhenForegrounded);
+    return () => {
+      window.removeEventListener("online", reconcileWhenForegrounded);
+      document.removeEventListener("visibilitychange", reconcileWhenForegrounded);
+    };
+  }, [eventGameId, sessionBearer]);
+
   async function openController() {
     setBusy(true);
     setMessage(null);
+    clearReplayAuthority();
+    if (replicaRef.current !== null) {
+      const invalidated = invalidateControllerReplica(replicaRef.current);
+      replicaRef.current = invalidated;
+      setReplica(invalidated);
+    }
     try {
       const response = await postJson<ControllerOpenResponse>("/api/event-control/open", {
         qrCredential,
@@ -98,6 +156,35 @@ export function EventGameControllerPage() {
       setEventGameId(response.eventGameId);
       setProjection(response.projection);
       setProjectionStatus(response.projectionStatus);
+      const existingReplica = replicaRef.current;
+      const restoredLoad = loadControllerReplica(
+        browserReplicaStorage(response.eventGameId),
+        response.eventGameId,
+      );
+      if (restoredLoad.warning !== null) setDurabilityWarning(restoredLoad.warning);
+      const scopedReplica =
+        existingReplica?.eventGameId === response.eventGameId
+          ? existingReplica
+          : restoredLoad.state;
+      const nextReplica =
+        scopedReplica?.eventGameId === response.eventGameId
+          ? rebindControllerReplica(
+              scopedReplica,
+              {
+                eventGameId: response.eventGameId,
+                grantSessionId: response.session.grantSessionId,
+                grantVersion: response.session.grantVersion,
+              },
+              response.projection,
+            )
+          : createControllerReplica({
+              eventGameId: response.eventGameId,
+              projection: response.projection ?? emptyProjection(response.eventGameId),
+              grantSessionId: response.session.grantSessionId,
+              grantVersion: response.session.grantVersion,
+            });
+      commitReplica(nextReplica);
+      await flushReplica(nextReplica, response.session.sessionBearer);
     } catch {
       clearSession();
       setMessage("Unable to open Controller experience.");
@@ -106,8 +193,8 @@ export function EventGameControllerPage() {
     }
   }
 
-  async function refreshController(silent = false) {
-    if (sessionBearer === null || eventGameId === null) return;
+  async function refreshController(silent = false): Promise<boolean> {
+    if (sessionBearer === null || eventGameId === null) return false;
     if (!silent) setBusy(true);
     try {
       const response = await postJson<ControllerRefreshResponse>("/api/event-control/refresh", {
@@ -118,15 +205,38 @@ export function EventGameControllerPage() {
         setSwitchTarget(
           stayedOnAssignment === response.currentEventGameId ? null : response.currentEventGameId,
         );
-        return;
+        return false;
       }
       if (response.status === "rejected") throw new Error("refresh failed");
       setSwitchTarget(null);
       setEventGameId(response.session.eventGameId);
       setProjection(response.projection);
       setProjectionStatus(response.projectionStatus);
+      const currentReplica = replicaRef.current;
+      const refreshedSession = {
+        eventGameId: response.session.eventGameId,
+        grantSessionId: response.session.grantSessionId,
+        grantVersion: response.session.grantVersion,
+      };
+      const nextReplica =
+        currentReplica?.eventGameId === response.session.eventGameId &&
+        currentReplica.session.grantSessionId === response.session.grantSessionId &&
+        currentReplica.session.grantVersion === response.session.grantVersion
+          ? acknowledgeControllerProjection(currentReplica, response.projection)
+          : currentReplica?.eventGameId === response.session.eventGameId
+            ? rebindControllerReplica(currentReplica, refreshedSession, response.projection)
+            : createControllerReplica({
+                eventGameId: response.session.eventGameId,
+                projection: response.projection ?? emptyProjection(response.session.eventGameId),
+                grantSessionId: response.session.grantSessionId,
+                grantVersion: response.session.grantVersion,
+              });
+      commitReplica(nextReplica);
+      await flushReplica(nextReplica, sessionBearer);
+      return true;
     } catch {
       if (!silent) setMessage("Unable to refresh Controller session.");
+      return false;
     } finally {
       if (!silent) setBusy(false);
     }
@@ -135,6 +245,13 @@ export function EventGameControllerPage() {
   async function switchController() {
     if (sessionBearer === null) return;
     setBusy(true);
+    clearReplayAuthority();
+    const current = replicaRef.current;
+    if (current !== null) {
+      const invalidated = invalidateControllerReplica(current);
+      replicaRef.current = invalidated;
+      setReplica(invalidated);
+    }
     try {
       const response = await postJson<ControllerRefreshResponse>("/api/event-control/switch", {
         sessionBearer,
@@ -143,6 +260,31 @@ export function EventGameControllerPage() {
       setEventGameId(response.session.eventGameId);
       setProjection(response.projection);
       setProjectionStatus(response.projectionStatus);
+      const restoredLoad = loadControllerReplica(
+        browserReplicaStorage(response.session.eventGameId),
+        response.session.eventGameId,
+      );
+      if (restoredLoad.warning !== null) setDurabilityWarning(restoredLoad.warning);
+      const restored = restoredLoad.state;
+      const nextReplica =
+        restored === null
+          ? createControllerReplica({
+              eventGameId: response.session.eventGameId,
+              projection: response.projection ?? emptyProjection(response.session.eventGameId),
+              grantSessionId: response.session.grantSessionId,
+              grantVersion: response.session.grantVersion,
+            })
+          : rebindControllerReplica(
+              restored,
+              {
+                eventGameId: response.session.eventGameId,
+                grantSessionId: response.session.grantSessionId,
+                grantVersion: response.session.grantVersion,
+              },
+              response.projection,
+            );
+      commitReplica(nextReplica);
+      await flushReplica(nextReplica, sessionBearer);
       setSwitchTarget(null);
       setStayedOnAssignment(null);
       setMessage("Controller Device switched to the newly assigned Event Game.");
@@ -167,6 +309,19 @@ export function EventGameControllerPage() {
       setEventGameId(response.session.eventGameId);
       setProjection(response.projection);
       setProjectionStatus(response.projectionStatus);
+      if (replicaRef.current !== null) {
+        const nextReplica = rebindControllerReplica(
+          replicaRef.current,
+          {
+            eventGameId: response.session.eventGameId,
+            grantSessionId: response.session.grantSessionId,
+            grantVersion: response.session.grantVersion,
+          },
+          response.projection,
+        );
+        commitReplica(nextReplica);
+        await flushReplica(nextReplica, sessionBearer);
+      }
       setMessage("Staying on the current Event Game until the assignment changes again.");
     } catch {
       setMessage("Unable to retain the current Event Game assignment.");
@@ -209,30 +364,6 @@ export function EventGameControllerPage() {
     }
   }
 
-  async function submitIntent(intent: LiveEventControllerIntent) {
-    if (sessionBearer === null || eventGameId === null) return;
-    setBusy(true);
-    try {
-      const response = await postJson<
-        | { status: "accepted" | "duplicate-accepted"; projection: ControllerProjection | null }
-        | { status: "rejected" | "retryable" }
-      >("/api/event-control/intent", { sessionBearer, eventGameId, intent });
-      if (response.status !== "accepted" && response.status !== "duplicate-accepted") {
-        if (response.status === "rejected") setPendingIntent(null);
-        setMessage("The Controller action was not committed; retry is safe.");
-        return;
-      }
-      setPendingIntent(null);
-      setProjection(response.projection);
-      setProjectionStatus(response.projection === null ? "unavailable" : "available");
-      if (intent.type === "clock" || intent.type === "set-running") setClockRunning(intent.running);
-    } catch {
-      setMessage("The Controller action may still be pending. Retry the same action.");
-    } finally {
-      setBusy(false);
-    }
-  }
-
   function recordGoal(gameSideId: string) {
     queueIntent({
       version: LIVE_EVENT_CONTROL_INTENT_VERSION,
@@ -257,29 +388,208 @@ export function EventGameControllerPage() {
     });
   }
 
-  function toggleClock() {
-    queueIntent({
-      version: LIVE_EVENT_CONTROL_INTENT_VERSION,
-      type: "clock",
-      running: !clockRunning,
-      operationId: crypto.randomUUID(),
-      factId: crypto.randomUUID(),
-      gameTimeMs: 0,
-      occurrence: { clientOriginAtMs: Date.now() },
-    });
+  function queueIntent(candidate: LiveEventControllerIntent) {
+    const current = replicaRef.current;
+    if (current === null) return;
+    try {
+      const dispatched = dispatchControllerAction(current, {
+        ...candidate,
+        occurrence: {
+          ...candidate.occurrence,
+          source: navigator.onLine === false ? "offline" : "online",
+        },
+      });
+      replicaRef.current = dispatched.state;
+      setReplica(dispatched.state);
+      setProjection(dispatched.state.projection);
+      setProjectionStatus("available");
+      void flushReplica(dispatched.state);
+    } catch {
+      setMessage("The Controller action could not be retained safely.");
+    }
   }
 
-  function queueIntent(candidate: LiveEventControllerIntent) {
-    const intent = retainControllerIntent(pendingIntent, candidate);
-    setPendingIntent(intent);
-    void submitIntent(intent);
+  async function flushReplica(state: ControllerReplicaState, bearer = sessionBearer) {
+    if (bearer === null) return;
+    const request = { state, authority: installReplayAuthority(state, bearer) };
+    const active = activeReplayRef.current;
+    if (active !== null) {
+      if (active.authority.ownerKey !== request.authority.ownerKey || active.state !== state) {
+        queuedReplayRef.current = request;
+      }
+      return;
+    }
+    await runReplay(request);
+  }
+
+  async function runReplay(request: ReplayRequest) {
+    if (!isInstalledReplayAuthority(request.authority)) return;
+    const current = replicaRef.current;
+    const replayState =
+      current !== null && replicaMatchesAuthority(current, request.authority)
+        ? current
+        : request.state;
+    const prepared = prepareControllerReplayBatch(replayState);
+    if (prepared === null) return;
+    commitReplica(prepared.state);
+    const active: ActiveReplay = {
+      state: prepared.state,
+      authority: request.authority,
+      requestToken: Symbol("controller-replay"),
+    };
+    activeReplayRef.current = active;
+    try {
+      const response = await postJson<ControllerReplayBatchResponse>("/api/event-control/replay", {
+        sessionBearer: request.authority.bearer,
+        eventGameId: prepared.batch.eventGameId,
+        batchId: prepared.batch.batchId,
+        replicaGeneration: prepared.batch.replicaGeneration,
+        grantSessionId: prepared.batch.session.grantSessionId,
+        grantVersion: prepared.batch.session.grantVersion,
+        actions: prepared.batch.actions,
+      });
+      if (!isInstalledReplayAuthority(request.authority)) return;
+      const nextReplica = reconcileControllerReplay(replicaRef.current ?? prepared.state, response);
+      commitReplica(nextReplica);
+      setProjection(nextReplica.projection);
+      setProjectionStatus(response.projection === null ? "unavailable" : "available");
+      if (
+        response.status === "synchronized" &&
+        nextReplica.pendingActions.some((action) => action.status === "pending")
+      ) {
+        queuedReplayRef.current = { state: nextReplica, authority: request.authority };
+      }
+      if (response.status === "retryable")
+        setMessage("Reconnect is incomplete; retained actions will retry.");
+    } catch {
+      if (isInstalledReplayAuthority(request.authority)) {
+        setMessage("Connection lost. Pending Controller actions remain safely retained.");
+      }
+    } finally {
+      if (activeReplayRef.current?.requestToken === active.requestToken) {
+        activeReplayRef.current = null;
+        const queued = queuedReplayRef.current;
+        queuedReplayRef.current = null;
+        const installed = installedReplayAuthorityRef.current;
+        if (
+          queued !== null &&
+          installed !== null &&
+          queued.authority.ownerKey === installed.ownerKey
+        ) {
+          void runReplay({ state: replicaRef.current ?? queued.state, authority: installed });
+        }
+      }
+    }
+  }
+
+  function installReplayAuthority(state: ControllerReplicaState, bearer: string): ReplayAuthority {
+    const current = installedReplayAuthorityRef.current;
+    if (current !== null && current.bearer === bearer && replicaMatchesAuthority(state, current)) {
+      return current;
+    }
+    const bearerGeneration = bearerGenerationRef.current + 1;
+    bearerGenerationRef.current = bearerGeneration;
+    const authority: ReplayAuthority = {
+      ownerKey: [
+        state.eventGameId,
+        state.replicaGeneration,
+        state.session.grantSessionId,
+        state.session.grantVersion,
+        bearerGeneration,
+      ].join("\u001f"),
+      bearer,
+      bearerGeneration,
+      eventGameId: state.eventGameId,
+      replicaGeneration: state.replicaGeneration,
+      grantSessionId: state.session.grantSessionId,
+      grantVersion: state.session.grantVersion,
+    };
+    installedReplayAuthorityRef.current = authority;
+    return authority;
+  }
+
+  function isInstalledReplayAuthority(authority: ReplayAuthority): boolean {
+    return installedReplayAuthorityRef.current?.ownerKey === authority.ownerKey;
+  }
+
+  function clearReplayAuthority() {
+    installedReplayAuthorityRef.current = null;
+    queuedReplayRef.current = null;
+  }
+
+  function commitReplica(state: ControllerReplicaState) {
+    replicaRef.current = state;
+    setReplica(state);
+  }
+
+  function toggleClock() {
+    const bearer = sessionBearer;
+    const currentEventGameId = eventGameId;
+    if (bearer === null || currentEventGameId === null) return;
+    if (navigator.onLine === false) {
+      setMessage("Clock control is unavailable while disconnected and was not retained.");
+      return;
+    }
+    void submitOnlineControllerIntent(
+      {
+        version: LIVE_EVENT_CONTROL_INTENT_VERSION,
+        type: "clock",
+        running: !clockRunning,
+        operationId: crypto.randomUUID(),
+        factId: crypto.randomUUID(),
+        gameTimeMs: 0,
+        occurrence: { clientOriginAtMs: Date.now(), source: "online" },
+      },
+      bearer,
+      currentEventGameId,
+    );
+  }
+
+  async function submitOnlineControllerIntent(
+    intent: LiveEventControllerIntent,
+    bearer: string,
+    currentEventGameId: string,
+  ) {
+    try {
+      const response = await postJson<LiveEventGameControlResult>("/api/event-control/intent", {
+        sessionBearer: bearer,
+        eventGameId: currentEventGameId,
+        intent,
+      });
+      if (response.status !== "accepted" && response.status !== "duplicate-accepted") {
+        setMessage("The online Controller action was not accepted.");
+        return;
+      }
+      setClockRunning(
+        intent.type === "clock" || intent.type === "set-running" ? intent.running : false,
+      );
+      if (response.projection !== null) {
+        const current = replicaRef.current;
+        if (current?.eventGameId === currentEventGameId) {
+          const nextReplica = acknowledgeControllerProjection(current, response.projection);
+          replicaRef.current = nextReplica;
+          setReplica(nextReplica);
+        }
+        setProjection(response.projection);
+        setProjectionStatus(response.projectionStatus);
+      }
+    } catch {
+      setMessage("The online Controller action could not be submitted.");
+    }
   }
 
   function clearSession() {
+    clearReplayAuthority();
+    if (replicaRef.current !== null) {
+      const invalidated = invalidateControllerReplica(replicaRef.current);
+      replicaRef.current = invalidated;
+      setReplica(invalidated);
+    }
     setSessionBearer(null);
     setEventGameId(null);
     setProjection(null);
     setProjectionStatus("unavailable");
+    setClockRunning(false);
     setRevealedQr(null);
     setSwitchTarget(null);
     setStayedOnAssignment(null);
@@ -393,9 +703,15 @@ export function EventGameControllerPage() {
                   ))}
                 </div>
               )}
-              {pendingIntent === null ? null : (
+              {replica !== null && replica.pendingActions.length > 0 ? (
                 <p className="text-sm text-amber-700">
-                  An uncertain Controller action is retained for safe retry.
+                  {replica.pendingActions.length} Controller action(s) retained for reconnect
+                  replay.
+                </p>
+              ) : null}
+              {durabilityWarning === null ? null : (
+                <p role="alert" className="text-sm font-medium text-amber-700">
+                  {durabilityWarning}
                 </p>
               )}
             </>
@@ -418,6 +734,18 @@ async function postJson<T>(path: string, body: unknown): Promise<T> {
   return result;
 }
 
+function replicaMatchesAuthority(
+  state: ControllerReplicaState,
+  authority: ReplayAuthority,
+): boolean {
+  return (
+    state.eventGameId === authority.eventGameId &&
+    state.replicaGeneration === authority.replicaGeneration &&
+    state.session.grantSessionId === authority.grantSessionId &&
+    state.session.grantVersion === authority.grantVersion
+  );
+}
+
 function readPersistedControllerSession(): PersistedControllerSession | null {
   try {
     const raw = sessionStorage.getItem("quadball:event-controller-session");
@@ -431,13 +759,41 @@ function readPersistedControllerSession(): PersistedControllerSession | null {
   }
 }
 
-function readPersistedPendingIntent(): PendingControllerIntent | null {
+function readPersistedControllerReplica(eventGameId: string | undefined): ControllerReplicaLoad {
   try {
-    const raw = sessionStorage.getItem("quadball:event-controller-pending-intent");
-    if (raw === null) return null;
-    const parsed = parseLiveEventControllerIntent(JSON.parse(raw));
-    return parsed.ok ? parsed.value : null;
+    if (typeof localStorage === "undefined") {
+      return { state: null, warning: null, quarantined: false };
+    }
+    return loadControllerReplica(browserReplicaStorage(eventGameId), eventGameId);
   } catch {
-    return null;
+    return {
+      state: null,
+      warning: "Controller recovery storage is unavailable; changes remain in memory.",
+      quarantined: false,
+    };
   }
+}
+
+function browserReplicaStorage(eventGameId?: string): ControllerReplicaStorage {
+  const storageKey = controllerReplicaStorageKey(eventGameId);
+  return {
+    read: () => localStorage.getItem(storageKey),
+    write: (value) => localStorage.setItem(storageKey, value),
+    quarantine: (value) => localStorage.setItem(`${storageKey}:quarantine`, value),
+  };
+}
+
+function emptyProjection(eventGameId: string): ControllerProjection {
+  return {
+    eventGameId,
+    phase: "scheduled",
+    scoreByGameSide: {},
+    goalCount: 0,
+    commencement: {
+      status: "provisional",
+      commencedAtMs: null,
+      provisionalRunningSinceMs: null,
+      provisionalElapsedMs: 0,
+    },
+  };
 }

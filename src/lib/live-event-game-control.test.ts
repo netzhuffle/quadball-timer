@@ -532,6 +532,178 @@ describe("Live Event Game control", () => {
     expect(actions[0]?.action.occurrence.trustedAtMs).toBeGreaterThan(10_000);
   });
 
+  test("replays one bounded batch with per-action outcomes and causal blocking", async () => {
+    const harness = await createHarness();
+    const opened = await harness.control.openController({
+      qrCredential: harness.qrCredential,
+      browserContext: "reconnect-device",
+    });
+    if (opened.status !== "opened") throw new Error("Expected the Controller to open.");
+    const result = await harness.control.replayControllerActions({
+      sessionBearer: opened.session.sessionBearer,
+      eventGameId: harness.root.eventGameId,
+      batchId: "batch-replay-test",
+      replicaGeneration: "generation-replay-test",
+      expectedGrantSessionId: opened.session.grantSessionId,
+      expectedGrantVersion: opened.session.grantVersion,
+      actions: [
+        {
+          eventGameId: harness.root.eventGameId,
+          intent: {
+            ...goalIntent({ gameSideId: "side-a" }),
+            operationId: "blocked-goal",
+            factId: "blocked-fact",
+          },
+          causalPredecessorIds: ["operation-goal"],
+        },
+        {
+          eventGameId: harness.root.eventGameId,
+          intent: goalIntent({ gameSideId: "missing-side" }),
+        },
+        {
+          eventGameId: harness.root.eventGameId,
+          intent: { ...goalIntent(), operationId: "unrelated-goal", factId: "unrelated-fact" },
+        },
+        {
+          eventGameId: harness.root.eventGameId,
+          intent: { ...goalIntent(), operationId: "unresolved-goal", factId: "unresolved-fact" },
+          causalPredecessorIds: ["not-retained"],
+        },
+      ],
+    });
+    expect(result.status).toBe("synchronized");
+    expect(
+      Object.fromEntries(result.outcomes.map((outcome) => [outcome.operationId, outcome.status])),
+    ).toEqual({
+      "operation-goal": "terminally-rejected",
+      "blocked-goal": "causally-blocked",
+      "unrelated-goal": "accepted",
+      "unresolved-goal": "terminally-rejected",
+    });
+    expect((await harness.record.readActions()).map((stored) => stored.action.operationId)).toEqual(
+      ["unrelated-goal"],
+    );
+  });
+
+  test("holds new replay evidence for a finished but unlocked Game", async () => {
+    const harness = await createHarness();
+    const opened = await harness.control.openController({
+      qrCredential: harness.qrCredential,
+      browserContext: "finished-reconnect-device",
+    });
+    if (opened.status !== "opened") throw new Error("Expected the Controller to open.");
+    const finish = await harness.control.submitControllerIntent({
+      sessionBearer: opened.session.sessionBearer,
+      eventGameId: harness.root.eventGameId,
+      intent: substantiveIntent("finish-before-replay", "result"),
+    });
+    expect(finish.status).toBe("accepted");
+    const replay = await harness.control.replayControllerActions({
+      sessionBearer: opened.session.sessionBearer,
+      eventGameId: harness.root.eventGameId,
+      batchId: "batch-finished-hold",
+      replicaGeneration: "generation-finished-hold",
+      expectedGrantSessionId: opened.session.grantSessionId,
+      expectedGrantVersion: opened.session.grantVersion,
+      actions: [
+        {
+          eventGameId: harness.root.eventGameId,
+          intent: goalIntent({ operationId: "held-goal", factId: "held-fact" }),
+          causalPredecessorIds: [],
+        },
+      ],
+    });
+    expect(replay.outcomes).toEqual([{ operationId: "held-goal", status: "held-for-correction" }]);
+    expect(await harness.record.readActions()).toHaveLength(1);
+  });
+
+  test("holds actions that follow an accepted result in the same replay batch", async () => {
+    const harness = await createHarness();
+    const opened = await harness.control.openController({
+      qrCredential: harness.qrCredential,
+      browserContext: "same-batch-finish-device",
+    });
+    if (opened.status !== "opened") throw new Error("Expected the Controller to open.");
+    const replay = await harness.control.replayControllerActions({
+      sessionBearer: opened.session.sessionBearer,
+      eventGameId: harness.root.eventGameId,
+      batchId: "batch-same-batch-finish",
+      replicaGeneration: "generation-same-batch-finish",
+      expectedGrantSessionId: opened.session.grantSessionId,
+      expectedGrantVersion: opened.session.grantVersion,
+      actions: [
+        {
+          eventGameId: harness.root.eventGameId,
+          intent: substantiveIntent("same-batch-result", "result"),
+          causalPredecessorIds: [],
+        },
+        {
+          eventGameId: harness.root.eventGameId,
+          intent: goalIntent({ operationId: "post-result-goal", factId: "post-result-fact" }),
+          causalPredecessorIds: [],
+        },
+      ],
+    });
+    expect(replay.outcomes).toEqual([
+      { operationId: "same-batch-result", status: "accepted" },
+      { operationId: "post-result-goal", status: "held-for-correction" },
+    ]);
+    expect((await harness.record.readActions()).map((stored) => stored.action.operationId)).toEqual(
+      ["same-batch-result"],
+    );
+  });
+
+  test("rejects replay authority mismatches and malformed causal evidence without submission", async () => {
+    const harness = await createHarness();
+    const opened = await harness.control.openController({
+      qrCredential: harness.qrCredential,
+      browserContext: "malformed-reconnect-device",
+    });
+    if (opened.status !== "opened") throw new Error("Expected the Controller to open.");
+    const mismatch = await harness.control.replayControllerActions({
+      sessionBearer: opened.session.sessionBearer,
+      eventGameId: harness.root.eventGameId,
+      batchId: "batch-mismatch",
+      replicaGeneration: "generation-mismatch",
+      expectedGrantSessionId: opened.session.grantSessionId,
+      expectedGrantVersion: "expired-version",
+      actions: [{ eventGameId: harness.root.eventGameId, intent: goalIntent() }],
+    });
+    expect(mismatch.status).toBe("rejected");
+    expect(await harness.record.readActions()).toHaveLength(0);
+    const malformed = await harness.control.replayControllerActions({
+      sessionBearer: opened.session.sessionBearer,
+      eventGameId: harness.root.eventGameId,
+      batchId: "batch-malformed",
+      replicaGeneration: "generation-malformed",
+      expectedGrantSessionId: opened.session.grantSessionId,
+      expectedGrantVersion: opened.session.grantVersion,
+      actions: [
+        {
+          eventGameId: harness.root.eventGameId,
+          intent: { ...goalIntent(), operationId: "bad-dependency" },
+          causalPredecessorIds: [42],
+        },
+        {
+          eventGameId: harness.root.eventGameId,
+          intent: { ...goalIntent(), operationId: "duplicate-dependency" },
+          causalPredecessorIds: ["same", "same"],
+        },
+        {
+          eventGameId: "another-game",
+          intent: { ...goalIntent(), operationId: "cross-game" },
+          causalPredecessorIds: [],
+        },
+      ],
+    });
+    expect(malformed.outcomes.map((outcome) => outcome.status)).toEqual([
+      "terminally-rejected",
+      "terminally-rejected",
+      "terminally-rejected",
+    ]);
+    expect(await harness.record.readActions()).toHaveLength(0);
+  });
+
   test("keeps distinct Controller Devices active while reopening one device replaces only itself", async () => {
     const harness = await createHarness();
     const first = await harness.control.openController({
@@ -664,6 +836,50 @@ describe("Live Event Game control", () => {
       clientOriginAtMs: 10_000,
       source: "online",
     });
+  });
+
+  test("distinguishes direct online provenance from later offline replay evidence", async () => {
+    const harness = await createHarness();
+    const opened = await harness.control.openController({
+      qrCredential: harness.qrCredential,
+      browserContext: "provenance-device",
+    });
+    if (opened.status !== "opened") throw new Error("Expected the Controller to open.");
+    await harness.control.submitControllerIntent({
+      sessionBearer: opened.session.sessionBearer,
+      eventGameId: harness.root.eventGameId,
+      intent: {
+        ...goalIntent({ operationId: "online-provenance", factId: "online-fact" }),
+        occurrence: { clientOriginAtMs: 1_000, source: "online" as const },
+      },
+    });
+    const offline = {
+      ...goalIntent({ operationId: "offline-provenance", factId: "offline-fact" }),
+      occurrence: { clientOriginAtMs: 2_000, source: "offline" as const },
+    };
+    const replay = await harness.control.replayControllerActions({
+      sessionBearer: opened.session.sessionBearer,
+      eventGameId: harness.root.eventGameId,
+      batchId: "provenance-batch",
+      replicaGeneration: "provenance-generation",
+      expectedGrantSessionId: opened.session.grantSessionId,
+      expectedGrantVersion: opened.session.grantVersion,
+      actions: [
+        { eventGameId: harness.root.eventGameId, intent: offline, causalPredecessorIds: [] },
+      ],
+    });
+    expect(replay.outcomes).toEqual([{ operationId: "offline-provenance", status: "accepted" }]);
+    const actions = await harness.record.readActions();
+    expect(
+      actions.map((stored) => ({
+        operationId: stored.action.operationId,
+        clientOriginAtMs: stored.action.occurrence.clientOriginAtMs,
+        source: stored.action.occurrence.source,
+      })),
+    ).toEqual([
+      { operationId: "online-provenance", clientOriginAtMs: 1_000, source: "online" },
+      { operationId: "offline-provenance", clientOriginAtMs: 2_000, source: "offline" },
+    ]);
   });
 
   test("acknowledges a committed goal when projection rebuild is unavailable", async () => {
@@ -907,12 +1123,14 @@ async function createHarness(
   };
 }
 
-function goalIntent(overrides: { gameSideId?: string } = {}) {
+function goalIntent(
+  overrides: { gameSideId?: string; operationId?: string; factId?: string } = {},
+) {
   return {
     version: LIVE_EVENT_CONTROL_INTENT_VERSION,
     type: "record-goal",
-    operationId: "operation-goal",
-    factId: "fact-goal",
+    operationId: overrides.operationId ?? "operation-goal",
+    factId: overrides.factId ?? "fact-goal",
     gameSideId: overrides.gameSideId ?? "side-a",
     gameTimeMs: 12_000,
     occurrence: { clientOriginAtMs: 10_000 },
