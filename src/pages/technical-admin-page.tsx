@@ -1,6 +1,8 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 
 type AdminSession = {
   authenticated: true;
@@ -40,6 +42,26 @@ export function TechnicalAdminPage({ enrollment }: { enrollment: boolean }) {
     } finally {
       setBusy(false);
     }
+  };
+
+  const completeStepUp = async (purpose: "replace-credential" | "revoke-other-sessions") => {
+    const optionsResponse = await adminFetch("/api/admin/step-up/options", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ purpose }),
+    });
+    if (!optionsResponse.ok) throw new Error("Fresh verification is unavailable.");
+    const options = (await optionsResponse.json()) as AuthenticationOptionsResponse;
+    const credential = await getCredential(options);
+    const complete = await adminFetch("/api/admin/step-up/complete", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        challengeId: options.challengeId,
+        response: serializeCredential(credential),
+      }),
+    });
+    if (!complete.ok) throw new Error("Fresh verification failed.");
   };
 
   if (enrollment) {
@@ -191,28 +213,333 @@ export function TechnicalAdminPage({ enrollment }: { enrollment: boolean }) {
       >
         Log out other sessions
       </Button>
+      <EventCatalogPanel />
     </AdminCard>
   );
+}
 
-  async function completeStepUp(purpose: "replace-credential" | "revoke-other-sessions") {
-    const optionsResponse = await adminFetch("/api/admin/step-up/options", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ purpose }),
-    });
-    if (!optionsResponse.ok) throw new Error("Fresh verification is unavailable.");
-    const options = (await optionsResponse.json()) as AuthenticationOptionsResponse;
-    const credential = await getCredential(options);
-    const complete = await adminFetch("/api/admin/step-up/complete", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        challengeId: options.challengeId,
-        response: serializeCredential(credential),
-      }),
-    });
-    if (!complete.ok) throw new Error("Fresh verification failed.");
-  }
+type EventCatalogResponse<T> =
+  | { status: "accepted"; value: T }
+  | { status: "rejected" | "retryable-failure"; reason?: string; detail: string };
+
+type EventProjection = {
+  eventId: string;
+  name: string;
+  timeZone: string;
+  lifecycle: "unscheduled" | "future" | "current" | "past";
+  gameDays: Array<{
+    gameDayId: string;
+    date: string;
+    classification: "future" | "current" | "past";
+  }>;
+};
+
+function EventCatalogPanel() {
+  const [events, setEvents] = useState<EventProjection[]>([]);
+  const [selected, setSelected] = useState<EventProjection | null>(null);
+  const [editedName, setEditedName] = useState("");
+  const [editedTimeZone, setEditedTimeZone] = useState("");
+  const [editedGameDays, setEditedGameDays] = useState<Record<string, string>>({});
+  const [name, setName] = useState("");
+  const [timeZone, setTimeZone] = useState("Europe/Zurich");
+  const [gameDayDate, setGameDayDate] = useState("");
+  const [message, setMessage] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const request = async <T,>(url: string, init?: RequestInit) => {
+    const response = await fetch(url, init);
+    const payload = (await response.json()) as EventCatalogResponse<T>;
+    if (!response.ok || payload.status !== "accepted") {
+      throw new Error("detail" in payload ? payload.detail : "Event catalog operation failed.");
+    }
+    return payload.value;
+  };
+
+  const refresh = async () => {
+    const value = await request<readonly EventProjection[]>("/api/admin/events");
+    setEvents([...value]);
+    if (selected !== null) {
+      const current = await request<EventProjection>(`/api/admin/events/${selected.eventId}`);
+      setSelected(current);
+      setEditedName(current.name);
+      setEditedTimeZone(current.timeZone);
+      setEditedGameDays(
+        Object.fromEntries(current.gameDays.map((day) => [day.gameDayId, day.date])),
+      );
+    }
+  };
+
+  const selectEvent = async (eventId: string) => {
+    const current = await request<EventProjection>(`/api/admin/events/${eventId}`);
+    setSelected(current);
+    setEditedName(current.name);
+    setEditedTimeZone(current.timeZone);
+    setEditedGameDays(Object.fromEntries(current.gameDays.map((day) => [day.gameDayId, day.date])));
+  };
+
+  useEffect(() => {
+    void refresh().catch((error: unknown) =>
+      setMessage(error instanceof Error ? error.message : "Unable to load Events."),
+    );
+  }, []);
+
+  const run = async (action: () => Promise<void>) => {
+    setBusy(true);
+    setMessage(null);
+    try {
+      await action();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Event catalog operation failed.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>Event catalog</CardTitle>
+        <CardDescription>
+          Create and maintain Unpublished Events and their Game Days.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-5">
+        <form
+          className="grid gap-3 sm:grid-cols-[1fr_1fr_auto]"
+          onSubmit={(event) => {
+            event.preventDefault();
+            void run(async () => {
+              await request<EventProjection>("/api/admin/events", {
+                method: "POST",
+                headers: {
+                  "content-type": "application/json",
+                  "x-technical-admin-csrf": "1",
+                },
+                body: JSON.stringify({ name, timeZone }),
+              });
+              setName("");
+              await refresh();
+            });
+          }}
+        >
+          <div className="space-y-2">
+            <Label htmlFor="event-name">Event name</Label>
+            <Input
+              id="event-name"
+              value={name}
+              onChange={(event) => setName(event.target.value)}
+              required
+            />
+          </div>
+          <div className="space-y-2">
+            <Label htmlFor="event-time-zone">Event timezone</Label>
+            <Input
+              id="event-time-zone"
+              value={timeZone}
+              onChange={(event) => setTimeZone(event.target.value)}
+              required
+            />
+          </div>
+          <Button className="self-end" disabled={busy} type="submit">
+            Create Event
+          </Button>
+        </form>
+
+        {message ? <p className="text-sm text-destructive">{message}</p> : null}
+
+        <div className="grid gap-3 sm:grid-cols-2">
+          <div className="space-y-2">
+            <h3 className="text-sm font-semibold">Events</h3>
+            {events.length === 0 ? (
+              <p className="text-sm text-muted-foreground">No Events yet.</p>
+            ) : null}
+            {events.map((event) => (
+              <button
+                className="block w-full rounded-lg border p-3 text-left hover:bg-muted"
+                key={event.eventId}
+                onClick={() => void run(() => selectEvent(event.eventId))}
+                type="button"
+              >
+                <span className="font-medium">{event.name}</span>
+                <span className="mt-1 block text-xs text-muted-foreground">
+                  {event.timeZone} · {event.lifecycle}
+                </span>
+              </button>
+            ))}
+          </div>
+          {selected ? (
+            <div className="space-y-3 rounded-lg border p-3">
+              <div>
+                <h3 className="font-semibold">{selected.name}</h3>
+                <p className="text-xs text-muted-foreground">
+                  {selected.eventId} · {selected.timeZone}
+                </p>
+              </div>
+              <div className="grid gap-3 sm:grid-cols-2">
+                <div className="space-y-2">
+                  <Label htmlFor="selected-event-name">Event name</Label>
+                  <Input
+                    id="selected-event-name"
+                    value={editedName}
+                    onChange={(event) => setEditedName(event.target.value)}
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="selected-event-time-zone">Event timezone</Label>
+                  <Input
+                    id="selected-event-time-zone"
+                    value={editedTimeZone}
+                    onChange={(event) => setEditedTimeZone(event.target.value)}
+                  />
+                </div>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <Button
+                  disabled={busy || editedName.length === 0 || editedTimeZone.length === 0}
+                  onClick={() =>
+                    void run(async () => {
+                      await request(`/api/admin/events/${selected.eventId}`, {
+                        method: "PATCH",
+                        headers: {
+                          "content-type": "application/json",
+                          "x-technical-admin-csrf": "1",
+                        },
+                        body: JSON.stringify({ name: editedName, timeZone: editedTimeZone }),
+                      });
+                      await refresh();
+                    })
+                  }
+                  type="button"
+                >
+                  Save Event
+                </Button>
+                <Button
+                  disabled={busy || selected.gameDays.length > 0}
+                  onClick={() =>
+                    void run(async () => {
+                      await request(`/api/admin/events/${selected.eventId}`, {
+                        method: "DELETE",
+                        headers: { "x-technical-admin-csrf": "1" },
+                      });
+                      setSelected(null);
+                      await refresh();
+                    })
+                  }
+                  type="button"
+                  variant="outline"
+                >
+                  Remove empty Event
+                </Button>
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="game-day-date">Add Game Day</Label>
+                <div className="flex gap-2">
+                  <Input
+                    id="game-day-date"
+                    type="date"
+                    value={gameDayDate}
+                    onChange={(event) => setGameDayDate(event.target.value)}
+                  />
+                  <Button
+                    disabled={busy || gameDayDate.length === 0}
+                    onClick={() =>
+                      void run(async () => {
+                        await request(`/api/admin/events/${selected.eventId}/game-days`, {
+                          method: "POST",
+                          headers: {
+                            "content-type": "application/json",
+                            "x-technical-admin-csrf": "1",
+                          },
+                          body: JSON.stringify({ date: gameDayDate }),
+                        });
+                        setGameDayDate("");
+                        await refresh();
+                      })
+                    }
+                    type="button"
+                  >
+                    Add
+                  </Button>
+                </div>
+              </div>
+              <ul className="space-y-1 text-sm">
+                {selected.gameDays.map((day) => (
+                  <li className="flex items-center justify-between gap-2" key={day.gameDayId}>
+                    <div className="flex items-center gap-2">
+                      <Input
+                        aria-label={`Game Day ${day.gameDayId} date`}
+                        id={`game-day-date-${day.gameDayId}`}
+                        type="date"
+                        value={editedGameDays[day.gameDayId] ?? day.date}
+                        onChange={(event) =>
+                          setEditedGameDays((current) => ({
+                            ...current,
+                            [day.gameDayId]: event.target.value,
+                          }))
+                        }
+                      />
+                      <span>{day.classification}</span>
+                    </div>
+                    <div className="flex items-center gap-1">
+                      <Button
+                        disabled={busy || (editedGameDays[day.gameDayId] ?? day.date).length === 0}
+                        onClick={() =>
+                          void run(async () => {
+                            await request(
+                              `/api/admin/events/${selected.eventId}/game-days/${day.gameDayId}`,
+                              {
+                                method: "PATCH",
+                                headers: {
+                                  "content-type": "application/json",
+                                  "x-technical-admin-csrf": "1",
+                                },
+                                body: JSON.stringify({
+                                  date: editedGameDays[day.gameDayId] ?? day.date,
+                                }),
+                              },
+                            );
+                            await refresh();
+                          })
+                        }
+                        size="sm"
+                        type="button"
+                      >
+                        Save Game Day
+                      </Button>
+                      <Button
+                        onClick={() =>
+                          void run(async () => {
+                            await request(
+                              `/api/admin/events/${selected.eventId}/game-days/${day.gameDayId}`,
+                              {
+                                method: "DELETE",
+                                headers: { "x-technical-admin-csrf": "1" },
+                              },
+                            );
+                            await refresh();
+                          })
+                        }
+                        size="sm"
+                        type="button"
+                        variant="ghost"
+                      >
+                        Remove
+                      </Button>
+                    </div>
+                  </li>
+                ))}
+                {selected.gameDays.length === 0 ? (
+                  <li className="text-muted-foreground">No Game Days.</li>
+                ) : null}
+              </ul>
+            </div>
+          ) : (
+            <p className="text-sm text-muted-foreground">Select an Event to inspect it.</p>
+          )}
+        </div>
+      </CardContent>
+    </Card>
+  );
 }
 
 function AdminCard({

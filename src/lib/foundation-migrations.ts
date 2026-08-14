@@ -1232,6 +1232,63 @@ const FOUNDATION_ACCEPTANCE_INTEGRITY_HISTORY_MIGRATION_SQL = `
     BEGIN SELECT RAISE(ABORT, 'Acceptance integrity anchors are immutable.'); END;
 `;
 
+export const FOUNDATION_EVENT_CATALOG_EVENTS_TABLE_SQL = `
+  CREATE TABLE foundation_event_catalog_events (
+    event_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    time_zone TEXT NOT NULL,
+    publication_status TEXT NOT NULL CHECK (publication_status = 'unpublished'),
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL
+  ) STRICT
+`;
+
+export const FOUNDATION_EVENT_CATALOG_GAME_DAYS_TABLE_SQL = `
+  CREATE TABLE foundation_event_catalog_game_days (
+    game_day_id TEXT PRIMARY KEY,
+    event_id TEXT NOT NULL REFERENCES foundation_event_catalog_events(event_id) ON DELETE CASCADE,
+    game_day_date TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    UNIQUE (event_id, game_day_date)
+  ) STRICT
+`;
+
+export const FOUNDATION_EVENT_CATALOG_AUDIT_TABLE_SQL = `
+  CREATE TABLE foundation_event_catalog_audit (
+    audit_id TEXT PRIMARY KEY,
+    operation_id TEXT NOT NULL UNIQUE,
+    action TEXT NOT NULL CHECK (action IN (
+      'event-created', 'event-updated', 'event-removed',
+      'game-day-added', 'game-day-updated', 'game-day-removed'
+    )),
+    event_id TEXT NOT NULL,
+    game_day_id TEXT,
+    actor_reference TEXT NOT NULL,
+    occurred_at_ms INTEGER NOT NULL,
+    before_json TEXT CHECK (before_json IS NULL OR json_valid(before_json)),
+    after_json TEXT NOT NULL CHECK (json_valid(after_json))
+  ) STRICT
+`;
+
+export const FOUNDATION_EVENT_CATALOG_GAME_DAYS_EVENT_INDEX_SQL = `
+  CREATE INDEX foundation_event_catalog_game_days_event_id
+    ON foundation_event_catalog_game_days (event_id, game_day_date)
+`;
+
+export const FOUNDATION_EVENT_CATALOG_AUDIT_EVENT_INDEX_SQL = `
+  CREATE INDEX foundation_event_catalog_audit_event_id
+    ON foundation_event_catalog_audit (event_id, occurred_at_ms, audit_id)
+`;
+
+const FOUNDATION_EVENT_CATALOG_MIGRATION_SQL = `
+  ${FOUNDATION_EVENT_CATALOG_EVENTS_TABLE_SQL};
+  ${FOUNDATION_EVENT_CATALOG_GAME_DAYS_TABLE_SQL};
+  ${FOUNDATION_EVENT_CATALOG_AUDIT_TABLE_SQL};
+  ${FOUNDATION_EVENT_CATALOG_GAME_DAYS_EVENT_INDEX_SQL};
+  ${FOUNDATION_EVENT_CATALOG_AUDIT_EVENT_INDEX_SQL};
+`;
+
 export const FOUNDATION_MIGRATIONS: readonly FoundationMigration[] = Object.freeze([
   createMigration({
     id: "001-foundation-event-game-record-roots",
@@ -1340,6 +1397,12 @@ export const FOUNDATION_MIGRATIONS: readonly FoundationMigration[] = Object.free
     ordinal: 18,
     schemaVersion: 18,
     sql: FOUNDATION_ACCEPTANCE_INTEGRITY_HISTORY_MIGRATION_SQL,
+  }),
+  createMigration({
+    id: "019-event-catalog",
+    ordinal: 19,
+    schemaVersion: 19,
+    sql: FOUNDATION_EVENT_CATALOG_MIGRATION_SQL,
   }),
 ]);
 

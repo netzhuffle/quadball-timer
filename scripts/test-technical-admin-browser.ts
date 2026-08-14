@@ -82,6 +82,7 @@ try {
   browser = await chromium.launch({ headless: true });
   const context = await browser.newContext({ ignoreHTTPSErrors: true });
   const page = await context.newPage();
+  page.setDefaultTimeout(5_000);
   browserPage = page;
   const cdp = await context.newCDPSession(page);
   await cdp.send("WebAuthn.enable");
@@ -164,6 +165,54 @@ try {
   await page.getByText("Active browser sessions: 1").waitFor();
   await page.getByRole("button", { name: "Replace passkey" }).click();
   await page.getByText("Active browser sessions: 1").waitFor();
+  await page.getByLabel("Event name").fill("Browser Event");
+  await page.getByLabel("Event timezone").fill("Europe/Zurich");
+  await page.getByRole("button", { name: "Create Event" }).click();
+  await page.getByText("Browser Event").waitFor();
+  await page.getByRole("button", { name: /Browser Event/ }).click();
+  await page.getByLabel("Add Game Day").fill("2026-08-14");
+  await page.getByRole("button", { name: "Add", exact: true }).click();
+  const gameDayDate = page.locator('input[id^="game-day-date-"]');
+  await expectValue(gameDayDate, "2026-08-14");
+  await page.getByText("current", { exact: true }).waitFor();
+  await gameDayDate.fill("2026-08-15");
+  await page.getByRole("button", { name: "Save Game Day" }).click();
+  await expectValue(gameDayDate, "2026-08-15");
+  await page.getByText("future", { exact: true }).waitFor();
+  await page.locator("#selected-event-name").fill("Browser Event Updated");
+  await page.getByRole("button", { name: "Save Event" }).click();
+  await page.getByRole("heading", { name: "Browser Event Updated" }).waitFor();
+  await page.getByRole("button", { name: "Remove", exact: true }).click();
+  await page.getByText("No Game Days.").waitFor();
+  await page.getByRole("button", { name: "Remove empty Event" }).click();
+  await page.getByText("No Events yet.").waitFor();
+  const staleCookies = await context.cookies();
+  const staleCookieHeader = staleCookies
+    .map((cookie) => `${cookie.name}=${cookie.value}`)
+    .join("; ");
+  const staleCsrf = staleCookies.find(
+    (cookie) => cookie.name === "__Host-technical-admin-csrf",
+  )?.value;
+  if (!staleCsrf) throw new Error("Technical Admin CSRF cookie was not retained.");
+  await page.getByRole("button", { name: "Sign out" }).click();
+  const forgedResponse = await context.request.post(`${origin}/api/admin/events`, {
+    data: { name: "Forged", timeZone: "UTC" },
+    headers: {
+      cookie: "__Host-technical-admin=forged-json-token",
+      "content-type": "application/json",
+      "x-technical-admin-csrf": "1",
+    },
+  });
+  assert(forgedResponse.status() === 401, "forged/raw authority was accepted");
+  const revokedResponse = await context.request.post(`${origin}/api/admin/events`, {
+    data: { name: "Revoked", timeZone: "UTC" },
+    headers: {
+      cookie: staleCookieHeader,
+      "content-type": "application/json",
+      "x-technical-admin-csrf": staleCsrf,
+    },
+  });
+  assert(revokedResponse.status() === 401, "revoked authority was cached or accepted");
   console.log(
     JSON.stringify({
       status: "passed",
@@ -176,6 +225,9 @@ try {
       recoveryCsrfRejected: true,
       sessionRevocation: true,
       replacement: true,
+      eventCatalog: true,
+      forgedAuthorityRejected: true,
+      revocationRevalidated: true,
     }),
   );
 } catch (error) {
@@ -216,6 +268,11 @@ async function waitForServer(url: string) {
 
 function assert(condition: boolean, message: string): asserts condition {
   if (!condition) throw new Error(message);
+}
+
+async function expectValue(locator: ReturnType<Page["locator"]>, expected: string) {
+  const actual = await locator.inputValue();
+  assert(actual === expected, `Expected input value ${expected}, got ${actual}.`);
 }
 
 function redactBrowserUrl(value: string) {
