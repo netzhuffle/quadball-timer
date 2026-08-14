@@ -226,6 +226,18 @@ function rebuildRecordSnapshot(
   return rebuildControlActionHistory(root, storedActions, registry, interpreter);
 }
 
+function hasCompatibleReplayContext(
+  root: EventGameRecordRoot,
+  interpreter: IqaGameRulesInterpreter | undefined,
+): boolean {
+  return (
+    interpreter !== undefined &&
+    typeof interpreter.version === "string" &&
+    interpreter.version === root.compatibility.interpreterVersion &&
+    typeof interpreter.rebuild === "function"
+  );
+}
+
 export function createEventGameRecord(
   storage: FoundationStorage,
   options: EventGameRecordOptions,
@@ -233,6 +245,12 @@ export function createEventGameRecord(
   const clock = options.clock ?? (() => Date.now());
   const codecRegistry =
     options.actionCodecRegistry ?? createControlActionCodecRegistry(options.actionCodecs);
+  if (options.interpreter !== undefined) {
+    storage.setReadinessContext?.({
+      actionCodecRegistry: codecRegistry,
+      interpreter: options.interpreter,
+    });
+  }
   let activeRecordId: string | undefined;
   let verifiedRevision: number | undefined;
   let stableIdentityRevision: number | undefined;
@@ -324,6 +342,14 @@ export function createEventGameRecord(
 
       const root = validated.value;
       const canonicalContent = canonicalizeEventGameRecordRoot(root);
+
+      if (!hasCompatibleReplayContext(root, options.interpreter)) {
+        return {
+          status: "rejected",
+          reason: "storage-not-ready",
+          detail: "The Event Game Record could not be durably registered.",
+        };
+      }
 
       try {
         const outcome = await storage.transaction((transaction) => {

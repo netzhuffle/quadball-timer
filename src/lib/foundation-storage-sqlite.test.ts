@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,12 +10,21 @@ import {
   type FoundationMigration,
 } from "@/lib/foundation-migrations";
 import type { EventGameRecordRoot } from "@/lib/foundation-record-types";
+import { createDeterministicTestIqaInterpreter } from "@/lib/event-game-actions";
+import { createFoundationAcceptance } from "@/lib/foundation-acceptance";
+import type { ControlActionInput } from "@/lib/event-game-actions";
 import { createEventGameRecord, type ExternalScopeResolver } from "@/lib/event-game-record";
 import {
   FoundationMigrationError,
   openSqliteFoundationStorage,
+  SqliteFoundationFault,
 } from "@/lib/foundation-storage-sqlite";
 import { createGrantTestKeyRing } from "@/lib/grant-authority-contract";
+import type { GrantAuthorityOptions } from "@/lib/grant-authority";
+import {
+  createGrantTestAuthorityVerifier,
+  createLegacyControlGrantTestAuthority,
+} from "@/lib/grant-authority-test-support";
 
 async function withDatabase<T>(work: (databasePath: string) => Promise<T>): Promise<T> {
   const directory = await mkdtemp(join(tmpdir(), "quadball-timer-sqlite-"));
@@ -27,6 +36,403 @@ async function withDatabase<T>(work: (databasePath: string) => Promise<T>): Prom
 }
 
 describe("SQLite foundation storage", () => {
+  test("latches an after-COMMIT boundary failure without claiming readiness", async () => {
+    await withDatabase(async (databasePath) => {
+      let injected = true;
+      const storage = openSqliteFoundationStorage(databasePath, {
+        faultInjector(phase) {
+          if (injected && phase === "after-commit")
+            throw new SqliteFoundationFault("commit-failure");
+        },
+      });
+      await storage.applyMigrations();
+      expect(await storage.readiness()).toMatchObject({
+        ok: false,
+        status: "not-writeable",
+        evidence: { sqlite: { failureCategory: "commit-failure" } },
+      });
+      injected = false;
+      expect(await storage.readiness()).toMatchObject({
+        ok: true,
+        evidence: { sqlite: { failureCategory: null }, transaction: { writePressure: "normal" } },
+      });
+      storage.close();
+    });
+  });
+
+  test("treats corruption as terminal and never probes or changes the database after restart", async () => {
+    await withDatabase(async (databasePath) => {
+      let injectCorruption = true;
+      let probeCalls = 0;
+      const storage = openSqliteFoundationStorage(databasePath, {
+        faultInjector(phase) {
+          if (phase === "readiness-write-probe") {
+            probeCalls += 1;
+            if (injectCorruption) throw new SqliteFoundationFault("corruption");
+          }
+        },
+      });
+      await storage.applyMigrations();
+      const markerPath = storage.quarantineMarkerPath;
+      expect(markerPath).toBe(`${databasePath}.quarantine`);
+      const before = new Database(databasePath);
+      const beforeUserVersion = before.query("PRAGMA user_version").get();
+      before.close();
+
+      expect(await storage.readiness()).toMatchObject({
+        ok: false,
+        status: "integrity-failure",
+        evidence: { sqlite: { failureCategory: "corruption" } },
+      });
+      expect(markerPath === null ? null : readFileSync(markerPath, "utf8")).toBe(
+        "quadball-timer-foundation-quarantine-v1\ncategory=corruption\n",
+      );
+      expect(markerPath === null ? null : statSync(markerPath).size).toBeLessThanOrEqual(128);
+      expect(markerPath === null ? null : statSync(markerPath).mode & 0o777).toBe(0o600);
+      expect(await storage.readiness()).toMatchObject({
+        ok: false,
+        status: "integrity-failure",
+        evidence: { sqlite: { failureCategory: "corruption" } },
+      });
+      expect(probeCalls).toBe(1);
+      injectCorruption = false;
+      expect(await storage.readiness()).toMatchObject({ ok: false, status: "integrity-failure" });
+      expect(probeCalls).toBe(1);
+
+      const frozenRecord = createEventGameRecord(storage, {
+        externalScopeResolver: createScopeResolver(createRoot("corruption-frozen")),
+        interpreter: createDeterministicTestIqaInterpreter("rules-v1"),
+      });
+      expect(await frozenRecord.registerRoot(createRoot("corruption-frozen"))).toMatchObject({
+        status: "rejected",
+        reason: "storage-not-ready",
+      });
+      const after = new Database(databasePath);
+      expect(after.query("PRAGMA user_version").get()).toEqual(beforeUserVersion);
+      expect(
+        after.query("SELECT COUNT(*) AS count FROM foundation_event_game_record_roots").get(),
+      ).toEqual({
+        count: 0,
+      });
+      after.close();
+      storage.close();
+
+      let restartedProbeCalls = 0;
+      const restarted = openSqliteFoundationStorage(databasePath, {
+        faultInjector(phase) {
+          if (phase === "readiness-write-probe") restartedProbeCalls += 1;
+        },
+      });
+      expect(await restarted.readiness()).toMatchObject({
+        ok: false,
+        status: "integrity-failure",
+        evidence: { sqlite: { failureCategory: "corruption" } },
+      });
+      expect(restartedProbeCalls).toBe(0);
+      const frozenAfterRestart = createEventGameRecord(restarted, {
+        externalScopeResolver: createScopeResolver(createRoot("corruption-restart-frozen")),
+        interpreter: createDeterministicTestIqaInterpreter("rules-v1"),
+      });
+      expect(
+        await frozenAfterRestart.registerRoot(createRoot("corruption-restart-frozen")),
+      ).toMatchObject({ status: "rejected", reason: "storage-not-ready" });
+      const afterRestart = new Database(databasePath);
+      expect(afterRestart.query("PRAGMA user_version").get()).toEqual(beforeUserVersion);
+      expect(
+        afterRestart
+          .query("SELECT COUNT(*) AS count FROM foundation_event_game_record_roots")
+          .get(),
+      ).toEqual({ count: 0 });
+      afterRestart.close();
+      restarted.close();
+    });
+  });
+
+  test.each([
+    "quarantine-write",
+    "quarantine-rename",
+    "quarantine-sync",
+    "quarantine-verify",
+  ] as const)("does not acknowledge a quarantine marker %s failure", async (failedPhase) => {
+    await withDatabase(async (databasePath) => {
+      let probeCalls = 0;
+      const storage = openSqliteFoundationStorage(databasePath, {
+        faultInjector(phase) {
+          if (phase === "readiness-write-probe") {
+            probeCalls += 1;
+            throw new SqliteFoundationFault("corruption");
+          }
+          if (phase === failedPhase) throw new Error("Injected quarantine persistence failure.");
+        },
+      });
+      await storage.applyMigrations();
+
+      expect(await storage.readiness()).toMatchObject({
+        ok: false,
+        status: "quarantine-failure",
+        detail: "SQLite corruption quarantine could not be durably persisted.",
+        evidence: { sqlite: { failureCategory: "corruption" } },
+      });
+      expect(probeCalls).toBe(1);
+      expect(await storage.readiness()).toMatchObject({
+        ok: false,
+        status: "quarantine-failure",
+        evidence: { sqlite: { failureCategory: "corruption" } },
+      });
+      expect(probeCalls).toBe(1);
+
+      const root = createRoot(`quarantine-${failedPhase}`);
+      const record = createEventGameRecord(storage, {
+        externalScopeResolver: createScopeResolver(root),
+        interpreter: createDeterministicTestIqaInterpreter("rules-v1"),
+      });
+      expect(await record.registerRoot(root)).toMatchObject({
+        status: "rejected",
+        reason: "storage-not-ready",
+      });
+      const raw = new Database(databasePath);
+      expect(
+        raw.query("SELECT COUNT(*) AS count FROM foundation_event_game_record_roots").get(),
+      ).toEqual({ count: 0 });
+      raw.close();
+      storage.close();
+    });
+  });
+
+  test("reports persisted key requirements without a ring and distinguishes missing audit keys", async () => {
+    await withDatabase(async (databasePath) => {
+      const empty = openSqliteFoundationStorage(databasePath);
+      await empty.applyMigrations();
+      const emptyReadiness = await empty.readiness();
+      expect(emptyReadiness).toMatchObject({
+        ok: true,
+        evidence: {
+          keys: {
+            requiredCount: 0,
+            availableCount: 0,
+            missingCount: 0,
+            requiredCategories: { encryption: 0, lookup: 0, audit: 0 },
+            missingCategories: { encryption: 0, lookup: 0, audit: 0 },
+          },
+        },
+      });
+      empty.close();
+
+      const keyRing = createGrantTestKeyRing();
+      const keyed = openSqliteFoundationStorage(databasePath, { grantKeyRing: keyRing });
+      const authority = createLegacyControlGrantTestAuthority(
+        keyed,
+        createGrantOptions("event-game-key-evidence", keyRing),
+      );
+      const created = await authority.createControlGrant({
+        scope: {
+          eventId: "event-key-evidence",
+          gameDayId: "day-key-evidence",
+          pitchId: "pitch-key-evidence",
+          pitchSlotId: "slot-key-evidence",
+        },
+        actor: { kind: "fixture", id: "key-evidence" },
+      });
+      expect(created.status).toBe("created");
+      keyed.close();
+
+      const noRing = openSqliteFoundationStorage(databasePath);
+      const noRingReadiness = await noRing.readiness();
+      expect(noRingReadiness).toMatchObject({ ok: false });
+      const noRingKeys = noRingReadiness.evidence?.keys;
+      expect(noRingKeys?.requiredCount).toBeGreaterThan(0);
+      expect(noRingKeys?.availableCount).toBe(0);
+      expect(noRingKeys?.missingCount).toBe(noRingKeys?.requiredCount);
+      expect(noRingKeys?.requiredCategories.audit).toBeGreaterThan(0);
+      expect(noRingKeys?.missingCategories.audit).toBe(noRingKeys?.requiredCategories.audit);
+      noRing.close();
+
+      const missingAuditRing = {
+        ...keyRing,
+        audit: { ...keyRing.audit, keys: new Map() },
+      };
+      const missingAudit = openSqliteFoundationStorage(databasePath, {
+        grantKeyRing: missingAuditRing,
+      });
+      const missingAuditReadiness = await missingAudit.readiness();
+      expect(missingAuditReadiness).toMatchObject({ ok: false });
+      expect(missingAuditReadiness.evidence?.keys.missingCategories.audit).toBeGreaterThan(0);
+      expect(missingAuditReadiness.evidence?.keys.availableCategories.encryption).toBeGreaterThan(
+        0,
+      );
+      expect(missingAuditReadiness.evidence?.keys.availableCategories.lookup).toBeGreaterThan(0);
+      missingAudit.close();
+    });
+  });
+
+  test("does not acknowledge Control Action or Grant revocation across a failed COMMIT", async () => {
+    await withDatabase(async (databasePath) => {
+      const keyRing = createGrantTestKeyRing();
+      let injectCommitFailure = false;
+      const storage = openSqliteFoundationStorage(databasePath, {
+        grantKeyRing: keyRing,
+        faultInjector(phase) {
+          if (injectCommitFailure && phase === "before-commit")
+            throw new SqliteFoundationFault("commit-failure");
+        },
+      });
+      await storage.applyMigrations();
+      const root = createRoot("sqlite-acceptance-rpo");
+      const grantOptions = createGrantOptions(root.eventGameId, keyRing);
+      const authority = createLegacyControlGrantTestAuthority(storage, grantOptions);
+      const created = await authority.createControlGrant({
+        scope: root.externalScope,
+        actor: { kind: "fixture", id: "fixture" },
+      });
+      if (created.status !== "created") throw new Error("Expected a Control Grant.");
+      const admitted = await authority.admitControlGrant({
+        qrCredential: created.qrCredential,
+        browserContext: "sqlite-controller",
+      });
+      if (admitted.status !== "admitted") throw new Error("Expected a Control Session.");
+      const record = createEventGameRecord(storage, {
+        externalScopeResolver: createScopeResolver(root),
+        interpreter: createDeterministicTestIqaInterpreter("rules-v1"),
+      });
+      expect(await record.registerRoot(root)).toMatchObject({ status: "registered" });
+      const acceptance = createFoundationAcceptance(storage, {
+        grant: grantOptions,
+        externalScopeResolver: createScopeResolver(root),
+        interpreter: createDeterministicTestIqaInterpreter("rules-v1"),
+      });
+      const action = createAcceptanceFact(root, admitted.grantSessionId, created.grantVersion);
+
+      injectCommitFailure = true;
+      const failedAction = await acceptance.submitBatch({
+        recordId: root.recordId,
+        eventGameId: root.eventGameId,
+        sessionBearer: admitted.sessionBearer,
+        actions: [action],
+      });
+      expect(failedAction).toMatchObject({
+        status: "partial",
+        results: [{ status: "retry-later", reason: "storage-unavailable" }],
+      });
+      expect(await storage.readiness()).toMatchObject({ ok: false, status: "not-writeable" });
+      injectCommitFailure = false;
+      expect(await storage.readiness()).toMatchObject({
+        ok: true,
+        evidence: { sqlite: { failureCategory: null }, replay: { result: "passed" } },
+      });
+      expect(await record.readActions()).toHaveLength(0);
+
+      const restarted = openSqliteFoundationStorage(databasePath, { grantKeyRing: keyRing });
+      const restartedRecord = createEventGameRecord(restarted, {
+        externalScopeResolver: createScopeResolver(root),
+        interpreter: createDeterministicTestIqaInterpreter("rules-v1"),
+      });
+      expect(await restartedRecord.registerRoot(root)).toMatchObject({ status: "idempotent" });
+      expect(await restartedRecord.readActions()).toHaveLength(0);
+      const restartedAcceptance = createFoundationAcceptance(restarted, {
+        grant: grantOptions,
+        externalScopeResolver: createScopeResolver(root),
+        interpreter: createDeterministicTestIqaInterpreter("rules-v1"),
+      });
+      expect(
+        await restartedAcceptance.submitBatch({
+          recordId: root.recordId,
+          eventGameId: root.eventGameId,
+          sessionBearer: admitted.sessionBearer,
+          actions: [action],
+        }),
+      ).toMatchObject({ status: "committed", results: [{ status: "accepted" }] });
+
+      restarted.close();
+      injectCommitFailure = true;
+      const failedRevocation = await authority.revokeControlGrant(created.grantId, {
+        kind: "fixture",
+        id: "fixture",
+      });
+      expect(failedRevocation).toMatchObject({ status: "rejected", reason: "unavailable" });
+      expect(await storage.readiness()).toMatchObject({ ok: false, status: "not-writeable" });
+      injectCommitFailure = false;
+      expect(await storage.readiness()).toMatchObject({ ok: true });
+      expect(
+        await authority.revokeControlGrant(created.grantId, {
+          kind: "fixture",
+          id: "fixture",
+        }),
+      ).toMatchObject({ status: "updated" });
+      const final = openSqliteFoundationStorage(databasePath, { grantKeyRing: keyRing });
+      const finalRecord = createEventGameRecord(final, {
+        externalScopeResolver: createScopeResolver(root),
+        interpreter: createDeterministicTestIqaInterpreter("rules-v1"),
+      });
+      expect(await finalRecord.registerRoot(root)).toMatchObject({ status: "idempotent" });
+      expect(await final.readiness()).toMatchObject({ ok: true });
+      expect(
+        await final.transaction((transaction) => transaction.findGrantById(created.grantId)),
+      ).toMatchObject({
+        status: "revoked",
+      });
+      final.close();
+      storage.close();
+    });
+  });
+
+  test.each([
+    ["busy", "begin"],
+    ["readonly", "readiness-write-probe"],
+    ["full", "begin"],
+    ["io-error", "begin"],
+    ["commit-failure", "commit"],
+  ] as const)("fails closed and recovers after a %s failure", async (category, phase) => {
+    await withDatabase(async (databasePath) => {
+      let injected = true;
+      const storage = openSqliteFoundationStorage(databasePath, {
+        faultInjector(actualPhase) {
+          if (injected && actualPhase === phase) {
+            throw new SqliteFoundationFault(category);
+          }
+        },
+      });
+      await storage.applyMigrations();
+      expect(storage.liveness?.()).toEqual({ ok: true, process: "available" });
+      if (phase === "readiness-write-probe")
+        expect(await storage.readiness()).toMatchObject({ ok: false, status: "not-writeable" });
+      const record = createEventGameRecord(storage, {
+        externalScopeResolver: createScopeResolver(createRoot(`fault-${category}`)),
+        interpreter: createDeterministicTestIqaInterpreter("rules-v1"),
+      });
+      const root = createRoot(`fault-${category}`);
+      const failed = await record.registerRoot(root);
+      expect(failed).toMatchObject({ status: "rejected", reason: "storage-not-ready" });
+
+      const raw = new Database(databasePath);
+      expect(
+        raw.query("SELECT COUNT(*) AS count FROM foundation_event_game_record_roots").get(),
+      ).toEqual({ count: 0 });
+      raw.close();
+      const evidence = await storage.readiness();
+      expect(evidence).toMatchObject({ ok: false, status: "not-writeable" });
+      expect(evidence.evidence?.sqlite.failureCategory).toBe(category);
+      expect(evidence.evidence?.transaction.rejectionCategories[category]).toBeGreaterThan(0);
+      const evidenceJson = JSON.stringify(evidence);
+      expect(evidenceJson).not.toContain("Injected");
+      expect(evidenceJson.length).toBeLessThan(4_096);
+      expect(Object.keys(evidence.evidence?.transaction.rejectionCategories ?? {}).sort()).toEqual([
+        "busy",
+        "commit-failure",
+        "corruption",
+        "full",
+        "io-error",
+        "readonly",
+      ]);
+      injected = false;
+      const recovered = await storage.readiness();
+      expect(recovered).toMatchObject({ ok: true });
+      expect(recovered.evidence?.sqlite.failureCategory).toBeNull();
+      expect(recovered.evidence?.transaction.writePressure).toBe("normal");
+      expect(await record.registerRoot(root)).toMatchObject({ status: "registered" });
+      storage.close();
+    });
+  });
+
   test("configures production settings without migrating on open", async () => {
     await withDatabase(async (databasePath) => {
       const storage = openSqliteFoundationStorage(databasePath);
@@ -44,6 +450,71 @@ describe("SQLite foundation storage", () => {
     });
   });
 
+  test("rejects the first root without compatible replay context before any durable mutation", async () => {
+    await withDatabase(async (databasePath) => {
+      const storage = openSqliteFoundationStorage(databasePath);
+      await storage.applyMigrations();
+      const root = createRoot("first-root-context");
+      const absent = createEventGameRecord(storage, {
+        externalScopeResolver: createScopeResolver(root),
+      });
+      expect(await absent.registerRoot(root)).toMatchObject({
+        status: "rejected",
+        reason: "storage-not-ready",
+      });
+
+      const unknown = createEventGameRecord(storage, {
+        externalScopeResolver: createScopeResolver(root),
+        interpreter: createDeterministicTestIqaInterpreter("rules-unknown"),
+      });
+      expect(await unknown.registerRoot(root)).toMatchObject({
+        status: "rejected",
+        reason: "storage-not-ready",
+      });
+      const raw = new Database(databasePath);
+      expect(
+        raw.query("SELECT COUNT(*) AS count FROM foundation_event_game_record_roots").get(),
+      ).toEqual({
+        count: 0,
+      });
+      expect(
+        raw.query("SELECT COUNT(*) AS count FROM foundation_event_game_record_idempotency").get(),
+      ).toEqual({
+        count: 0,
+      });
+      expect(
+        raw.query("SELECT COUNT(*) AS count FROM foundation_event_game_record_audit").get(),
+      ).toEqual({
+        count: 0,
+      });
+      raw.close();
+      expect(await storage.readiness()).toMatchObject({ ok: true });
+
+      const valid = createEventGameRecord(storage, {
+        externalScopeResolver: createScopeResolver(root),
+        interpreter: createDeterministicTestIqaInterpreter("rules-v1"),
+      });
+      expect(await valid.registerRoot(root)).toMatchObject({ status: "registered" });
+      storage.close();
+
+      const restarted = openSqliteFoundationStorage(databasePath);
+      expect(await restarted.readiness()).toMatchObject({
+        ok: false,
+        status: "integrity-failure",
+        evidence: { replay: { result: "not-configured", rootCount: 1 } },
+      });
+      createEventGameRecord(restarted, {
+        externalScopeResolver: createScopeResolver(root),
+        interpreter: createDeterministicTestIqaInterpreter("rules-v1"),
+      });
+      expect(await restarted.readiness()).toMatchObject({
+        ok: true,
+        evidence: { replay: { result: "passed", rootCount: 1 } },
+      });
+      restarted.close();
+    });
+  });
+
   test("applies explicit migrations, persists a root, and reopens it", async () => {
     await withDatabase(async (databasePath) => {
       const first = openSqliteFoundationStorage(databasePath);
@@ -52,20 +523,32 @@ describe("SQLite foundation storage", () => {
       const root = createRoot(recordId);
       const firstRecord = createEventGameRecord(first, {
         externalScopeResolver: createScopeResolver(root),
+        interpreter: createDeterministicTestIqaInterpreter("rules-v1"),
       });
       expect(await firstRecord.registerRoot(root)).toMatchObject({ status: "registered" });
       first.close();
 
       const reopened = openSqliteFoundationStorage(databasePath);
-      expect(await reopened.readiness()).toMatchObject({ ok: true, schemaVersion: "21" });
+      const beforeContext = await reopened.readiness();
+      expect(beforeContext).toMatchObject({
+        ok: false,
+        status: "integrity-failure",
+        evidence: { replay: { result: "not-configured", rootCount: 1 } },
+      });
       const reopenedRecord = createEventGameRecord(reopened, {
         externalScopeResolver: createScopeResolver(root),
+        interpreter: createDeterministicTestIqaInterpreter("rules-v1"),
       });
       expect(await reopenedRecord.readRoot(recordId)).toMatchObject({
         recordId,
         eventGameId: "event-game-reopen",
       });
       expect(await reopenedRecord.registerRoot(root)).toMatchObject({ status: "idempotent" });
+      expect(await reopened.readiness()).toMatchObject({
+        ok: true,
+        schemaVersion: "21",
+        evidence: { replay: { result: "passed", rootCount: 1, durationMs: expect.any(Number) } },
+      });
       reopened.close();
     });
   });
@@ -319,6 +802,7 @@ describe("SQLite foundation storage", () => {
       const root = createRoot("corrupt-root");
       const record = createEventGameRecord(initial, {
         externalScopeResolver: createScopeResolver(root),
+        interpreter: createDeterministicTestIqaInterpreter("rules-v1"),
       });
       expect(await record.registerRoot(root)).toMatchObject({ status: "registered" });
       initial.close();
@@ -461,5 +945,49 @@ function createScopeResolver(root: EventGameRecordRoot): ExternalScopeResolver {
         ? { status: "resolved" }
         : { status: "mismatch", detail: "The Event Team is outside the Event scope." };
     },
+  };
+}
+
+function createGrantOptions(
+  eventGameId: string,
+  keyRing: ReturnType<typeof createGrantTestKeyRing>,
+): GrantAuthorityOptions {
+  let call = 0;
+  return {
+    environmentId: "sqlite-acceptance-test",
+    clock: { nowMs: () => 1_000 },
+    randomness: {
+      bytes(length) {
+        call += 1;
+        return Uint8Array.from({ length }, (_, index) => (index + call + length) % 256);
+      },
+    },
+    keyRing,
+    controlScopeResolver: { resolve: () => ({ status: "eligible", eventGameId }) },
+    privilegedAuthorityVerifier: createGrantTestAuthorityVerifier(),
+  };
+}
+
+function createAcceptanceFact(
+  root: EventGameRecordRoot,
+  sessionId: string,
+  versionId: string,
+): ControlActionInput {
+  return {
+    recordId: root.recordId,
+    eventGameId: root.eventGameId,
+    operationId: "sqlite-acceptance-operation",
+    kind: { id: "game-fact", version: "1" },
+    payload: {
+      factId: "sqlite-acceptance-fact",
+      factType: "test",
+      gameSideId: root.gameSides[0]!.id,
+      gameTimeMs: 1_000,
+      data: { source: "sqlite-acceptance-test" },
+    },
+    causalPredecessorIds: [],
+    occurrence: { trustedAtMs: 1_000, clientOriginAtMs: 1_000, source: "online" },
+    grant: { sessionId, versionId },
+    lifecycle: structuredClone(root.lifecycle),
   };
 }

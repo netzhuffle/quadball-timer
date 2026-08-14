@@ -3,6 +3,8 @@ import type {
   ControlAction,
   ControlAuditEntry,
   EventGameRecordMetadata,
+  ControlActionCodecRegistry,
+  IqaGameRulesInterpreter,
 } from "@/lib/event-game-actions";
 import type {
   GrantKeyRing,
@@ -178,6 +180,7 @@ export type FoundationStorageReadiness =
       ok: true;
       schemaVersion: string;
       storage: "memory" | "sqlite";
+      evidence?: FoundationStorageEvidence;
     }
   | {
       ok: false;
@@ -191,10 +194,70 @@ export type FoundationStorageReadiness =
         | "future"
         | "unsafe-settings"
         | "integrity-failure"
+        | "quarantine-failure"
         | "not-writeable";
       detail: string;
       storage: "memory" | "sqlite";
+      evidence?: FoundationStorageEvidence;
     };
+
+export type FoundationStorageFailureCategory =
+  | "busy"
+  | "readonly"
+  | "full"
+  | "io-error"
+  | "commit-failure"
+  | "corruption";
+
+export type FoundationStorageKeyCategory = "encryption" | "lookup" | "audit";
+
+export type FoundationStorageKeyCounts = Record<FoundationStorageKeyCategory, number>;
+
+export type FoundationStorageEvidence = {
+  runtime: { engine: "bun"; version: string; sqliteVersion: string | null };
+  transaction: {
+    lastLatencyMs: number | null;
+    rejectionCount: number;
+    rejectionCategories: Record<FoundationStorageFailureCategory, number>;
+    writePressure: "unknown" | "normal" | "unsafe";
+  };
+  sqlite: {
+    journalMode: "wal" | "unknown";
+    synchronous: number | null;
+    foreignKeys: boolean | null;
+    walBytes: number | null;
+    checkpoint: "not-attempted" | "ok" | "busy" | "failed";
+    diskBytes: number | null;
+    diskFreeBytes: number | null;
+    failureCategory: FoundationStorageFailureCategory | null;
+  };
+  migration: {
+    state: "unknown" | "ready" | "unsafe";
+    schemaVersion: string | null;
+    appliedCount: number | null;
+  };
+  keys: {
+    requiredCount: number;
+    availableCount: number;
+    missingCount: number;
+    requiredCategories: FoundationStorageKeyCounts;
+    availableCategories: FoundationStorageKeyCounts;
+    missingCategories: FoundationStorageKeyCounts;
+  };
+  replay: {
+    result: "not-configured" | "passed" | "failed";
+    rootCount: number;
+    actionCount: number;
+    durationMs: number | null;
+  };
+};
+
+export type FoundationStorageReadinessContext = {
+  actionCodecRegistry: ControlActionCodecRegistry;
+  interpreter: IqaGameRulesInterpreter;
+};
+
+export type FoundationStorageLiveness = { ok: true; process: "available" };
 
 export type FoundationStorageSnapshot = {
   revision: number;
@@ -374,6 +437,8 @@ export interface FoundationStorage {
   readRecordMetadata(recordId: string): Promise<StoredEventGameRecordMetadata | null>;
   readAuditEntries(recordId: string): Promise<StoredControlAuditEntry[]>;
   readiness(): Promise<FoundationStorageReadiness>;
+  liveness?(): FoundationStorageLiveness;
+  setReadinessContext?(context: FoundationStorageReadinessContext): void;
   /** Configure the key material required to validate persisted Grant state. */
   setGrantKeyRing?(keyRing: GrantKeyRing): void;
   /** Configure the environment and key material required for deep Grant validation. */

@@ -155,20 +155,20 @@ describe("immutable Event Game actions", () => {
       externalScopeResolver: createScopeResolver(versionRoot),
       interpreter: createDeterministicTestIqaInterpreter("rules-v2"),
     });
-    expect(await versionRecord.registerRoot(versionRoot)).toMatchObject({ status: "registered" });
+    expect(await versionRecord.registerRoot(versionRoot)).toMatchObject({
+      status: "rejected",
+      reason: "storage-not-ready",
+    });
     expect(await versionRecord.rebuild()).toMatchObject({
       status: "failed",
-      reason: "unknown-interpreter-version",
+      reason: "invalid-history",
     });
-    expect(await versionRecord.readiness()).toMatchObject({
-      ok: false,
-      status: "rebuild-failure",
-    });
+    expect(await versionRecord.readiness()).toMatchObject({ ok: false, status: "record-missing" });
     expect(
       await versionRecord.acceptAction(
         createFact(versionRoot, "operation-after-version-failure", 2_000),
       ),
-    ).toMatchObject({ status: "rejected", reason: "storage-not-ready" });
+    ).toMatchObject({ status: "rejected", reason: "record-not-found" });
 
     const nondeterministicRoot = createRoot("record-interpreter-nondeterministic");
     let rebuildCount = 0;
@@ -207,14 +207,19 @@ describe("immutable Event Game actions", () => {
     const record = createEventGameRecord(storage, {
       externalScopeResolver: createScopeResolver(root),
     });
-    expect(await record.registerRoot(root)).toMatchObject({ status: "registered" });
+    expect(await record.registerRoot(root)).toMatchObject({
+      status: "rejected",
+      reason: "storage-not-ready",
+    });
     expect(
       await record.acceptAction(createFact(root, "operation-no-interpreter", 1_000)),
     ).toMatchObject({
       status: "rejected",
-      reason: "storage-not-ready",
+      reason: "record-not-found",
     });
-    expect(await record.readActions()).toHaveLength(0);
+    expect(
+      await storage.transaction((transaction) => transaction.listActions(root.recordId)),
+    ).toHaveLength(0);
     expect(record.readAudit(createTestAuditAuthority("event-admin").credential)).rejects.toThrow(
       "trusted",
     );
@@ -227,7 +232,7 @@ describe("immutable Event Game actions", () => {
       auditAuthorityVerifier: trusted.verifier,
       interpreter: createDeterministicTestIqaInterpreter("rules-v1"),
     });
-    expect(await authorizedRecord.registerRoot(root)).toMatchObject({ status: "idempotent" });
+    expect(await authorizedRecord.registerRoot(root)).toMatchObject({ status: "registered" });
     expect(await authorizedRecord.readAudit(trusted.credential)).toHaveLength(0);
     expect(
       authorizedRecord.readAudit(createTestAuditAuthority("technical-admin").credential),

@@ -3,6 +3,7 @@ import {
   canonicalizeEventGameRecordRoot,
   type EventGameRecordRoot,
 } from "@/lib/foundation-record-types";
+import { createDeterministicTestIqaInterpreter } from "@/lib/event-game-actions";
 import { createEventGameRecord, type ExternalScopeResolver } from "@/lib/event-game-record";
 import { createInMemoryFoundationStorage } from "@/lib/foundation-storage-memory";
 
@@ -60,6 +61,7 @@ describe("Event Game Record contract", () => {
     const root = createRoot();
     const record = createEventGameRecord(createInMemoryFoundationStorage(), {
       externalScopeResolver: createScopeResolver(root),
+      interpreter: createDeterministicTestIqaInterpreter("rules-v1"),
     });
 
     expect(await record.registerRoot(root)).toMatchObject({ status: "registered" });
@@ -83,6 +85,7 @@ describe("Event Game Record contract", () => {
     const root = createRoot();
     const record = createEventGameRecord(createInMemoryFoundationStorage(), {
       externalScopeResolver: createScopeResolver(root),
+      interpreter: createDeterministicTestIqaInterpreter("rules-v1"),
     });
     const reordered = JSON.parse(
       JSON.stringify({

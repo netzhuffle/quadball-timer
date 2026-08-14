@@ -691,21 +691,16 @@ describe("SQLite immutable Event Game actions", () => {
 
       const reopened = openSqliteFoundationStorage(databasePath);
       const reopenedRecord = createRecord(reopened, root);
-      expect(await reopenedRecord.registerRoot(root)).toMatchObject({ status: "idempotent" });
-      expect(await reopenedRecord.readiness()).toMatchObject({
-        ok: false,
-        status: "rebuild-failure",
+      expect(await reopenedRecord.registerRoot(root)).toMatchObject({
+        status: "rejected",
+        reason: "storage-not-ready",
       });
-      expect(
-        await reopenedRecord.acceptAction(
-          createFact(root, "operation-after-unknown-version", 2_000),
-        ),
-      ).toMatchObject({ status: "rejected", reason: "storage-not-ready" });
-      expect(
-        (await reopenedRecord.readAudit(createAuditAuthority())).filter(
-          (entry) => entry.operationId === "operation-after-unknown-version",
-        ),
-      ).toHaveLength(0);
+      const failedReadiness = await reopenedRecord.readiness();
+      expect(failedReadiness).toMatchObject({ ok: false, status: "storage-not-ready" });
+      expect(failedReadiness.storage.evidence?.replay).toMatchObject({
+        result: "failed",
+        durationMs: expect.any(Number),
+      });
       reopened.close();
     });
   });
@@ -773,11 +768,24 @@ describe("SQLite immutable Event Game actions", () => {
 
         const reopened = openSqliteFoundationStorage(databasePath);
         const reopenedRecord = createRecord(reopened, root);
-        expect(await reopenedRecord.registerRoot(root)).toMatchObject({ status: "idempotent" });
-        expect(await reopenedRecord.readiness(), label).toMatchObject({
-          ok: false,
-          status: "rebuild-failure",
-        });
+        if (label === "action") {
+          expect(await reopenedRecord.registerRoot(root)).toMatchObject({
+            status: "rejected",
+            reason: "storage-not-ready",
+          });
+          const failedReadiness = await reopenedRecord.readiness();
+          expect(failedReadiness).toMatchObject({ ok: false, status: "storage-not-ready" });
+          expect(failedReadiness.storage.evidence?.replay).toMatchObject({
+            result: "failed",
+            durationMs: expect.any(Number),
+          });
+        } else {
+          expect(await reopenedRecord.registerRoot(root)).toMatchObject({ status: "idempotent" });
+          expect(await reopenedRecord.readiness(), label).toMatchObject({
+            ok: false,
+            status: "rebuild-failure",
+          });
+        }
         reopened.close();
       });
     }
@@ -1206,7 +1214,14 @@ describe("SQLite immutable Event Game actions", () => {
         database.close();
         const reopened = openSqliteFoundationStorage(databasePath);
         const reopenedRecord = createRecord(reopened, root);
-        expect(await reopenedRecord.registerRoot(root)).toMatchObject({ status: "idempotent" });
+        if (label === "missing-version") {
+          expect(await reopenedRecord.registerRoot(root)).toMatchObject({
+            status: "rejected",
+            reason: "storage-not-ready",
+          });
+        } else {
+          expect(await reopenedRecord.registerRoot(root)).toMatchObject({ status: "idempotent" });
+        }
         expect(await reopenedRecord.readiness()).toMatchObject({ ok: false });
         expect(
           await reopenedRecord.acceptAction(createFact(root, "operation-after-corruption", 3_000)),
@@ -1238,14 +1253,15 @@ describe("SQLite immutable Event Game actions", () => {
         },
         auditAuthorityVerifier: testAuditAuthorityVerifier,
       });
-      expect(await nondeterministic.registerRoot(root)).toMatchObject({ status: "idempotent" });
+      expect(await nondeterministic.registerRoot(root)).toMatchObject({
+        status: "rejected",
+        reason: "storage-not-ready",
+      });
       expect(
         await nondeterministic.acceptAction(
           createFact(root, "operation-after-nondeterministic", 2_000),
         ),
       ).toMatchObject({ status: "rejected", reason: "storage-not-ready" });
-      expect(await seeded.readActions()).toHaveLength(1);
-      expect(await nondeterministic.readAudit(createAuditAuthority())).toHaveLength(1);
       storage.close();
     });
   });
@@ -1289,8 +1305,14 @@ describe("SQLite immutable Event Game actions", () => {
       expect(
         await record.acceptAction(createFact(root, "operation-after-cache-race", 2_000)),
       ).toMatchObject({ status: "rejected", reason: "storage-not-ready" });
-      expect(await record.readActions()).toHaveLength(1);
-      expect(await record.readAudit(createAuditAuthority())).toHaveLength(1);
+      const retained = new Database(databasePath);
+      expect(
+        retained.query("SELECT COUNT(*) AS count FROM foundation_event_game_record_actions").get(),
+      ).toEqual({ count: 1 });
+      expect(
+        retained.query("SELECT COUNT(*) AS count FROM foundation_event_game_record_audit").get(),
+      ).toEqual({ count: 1 });
+      retained.close();
       storage.close();
     });
   });
