@@ -2,7 +2,11 @@ import { useEffect, useState, type ReactNode } from "react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 
-type AdminSession = { authenticated: true; environment: "production" | "test" };
+type AdminSession = {
+  authenticated: true;
+  environment: "production" | "test";
+  activeSessionCount: number;
+};
 
 export function TechnicalAdminPage({ enrollment }: { enrollment: boolean }) {
   const [session, setSession] = useState<AdminSession | null>(null);
@@ -21,7 +25,7 @@ export function TechnicalAdminPage({ enrollment }: { enrollment: boolean }) {
       );
       return;
     }
-    void fetch("/api/admin/session").then(async (response) => {
+    void adminFetch("/api/admin/session").then(async (response) => {
       if (response.ok) setSession((await response.json()) as AdminSession);
     });
   }, [enrollment]);
@@ -52,7 +56,7 @@ export function TechnicalAdminPage({ enrollment }: { enrollment: boolean }) {
           onClick={() =>
             void run(async () => {
               if (enrollmentToken === null) throw new Error("Missing enrollment authorization.");
-              const optionsResponse = await fetch("/api/admin/enrollment/options", {
+              const optionsResponse = await adminFetch("/api/admin/enrollment/options", {
                 method: "POST",
                 headers: { "content-type": "application/json" },
                 body: JSON.stringify({ token: enrollmentToken }),
@@ -60,7 +64,7 @@ export function TechnicalAdminPage({ enrollment }: { enrollment: boolean }) {
               if (!optionsResponse.ok) throw new Error("Enrollment is unavailable.");
               const options = (await optionsResponse.json()) as RegistrationOptionsResponse;
               const credential = await createCredential(options);
-              const complete = await fetch("/api/admin/enrollment/complete", {
+              const complete = await adminFetch("/api/admin/enrollment/complete", {
                 method: "POST",
                 headers: { "content-type": "application/json" },
                 body: JSON.stringify({
@@ -87,13 +91,13 @@ export function TechnicalAdminPage({ enrollment }: { enrollment: boolean }) {
           disabled={busy}
           onClick={() =>
             void run(async () => {
-              const optionsResponse = await fetch("/api/admin/authentication/options", {
+              const optionsResponse = await adminFetch("/api/admin/authentication/options", {
                 method: "POST",
               });
               if (!optionsResponse.ok) throw new Error("Sign-in unavailable.");
               const options = (await optionsResponse.json()) as AuthenticationOptionsResponse;
               const credential = await getCredential(options);
-              const complete = await fetch("/api/admin/authentication/complete", {
+              const complete = await adminFetch("/api/admin/authentication/complete", {
                 method: "POST",
                 headers: { "content-type": "application/json" },
                 body: JSON.stringify({
@@ -102,7 +106,7 @@ export function TechnicalAdminPage({ enrollment }: { enrollment: boolean }) {
                 }),
               });
               if (!complete.ok) throw new Error("Sign-in failed.");
-              const sessionResponse = await fetch("/api/admin/session");
+              const sessionResponse = await adminFetch("/api/admin/session");
               if (!sessionResponse.ok) throw new Error("Session was not created.");
               setSession((await sessionResponse.json()) as AdminSession);
             })
@@ -123,19 +127,92 @@ export function TechnicalAdminPage({ enrollment }: { enrollment: boolean }) {
       <p className="text-sm text-muted-foreground">
         Event administration is available from this protected shell.
       </p>
+      <p className="text-sm text-muted-foreground">
+        Active browser sessions: {session.activeSessionCount}
+      </p>
       <Button
         variant="outline"
         onClick={() =>
           void run(async () => {
-            await fetch("/api/admin/logout", { method: "POST" });
+            await adminFetch("/api/admin/logout", {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+            });
             setSession(null);
           })
         }
       >
         Sign out
       </Button>
+      <Button
+        variant="outline"
+        onClick={() =>
+          void run(async () => {
+            await completeStepUp("replace-credential");
+            const optionsResponse = await adminFetch("/api/admin/replacement/options", {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+            });
+            if (!optionsResponse.ok) throw new Error("Replacement is unavailable.");
+            const options = (await optionsResponse.json()) as RegistrationOptionsResponse;
+            const credential = await createCredential(options);
+            const complete = await adminFetch("/api/admin/replacement/complete", {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({
+                challengeId: options.challengeId,
+                response: serializeCredential(credential),
+              }),
+            });
+            if (!complete.ok) throw new Error("Replacement failed.");
+            const refreshed = await adminFetch("/api/admin/session");
+            if (!refreshed.ok) throw new Error("Replacement session was not created.");
+            setSession((await refreshed.json()) as AdminSession);
+          })
+        }
+      >
+        Replace passkey
+      </Button>
+      <Button
+        variant="outline"
+        onClick={() =>
+          void run(async () => {
+            await completeStepUp("revoke-other-sessions");
+            const response = await adminFetch("/api/admin/sessions/revoke-others", {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+            });
+            if (!response.ok) throw new Error("Session revocation failed.");
+            const refreshed = await adminFetch("/api/admin/session");
+            if (!refreshed.ok) throw new Error("Session status is unavailable.");
+            setSession((await refreshed.json()) as AdminSession);
+          })
+        }
+      >
+        Log out other sessions
+      </Button>
     </AdminCard>
   );
+
+  async function completeStepUp(purpose: "replace-credential" | "revoke-other-sessions") {
+    const optionsResponse = await adminFetch("/api/admin/step-up/options", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ purpose }),
+    });
+    if (!optionsResponse.ok) throw new Error("Fresh verification is unavailable.");
+    const options = (await optionsResponse.json()) as AuthenticationOptionsResponse;
+    const credential = await getCredential(options);
+    const complete = await adminFetch("/api/admin/step-up/complete", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        challengeId: options.challengeId,
+        response: serializeCredential(credential),
+      }),
+    });
+    if (!complete.ok) throw new Error("Fresh verification failed.");
+  }
 }
 
 function AdminCard({
@@ -244,4 +321,17 @@ function decode(value: string) {
   const padded = value.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((value.length + 3) % 4);
   const binary = atob(padded);
   return Uint8Array.from(binary, (character) => character.charCodeAt(0));
+}
+
+async function adminFetch(input: RequestInfo | URL, init: RequestInit = {}) {
+  const headers = new Headers(init.headers);
+  if ((init.method ?? "GET").toUpperCase() !== "GET") {
+    const csrf = document.cookie
+      .split(";")
+      .map((part) => part.trim())
+      .find((part) => part.startsWith("__Host-technical-admin-csrf="))
+      ?.slice("__Host-technical-admin-csrf=".length);
+    if (csrf) headers.set("x-technical-admin-csrf", csrf);
+  }
+  return fetch(input, { ...init, headers });
 }

@@ -1,0 +1,335 @@
+import { describe, expect, test } from "bun:test";
+import { chmodSync, mkdtempSync, rmSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { Database } from "bun:sqlite";
+import {
+  SqliteTechnicalAdminAuthRepository,
+  createTechnicalAdminAuth,
+  technicalAdminSessionTtls,
+  type TechnicalAdminRetentionScheduler,
+  type WebAuthnVerifier,
+} from "@/lib/technical-admin-auth";
+
+const binding = { origin: "https://localhost:39421", host: "localhost:39421" };
+const identity = { environment: "test" as const, origin: binding.origin, rpId: "localhost" };
+
+function createVerifier(): WebAuthnVerifier {
+  let signCount = 1;
+  return {
+    async verifyRegistration() {
+      return {
+        credentialId: "credential-1",
+        publicKey: { kty: "OKP", crv: "Ed25519", x: "focused-key" },
+        signCount: signCount++,
+      };
+    },
+    async verifyAuthentication() {
+      return { signCount: signCount++ };
+    },
+  };
+}
+
+async function enrollAndAuthenticate(
+  repository: SqliteTechnicalAdminAuthRepository,
+  now: () => number,
+) {
+  const auth = createTechnicalAdminAuth(identity, repository, createVerifier(), now);
+  const issued = auth.issueEnrollmentAuthorization();
+  if (!issued.ok) throw new Error("Expected enrollment authorization.");
+  const enrollmentToken = decodeURIComponent(issued.value.url.split("token=")[1] ?? "");
+  const enrollment = auth.beginEnrollment(enrollmentToken, binding);
+  if (!enrollment.ok) throw new Error("Expected enrollment options.");
+  const completed = await auth.completeEnrollment(enrollment.value.challengeId, {}, binding);
+  if (!completed.ok) throw new Error("Expected enrollment completion.");
+  const options = auth.beginAuthentication(binding);
+  if (!options.ok) throw new Error("Expected authentication options.");
+  const session = await auth.completeAuthentication(options.value.challengeId, {}, binding);
+  if (!session.ok) throw new Error("Expected authenticated session.");
+  return { auth, session: session.value };
+}
+
+function insertCredential(databasePath: string, count = 1) {
+  const database = new Database(databasePath);
+  for (let index = 0; index < count; index++) {
+    database
+      .query("INSERT INTO technical_admin_credentials VALUES (?, ?, ?, ?)")
+      .run(
+        `credential-${index}`,
+        JSON.stringify({ kty: "OKP", crv: "Ed25519", x: `key-${index}` }),
+        1,
+        0,
+      );
+  }
+  database.close();
+}
+
+function createManualRetentionScheduler(now: () => number) {
+  let nextId = 0;
+  const timers = new Map<number, { atMs: number; callback: () => void }>();
+  const scheduler: TechnicalAdminRetentionScheduler = {
+    schedule(callback, deadlineMs) {
+      const id = ++nextId;
+      timers.set(id, { atMs: deadlineMs, callback });
+      return id;
+    },
+    cancel(timer) {
+      timers.delete(timer as number);
+    },
+  };
+  return {
+    scheduler,
+    pendingCount: () => timers.size,
+    runDue: () => {
+      const due = [...timers.entries()]
+        .filter(([, timer]) => timer.atMs <= now())
+        .sort(([, left], [, right]) => left.atMs - right.atMs);
+      for (const [id, timer] of due) {
+        if (!timers.delete(id)) continue;
+        timer.callback();
+      }
+    },
+  };
+}
+
+async function runResetCli(databasePath: string, input: string) {
+  const child = Bun.spawn(["bun", "scripts/reset-technical-admin.ts"], {
+    cwd: process.cwd(),
+    env: {
+      ...Object.fromEntries(
+        Object.entries(process.env).filter(
+          (entry): entry is [string, string] => entry[1] !== undefined,
+        ),
+      ),
+      NODE_ENV: "test",
+      QUADBALL_ENVIRONMENT: "test",
+      PORT: "39421",
+      PUBLIC_ORIGIN: binding.origin,
+      WEBAUTHN_RP_ID: "localhost",
+      TECHNICAL_ADMIN_DATABASE: databasePath,
+    },
+    stdin: "pipe",
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  await child.stdin.write(input);
+  await child.stdin.end();
+  const [stdout, stderr, exitCode] = await Promise.all([
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+    child.exited,
+  ]);
+  return { stdout, stderr, exitCode };
+}
+
+async function withTempDirectory<T>(
+  prefix: string,
+  work: (directory: string) => T | PromiseLike<T>,
+): Promise<T> {
+  const directory = mkdtempSync(join(tmpdir(), prefix));
+  try {
+    return await work(directory);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+describe("focused Technical Admin SQLite boundary", () => {
+  test("persists purpose-bound step-up and its authenticator counter across restart", async () => {
+    await withTempDirectory("technical-admin-focused-", async (directory) => {
+      const databasePath = join(directory, "auth.sqlite");
+      let nowMs = 1_000;
+      let first: SqliteTechnicalAdminAuthRepository | undefined;
+      let restarted: SqliteTechnicalAdminAuthRepository | undefined;
+      try {
+        first = new SqliteTechnicalAdminAuthRepository(databasePath, identity);
+        const { auth, session } = await enrollAndAuthenticate(first, () => nowMs);
+        const stepUp = auth.beginFreshVerification(session.token, "replace-credential", binding);
+        if (!stepUp.ok) throw new Error("Expected replacement step-up options.");
+        expect(
+          await auth.completeFreshVerification(
+            session.token,
+            stepUp.value.challengeId,
+            {},
+            binding,
+          ),
+        ).toEqual({ ok: true, value: undefined });
+        expect(first.getCredential()?.signCount).toBe(3);
+        first.close();
+        first = undefined;
+
+        restarted = new SqliteTechnicalAdminAuthRepository(databasePath, identity);
+        const restartedAuth = createTechnicalAdminAuth(
+          identity,
+          restarted,
+          createVerifier(),
+          () => nowMs,
+        );
+        expect(restarted.getCredential()?.signCount).toBe(3);
+        expect(restartedAuth.authenticateSession(session.token)).toBe(true);
+        expect(restartedAuth.beginReplacement(session.token, binding).ok).toBe(true);
+      } finally {
+        first?.close();
+        restarted?.close();
+      }
+    });
+  });
+
+  test("rolls back the fresh counter when the session commit cannot complete", async () => {
+    await withTempDirectory("technical-admin-counter-focused-", async (directory) => {
+      const databasePath = join(directory, "auth.sqlite");
+      let repository: SqliteTechnicalAdminAuthRepository | undefined;
+      try {
+        repository = new SqliteTechnicalAdminAuthRepository(databasePath, identity);
+        const { auth, session } = await enrollAndAuthenticate(repository, () => 1_000);
+        const stepUp = auth.beginFreshVerification(session.token, "replace-credential", binding);
+        if (!stepUp.ok) throw new Error("Expected replacement step-up options.");
+        const authority = auth.resolveCurrentAuthority(session.token);
+        if (!authority) throw new Error("Expected current authority.");
+        expect(
+          repository.consumeChallenge(
+            stepUp.value.challengeId,
+            "fresh-verification",
+            1_000,
+            authority.sessionId,
+          ),
+        ).not.toBeNull();
+        const before = repository.getCredential()?.signCount;
+        repository.revokeSession(authority.sessionId, 1_000);
+        expect(repository.commitFreshVerification(stepUp.value.challengeId, 3, 1_000)).toBe(false);
+        expect(repository.getCredential()?.signCount).toBe(before);
+      } finally {
+        repository?.close();
+      }
+    });
+  });
+
+  test("fails closed for corrupt and read-only reset storage", () => {
+    return withTempDirectory("technical-admin-corrupt-focused-", (directory) => {
+      const corruptPath = join(directory, "corrupt.sqlite");
+      let reopened: SqliteTechnicalAdminAuthRepository | undefined;
+      let readOnly: SqliteTechnicalAdminAuthRepository | undefined;
+      try {
+        const corrupt = new SqliteTechnicalAdminAuthRepository(corruptPath, identity);
+        corrupt.close();
+        insertCredential(corruptPath, 2);
+        reopened = new SqliteTechnicalAdminAuthRepository(corruptPath, identity);
+        const auth = createTechnicalAdminAuth(identity, reopened, createVerifier(), () => 1_000);
+        expect(auth.storageStatus().state).toBe("corrupt");
+        expect(auth.emergencyReset()).toEqual({ ok: false, error: "storage-failure" });
+        reopened.close();
+        reopened = undefined;
+
+        const readOnlyPath = join(directory, "readonly.sqlite");
+        const writable = new SqliteTechnicalAdminAuthRepository(readOnlyPath, identity);
+        writable.close();
+        insertCredential(readOnlyPath);
+        readOnly = new SqliteTechnicalAdminAuthRepository(readOnlyPath, identity, {
+          readwrite: false,
+        });
+        expect(readOnly.getStorageStatus(1_000).state).toBe("read-only");
+        const readOnlyAuth = createTechnicalAdminAuth(
+          identity,
+          readOnly,
+          createVerifier(),
+          () => 1_000,
+        );
+        expect(readOnlyAuth.emergencyReset()).toEqual({ ok: false, error: "storage-failure" });
+      } finally {
+        reopened?.close();
+        readOnly?.close();
+      }
+    });
+  });
+
+  test("removes quiet-period telemetry past the 30-day boundary", () => {
+    return withTempDirectory("technical-admin-retention-focused-", (directory) => {
+      const databasePath = join(directory, "auth.sqlite");
+      const repository = new SqliteTechnicalAdminAuthRepository(databasePath, identity);
+      let nowMs = 1_000;
+      const auth = createTechnicalAdminAuth(identity, repository, createVerifier(), () => nowMs);
+      const manual = createManualRetentionScheduler(() => nowMs);
+      try {
+        repository.appendOperationalLog({
+          atMs: 1_000,
+          event: "logout",
+          outcome: "accepted",
+          environment: "test",
+          generation: 0,
+          sessionReference: null,
+          sourceCorrelation: null,
+        });
+        repository.appendAlert({
+          atMs: 1_000,
+          event: "unsafe-storage",
+          environment: "test",
+          generation: 0,
+          sourceCorrelation: null,
+        });
+        auth.startRetentionMaintenance(manual.scheduler);
+        expect(manual.pendingCount()).toBe(1);
+        nowMs += technicalAdminSessionTtls().logRetentionMs;
+        manual.runDue();
+        expect(
+          repository.database
+            .query("SELECT COUNT(*) AS count FROM technical_admin_operational_logs")
+            .get(),
+        ).toEqual({
+          count: 0,
+        });
+        expect(
+          repository.database.query("SELECT COUNT(*) AS count FROM technical_admin_alerts").get(),
+        ).toEqual({
+          count: 0,
+        });
+        expect(manual.pendingCount()).toBe(0);
+      } finally {
+        auth.close();
+        repository.close();
+      }
+    });
+  });
+
+  test("reset CLI requires confirmation, fails safely, and emits URL only after commit", async () => {
+    await withTempDirectory("technical-admin-cli-focused-", async (directory) => {
+      const mismatchPath = join(directory, "mismatch.sqlite");
+      const mismatch = await runResetCli(mismatchPath, "wrong\n");
+      expect(mismatch.exitCode).toBe(1);
+      expect(mismatch.stdout).not.toContain("#token=");
+      expect(mismatch.stderr).toContain("Reset cancelled.");
+
+      const successPath = join(directory, "success.sqlite");
+      const successRepository = new SqliteTechnicalAdminAuthRepository(successPath, identity);
+      successRepository.close();
+      insertCredential(successPath);
+      const success = await runResetCli(successPath, "test\n");
+      expect(success.exitCode).toBe(0);
+      expect(success.stdout).toContain("https://localhost:39421/admin/enroll#token=");
+      const afterSuccess = new SqliteTechnicalAdminAuthRepository(successPath, identity);
+      expect(afterSuccess.getCredential()).toBeNull();
+      afterSuccess.close();
+
+      const corruptPath = join(directory, "unsafe.sqlite");
+      const unsafeRepository = new SqliteTechnicalAdminAuthRepository(corruptPath, identity);
+      unsafeRepository.close();
+      insertCredential(corruptPath, 2);
+      const unsafe = await runResetCli(corruptPath, "");
+      expect(unsafe.exitCode).toBe(1);
+      expect(unsafe.stdout).not.toContain("#token=");
+      expect(unsafe.stderr).toContain("not safe to reset");
+
+      const readOnlyPath = join(directory, "readonly-cli.sqlite");
+      const readOnlyRepository = new SqliteTechnicalAdminAuthRepository(readOnlyPath, identity);
+      readOnlyRepository.close();
+      insertCredential(readOnlyPath);
+      chmodSync(readOnlyPath, 0o444);
+      try {
+        const readOnly = await runResetCli(readOnlyPath, "test\n");
+        expect(readOnly.exitCode).toBe(1);
+        expect(readOnly.stdout).not.toContain("#token=");
+      } finally {
+        chmodSync(readOnlyPath, 0o600);
+      }
+    });
+  });
+});

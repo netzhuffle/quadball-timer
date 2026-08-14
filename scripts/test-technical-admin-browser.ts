@@ -122,12 +122,60 @@ try {
 
   await page.getByRole("button", { name: "Sign in with passkey" }).click();
   await page.getByText("Technical Admin administration").waitFor();
+  const csrfFailureStatus = await page.evaluate(async () => {
+    const response = await fetch("/api/admin/logout", { method: "POST" });
+    return response.status;
+  });
+  assert(csrfFailureStatus === 401, "logout without the custom CSRF header was accepted");
+  const cookies = await context.cookies();
+  const cookieHeader = cookies.map((cookie) => `${cookie.name}=${cookie.value}`).join("; ");
+  const csrfToken = cookies.find((cookie) => cookie.name === "__Host-technical-admin-csrf")?.value;
+  if (!csrfToken) throw new Error("Technical Admin CSRF cookie was not issued.");
+  const recoveryOptions = {
+    method: "POST" as const,
+    data: { purpose: "revoke-other-sessions" },
+    headers: {
+      cookie: cookieHeader,
+      "x-technical-admin-csrf": csrfToken,
+    },
+  };
+  const wrongOriginResponse = await context.request.post(`${origin}/api/admin/step-up/options`, {
+    ...recoveryOptions,
+    headers: { ...recoveryOptions.headers, origin: "https://evil.example" },
+  });
+  assert(wrongOriginResponse.status() === 401, "wrong-Origin recovery mutation was accepted");
+  const wrongContentTypeResponse = await context.request.post(
+    `${origin}/api/admin/step-up/options`,
+    {
+      ...recoveryOptions,
+      headers: { ...recoveryOptions.headers, "content-type": "text/plain" },
+    },
+  );
+  assert(
+    wrongContentTypeResponse.status() === 401,
+    "wrong-content-type recovery mutation was accepted",
+  );
+  const missingCsrfResponse = await context.request.post(`${origin}/api/admin/step-up/options`, {
+    data: { purpose: "revoke-other-sessions" },
+    headers: { cookie: cookieHeader, "content-type": "application/json" },
+  });
+  assert(missingCsrfResponse.status() === 401, "missing-CSRF recovery mutation was accepted");
+  await page.getByRole("button", { name: "Log out other sessions" }).click();
+  await page.getByText("Active browser sessions: 1").waitFor();
+  await page.getByRole("button", { name: "Replace passkey" }).click();
+  await page.getByText("Active browser sessions: 1").waitFor();
   console.log(
     JSON.stringify({
       status: "passed",
       enrollment: true,
       authentication: true,
       replayRejected: true,
+      csrfRejected: true,
+      recoveryBindingRejected: true,
+      recoveryContentTypeRejected: true,
+      recoveryCsrfRejected: true,
+      sessionRevocation: true,
+      replacement: true,
     }),
   );
 } catch (error) {
