@@ -305,6 +305,31 @@ async function startServer() {
             return liveEventControlTransport.submitControllerIntent(req);
           },
         },
+        "/api/event-control/refresh": {
+          POST(req: Request) {
+            return liveEventControlTransport.refreshController(req);
+          },
+        },
+        "/api/event-control/switch": {
+          POST(req: Request) {
+            return liveEventControlTransport.switchController(req);
+          },
+        },
+        "/api/event-control/stay": {
+          POST(req: Request) {
+            return liveEventControlTransport.stayController(req);
+          },
+        },
+        "/api/event-control/reveal-qr": {
+          POST(req: Request) {
+            return liveEventControlTransport.revealControllerQr(req);
+          },
+        },
+        "/api/event-control/leave": {
+          POST(req: Request) {
+            return liveEventControlTransport.leaveController(req);
+          },
+        },
         "/api/admin/enrollment/options": {
           async POST(req: Request) {
             const body = await readJsonRecord(req);

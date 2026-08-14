@@ -301,6 +301,7 @@ type RootStatements = {
   byGameSideId: SqlStatement;
   insertRoot: SqlStatement;
   allRoots: SqlStatement;
+  updateRoot: SqlStatement;
   insertSide: SqlStatement;
   actionByOperationId: SqlStatement;
   actionsByRecordId: SqlStatement;
@@ -841,6 +842,7 @@ export class SqliteFoundationStorage implements FoundationStorage {
       findRootByGameSideId: (gameSideId) =>
         this.readRootByStatement(statements.byGameSideId, gameSideId),
       insertRoot: (storedRoot) => this.insertRoot(statements, storedRoot),
+      updateRoot: (storedRoot) => this.updateRoot(statements, storedRoot),
       findActionByOperationId: (recordId, operationId) =>
         this.readActionByStatement(statements.actionByOperationId, recordId, operationId),
       listActions: (recordId) => this.readActionsByRecordId(statements.actionsByRecordId, recordId),
@@ -1171,6 +1173,23 @@ export class SqliteFoundationStorage implements FoundationStorage {
     );
   }
 
+  private updateRoot(statements: RootStatements, storedRoot: StoredEventGameRecordRoot): void {
+    const { root } = storedRoot;
+    const result = statements.updateRoot.run(
+      root.lifecycle.phase,
+      root.lifecycle.commencedAtMs,
+      root.lifecycle.finishedAtMs,
+      root.lifecycle.lockedAtMs,
+      root.lifecycle.lockReason,
+      storedRoot.canonicalContent,
+      JSON.stringify(root),
+      root.recordId,
+    );
+    if (result.changes !== 1) {
+      throw new FoundationStorageConstraintError("record-id");
+    }
+  }
+
   private insertAction(statements: RootStatements, storedAction: StoredControlAction): void {
     const { action } = storedAction;
     const actionId = actionIdentity(action.recordId, action.operationId);
@@ -1298,6 +1317,12 @@ export class SqliteFoundationStorage implements FoundationStorage {
           creation_operation_id, creation_actor_reference, creation_source,
           creation_created_at_ms, canonical_content, root_json
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `),
+      updateRoot: this.database.query(`
+        UPDATE foundation_event_game_record_roots
+        SET lifecycle_phase = ?, commenced_at_ms = ?, finished_at_ms = ?,
+            locked_at_ms = ?, lock_reason = ?, canonical_content = ?, root_json = ?
+        WHERE record_id = ?
       `),
       insertSide: this.database.query(`
         INSERT INTO foundation_event_game_record_sides (

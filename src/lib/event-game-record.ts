@@ -88,6 +88,43 @@ export type ExternalScopeResolver = {
   ): ExternalEventTeamResolution;
 };
 
+function sameLifecycleContext(
+  left: EventGameRecordRoot["lifecycle"],
+  right: EventGameRecordRoot["lifecycle"],
+): boolean {
+  return (
+    left.phase === right.phase &&
+    left.commencedAtMs === right.commencedAtMs &&
+    left.finishedAtMs === right.finishedAtMs &&
+    left.lockedAtMs === right.lockedAtMs &&
+    left.lockReason === right.lockReason
+  );
+}
+
+function isAllowedLifecycleTransition(
+  current: EventGameRecordRoot["lifecycle"],
+  next: EventGameRecordRoot["lifecycle"],
+): boolean {
+  if (current.lockedAtMs !== null || current.finishedAtMs !== null) return false;
+  if (
+    current.commencedAtMs !== null &&
+    (next.commencedAtMs === null || next.commencedAtMs !== current.commencedAtMs)
+  )
+    return false;
+  if (next.phase === "scheduled" && next.commencedAtMs !== null) return false;
+  if (current.phase === "scheduled") {
+    return (
+      next.commencedAtMs !== null && (next.phase === "in-progress" || next.phase === "finished")
+    );
+  }
+  if (current.phase === "in-progress" || current.phase === "suspended") {
+    return (
+      next.phase === current.phase || (next.phase === "finished" && next.finishedAtMs !== null)
+    );
+  }
+  return false;
+}
+
 export type EventGameRecordOptions = {
   externalScopeResolver: ExternalScopeResolver;
   clock?: () => number;
@@ -117,6 +154,9 @@ export type RootRegistrationOutcome =
 export type EventGameRecord = {
   registerRoot(root: unknown): Promise<RootRegistrationOutcome>;
   readRoot(recordId: string): Promise<EventGameRecordRoot | null>;
+  transitionLifecycle(
+    lifecycle: EventGameRecordRoot["lifecycle"],
+  ): Promise<LifecycleTransitionOutcome>;
   acceptAction(input: unknown): Promise<ControlActionAcceptanceOutcome>;
   readActions(): Promise<StoredControlAction[]>;
   readRecoveryProvenance(): Promise<ControlActionRecoveryProvenance[]>;
@@ -125,6 +165,10 @@ export type EventGameRecord = {
   rebuild(): Promise<ActionRebuildResult>;
   readiness(): Promise<EventGameRecordReadiness>;
 };
+
+export type LifecycleTransitionOutcome =
+  | { status: "updated" | "idempotent"; root: EventGameRecordRoot }
+  | { status: "rejected"; detail: string };
 
 export type ControlActionAcceptanceOutcome =
   | {
@@ -458,6 +502,54 @@ export function createEventGameRecord(
 
     readRoot(recordId) {
       return storage.readRoot(recordId);
+    },
+
+    async transitionLifecycle(lifecycle) {
+      try {
+        return await storage.transaction((transaction) => {
+          const current = transaction.findRootByRecordId(currentRecordId());
+          if (current === null) {
+            return {
+              status: "rejected",
+              detail: "The Event Game Record is not registered.",
+            } satisfies LifecycleTransitionOutcome;
+          }
+          if (sameLifecycleContext(current.lifecycle, lifecycle)) {
+            return {
+              status: "idempotent",
+              root: cloneEventGameRecordRoot(current),
+            } satisfies LifecycleTransitionOutcome;
+          }
+          const candidate = { ...current, lifecycle: structuredClone(lifecycle) };
+          const validated = validateEventGameRecordRoot(candidate);
+          if (!validated.ok) {
+            return {
+              status: "rejected",
+              detail: validated.error,
+            } satisfies LifecycleTransitionOutcome;
+          }
+          if (!isAllowedLifecycleTransition(current.lifecycle, validated.value.lifecycle)) {
+            return {
+              status: "rejected",
+              detail: "Event Game lifecycle transitions are monotonic.",
+            } satisfies LifecycleTransitionOutcome;
+          }
+          const storedRoot = {
+            root: validated.value,
+            canonicalContent: canonicalizeEventGameRecordRoot(validated.value),
+          };
+          transaction.updateRoot(storedRoot);
+          return {
+            status: "updated",
+            root: cloneEventGameRecordRoot(validated.value),
+          } satisfies LifecycleTransitionOutcome;
+        });
+      } catch {
+        return {
+          status: "rejected",
+          detail: "The Event Game lifecycle could not be durably updated.",
+        } satisfies LifecycleTransitionOutcome;
+      }
     },
 
     async acceptAction(input) {

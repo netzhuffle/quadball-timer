@@ -320,6 +320,7 @@ export type FoundationStorageSnapshot = {
 
 export type FoundationStorageTransaction = FoundationStorageSnapshot & {
   insertRoot(root: StoredEventGameRecordRoot): void;
+  updateRoot(root: StoredEventGameRecordRoot): void;
   insertAction(action: StoredControlAction): void;
   upsertRecordMetadata(metadata: StoredEventGameRecordMetadata): void;
   appendAuditEntry(entry: StoredControlAuditEntry): void;

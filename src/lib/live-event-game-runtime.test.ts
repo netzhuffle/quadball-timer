@@ -6,13 +6,18 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createEventGameRecord } from "@/lib/event-game-record";
 import type { EventGameRecordRoot } from "@/lib/foundation-record-types";
+import type { FoundationStorageSnapshot } from "@/lib/foundation-storage";
 import { FOUNDATION_MIGRATIONS } from "@/lib/foundation-migrations";
 import { openSqliteFoundationStorage } from "@/lib/foundation-storage-sqlite";
 import { createGrantTestAuthorityVerifier } from "@/lib/grant-authority-test-support";
 import { createTypedGrantAuthority } from "@/lib/grant-management";
 import type { GrantAuthorityOptions } from "@/lib/grant-authority";
 import type { GrantKeyRing } from "@/lib/grant-types";
-import { openLiveEventGameRuntime, readLiveEventGrantKeyRing } from "@/lib/live-event-game-runtime";
+import {
+  createControlScopeResolver,
+  openLiveEventGameRuntime,
+  readLiveEventGrantKeyRing,
+} from "@/lib/live-event-game-runtime";
 import {
   createLiveEventGameIqaInterpreter,
   LIVE_EVENT_CONTROL_INTENT_VERSION,
@@ -201,7 +206,11 @@ describe("Live Event Game SQLite runtime", () => {
       expect(accepted).toMatchObject({
         status: "accepted",
         projectionStatus: "available",
-        projection: { scoreByGameSide: { "side-a": 10, "side-b": 0 }, goalCount: 1 },
+        projection: {
+          scoreByGameSide: { "side-a": 10, "side-b": 0 },
+          goalCount: 1,
+          commencement: { status: "commenced", commencedAtMs: 10_000 },
+        },
       });
 
       const duplicate = await runtime.control.submitControllerIntent({
@@ -243,6 +252,151 @@ describe("Live Event Game SQLite runtime", () => {
         projectionStatus: "available",
         projection: { scoreByGameSide: { "side-a": 10, "side-b": 0 }, goalCount: 1 },
       });
+    } finally {
+      runtime.close();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("production scope resolver switches before commencement and pins after it", () => {
+    const previous = createRoot();
+    const current: EventGameRecordRoot = {
+      ...previous,
+      recordId: "runtime-record-current",
+      eventGameId: "runtime-game-current",
+      ownership: { eventId: previous.eventId, eventGameId: "runtime-game-current" },
+      lifecycle: { ...previous.lifecycle },
+    };
+    const previousCommenced: EventGameRecordRoot = {
+      ...previous,
+      recordId: "runtime-record-previous-commenced",
+      eventGameId: "runtime-game-previous-commenced",
+      ownership: { eventId: previous.eventId, eventGameId: "runtime-game-previous-commenced" },
+      lifecycle: { ...previous.lifecycle, phase: "in-progress", commencedAtMs: 10_000 },
+    };
+    const snapshot = {
+      findRootByPitchSlotId: () => current,
+      findRootByEventGameId: (eventGameId: string) =>
+        eventGameId === previous.eventGameId
+          ? previous
+          : eventGameId === previousCommenced.eventGameId
+            ? previousCommenced
+            : current,
+    } as unknown as FoundationStorageSnapshot;
+    const resolver = createControlScopeResolver();
+
+    expect(
+      resolver.resolveSession?.(current.externalScope, previous.eventGameId, snapshot),
+    ).toEqual({
+      status: "switchable",
+      previousEventGameId: previous.eventGameId,
+      currentEventGameId: current.eventGameId,
+    });
+    expect(
+      resolver.resolveSession?.(current.externalScope, previousCommenced.eventGameId, snapshot),
+    ).toEqual({
+      status: "pinned",
+      sessionEventGameId: previousCommenced.eventGameId,
+      currentEventGameId: current.eventGameId,
+    });
+  });
+
+  test("production reassignment resolution persists passive commencement without refresh", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "quadball-event-game-runtime-"));
+    const databasePath = join(directory, "event-game.sqlite");
+    const keyRing = createKeyRing();
+    let nowMs = 0;
+    const previous = createRoot();
+    const current: EventGameRecordRoot = {
+      ...previous,
+      recordId: "runtime-record-reassigned",
+      eventGameId: "runtime-game-reassigned",
+      ownership: { eventId: previous.eventId, eventGameId: "runtime-game-reassigned" },
+      externalScope: { ...previous.externalScope, pitchSlotId: "runtime-slot-2" },
+      gameSides: [
+        { id: "side-c", eventTeamId: "team-c", teamInterpretationRef: "team-c-v1" },
+        { id: "side-d", eventTeamId: "team-d", teamInterpretationRef: "team-d-v1" },
+      ],
+      creationEvidence: { ...previous.creationEvidence, operationId: "runtime-register-2" },
+    };
+    const setupStorage = openSqliteFoundationStorage(databasePath, { grantKeyRing: keyRing });
+    let qrCredential: string;
+    try {
+      await setupStorage.applyMigrations({ requireCandidate: false });
+      for (const root of [previous, current]) {
+        const record = createEventGameRecord(setupStorage, {
+          externalScopeResolver: createExternalScopeResolver(root),
+          interpreter: createLiveEventGameIqaInterpreter(),
+          auditAuthorityVerifier: { verify: () => true },
+        });
+        expect(await record.registerRoot(root)).toMatchObject({ status: "registered" });
+      }
+      const authority = createTypedGrantAuthority(
+        setupStorage,
+        createGrantOptions("runtime-test", keyRing),
+      );
+      const created = await authority.createControlGrant({
+        scope: previous.externalScope,
+        authority: { kind: "fixture", id: "runtime-fixture" },
+      });
+      if (created.status !== "created") throw new Error("Expected a runtime Control Grant.");
+      qrCredential = created.qrCredential;
+    } finally {
+      setupStorage.close();
+    }
+
+    const runtime = await openLiveEventGameRuntime({
+      databasePath,
+      environmentId: "runtime-test",
+      keyRing,
+      clock: () => nowMs,
+    });
+    try {
+      const opened = await runtime.control.openController({
+        qrCredential,
+        browserContext: "runtime-reassignment-device",
+      });
+      if (opened.status !== "opened") throw new Error("Expected the runtime Controller to open.");
+      const clock = await runtime.control.submitControllerIntent({
+        sessionBearer: opened.session.sessionBearer,
+        eventGameId: previous.eventGameId,
+        intent: {
+          version: LIVE_EVENT_CONTROL_INTENT_VERSION,
+          type: "clock",
+          operationId: "runtime-clock-start",
+          factId: "runtime-clock-fact",
+          running: true,
+          gameTimeMs: 0,
+          occurrence: { clientOriginAtMs: 0 },
+        },
+      });
+      expect(clock).toMatchObject({ status: "accepted" });
+      nowMs = 10_001;
+
+      const storage = openSqliteFoundationStorage(databasePath, { grantKeyRing: keyRing });
+      try {
+        createEventGameRecord(storage, {
+          externalScopeResolver: createExternalScopeResolver(previous),
+          interpreter: createLiveEventGameIqaInterpreter(),
+        });
+        const result = await storage.transaction((transaction) =>
+          createControlScopeResolver(() => nowMs).resolveSession?.(
+            current.externalScope,
+            previous.eventGameId,
+            transaction,
+          ),
+        );
+        expect(result).toEqual({
+          status: "pinned",
+          sessionEventGameId: previous.eventGameId,
+          currentEventGameId: current.eventGameId,
+        });
+        expect(await storage.readRoot(previous.recordId)).toMatchObject({
+          lifecycle: { phase: "in-progress", commencedAtMs: 10_000 },
+        });
+      } finally {
+        storage.close();
+      }
     } finally {
       runtime.close();
       await rm(directory, { recursive: true, force: true });

@@ -25,12 +25,17 @@ import {
   findFactById,
   validateDependencies,
 } from "@/lib/event-game-record-helpers";
-import type { EventGameRecordRoot } from "@/lib/foundation-record-types";
+import {
+  canonicalizeEventGameRecordRoot,
+  validateEventGameRecordRoot,
+  type EventGameRecordRoot,
+} from "@/lib/foundation-record-types";
 import type {
   FoundationStorage,
   FoundationStorageSnapshot,
   FoundationStorageTransaction,
   StoredAcceptanceBudget,
+  StoredControlAction,
   StoredReplayAttempt,
   StoredReplayReservation,
 } from "@/lib/foundation-storage";
@@ -81,6 +86,7 @@ export type ControlActionBatchInput = {
     originatingSessionId: string;
     replayEvidenceId: string;
   };
+  lifecycleTransition?: EventGameRecordRoot["lifecycle"];
 };
 
 export type FoundationActionResult =
@@ -145,6 +151,7 @@ export type FoundationAcceptanceOptions = {
       | "after-metadata"
       | "after-control-audit"
       | "after-grant-audit"
+      | "after-lifecycle"
       | "before-receipt",
   ) => void;
   /** Test-only barrier between read-only preflight and the first write transaction. */
@@ -341,7 +348,7 @@ export function createFoundationAcceptance(
         trustedLockedReplay: true,
         // Locked discard validates codec/envelope/payload evidence but does
         // not execute root-dependent sporting semantics.
-        actions: prepareBatchActions(batch, null),
+        actions: prepareBatchActions(batch, null, transaction),
       };
     }
     const bearer = replay?.sessionBearer ?? batch.input.sessionBearer;
@@ -350,7 +357,7 @@ export function createFoundationAcceptance(
     const authorization = authorizeGrantInTransaction(transaction, options.grant, {
       sessionBearer: bearer,
       eventGameId: batch.input.eventGameId,
-      controlSessionDecision: batch.input.controlSessionDecision ?? "stay",
+      controlSessionDecision: batch.input.controlSessionDecision,
       readOnly: true,
     });
     if (
@@ -376,23 +383,36 @@ export function createFoundationAcceptance(
         authorized: true,
         root: null,
         trustedLockedReplay: false,
-        actions: prepareBatchActions(batch, null),
+        actions: prepareBatchActions(batch, null, transaction),
       };
     return {
       authorized: true,
       root,
       trustedLockedReplay: false,
-      actions: prepareBatchActions(batch, root),
+      actions: prepareBatchActions(batch, root, transaction),
     };
   }
 
   function prepareBatchActions(
     batch: PreparedBatch,
     root: EventGameRecordRoot | null,
+    snapshot: FoundationStorageSnapshot,
   ): readonly { prepared: PreparedControlAction | null; error: string | null }[] {
     return batch.actions.map(({ raw }) => {
       try {
-        const prepared = prepareControlAction(raw, root, registry, readNow(clock), {
+        const operationId =
+          typeof raw === "object" && raw !== null && !Array.isArray(raw)
+            ? (raw as Record<string, unknown>).operationId
+            : undefined;
+        const existing =
+          root !== null && typeof operationId === "string"
+            ? snapshot.findActionByOperationId(root.recordId, operationId)
+            : null;
+        const preparationRoot =
+          root !== null && existing !== null
+            ? { ...root, lifecycle: existing.action.lifecycle }
+            : root;
+        const prepared = prepareControlAction(raw, preparationRoot, registry, readNow(clock), {
           allowConcurrentTeamAssignment: true,
         });
         return prepared.ok
@@ -425,9 +445,14 @@ export function createFoundationAcceptance(
   function prepareCurrentAction(
     raw: unknown,
     root: EventGameRecordRoot | null,
+    existing?: StoredControlAction | null,
   ): { prepared: PreparedControlAction | null; error: string | null } {
     try {
-      const prepared = prepareControlAction(raw, root, registry, readNow(clock), {
+      const preparationRoot =
+        root !== null && existing !== null && existing !== undefined
+          ? { ...root, lifecycle: existing.action.lifecycle }
+          : root;
+      const prepared = prepareControlAction(raw, preparationRoot, registry, readNow(clock), {
         allowConcurrentTeamAssignment: true,
       });
       return prepared.ok
@@ -523,7 +548,7 @@ export function createFoundationAcceptance(
     const authorization = authorizeGrantInTransaction(transaction, options.grant, {
       sessionBearer: bearer,
       eventGameId: batch.input.eventGameId,
-      controlSessionDecision: batch.input.controlSessionDecision ?? "stay",
+      controlSessionDecision: batch.input.controlSessionDecision,
       readOnly: true,
     });
     if (
@@ -576,7 +601,7 @@ export function createFoundationAcceptance(
       root.recordId,
       structural.envelope.operationId,
     );
-    let currentPreparation = prepareCurrentAction(structural.raw, root);
+    let currentPreparation = prepareCurrentAction(structural.raw, root, existing);
     if (
       existing !== null &&
       currentPreparation.prepared !== null &&
@@ -585,12 +610,14 @@ export function createFoundationAcceptance(
       currentPreparation = prepareCurrentAction(
         withTrustedOccurrence(structural.raw, existing.action.occurrence.trustedAtMs),
         root,
+        existing,
       );
     }
     const prepared = currentPreparation.prepared;
     if (
       preflightAction !== undefined &&
-      !samePreparationResultIgnoringTrustedOccurrence(prepared, preflightAction.prepared)
+      !samePreparationResultIgnoringTrustedOccurrence(prepared, preflightAction.prepared) &&
+      transaction.findActionByOperationId(root.recordId, structural.envelope.operationId) === null
     )
       return one({
         status: "retry-later",
@@ -601,7 +628,7 @@ export function createFoundationAcceptance(
     const currentAuthorization = authorizeGrantInTransaction(transaction, options.grant, {
       sessionBearer: bearer,
       eventGameId: batch.input.eventGameId,
-      controlSessionDecision: batch.input.controlSessionDecision ?? "stay",
+      controlSessionDecision: batch.input.controlSessionDecision,
     });
     if (
       currentAuthorization === GENERIC_GRANT_AUTHORIZATION_FAILURE ||
@@ -820,6 +847,7 @@ export function createFoundationAcceptance(
         mode,
         replayState,
         existing.action,
+        batch.input.lifecycleTransition,
       );
     if (existing !== null)
       return writeOutcome(
@@ -886,6 +914,7 @@ export function createFoundationAcceptance(
       current,
       mode,
       replayState,
+      batch.input.lifecycleTransition,
     );
   }
 
@@ -898,6 +927,7 @@ export function createFoundationAcceptance(
     current: AuthorizedControl,
     mode: "online" | "replay",
     reservation: StoredReplayReservation | undefined,
+    lifecycleTransition: EventGameRecordRoot["lifecycle"] | undefined,
   ): OneOutcome {
     const acceptanceId = `accept-${sha256(`${root.recordId}:${action.operationId}:${action.grant.sessionId}`)}`;
     const grantAudit = linkedGrantAudit(
@@ -928,6 +958,7 @@ export function createFoundationAcceptance(
       action.interpretation.type === "team-assignment-correction"
     )
       appendConcurrentCorrectionAudits(transaction, root.recordId, action.acceptedAtMs);
+    applyLifecycleTransition(transaction, root.recordId, lifecycleTransition);
     return finishReplay(
       transaction,
       reservation,
@@ -1058,6 +1089,7 @@ export function createFoundationAcceptance(
     mode: "online" | "replay",
     reservation: StoredReplayReservation | undefined,
     existing: ControlAction,
+    lifecycleTransition: EventGameRecordRoot["lifecycle"] | undefined,
   ): OneOutcome {
     const nowMs = readNow(clock);
     const controlAudit = createControlAudit(
@@ -1092,6 +1124,7 @@ export function createFoundationAcceptance(
     options.failureInjector?.("after-control-audit");
     transaction.appendGrantAudit(grantAudit);
     options.failureInjector?.("after-grant-audit");
+    applyLifecycleTransition(transaction, root.recordId, lifecycleTransition);
     return finishReplay(
       transaction,
       reservation,
@@ -1451,6 +1484,9 @@ export function createFoundationAcceptance(
           }
         : null,
       actions: raw.actions,
+      ...(isRecord(raw.lifecycleTransition)
+        ? { lifecycleTransition: raw.lifecycleTransition }
+        : {}),
     };
     return {
       input: {
@@ -1460,12 +1496,70 @@ export function createFoundationAcceptance(
         sessionBearer: typeof raw.sessionBearer === "string" ? raw.sessionBearer : undefined,
         mode: effectiveMode,
         replay,
+        lifecycleTransition: isRecord(raw.lifecycleTransition)
+          ? (structuredClone(raw.lifecycleTransition) as EventGameRecordRoot["lifecycle"])
+          : undefined,
       },
       actions,
       order,
       size,
       digest: sha256(JSON.stringify(normalized)),
     };
+  }
+
+  function applyLifecycleTransition(
+    transaction: FoundationStorageTransaction,
+    recordId: string,
+    lifecycle: EventGameRecordRoot["lifecycle"] | undefined,
+  ): void {
+    if (lifecycle === undefined) return;
+    const current = transaction.findRootByRecordId(recordId);
+    if (current === null) throw new Error("The Event Game Record is unavailable.");
+    if (JSON.stringify(current.lifecycle) === JSON.stringify(lifecycle)) return;
+    if (current.lifecycle.phase === "finished" && lifecycle.phase === "finished") return;
+    if (
+      current.lifecycle.commencedAtMs !== null &&
+      lifecycle.commencedAtMs !== current.lifecycle.commencedAtMs &&
+      lifecycle.phase === "in-progress"
+    )
+      return;
+    const validated = validateEventGameRecordRoot({
+      ...current,
+      lifecycle: structuredClone(lifecycle),
+    });
+    if (
+      !validated.ok ||
+      !allowedLifecycleTransition(current.lifecycle, validated.value.lifecycle)
+    ) {
+      throw new Error("Event Game lifecycle transitions are monotonic.");
+    }
+    transaction.updateRoot({
+      root: validated.value,
+      canonicalContent: canonicalizeEventGameRecordRoot(validated.value),
+    });
+    options.failureInjector?.("after-lifecycle");
+  }
+
+  function allowedLifecycleTransition(
+    current: EventGameRecordRoot["lifecycle"],
+    next: EventGameRecordRoot["lifecycle"],
+  ): boolean {
+    if (current.lockedAtMs !== null || current.finishedAtMs !== null) return false;
+    if (
+      current.commencedAtMs !== null &&
+      (next.commencedAtMs === null || next.commencedAtMs !== current.commencedAtMs)
+    )
+      return false;
+    if (next.phase === "scheduled" && next.commencedAtMs !== null) return false;
+    if (current.phase === "scheduled")
+      return (
+        next.commencedAtMs !== null && (next.phase === "in-progress" || next.phase === "finished")
+      );
+    if (current.phase === "in-progress" || current.phase === "suspended")
+      return (
+        next.phase === current.phase || (next.phase === "finished" && next.finishedAtMs !== null)
+      );
+    return false;
   }
 
   function replayReservation(

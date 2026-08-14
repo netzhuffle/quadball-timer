@@ -147,6 +147,7 @@ export type ControlGrantScopeResolver = {
   resolveSession?: (
     scope: ControlGrantScope,
     sessionEventGameId: string,
+    snapshot?: FoundationStorageSnapshot,
   ) => ControlGrantSessionResolution;
   /** Optional lifecycle-aware seam used by explicit offline replay authorization. */
   resolveReplay?: (
@@ -197,6 +198,7 @@ export type StoredGrantSession = {
   grantId: string;
   grantVersion: string;
   eventGameId: string;
+  stayedOnEventGameId?: string | null;
   browserContextDigest: string;
   browserContextKeyVersion: string;
   bearerMaterialState: "present" | "erased";

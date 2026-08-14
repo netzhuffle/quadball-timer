@@ -1,5 +1,8 @@
 import { readJsonBodyWithinLimit } from "@/lib/http-body";
 import type {
+  ControllerLeaveResult,
+  ControllerQrResult,
+  ControllerRefreshResult,
   LiveEventGameControlResult,
   OpenControllerResult,
 } from "@/lib/live-event-game-control";
@@ -7,6 +10,11 @@ import { SHARED_LIMITS } from "@/lib/validation-policy";
 
 export type LiveEventGameControlTransport = {
   openController(request: Request): Promise<Response>;
+  refreshController(request: Request): Promise<Response>;
+  switchController(request: Request): Promise<Response>;
+  stayController(request: Request): Promise<Response>;
+  revealControllerQr(request: Request): Promise<Response>;
+  leaveController(request: Request): Promise<Response>;
   submitControllerIntent(request: Request): Promise<Response>;
 };
 
@@ -15,6 +23,20 @@ export type LiveEventGameControlTransportTarget = {
     qrCredential: string;
     browserContext: string;
   }): Promise<OpenControllerResult>;
+  refreshController(input: {
+    sessionBearer: string;
+    eventGameId: string;
+  }): Promise<ControllerRefreshResult>;
+  switchController(input: { sessionBearer: string }): Promise<ControllerRefreshResult>;
+  stayController(input: {
+    sessionBearer: string;
+    eventGameId: string;
+  }): Promise<ControllerRefreshResult>;
+  revealControllerQr(input: {
+    sessionBearer: string;
+    eventGameId: string;
+  }): Promise<ControllerQrResult>;
+  leaveController(input: { sessionBearer: string }): Promise<ControllerLeaveResult>;
   submitControllerIntent(input: {
     sessionBearer: string;
     eventGameId: string;
@@ -72,12 +94,88 @@ export function createLiveEventGameControlTransport(
       });
       return noStoreJson(result, resultStatus(result));
     },
+    async refreshController(request) {
+      const input = await readSessionInput(request, isAllowedRequest);
+      if (input === null || input.eventGameId === undefined) return unavailable();
+      const control = resolve();
+      if (control === null) return unavailable();
+      const result = await control.refreshController({
+        sessionBearer: input.sessionBearer,
+        eventGameId: input.eventGameId,
+      });
+      return noStoreJson(result, controllerResultStatus(result));
+    },
+    async switchController(request) {
+      const input = await readSessionInput(request, isAllowedRequest);
+      if (input === null) return unavailable();
+      const control = resolve();
+      if (control === null) return unavailable();
+      const result = await control.switchController({ sessionBearer: input.sessionBearer });
+      return noStoreJson(result, controllerResultStatus(result));
+    },
+    async stayController(request) {
+      const input = await readSessionInput(request, isAllowedRequest);
+      if (input === null || input.eventGameId === undefined) return unavailable();
+      const control = resolve();
+      if (control === null) return unavailable();
+      const result = await control.stayController({
+        sessionBearer: input.sessionBearer,
+        eventGameId: input.eventGameId,
+      });
+      return noStoreJson(result, controllerResultStatus(result));
+    },
+    async revealControllerQr(request) {
+      const input = await readSessionInput(request, isAllowedRequest);
+      if (input === null || input.eventGameId === undefined) return unavailable();
+      const control = resolve();
+      if (control === null) return unavailable();
+      const result = await control.revealControllerQr({
+        sessionBearer: input.sessionBearer,
+        eventGameId: input.eventGameId,
+      });
+      return noStoreJson(result, controllerResultStatus(result));
+    },
+    async leaveController(request) {
+      if (!isAllowedRequest(request)) return unavailable();
+      const control = resolve();
+      if (control === null) return unavailable();
+      const body = await readJsonBodyWithinLimit(
+        request,
+        SHARED_LIMITS.transport.httpJsonBodyBytes,
+      );
+      if (!body.ok || !isRecord(body.body) || typeof body.body.sessionBearer !== "string") {
+        return unavailable();
+      }
+      const result = await control.leaveController({ sessionBearer: body.body.sessionBearer });
+      return noStoreJson(result, controllerResultStatus(result));
+    },
   };
+}
+
+async function readSessionInput(
+  request: Request,
+  isAllowedRequest: (request: Request) => boolean,
+): Promise<{ sessionBearer: string; eventGameId?: string } | null> {
+  if (!isAllowedRequest(request)) return null;
+  const body = await readJsonBodyWithinLimit(request, SHARED_LIMITS.transport.httpJsonBodyBytes);
+  if (!body.ok || !isRecord(body.body) || typeof body.body.sessionBearer !== "string") return null;
+  if (typeof body.body.eventGameId === "string") {
+    return { sessionBearer: body.body.sessionBearer, eventGameId: body.body.eventGameId };
+  }
+  return { sessionBearer: body.body.sessionBearer };
 }
 
 function resultStatus(result: LiveEventGameControlResult): number {
   if (result.status === "retryable") return 503;
   if (result.status === "rejected") return 403;
+  return 200;
+}
+
+function controllerResultStatus(
+  result: ControllerRefreshResult | ControllerQrResult | ControllerLeaveResult,
+): number {
+  if (result.status === "rejected") return 403;
+  if (result.status === "switch-required") return 409;
   return 200;
 }
 

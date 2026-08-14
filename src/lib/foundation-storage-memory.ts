@@ -1140,6 +1140,17 @@ function createTransaction(
       });
       undo.push(() => state.roots.delete(storedRoot.root.recordId));
     },
+    updateRoot(storedRoot) {
+      const previous = state.roots.get(storedRoot.root.recordId);
+      if (previous === undefined) {
+        throw new FoundationStorageConstraintError("record-id");
+      }
+      state.roots.set(storedRoot.root.recordId, {
+        root: cloneEventGameRecordRoot(storedRoot.root),
+        canonicalContent: storedRoot.canonicalContent,
+      });
+      undo.push(() => state.roots.set(storedRoot.root.recordId, previous));
+    },
     insertAction(storedAction) {
       const { action } = storedAction;
       if (!state.roots.has(action.recordId)) {

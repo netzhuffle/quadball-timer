@@ -6,7 +6,7 @@ import { createEventGameRecord } from "@/lib/event-game-record";
 import { createGrantTestAuthorityVerifier } from "@/lib/grant-authority-test-support";
 import { createTypedGrantAuthority } from "@/lib/grant-management";
 import type { GrantAuthorityOptions } from "@/lib/grant-authority";
-import type { GrantKeyRing } from "@/lib/grant-types";
+import type { ControlGrantSessionResolution, GrantKeyRing } from "@/lib/grant-types";
 import type { EventGameRecordRoot } from "@/lib/foundation-record-types";
 import {
   createLiveEventGameControl,
@@ -129,6 +129,243 @@ describe("Live Event Game control", () => {
         browserContext: "controller-phone",
       }),
     ).toEqual({ status: "rejected", message: "Unable to open Controller experience." });
+  });
+
+  test("keeps a short clock test provisional, then commences after ten active seconds", async () => {
+    const harness = await createHarness();
+    const opened = await harness.control.openController({
+      qrCredential: harness.qrCredential,
+      browserContext: "clock-boundary",
+    });
+    if (opened.status !== "opened") throw new Error("Expected the Controller to open.");
+
+    const start = await harness.control.submitControllerIntent({
+      sessionBearer: opened.session.sessionBearer,
+      eventGameId: harness.root.eventGameId,
+      intent: clockIntent("clock-start", true),
+    });
+    expect(start).toMatchObject({
+      status: "accepted",
+      projection: { commencement: { status: "provisional" } },
+    });
+
+    harness.setNow(19_000);
+    const shortRunningUpdate = await harness.control.submitControllerIntent({
+      sessionBearer: opened.session.sessionBearer,
+      eventGameId: harness.root.eventGameId,
+      intent: clockIntent("clock-short-update", true),
+    });
+    expect(shortRunningUpdate).toMatchObject({
+      projection: { commencement: { status: "provisional" } },
+    });
+    expect(
+      (await harness.record.readRoot(harness.root.recordId))?.lifecycle.commencedAtMs,
+    ).toBeNull();
+
+    harness.setNow(20_000);
+    const longPause = await harness.control.submitControllerIntent({
+      sessionBearer: opened.session.sessionBearer,
+      eventGameId: harness.root.eventGameId,
+      intent: clockIntent("clock-long-pause", false),
+    });
+    expect(longPause).toMatchObject({ projection: { commencement: { status: "commenced" } } });
+    expect((await harness.record.readRoot(harness.root.recordId))?.lifecycle).toMatchObject({
+      phase: "in-progress",
+      commencedAtMs: 20_000,
+    });
+  });
+
+  test("persists passive clock commencement at the ten-second boundary during refresh", async () => {
+    const harness = await createHarness();
+    const opened = await harness.control.openController({
+      qrCredential: harness.qrCredential,
+      browserContext: "passive-commencement",
+    });
+    if (opened.status !== "opened") throw new Error("Expected the Controller to open.");
+
+    await harness.control.submitControllerIntent({
+      sessionBearer: opened.session.sessionBearer,
+      eventGameId: harness.root.eventGameId,
+      intent: clockIntent("passive-clock-start", true),
+    });
+    harness.setNow(20_000);
+    expect(
+      await harness.control.refreshController({
+        sessionBearer: opened.session.sessionBearer,
+        eventGameId: harness.root.eventGameId,
+      }),
+    ).toMatchObject({
+      status: "authorized",
+      projection: { commencement: { status: "commenced", commencedAtMs: 20_000 } },
+    });
+    expect((await harness.record.readRoot(harness.root.recordId))?.lifecycle).toMatchObject({
+      phase: "in-progress",
+      commencedAtMs: 20_000,
+    });
+
+    harness.setNow(25_000);
+    await harness.control.submitControllerIntent({
+      sessionBearer: opened.session.sessionBearer,
+      eventGameId: harness.root.eventGameId,
+      intent: substantiveIntent("passive-card", "card"),
+    });
+    expect((await harness.record.readRoot(harness.root.recordId))?.lifecycle.commencedAtMs).toBe(
+      20_000,
+    );
+  });
+
+  test.each(["card", "timeout", "suspension", "result"] as const)(
+    "commences irreversibly on the first %s trigger",
+    async (trigger) => {
+      const harness = await createHarness();
+      const opened = await harness.control.openController({
+        qrCredential: harness.qrCredential,
+        browserContext: `trigger-${trigger}`,
+      });
+      if (opened.status !== "opened") throw new Error("Expected the Controller to open.");
+      const result = await harness.control.submitControllerIntent({
+        sessionBearer: opened.session.sessionBearer,
+        eventGameId: harness.root.eventGameId,
+        intent: substantiveIntent(`trigger-${trigger}`, trigger),
+      });
+      expect(result.status).toBe("accepted");
+      expect((await harness.record.readRoot(harness.root.recordId))?.lifecycle.commencedAtMs).toBe(
+        10_000,
+      );
+      if (trigger === "result") {
+        expect((await harness.record.readRoot(harness.root.recordId))?.lifecycle.phase).toBe(
+          "finished",
+        );
+      }
+    },
+  );
+
+  test("reset and undo do not reverse commencement, and QR reveal stops after finish", async () => {
+    const harness = await createHarness();
+    const opened = await harness.control.openController({
+      qrCredential: harness.qrCredential,
+      browserContext: "qr-and-leave",
+    });
+    if (opened.status !== "opened") throw new Error("Expected the Controller to open.");
+    expect(
+      await harness.control.revealControllerQr({
+        sessionBearer: opened.session.sessionBearer,
+        eventGameId: harness.root.eventGameId,
+      }),
+    ).toMatchObject({ status: "revealed", qrCredential: harness.qrCredential });
+    await harness.control.submitControllerIntent({
+      sessionBearer: opened.session.sessionBearer,
+      eventGameId: harness.root.eventGameId,
+      intent: goalIntent(),
+    });
+    await harness.control.submitControllerIntent({
+      sessionBearer: opened.session.sessionBearer,
+      eventGameId: harness.root.eventGameId,
+      intent: simpleIntent("reset-1", "reset"),
+    });
+    await harness.control.submitControllerIntent({
+      sessionBearer: opened.session.sessionBearer,
+      eventGameId: harness.root.eventGameId,
+      intent: simpleIntent("undo-1", "undo"),
+    });
+    expect(
+      (await harness.record.readRoot(harness.root.recordId))?.lifecycle.commencedAtMs,
+    ).not.toBeNull();
+    const finishIntent = substantiveIntent("finish-1", "result");
+    expect(
+      await harness.control.submitControllerIntent({
+        sessionBearer: opened.session.sessionBearer,
+        eventGameId: harness.root.eventGameId,
+        intent: finishIntent,
+      }),
+    ).toMatchObject({ status: "accepted" });
+    expect(
+      await harness.control.submitControllerIntent({
+        sessionBearer: opened.session.sessionBearer,
+        eventGameId: harness.root.eventGameId,
+        intent: finishIntent,
+      }),
+    ).toMatchObject({ status: "duplicate-accepted" });
+    expect(
+      await harness.control.submitControllerIntent({
+        sessionBearer: opened.session.sessionBearer,
+        eventGameId: harness.root.eventGameId,
+        intent: substantiveIntent("post-finish", "card"),
+      }),
+    ).toMatchObject({ status: "rejected" });
+    expect(
+      (await ownerState(harness)).grantSessions.find(
+        (session) => session.sessionId === opened.session.grantSessionId,
+      )?.stayedOnEventGameId,
+    ).toBeNull();
+    expect(
+      await harness.control.revealControllerQr({
+        sessionBearer: opened.session.sessionBearer,
+        eventGameId: harness.root.eventGameId,
+      }),
+    ).toEqual({ status: "rejected", message: "Unable to reveal the active Control Grant QR." });
+    expect(
+      await harness.control.leaveController({ sessionBearer: opened.session.sessionBearer }),
+    ).toEqual({
+      status: "left",
+    });
+    expect(
+      await harness.control.submitControllerIntent({
+        sessionBearer: opened.session.sessionBearer,
+        eventGameId: harness.root.eventGameId,
+        intent: simpleIntent("after-leave", "undo"),
+      }),
+    ).toMatchObject({ status: "rejected" });
+  });
+
+  test("returns a pre-commencement switch prompt and pins a commenced session", async () => {
+    const harness = await createHarness();
+    const opened = await harness.control.openController({
+      qrCredential: harness.qrCredential,
+      browserContext: "switch-boundary",
+    });
+    if (opened.status !== "opened") throw new Error("Expected the Controller to open.");
+
+    harness.setSessionResolution({
+      status: "switchable",
+      previousEventGameId: harness.root.eventGameId,
+      currentEventGameId: "game-reassigned",
+    });
+    const prompt = await harness.control.refreshController({
+      sessionBearer: opened.session.sessionBearer,
+      eventGameId: harness.root.eventGameId,
+    });
+    expect(prompt).toMatchObject({
+      status: "switch-required",
+      previousEventGameId: harness.root.eventGameId,
+      currentEventGameId: "game-reassigned",
+    });
+    expect(
+      await harness.control.revealControllerQr({
+        sessionBearer: opened.session.sessionBearer,
+        eventGameId: harness.root.eventGameId,
+      }),
+    ).toMatchObject({ status: "rejected" });
+    expect(
+      (await ownerState(harness)).grantSessions.find(
+        (session) => session.sessionId === opened.session.grantSessionId,
+      )?.stayedOnEventGameId,
+    ).toBeNull();
+    expect(
+      await harness.control.stayController({
+        sessionBearer: opened.session.sessionBearer,
+        eventGameId: harness.root.eventGameId,
+      }),
+    ).toMatchObject({ status: "authorized", session: { eventGameId: harness.root.eventGameId } });
+    expect(
+      await harness.control.refreshController({
+        sessionBearer: opened.session.sessionBearer,
+        eventGameId: harness.root.eventGameId,
+      }),
+    ).toMatchObject({ status: "authorized", session: { eventGameId: harness.root.eventGameId } });
+    expect(
+      await harness.control.switchController({ sessionBearer: opened.session.sessionBearer }),
+    ).toMatchObject({ status: "authorized" });
   });
 
   test("authorizes the Controller session before inspecting untrusted intent content", async () => {
@@ -361,6 +598,28 @@ describe("Live Event Game control", () => {
     });
   });
 
+  test("atomically rolls back the action and commencement at the lifecycle boundary", async () => {
+    const harness = await createHarness({ failureBoundary: "after-lifecycle" });
+    const opened = await harness.control.openController({
+      qrCredential: harness.qrCredential,
+      browserContext: "controller-phone",
+    });
+    if (opened.status !== "opened") throw new Error("Expected the Controller to open.");
+
+    expect(
+      await harness.control.submitControllerIntent({
+        sessionBearer: opened.session.sessionBearer,
+        eventGameId: harness.root.eventGameId,
+        intent: substantiveIntent("atomic-card", "card"),
+      }),
+    ).toMatchObject({ status: "retryable" });
+    expect(await harness.record.readActions()).toHaveLength(0);
+    expect((await harness.record.readRoot(harness.root.recordId))?.lifecycle).toMatchObject({
+      phase: "scheduled",
+      commencedAtMs: null,
+    });
+  });
+
   test("assigns trusted occurrence time at the server seam and leaves Ad Hoc commands separate", async () => {
     expect(
       parseLiveEventControllerIntent({
@@ -484,6 +743,35 @@ describe("Live Event Game control", () => {
     };
     expect(opened.session.sessionBearer).toBeString();
 
+    const refreshResponse = await transport.refreshController(
+      new Request("https://timer.quadball.app/api/event-control/refresh", {
+        method: "POST",
+        headers: { origin: allowedOrigin, host: "timer.quadball.app" },
+        body: JSON.stringify({
+          sessionBearer: opened.session.sessionBearer,
+          eventGameId: opened.eventGameId,
+        }),
+      }),
+    );
+    expect(refreshResponse.status).toBe(200);
+    expect(await refreshResponse.json()).toMatchObject({ status: "authorized" });
+
+    const revealResponse = await transport.revealControllerQr(
+      new Request("https://timer.quadball.app/api/event-control/reveal-qr", {
+        method: "POST",
+        headers: { origin: allowedOrigin, host: "timer.quadball.app" },
+        body: JSON.stringify({
+          sessionBearer: opened.session.sessionBearer,
+          eventGameId: opened.eventGameId,
+        }),
+      }),
+    );
+    expect(revealResponse.status).toBe(200);
+    expect(await revealResponse.json()).toMatchObject({
+      status: "revealed",
+      qrCredential: harness.qrCredential,
+    });
+
     const actionResponse = await transport.submitControllerIntent(
       new Request("https://timer.quadball.app/api/event-control/intent", {
         method: "POST",
@@ -510,6 +798,16 @@ describe("Live Event Game control", () => {
       }),
     );
     expect(rejectedAction.status).toBe(404);
+
+    const leaveResponse = await transport.leaveController(
+      new Request("https://timer.quadball.app/api/event-control/leave", {
+        method: "POST",
+        headers: { origin: allowedOrigin, host: "timer.quadball.app" },
+        body: JSON.stringify({ sessionBearer: opened.session.sessionBearer }),
+      }),
+    );
+    expect(leaveResponse.status).toBe(200);
+    expect(await leaveResponse.json()).toEqual({ status: "left" });
   });
 });
 
@@ -518,13 +816,15 @@ async function createHarness(
     eventGameId?: string;
     grantEventGameId?: string;
     grantExpiresAtMs?: number | null;
-    failureBoundary?: "after-action";
+    failureBoundary?: "after-action" | "after-lifecycle";
     projectionFailure?: () => boolean;
     scopeStatus?: "empty" | "conflict";
     controlClock?: () => number;
+    sessionResolution?: ControlGrantSessionResolution;
   } = {},
 ) {
   const root = createRoot(overrides.eventGameId ?? "game-live-control");
+  const reassignedRoot = createRoot("game-reassigned", "reassigned");
   const storage = createInMemoryFoundationStorage();
   const grantOptions = createGrantOptions(overrides.grantEventGameId ?? root.eventGameId);
   const authority = createTypedGrantAuthority(storage, grantOptions);
@@ -540,6 +840,8 @@ async function createHarness(
   });
   if (admitted.status !== "admitted") throw new Error("Expected a Grant Session.");
   if (overrides.scopeStatus !== undefined) grantOptions.setScopeStatus(overrides.scopeStatus);
+  if (overrides.sessionResolution !== undefined)
+    grantOptions.setSessionResolution(overrides.sessionResolution);
 
   let failureBoundary = overrides.failureBoundary;
   const record = createEventGameRecord(storage, {
@@ -550,6 +852,15 @@ async function createHarness(
   });
   if ((await record.registerRoot(root)).status !== "registered") {
     throw new Error("Expected the Event Game Record root to register.");
+  }
+  const reassignedRecord = createEventGameRecord(storage, {
+    externalScopeResolver: createScopeResolver(reassignedRoot),
+    interpreter: createLiveEventGameIqaInterpreter(),
+    clock: () => grantOptions.clock.nowMs(),
+    auditAuthorityVerifier: { verify: () => true },
+  });
+  if ((await reassignedRecord.registerRoot(reassignedRoot)).status !== "registered") {
+    throw new Error("Expected the reassigned Event Game Record root to register.");
   }
   const acceptance = createFoundationAcceptance(storage, {
     grant: grantOptions,
@@ -562,7 +873,11 @@ async function createHarness(
   });
   const control = createLiveEventGameControl({
     resolveEventGameRecord: async (eventGameId) =>
-      eventGameId === root.eventGameId ? { recordId: root.recordId, record } : null,
+      eventGameId === root.eventGameId
+        ? { recordId: root.recordId, record }
+        : eventGameId === reassignedRoot.eventGameId
+          ? { recordId: reassignedRoot.recordId, record: reassignedRecord }
+          : null,
     acceptance,
     grantAuthority: authority,
     clock: overrides.controlClock ?? (() => grantOptions.clock.nowMs()),
@@ -586,6 +901,9 @@ async function createHarness(
     setScopeEventGameId(value: string) {
       grantOptions.setScopeEventGameId(value);
     },
+    setSessionResolution(value: ControlGrantSessionResolution | undefined) {
+      grantOptions.setSessionResolution(value);
+    },
   };
 }
 
@@ -601,10 +919,49 @@ function goalIntent(overrides: { gameSideId?: string } = {}) {
   };
 }
 
+function clockIntent(operationId: string, running: boolean) {
+  return {
+    version: LIVE_EVENT_CONTROL_INTENT_VERSION,
+    type: "clock" as const,
+    operationId,
+    factId: `fact-${operationId}`,
+    running,
+    gameTimeMs: 0,
+    occurrence: { clientOriginAtMs: null },
+  };
+}
+
+function substantiveIntent(
+  operationId: string,
+  trigger: "card" | "timeout" | "suspension" | "result",
+) {
+  return {
+    version: LIVE_EVENT_CONTROL_INTENT_VERSION,
+    type: "substantive" as const,
+    trigger,
+    operationId,
+    factId: `fact-${operationId}`,
+    gameTimeMs: 0,
+    occurrence: { clientOriginAtMs: null },
+  };
+}
+
+function simpleIntent(operationId: string, type: "reset" | "undo") {
+  return {
+    version: LIVE_EVENT_CONTROL_INTENT_VERSION,
+    type,
+    operationId,
+    factId: `fact-${operationId}`,
+    gameTimeMs: 0,
+    occurrence: { clientOriginAtMs: null },
+  } as const;
+}
+
 type TestGrantOptions = GrantAuthorityOptions & {
   setNow: (value: number) => void;
   setScopeStatus: (value: "empty" | "conflict" | undefined) => void;
   setScopeEventGameId: (value: string) => void;
+  setSessionResolution: (value: ControlGrantSessionResolution | undefined) => void;
 };
 
 function createGrantOptions(eventGameId: string): TestGrantOptions {
@@ -612,6 +969,7 @@ function createGrantOptions(eventGameId: string): TestGrantOptions {
   let nowMs = 10_000;
   let scopeStatus: "empty" | "conflict" | undefined;
   let resolvedEventGameId = eventGameId;
+  let sessionResolution: ControlGrantSessionResolution | undefined;
   return {
     environmentId: "live-control-test",
     clock: { nowMs: () => nowMs },
@@ -627,6 +985,11 @@ function createGrantOptions(eventGameId: string): TestGrantOptions {
         scopeStatus === undefined
           ? { status: "eligible", eventGameId: resolvedEventGameId }
           : { status: scopeStatus },
+      resolveSession: (_scope, sessionEventGameId) =>
+        sessionResolution ??
+        (sessionEventGameId === resolvedEventGameId
+          ? { status: "current", eventGameId: resolvedEventGameId }
+          : { status: "mismatch" }),
     },
     privilegedAuthorityVerifier: createGrantTestAuthorityVerifier(),
     setNow(value: number) {
@@ -637,6 +1000,9 @@ function createGrantOptions(eventGameId: string): TestGrantOptions {
     },
     setScopeEventGameId(value) {
       resolvedEventGameId = value;
+    },
+    setSessionResolution(value) {
+      sessionResolution = value;
     },
   };
 }
@@ -663,7 +1029,7 @@ function bytes(start: number): Uint8Array {
   return Uint8Array.from({ length: 32 }, (_, index) => start + index);
 }
 
-function createRoot(eventGameId: string): EventGameRecordRoot {
+function createRoot(eventGameId: string, sideSuffix = ""): EventGameRecordRoot {
   return {
     recordId: `record-${eventGameId}`,
     eventId: "event-live-control",
@@ -676,8 +1042,16 @@ function createRoot(eventGameId: string): EventGameRecordRoot {
       pitchSlotId: `slot-${eventGameId}`,
     },
     gameSides: [
-      { id: "side-a", eventTeamId: "team-a", teamInterpretationRef: "team-a-v1" },
-      { id: "side-b", eventTeamId: "team-b", teamInterpretationRef: "team-b-v1" },
+      {
+        id: `side-a${sideSuffix}`,
+        eventTeamId: `team-a${sideSuffix}`,
+        teamInterpretationRef: `team-a${sideSuffix}-v1`,
+      },
+      {
+        id: `side-b${sideSuffix}`,
+        eventTeamId: `team-b${sideSuffix}`,
+        teamInterpretationRef: `team-b${sideSuffix}-v1`,
+      },
     ],
     lifecycle: {
       phase: "scheduled",

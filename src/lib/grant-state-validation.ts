@@ -991,6 +991,9 @@ function validateSession(
     !validateOpaqueIdentifier(session.grantId, "session.grantId").ok ||
     !validateOpaqueIdentifier(session.grantVersion, "session.grantVersion").ok ||
     !validateOpaqueIdentifier(session.eventGameId, "session.eventGameId").ok ||
+    (session.stayedOnEventGameId !== undefined &&
+      session.stayedOnEventGameId !== null &&
+      !validateOpaqueIdentifier(session.stayedOnEventGameId, "session.stayedOnEventGameId").ok) ||
     session.browserContextKeyVersion.length === 0 ||
     !isStoredGrantSessionStatus(session.status) ||
     !Number.isSafeInteger(session.createdAtMs) ||

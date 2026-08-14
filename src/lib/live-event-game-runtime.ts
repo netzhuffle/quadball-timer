@@ -14,6 +14,14 @@ import { createTypedGrantAuthority } from "@/lib/grant-management";
 import type { GrantAuthorityOptions } from "@/lib/grant-authority";
 import type { GrantKeyRing } from "@/lib/grant-types";
 import type { EventGameRecordRoot } from "@/lib/foundation-record-types";
+import {
+  canonicalizeEventGameRecordRoot,
+  validateEventGameRecordRoot,
+} from "@/lib/foundation-record-types";
+import type {
+  FoundationStorageSnapshot,
+  FoundationStorageTransaction,
+} from "@/lib/foundation-storage";
 
 export type LiveEventGameRuntime = {
   control: ReturnType<typeof createLiveEventGameControl>;
@@ -106,16 +114,20 @@ function createGrantOptions(
     clock: { nowMs: clock },
     randomness: { bytes: (length) => new Uint8Array(randomBytes(length)) },
     keyRing,
-    controlScopeResolver: createControlScopeResolver(),
+    controlScopeResolver: createControlScopeResolver(clock),
     privilegedAuthorityVerifier: { verify: () => null },
   };
 }
 
-function createControlScopeResolver(): GrantAuthorityOptions["controlScopeResolver"] {
+export function createControlScopeResolver(
+  clock: () => number = () => Date.now(),
+): GrantAuthorityOptions["controlScopeResolver"] {
   return {
     resolve(scope, snapshot) {
       if (snapshot === undefined) return { status: "unavailable" };
-      const root = snapshot.findRootByPitchSlotId(scope.pitchSlotId);
+      const storedRoot = snapshot.findRootByPitchSlotId(scope.pitchSlotId);
+      const root =
+        storedRoot === null ? null : materializeCommencement(storedRoot, snapshot, clock());
       if (root === null) return { status: "empty" };
       if (
         root.externalScope.eventId !== scope.eventId ||
@@ -128,7 +140,94 @@ function createControlScopeResolver(): GrantAuthorityOptions["controlScopeResolv
       }
       return { status: "eligible", eventGameId: root.eventGameId };
     },
+    resolveSession(scope, sessionEventGameId, snapshot) {
+      if (snapshot === undefined) return { status: "unavailable" };
+      const storedCurrent = snapshot.findRootByPitchSlotId(scope.pitchSlotId);
+      const current =
+        storedCurrent === null ? null : materializeCommencement(storedCurrent, snapshot, clock());
+      if (current === null) return { status: "empty" };
+      if (
+        current.externalScope.eventId !== scope.eventId ||
+        current.externalScope.gameDayId !== scope.gameDayId ||
+        current.externalScope.pitchId !== scope.pitchId
+      )
+        return { status: "conflict" };
+      if (current.lifecycle.lockedAtMs !== null) {
+        return { status: "game-locked", eventGameId: current.eventGameId };
+      }
+      if (current.eventGameId === sessionEventGameId) {
+        return { status: "current", eventGameId: current.eventGameId };
+      }
+      const sessionRootValue = snapshot.findRootByEventGameId(sessionEventGameId);
+      const sessionRoot =
+        sessionRootValue === null
+          ? null
+          : materializeCommencement(sessionRootValue, snapshot, clock());
+      return sessionRoot !== null && sessionRoot.lifecycle.commencedAtMs !== null
+        ? {
+            status: "pinned",
+            sessionEventGameId,
+            currentEventGameId: current.eventGameId,
+          }
+        : {
+            status: "switchable",
+            previousEventGameId: sessionEventGameId,
+            currentEventGameId: current.eventGameId,
+          };
+    },
   };
+}
+
+function materializeCommencement(
+  root: EventGameRecordRoot,
+  snapshot: FoundationStorageSnapshot,
+  nowMs: number,
+): EventGameRecordRoot {
+  if (root.lifecycle.phase !== "scheduled" || root.lifecycle.commencedAtMs !== null) return root;
+  if (typeof snapshot.listActions !== "function") return root;
+  const runningSinceMs = latestRunningClockStart(snapshot.listActions(root.recordId));
+  if (runningSinceMs === null || nowMs < runningSinceMs + 10_000) return root;
+  const candidate = {
+    ...root,
+    lifecycle: {
+      ...root.lifecycle,
+      phase: "in-progress" as const,
+      commencedAtMs: runningSinceMs + 10_000,
+    },
+  };
+  const validated = validateEventGameRecordRoot(candidate);
+  if (!validated.ok) return root;
+  const transaction = snapshot as FoundationStorageTransaction;
+  if (typeof transaction.updateRoot === "function") {
+    transaction.updateRoot({
+      root: validated.value,
+      canonicalContent: canonicalizeEventGameRecordRoot(validated.value),
+    });
+  }
+  return validated.value;
+}
+
+function latestRunningClockStart(
+  actions: readonly { action: { interpretation: unknown } }[],
+): number | null {
+  for (const stored of [...actions].reverse()) {
+    const interpretation = stored.action.interpretation;
+    if (
+      !isRecord(interpretation) ||
+      interpretation.type !== "fact" ||
+      interpretation.factType !== "clock"
+    )
+      continue;
+    const payload = interpretation.payload;
+    if (!isRecord(payload) || !isRecord(payload.data)) return null;
+    if (payload.data.running !== true) return null;
+    return typeof payload.data.startedAtMs === "number" ? payload.data.startedAtMs : null;
+  }
+  return null;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function createExternalScopeResolver(): ExternalScopeResolver {

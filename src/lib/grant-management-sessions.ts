@@ -128,6 +128,7 @@ export async function admitGrant(
         grantId: current.grantId,
         grantVersion: current.grantVersion,
         eventGameId: eventGameId ?? "grant-management",
+        stayedOnEventGameId: null,
         browserContextDigest: contextDigest,
         browserContextKeyVersion: lookupVersion,
         bearerMaterialState: "present",
@@ -217,7 +218,7 @@ export function authorizeGrantInTransaction(
     readOnly?: boolean;
   },
 ): TypedGrantAuthorization {
-  const session = findSessionByBearer(transaction, options, input.sessionBearer);
+  let session = findSessionByBearer(transaction, options, input.sessionBearer);
   if (session === null) return GENERIC_GRANT_AUTHORIZATION_FAILURE;
   const stored = transaction.findGrantById(session.grantId);
   if (stored === null) return GENERIC_GRANT_AUTHORIZATION_FAILURE;
@@ -264,6 +265,19 @@ export function authorizeGrantInTransaction(
     if (relationship.status === "switchable") {
       if (
         input.controlSessionDecision === "stay" &&
+        input.eventGameId === relationship.previousEventGameId &&
+        !input.readOnly
+      ) {
+        session = {
+          ...session,
+          stayedOnEventGameId: relationship.currentEventGameId,
+        };
+        transaction.updateGrantSession({
+          ...session,
+        });
+        eventGameId = relationship.previousEventGameId;
+      } else if (
+        session.stayedOnEventGameId === relationship.currentEventGameId &&
         input.eventGameId === relationship.previousEventGameId
       ) {
         eventGameId = relationship.previousEventGameId;
@@ -341,6 +355,7 @@ export async function acceptControlGrantSessionSwitch(
       transaction.updateGrantSession({
         ...session,
         eventGameId: relationship.currentEventGameId,
+        stayedOnEventGameId: null,
         lastActiveAtMs: nowMs,
       });
       transaction.appendGrantAudit(
@@ -597,7 +612,11 @@ function resolveControlSession(
   sessionEventGameId: string,
 ): ControlGrantSessionResolution {
   if (options.controlScopeResolver.resolveSession !== undefined) {
-    const resolved = options.controlScopeResolver.resolveSession(scope, sessionEventGameId);
+    const resolved = options.controlScopeResolver.resolveSession(
+      scope,
+      sessionEventGameId,
+      transaction,
+    );
     if (resolved.status === "current")
       return resolved.eventGameId === sessionEventGameId &&
         validateOpaqueIdentifier(resolved.eventGameId, "eventGameId").ok

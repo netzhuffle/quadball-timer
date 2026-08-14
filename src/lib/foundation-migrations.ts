@@ -1552,6 +1552,11 @@ const FOUNDATION_EVENT_CATALOG_MIGRATION_SQL = `
   ${FOUNDATION_EVENT_CATALOG_AUDIT_EVENT_INDEX_SQL};
 `;
 
+const FOUNDATION_CONTROL_SESSION_STAY_MIGRATION_SQL = `
+  ALTER TABLE foundation_grant_sessions
+    ADD COLUMN stayed_on_event_game_id TEXT;
+`;
+
 export const FOUNDATION_MIGRATIONS: readonly FoundationMigration[] = Object.freeze([
   createMigration({
     id: "001-foundation-event-game-record-roots",
@@ -1678,6 +1683,12 @@ export const FOUNDATION_MIGRATIONS: readonly FoundationMigration[] = Object.free
     ordinal: 21,
     schemaVersion: 21,
     sql: FOUNDATION_GRANT_CODE_LOCK_MIGRATION_SQL,
+  }),
+  createMigration({
+    id: "022-control-session-stay-binding",
+    ordinal: 22,
+    schemaVersion: 22,
+    sql: FOUNDATION_CONTROL_SESSION_STAY_MIGRATION_SQL,
   }),
 ]);
 
