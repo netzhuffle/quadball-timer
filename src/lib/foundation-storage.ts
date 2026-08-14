@@ -61,6 +61,31 @@ export const REQUIRED_GRANT_STORAGE_ANCHOR_METHODS = Object.freeze([
   "writeGrantAdmissionStateAnchor",
 ] as const);
 
+export const EVENT_CATALOG_STORAGE_CAPABILITY_NAME = "event-catalog-storage" as const;
+export const EVENT_CATALOG_STORAGE_CAPABILITY_VERSION = 1 as const;
+export const EVENT_CATALOG_STORAGE_CAPABILITY_IMPLEMENTATION =
+  "event-teams-rosters-pitches-transaction-v1" as const;
+export type EventCatalogStorageCapability = {
+  name: typeof EVENT_CATALOG_STORAGE_CAPABILITY_NAME;
+  version: typeof EVENT_CATALOG_STORAGE_CAPABILITY_VERSION;
+  implementation: typeof EVENT_CATALOG_STORAGE_CAPABILITY_IMPLEMENTATION;
+  transaction: readonly string[];
+};
+export const REQUIRED_EVENT_CATALOG_STORAGE_TRANSACTION_METHODS = Object.freeze([
+  "findEventTeam",
+  "listEventTeams",
+  "listRoster",
+  "findRosterEntry",
+  "findPitch",
+  "listPitches",
+  "insertEventTeam",
+  "updateEventTeam",
+  "insertRosterEntry",
+  "updateRosterEntry",
+  "insertPitch",
+  "updatePitch",
+] as const);
+
 export const DURABLE_EVIDENCE_PROVENANCE = Symbol("durable-evidence-provenance");
 
 export type StoredControlAction = {
@@ -105,6 +130,33 @@ export type StoredEventCatalogGameDay = {
   updatedAtMs: number;
 };
 
+export type StoredEventCatalogTeam = {
+  eventTeamId: string;
+  eventId: string;
+  name: string;
+  defaultColor: string;
+  createdAtMs: number;
+  updatedAtMs: number;
+};
+
+export type StoredEventCatalogRosterEntry = {
+  rosterEntryId: string;
+  eventId: string;
+  eventTeamId: string;
+  playerNumber: number;
+  publicName: string;
+  createdAtMs: number;
+  updatedAtMs: number;
+};
+
+export type StoredEventCatalogPitch = {
+  pitchId: string;
+  eventId: string;
+  name: string;
+  createdAtMs: number;
+  updatedAtMs: number;
+};
+
 export type EventCatalogAuditEntry = {
   auditId: string;
   operationId: string;
@@ -114,7 +166,12 @@ export type EventCatalogAuditEntry = {
     | "event-removed"
     | "game-day-added"
     | "game-day-updated"
-    | "game-day-removed";
+    | "game-day-removed"
+    | "event-team-created"
+    | "event-team-updated"
+    | "roster-updated"
+    | "pitch-created"
+    | "pitch-updated";
   eventId: string;
   gameDayId: string | null;
   actorReference: string;
@@ -309,6 +366,12 @@ export type FoundationStorageSnapshot = {
   findEvent(eventId: string): StoredEventCatalogEvent | null;
   listEvents(): StoredEventCatalogEvent[];
   listGameDays(eventId: string): StoredEventCatalogGameDay[];
+  findEventTeam(eventTeamId: string): StoredEventCatalogTeam | null;
+  listEventTeams(eventId: string): StoredEventCatalogTeam[];
+  listRoster(eventTeamId: string): StoredEventCatalogRosterEntry[];
+  findRosterEntry(eventTeamId: string, playerNumber: number): StoredEventCatalogRosterEntry | null;
+  findPitch(pitchId: string): StoredEventCatalogPitch | null;
+  listPitches(eventId: string): StoredEventCatalogPitch[];
   listEventAuditTrail(eventId: string): EventCatalogAuditEntry[];
   readGrantAdmissionTelemetry?(
     mode: GrantAdmissionMode,
@@ -347,6 +410,12 @@ export type FoundationStorageTransaction = FoundationStorageSnapshot & {
   insertGameDay(gameDay: StoredEventCatalogGameDay): void;
   updateGameDay(gameDay: StoredEventCatalogGameDay): void;
   deleteGameDay(gameDayId: string): void;
+  insertEventTeam(team: StoredEventCatalogTeam): void;
+  updateEventTeam(team: StoredEventCatalogTeam): void;
+  insertRosterEntry(entry: StoredEventCatalogRosterEntry): void;
+  updateRosterEntry(entry: StoredEventCatalogRosterEntry): void;
+  insertPitch(pitch: StoredEventCatalogPitch): void;
+  updatePitch(pitch: StoredEventCatalogPitch): void;
   appendEventAudit(entry: EventCatalogAuditEntry): void;
   writeGrantAdmissionTelemetry?(value: GrantAdmissionTelemetry): void;
   writeGrantAdmissionGlobalWindow?(value: GrantAdmissionGlobalWindow): void;
@@ -356,6 +425,38 @@ export type FoundationStorageTransaction = FoundationStorageSnapshot & {
 };
 
 export type FoundationStorageTransactionWork<T> = (transaction: FoundationStorageTransaction) => T;
+
+export type CatalogCapableFoundationStorage = FoundationStorage & {
+  eventCatalogStorageCapability(): EventCatalogStorageCapability;
+};
+
+export class FoundationEventCatalogCapabilityError extends Error {
+  constructor() {
+    super("Foundation storage does not implement the Event Catalog contract.");
+    this.name = "FoundationEventCatalogCapabilityError";
+  }
+}
+
+export function assertEventCatalogStorageCapability(
+  capability: EventCatalogStorageCapability,
+): void {
+  if (
+    capability.name !== EVENT_CATALOG_STORAGE_CAPABILITY_NAME ||
+    capability.version !== EVENT_CATALOG_STORAGE_CAPABILITY_VERSION ||
+    capability.implementation !== EVENT_CATALOG_STORAGE_CAPABILITY_IMPLEMENTATION ||
+    !sameMethods(capability.transaction, REQUIRED_EVENT_CATALOG_STORAGE_TRANSACTION_METHODS)
+  ) {
+    throw new FoundationEventCatalogCapabilityError();
+  }
+}
+
+export function requireEventCatalogStorageCapabilities(
+  storage: FoundationStorage,
+): asserts storage is CatalogCapableFoundationStorage {
+  if (typeof storage.eventCatalogStorageCapability !== "function")
+    throw new FoundationEventCatalogCapabilityError();
+  assertEventCatalogStorageCapability(storage.eventCatalogStorageCapability());
+}
 
 /** The storage surface required by the Grant-Code authority. */
 export type GrantStorageTransaction = FoundationStorageTransaction & {
@@ -445,6 +546,7 @@ export interface FoundationStorage {
   /** Configure the environment and key material required for deep Grant validation. */
   setGrantValidationContext?(context: GrantStateValidationContext): void;
   grantStorageCapability?(): GrantStorageCapability;
+  eventCatalogStorageCapability?(): EventCatalogStorageCapability;
   close(): void;
 }
 
@@ -472,6 +574,12 @@ export type FoundationStorageConstraint =
   | "event-id"
   | "game-day-id"
   | "game-day-date"
+  | "event-team-id"
+  | "event-team-name"
+  | "roster-entry-id"
+  | "roster-player-number"
+  | "pitch-id"
+  | "pitch-name"
   | "event-audit-id"
   | "event-operation-id"
   | "grant-code-digest";
