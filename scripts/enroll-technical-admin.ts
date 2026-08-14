@@ -3,11 +3,11 @@ import {
   createSqliteTechnicalAdminAuthRepository,
   createTechnicalAdminAuth,
 } from "@/lib/technical-admin-auth";
-import { readTechnicalAdminConfig } from "@/lib/technical-admin-config";
+import { readRuntimeConfig } from "@/lib/runtime-config";
 
-const config = readTechnicalAdminConfig();
+const { technicalAdmin: config, storagePaths } = readRuntimeConfig();
 const { environment } = config;
-const databasePath = config.databasePath ?? `data/${environment}/technical-admin.sqlite`;
+const databasePath = storagePaths.technicalAdminDatabase;
 
 const repository = createSqliteTechnicalAdminAuthRepository(databasePath, {
   environment,

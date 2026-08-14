@@ -31,7 +31,7 @@ import {
   type TechnicalAdminAuth,
   type TechnicalAdminAuthority,
 } from "@/lib/technical-admin-auth";
-import { readTechnicalAdminConfig } from "@/lib/technical-admin-config";
+import { readRuntimeConfig } from "@/lib/runtime-config";
 import {
   createEventCatalog,
   createFoundationEventCatalogStorage,
@@ -103,8 +103,8 @@ async function startServer() {
 
   try {
     const port = Number(process.env.PORT ?? 3000);
-    const technicalAdminConfig = readTechnicalAdminConfig();
-    const { environment, storagePaths } = technicalAdminConfig;
+    const { technicalAdmin: technicalAdminConfig, storagePaths } = readRuntimeConfig();
+    const { environment } = technicalAdminConfig;
     assertProductionStateBoundary(environment, storagePaths);
     const databasePath = storagePaths.technicalAdminDatabase;
     technicalAdminRepository = createSqliteTechnicalAdminAuthRepository(databasePath, {

@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 describe("server startup", () => {
-  test("starts the production runtime from a read-only release with explicit Test state", async () => {
+  test("starts from a read-only release while an unready Foundation leaves health available", async () => {
     const root = await mkdtemp(join(tmpdir(), "quadball-timer-startup-"));
     const releaseDirectory = join(root, "release");
     const stateDirectory = join(root, "state");
@@ -41,6 +41,40 @@ describe("server startup", () => {
       server.kill();
       await server.exited;
       await chmod(releaseDirectory, 0o750);
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps unrelated routes available when Foundation storage cannot be opened", async () => {
+    const root = await mkdtemp(join(tmpdir(), "quadball-timer-startup-"));
+    const stateDirectory = join(root, "state");
+    await mkdir(stateDirectory, { mode: 0o750 });
+    const server = Bun.spawn([process.execPath, "run", join(process.cwd(), "src/index.ts")], {
+      cwd: root,
+      env: {
+        NODE_ENV: "production",
+        QUADBALL_ENVIRONMENT: "test",
+        PUBLIC_ORIGIN: "https://localhost.test",
+        TECHNICAL_ADMIN_DATABASE: join(stateDirectory, "technical-admin.sqlite"),
+        FOUNDATION_DATABASE: join(root, "absent", "foundation.sqlite"),
+        HOST: "127.0.0.1",
+        PORT: "0",
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+
+    try {
+      const serverUrl = await readServerUrl(server.stdout);
+      const health = await fetch(new URL("/internal/healthz", serverUrl), {
+        headers: { host: serverUrl.host },
+      });
+      const games = await fetch(new URL("/api/games", serverUrl));
+      expect(health.status).toBe(200);
+      expect(games.status).toBe(200);
+    } finally {
+      server.kill();
+      await server.exited;
       await rm(root, { recursive: true, force: true });
     }
   });

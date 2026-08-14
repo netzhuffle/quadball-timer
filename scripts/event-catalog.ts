@@ -11,7 +11,7 @@ import {
   createTechnicalAdminAuth,
   type TechnicalAdminAuthority,
 } from "@/lib/technical-admin-auth";
-import { readTechnicalAdminConfig } from "@/lib/technical-admin-config";
+import { readRuntimeConfig } from "@/lib/runtime-config";
 
 const args = process.argv.slice(2);
 const databasePath = option("--db") ?? process.env.EVENT_CATALOG_DATABASE?.trim() ?? null;
@@ -43,7 +43,7 @@ try {
   if (!readiness.ok) throw new FoundationStorageNotReadyError(readiness);
   const catalog = createEventCatalog(createFoundationEventCatalogStorage(foundationStorage), {});
   hostAuth = createTechnicalAdminAuth(
-    readTechnicalAdminConfig(),
+    readRuntimeConfig().technicalAdmin,
     new MemoryTechnicalAdminAuthRepository(),
   );
   const result = await run(catalog, command, hostAuth);

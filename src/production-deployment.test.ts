@@ -44,7 +44,15 @@ describe("Production deployment contract", () => {
     const activation = readFileSync(join(repositoryRoot, "deploy/activate-release.sh"), "utf8");
 
     expect(activation).toContain("check_service_state_contract");
-    expect(activation).toContain("missing required Production state configuration");
+    expect(activation).toContain(
+      'systemctl show "$service_name" --property=StateDirectory --value',
+    );
+    expect(activation).toContain(
+      'systemctl show "$service_name" --property=StateDirectoryMode --value',
+    );
+    expect(activation).toContain('systemctl show "$service_name" --property=Environment --value');
+    expect(activation).not.toContain('systemctl cat "$service_name"');
+    expect(activation).toContain("does not provide the required Production state contract");
     expect(activation).toContain(
       "Install ${release_dir}/deploy/systemd/quadball-timer.service and run systemctl daemon-reload before activation.",
     );

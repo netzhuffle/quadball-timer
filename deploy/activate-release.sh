@@ -92,21 +92,22 @@ if [[ "$actual_exec_start" != *"$expected_exec_start"* ]]; then
 fi
 
 check_service_state_contract() {
-  local installed_unit
-  local required_directive
-  installed_unit="$(systemctl cat "$service_name" --no-pager 2>/dev/null || true)"
-  for required_directive in \
-    "StateDirectory=quadball-timer" \
-    "StateDirectoryMode=0750" \
-    "Environment=TECHNICAL_ADMIN_DATABASE=/var/lib/quadball-timer/technical-admin.sqlite" \
-    "Environment=FOUNDATION_DATABASE=/var/lib/quadball-timer/foundation.sqlite"
-  do
-    if ! grep -Fqx "$required_directive" <<<"$installed_unit"; then
-      echo "Systemd service ${service_name} is missing required Production state configuration: ${required_directive}" >&2
-      echo "Install ${release_dir}/deploy/systemd/quadball-timer.service and run systemctl daemon-reload before activation." >&2
-      return 1
-    fi
-  done
+  local effective_environment
+  local effective_state_directory
+  local effective_state_directory_mode
+  effective_state_directory="$(systemctl show "$service_name" --property=StateDirectory --value 2>/dev/null || true)"
+  effective_state_directory_mode="$(systemctl show "$service_name" --property=StateDirectoryMode --value 2>/dev/null || true)"
+  effective_environment="$(systemctl show "$service_name" --property=Environment --value 2>/dev/null || true)"
+
+  if [[ "$effective_state_directory" != "quadball-timer" ]] ||
+    [[ "$effective_state_directory_mode" != "0750" ]] ||
+    [[ " $effective_environment " != *" TECHNICAL_ADMIN_DATABASE=/var/lib/quadball-timer/technical-admin.sqlite "* ]] ||
+    [[ " $effective_environment " != *" FOUNDATION_DATABASE=/var/lib/quadball-timer/foundation.sqlite "* ]]
+  then
+    echo "Systemd service ${service_name} does not provide the required Production state contract." >&2
+    echo "Install ${release_dir}/deploy/systemd/quadball-timer.service and run systemctl daemon-reload before activation." >&2
+    return 1
+  fi
 }
 
 if ! check_service_state_contract; then
