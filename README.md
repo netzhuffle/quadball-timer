@@ -42,6 +42,12 @@ deploy-quadball-timer ALL=NOPASSWD: /bin/systemctl restart quadball-timer
 The app itself binds to `127.0.0.1:3000`; public HTTPS and WebSocket traffic is
 terminated by Caddy and proxied to that localhost backend.
 
+Production state is separate from immutable releases. The systemd unit owns the
+private `/var/lib/quadball-timer` state directory. Technical Admin authority is
+stored in `technical-admin.sqlite`, while Event administration foundation data
+uses the separate `foundation.sqlite` file. Activation fails before switching a
+release when the installed unit does not provide this state contract.
+
 Pushes to `main` skip CI and deployment when every changed path is limited to
 `AGENTS.md`, `CONTEXT.md`, `README.md`, `docs/`, or `.github/dependabot.yml`.
 Files under `docs/` are also excluded from formatting, linting, and type-aware
