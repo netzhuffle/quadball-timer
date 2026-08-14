@@ -234,6 +234,31 @@ try {
   await eventAdminGameDaySelector.selectOption({ index: 2 });
   const secondSelectedGameDay = await expectSelectValue(eventAdminGameDaySelector, 2);
   assert(firstSelectedGameDay !== secondSelectedGameDay, "Game Day selector reused one option");
+  await eventAdminPage.getByLabel("New Event Team name").fill("Blue");
+  await eventAdminPage.getByRole("button", { name: "Add Team" }).click();
+  await eventAdminPage.getByText("Blue", { exact: true }).first().waitFor();
+  await eventAdminPage.getByLabel("Event Team Blue name").fill("Blue Updated");
+  await eventAdminPage.getByLabel("Event Team Blue color").fill("#123456");
+  await eventAdminPage.getByRole("button", { name: "Save Event Team" }).click();
+  await eventAdminPage.getByText("Blue Updated", { exact: true }).first().waitFor();
+  await expectValue(eventAdminPage.getByLabel("Event Team Blue Updated color"), "#123456");
+  await eventAdminPage.getByLabel("Roster Event Team").selectOption({ label: "Blue Updated" });
+  await eventAdminPage.getByLabel("Player number").fill("7");
+  await eventAdminPage.getByLabel("Player public name").fill("Player Seven");
+  await eventAdminPage.getByRole("button", { name: "Save Roster" }).click();
+  await eventAdminPage.getByText("#7 Player Seven", { exact: true }).waitFor();
+  await eventAdminPage.getByLabel("New Pitch name").fill("Pitch One");
+  const createPitchResponsePromise = eventAdminPage.waitForResponse(
+    (response) =>
+      response.url().includes(`/api/event-admin/events/${eventId}/pitches`) &&
+      response.request().method() === "POST",
+  );
+  await eventAdminPage.getByRole("button", { name: "Add Pitch" }).click();
+  assert((await createPitchResponsePromise).status() === 201, "Pitch creation failed");
+  await eventAdminPage.getByLabel("Pitch Pitch One name").waitFor();
+  await eventAdminPage.getByLabel("Pitch Pitch One name").fill("Pitch Main");
+  await eventAdminPage.getByRole("button", { name: "Save Pitch" }).click();
+  await eventAdminPage.getByLabel("Pitch Pitch Main name").waitFor();
   const sessionCookieBeforeRefresh = (await eventAdminContext.cookies()).find(
     (cookie) => cookie.name === "__Host-event-admin-session",
   );

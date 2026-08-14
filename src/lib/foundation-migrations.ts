@@ -1534,6 +1534,48 @@ export const FOUNDATION_EVENT_CATALOG_AUDIT_TABLE_SQL = `
   ) STRICT
 `;
 
+export const FOUNDATION_EVENT_CATALOG_AUDIT_TABLE_V2_SQL =
+  FOUNDATION_EVENT_CATALOG_AUDIT_TABLE_SQL.replace(
+    "'game-day-added', 'game-day-updated', 'game-day-removed'",
+    "'game-day-added', 'game-day-updated', 'game-day-removed', 'event-team-created', 'event-team-updated', 'roster-updated', 'pitch-created', 'pitch-updated'",
+  );
+
+export const FOUNDATION_EVENT_CATALOG_TEAMS_TABLE_SQL = `
+  CREATE TABLE foundation_event_catalog_teams (
+    event_team_id TEXT PRIMARY KEY,
+    event_id TEXT NOT NULL REFERENCES foundation_event_catalog_events(event_id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    default_color TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    UNIQUE (event_id, name)
+  ) STRICT
+`;
+
+export const FOUNDATION_EVENT_CATALOG_ROSTER_TABLE_SQL = `
+  CREATE TABLE foundation_event_catalog_roster (
+    roster_entry_id TEXT PRIMARY KEY,
+    event_id TEXT NOT NULL REFERENCES foundation_event_catalog_events(event_id) ON DELETE CASCADE,
+    event_team_id TEXT NOT NULL REFERENCES foundation_event_catalog_teams(event_team_id) ON DELETE CASCADE,
+    player_number INTEGER NOT NULL CHECK (player_number BETWEEN 0 AND 99),
+    public_name TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    UNIQUE (event_team_id, player_number)
+  ) STRICT
+`;
+
+export const FOUNDATION_EVENT_CATALOG_PITCHES_TABLE_SQL = `
+  CREATE TABLE foundation_event_catalog_pitches (
+    pitch_id TEXT PRIMARY KEY,
+    event_id TEXT NOT NULL REFERENCES foundation_event_catalog_events(event_id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    UNIQUE (event_id, name)
+  ) STRICT
+`;
+
 export const FOUNDATION_EVENT_CATALOG_GAME_DAYS_EVENT_INDEX_SQL = `
   CREATE INDEX foundation_event_catalog_game_days_event_id
     ON foundation_event_catalog_game_days (event_id, game_day_date)
@@ -1544,12 +1586,46 @@ export const FOUNDATION_EVENT_CATALOG_AUDIT_EVENT_INDEX_SQL = `
     ON foundation_event_catalog_audit (event_id, occurred_at_ms, audit_id)
 `;
 
+export const FOUNDATION_EVENT_CATALOG_ROSTER_TEAM_INDEX_SQL = `
+  CREATE INDEX foundation_event_catalog_roster_team_id
+    ON foundation_event_catalog_roster (event_team_id, player_number)
+`;
+
+export const FOUNDATION_EVENT_CATALOG_PITCHES_EVENT_INDEX_SQL = `
+  CREATE INDEX foundation_event_catalog_pitches_event_id
+    ON foundation_event_catalog_pitches (event_id, name, pitch_id)
+`;
+
 const FOUNDATION_EVENT_CATALOG_MIGRATION_SQL = `
   ${FOUNDATION_EVENT_CATALOG_EVENTS_TABLE_SQL};
   ${FOUNDATION_EVENT_CATALOG_GAME_DAYS_TABLE_SQL};
   ${FOUNDATION_EVENT_CATALOG_AUDIT_TABLE_SQL};
   ${FOUNDATION_EVENT_CATALOG_GAME_DAYS_EVENT_INDEX_SQL};
   ${FOUNDATION_EVENT_CATALOG_AUDIT_EVENT_INDEX_SQL};
+`;
+
+const FOUNDATION_EVENT_TEAMS_AND_PITCHES_MIGRATION_SQL = `
+  CREATE TABLE foundation_event_catalog_audit_v2 AS
+    SELECT * FROM foundation_event_catalog_audit;
+  DROP TABLE foundation_event_catalog_audit;
+  ${FOUNDATION_EVENT_CATALOG_AUDIT_TABLE_V2_SQL.replace(
+    "CREATE TABLE foundation_event_catalog_audit",
+    "CREATE TABLE foundation_event_catalog_audit_rebuilt",
+  )};
+  INSERT INTO foundation_event_catalog_audit_rebuilt
+    (audit_id, operation_id, action, event_id, game_day_id, actor_reference,
+     occurred_at_ms, before_json, after_json)
+  SELECT audit_id, operation_id, action, event_id, game_day_id, actor_reference,
+         occurred_at_ms, before_json, after_json
+  FROM foundation_event_catalog_audit_v2;
+  DROP TABLE foundation_event_catalog_audit_v2;
+  ALTER TABLE foundation_event_catalog_audit_rebuilt RENAME TO foundation_event_catalog_audit;
+  ${FOUNDATION_EVENT_CATALOG_TEAMS_TABLE_SQL};
+  ${FOUNDATION_EVENT_CATALOG_ROSTER_TABLE_SQL};
+  ${FOUNDATION_EVENT_CATALOG_PITCHES_TABLE_SQL};
+  ${FOUNDATION_EVENT_CATALOG_AUDIT_EVENT_INDEX_SQL};
+  ${FOUNDATION_EVENT_CATALOG_ROSTER_TEAM_INDEX_SQL};
+  ${FOUNDATION_EVENT_CATALOG_PITCHES_EVENT_INDEX_SQL};
 `;
 
 export const FOUNDATION_MIGRATIONS: readonly FoundationMigration[] = Object.freeze([
@@ -1678,6 +1754,12 @@ export const FOUNDATION_MIGRATIONS: readonly FoundationMigration[] = Object.free
     ordinal: 21,
     schemaVersion: 21,
     sql: FOUNDATION_GRANT_CODE_LOCK_MIGRATION_SQL,
+  }),
+  createMigration({
+    id: "022-event-teams-rosters-and-pitches",
+    ordinal: 22,
+    schemaVersion: 22,
+    sql: FOUNDATION_EVENT_TEAMS_AND_PITCHES_MIGRATION_SQL,
   }),
 ]);
 

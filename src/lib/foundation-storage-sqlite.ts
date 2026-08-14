@@ -54,6 +54,9 @@ import {
   type StoredEventGameRecordRoot,
   type StoredEventCatalogEvent,
   type StoredEventCatalogGameDay,
+  type StoredEventCatalogTeam,
+  type StoredEventCatalogRosterEntry,
+  type StoredEventCatalogPitch,
   type EventCatalogAuditEntry,
 } from "@/lib/foundation-storage";
 import type {
@@ -218,6 +221,42 @@ function readGameDay(value: unknown): StoredEventCatalogGameDay {
   };
 }
 
+function readEventTeam(value: unknown): StoredEventCatalogTeam {
+  const row = value as Record<string, unknown>;
+  return {
+    eventTeamId: String(row.eventTeamId),
+    eventId: String(row.eventId),
+    name: String(row.name),
+    defaultColor: String(row.defaultColor),
+    createdAtMs: Number(row.createdAtMs),
+    updatedAtMs: Number(row.updatedAtMs),
+  };
+}
+
+function readRosterEntry(value: unknown): StoredEventCatalogRosterEntry {
+  const row = value as Record<string, unknown>;
+  return {
+    rosterEntryId: String(row.rosterEntryId),
+    eventId: String(row.eventId),
+    eventTeamId: String(row.eventTeamId),
+    playerNumber: Number(row.playerNumber),
+    publicName: String(row.publicName),
+    createdAtMs: Number(row.createdAtMs),
+    updatedAtMs: Number(row.updatedAtMs),
+  };
+}
+
+function readPitch(value: unknown): StoredEventCatalogPitch {
+  const row = value as Record<string, unknown>;
+  return {
+    pitchId: String(row.pitchId),
+    eventId: String(row.eventId),
+    name: String(row.name),
+    createdAtMs: Number(row.createdAtMs),
+    updatedAtMs: Number(row.updatedAtMs),
+  };
+}
+
 function readEventAudit(value: unknown): EventCatalogAuditEntry {
   const row = value as Record<string, unknown>;
   return {
@@ -275,6 +314,12 @@ type RootStatements = {
   allEvents: SqlStatement;
   gameDaysByEventId: SqlStatement;
   eventAuditsByEventId: SqlStatement;
+  eventTeamById: SqlStatement;
+  eventTeamsByEventId: SqlStatement;
+  rosterByTeamId: SqlStatement;
+  rosterEntryByTeamAndNumber: SqlStatement;
+  pitchById: SqlStatement;
+  pitchesByEventId: SqlStatement;
   insertEvent: SqlStatement;
   updateEvent: SqlStatement;
   deleteEvent: SqlStatement;
@@ -282,6 +327,12 @@ type RootStatements = {
   updateGameDay: SqlStatement;
   deleteGameDay: SqlStatement;
   insertEventAudit: SqlStatement;
+  insertEventTeam: SqlStatement;
+  updateEventTeam: SqlStatement;
+  insertRosterEntry: SqlStatement;
+  updateRosterEntry: SqlStatement;
+  insertPitch: SqlStatement;
+  updatePitch: SqlStatement;
 };
 
 const ROOT_SELECT_COLUMNS = `
@@ -523,6 +574,28 @@ export class SqliteFoundationStorage implements FoundationStorage {
     } as const;
   }
 
+  eventCatalogStorageCapability() {
+    return {
+      name: "event-catalog-storage",
+      version: 1,
+      implementation: "event-teams-rosters-pitches-transaction-v1",
+      transaction: [
+        "findEventTeam",
+        "listEventTeams",
+        "listRoster",
+        "findRosterEntry",
+        "findPitch",
+        "listPitches",
+        "insertEventTeam",
+        "updateEventTeam",
+        "insertRosterEntry",
+        "updateRosterEntry",
+        "insertPitch",
+        "updatePitch",
+      ],
+    } as const;
+  }
+
   setGrantValidationContext(context: GrantStateValidationContext): void {
     this.grantValidationContext = { ...this.grantValidationContext, ...context };
   }
@@ -710,6 +783,21 @@ export class SqliteFoundationStorage implements FoundationStorage {
           .map(readEvent)
           .filter((event): event is StoredEventCatalogEvent => event !== null),
       listGameDays: (eventId) => statements.gameDaysByEventId.all(eventId).map(readGameDay),
+      findEventTeam: (eventTeamId) => {
+        const row = statements.eventTeamById.get(eventTeamId);
+        return row === null ? null : readEventTeam(row);
+      },
+      listEventTeams: (eventId) => statements.eventTeamsByEventId.all(eventId).map(readEventTeam),
+      listRoster: (eventTeamId) => statements.rosterByTeamId.all(eventTeamId).map(readRosterEntry),
+      findRosterEntry: (eventTeamId, playerNumber) => {
+        const row = statements.rosterEntryByTeamAndNumber.get(eventTeamId, playerNumber);
+        return row === null ? null : readRosterEntry(row);
+      },
+      findPitch: (pitchId) => {
+        const row = statements.pitchById.get(pitchId);
+        return row === null ? null : readPitch(row);
+      },
+      listPitches: (eventId) => statements.pitchesByEventId.all(eventId).map(readPitch),
       listEventAuditTrail: (eventId) =>
         statements.eventAuditsByEventId.all(eventId).map(readEventAudit),
       insertAction: (storedAction) => this.insertAction(statements, storedAction),
@@ -950,6 +1038,44 @@ export class SqliteFoundationStorage implements FoundationStorage {
           entry.before === null ? null : JSON.stringify(entry.before),
           JSON.stringify(entry.after),
         ),
+      insertEventTeam: (team) =>
+        statements.insertEventTeam.run(
+          team.eventTeamId,
+          team.eventId,
+          team.name,
+          team.defaultColor,
+          team.createdAtMs,
+          team.updatedAtMs,
+        ),
+      updateEventTeam: (team) =>
+        statements.updateEventTeam.run(
+          team.name,
+          team.defaultColor,
+          team.updatedAtMs,
+          team.eventTeamId,
+        ),
+      insertRosterEntry: (entry) =>
+        statements.insertRosterEntry.run(
+          entry.rosterEntryId,
+          entry.eventId,
+          entry.eventTeamId,
+          entry.playerNumber,
+          entry.publicName,
+          entry.createdAtMs,
+          entry.updatedAtMs,
+        ),
+      updateRosterEntry: (entry) =>
+        statements.updateRosterEntry.run(entry.publicName, entry.updatedAtMs, entry.rosterEntryId),
+      insertPitch: (pitch) =>
+        statements.insertPitch.run(
+          pitch.pitchId,
+          pitch.eventId,
+          pitch.name,
+          pitch.createdAtMs,
+          pitch.updatedAtMs,
+        ),
+      updatePitch: (pitch) =>
+        statements.updatePitch.run(pitch.name, pitch.updatedAtMs, pitch.pitchId),
       writeGrantAdmissionTelemetry: (value) => {
         this.getGrantStatements().upsertTelemetry.run(
           value.mode,
@@ -1244,6 +1370,46 @@ export class SqliteFoundationStorage implements FoundationStorage {
         FROM foundation_event_catalog_game_days
         WHERE event_id = ? ORDER BY game_day_date, game_day_id
       `),
+      eventTeamById: this.database.query(`
+        SELECT event_team_id AS eventTeamId, event_id AS eventId, name,
+               default_color AS defaultColor, created_at_ms AS createdAtMs,
+               updated_at_ms AS updatedAtMs
+        FROM foundation_event_catalog_teams WHERE event_team_id = ?
+      `),
+      eventTeamsByEventId: this.database.query(`
+        SELECT event_team_id AS eventTeamId, event_id AS eventId, name,
+               default_color AS defaultColor, created_at_ms AS createdAtMs,
+               updated_at_ms AS updatedAtMs
+        FROM foundation_event_catalog_teams WHERE event_id = ?
+        ORDER BY event_team_id
+      `),
+      rosterByTeamId: this.database.query(`
+        SELECT roster_entry_id AS rosterEntryId, event_id AS eventId,
+               event_team_id AS eventTeamId, player_number AS playerNumber,
+               public_name AS publicName, created_at_ms AS createdAtMs,
+               updated_at_ms AS updatedAtMs
+        FROM foundation_event_catalog_roster WHERE event_team_id = ?
+        ORDER BY player_number
+      `),
+      rosterEntryByTeamAndNumber: this.database.query(`
+        SELECT roster_entry_id AS rosterEntryId, event_id AS eventId,
+               event_team_id AS eventTeamId, player_number AS playerNumber,
+               public_name AS publicName, created_at_ms AS createdAtMs,
+               updated_at_ms AS updatedAtMs
+        FROM foundation_event_catalog_roster
+        WHERE event_team_id = ? AND player_number = ?
+      `),
+      pitchById: this.database.query(`
+        SELECT pitch_id AS pitchId, event_id AS eventId, name,
+               created_at_ms AS createdAtMs, updated_at_ms AS updatedAtMs
+        FROM foundation_event_catalog_pitches WHERE pitch_id = ?
+      `),
+      pitchesByEventId: this.database.query(`
+        SELECT pitch_id AS pitchId, event_id AS eventId, name,
+               created_at_ms AS createdAtMs, updated_at_ms AS updatedAtMs
+        FROM foundation_event_catalog_pitches WHERE event_id = ?
+        ORDER BY pitch_id
+      `),
       eventAuditsByEventId: this.database.query(`
         SELECT audit_id AS auditId, operation_id AS operationId, action,
                event_id AS eventId, game_day_id AS gameDayId,
@@ -1283,6 +1449,36 @@ export class SqliteFoundationStorage implements FoundationStorage {
           (audit_id, operation_id, action, event_id, game_day_id, actor_reference,
            occurred_at_ms, before_json, after_json)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `),
+      insertEventTeam: this.database.query(`
+        INSERT INTO foundation_event_catalog_teams
+          (event_team_id, event_id, name, default_color, created_at_ms, updated_at_ms)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `),
+      updateEventTeam: this.database.query(`
+        UPDATE foundation_event_catalog_teams
+        SET name = ?, default_color = ?, updated_at_ms = ?
+        WHERE event_team_id = ?
+      `),
+      insertRosterEntry: this.database.query(`
+        INSERT INTO foundation_event_catalog_roster
+          (roster_entry_id, event_id, event_team_id, player_number, public_name, created_at_ms, updated_at_ms)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `),
+      updateRosterEntry: this.database.query(`
+        UPDATE foundation_event_catalog_roster
+        SET public_name = ?, updated_at_ms = ?
+        WHERE roster_entry_id = ?
+      `),
+      insertPitch: this.database.query(`
+        INSERT INTO foundation_event_catalog_pitches
+          (pitch_id, event_id, name, created_at_ms, updated_at_ms)
+        VALUES (?, ?, ?, ?, ?)
+      `),
+      updatePitch: this.database.query(`
+        UPDATE foundation_event_catalog_pitches
+        SET name = ?, updated_at_ms = ?
+        WHERE pitch_id = ?
       `),
       budgetById: this.database.query(
         `SELECT * FROM foundation_acceptance_budgets WHERE bucket_id = ?`,
@@ -1682,6 +1878,24 @@ function translateSqliteConstraint(error: unknown): unknown {
   }
   if (message.includes("foundation_grant_audit.audit_id")) {
     return new FoundationStorageConstraintError("grant-audit-id");
+  }
+  if (message.includes("foundation_event_catalog_teams.event_team_id")) {
+    return new FoundationStorageConstraintError("event-team-id");
+  }
+  if (message.includes("foundation_event_catalog_teams.event_id") && message.includes("name")) {
+    return new FoundationStorageConstraintError("event-team-name");
+  }
+  if (message.includes("foundation_event_catalog_roster.roster_entry_id")) {
+    return new FoundationStorageConstraintError("roster-entry-id");
+  }
+  if (message.includes("foundation_event_catalog_roster.event_team_id")) {
+    return new FoundationStorageConstraintError("roster-player-number");
+  }
+  if (message.includes("foundation_event_catalog_pitches.pitch_id")) {
+    return new FoundationStorageConstraintError("pitch-id");
+  }
+  if (message.includes("foundation_event_catalog_pitches.event_id") && message.includes("name")) {
+    return new FoundationStorageConstraintError("pitch-name");
   }
   return translateControlSqliteConstraint(error);
 }

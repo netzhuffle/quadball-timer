@@ -13,7 +13,7 @@ const migrations: readonly FoundationMigration[] = [
 ];
 
 describe("foundation migration ledger compatibility", () => {
-  test("keeps accepted migrations 001 through 019 byte-for-byte immutable and pins 020/021", () => {
+  test("keeps accepted migrations 001 through 021 byte-for-byte immutable and pins 022", () => {
     expect(FOUNDATION_MIGRATIONS.map(({ id, checksum }) => ({ id, checksum }))).toEqual([
       {
         id: "001-foundation-event-game-record-roots",
@@ -98,6 +98,10 @@ describe("foundation migration ledger compatibility", () => {
       {
         id: "021-grant-code-game-lock-erasure-evidence",
         checksum: "d91853426ecc62a0b5a6341536fc788753604b75aef6d515de770624d403fec0",
+      },
+      {
+        id: "022-event-teams-rosters-and-pitches",
+        checksum: "cba4dc52a3eff2bd982091112a65bafeb5bbc62965974d7eec4fdf869072042f",
       },
     ]);
   });
