@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 describe("server startup", () => {
-  test("starts a Production server from a read-only release with explicit writable state", async () => {
+  test("starts the production runtime from a read-only release with explicit Test state", async () => {
     const root = await mkdtemp(join(tmpdir(), "quadball-timer-startup-"));
     const releaseDirectory = join(root, "release");
     const stateDirectory = join(root, "state");
@@ -17,8 +17,8 @@ describe("server startup", () => {
       env: {
         ...process.env,
         NODE_ENV: "production",
-        QUADBALL_ENVIRONMENT: "production",
-        PUBLIC_ORIGIN: "https://timer.quadball.app",
+        QUADBALL_ENVIRONMENT: "test",
+        PUBLIC_ORIGIN: "https://localhost.test",
         TECHNICAL_ADMIN_DATABASE: join(stateDirectory, "technical-admin.sqlite"),
         FOUNDATION_DATABASE: join(stateDirectory, "foundation.sqlite"),
         HOST: "127.0.0.1",

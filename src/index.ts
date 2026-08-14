@@ -41,10 +41,7 @@ import {
 import { createInMemoryFoundationStorage } from "@/lib/foundation-storage-memory";
 import { openSqliteFoundationStorage } from "@/lib/foundation-storage-sqlite";
 import type { FoundationStorage } from "@/lib/foundation-storage";
-import {
-  assertProductionStateBoundary,
-  readRuntimeStoragePaths,
-} from "@/lib/runtime-storage-config";
+import { assertProductionStateBoundary } from "@/lib/runtime-storage-config";
 import { createStartupCleanup } from "@/lib/startup-resources";
 
 type ManagedGame = {
@@ -107,10 +104,9 @@ async function startServer() {
   try {
     const port = Number(process.env.PORT ?? 3000);
     const technicalAdminConfig = readTechnicalAdminConfig();
-    const { environment } = technicalAdminConfig;
-    const storagePaths = readRuntimeStoragePaths(environment);
+    const { environment, storagePaths } = technicalAdminConfig;
     assertProductionStateBoundary(environment, storagePaths);
-    const databasePath = technicalAdminConfig.databasePath ?? storagePaths.technicalAdminDatabase;
+    const databasePath = storagePaths.technicalAdminDatabase;
     technicalAdminRepository = createSqliteTechnicalAdminAuthRepository(databasePath, {
       environment: technicalAdminConfig.environment,
       origin: technicalAdminConfig.origin,

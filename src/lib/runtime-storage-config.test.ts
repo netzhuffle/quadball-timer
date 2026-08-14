@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { chmodSync, mkdtempSync, mkdirSync, rmSync, symlinkSync } from "node:fs";
+import { chmodSync, mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -22,9 +22,18 @@ describe("runtime storage configuration", () => {
     });
   });
 
-  test("honors explicit storage paths for disposable startup environments", () => {
-    expect(
+  test("rejects Production storage overrides outside the canonical state directory", () => {
+    expect(() =>
       readRuntimeStoragePaths("production", {
+        TECHNICAL_ADMIN_DATABASE: "/tmp/timer-test/technical-admin.sqlite",
+        FOUNDATION_DATABASE: "/tmp/timer-test/foundation.sqlite",
+      }),
+    ).toThrow("canonical path");
+  });
+
+  test("honors explicit storage paths for disposable Test environments", () => {
+    expect(
+      readRuntimeStoragePaths("test", {
         TECHNICAL_ADMIN_DATABASE: "/tmp/timer-test/technical-admin.sqlite",
         FOUNDATION_DATABASE: "/tmp/timer-test/foundation.sqlite",
       }),
@@ -82,5 +91,31 @@ describe("runtime storage configuration", () => {
         foundationDatabase: "/srv/quadball-timer/foundation.sqlite",
       }),
     ).toThrow("one state directory");
+  });
+
+  test("rejects an unsafe existing Technical Admin database before startup", () => {
+    const root = mkdtempSync(join(tmpdir(), "quadball-timer-state-"));
+    const unsafeDatabase = join(root, "unsafe.sqlite");
+    const linkedDatabase = join(root, "linked.sqlite");
+    const linkTarget = join(root, "target.sqlite");
+    chmodSync(root, 0o750);
+    writeFileSync(unsafeDatabase, "");
+    chmodSync(unsafeDatabase, 0o660);
+    writeFileSync(linkTarget, "");
+    chmodSync(linkTarget, 0o640);
+    symlinkSync(linkTarget, linkedDatabase);
+
+    try {
+      for (const technicalAdminDatabase of [unsafeDatabase, linkedDatabase]) {
+        expect(() =>
+          assertProductionStateBoundary("production", {
+            technicalAdminDatabase,
+            foundationDatabase: join(root, "foundation.sqlite"),
+          }),
+        ).toThrow("Technical Admin database");
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });
