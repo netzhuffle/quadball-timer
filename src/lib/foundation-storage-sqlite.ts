@@ -1,7 +1,19 @@
 import { Database } from "bun:sqlite";
+import {
+  closeSync,
+  fsyncSync,
+  lstatSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  statfsSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { EventGameRecordRoot } from "@/lib/foundation-record-types";
 import {
   appendGrantAudit,
@@ -26,6 +38,11 @@ import {
 import type { GrantKeyRing } from "@/lib/grant-types";
 import type { GrantStateValidationContext } from "@/lib/grant-state-validation";
 import {
+  CONTROL_ACTION_ORDERING_VERSION,
+  rebuildControlActionHistory,
+} from "@/lib/event-game-actions";
+import { validateIdempotencyHistory } from "@/lib/event-game-record-helpers";
+import {
   assessMigrationReadiness,
   FOUNDATION_MIGRATION_LEDGER_SQL,
   FOUNDATION_MIGRATIONS,
@@ -38,6 +55,11 @@ import {
   FoundationStorageClosedError,
   FoundationStorageConstraintError,
   FoundationStorageNotReadyError,
+  type FoundationStorageEvidence,
+  type FoundationStorageFailureCategory,
+  type FoundationStorageKeyCategory,
+  type FoundationStorageKeyCounts,
+  type FoundationStorageReadinessContext,
   isThenable,
   type FoundationStorage,
   type FoundationStorageReadiness,
@@ -82,7 +104,25 @@ export type SqliteFoundationStorageOptions = {
   beforeWriteTransactionLock?: () => void;
   grantKeyRing?: GrantKeyRing;
   grantValidationContext?: GrantStateValidationContext;
+  /** Test-only fault injection at a durable transaction phase. */
+  faultInjector?: (
+    phase:
+      | "begin"
+      | "commit"
+      | "before-commit"
+      | "after-commit"
+      | "readiness-write-probe"
+      | "quarantine-write"
+      | "quarantine-rename"
+      | "quarantine-sync"
+      | "quarantine-verify",
+  ) => void;
+  /** Migration candidates are not authoritative runtime composition boundaries. */
+  requireReplayContext?: boolean;
 };
+
+const QUARANTINE_MARKER_CONTENT = "quadball-timer-foundation-quarantine-v1\ncategory=corruption\n";
+const QUARANTINE_MARKER_MAX_BYTES = 128;
 
 export type SqliteFoundationSettings = {
   journalMode: string;
@@ -110,6 +150,23 @@ export class FoundationMigrationError extends Error {
     super(message);
     this.name = "FoundationMigrationError";
     this.readiness = readiness;
+  }
+}
+
+export class SqliteFoundationFault extends Error {
+  readonly category: FoundationStorageFailureCategory;
+
+  constructor(category: FoundationStorageFailureCategory) {
+    super("Injected SQLite foundation fault.");
+    this.name = "SqliteFoundationFault";
+    this.category = category;
+  }
+}
+
+export class FoundationQuarantinePersistenceError extends Error {
+  constructor() {
+    super("SQLite corruption quarantine could not be durably persisted.");
+    this.name = "FoundationQuarantinePersistenceError";
   }
 }
 
@@ -241,6 +298,7 @@ type RootStatements = {
   byPitchSlotId: SqlStatement;
   byGameSideId: SqlStatement;
   insertRoot: SqlStatement;
+  allRoots: SqlStatement;
   insertSide: SqlStatement;
   actionByOperationId: SqlStatement;
   actionsByRecordId: SqlStatement;
@@ -301,13 +359,36 @@ const ROOT_SELECT_COLUMNS = `
 
 const OPAQUE_MIGRATION_REFERENCE_PATTERN = /^opaque-migration-reference-v1:[a-f0-9]{64}$/;
 
+const KEY_CATEGORIES: readonly FoundationStorageKeyCategory[] = ["encryption", "lookup", "audit"];
+
+function emptyKeyCounts(): FoundationStorageKeyCounts {
+  return { encryption: 0, lookup: 0, audit: 0 };
+}
+
+function keyCategory(kind: "e" | "l" | "a"): FoundationStorageKeyCategory {
+  return kind === "e" ? "encryption" : kind === "l" ? "lookup" : "audit";
+}
+
+function extractIntegrityKeyVersion(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const match = /^hmac-sha256-v1:([^:]{1,64}):[^:]{1,256}$/.exec(value);
+  return match?.[1] ?? null;
+}
+
+function readNullableTextValue(value: unknown): string | null {
+  return typeof value === "string" ? value : null;
+}
+
 export class SqliteFoundationStorage implements FoundationStorage {
   readonly databasePath: string;
+  readonly quarantineMarkerPath: string | null;
 
   private readonly database: Database;
   private readonly migrations: readonly FoundationMigration[];
   private readonly busyTimeoutMs: number;
   private readonly beforeWriteTransactionLock: (() => void) | undefined;
+  private readonly faultInjector: SqliteFoundationStorageOptions["faultInjector"];
+  private readonly requireReplayContext: boolean;
   private grantValidationContext: GrantStateValidationContext;
   private writerTail: Promise<void> = Promise.resolve();
   private statements: RootStatements | undefined;
@@ -315,25 +396,50 @@ export class SqliteFoundationStorage implements FoundationStorage {
   private closed = false;
   private revision = 0;
   private dataVersion: number;
+  private readinessContext: FoundationStorageReadinessContext | undefined;
+  private unsafeFailure: FoundationStorageFailureCategory | undefined;
+  private quarantinePersistenceFailure = false;
+  private lastTransactionLatencyMs: number | null = null;
+  private rejectionCount = 0;
+  private readonly rejectionCategories: Record<FoundationStorageFailureCategory, number> = {
+    busy: 0,
+    readonly: 0,
+    full: 0,
+    "io-error": 0,
+    "commit-failure": 0,
+    corruption: 0,
+  };
 
   constructor(databasePath: string, options: SqliteFoundationStorageOptions = {}) {
     this.databasePath = databasePath;
+    this.quarantineMarkerPath = databasePath === ":memory:" ? null : `${databasePath}.quarantine`;
     this.migrations = options.migrations ?? FOUNDATION_MIGRATIONS;
     this.busyTimeoutMs = options.busyTimeoutMs ?? 5_000;
     this.beforeWriteTransactionLock = options.beforeWriteTransactionLock;
+    this.faultInjector = options.faultInjector;
+    this.requireReplayContext = options.requireReplayContext ?? true;
     this.grantValidationContext = options.grantValidationContext ?? {
       keyRing: options.grantKeyRing,
     };
+    this.unsafeFailure = readQuarantineMarker(this.quarantineMarkerPath) ? "corruption" : undefined;
     this.database = new Database(databasePath);
-    this.configureDatabase();
+    if (this.unsafeFailure !== "corruption") this.configureDatabase();
     this.dataVersion = this.readDataVersion();
   }
 
   transaction<T>(work: FoundationStorageTransactionWork<T>): Promise<T> {
     return this.enqueue(() => {
       this.beforeWriteTransactionLock?.();
-      this.database.exec("BEGIN IMMEDIATE;");
+      const startedAt = Date.now();
+      let transactionStarted = false;
+      let commitBoundary = false;
       try {
+        if (this.unsafeFailure === "corruption") {
+          throw new FoundationStorageNotReadyError(this.readinessSync());
+        }
+        this.faultInjector?.("begin");
+        this.database.exec("BEGIN IMMEDIATE;");
+        transactionStarted = true;
         // The write lock fixes the snapshot before both the external revision
         // token and semantic readiness are derived. A commit from another
         // connection cannot land between these operations and be hidden by
@@ -358,12 +464,32 @@ export class SqliteFoundationStorage implements FoundationStorage {
           }
           writeGrantAdmissionStateAnchor(grantStatements, keyRing);
         }
+        commitBoundary = true;
+        this.faultInjector?.("before-commit");
+        this.faultInjector?.("commit");
         this.database.exec("COMMIT;");
+        transactionStarted = false;
+        this.faultInjector?.("after-commit");
+        this.lastTransactionLatencyMs = boundedMetric(Date.now() - startedAt);
+        this.unsafeFailure = undefined;
         this.revision += 1;
         this.dataVersion = this.readDataVersion();
         return result;
       } catch (error) {
-        this.rollbackQuietly();
+        if (transactionStarted) this.rollbackQuietly();
+        this.lastTransactionLatencyMs = boundedMetric(Date.now() - startedAt);
+        const category = classifySqliteFailure(
+          error,
+          commitBoundary ? "commit" : transactionStarted ? "transaction" : "commit",
+        );
+        if (category !== null) {
+          if (category === "corruption") this.latchCorruption();
+          else this.unsafeFailure = category;
+          this.rejectionCount = boundedMetric(this.rejectionCount + 1);
+          this.rejectionCategories[category] = boundedMetric(
+            this.rejectionCategories[category] + 1,
+          );
+        }
         throw translateSqliteConstraint(error);
       }
     });
@@ -413,7 +539,15 @@ export class SqliteFoundationStorage implements FoundationStorage {
   }
 
   readiness(): Promise<FoundationStorageReadiness> {
-    return this.enqueue(() => this.readinessSync());
+    return this.enqueue(() => this.readinessSync(true));
+  }
+
+  liveness() {
+    return { ok: true as const, process: "available" as const };
+  }
+
+  setReadinessContext(context: FoundationStorageReadinessContext): void {
+    this.readinessContext = context;
   }
 
   getSettings(): SqliteFoundationSettings {
@@ -424,6 +558,11 @@ export class SqliteFoundationStorage implements FoundationStorage {
   async applyMigrations(
     options: { requireCandidate?: boolean } = {},
   ): Promise<FoundationMigrationReport> {
+    if (this.unsafeFailure === "corruption") {
+      throw new FoundationMigrationError(
+        "The SQLite foundation database is quarantined after suspected corruption.",
+      );
+    }
     if (options.requireCandidate !== false) {
       const candidate = await this.validateCandidate();
       if (!candidate.ready) {
@@ -459,6 +598,7 @@ export class SqliteFoundationStorage implements FoundationStorage {
         migrations: this.migrations,
         busyTimeoutMs: this.busyTimeoutMs,
         grantValidationContext: this.grantValidationContext,
+        requireReplayContext: false,
       });
       const migration = await candidate.applyMigrations({ requireCandidate: false });
       const readiness = await candidate.readiness();
@@ -484,6 +624,9 @@ export class SqliteFoundationStorage implements FoundationStorage {
   }
 
   setGrantKeyRing(keyRing: GrantKeyRing): void {
+    if (this.unsafeFailure === "corruption") {
+      throw new FoundationStorageNotReadyError(this.readinessSync());
+    }
     if (
       !this.hasInstalledGrantAdmissionAnchor() &&
       (this.countRows("foundation_grant_admission_telemetry") > 0 ||
@@ -1121,6 +1264,9 @@ export class SqliteFoundationStorage implements FoundationStorage {
   private getStatements(): RootStatements {
     if (this.statements !== undefined) return this.statements;
     this.statements = {
+      allRoots: this.database.query(
+        `SELECT ${ROOT_SELECT_COLUMNS} FROM foundation_event_game_record_roots AS roots ORDER BY roots.record_id`,
+      ),
       byRecordId: this.database.query(
         `SELECT ${ROOT_SELECT_COLUMNS} FROM foundation_event_game_record_roots AS roots WHERE roots.record_id = ?`,
       ),
@@ -1406,20 +1552,51 @@ export class SqliteFoundationStorage implements FoundationStorage {
     };
   }
 
-  private readinessSync(): FoundationStorageReadiness {
+  private readinessSync(probeWriteability = false): FoundationStorageReadiness {
+    const evidence = this.baseEvidence();
     try {
       this.assertOpen();
+      if (this.unsafeFailure === "corruption") {
+        evidence.transaction.writePressure = "unsafe";
+        evidence.sqlite.failureCategory = "corruption";
+        return {
+          ok: false,
+          status: this.quarantinePersistenceFailure ? "quarantine-failure" : "integrity-failure",
+          detail: this.quarantinePersistenceFailure
+            ? "SQLite corruption quarantine could not be durably persisted."
+            : "SQLite durable authority is frozen after suspected corruption.",
+          storage: "sqlite",
+          evidence,
+        };
+      }
+      if (this.unsafeFailure !== undefined && !probeWriteability) {
+        evidence.transaction.writePressure = "unsafe";
+        evidence.sqlite.failureCategory = this.unsafeFailure;
+        return {
+          ok: false,
+          status: "not-writeable",
+          detail: "SQLite durable authority is paused until a writeability proof succeeds.",
+          storage: "sqlite",
+          evidence,
+        };
+      }
       const settings = this.readSettings();
+      evidence.sqlite.journalMode =
+        settings.journalMode.toLowerCase() === "wal" ? "wal" : "unknown";
+      evidence.sqlite.synchronous = settings.synchronous;
+      evidence.sqlite.foreignKeys = settings.foreignKeys === 1;
       if (
-        settings.journalMode.toLowerCase() !== "wal" ||
+        evidence.sqlite.journalMode !== "wal" ||
         settings.synchronous !== 2 ||
         settings.foreignKeys !== 1
       ) {
+        evidence.transaction.writePressure = "unsafe";
         return {
           ok: false,
           status: "unsafe-settings",
           detail: "SQLite did not report the required WAL, FULL, and foreign-key settings.",
           storage: "sqlite",
+          evidence,
         };
       }
 
@@ -1429,12 +1606,16 @@ export class SqliteFoundationStorage implements FoundationStorage {
         migrationState.entries,
         this.migrations,
       );
+      evidence.migration.state = migrationReadiness.status === "ready" ? "ready" : "unsafe";
+      evidence.migration.schemaVersion = String(migrationReadiness.schemaVersion);
+      evidence.migration.appliedCount = boundedMetric(migrationState.entries.length);
       if (migrationReadiness.status !== "ready") {
         return {
           ok: false,
           status: migrationReadiness.status,
           detail: migrationReadiness.detail,
           storage: "sqlite",
+          evidence,
         };
       }
       if (
@@ -1442,9 +1623,10 @@ export class SqliteFoundationStorage implements FoundationStorage {
         this.migrations.some((migration) => migration.id === "006-grant-cryptographic-erasure")
       )
         this.refreshGrantMigrationProvenance();
+      this.updateKeyEvidence(evidence);
       const schemaVerification = verifyFoundationSchema(this.database, this.grantValidationContext);
       if (!schemaVerification.ok) {
-        return { ...schemaVerification, storage: "sqlite" };
+        return { ...schemaVerification, storage: "sqlite", evidence };
       }
       const idempotencyFailure = this.verifyIdempotencyParity();
       if (idempotencyFailure !== null) {
@@ -1453,28 +1635,94 @@ export class SqliteFoundationStorage implements FoundationStorage {
           status: "integrity-failure",
           detail: idempotencyFailure,
           storage: "sqlite",
+          evidence,
         };
       }
-
+      const rootCount = this.countRows("foundation_event_game_record_roots");
+      const actionCount = this.countRows("foundation_event_game_record_actions");
+      if (
+        this.requireReplayContext &&
+        this.readinessContext === undefined &&
+        (rootCount > 0 || actionCount > 0)
+      ) {
+        evidence.replay.rootCount = boundedMetric(rootCount);
+        evidence.replay.actionCount = boundedMetric(actionCount);
+        evidence.replay.result = "not-configured";
+        evidence.transaction.writePressure = "unsafe";
+        return {
+          ok: false,
+          status: "integrity-failure",
+          detail: "Event Game replay context is not installed at the authoritative boundary.",
+          storage: "sqlite",
+          evidence,
+        };
+      }
+      if (this.readinessContext !== undefined) {
+        const replayFailure = this.verifyRegisteredReplay(evidence, this.readinessContext);
+        if (replayFailure !== null)
+          return {
+            ok: false,
+            status: "integrity-failure",
+            detail: replayFailure,
+            storage: "sqlite",
+            evidence,
+          };
+      }
+      if (probeWriteability) {
+        this.probeWriteability(evidence);
+        this.unsafeFailure = undefined;
+        evidence.sqlite.failureCategory = null;
+      }
+      evidence.transaction.writePressure = "normal";
       return {
         ok: true,
         schemaVersion: String(migrationReadiness.schemaVersion),
         storage: "sqlite",
+        evidence,
       };
     } catch (error) {
+      const category = classifySqliteFailure(error, "readiness");
+      if (category !== null) {
+        if (category === "corruption") this.latchCorruption();
+        else this.unsafeFailure = category;
+        this.rejectionCount = boundedMetric(this.rejectionCount + 1);
+        this.rejectionCategories[category] = boundedMetric(this.rejectionCategories[category] + 1);
+        evidence.transaction.rejectionCount = this.rejectionCount;
+        evidence.transaction.rejectionCategories = { ...this.rejectionCategories };
+        evidence.transaction.writePressure = "unsafe";
+        evidence.sqlite.failureCategory = category;
+        return {
+          ok: false,
+          status:
+            category === "corruption"
+              ? this.quarantinePersistenceFailure
+                ? "quarantine-failure"
+                : "integrity-failure"
+              : "not-writeable",
+          detail:
+            category === "corruption" && this.quarantinePersistenceFailure
+              ? "SQLite corruption quarantine could not be durably persisted."
+              : "SQLite durable authority is paused after a storage failure.",
+          storage: "sqlite",
+          evidence,
+        };
+      }
       if (error instanceof FoundationStorageClosedError) {
         return {
           ok: false,
           status: "closed",
           detail: "SQLite foundation storage is closed.",
           storage: "sqlite",
+          evidence,
         };
       }
+      evidence.transaction.writePressure = "unsafe";
       return {
         ok: false,
         status: "integrity-failure",
         detail: "SQLite readiness verification failed.",
         storage: "sqlite",
+        evidence,
       };
     }
   }
@@ -1486,6 +1734,237 @@ export class SqliteFoundationStorage implements FoundationStorage {
       foreignKeys: readInteger(this.database.query("PRAGMA foreign_keys").get()),
       busyTimeoutMs: readInteger(this.database.query("PRAGMA busy_timeout").get()),
     };
+  }
+
+  private baseEvidence(): FoundationStorageEvidence {
+    const databaseBytes = safeFileSize(this.databasePath);
+    const walBytes = safeFileSize(`${this.databasePath}-wal`);
+    return {
+      runtime: {
+        engine: "bun",
+        version: boundedText(Bun.version),
+        sqliteVersion: safeSqliteVersion(this.database),
+      },
+      transaction: {
+        lastLatencyMs: this.lastTransactionLatencyMs,
+        rejectionCount: this.rejectionCount,
+        rejectionCategories: { ...this.rejectionCategories },
+        writePressure: "unknown",
+      },
+      sqlite: {
+        journalMode: "unknown",
+        synchronous: null,
+        foreignKeys: null,
+        walBytes,
+        checkpoint: "not-attempted",
+        diskBytes: databaseBytes,
+        diskFreeBytes: safeFreeBytes(this.databasePath),
+        failureCategory: this.unsafeFailure ?? null,
+      },
+      migration: { state: "unknown", schemaVersion: null, appliedCount: null },
+      keys: {
+        requiredCount: 0,
+        availableCount: 0,
+        missingCount: 0,
+        requiredCategories: emptyKeyCounts(),
+        availableCategories: emptyKeyCounts(),
+        missingCategories: emptyKeyCounts(),
+      },
+      replay: {
+        result: this.readinessContext === undefined ? "not-configured" : "failed",
+        rootCount: 0,
+        actionCount: 0,
+        durationMs: null,
+      },
+    };
+  }
+
+  private probeWriteability(evidence: FoundationStorageEvidence): void {
+    const startedAt = Date.now();
+    const originalUserVersion = readInteger(
+      (this.database.query("PRAGMA user_version").get() as RootRow).user_version,
+    );
+    let transactionStarted = false;
+    try {
+      this.faultInjector?.("begin");
+      this.database.exec("BEGIN IMMEDIATE;");
+      transactionStarted = true;
+      this.faultInjector?.("readiness-write-probe");
+      this.database.exec(`PRAGMA user_version = ${originalUserVersion + 1};`);
+      this.database.exec(`PRAGMA user_version = ${originalUserVersion};`);
+      this.faultInjector?.("before-commit");
+      this.faultInjector?.("commit");
+      this.database.exec("COMMIT;");
+      transactionStarted = false;
+      this.faultInjector?.("after-commit");
+      const verifiedUserVersion = readInteger(
+        (this.database.query("PRAGMA user_version").get() as RootRow).user_version,
+      );
+      if (verifiedUserVersion !== originalUserVersion)
+        throw new SqliteFoundationFault("corruption");
+    } catch (error) {
+      if (transactionStarted) this.rollbackQuietly();
+      throw error;
+    }
+    evidence.transaction.lastLatencyMs = boundedMetric(Date.now() - startedAt);
+    try {
+      const row = this.database.query("PRAGMA wal_checkpoint(PASSIVE)").get() as Record<
+        string,
+        unknown
+      > | null;
+      const busy = readInteger(row?.busy ?? 0);
+      evidence.sqlite.checkpoint = busy === 0 ? "ok" : "busy";
+      if (busy !== 0) throw new SqliteFoundationFault("busy");
+    } catch (error) {
+      if (error instanceof SqliteFoundationFault) throw error;
+      evidence.sqlite.checkpoint = "failed";
+      throw new SqliteFoundationFault("io-error");
+    }
+  }
+
+  private updateKeyEvidence(evidence: FoundationStorageEvidence): void {
+    const keyRing = this.grantValidationContext.keyRing;
+    const required = new Set<string>();
+    const requiredCategories = emptyKeyCounts();
+    const addRequired = (kind: "e" | "l" | "a", version: string | null): void => {
+      if (
+        typeof version !== "string" ||
+        version.length === 0 ||
+        version.length > 64 ||
+        !/^[A-Za-z0-9._-]+$/.test(version)
+      )
+        return;
+      const key = `${kind}:${version}`;
+      if (required.has(key)) return;
+      required.add(key);
+      requiredCategories[keyCategory(kind)] += 1;
+    };
+    for (const grant of listGrants(this.getGrantStatements().allGrants)) {
+      if (grant.credential.materialState === "present") {
+        addRequired("e", grant.credential.encryptionKeyVersion);
+        addRequired("l", grant.credential.lookupKeyVersion);
+      }
+      if (grant.code !== null && grant.code !== undefined && grant.code.state !== "erased") {
+        addRequired("e", grant.code.encryptionKeyVersion);
+        addRequired("a", grant.code.lookupKeyVersion);
+      }
+      for (const session of listGrantSessions(
+        this.getGrantStatements().sessionsByGrant,
+        grant.grantId,
+      )) {
+        addRequired("l", session.browserContextKeyVersion);
+        if (session.bearerMaterialState === "present")
+          addRequired("l", session.bearerLookupKeyVersion);
+      }
+    }
+    for (const row of this.database
+      .query("SELECT audit_integrity_tag FROM foundation_grant_audit")
+      .all() as unknown[]) {
+      addRequired("a", extractIntegrityKeyVersion(asRecord(row).audit_integrity_tag));
+    }
+    for (const row of this.database
+      .query("SELECT integrity_tag FROM foundation_grant_state_anchors")
+      .all() as unknown[]) {
+      addRequired("a", extractIntegrityKeyVersion(asRecord(row).integrity_tag));
+    }
+    for (const row of this.database
+      .query("SELECT integrity_tag FROM foundation_grant_admission_state_anchors")
+      .all() as unknown[]) {
+      addRequired("a", extractIntegrityKeyVersion(asRecord(row).integrity_tag));
+    }
+    for (const row of this.database
+      .query("SELECT key_version FROM foundation_acceptance_integrity_anchors")
+      .all() as unknown[]) {
+      addRequired("a", readNullableTextValue(asRecord(row).key_version));
+    }
+    for (const row of this.database
+      .query("SELECT receipt_key_version FROM foundation_replay_receipts")
+      .all() as unknown[]) {
+      addRequired("a", readNullableTextValue(asRecord(row).receipt_key_version));
+    }
+    const availableCategories = emptyKeyCounts();
+    const available = [...required].filter((key) => {
+      const [kind, version] = key.split(":");
+      if (version === undefined) return false;
+      const available =
+        keyRing !== undefined &&
+        (kind === "e"
+          ? keyRing.encryption.keys.has(version)
+          : kind === "a"
+            ? keyRing.audit.keys.has(version)
+            : keyRing.lookup.keys.has(version));
+      if (available) availableCategories[keyCategory(kind as "e" | "l" | "a")] += 1;
+      return available;
+    }).length;
+    const missingCategories = emptyKeyCounts();
+    for (const category of KEY_CATEGORIES) {
+      missingCategories[category] = requiredCategories[category] - availableCategories[category];
+    }
+    evidence.keys = {
+      requiredCount: boundedMetric(required.size),
+      availableCount: boundedMetric(available),
+      missingCount: boundedMetric(required.size - available),
+      requiredCategories,
+      availableCategories,
+      missingCategories,
+    };
+  }
+
+  private verifyRegisteredReplay(
+    evidence: FoundationStorageEvidence,
+    context: FoundationStorageReadinessContext,
+  ): string | null {
+    const startedAt = Date.now();
+    try {
+      const rows = this.getStatements().allRoots.all() as unknown[];
+      evidence.replay.rootCount = boundedMetric(rows.length);
+      for (const value of rows) {
+        const row = asRecord(value);
+        const root = readValidatedFoundationRoot(this.database, row);
+        const actions = this.readActionsByRecordId(
+          this.getStatements().actionsByRecordId,
+          root.recordId,
+        );
+        const idempotency = this.readIdempotencyByRecordId(
+          this.getStatements().idempotencyByRecordId,
+          root.recordId,
+        );
+        const metadataRow = this.getStatements().metadataByRecordId.get(
+          root.recordId,
+        ) as RootRow | null;
+        const metadata = metadataRow === null ? null : readMetadata(metadataRow);
+        evidence.replay.actionCount = boundedMetric(evidence.replay.actionCount + actions.length);
+        if (
+          metadata === null ||
+          metadata.actionCount !== actions.length ||
+          metadata.orderingVersion !== CONTROL_ACTION_ORDERING_VERSION
+        )
+          return "Event Game Record replay metadata is incomplete.";
+        const idempotencyFailure = validateIdempotencyHistory(root, actions, idempotency);
+        if (idempotencyFailure !== null) return idempotencyFailure;
+        const historicalRoot =
+          actions[0] === undefined
+            ? root
+            : {
+                ...root,
+                lifecycle: structuredClone(actions[0].action.lifecycle),
+              };
+        const replay = rebuildControlActionHistory(
+          historicalRoot,
+          actions,
+          context.actionCodecRegistry,
+          context.interpreter,
+        );
+        if (replay.status !== "ready") return replay.detail;
+      }
+      evidence.replay.result = "passed";
+      return null;
+    } catch {
+      return "Event Game Record replay verification failed.";
+    } finally {
+      evidence.replay.durationMs = boundedMetric(Date.now() - startedAt);
+      if (evidence.replay.result !== "passed") evidence.replay.result = "failed";
+    }
   }
 
   private refreshGrantMigrationProvenance(): void {
@@ -1613,6 +2092,16 @@ export class SqliteFoundationStorage implements FoundationStorage {
     );
   }
 
+  private latchCorruption(): void {
+    this.unsafeFailure = "corruption";
+    try {
+      persistQuarantineMarker(this.quarantineMarkerPath, this.faultInjector);
+    } catch (error) {
+      if (!(error instanceof FoundationQuarantinePersistenceError)) throw error;
+      this.quarantinePersistenceFailure = true;
+    }
+  }
+
   private rollbackQuietly(): void {
     try {
       this.database.exec("ROLLBACK;");
@@ -1684,4 +2173,148 @@ function translateSqliteConstraint(error: unknown): unknown {
     return new FoundationStorageConstraintError("grant-audit-id");
   }
   return translateControlSqliteConstraint(error);
+}
+
+function boundedMetric(value: number): number {
+  return Number.isSafeInteger(value) ? Math.max(0, Math.min(value, 1_000_000_000)) : 0;
+}
+
+function boundedText(value: string): string {
+  return value.length <= 32 ? value : value.slice(0, 32);
+}
+
+function readQuarantineMarker(path: string | null): boolean {
+  if (path === null) return false;
+  try {
+    const stats = statSync(path);
+    if (!stats.isFile() || stats.size > QUARANTINE_MARKER_MAX_BYTES) return true;
+  } catch (error) {
+    return error instanceof Error && (error as NodeJS.ErrnoException).code !== "ENOENT";
+  }
+  return true;
+}
+
+function persistQuarantineMarker(
+  path: string | null,
+  faultInjector: SqliteFoundationStorageOptions["faultInjector"],
+): void {
+  if (path === null) throw new FoundationQuarantinePersistenceError();
+  try {
+    if (statSync(path).isFile()) {
+      verifyQuarantineMarker(path);
+      return;
+    }
+  } catch (error) {
+    if (!(error instanceof Error) || (error as NodeJS.ErrnoException).code !== "ENOENT") {
+      throw new FoundationQuarantinePersistenceError();
+    }
+  }
+
+  const temporaryPath = `${path}.tmp-${process.pid}-${Date.now()}`;
+  try {
+    faultInjector?.("quarantine-write");
+    writeFileSync(temporaryPath, QUARANTINE_MARKER_CONTENT, {
+      encoding: "utf8",
+      flag: "wx",
+      mode: 0o600,
+    });
+    const markerFd = openSync(temporaryPath, "r");
+    try {
+      faultInjector?.("quarantine-sync");
+      fsyncSync(markerFd);
+    } finally {
+      closeSync(markerFd);
+    }
+    faultInjector?.("quarantine-rename");
+    renameSync(temporaryPath, path);
+    const parentFd = openSync(dirname(path), "r");
+    try {
+      faultInjector?.("quarantine-sync");
+      fsyncSync(parentFd);
+    } catch {
+      closeSync(parentFd);
+      throw new FoundationQuarantinePersistenceError();
+    }
+    closeSync(parentFd);
+    faultInjector?.("quarantine-verify");
+    verifyQuarantineMarker(path);
+  } catch {
+    try {
+      unlinkSync(temporaryPath);
+    } catch {
+      // Preserve the bounded quarantine failure even if cleanup is unavailable.
+    }
+    throw new FoundationQuarantinePersistenceError();
+  }
+}
+
+function verifyQuarantineMarker(path: string): void {
+  const stats = lstatSync(path);
+  if (
+    !stats.isFile() ||
+    stats.size > QUARANTINE_MARKER_MAX_BYTES ||
+    (stats.mode & 0o777) !== 0o600
+  ) {
+    throw new FoundationQuarantinePersistenceError();
+  }
+  if (readFileSync(path, "utf8") !== QUARANTINE_MARKER_CONTENT) {
+    throw new FoundationQuarantinePersistenceError();
+  }
+}
+
+function safeFileSize(path: string): number | null {
+  try {
+    return boundedMetric(statSync(path).size);
+  } catch {
+    return null;
+  }
+}
+
+function safeFreeBytes(path: string): number | null {
+  try {
+    const stats = statfsSync(path);
+    return boundedMetric(stats.bavail * stats.bsize);
+  } catch {
+    return null;
+  }
+}
+
+function safeSqliteVersion(database: Database): string | null {
+  try {
+    const row = database.query("SELECT sqlite_version() AS version").get() as Record<
+      string,
+      unknown
+    >;
+    const version = row.version;
+    return typeof version === "string" ? boundedText(version) : null;
+  } catch {
+    return null;
+  }
+}
+
+function classifySqliteFailure(
+  error: unknown,
+  phase: "transaction" | "commit" | "readiness",
+): FoundationStorageFailureCategory | null {
+  if (error instanceof SqliteFoundationFault) return error.category;
+  if (!(error instanceof Error)) return null;
+  const message = error.message.toLowerCase();
+  if (message.includes("busy") || message.includes("locked")) return "busy";
+  if (
+    message.includes("readonly") ||
+    message.includes("read-only") ||
+    message.includes("permission denied")
+  )
+    return "readonly";
+  if (message.includes("full") || message.includes("quota")) return "full";
+  if (message.includes("ioerr") || message.includes("i/o") || message.includes("disk i/o"))
+    return "io-error";
+  if (phase === "commit" && message.includes("commit")) return "commit-failure";
+  if (
+    message.includes("malformed") ||
+    message.includes("corrupt") ||
+    message.includes("not a database")
+  )
+    return "corruption";
+  return null;
 }

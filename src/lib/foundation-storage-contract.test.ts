@@ -3,6 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createEventGameRecord, type ExternalScopeResolver } from "@/lib/event-game-record";
+import { createDeterministicTestIqaInterpreter } from "@/lib/event-game-actions";
 import {
   canonicalizeEventGameRecordRoot,
   type EventGameRecordRoot,
@@ -97,6 +98,7 @@ function runStorageContract(name: string, factory: StorageFactory): void {
         const root = createRoot();
         const record = createEventGameRecord(harness.storage, {
           externalScopeResolver: createScopeResolver(root),
+          interpreter: createDeterministicTestIqaInterpreter("rules-v1"),
         });
         expect(await record.registerRoot(root)).toMatchObject({ status: "registered" });
         expect(await record.readRoot(root.recordId)).toEqual(root);
@@ -111,6 +113,7 @@ function runStorageContract(name: string, factory: StorageFactory): void {
         const root = createRoot();
         const record = createEventGameRecord(harness.storage, {
           externalScopeResolver: createScopeResolver(root),
+          interpreter: createDeterministicTestIqaInterpreter("rules-v1"),
         });
         expect(await record.registerRoot(root)).toMatchObject({ status: "registered" });
         expect(await record.registerRoot(structuredClone(root))).toMatchObject({
@@ -163,6 +166,7 @@ function runStorageContract(name: string, factory: StorageFactory): void {
         };
         const record = createEventGameRecord(harness.storage, {
           externalScopeResolver: resolver,
+          interpreter: createDeterministicTestIqaInterpreter("rules-v1"),
         });
 
         expect(await record.registerRoot(root)).toMatchObject({ status: "registered" });
@@ -183,6 +187,7 @@ function runStorageContract(name: string, factory: StorageFactory): void {
         const root = createRoot();
         const record = createEventGameRecord(harness.storage, {
           externalScopeResolver: createScopeResolver(root),
+          interpreter: createDeterministicTestIqaInterpreter("rules-v1"),
         });
         const outcomes = await Promise.all([record.registerRoot(root), record.registerRoot(root)]);
         expect(outcomes.filter((outcome) => outcome.status === "registered")).toHaveLength(1);
@@ -249,6 +254,7 @@ function runStorageContract(name: string, factory: StorageFactory): void {
           const caseEventGameId = `event-game-${label.replaceAll(" ", "-").toLowerCase()}`;
           const record = createEventGameRecord(harness.storage, {
             externalScopeResolver: resolver,
+            interpreter: createDeterministicTestIqaInterpreter("rules-v1"),
           });
           const outcome = await record.registerRoot(
             createRoot({
@@ -275,6 +281,7 @@ function runStorageContract(name: string, factory: StorageFactory): void {
       try {
         const record = createEventGameRecord(harness.storage, {
           externalScopeResolver: resolver,
+          interpreter: createDeterministicTestIqaInterpreter("rules-v1"),
         });
         expect(await record.registerRoot(root)).toMatchObject({ status: "registered" });
       } finally {
@@ -318,6 +325,7 @@ function runStorageContract(name: string, factory: StorageFactory): void {
           });
           const record = createEventGameRecord(harness.storage, {
             externalScopeResolver: createScopeResolver(root),
+            interpreter: createDeterministicTestIqaInterpreter("rules-v1"),
           });
           const outcome = await record.registerRoot(root);
           expect(outcome).toMatchObject({ status: "rejected", reason: "invalid-root" });

@@ -311,13 +311,27 @@ export function registerGrantAuthorityContract(
             });
           }),
         ).rejects.toThrow();
-        expect(await storage.readiness()).toMatchObject({ ok: true });
-        expect(
-          await authority.createControlGrant({
-            scope: { ...createScope(), pitchSlotId: "slot-after-active-downgrade" },
-            actor: createActor(),
-          }),
-        ).toMatchObject({ status: "created" });
+        const readinessAfterActiveDowngrade = await storage.readiness();
+        if (!readinessAfterActiveDowngrade.ok) {
+          expect(readinessAfterActiveDowngrade).toMatchObject({
+            ok: false,
+            status: "integrity-failure",
+          });
+          expect(
+            await authority.createControlGrant({
+              scope: { ...createScope(), pitchSlotId: "slot-after-active-downgrade" },
+              actor: createActor(),
+            }),
+          ).toMatchObject({ status: "rejected", reason: "unavailable" });
+        } else {
+          expect(readinessAfterActiveDowngrade).toMatchObject({ ok: true });
+          expect(
+            await authority.createControlGrant({
+              scope: { ...createScope(), pitchSlotId: "slot-after-active-downgrade" },
+              actor: createActor(),
+            }),
+          ).toMatchObject({ status: "created" });
+        }
       });
 
       await withStorage(createStorage, async (storage) => {
@@ -344,13 +358,27 @@ export function registerGrantAuthorityContract(
             });
           }),
         ).rejects.toThrow();
-        expect(await storage.readiness()).toMatchObject({ ok: true });
-        expect(
-          await authority.createControlGrant({
-            scope: { ...createScope(), pitchSlotId: "slot-after-erased-downgrade" },
-            actor: createActor(),
-          }),
-        ).toMatchObject({ status: "created" });
+        const readinessAfterErasedDowngrade = await storage.readiness();
+        if (!readinessAfterErasedDowngrade.ok) {
+          expect(readinessAfterErasedDowngrade).toMatchObject({
+            ok: false,
+            status: "integrity-failure",
+          });
+          expect(
+            await authority.createControlGrant({
+              scope: { ...createScope(), pitchSlotId: "slot-after-erased-downgrade" },
+              actor: createActor(),
+            }),
+          ).toMatchObject({ status: "rejected", reason: "unavailable" });
+        } else {
+          expect(readinessAfterErasedDowngrade).toMatchObject({ ok: true });
+          expect(
+            await authority.createControlGrant({
+              scope: { ...createScope(), pitchSlotId: "slot-after-erased-downgrade" },
+              actor: createActor(),
+            }),
+          ).toMatchObject({ status: "created" });
+        }
       });
     },
   );

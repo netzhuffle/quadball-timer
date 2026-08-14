@@ -184,6 +184,10 @@ export function createFoundationAcceptance(
   const clock = options.clock ?? (() => Date.now());
   const registry =
     options.actionCodecRegistry ?? createControlActionCodecRegistry(options.actionCodecs);
+  storage.setReadinessContext?.({
+    actionCodecRegistry: registry,
+    interpreter: options.interpreter,
+  });
   const limits = { ...ACCEPTANCE_LIMITS, ...options.limits };
   storage.setGrantValidationContext?.({
     environmentId: options.grant.environmentId,

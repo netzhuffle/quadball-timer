@@ -79,6 +79,17 @@ describe("focused SQLite composed acceptance", () => {
       storage.close();
 
       const reopened = openSqliteFoundationStorage(databasePath, { grantKeyRing: createKeyRing() });
+      expect(await reopened.readiness()).toMatchObject({
+        ok: false,
+        status: "integrity-failure",
+        evidence: { replay: { result: "not-configured", rootCount: 1 } },
+      });
+      const reopenedRecord = createEventGameRecord(reopened, {
+        externalScopeResolver: createScopeResolver(root),
+        interpreter: createDeterministicTestIqaInterpreter("rules-v1"),
+        auditAuthorityVerifier: { verify: () => true },
+      });
+      expect(await reopenedRecord.registerRoot(root)).toMatchObject({ status: "idempotent" });
       expect(await reopened.readiness()).toMatchObject({ ok: true, schemaVersion: "21" });
       expect(await reopened.readActions(root.recordId)).toHaveLength(1);
       expect(await reopened.readAuditEntries(root.recordId)).toHaveLength(1);
@@ -106,6 +117,7 @@ describe("focused SQLite composed acceptance", () => {
       if (admitted.status !== "admitted") throw new Error("Expected a Control Session.");
       const record = createEventGameRecord(storage, {
         externalScopeResolver: createScopeResolver(root),
+        interpreter: createDeterministicTestIqaInterpreter("rules-v1"),
       });
       expect(await record.registerRoot(root)).toMatchObject({ status: "registered" });
       const action = createFact(
@@ -182,6 +194,7 @@ describe("focused SQLite composed acceptance", () => {
         throw new Error(`Expected a Control Session: ${JSON.stringify(admitted)}`);
       const record = createEventGameRecord(bootstrap, {
         externalScopeResolver: createScopeResolver(root),
+        interpreter: createDeterministicTestIqaInterpreter("rules-v1"),
       });
       expect(await record.registerRoot(root)).toMatchObject({ status: "registered" });
       bootstrap.close();
@@ -318,8 +331,13 @@ describe("focused SQLite composed acceptance", () => {
       const finalVerify = openSqliteFoundationStorage(databasePath, {
         grantKeyRing: createKeyRing(),
       });
+      const finalRecord = createEventGameRecord(finalVerify, {
+        externalScopeResolver: createScopeResolver(root),
+        interpreter: createDeterministicTestIqaInterpreter("rules-v1"),
+      });
+      expect(await finalRecord.registerRoot(root)).toMatchObject({ status: "idempotent" });
       expect(await finalVerify.readiness()).toMatchObject({ ok: true });
-      expect(await finalVerify.readActions(root.recordId)).toHaveLength(3);
+      expect(await finalRecord.readActions()).toHaveLength(3);
       finalVerify.close();
     });
   });
@@ -343,6 +361,7 @@ describe("focused SQLite composed acceptance", () => {
       if (admitted.status !== "admitted") throw new Error("Expected a Control Session.");
       const record = createEventGameRecord(storage, {
         externalScopeResolver: createScopeResolver(root),
+        interpreter: createDeterministicTestIqaInterpreter("rules-v1"),
       });
       expect(await record.registerRoot(root)).toMatchObject({ status: "registered" });
       const nowMs = { value: 1_000 };
@@ -538,6 +557,7 @@ describe("focused SQLite composed acceptance", () => {
       if (admitted.status !== "admitted") throw new Error("Expected a Control Session.");
       const record = createEventGameRecord(storage, {
         externalScopeResolver: createScopeResolver(root),
+        interpreter: createDeterministicTestIqaInterpreter("rules-v1"),
       });
       expect(await record.registerRoot(root)).toMatchObject({ status: "registered" });
       const acceptance = createAcceptance(storage, root, grantOptions, true);
@@ -731,6 +751,7 @@ describe("focused SQLite composed acceptance", () => {
       if (admitted.status !== "admitted") throw new Error("Expected a Control Session.");
       const record = createEventGameRecord(storage, {
         externalScopeResolver: createScopeResolver(root),
+        interpreter: createDeterministicTestIqaInterpreter("rules-v1"),
       });
       expect(await record.registerRoot(root)).toMatchObject({ status: "registered" });
       const nowMs = { value: 1_000 };
@@ -816,6 +837,7 @@ describe("focused SQLite composed acceptance", () => {
         if (admitted.status !== "admitted") throw new Error("Expected a Control Session.");
         const record = createEventGameRecord(storage, {
           externalScopeResolver: createScopeResolver(root),
+          interpreter: createDeterministicTestIqaInterpreter("rules-v1"),
         });
         expect(await record.registerRoot(root)).toMatchObject({ status: "registered" });
         const first = createFact(
@@ -911,6 +933,7 @@ describe("focused SQLite composed acceptance", () => {
       if (admitted.status !== "admitted") throw new Error("Expected a Control Session.");
       const record = createEventGameRecord(storage, {
         externalScopeResolver: createScopeResolver(root),
+        interpreter: createDeterministicTestIqaInterpreter("rules-v1"),
       });
       expect(await record.registerRoot(root)).toMatchObject({ status: "registered" });
       const action = createFact(
@@ -1233,8 +1256,16 @@ async function withRaceCase(
     bootstrap.close();
 
     const left = openSqliteFoundationStorage(databasePath, { grantKeyRing: createKeyRing() });
+    createEventGameRecord(left, {
+      externalScopeResolver: createScopeResolver(root),
+      interpreter: createDeterministicTestIqaInterpreter("rules-v1"),
+    });
     const rightStorage = openSqliteFoundationStorage(databasePath, {
       grantKeyRing: createKeyRing(),
+    });
+    createEventGameRecord(rightStorage, {
+      externalScopeResolver: createScopeResolver(root),
+      interpreter: createDeterministicTestIqaInterpreter("rules-v1"),
     });
     const rightAuthority = createLegacyControlGrantTestAuthority(rightStorage, grantOptions);
     const scopeResolver = {
