@@ -1,4 +1,5 @@
 import { useEffect, useState, type ReactNode } from "react";
+import QRCode from "qrcode/lib/browser";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -234,6 +235,14 @@ type EventProjection = {
   }>;
 };
 
+type EventAdminGrantProjection = {
+  grantId: string;
+  grantVersion: string;
+  eventId: string;
+  status: "active" | "disabled" | "revoked" | "expired";
+  expiresAtMs: number | null;
+};
+
 function EventCatalogPanel() {
   const [events, setEvents] = useState<EventProjection[]>([]);
   const [selected, setSelected] = useState<EventProjection | null>(null);
@@ -244,10 +253,31 @@ function EventCatalogPanel() {
   const [timeZone, setTimeZone] = useState("Europe/Zurich");
   const [gameDayDate, setGameDayDate] = useState("");
   const [message, setMessage] = useState<string | null>(null);
+  const [eventAdminGrant, setEventAdminGrant] = useState<EventAdminGrantProjection | null>(null);
+  const [revealedCredential, setRevealedCredential] = useState<string | null>(null);
+  const [qrDataUrl, setQrDataUrl] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
+  useEffect(() => {
+    if (revealedCredential === null) {
+      setQrDataUrl(null);
+      return;
+    }
+    let cancelled = false;
+    void QRCode.toDataURL(revealedCredential, {
+      errorCorrectionLevel: "M",
+      margin: 2,
+      width: 320,
+    }).then((dataUrl) => {
+      if (!cancelled) setQrDataUrl(dataUrl);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [revealedCredential]);
+
   const request = async <T,>(url: string, init?: RequestInit) => {
-    const response = await fetch(url, init);
+    const response = await adminFetch(url, init);
     const payload = (await response.json()) as EventCatalogResponse<T>;
     if (!response.ok || payload.status !== "accepted") {
       throw new Error("detail" in payload ? payload.detail : "Event catalog operation failed.");
@@ -266,6 +296,10 @@ function EventCatalogPanel() {
       setEditedGameDays(
         Object.fromEntries(current.gameDays.map((day) => [day.gameDayId, day.date])),
       );
+      const grant = await request<EventAdminGrantProjection | null>(
+        `/api/admin/events/${current.eventId}/event-admin-grant`,
+      );
+      setEventAdminGrant(grant);
     }
   };
 
@@ -275,6 +309,12 @@ function EventCatalogPanel() {
     setEditedName(current.name);
     setEditedTimeZone(current.timeZone);
     setEditedGameDays(Object.fromEntries(current.gameDays.map((day) => [day.gameDayId, day.date])));
+    setEventAdminGrant(
+      await request<EventAdminGrantProjection | null>(
+        `/api/admin/events/${current.eventId}/event-admin-grant`,
+      ),
+    );
+    setRevealedCredential(null);
   };
 
   useEffect(() => {
@@ -430,6 +470,146 @@ function EventCatalogPanel() {
                 >
                   Remove empty Event
                 </Button>
+                <Button
+                  variant="outline"
+                  onClick={() => window.location.assign(`/event-admin?eventId=${selected.eventId}`)}
+                >
+                  Open Event Hub
+                </Button>
+              </div>
+              <div className="space-y-3 rounded-lg border p-3">
+                <div>
+                  <h3 className="font-semibold">Event Admin Grant</h3>
+                  <p className="text-xs text-muted-foreground">
+                    Shared Event-scoped handoff; the QR credential is shown only after an explicit
+                    reveal.
+                  </p>
+                </div>
+                {eventAdminGrant ? (
+                  <p className="text-sm">
+                    {eventAdminGrant.status} · {eventAdminGrant.grantId}
+                  </p>
+                ) : (
+                  <p className="text-sm text-muted-foreground">No Event Admin Grant yet.</p>
+                )}
+                <div className="flex flex-wrap gap-2">
+                  <Button
+                    disabled={busy || eventAdminGrant !== null}
+                    onClick={() =>
+                      void run(async () => {
+                        setEventAdminGrant(
+                          await request<EventAdminGrantProjection>(
+                            `/api/admin/events/${selected.eventId}/event-admin-grant`,
+                            {
+                              method: "POST",
+                              headers: { "content-type": "application/json" },
+                            },
+                          ),
+                        );
+                      })
+                    }
+                  >
+                    Create Grant
+                  </Button>
+                  <Button
+                    disabled={busy || eventAdminGrant === null}
+                    onClick={() =>
+                      void run(async () => {
+                        const response = await adminFetch(
+                          `/api/admin/events/${selected.eventId}/event-admin-grant/reveal`,
+                          { method: "POST", headers: { "content-type": "application/json" } },
+                        );
+                        const payload = (await response.json()) as EventCatalogResponse<{
+                          qrCredential: string;
+                        }>;
+                        if (!response.ok || payload.status !== "accepted")
+                          throw new Error("Grant reveal failed.");
+                        setRevealedCredential(payload.value.qrCredential);
+                      })
+                    }
+                  >
+                    Reveal QR credential
+                  </Button>
+                  <Button
+                    variant="outline"
+                    disabled={busy || eventAdminGrant?.status !== "active"}
+                    onClick={() =>
+                      void run(async () => {
+                        await request(
+                          `/api/admin/events/${selected.eventId}/event-admin-grant/rotate`,
+                          {
+                            method: "POST",
+                            headers: { "content-type": "application/json" },
+                          },
+                        );
+                        setRevealedCredential(null);
+                        await refresh();
+                      })
+                    }
+                  >
+                    Rotate Grant
+                  </Button>
+                  <Button
+                    variant="outline"
+                    disabled={busy || eventAdminGrant?.status !== "active"}
+                    onClick={() =>
+                      void run(async () => {
+                        await request(
+                          `/api/admin/events/${selected.eventId}/event-admin-grant/disable`,
+                          { method: "POST", headers: { "content-type": "application/json" } },
+                        );
+                        await refresh();
+                      })
+                    }
+                  >
+                    Disable Grant
+                  </Button>
+                  <Button
+                    variant="outline"
+                    disabled={busy || eventAdminGrant?.status !== "active"}
+                    onClick={() =>
+                      void run(async () => {
+                        await request(
+                          `/api/admin/events/${selected.eventId}/event-admin-grant/revoke`,
+                          { method: "POST", headers: { "content-type": "application/json" } },
+                        );
+                        await refresh();
+                      })
+                    }
+                  >
+                    Revoke Grant
+                  </Button>
+                  <Button
+                    variant="outline"
+                    disabled={
+                      busy || eventAdminGrant?.status === "active" || eventAdminGrant === null
+                    }
+                    onClick={() =>
+                      void run(async () => {
+                        await request(
+                          `/api/admin/events/${selected.eventId}/event-admin-grant/reactivate`,
+                          { method: "POST", headers: { "content-type": "application/json" } },
+                        );
+                        setRevealedCredential(null);
+                        await refresh();
+                      })
+                    }
+                  >
+                    Reactivate Grant
+                  </Button>
+                </div>
+                {qrDataUrl ? (
+                  <div className="space-y-2 rounded-md border bg-white p-3">
+                    <img
+                      alt="Event Admin Grant QR code"
+                      className="mx-auto size-80 max-w-full"
+                      src={qrDataUrl}
+                    />
+                    <p className="text-center text-xs text-muted-foreground">
+                      Scan this protected QR code on the Event Admin device.
+                    </p>
+                  </div>
+                ) : null}
               </div>
               <div className="space-y-2">
                 <Label htmlFor="game-day-date">Add Game Day</Label>

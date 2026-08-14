@@ -1,0 +1,447 @@
+import { describe, expect, test } from "bun:test";
+import { createEventAdministration } from "@/lib/event-administration";
+import { createEventCatalog, createFoundationEventCatalogStorage } from "@/lib/event-catalog";
+import type { FoundationStorage } from "@/lib/foundation-storage";
+import { createInMemoryFoundationStorage } from "@/lib/foundation-storage-memory";
+import { createGrantAuthority, createGrantAuthorityVerifier } from "@/lib/grant-authority";
+import type { GrantKeyRing } from "@/lib/grant-types";
+import {
+  MemoryTechnicalAdminAuthRepository,
+  createTechnicalAdminAuth,
+  isTechnicalAdminAuthority,
+} from "@/lib/technical-admin-auth";
+
+const keyRing: GrantKeyRing = {
+  encryption: { currentVersion: "v1", keys: new Map([["v1", bytes(1)]]) },
+  lookup: { currentVersion: "v1", keys: new Map([["v1", bytes(2)]]) },
+  audit: { currentVersion: "v1", keys: new Map([["v1", bytes(3)]]) },
+};
+
+describe("Event Administration handoff", () => {
+  test("creates a secret-free handoff, admits a pseudonymous session, and opens the same Hub", async () => {
+    const fixture = createFixture();
+    const event = await fixture.catalog.createEvent(
+      { name: "Two Day Event", timeZone: "Europe/Zurich" },
+      fixture.technical,
+    );
+    if (event.status !== "accepted") throw new Error("Expected Event.");
+    await fixture.catalog.addGameDay(
+      event.value.eventId,
+      { date: "2026-08-14" },
+      fixture.technical,
+    );
+    await fixture.catalog.addGameDay(
+      event.value.eventId,
+      { date: "2026-08-15" },
+      fixture.technical,
+    );
+
+    const created = await fixture.administration.createEventAdminGrant(
+      event.value.eventId,
+      fixture.technical,
+    );
+    expect(created).toMatchObject({ status: "accepted", value: { status: "active" } });
+    expect(JSON.stringify(created)).not.toContain("qrCredential");
+    if (created.status !== "accepted") throw new Error("Expected Grant.");
+
+    const grant = await fixture.grants.revealGrant(created.value.grantId, fixture.technical);
+    if (grant.status !== "revealed") throw new Error("Expected Grant reveal.");
+    const admission = await fixture.administration.admitEventAdmin({
+      qrCredential: grant.qrCredential,
+      browserContext: "browser-a",
+      deviceClass: "mobile",
+      browserClass: "safari",
+    });
+    expect(admission).toMatchObject({ status: "admitted", eventGameId: null });
+    if (admission.status !== "admitted") return;
+
+    const eventAdminHub = await fixture.administration.openEventHub({
+      eventId: event.value.eventId,
+      authority: { kind: "grant-session", sessionBearer: admission.sessionBearer },
+    });
+    expect(eventAdminHub).toMatchObject({
+      status: "accepted",
+      value: { authority: "event-admin", event: { eventId: event.value.eventId } },
+    });
+    const technicalHub = await fixture.administration.openEventHub({
+      eventId: event.value.eventId,
+      authority: fixture.technical,
+    });
+    expect(technicalHub).toMatchObject({
+      status: "accepted",
+      value: { authority: "technical-admin", event: { eventId: event.value.eventId } },
+    });
+  });
+
+  test("rejects duplicate Event Admin creation without creating another authority", async () => {
+    const fixture = createFixture();
+    const event = await fixture.catalog.createEvent(
+      { name: "Singular Event", timeZone: "UTC" },
+      fixture.technical,
+    );
+    if (event.status !== "accepted") throw new Error("Expected Event.");
+    await fixture.catalog.addGameDay(
+      event.value.eventId,
+      { date: "2026-08-14" },
+      fixture.technical,
+    );
+
+    const first = await fixture.administration.createEventAdminGrant(
+      event.value.eventId,
+      fixture.technical,
+    );
+    const duplicate = await fixture.administration.createEventAdminGrant(
+      event.value.eventId,
+      fixture.technical,
+    );
+    expect(first).toMatchObject({ status: "accepted", value: { status: "active" } });
+    expect(duplicate).toMatchObject({
+      status: "rejected",
+      reason: "invalid-input",
+      detail: "An Event Admin Grant already exists for this Event.",
+    });
+    expect(
+      await fixture.storage.transaction((transaction) =>
+        transaction
+          .listGrants()
+          .filter(
+            (grant) =>
+              grant.grantType === "event-admin" && grant.scope.eventId === event.value.eventId,
+          ),
+      ),
+    ).toHaveLength(1);
+  });
+
+  test("revokes stale sessions across disable/reactivate and expiry", async () => {
+    const fixture = createFixture();
+    const event = await fixture.catalog.createEvent(
+      { name: "Lifecycle Event", timeZone: "UTC" },
+      fixture.technical,
+    );
+    if (event.status !== "accepted") throw new Error("Expected Event.");
+    await fixture.catalog.addGameDay(
+      event.value.eventId,
+      { date: "2026-08-14" },
+      fixture.technical,
+    );
+    const created = await fixture.administration.createEventAdminGrant(
+      event.value.eventId,
+      fixture.technical,
+    );
+    if (created.status !== "accepted") throw new Error("Expected Grant.");
+    const firstCredential = await fixture.grants.revealGrant(
+      created.value.grantId,
+      fixture.technical,
+    );
+    if (firstCredential.status !== "revealed") throw new Error("Expected reveal.");
+    const firstAdmission = await fixture.administration.admitEventAdmin({
+      qrCredential: firstCredential.qrCredential,
+      browserContext: "lifecycle-browser",
+    });
+    if (firstAdmission.status !== "admitted") throw new Error("Expected admission.");
+
+    expect(
+      await fixture.administration.disableEventAdminGrant(event.value.eventId, fixture.technical),
+    ).toMatchObject({ status: "accepted", value: { status: "updated" } });
+    expect(
+      await fixture.administration.openEventHub({
+        eventId: event.value.eventId,
+        authority: { kind: "grant-session", sessionBearer: firstAdmission.sessionBearer },
+      }),
+    ).toMatchObject({ status: "rejected", reason: "unauthorized" });
+
+    expect(
+      await fixture.administration.reactivateEventAdminGrant(
+        event.value.eventId,
+        fixture.technical,
+      ),
+    ).toMatchObject({ status: "accepted", value: { status: "updated" } });
+    expect(
+      await fixture.administration.openEventHub({
+        eventId: event.value.eventId,
+        authority: { kind: "grant-session", sessionBearer: firstAdmission.sessionBearer },
+      }),
+    ).toMatchObject({ status: "rejected", reason: "unauthorized" });
+
+    const freshCredential = await fixture.grants.revealGrant(
+      created.value.grantId,
+      fixture.technical,
+    );
+    if (freshCredential.status !== "revealed") throw new Error("Expected fresh reveal.");
+    const freshAdmission = await fixture.administration.admitEventAdmin({
+      qrCredential: freshCredential.qrCredential,
+      browserContext: "fresh-lifecycle-browser",
+    });
+    if (freshAdmission.status !== "admitted") throw new Error("Expected fresh admission.");
+    expect(
+      await fixture.administration.openEventHub({
+        eventId: event.value.eventId,
+        authority: { kind: "grant-session", sessionBearer: freshAdmission.sessionBearer },
+      }),
+    ).toMatchObject({ status: "accepted" });
+    fixture.setNow(Date.parse("2026-09-20T12:00:00Z"));
+    expect(
+      await fixture.administration.openEventHub({
+        eventId: event.value.eventId,
+        authority: { kind: "grant-session", sessionBearer: freshAdmission.sessionBearer },
+      }),
+    ).toMatchObject({ status: "rejected", reason: "unauthorized" });
+  });
+
+  test("rejects wrong-Event sessions and invalidates a rotated Grant before projection", async () => {
+    const fixture = createFixture();
+    const first = await fixture.catalog.createEvent(
+      { name: "First", timeZone: "UTC" },
+      fixture.technical,
+    );
+    const second = await fixture.catalog.createEvent(
+      { name: "Second", timeZone: "UTC" },
+      fixture.technical,
+    );
+    if (first.status !== "accepted" || second.status !== "accepted")
+      throw new Error("Expected Events.");
+    await fixture.catalog.addGameDay(
+      first.value.eventId,
+      { date: "2026-08-14" },
+      fixture.technical,
+    );
+    await fixture.catalog.addGameDay(
+      second.value.eventId,
+      { date: "2026-08-14" },
+      fixture.technical,
+    );
+    const grant = await fixture.grants.createEventAdminGrant({
+      authority: fixture.technical,
+      scope: { eventId: first.value.eventId, eventTimeZone: "UTC", finalGameDayDate: "2026-08-14" },
+    });
+    if (grant.status !== "created") throw new Error("Expected Grant.");
+    const admission = await fixture.administration.admitEventAdmin({
+      qrCredential: grant.qrCredential,
+      browserContext: "browser-b",
+    });
+    if (admission.status !== "admitted") throw new Error("Expected admission.");
+
+    expect(
+      await fixture.administration.openEventHub({
+        eventId: second.value.eventId,
+        authority: { kind: "grant-session", sessionBearer: admission.sessionBearer },
+      }),
+    ).toMatchObject({ status: "rejected", reason: "unauthorized" });
+    expect(
+      await fixture.administration.rotateEventAdminGrant(first.value.eventId, fixture.technical),
+    ).toMatchObject({
+      status: "accepted",
+      value: { status: "updated" },
+    });
+    expect(
+      await fixture.administration.openEventHub({
+        eventId: first.value.eventId,
+        authority: { kind: "grant-session", sessionBearer: admission.sessionBearer },
+      }),
+    ).toMatchObject({ status: "rejected", reason: "unauthorized" });
+  });
+
+  test("explicitly revokes a newly admitted currently valid session", async () => {
+    const fixture = createFixture();
+    const event = await fixture.catalog.createEvent(
+      { name: "Revoke Event", timeZone: "UTC" },
+      fixture.technical,
+    );
+    if (event.status !== "accepted") throw new Error("Expected Event.");
+    await fixture.catalog.addGameDay(
+      event.value.eventId,
+      { date: "2026-08-14" },
+      fixture.technical,
+    );
+    const grant = await fixture.administration.createEventAdminGrant(
+      event.value.eventId,
+      fixture.technical,
+    );
+    if (grant.status !== "accepted") throw new Error("Expected Grant.");
+    const reveal = await fixture.grants.revealGrant(grant.value.grantId, fixture.technical);
+    if (reveal.status !== "revealed") throw new Error("Expected reveal.");
+    const admission = await fixture.administration.admitEventAdmin({
+      qrCredential: reveal.qrCredential,
+      browserContext: "revoke-browser",
+    });
+    if (admission.status !== "admitted") throw new Error("Expected admission.");
+    expect(
+      await fixture.administration.openEventHub({
+        eventId: event.value.eventId,
+        authority: { kind: "grant-session", sessionBearer: admission.sessionBearer },
+      }),
+    ).toMatchObject({ status: "accepted" });
+    expect(
+      await fixture.administration.revokeEventAdminGrant(event.value.eventId, fixture.technical),
+    ).toMatchObject({ status: "accepted", value: { status: "updated" } });
+    expect(
+      await fixture.administration.openEventHub({
+        eventId: event.value.eventId,
+        authority: { kind: "grant-session", sessionBearer: admission.sessionBearer },
+      }),
+    ).toMatchObject({ status: "rejected", reason: "unauthorized" });
+  });
+
+  test("keeps Grant, session, audit, and catalog state unchanged on an injected transaction failure", async () => {
+    const baseStorage = createInMemoryFoundationStorage();
+    let failNext = false;
+    const storage = new Proxy(baseStorage, {
+      get(target, property, receiver) {
+        if (property === "transaction") {
+          return (work: Parameters<FoundationStorage["transaction"]>[0]) =>
+            target.transaction((transaction) => {
+              const result = work(transaction);
+              if (failNext) {
+                failNext = false;
+                throw new Error("injected transaction failure");
+              }
+              return result;
+            });
+        }
+        const value = Reflect.get(target, property, receiver);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    }) as FoundationStorage;
+    const fixture = createFixture(storage);
+    const event = await fixture.catalog.createEvent(
+      { name: "Failure Event", timeZone: "UTC" },
+      fixture.technical,
+    );
+    if (event.status !== "accepted") throw new Error("Expected Event.");
+    await fixture.catalog.addGameDay(
+      event.value.eventId,
+      { date: "2026-08-14" },
+      fixture.technical,
+    );
+    const grant = await fixture.administration.createEventAdminGrant(
+      event.value.eventId,
+      fixture.technical,
+    );
+    if (grant.status !== "accepted") throw new Error("Expected Grant.");
+    const reveal = await fixture.grants.revealGrant(grant.value.grantId, fixture.technical);
+    if (reveal.status !== "revealed") throw new Error("Expected reveal.");
+    const admission = await fixture.administration.admitEventAdmin({
+      qrCredential: reveal.qrCredential,
+      browserContext: "failure-browser",
+    });
+    if (admission.status !== "admitted") throw new Error("Expected admission.");
+    const readState = () =>
+      baseStorage.transaction((transaction) => ({
+        grants: transaction.listGrants(),
+        sessions: transaction.listGrantSessions(grant.value.grantId),
+        grantAudit: transaction.listGrantAudit(grant.value.grantId),
+        event: transaction.findEvent(event.value.eventId),
+        gameDays: transaction.listGameDays(event.value.eventId),
+        eventAudit: transaction.listEventAuditTrail(event.value.eventId),
+      }));
+    const before = await readState();
+    failNext = true;
+    expect(
+      await fixture.administration.openEventHub({
+        eventId: event.value.eventId,
+        authority: { kind: "grant-session", sessionBearer: admission.sessionBearer },
+      }),
+    ).toMatchObject({ status: "retryable-failure" });
+    expect(await readState()).toEqual(before);
+  });
+
+  test("preserves empty Event removal while rejecting removal of an attached Grant", async () => {
+    const fixture = createFixture();
+    const event = await fixture.catalog.createEvent(
+      { name: "Attached Grant Event", timeZone: "UTC" },
+      fixture.technical,
+    );
+    if (event.status !== "accepted") throw new Error("Expected Event.");
+    const day = await fixture.catalog.addGameDay(
+      event.value.eventId,
+      { date: "2026-08-14" },
+      fixture.technical,
+    );
+    if (day.status !== "accepted") throw new Error("Expected Game Day.");
+    const grant = await fixture.administration.createEventAdminGrant(
+      event.value.eventId,
+      fixture.technical,
+    );
+    if (grant.status !== "accepted") throw new Error("Expected Grant.");
+    expect(
+      await fixture.catalog.removeGameDay(
+        event.value.eventId,
+        day.value.gameDayId,
+        fixture.technical,
+      ),
+    ).toMatchObject({ status: "accepted" });
+    expect(await fixture.catalog.removeEvent(event.value.eventId, fixture.technical)).toMatchObject(
+      {
+        status: "rejected",
+        reason: "in-use",
+        detail: "Event has an attached Event Admin Grant.",
+      },
+    );
+    const empty = await fixture.catalog.createEvent(
+      { name: "No Grant Event", timeZone: "UTC" },
+      fixture.technical,
+    );
+    if (empty.status !== "accepted") throw new Error("Expected empty Event.");
+    expect(await fixture.catalog.removeEvent(empty.value.eventId, fixture.technical)).toMatchObject(
+      {
+        status: "accepted",
+      },
+    );
+  });
+});
+
+function createFixture(storage: FoundationStorage = createInMemoryFoundationStorage()) {
+  let nowMs = Date.parse("2026-08-14T12:00:00Z");
+  let entropy = 7;
+  const technical = createTechnicalAdminAuth(
+    { environment: "test", origin: "https://timer.example", rpId: "timer.example" },
+    new MemoryTechnicalAdminAuthRepository(),
+  ).resolveHostLocalAuthority();
+  const catalog = createEventCatalog(createFoundationEventCatalogStorage(storage), {
+    clock: { nowMs: () => nowMs },
+  });
+  const options = {
+    environmentId: "test",
+    clock: { nowMs: () => nowMs },
+    randomness: {
+      bytes: (length: number) => {
+        const seed = entropy++;
+        return Uint8Array.from({ length }, (_, index) => ((seed + index * 37) % 240) + 1);
+      },
+    },
+    keyRing,
+    controlScopeResolver: { resolve: () => ({ status: "unavailable" as const }) },
+    privilegedAuthorityVerifier: createGrantAuthorityVerifier((input) => {
+      if (isTechnicalAdminAuthority(input)) return { kind: "technical-admin", id: input.sessionId };
+      if (
+        isRecord(input) &&
+        input.kind === "grant-session" &&
+        typeof input.sessionBearer === "string"
+      )
+        return { kind: "grant-session", sessionBearer: input.sessionBearer, sessionId: "session" };
+      return null;
+    }),
+  };
+  const grants = createGrantAuthority(storage, options);
+  const administration = createEventAdministration({
+    storage,
+    grants,
+    nowMs: () => nowMs,
+  });
+  return {
+    storage,
+    technical,
+    catalog,
+    grants,
+    administration,
+    setNow: (value: number) => (nowMs = value),
+  };
+}
+
+function bytes(value: number): Uint8Array {
+  return new Uint8Array(32).fill(value);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
