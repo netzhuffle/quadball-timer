@@ -200,10 +200,6 @@ _Avoid_: Live database, production instance
 The permanent non-production Quadball Timer environment used for rehearsals, demonstrations, and testing. Its Events, credentials, authority, and operational records are separate from and never authoritative in the Production Environment.
 _Avoid_: Rehearsal Environment, staging environment, test database
 
-**Production Acceptance Authority**:
-Either of the two people who must approve production use for an Event: the repository maintainer for technical readiness and the organizing association's president for operational readiness. Both approvals are required, and either authority may require fallback to the Official Score Sheet and manual timing.
-_Avoid_: Technical Admin, Event Admin
-
 **Event Admin Grant**:
 The Event-scoped shared capability that admits Event Admins without individual accounts. It is created and managed by the Technical Admin.
 _Avoid_: Event Admin account, organizer account
