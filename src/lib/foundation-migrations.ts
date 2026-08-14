@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto";
 
+import { createFoundationGrantErasureMigrationSql } from "./foundation-grant-erasure-migration";
+
 export const FOUNDATION_MIGRATION_LEDGER_TABLE = "foundation_migration_ledger";
 
 export type FoundationMigration = {
@@ -177,6 +179,202 @@ export const FOUNDATION_AUDIT_RECORD_INDEX_SQL = `
     ON foundation_event_game_record_audit (record_id, created_at_ms)
 `;
 
+const FOUNDATION_GRANT_TABLE_V4_SQL = `
+  CREATE TABLE foundation_grant_roots (
+    grant_id TEXT PRIMARY KEY,
+    grant_type TEXT NOT NULL CHECK (grant_type = 'control'),
+    grant_version TEXT NOT NULL UNIQUE,
+    event_id TEXT NOT NULL,
+    game_day_id TEXT NOT NULL,
+    pitch_id TEXT NOT NULL,
+    pitch_slot_id TEXT NOT NULL UNIQUE,
+    status TEXT NOT NULL CHECK (status IN ('active', 'disabled', 'revoked', 'expired')),
+    created_at_ms INTEGER NOT NULL,
+    expires_at_ms INTEGER,
+    credential_format_version INTEGER NOT NULL CHECK (credential_format_version = 1),
+    credential_kind TEXT NOT NULL CHECK (credential_kind = 'qr'),
+    encryption_key_version TEXT NOT NULL,
+    lookup_key_version TEXT NOT NULL,
+    credential_iv TEXT NOT NULL,
+    credential_ciphertext TEXT NOT NULL,
+    credential_tag TEXT NOT NULL,
+    credential_lookup_digest TEXT NOT NULL UNIQUE,
+    credential_fingerprint TEXT NOT NULL,
+    CHECK (expires_at_ms IS NULL OR expires_at_ms > created_at_ms)
+  ) STRICT
+`;
+
+const FOUNDATION_GRANT_SESSION_TABLE_V4_SQL = `
+  CREATE TABLE foundation_grant_sessions (
+    session_id TEXT PRIMARY KEY,
+    grant_id TEXT NOT NULL REFERENCES foundation_grant_roots(grant_id) ON DELETE CASCADE,
+    grant_version TEXT NOT NULL,
+    event_game_id TEXT NOT NULL,
+    browser_context_digest TEXT NOT NULL,
+    browser_context_key_version TEXT NOT NULL,
+    bearer_lookup_verifier TEXT NOT NULL UNIQUE,
+    bearer_lookup_key_version TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('active', 'revoked', 'expired')),
+    created_at_ms INTEGER NOT NULL,
+    last_active_at_ms INTEGER NOT NULL,
+    revoked_at_ms INTEGER,
+    CHECK ((status = 'active' AND revoked_at_ms IS NULL) OR (status <> 'active'))
+  ) STRICT
+`;
+
+export const FOUNDATION_GRANT_TABLE_SQL = `
+  CREATE TABLE foundation_grant_roots (
+    grant_id TEXT PRIMARY KEY,
+    grant_type TEXT NOT NULL CHECK (grant_type = 'control'),
+    grant_version TEXT NOT NULL UNIQUE,
+    event_id TEXT NOT NULL,
+    game_day_id TEXT NOT NULL,
+    pitch_id TEXT NOT NULL,
+    pitch_slot_id TEXT NOT NULL UNIQUE,
+    status TEXT NOT NULL CHECK (status IN ('active', 'disabled', 'revoked', 'expired')),
+    created_at_ms INTEGER NOT NULL,
+    expires_at_ms INTEGER,
+    credential_format_version INTEGER NOT NULL CHECK (credential_format_version = 1),
+    credential_kind TEXT NOT NULL CHECK (credential_kind = 'qr'),
+    credential_material_state TEXT NOT NULL CHECK (credential_material_state IN ('present', 'erased')),
+    encryption_key_version TEXT,
+    lookup_key_version TEXT,
+    credential_iv TEXT,
+    credential_ciphertext TEXT,
+    credential_tag TEXT,
+    credential_lookup_digest TEXT UNIQUE,
+    credential_fingerprint TEXT NOT NULL,
+    CHECK (expires_at_ms IS NULL OR expires_at_ms > created_at_ms),
+    CHECK (
+      (credential_material_state = 'present' AND encryption_key_version IS NOT NULL AND lookup_key_version IS NOT NULL AND credential_iv IS NOT NULL AND credential_ciphertext IS NOT NULL AND credential_tag IS NOT NULL AND credential_lookup_digest IS NOT NULL)
+      OR
+      (credential_material_state = 'erased' AND encryption_key_version IS NULL AND lookup_key_version IS NULL AND credential_iv IS NULL AND credential_ciphertext IS NULL AND credential_tag IS NULL AND credential_lookup_digest IS NULL)
+    ),
+    CHECK (
+      (status = 'expired' AND credential_material_state = 'erased')
+      OR
+      (status <> 'expired' AND credential_material_state = 'present')
+    )
+  ) STRICT
+`;
+
+export const FOUNDATION_GRANT_SESSION_TABLE_SQL = `
+  CREATE TABLE foundation_grant_sessions (
+    session_id TEXT PRIMARY KEY,
+    grant_id TEXT NOT NULL REFERENCES foundation_grant_roots(grant_id) ON DELETE CASCADE,
+    grant_version TEXT NOT NULL,
+    event_game_id TEXT NOT NULL,
+    browser_context_digest TEXT NOT NULL,
+    browser_context_key_version TEXT NOT NULL,
+    bearer_material_state TEXT NOT NULL CHECK (bearer_material_state IN ('present', 'erased')),
+    bearer_lookup_verifier TEXT UNIQUE,
+    bearer_lookup_key_version TEXT,
+    status TEXT NOT NULL CHECK (status IN ('active', 'revoked', 'expired')),
+    created_at_ms INTEGER NOT NULL,
+    last_active_at_ms INTEGER NOT NULL,
+    revoked_at_ms INTEGER,
+    CHECK ((status = 'active' AND revoked_at_ms IS NULL) OR (status <> 'active')),
+    CHECK (
+      (bearer_material_state = 'present' AND bearer_lookup_verifier IS NOT NULL AND bearer_lookup_key_version IS NOT NULL)
+      OR
+      (bearer_material_state = 'erased' AND bearer_lookup_verifier IS NULL AND bearer_lookup_key_version IS NULL)
+    ),
+    CHECK (
+      (status = 'expired' AND bearer_material_state = 'erased')
+      OR
+      (status <> 'expired' AND bearer_material_state = 'present')
+    )
+  ) STRICT
+`;
+
+const FOUNDATION_GRANT_AUDIT_TABLE_V4_SQL = `
+  CREATE TABLE foundation_grant_audit (
+    audit_id TEXT PRIMARY KEY,
+    action TEXT NOT NULL CHECK (action IN ('grant-created', 'credential-revealed', 'grant-disabled', 'grant-revoked', 'session-admitted', 'session-replaced')),
+    outcome TEXT NOT NULL CHECK (outcome = 'accepted'),
+    actor_reference TEXT NOT NULL,
+    grant_id TEXT NOT NULL REFERENCES foundation_grant_roots(grant_id) ON DELETE CASCADE,
+    grant_type TEXT NOT NULL CHECK (grant_type = 'control'),
+    grant_version TEXT NOT NULL,
+    event_id TEXT NOT NULL,
+    game_day_id TEXT NOT NULL,
+    pitch_id TEXT NOT NULL,
+    pitch_slot_id TEXT NOT NULL,
+    session_id TEXT,
+    replaced_session_id TEXT,
+    event_game_id TEXT,
+    credential_kind TEXT CHECK (credential_kind IS NULL OR credential_kind = 'qr'),
+    credential_fingerprint TEXT,
+    before_status TEXT CHECK (before_status IS NULL OR before_status IN ('active', 'disabled', 'revoked', 'expired')),
+    after_status TEXT CHECK (after_status IS NULL OR after_status IN ('active', 'disabled', 'revoked', 'expired')),
+    created_at_ms INTEGER NOT NULL
+  ) STRICT
+`;
+
+const FOUNDATION_GRANT_AUDIT_TABLE_V5_SQL = `
+  CREATE TABLE foundation_grant_audit (
+    audit_id TEXT PRIMARY KEY,
+    action TEXT NOT NULL CHECK (action IN ('grant-created', 'credential-revealed', 'grant-expired', 'grant-disabled', 'grant-revoked', 'session-admitted', 'session-replaced')),
+    outcome TEXT NOT NULL CHECK (outcome = 'accepted'),
+    actor_reference TEXT NOT NULL,
+    grant_id TEXT NOT NULL REFERENCES foundation_grant_roots(grant_id) ON DELETE CASCADE,
+    grant_type TEXT NOT NULL CHECK (grant_type = 'control'),
+    grant_version TEXT NOT NULL,
+    event_id TEXT NOT NULL,
+    game_day_id TEXT NOT NULL,
+    pitch_id TEXT NOT NULL,
+    pitch_slot_id TEXT NOT NULL,
+    session_id TEXT,
+    replaced_session_id TEXT,
+    event_game_id TEXT,
+    credential_kind TEXT CHECK (credential_kind IS NULL OR credential_kind = 'qr'),
+    credential_fingerprint TEXT,
+    before_status TEXT CHECK (before_status IS NULL OR before_status IN ('active', 'disabled', 'revoked', 'expired')),
+    after_status TEXT CHECK (after_status IS NULL OR after_status IN ('active', 'disabled', 'revoked', 'expired')),
+    created_at_ms INTEGER NOT NULL
+  ) STRICT
+`;
+
+export const FOUNDATION_GRANT_AUDIT_TABLE_SQL = `
+  CREATE TABLE foundation_grant_audit (
+    audit_id TEXT PRIMARY KEY,
+    action TEXT NOT NULL CHECK (action IN ('grant-created', 'credential-revealed', 'credential-rotated', 'grant-expired', 'grant-disabled', 'grant-revoked', 'session-admitted', 'session-replaced')),
+    outcome TEXT NOT NULL CHECK (outcome = 'accepted'),
+    actor_reference TEXT NOT NULL,
+    grant_id TEXT NOT NULL REFERENCES foundation_grant_roots(grant_id) ON DELETE CASCADE,
+    grant_type TEXT NOT NULL CHECK (grant_type = 'control'),
+    grant_version TEXT NOT NULL,
+    event_id TEXT NOT NULL,
+    game_day_id TEXT NOT NULL,
+    pitch_id TEXT NOT NULL,
+    pitch_slot_id TEXT NOT NULL,
+    session_id TEXT,
+    replaced_session_id TEXT,
+    event_game_id TEXT,
+    credential_kind TEXT CHECK (credential_kind IS NULL OR credential_kind = 'qr'),
+    credential_fingerprint TEXT,
+    before_status TEXT CHECK (before_status IS NULL OR before_status IN ('active', 'disabled', 'revoked', 'expired')),
+    after_status TEXT CHECK (after_status IS NULL OR after_status IN ('active', 'disabled', 'revoked', 'expired')),
+    created_at_ms INTEGER NOT NULL
+  ) STRICT
+`;
+
+export const FOUNDATION_GRANT_SESSION_GRANT_INDEX_SQL = `
+  CREATE INDEX foundation_grant_sessions_grant_id
+    ON foundation_grant_sessions (grant_id)
+`;
+
+export const FOUNDATION_GRANT_SESSION_CONTEXT_INDEX_SQL = `
+  CREATE UNIQUE INDEX foundation_grant_sessions_active_context
+    ON foundation_grant_sessions (grant_id, browser_context_digest)
+    WHERE status = 'active'
+`;
+
+export const FOUNDATION_GRANT_AUDIT_GRANT_INDEX_SQL = `
+  CREATE INDEX foundation_grant_audit_grant_id
+    ON foundation_grant_audit (grant_id, audit_id)
+`;
+
 const FOUNDATION_INITIAL_ROOT_MIGRATION_SQL = `
       CREATE TABLE foundation_event_game_record_roots (
         record_id TEXT PRIMARY KEY,
@@ -318,6 +516,46 @@ const FOUNDATION_ACTIONS_MIGRATION_SQL = `
   ${FOUNDATION_AUDIT_RECORD_INDEX_SQL};
 `;
 
+const FOUNDATION_GRANT_MIGRATION_SQL = `
+  ${FOUNDATION_GRANT_TABLE_V4_SQL};
+  ${FOUNDATION_GRANT_SESSION_TABLE_V4_SQL};
+  ${FOUNDATION_GRANT_AUDIT_TABLE_V4_SQL};
+  ${FOUNDATION_GRANT_SESSION_GRANT_INDEX_SQL};
+  ${FOUNDATION_GRANT_SESSION_CONTEXT_INDEX_SQL};
+  ${FOUNDATION_GRANT_AUDIT_GRANT_INDEX_SQL};
+`;
+
+const FOUNDATION_GRANT_EXPIRY_MIGRATION_SQL = `
+  ${FOUNDATION_GRANT_AUDIT_TABLE_V5_SQL.replace(
+    "CREATE TABLE foundation_grant_audit",
+    "CREATE TABLE foundation_grant_audit_v4",
+  )};
+  INSERT INTO foundation_grant_audit_v4 (
+    audit_id, action, outcome, actor_reference, grant_id, grant_type, grant_version,
+    event_id, game_day_id, pitch_id, pitch_slot_id, session_id, replaced_session_id,
+    event_game_id, credential_kind, credential_fingerprint, before_status, after_status,
+    created_at_ms
+  )
+  SELECT
+    audit_id, action, outcome, actor_reference, grant_id, grant_type, grant_version,
+    event_id, game_day_id, pitch_id, pitch_slot_id, session_id, replaced_session_id,
+    event_game_id, credential_kind, credential_fingerprint, before_status, after_status,
+    created_at_ms
+  FROM foundation_grant_audit;
+  DROP TABLE foundation_grant_audit;
+  ALTER TABLE foundation_grant_audit_v4 RENAME TO foundation_grant_audit;
+  ${FOUNDATION_GRANT_AUDIT_GRANT_INDEX_SQL};
+`;
+
+const FOUNDATION_GRANT_ERASURE_MIGRATION_SQL = createFoundationGrantErasureMigrationSql({
+  grantTableSql: FOUNDATION_GRANT_TABLE_SQL,
+  sessionTableSql: FOUNDATION_GRANT_SESSION_TABLE_SQL,
+  auditTableSql: FOUNDATION_GRANT_AUDIT_TABLE_SQL,
+  sessionGrantIndexSql: FOUNDATION_GRANT_SESSION_GRANT_INDEX_SQL,
+  sessionContextIndexSql: FOUNDATION_GRANT_SESSION_CONTEXT_INDEX_SQL,
+  auditGrantIndexSql: FOUNDATION_GRANT_AUDIT_GRANT_INDEX_SQL,
+});
+
 export const FOUNDATION_MIGRATIONS: readonly FoundationMigration[] = Object.freeze([
   createMigration({
     id: "001-foundation-event-game-record-roots",
@@ -336,6 +574,24 @@ export const FOUNDATION_MIGRATIONS: readonly FoundationMigration[] = Object.free
     ordinal: 3,
     schemaVersion: 3,
     sql: FOUNDATION_ACTIONS_MIGRATION_SQL,
+  }),
+  createMigration({
+    id: "004-foundation-control-grants",
+    ordinal: 4,
+    schemaVersion: 4,
+    sql: FOUNDATION_GRANT_MIGRATION_SQL,
+  }),
+  createMigration({
+    id: "005-grant-expiry-lifecycle",
+    ordinal: 5,
+    schemaVersion: 5,
+    sql: FOUNDATION_GRANT_EXPIRY_MIGRATION_SQL,
+  }),
+  createMigration({
+    id: "006-grant-cryptographic-erasure",
+    ordinal: 6,
+    schemaVersion: 6,
+    sql: FOUNDATION_GRANT_ERASURE_MIGRATION_SQL,
   }),
 ]);
 

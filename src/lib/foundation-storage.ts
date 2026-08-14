@@ -4,6 +4,11 @@ import type {
   ControlAuditEntry,
   EventGameRecordMetadata,
 } from "@/lib/event-game-actions";
+import type {
+  StoredControlGrant,
+  StoredGrantAuditEntry,
+  StoredGrantSession,
+} from "@/lib/grant-types";
 
 export type StoredEventGameRecordRoot = {
   root: EventGameRecordRoot;
@@ -62,6 +67,18 @@ export type FoundationStorageSnapshot = {
   listIdempotencyEntries(recordId: string): StoredControlIdempotencyEntry[];
   readRecordMetadata(recordId: string): StoredEventGameRecordMetadata | null;
   listAuditEntries(recordId: string): StoredControlAuditEntry[];
+  findGrantById(grantId: string): StoredControlGrant | null;
+  findGrantByCredentialLookupDigest(lookupDigest: string): StoredControlGrant | null;
+  findActiveSessionByGrantAndContext(
+    grantId: string,
+    browserContextDigest: string,
+  ): StoredGrantSession | null;
+  findSessionByBearerVerifier(
+    bearerLookupVerifier: string,
+    bearerLookupKeyVersion: string,
+  ): StoredGrantSession | null;
+  listGrantSessions(grantId: string): StoredGrantSession[];
+  listGrantAudit(grantId: string): StoredGrantAuditEntry[];
 };
 
 export type FoundationStorageTransaction = FoundationStorageSnapshot & {
@@ -69,6 +86,11 @@ export type FoundationStorageTransaction = FoundationStorageSnapshot & {
   insertAction(action: StoredControlAction): void;
   upsertRecordMetadata(metadata: StoredEventGameRecordMetadata): void;
   appendAuditEntry(entry: StoredControlAuditEntry): void;
+  insertGrant(grant: StoredControlGrant): void;
+  updateGrant(grant: StoredControlGrant): void;
+  insertGrantSession(session: StoredGrantSession): void;
+  updateGrantSession(session: StoredGrantSession): void;
+  appendGrantAudit(entry: StoredGrantAuditEntry): void;
 };
 
 export type FoundationStorageTransactionWork<T> = (transaction: FoundationStorageTransaction) => T;
@@ -90,7 +112,15 @@ export type FoundationStorageConstraint =
   | "pitch-slot-id"
   | "game-side-id"
   | "operation-id"
-  | "audit-id";
+  | "audit-id"
+  | "grant-id"
+  | "grant-version"
+  | "grant-pitch-slot-id"
+  | "grant-credential-digest"
+  | "grant-session-id"
+  | "grant-session-verifier"
+  | "grant-session-context"
+  | "grant-audit-id";
 
 export class FoundationStorageConstraintError extends Error {
   readonly constraint: FoundationStorageConstraint;

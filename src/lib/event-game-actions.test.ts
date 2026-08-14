@@ -435,6 +435,12 @@ async function readSnapshot(
     listIdempotencyEntries: () => idempotency,
     readRecordMetadata: () => metadata,
     listAuditEntries: () => audits,
+    findGrantById: () => null,
+    findGrantByCredentialLookupDigest: () => null,
+    findActiveSessionByGrantAndContext: () => null,
+    findSessionByBearerVerifier: () => null,
+    listGrantSessions: () => [],
+    listGrantAudit: () => [],
   };
 }
 

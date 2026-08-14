@@ -5,6 +5,14 @@ import {
   type EventGameRecordRoot,
 } from "@/lib/foundation-record-types";
 import {
+  cloneStoredControlGrant,
+  cloneStoredGrantAuditEntry,
+  cloneStoredGrantSession,
+  type StoredControlGrant,
+  type StoredGrantAuditEntry,
+  type StoredGrantSession,
+} from "@/lib/grant-types";
+import {
   FoundationStorageClosedError,
   FoundationStorageConstraintError,
   type FoundationStorage,
@@ -25,7 +33,10 @@ type MemoryState = {
   actions: Map<string, Map<string, StoredControlAction>>;
   idempotency: Map<string, Map<string, StoredControlIdempotencyEntry>>;
   metadata: Map<string, StoredEventGameRecordMetadata>;
-  audits: Map<string, Map<string, StoredControlAuditEntry>>;
+  controlAudits: Map<string, Map<string, StoredControlAuditEntry>>;
+  grants: Map<string, StoredControlGrant>;
+  sessions: Map<string, StoredGrantSession>;
+  grantAudits: Map<string, StoredGrantAuditEntry>;
 };
 
 export function createInMemoryFoundationStorage(): FoundationStorage {
@@ -38,9 +49,11 @@ class InMemoryFoundationStorage implements FoundationStorage {
     actions: new Map(),
     idempotency: new Map(),
     metadata: new Map(),
-    audits: new Map(),
+    controlAudits: new Map(),
+    grants: new Map(),
+    sessions: new Map(),
+    grantAudits: new Map(),
   };
-
   private writerTail: Promise<void> = Promise.resolve();
   private closed = false;
   private revision = 0;
@@ -103,7 +116,7 @@ class InMemoryFoundationStorage implements FoundationStorage {
   readAuditEntries(recordId: string): Promise<StoredControlAuditEntry[]> {
     return this.writerTail.then(() => {
       this.assertOpen();
-      return [...(this.state.audits.get(recordId)?.values() ?? [])].map((entry) =>
+      return [...(this.state.controlAudits.get(recordId)?.values() ?? [])].map((entry) =>
         structuredClone(entry),
       );
     });
@@ -242,7 +255,7 @@ function createTransaction(
       return metadata === undefined ? null : structuredClone(metadata);
     },
     listAuditEntries(recordId) {
-      return [...(state.audits.get(recordId)?.values() ?? [])].map((entry) =>
+      return [...(state.controlAudits.get(recordId)?.values() ?? [])].map((entry) =>
         structuredClone(entry),
       );
     },
@@ -323,17 +336,200 @@ function createTransaction(
       });
     },
     appendAuditEntry(entry) {
-      let audits = state.audits.get(entry.recordId);
+      let audits = state.controlAudits.get(entry.recordId);
       if (audits === undefined) {
         audits = new Map();
-        state.audits.set(entry.recordId, audits);
-        undo.push(() => state.audits.delete(entry.recordId));
+        state.controlAudits.set(entry.recordId, audits);
+        undo.push(() => state.controlAudits.delete(entry.recordId));
       }
       if (audits.has(entry.auditId)) {
         throw new FoundationStorageConstraintError("audit-id");
       }
       audits.set(entry.auditId, structuredClone(entry));
       undo.push(() => audits?.delete(entry.auditId));
+    },
+    findGrantById(grantId) {
+      const grant = state.grants.get(grantId);
+      return grant === undefined ? null : cloneStoredControlGrant(grant);
+    },
+    findGrantByCredentialLookupDigest(lookupDigest) {
+      return findGrant(state.grants, (grant) => grant.credential.lookupDigest === lookupDigest);
+    },
+    findActiveSessionByGrantAndContext(grantId, browserContextDigest) {
+      return findSession(
+        state.sessions,
+        (session) =>
+          session.grantId === grantId &&
+          session.browserContextDigest === browserContextDigest &&
+          session.status === "active",
+      );
+    },
+    findSessionByBearerVerifier(bearerLookupVerifier, bearerLookupKeyVersion) {
+      return findSession(
+        state.sessions,
+        (session) =>
+          session.bearerLookupVerifier === bearerLookupVerifier &&
+          session.bearerLookupKeyVersion === bearerLookupKeyVersion,
+      );
+    },
+    listGrantSessions(grantId) {
+      return [...state.sessions.values()]
+        .filter((session) => session.grantId === grantId)
+        .sort((left, right) => left.sessionId.localeCompare(right.sessionId))
+        .map(cloneStoredGrantSession);
+    },
+    listGrantAudit(grantId) {
+      return [...state.grantAudits.values()]
+        .filter((entry) => entry.grantId === grantId)
+        .sort((left, right) => left.auditId.localeCompare(right.auditId))
+        .map(cloneStoredGrantAuditEntry);
+    },
+    insertGrant(grant) {
+      if (state.grants.has(grant.grantId)) {
+        throw new FoundationStorageConstraintError("grant-id");
+      }
+      if (findGrant(state.grants, (candidate) => candidate.grantVersion === grant.grantVersion)) {
+        throw new FoundationStorageConstraintError("grant-version");
+      }
+      if (
+        findGrant(
+          state.grants,
+          (candidate) =>
+            grant.credential.lookupDigest !== null &&
+            candidate.credential.lookupDigest === grant.credential.lookupDigest,
+        )
+      ) {
+        throw new FoundationStorageConstraintError("grant-credential-digest");
+      }
+      if (
+        findGrant(
+          state.grants,
+          (candidate) => candidate.scope.pitchSlotId === grant.scope.pitchSlotId,
+        )
+      ) {
+        throw new FoundationStorageConstraintError("grant-pitch-slot-id");
+      }
+      state.grants.set(grant.grantId, cloneStoredControlGrant(grant));
+      undo.push(() => state.grants.delete(grant.grantId));
+    },
+    updateGrant(grant) {
+      if (!state.grants.has(grant.grantId)) {
+        throw new FoundationStorageConstraintError("grant-id");
+      }
+      if (
+        findGrant(
+          state.grants,
+          (candidate) =>
+            candidate.grantId !== grant.grantId && candidate.grantVersion === grant.grantVersion,
+        )
+      ) {
+        throw new FoundationStorageConstraintError("grant-version");
+      }
+      if (
+        findGrant(
+          state.grants,
+          (candidate) =>
+            candidate.grantId !== grant.grantId &&
+            candidate.scope.pitchSlotId === grant.scope.pitchSlotId,
+        )
+      ) {
+        throw new FoundationStorageConstraintError("grant-pitch-slot-id");
+      }
+      if (
+        findGrant(
+          state.grants,
+          (candidate) =>
+            candidate.grantId !== grant.grantId &&
+            grant.credential.lookupDigest !== null &&
+            candidate.credential.lookupDigest === grant.credential.lookupDigest,
+        )
+      ) {
+        throw new FoundationStorageConstraintError("grant-credential-digest");
+      }
+      const previous = state.grants.get(grant.grantId);
+      state.grants.set(grant.grantId, cloneStoredControlGrant(grant));
+      undo.push(() => {
+        if (previous !== undefined) state.grants.set(grant.grantId, previous);
+      });
+    },
+    insertGrantSession(session) {
+      if (state.sessions.has(session.sessionId)) {
+        throw new FoundationStorageConstraintError("grant-session-id");
+      }
+      if (
+        findSession(
+          state.sessions,
+          (candidate) =>
+            session.bearerLookupVerifier !== null &&
+            candidate.bearerLookupVerifier === session.bearerLookupVerifier,
+        )
+      ) {
+        throw new FoundationStorageConstraintError("grant-session-verifier");
+      }
+      if (
+        session.status === "active" &&
+        findSession(
+          state.sessions,
+          (candidate) =>
+            candidate.grantId === session.grantId &&
+            candidate.browserContextDigest === session.browserContextDigest &&
+            candidate.status === "active",
+        )
+      ) {
+        throw new FoundationStorageConstraintError("grant-session-context");
+      }
+      if (!state.grants.has(session.grantId)) {
+        throw new FoundationStorageConstraintError("grant-id");
+      }
+      state.sessions.set(session.sessionId, cloneStoredGrantSession(session));
+      undo.push(() => state.sessions.delete(session.sessionId));
+    },
+    updateGrantSession(session) {
+      if (!state.sessions.has(session.sessionId)) {
+        throw new FoundationStorageConstraintError("grant-session-id");
+      }
+      if (!state.grants.has(session.grantId)) {
+        throw new FoundationStorageConstraintError("grant-id");
+      }
+      if (
+        findSession(
+          state.sessions,
+          (candidate) =>
+            candidate.sessionId !== session.sessionId &&
+            session.bearerLookupVerifier !== null &&
+            candidate.bearerLookupVerifier === session.bearerLookupVerifier,
+        )
+      ) {
+        throw new FoundationStorageConstraintError("grant-session-verifier");
+      }
+      if (
+        session.status === "active" &&
+        findSession(
+          state.sessions,
+          (candidate) =>
+            candidate.sessionId !== session.sessionId &&
+            candidate.grantId === session.grantId &&
+            candidate.browserContextDigest === session.browserContextDigest &&
+            candidate.status === "active",
+        )
+      ) {
+        throw new FoundationStorageConstraintError("grant-session-context");
+      }
+      const previous = state.sessions.get(session.sessionId);
+      state.sessions.set(session.sessionId, cloneStoredGrantSession(session));
+      undo.push(() => {
+        if (previous !== undefined) state.sessions.set(session.sessionId, previous);
+      });
+    },
+    appendGrantAudit(entry) {
+      if (state.grantAudits.has(entry.auditId)) {
+        throw new FoundationStorageConstraintError("grant-audit-id");
+      }
+      if (!state.grants.has(entry.grantId)) {
+        throw new FoundationStorageConstraintError("grant-id");
+      }
+      state.grantAudits.set(entry.auditId, cloneStoredGrantAuditEntry(entry));
+      undo.push(() => state.grantAudits.delete(entry.auditId));
     },
   };
 }
@@ -360,4 +556,24 @@ function cloneActions(
   actions: Map<string, StoredControlAction> | undefined,
 ): StoredControlAction[] {
   return [...(actions?.values() ?? [])].map((stored) => structuredClone(stored));
+}
+
+function findGrant(
+  state: Map<string, StoredControlGrant>,
+  predicate: (grant: StoredControlGrant) => boolean,
+): StoredControlGrant | null {
+  for (const grant of state.values()) {
+    if (predicate(grant)) return cloneStoredControlGrant(grant);
+  }
+  return null;
+}
+
+function findSession(
+  state: Map<string, StoredGrantSession>,
+  predicate: (session: StoredGrantSession) => boolean,
+): StoredGrantSession | null {
+  for (const session of state.values()) {
+    if (predicate(session)) return cloneStoredGrantSession(session);
+  }
+  return null;
 }

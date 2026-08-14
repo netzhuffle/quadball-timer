@@ -4,6 +4,19 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { EventGameRecordRoot } from "@/lib/foundation-record-types";
 import {
+  appendGrantAudit,
+  createGrantSqliteStatements,
+  insertGrant,
+  insertGrantSession,
+  listGrantAudit,
+  listGrantSessions,
+  readGrantByStatement,
+  readSessionByStatement,
+  updateGrant,
+  updateGrantSession,
+  type GrantSqliteStatements,
+} from "@/lib/grant-storage-sqlite";
+import {
   assessMigrationReadiness,
   FOUNDATION_MIGRATION_LEDGER_SQL,
   FOUNDATION_MIGRATIONS,
@@ -14,6 +27,7 @@ import {
 import { verifyFoundationSchema, readValidatedFoundationRoot } from "@/lib/foundation-schema";
 import {
   FoundationStorageClosedError,
+  FoundationStorageConstraintError,
   FoundationStorageNotReadyError,
   isThenable,
   type FoundationStorage,
@@ -36,7 +50,7 @@ import {
   readMetadata,
   readStoredAction,
   readText,
-  translateSqliteConstraint,
+  translateSqliteConstraint as translateControlSqliteConstraint,
   type RootRow,
 } from "@/lib/foundation-storage-sqlite-helpers";
 
@@ -120,6 +134,7 @@ export class SqliteFoundationStorage implements FoundationStorage {
   private readonly beforeWriteTransactionLock: (() => void) | undefined;
   private writerTail: Promise<void> = Promise.resolve();
   private statements: RootStatements | undefined;
+  private grantStatements: GrantSqliteStatements | undefined;
   private closed = false;
   private revision = 0;
   private dataVersion: number;
@@ -367,6 +382,30 @@ export class SqliteFoundationStorage implements FoundationStorage {
       insertAction: (storedAction) => this.insertAction(statements, storedAction),
       upsertRecordMetadata: (metadata) => this.upsertRecordMetadata(statements, metadata),
       appendAuditEntry: (entry) => this.appendAuditEntry(statements, entry),
+      findGrantById: (grantId) =>
+        readGrantByStatement(this.getGrantStatements().byGrantId, grantId),
+      findGrantByCredentialLookupDigest: (lookupDigest) =>
+        readGrantByStatement(this.getGrantStatements().byCredentialDigest, lookupDigest),
+      findActiveSessionByGrantAndContext: (grantId, browserContextDigest) =>
+        readSessionByStatement(
+          this.getGrantStatements().activeSessionByContext,
+          grantId,
+          browserContextDigest,
+        ),
+      findSessionByBearerVerifier: (bearerLookupVerifier, bearerLookupKeyVersion) =>
+        readSessionByStatement(
+          this.getGrantStatements().sessionByBearer,
+          bearerLookupVerifier,
+          bearerLookupKeyVersion,
+        ),
+      listGrantSessions: (grantId) =>
+        listGrantSessions(this.getGrantStatements().sessionsByGrant, grantId),
+      listGrantAudit: (grantId) => listGrantAudit(this.getGrantStatements().auditByGrant, grantId),
+      insertGrant: (grant) => insertGrant(this.getGrantStatements(), grant),
+      updateGrant: (grant) => updateGrant(this.getGrantStatements(), grant),
+      insertGrantSession: (session) => insertGrantSession(this.getGrantStatements(), session),
+      updateGrantSession: (session) => updateGrantSession(this.getGrantStatements(), session),
+      appendGrantAudit: (entry) => appendGrantAudit(this.getGrantStatements(), entry),
     };
   }
 
@@ -600,6 +639,12 @@ export class SqliteFoundationStorage implements FoundationStorage {
     return this.statements;
   }
 
+  private getGrantStatements(): GrantSqliteStatements {
+    if (this.grantStatements !== undefined) return this.grantStatements;
+    this.grantStatements = createGrantSqliteStatements(this.database);
+    return this.grantStatements;
+  }
+
   private readMigrationState(): { ledgerExists: boolean; entries: MigrationLedgerEntry[] } {
     const ledgerExists = this.tableExists("foundation_migration_ledger");
     if (!ledgerExists) return { ledgerExists: false, entries: [] };
@@ -827,4 +872,38 @@ export async function validateFoundationMigrationCandidate(
   options: { retainCandidate?: boolean } = {},
 ): Promise<FoundationMigrationCandidateReport> {
   return storage.validateCandidate(options);
+}
+
+function translateSqliteConstraint(error: unknown): unknown {
+  if (!(error instanceof Error)) return error;
+  const message = error.message.toLowerCase();
+  if (message.includes("foundation_grant_roots.grant_id")) {
+    return new FoundationStorageConstraintError("grant-id");
+  }
+  if (message.includes("foundation_grant_roots.grant_version")) {
+    return new FoundationStorageConstraintError("grant-version");
+  }
+  if (message.includes("foundation_grant_roots.pitch_slot_id")) {
+    return new FoundationStorageConstraintError("grant-pitch-slot-id");
+  }
+  if (message.includes("foundation_grant_roots.credential_lookup_digest")) {
+    return new FoundationStorageConstraintError("grant-credential-digest");
+  }
+  if (
+    message.includes("foundation_grant_sessions_active_context") ||
+    (message.includes("foundation_grant_sessions.grant_id") &&
+      message.includes("browser_context_digest"))
+  ) {
+    return new FoundationStorageConstraintError("grant-session-context");
+  }
+  if (message.includes("foundation_grant_sessions.session_id")) {
+    return new FoundationStorageConstraintError("grant-session-id");
+  }
+  if (message.includes("foundation_grant_sessions.bearer_lookup_verifier")) {
+    return new FoundationStorageConstraintError("grant-session-verifier");
+  }
+  if (message.includes("foundation_grant_audit.audit_id")) {
+    return new FoundationStorageConstraintError("grant-audit-id");
+  }
+  return translateControlSqliteConstraint(error);
 }

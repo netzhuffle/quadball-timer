@@ -257,6 +257,12 @@ export function createEventGameRecord(
         listIdempotencyEntries: () => idempotencyEntries,
         readRecordMetadata: () => metadata,
         listAuditEntries: () => auditEntries,
+        findGrantById: () => null,
+        findGrantByCredentialLookupDigest: () => null,
+        findActiveSessionByGrantAndContext: () => null,
+        findSessionByBearerVerifier: () => null,
+        listGrantSessions: () => [],
+        listGrantAudit: () => [],
       };
       return rebuildRecordSnapshot(root, snapshot, codecRegistry, options.interpreter);
     } catch (error) {

@@ -14,6 +14,12 @@ import {
   FOUNDATION_ROOT_TABLE_SQL,
   FOUNDATION_SIDE_RECORD_INDEX_SQL,
   FOUNDATION_SIDE_TABLE_SQL,
+  FOUNDATION_GRANT_AUDIT_GRANT_INDEX_SQL,
+  FOUNDATION_GRANT_AUDIT_TABLE_SQL,
+  FOUNDATION_GRANT_SESSION_CONTEXT_INDEX_SQL,
+  FOUNDATION_GRANT_SESSION_GRANT_INDEX_SQL,
+  FOUNDATION_GRANT_SESSION_TABLE_SQL,
+  FOUNDATION_GRANT_TABLE_SQL,
 } from "@/lib/foundation-migrations";
 import {
   canonicalizeEventGameRecordRoot,
@@ -71,6 +77,9 @@ const ACTION_TABLE = "foundation_event_game_record_actions";
 const IDEMPOTENCY_TABLE = "foundation_event_game_record_idempotency";
 const METADATA_TABLE = "foundation_event_game_record_metadata";
 const AUDIT_TABLE = "foundation_event_game_record_audit";
+const GRANT_TABLE = "foundation_grant_roots";
+const GRANT_SESSION_TABLE = "foundation_grant_sessions";
+const GRANT_AUDIT_TABLE = "foundation_grant_audit";
 
 const expectedManifest: FoundationSchemaManifest = {
   objects: [
@@ -81,6 +90,9 @@ const expectedManifest: FoundationSchemaManifest = {
     object("table", IDEMPOTENCY_TABLE, IDEMPOTENCY_TABLE, FOUNDATION_IDEMPOTENCY_TABLE_SQL),
     object("table", METADATA_TABLE, METADATA_TABLE, FOUNDATION_METADATA_TABLE_SQL),
     object("table", AUDIT_TABLE, AUDIT_TABLE, FOUNDATION_AUDIT_TABLE_SQL),
+    object("table", GRANT_TABLE, GRANT_TABLE, FOUNDATION_GRANT_TABLE_SQL),
+    object("table", GRANT_SESSION_TABLE, GRANT_SESSION_TABLE, FOUNDATION_GRANT_SESSION_TABLE_SQL),
+    object("table", GRANT_AUDIT_TABLE, GRANT_AUDIT_TABLE, FOUNDATION_GRANT_AUDIT_TABLE_SQL),
     object(
       "index",
       "foundation_event_game_record_roots_event_id",
@@ -116,6 +128,24 @@ const expectedManifest: FoundationSchemaManifest = {
       "foundation_event_game_record_audit_record_id",
       AUDIT_TABLE,
       FOUNDATION_AUDIT_RECORD_INDEX_SQL,
+    ),
+    object(
+      "index",
+      "foundation_grant_sessions_grant_id",
+      GRANT_SESSION_TABLE,
+      FOUNDATION_GRANT_SESSION_GRANT_INDEX_SQL,
+    ),
+    object(
+      "index",
+      "foundation_grant_sessions_active_context",
+      GRANT_SESSION_TABLE,
+      FOUNDATION_GRANT_SESSION_CONTEXT_INDEX_SQL,
+    ),
+    object(
+      "index",
+      "foundation_grant_audit_grant_id",
+      GRANT_AUDIT_TABLE,
+      FOUNDATION_GRANT_AUDIT_GRANT_INDEX_SQL,
     ),
   ].sort(compareNamed),
   tables: [
@@ -203,6 +233,62 @@ const expectedManifest: FoundationSchemaManifest = {
           table: ROOT_TABLE,
           from: "record_id",
           to: "record_id",
+          onUpdate: "NO ACTION",
+          onDelete: "CASCADE",
+          match: "NONE",
+        },
+      ],
+    },
+    {
+      name: GRANT_TABLE,
+      columns: [
+        column("grant_id", "TEXT", 1, 1),
+        column("grant_type", "TEXT", 1, 0),
+        column("grant_version", "TEXT", 1, 0),
+        column("event_id", "TEXT", 1, 0),
+        column("game_day_id", "TEXT", 1, 0),
+        column("pitch_id", "TEXT", 1, 0),
+        column("pitch_slot_id", "TEXT", 1, 0),
+        column("status", "TEXT", 1, 0),
+        column("created_at_ms", "INTEGER", 1, 0),
+        column("expires_at_ms", "INTEGER", 0, 0),
+        column("credential_format_version", "INTEGER", 1, 0),
+        column("credential_kind", "TEXT", 1, 0),
+        column("credential_material_state", "TEXT", 1, 0),
+        column("encryption_key_version", "TEXT", 0, 0),
+        column("lookup_key_version", "TEXT", 0, 0),
+        column("credential_iv", "TEXT", 0, 0),
+        column("credential_ciphertext", "TEXT", 0, 0),
+        column("credential_tag", "TEXT", 0, 0),
+        column("credential_lookup_digest", "TEXT", 0, 0),
+        column("credential_fingerprint", "TEXT", 1, 0),
+      ],
+      foreignKeys: [],
+    },
+    {
+      name: GRANT_SESSION_TABLE,
+      columns: [
+        column("session_id", "TEXT", 1, 1),
+        column("grant_id", "TEXT", 1, 0),
+        column("grant_version", "TEXT", 1, 0),
+        column("event_game_id", "TEXT", 1, 0),
+        column("browser_context_digest", "TEXT", 1, 0),
+        column("browser_context_key_version", "TEXT", 1, 0),
+        column("bearer_material_state", "TEXT", 1, 0),
+        column("bearer_lookup_verifier", "TEXT", 0, 0),
+        column("bearer_lookup_key_version", "TEXT", 0, 0),
+        column("status", "TEXT", 1, 0),
+        column("created_at_ms", "INTEGER", 1, 0),
+        column("last_active_at_ms", "INTEGER", 1, 0),
+        column("revoked_at_ms", "INTEGER", 0, 0),
+      ],
+      foreignKeys: [
+        {
+          id: 0,
+          sequence: 0,
+          table: GRANT_TABLE,
+          from: "grant_id",
+          to: "grant_id",
           onUpdate: "NO ACTION",
           onDelete: "CASCADE",
           match: "NONE",
@@ -299,6 +385,42 @@ const expectedManifest: FoundationSchemaManifest = {
         },
       ],
     },
+    {
+      name: GRANT_AUDIT_TABLE,
+      columns: [
+        column("audit_id", "TEXT", 1, 1),
+        column("action", "TEXT", 1, 0),
+        column("outcome", "TEXT", 1, 0),
+        column("actor_reference", "TEXT", 1, 0),
+        column("grant_id", "TEXT", 1, 0),
+        column("grant_type", "TEXT", 1, 0),
+        column("grant_version", "TEXT", 1, 0),
+        column("event_id", "TEXT", 1, 0),
+        column("game_day_id", "TEXT", 1, 0),
+        column("pitch_id", "TEXT", 1, 0),
+        column("pitch_slot_id", "TEXT", 1, 0),
+        column("session_id", "TEXT", 0, 0),
+        column("replaced_session_id", "TEXT", 0, 0),
+        column("event_game_id", "TEXT", 0, 0),
+        column("credential_kind", "TEXT", 0, 0),
+        column("credential_fingerprint", "TEXT", 0, 0),
+        column("before_status", "TEXT", 0, 0),
+        column("after_status", "TEXT", 0, 0),
+        column("created_at_ms", "INTEGER", 1, 0),
+      ],
+      foreignKeys: [
+        {
+          id: 0,
+          sequence: 0,
+          table: GRANT_TABLE,
+          from: "grant_id",
+          to: "grant_id",
+          onUpdate: "NO ACTION",
+          onDelete: "CASCADE",
+          match: "NONE",
+        },
+      ],
+    },
   ].sort(compareNamed),
   indexes: [
     index("foundation_event_game_record_roots_event_id", 0, ["event_id"]),
@@ -307,6 +429,9 @@ const expectedManifest: FoundationSchemaManifest = {
     index("foundation_event_game_record_actions_record_id", 0, ["record_id", "accepted_at_ms"]),
     index("foundation_event_game_record_idempotency_record_id", 0, ["record_id"]),
     index("foundation_event_game_record_audit_record_id", 0, ["record_id", "created_at_ms"]),
+    index("foundation_grant_sessions_grant_id", 0, ["grant_id"]),
+    index("foundation_grant_sessions_active_context", 1, ["grant_id", "browser_context_digest"], 1),
+    index("foundation_grant_audit_grant_id", 0, ["grant_id", "audit_id"]),
   ].sort(compareNamed),
 };
 
@@ -370,6 +495,7 @@ export function verifyFoundationSchema(database: Database): FoundationSchemaVeri
       };
     }
     scanFoundationRoots(database);
+    scanFoundationGrantState(database);
     return { ok: true };
   } catch {
     return {
@@ -403,6 +529,29 @@ export function scanFoundationRoots(database: Database): void {
     .all() as unknown[];
   for (const value of rows) {
     readValidatedFoundationRoot(database, asRecord(value));
+  }
+}
+
+function scanFoundationGrantState(database: Database): void {
+  const invalidGrant = database
+    .query(
+      `SELECT grant_id FROM foundation_grant_roots
+       WHERE (status = 'expired') <> (credential_material_state = 'erased')
+       LIMIT 1`,
+    )
+    .get();
+  if (invalidGrant !== null) {
+    throw new Error("Stored Grant lifecycle and credential material state do not match.");
+  }
+  const invalidSession = database
+    .query(
+      `SELECT session_id FROM foundation_grant_sessions
+       WHERE (status = 'expired') <> (bearer_material_state = 'erased')
+       LIMIT 1`,
+    )
+    .get();
+  if (invalidSession !== null) {
+    throw new Error("Stored Grant Session lifecycle and bearer material state do not match.");
   }
 }
 
@@ -511,6 +660,9 @@ function readSchemaManifest(database: Database): FoundationSchemaManifest {
     IDEMPOTENCY_TABLE,
     METADATA_TABLE,
     AUDIT_TABLE,
+    GRANT_TABLE,
+    GRANT_SESSION_TABLE,
+    GRANT_AUDIT_TABLE,
   ].map((name) => ({
     name,
     columns: readColumns(database, name),
@@ -523,6 +675,9 @@ function readSchemaManifest(database: Database): FoundationSchemaManifest {
     "foundation_event_game_record_actions_record_id",
     "foundation_event_game_record_idempotency_record_id",
     "foundation_event_game_record_audit_record_id",
+    "foundation_grant_sessions_grant_id",
+    "foundation_grant_sessions_active_context",
+    "foundation_grant_audit_grant_id",
   ].map((name) => readIndex(database, name));
 
   return {
@@ -619,6 +774,8 @@ function readIndex(database: Database, name: string): SchemaIndex {
 }
 
 function indexTable(name: string): string {
+  if (name.startsWith("foundation_grant_sessions")) return GRANT_SESSION_TABLE;
+  if (name.startsWith("foundation_grant_audit")) return GRANT_AUDIT_TABLE;
   if (name.includes("sides")) return SIDE_TABLE;
   if (name.includes("actions")) return ACTION_TABLE;
   if (name.includes("idempotency")) return IDEMPOTENCY_TABLE;
@@ -650,8 +807,8 @@ function column(
   };
 }
 
-function index(name: string, unique: number, columns: string[]): SchemaIndex {
-  return { name, unique, origin: "c", partial: 0, columns };
+function index(name: string, unique: number, columns: string[], partial = 0): SchemaIndex {
+  return { name, unique, origin: "c", partial, columns };
 }
 
 function fingerprint(manifest: FoundationSchemaManifest): string {

@@ -56,7 +56,7 @@ describe("SQLite foundation storage", () => {
       first.close();
 
       const reopened = openSqliteFoundationStorage(databasePath);
-      expect(await reopened.readiness()).toMatchObject({ ok: true, schemaVersion: "3" });
+      expect(await reopened.readiness()).toMatchObject({ ok: true, schemaVersion: "6" });
       const reopenedRecord = createEventGameRecord(reopened, {
         externalScopeResolver: createScopeResolver(root),
       });
@@ -74,12 +74,12 @@ describe("SQLite foundation storage", () => {
       const storage = openSqliteFoundationStorage(databasePath);
       const candidate = await storage.validateCandidate();
       expect(candidate.ready).toBe(true);
-      expect(candidate.readiness).toMatchObject({ ok: true, schemaVersion: "3" });
+      expect(candidate.readiness).toMatchObject({ ok: true, schemaVersion: "6" });
       expect(existsSync(candidate.candidatePath)).toBe(false);
       expect(await storage.readiness()).toMatchObject({ ok: false, status: "pending" });
 
       const migration = await storage.applyMigrations({ requireCandidate: true });
-      expect(migration.schemaVersion).toBe(3);
+      expect(migration.schemaVersion).toBe(6);
       expect(await storage.readiness()).toMatchObject({ ok: true });
       storage.close();
     });
@@ -90,10 +90,16 @@ describe("SQLite foundation storage", () => {
       const initialMigration = FOUNDATION_MIGRATIONS[0];
       const repairMigration = FOUNDATION_MIGRATIONS[1];
       const actionMigration = FOUNDATION_MIGRATIONS[2];
+      const grantMigration = FOUNDATION_MIGRATIONS[3];
+      const expiryMigration = FOUNDATION_MIGRATIONS[4];
+      const erasureMigration = FOUNDATION_MIGRATIONS[5];
       if (
         initialMigration === undefined ||
         repairMigration === undefined ||
-        actionMigration === undefined
+        actionMigration === undefined ||
+        grantMigration === undefined ||
+        expiryMigration === undefined ||
+        erasureMigration === undefined
       ) {
         throw new Error("Expected the foundation migrations.");
       }
@@ -106,8 +112,14 @@ describe("SQLite foundation storage", () => {
       const current = openSqliteFoundationStorage(databasePath);
       expect(await current.readiness()).toMatchObject({ ok: false, status: "missing" });
       const migration = await current.applyMigrations();
-      expect(migration.appliedMigrationIds).toEqual([repairMigration.id, actionMigration.id]);
-      expect(await current.readiness()).toMatchObject({ ok: true, schemaVersion: "3" });
+      expect(migration.appliedMigrationIds).toEqual([
+        repairMigration.id,
+        actionMigration.id,
+        grantMigration.id,
+        expiryMigration.id,
+        erasureMigration.id,
+      ]);
+      expect(await current.readiness()).toMatchObject({ ok: true, schemaVersion: "6" });
       current.close();
     });
   });
@@ -116,9 +128,9 @@ describe("SQLite foundation storage", () => {
     await withDatabase(async (databasePath) => {
       const baseMigrations = FOUNDATION_MIGRATIONS;
       const failingMigration = createMigration(
-        "003-failing-test-migration",
-        3,
-        3,
+        "007-failing-test-migration",
+        7,
+        7,
         "CREATE TABLE migration_failure_probe (id TEXT) STRICT; THIS IS NOT SQL;",
       );
       const store = openSqliteFoundationStorage(databasePath, {
@@ -138,7 +150,7 @@ describe("SQLite foundation storage", () => {
       });
       expect(await priorBinary.readiness()).toMatchObject({
         ok: true,
-        schemaVersion: "3",
+        schemaVersion: "6",
       });
       priorBinary.close();
 
@@ -210,7 +222,7 @@ describe("SQLite foundation storage", () => {
         .query(
           "INSERT INTO foundation_migration_ledger (migration_id, ordinal, schema_version, checksum, status, applied_at_ms) VALUES (?, ?, ?, ?, ?, ?)",
         )
-        .run("future-999", 4, 4, "future-checksum", "complete", 2_000);
+        .run("future-999", 7, 7, "future-checksum", "complete", 2_000);
       futureDatabase.close();
       const future = openSqliteFoundationStorage(databasePath);
       expect(await future.readiness()).toMatchObject({ ok: false });

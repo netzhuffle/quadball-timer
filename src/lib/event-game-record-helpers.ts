@@ -231,6 +231,14 @@ export function constraintToConflict(
     case "record-id":
     case "operation-id":
     case "audit-id":
+    case "grant-id":
+    case "grant-version":
+    case "grant-pitch-slot-id":
+    case "grant-credential-digest":
+    case "grant-session-id":
+    case "grant-session-verifier":
+    case "grant-session-context":
+    case "grant-audit-id":
       return "content-conflict";
   }
 }
