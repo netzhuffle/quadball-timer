@@ -11,6 +11,7 @@
     "event:catalog": "bun scripts/event-catalog.ts",
     "test:focused:technical-admin-browser": "bun scripts/test-technical-admin-browser.ts",
     "test:focused:technical-admin": "bun test --isolate ./src/lib/technical-admin-auth-sqlite.focused.ts",
+    "test:focused:startup": "bun test --isolate ./src/index-startup.focused.ts",
     "build": "bun run build.ts",
     "build:executable": "bun run build.ts --compile --compile-target=bun-linux-x64-modern --outfile=dist/quadball-timer",
     "check:sqlite-runtime": "bun scripts/check-sqlite-runtime.ts",

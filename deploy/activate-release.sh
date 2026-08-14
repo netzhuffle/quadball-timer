@@ -91,10 +91,43 @@ if [[ "$actual_exec_start" != *"$expected_exec_start"* ]]; then
   exit 1
 fi
 
+check_service_state_contract() {
+  local effective_environment
+  local effective_state_directory
+  local effective_state_directory_mode
+  effective_state_directory="$(systemctl show "$service_name" --property=StateDirectory --value 2>/dev/null || true)"
+  effective_state_directory_mode="$(systemctl show "$service_name" --property=StateDirectoryMode --value 2>/dev/null || true)"
+  effective_environment="$(systemctl show "$service_name" --property=Environment --value 2>/dev/null || true)"
+
+  if [[ "$effective_state_directory" != "quadball-timer" ]] ||
+    [[ "$effective_state_directory_mode" != "0750" ]] ||
+    [[ " $effective_environment " != *" TECHNICAL_ADMIN_DATABASE=/var/lib/quadball-timer/technical-admin.sqlite "* ]] ||
+    [[ " $effective_environment " != *" FOUNDATION_DATABASE=/var/lib/quadball-timer/foundation.sqlite "* ]]
+  then
+    echo "Systemd service ${service_name} does not provide the required Production state contract." >&2
+    echo "Install ${release_dir}/deploy/systemd/quadball-timer.service and run systemctl daemon-reload before activation." >&2
+    return 1
+  fi
+}
+
+if ! check_service_state_contract; then
+  exit 1
+fi
+
 ln -sfn "$release_dir" "$current_link"
 
 restart_service() {
   sudo systemctl restart "$service_name"
+}
+
+report_service_state() {
+  local property
+  local value
+  echo "Service state after failed activation:" >&2
+  for property in ActiveState SubState Result ExecMainStatus; do
+    value="$(systemctl show "$service_name" --property="$property" --value 2>/dev/null || true)"
+    echo "  ${property}=${value:-<unavailable>}" >&2
+  done
 }
 
 check_health() {
@@ -132,6 +165,7 @@ if restart_service && check_health; then
   activate_release
 fi
 
+report_service_state
 echo "Deploy failed; attempting rollback." >&2
 if [[ -n "$previous_release" && -d "$previous_release" ]]; then
   ln -sfn "$previous_release" "$current_link"

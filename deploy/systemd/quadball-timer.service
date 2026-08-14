@@ -10,6 +10,10 @@ WorkingDirectory=/srv/quadball-timer/current
 Environment=NODE_ENV=production
 Environment=HOST=127.0.0.1
 Environment=PORT=3000
+Environment=TECHNICAL_ADMIN_DATABASE=/var/lib/quadball-timer/technical-admin.sqlite
+Environment=FOUNDATION_DATABASE=/var/lib/quadball-timer/foundation.sqlite
+StateDirectory=quadball-timer
+StateDirectoryMode=0750
 ExecStart=/srv/quadball-timer/current/quadball-timer
 Restart=always
 RestartSec=3

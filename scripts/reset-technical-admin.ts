@@ -6,10 +6,10 @@ import {
   createTechnicalAdminAuth,
   type TechnicalAdminAuthRepository,
 } from "@/lib/technical-admin-auth";
-import { readTechnicalAdminConfig } from "@/lib/technical-admin-config";
+import { readRuntimeConfig } from "@/lib/runtime-config";
 
-const config = readTechnicalAdminConfig();
-const databasePath = config.databasePath ?? `data/${config.environment}/technical-admin.sqlite`;
+const { technicalAdmin: config, storagePaths } = readRuntimeConfig();
+const databasePath = storagePaths.technicalAdminDatabase;
 let repository: TechnicalAdminAuthRepository | undefined;
 let statusPrinted = false;
 

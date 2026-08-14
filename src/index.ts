@@ -31,7 +31,7 @@ import {
   type TechnicalAdminAuth,
   type TechnicalAdminAuthority,
 } from "@/lib/technical-admin-auth";
-import { readTechnicalAdminConfig } from "@/lib/technical-admin-config";
+import { readRuntimeConfig } from "@/lib/runtime-config";
 import {
   createEventCatalog,
   createFoundationEventCatalogStorage,
@@ -41,6 +41,7 @@ import {
 import { createInMemoryFoundationStorage } from "@/lib/foundation-storage-memory";
 import { openSqliteFoundationStorage } from "@/lib/foundation-storage-sqlite";
 import type { FoundationStorage } from "@/lib/foundation-storage";
+import { assertProductionStateBoundary } from "@/lib/runtime-storage-config";
 import { createStartupCleanup } from "@/lib/startup-resources";
 
 type ManagedGame = {
@@ -102,10 +103,10 @@ async function startServer() {
 
   try {
     const port = Number(process.env.PORT ?? 3000);
-    const technicalAdminConfig = readTechnicalAdminConfig();
+    const { technicalAdmin: technicalAdminConfig, storagePaths } = readRuntimeConfig();
     const { environment } = technicalAdminConfig;
-    const databasePath =
-      technicalAdminConfig.databasePath ?? `data/${environment}/technical-admin.sqlite`;
+    assertProductionStateBoundary(environment, storagePaths);
+    const databasePath = storagePaths.technicalAdminDatabase;
     technicalAdminRepository = createSqliteTechnicalAdminAuthRepository(databasePath, {
       environment: technicalAdminConfig.environment,
       origin: technicalAdminConfig.origin,
@@ -120,8 +121,7 @@ async function startServer() {
     technicalAdminAuth.storageStatus();
     technicalAdminAuth.startRetentionMaintenance(createTechnicalAdminRetentionScheduler());
 
-    const foundationDatabasePath =
-      process.env.FOUNDATION_DATABASE?.trim() || `data/${environment}/foundation.sqlite`;
+    const foundationDatabasePath = storagePaths.foundationDatabase;
     let eventCatalogStorage;
     let candidateFoundation: FoundationStorage | undefined;
     try {
