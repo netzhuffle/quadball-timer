@@ -100,6 +100,8 @@ import {
 export type SqliteFoundationStorageOptions = {
   migrations?: readonly FoundationMigration[];
   busyTimeoutMs?: number;
+  /** Read-only existing-database mode used by startup readiness preflight. */
+  readOnly?: boolean;
   /** Test-only synchronization seam immediately before acquiring the writer lock. */
   beforeWriteTransactionLock?: () => void;
   grantKeyRing?: GrantKeyRing;
@@ -386,6 +388,7 @@ export class SqliteFoundationStorage implements FoundationStorage {
   private readonly database: Database;
   private readonly migrations: readonly FoundationMigration[];
   private readonly busyTimeoutMs: number;
+  private readonly readOnly: boolean;
   private readonly beforeWriteTransactionLock: (() => void) | undefined;
   private readonly faultInjector: SqliteFoundationStorageOptions["faultInjector"];
   private readonly requireReplayContext: boolean;
@@ -415,6 +418,7 @@ export class SqliteFoundationStorage implements FoundationStorage {
     this.quarantineMarkerPath = databasePath === ":memory:" ? null : `${databasePath}.quarantine`;
     this.migrations = options.migrations ?? FOUNDATION_MIGRATIONS;
     this.busyTimeoutMs = options.busyTimeoutMs ?? 5_000;
+    this.readOnly = options.readOnly === true;
     this.beforeWriteTransactionLock = options.beforeWriteTransactionLock;
     this.faultInjector = options.faultInjector;
     this.requireReplayContext = options.requireReplayContext ?? true;
@@ -422,8 +426,10 @@ export class SqliteFoundationStorage implements FoundationStorage {
       keyRing: options.grantKeyRing,
     };
     this.unsafeFailure = readQuarantineMarker(this.quarantineMarkerPath) ? "corruption" : undefined;
-    this.database = new Database(databasePath);
-    if (this.unsafeFailure !== "corruption") this.configureDatabase();
+    this.database = this.readOnly
+      ? new Database(databasePath, { readonly: true })
+      : new Database(databasePath, { create: true, readwrite: true });
+    if (!this.readOnly && this.unsafeFailure !== "corruption") this.configureDatabase();
     this.dataVersion = this.readDataVersion();
   }
 
@@ -539,7 +545,7 @@ export class SqliteFoundationStorage implements FoundationStorage {
   }
 
   readiness(): Promise<FoundationStorageReadiness> {
-    return this.enqueue(() => this.readinessSync(true));
+    return this.enqueue(() => this.readinessSync(!this.readOnly));
   }
 
   liveness() {
@@ -1586,9 +1592,8 @@ export class SqliteFoundationStorage implements FoundationStorage {
       evidence.sqlite.synchronous = settings.synchronous;
       evidence.sqlite.foreignKeys = settings.foreignKeys === 1;
       if (
-        evidence.sqlite.journalMode !== "wal" ||
-        settings.synchronous !== 2 ||
-        settings.foreignKeys !== 1
+        settings.journalMode.toLowerCase() !== "wal" ||
+        (!this.readOnly && (settings.synchronous !== 2 || settings.foreignKeys !== 1))
       ) {
         evidence.transaction.writePressure = "unsafe";
         return {
@@ -2132,6 +2137,30 @@ export function openSqliteFoundationStorage(
   options: SqliteFoundationStorageOptions = {},
 ): SqliteFoundationStorage {
   return new SqliteFoundationStorage(databasePath, options);
+}
+
+export async function readSqliteFoundationStorageReadiness(
+  databasePath: string,
+  options: Omit<SqliteFoundationStorageOptions, "readOnly"> = {},
+): Promise<FoundationStorageReadiness> {
+  let storage: SqliteFoundationStorage | undefined;
+  try {
+    storage = new SqliteFoundationStorage(databasePath, {
+      ...options,
+      readOnly: true,
+      requireReplayContext: false,
+    });
+    return await storage.readiness();
+  } catch {
+    return {
+      ok: false,
+      status: "missing",
+      detail: "SQLite foundation database is unavailable.",
+      storage: "sqlite",
+    };
+  } finally {
+    storage?.close();
+  }
 }
 
 export async function validateFoundationMigrationCandidate(

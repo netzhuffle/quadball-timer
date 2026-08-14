@@ -202,6 +202,7 @@ export type TypedGrantAuthority = {
     sessionBearer: string;
     eventGameId?: string;
     controlSessionDecision?: ControlGrantSessionDecision;
+    readOnly?: boolean;
   }): Promise<TypedGrantAuthorization>;
   /** Revalidates and refreshes a Grant Session on the caller's existing transaction. */
   authorizeGrantInTransaction(

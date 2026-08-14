@@ -167,7 +167,10 @@ export function canManageInTransaction(
     return false;
   }
   if (caller.grantType === "control") {
-    const resolved = options.controlScopeResolver.resolve(caller.scope as ControlGrantScope);
+    const resolved = options.controlScopeResolver.resolve(
+      caller.scope as ControlGrantScope,
+      transaction,
+    );
     if (resolved.status === "terminal") {
       if (resolved.reason === "game-locked")
         terminateControlSessionForEventGame(
@@ -225,7 +228,10 @@ export function canCreateInTransaction(
     return false;
   }
   if (caller.grantType === "control") {
-    const resolved = options.controlScopeResolver.resolve(caller.scope as ControlGrantScope);
+    const resolved = options.controlScopeResolver.resolve(
+      caller.scope as ControlGrantScope,
+      transaction,
+    );
     if (resolved.status === "terminal") {
       if (resolved.reason === "game-locked")
         terminateControlSessionForEventGame(

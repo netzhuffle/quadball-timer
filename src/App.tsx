@@ -8,6 +8,7 @@ import { DEFAULT_AWAY_TEAM_COLOR, DEFAULT_HOME_TEAM_COLOR } from "@/lib/team-col
 import { ColorTestPage } from "@/pages/color-test-page";
 import { EventOperationsPrototypePage } from "@/pages/event-operations-prototype-page";
 import { EventAdminPage } from "@/pages/event-admin-page";
+import { EventGameControllerPage } from "@/pages/event-game-controller-page";
 import { GamePage } from "@/pages/game-page";
 import { TechnicalAdminPage } from "@/pages/technical-admin-page";
 import "./index.css";
@@ -24,6 +25,9 @@ type Route =
     }
   | {
       type: "event-admin";
+    }
+  | {
+      type: "event-game-controller";
     }
   | {
       type: "technical-admin";
@@ -54,6 +58,10 @@ export function App() {
 
   if (route.type === "event-admin") {
     return <EventAdminPage />;
+  }
+
+  if (route.type === "event-game-controller") {
+    return <EventGameControllerPage />;
   }
 
   if (route.type === "technical-admin") {
@@ -348,6 +356,10 @@ function parseRoute(pathname: string, search: string): Route {
 
   if (pathname === "/event-admin" || pathname === "/event-admin/") {
     return { type: "event-admin" };
+  }
+
+  if (pathname === "/event-control" || pathname === "/event-control/") {
+    return { type: "event-game-controller" };
   }
 
   const match = pathname.match(/^\/game\/([a-zA-Z0-9-]+)$/);

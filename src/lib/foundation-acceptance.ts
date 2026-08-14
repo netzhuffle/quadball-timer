@@ -39,7 +39,11 @@ import type { GrantAuthorityOptions } from "@/lib/grant-authority";
 import { auditInput } from "@/lib/grant-management-audit";
 import { createAuditEntry as createGrantAudit } from "@/lib/grant-lifecycle";
 import { GENERIC_GRANT_AUTHORIZATION_FAILURE } from "@/lib/grant-authority-types";
-import type { StoredGrant, StoredGrantSession } from "@/lib/grant-types";
+import type {
+  ControlGrantSessionDecision,
+  StoredGrant,
+  StoredGrantSession,
+} from "@/lib/grant-types";
 import { computeLookupDigest } from "@/lib/grant-crypto";
 import { validateOpaqueIdentifier } from "@/lib/validation-policy";
 import {
@@ -70,6 +74,7 @@ export type ControlActionBatchInput = {
   eventGameId: string;
   actions: readonly unknown[];
   sessionBearer?: string;
+  controlSessionDecision?: ControlGrantSessionDecision;
   mode?: "online" | "replay";
   replay?: {
     sessionBearer: string;
@@ -345,7 +350,7 @@ export function createFoundationAcceptance(
     const authorization = authorizeGrantInTransaction(transaction, options.grant, {
       sessionBearer: bearer,
       eventGameId: batch.input.eventGameId,
-      controlSessionDecision: "stay",
+      controlSessionDecision: batch.input.controlSessionDecision ?? "stay",
       readOnly: true,
     });
     if (
@@ -518,7 +523,7 @@ export function createFoundationAcceptance(
     const authorization = authorizeGrantInTransaction(transaction, options.grant, {
       sessionBearer: bearer,
       eventGameId: batch.input.eventGameId,
-      controlSessionDecision: "stay",
+      controlSessionDecision: batch.input.controlSessionDecision ?? "stay",
       readOnly: true,
     });
     if (
@@ -567,9 +572,26 @@ export function createFoundationAcceptance(
         detail: "Retry after the Event scope is available.",
       });
 
-    const currentPreparation = prepareCurrentAction(structural.raw, root);
+    const existing = transaction.findActionByOperationId(
+      root.recordId,
+      structural.envelope.operationId,
+    );
+    let currentPreparation = prepareCurrentAction(structural.raw, root);
+    if (
+      existing !== null &&
+      currentPreparation.prepared !== null &&
+      sameImmutableActionContent(existing.action, currentPreparation.prepared.input)
+    ) {
+      currentPreparation = prepareCurrentAction(
+        withTrustedOccurrence(structural.raw, existing.action.occurrence.trustedAtMs),
+        root,
+      );
+    }
     const prepared = currentPreparation.prepared;
-    if (preflightAction !== undefined && !samePreparationResult(prepared, preflightAction.prepared))
+    if (
+      preflightAction !== undefined &&
+      !samePreparationResultIgnoringTrustedOccurrence(prepared, preflightAction.prepared)
+    )
       return one({
         status: "retry-later",
         reason: "stale-preflight",
@@ -579,7 +601,7 @@ export function createFoundationAcceptance(
     const currentAuthorization = authorizeGrantInTransaction(transaction, options.grant, {
       sessionBearer: bearer,
       eventGameId: batch.input.eventGameId,
-      controlSessionDecision: "stay",
+      controlSessionDecision: batch.input.controlSessionDecision ?? "stay",
     });
     if (
       currentAuthorization === GENERIC_GRANT_AUTHORIZATION_FAILURE ||
@@ -789,7 +811,6 @@ export function createFoundationAcceptance(
         normalizeFoundationRejectionReason(dependency.reason),
         dependency.detail,
       );
-    const existing = transaction.findActionByOperationId(root.recordId, prepared.input.operationId);
     if (existing !== null && existing.contentFingerprint === prepared.contentFingerprint)
       return writeDuplicateOutcome(
         transaction,
@@ -1569,12 +1590,60 @@ function samePreparedAction(
   );
 }
 
-function samePreparationResult(
+function samePreparationResultIgnoringTrustedOccurrence(
   left: PreparedControlAction | null,
   right: PreparedControlAction | null,
 ): boolean {
   if (left === null || right === null) return left === right;
-  return samePreparedAction(left, right);
+  return (
+    left.codecIdentity === right.codecIdentity &&
+    canonicalizeJson(actionContentWithoutTrustedOccurrence(left.input)) ===
+      canonicalizeJson(actionContentWithoutTrustedOccurrence(right.input)) &&
+    canonicalizeJson(left.interpretation) === canonicalizeJson(right.interpretation) &&
+    canonicalizeJson(left.input.lifecycle) === canonicalizeJson(right.input.lifecycle)
+  );
+}
+
+function sameImmutableActionContent(
+  existing: ControlAction,
+  candidate: ControlActionInput,
+): boolean {
+  return (
+    canonicalizeJson(actionContentWithoutTrustedOccurrence(existing)) ===
+    canonicalizeJson(actionContentWithoutTrustedOccurrence(candidate))
+  );
+}
+
+function actionContentWithoutTrustedOccurrence(
+  action: ControlActionInput,
+): Record<string, unknown> {
+  return {
+    recordId: action.recordId,
+    eventGameId: action.eventGameId,
+    operationId: action.operationId,
+    kind: action.kind,
+    payload: action.payload,
+    causalPredecessorIds: action.causalPredecessorIds,
+    occurrence: {
+      clientOriginAtMs: action.occurrence.clientOriginAtMs,
+      source: action.occurrence.source,
+    },
+    grant: action.grant,
+    lifecycle: action.lifecycle,
+    override: action.override ?? null,
+    recoveryProvenance: action.recoveryProvenance ?? null,
+  };
+}
+
+function withTrustedOccurrence(raw: unknown, trustedAtMs: number): unknown {
+  if (!isRecord(raw) || !isRecord(raw.occurrence)) return raw;
+  return {
+    ...structuredClone(raw),
+    occurrence: {
+      ...structuredClone(raw.occurrence),
+      trustedAtMs,
+    },
+  };
 }
 
 function one(result: FoundationActionResult): OneOutcome {
