@@ -38,6 +38,14 @@ import {
   createUnavailableEventCatalogStorage,
   type CatalogOutcome,
 } from "@/lib/event-catalog";
+import {
+  createEventAdministration,
+  type EventAdministration,
+  type EventAdministrationAuthority,
+  type EventAdministrationOutcome,
+} from "@/lib/event-administration";
+import { createGrantAuthority } from "@/lib/grant-authority";
+import { readGrantAuthorityOptions } from "@/lib/grant-runtime";
 import { createInMemoryFoundationStorage } from "@/lib/foundation-storage-memory";
 import { openSqliteFoundationStorage } from "@/lib/foundation-storage-sqlite";
 import type { FoundationStorage } from "@/lib/foundation-storage";
@@ -155,6 +163,38 @@ async function startServer() {
     }
 
     const eventCatalog = createEventCatalog(eventCatalogStorage, {});
+    let eventAdministration: EventAdministration | null = null;
+    if (foundationStorage !== undefined) {
+      try {
+        const grantAuthority = createGrantAuthority(
+          foundationStorage,
+          readGrantAuthorityOptions(environment),
+        );
+        eventAdministration = createEventAdministration({
+          storage: foundationStorage,
+          grants: grantAuthority,
+        });
+      } catch {
+        // Grant keys are an Event Administration dependency, not a server-wide dependency.
+        // Keep the foundation-backed Technical Admin and Event Catalog routes available.
+        eventAdministration = null;
+      }
+    }
+    const adminGrantMutationRoute =
+      (
+        operation:
+          | "rotateEventAdminGrant"
+          | "disableEventAdminGrant"
+          | "revokeEventAdminGrant"
+          | "reactivateEventAdminGrant",
+      ) =>
+      async (req: Request) => {
+        const token = requireTechnicalAdminMutationToken(req, technicalAdminAuth);
+        if (token === null) return genericAuthFailure(401);
+        if (eventAdministration === null) return genericAuthFailure(503);
+        const eventId = new URL(req.url).pathname.split("/").at(-3) ?? "";
+        return eventAdministrationResponse(await eventAdministration[operation](eventId, token));
+      };
     const tls =
       process.env.TLS_CERT_FILE && process.env.TLS_KEY_FILE
         ? { cert: Bun.file(process.env.TLS_CERT_FILE), key: Bun.file(process.env.TLS_KEY_FILE) }
@@ -495,6 +535,123 @@ async function startServer() {
             const eventId = path.at(-3) ?? "";
             const gameDayId = path.at(-1) ?? "";
             return catalogResponse(await eventCatalog.removeGameDay(eventId, gameDayId, token));
+          },
+        },
+        "/api/admin/events/:eventId/event-admin-grant": {
+          async GET(req: Request) {
+            const token = requireTechnicalAdminToken(req, technicalAdminAuth);
+            if (token === null) return genericAuthFailure(401);
+            if (eventAdministration === null) return genericAuthFailure(503);
+            const eventId = new URL(req.url).pathname.split("/").at(-2) ?? "";
+            return eventAdministrationResponse(
+              await eventAdministration.inspectEventAdminGrant(eventId, token),
+            );
+          },
+          async POST(req: Request) {
+            const token = requireTechnicalAdminMutationToken(req, technicalAdminAuth);
+            if (token === null) return genericAuthFailure(401);
+            if (eventAdministration === null) return genericAuthFailure(503);
+            const eventId = new URL(req.url).pathname.split("/").at(-2) ?? "";
+            return eventAdministrationResponse(
+              await eventAdministration.createEventAdminGrant(eventId, token),
+              201,
+            );
+          },
+        },
+        "/api/admin/events/:eventId/event-admin-grant/reveal": {
+          async POST(req: Request) {
+            const token = requireTechnicalAdminMutationToken(req, technicalAdminAuth);
+            if (token === null) return genericAuthFailure(401);
+            if (eventAdministration === null) return genericAuthFailure(503);
+            const eventId = new URL(req.url).pathname.split("/").at(-3) ?? "";
+            return sensitiveEventAdministrationResponse(
+              await eventAdministration.revealEventAdminGrant(eventId, token),
+            );
+          },
+        },
+        "/api/admin/events/:eventId/event-admin-grant/rotate": {
+          POST: adminGrantMutationRoute("rotateEventAdminGrant"),
+        },
+        "/api/admin/events/:eventId/event-admin-grant/disable": {
+          POST: adminGrantMutationRoute("disableEventAdminGrant"),
+        },
+        "/api/admin/events/:eventId/event-admin-grant/revoke": {
+          POST: adminGrantMutationRoute("revokeEventAdminGrant"),
+        },
+        "/api/admin/events/:eventId/event-admin-grant/reactivate": {
+          POST: adminGrantMutationRoute("reactivateEventAdminGrant"),
+        },
+        "/api/event-admin/admit": {
+          async POST(req: Request) {
+            if (eventAdministration === null) return genericAuthFailure(503);
+            const body = await readJsonRecord(req);
+            if (body === null || typeof body.qrCredential !== "string")
+              return json({ error: "Unable to admit this Grant." }, 400);
+            const context = readEventAdminContext(req.headers.get("cookie")) ?? crypto.randomUUID();
+            const result = await eventAdministration.admitEventAdmin({
+              qrCredential: body.qrCredential,
+              browserContext: context,
+              deviceClass: body.deviceClass,
+              browserClass: body.browserClass,
+            });
+            if (result.status !== "admitted") return sensitiveJson(result, 401);
+            return sensitiveJson(
+              {
+                status: "admitted",
+                grantId: result.grantId,
+                grantVersion: result.grantVersion,
+                grantType: result.grantType,
+                scope: result.scope,
+                grantSessionId: result.grantSessionId,
+              },
+              200,
+              [
+                ["set-cookie", eventAdminContextCookie(context)],
+                [
+                  "set-cookie",
+                  eventAdminSessionCookie(result.sessionBearer, result.sessionExpiresAtMs),
+                ],
+              ],
+            );
+          },
+        },
+        "/api/event-admin/hub": {
+          async GET(req: Request) {
+            if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
+            const url = new URL(req.url);
+            const eventId = url.searchParams.get("eventId") ?? "";
+            const gameDayId = url.searchParams.get("gameDayId") ?? undefined;
+            const authority = resolveEventAdministrationAuthority(req, technicalAdminAuth);
+            if (authority === null) return sensitiveGenericAuthFailure(401);
+            const result = await eventAdministration.openEventHub({
+              eventId,
+              gameDayId,
+              authority,
+            });
+            const refreshHeaders: Array<[string, string]> =
+              authority.kind === "grant-session" && result.status === "accepted"
+                ? [
+                    [
+                      "set-cookie",
+                      eventAdminSessionCookie(
+                        authority.sessionBearer,
+                        result.value.grantSessionExpiresAtMs,
+                      ),
+                    ],
+                  ]
+                : [];
+            return sensitiveEventAdministrationResponse(result, 200, refreshHeaders);
+          },
+        },
+        "/api/event-admin/leave": {
+          async POST(req: Request) {
+            if (eventAdministration === null) return genericAuthFailure(503);
+            const sessionBearer = readEventAdminSession(req.headers.get("cookie"));
+            if (sessionBearer === null) return genericAuthFailure(401);
+            const result = await eventAdministration.leaveEventAdminSession(sessionBearer);
+            return sensitiveJson(result, result.status === "updated" ? 200 : 401, [
+              ["set-cookie", clearEventAdminSessionCookie()],
+            ]);
           },
         },
         "/internal/healthz": {
@@ -937,6 +1094,10 @@ function genericAuthFailure(status: number) {
   return json({ error: "Authentication failed." }, status);
 }
 
+function sensitiveGenericAuthFailure(status: number) {
+  return sensitiveJson({ error: "Authentication failed." }, status);
+}
+
 function authFailureResponse(result: AuthResult<unknown>) {
   if (result.ok) return sensitiveJson(result.value);
   const headers: Array<[string, string]> = [];
@@ -962,13 +1123,13 @@ function requireTechnicalAdminMutationToken(
   req: Request,
   technicalAdminAuth: ReturnType<typeof createTechnicalAdminAuth>,
 ): TechnicalAdminAuthority | null {
-  if (
-    req.headers.get("x-technical-admin-csrf") !== "1" ||
-    !technicalAdminAuth.isExpectedBinding(requestBinding(req))
-  ) {
-    return null;
-  }
-  return requireTechnicalAdminToken(req, technicalAdminAuth);
+  if (!technicalAdminAuth.isExpectedBinding(requestBinding(req))) return null;
+  const token = readTechnicalAdminCookie(req.headers.get("cookie"));
+  const csrfToken = req.headers.get("x-technical-admin-csrf");
+  if (token === null || csrfToken === null) return null;
+  if (!technicalAdminAuth.authenticateSession(token)) return null;
+  if (!technicalAdminAuth.verifyCsrf(token, csrfToken)) return null;
+  return technicalAdminAuth.resolveCurrentAuthority(token);
 }
 
 function catalogResponse<T>(result: CatalogOutcome<T>, acceptedStatus = 200) {
@@ -985,6 +1146,31 @@ function catalogResponse<T>(result: CatalogOutcome<T>, acceptedStatus = 200) {
   return json(result, status);
 }
 
+function eventAdministrationResponse<T>(
+  result: EventAdministrationOutcome<T>,
+  acceptedStatus = 200,
+  extraHeaders: Iterable<[string, string]> = [],
+) {
+  if (result.status === "accepted") return json(result, acceptedStatus, extraHeaders);
+  if (result.status === "retryable-failure") return json(result, 503, extraHeaders);
+  const status = result.reason === "unauthorized" ? 401 : result.reason === "not-found" ? 404 : 400;
+  return json(result, status, extraHeaders);
+}
+
+function sensitiveEventAdministrationResponse<T>(
+  result: EventAdministrationOutcome<T>,
+  acceptedStatus = 200,
+  extraHeaders: Iterable<[string, string]> = [],
+) {
+  if (result.status === "accepted") return sensitiveJson(result, acceptedStatus, extraHeaders);
+  if (result.status === "retryable-failure") return sensitiveJson(result, 503, extraHeaders);
+  return sensitiveJson(
+    result,
+    result.reason === "unauthorized" ? 401 : result.reason === "not-found" ? 404 : 400,
+    extraHeaders,
+  );
+}
+
 function readTechnicalAdminCookie(header: string | null): string | null {
   if (header === null) return null;
   for (const part of header.split(";")) {
@@ -992,6 +1178,51 @@ function readTechnicalAdminCookie(header: string | null): string | null {
     if (name === "__Host-technical-admin" && value.length > 0) return value.join("=");
   }
   return null;
+}
+
+function resolveEventAdministrationAuthority(
+  req: Request,
+  technicalAdminAuth: ReturnType<typeof createTechnicalAdminAuth>,
+): EventAdministrationAuthority | null {
+  const technicalToken = readTechnicalAdminCookie(req.headers.get("cookie"));
+  const technical =
+    technicalToken === null ? null : technicalAdminAuth.resolveCurrentAuthority(technicalToken);
+  if (technical !== null) return technical;
+  const sessionBearer = readEventAdminSession(req.headers.get("cookie"));
+  return sessionBearer === null ? null : { kind: "grant-session", sessionBearer };
+}
+
+function readEventAdminContext(header: string | null): string | null {
+  return readCookieValue(header, "__Host-event-admin-context");
+}
+
+function readEventAdminSession(header: string | null): string | null {
+  return readCookieValue(header, "__Host-event-admin-session");
+}
+
+function readCookieValue(header: string | null, cookieName: string): string | null {
+  if (header === null) return null;
+  for (const part of header.split(";")) {
+    const [name, ...value] = part.trim().split("=");
+    if (name === cookieName && value.length > 0) return value.join("=");
+  }
+  return null;
+}
+
+function eventAdminContextCookie(value: string): string {
+  return `__Host-event-admin-context=${encodeURIComponent(value)}; Path=/; HttpOnly; Secure; SameSite=Strict`;
+}
+
+function eventAdminSessionCookie(value: string, expiresAtMs: number | null | undefined): string {
+  const maxAgeSeconds =
+    expiresAtMs === null || expiresAtMs === undefined
+      ? 2_592_000
+      : Math.max(0, Math.min(2_592_000, Math.ceil((expiresAtMs - Date.now()) / 1_000)));
+  return `__Host-event-admin-session=${encodeURIComponent(value)}; Path=/; Max-Age=${maxAgeSeconds}; HttpOnly; Secure; SameSite=Strict`;
+}
+
+function clearEventAdminSessionCookie(): string {
+  return "__Host-event-admin-session=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict";
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

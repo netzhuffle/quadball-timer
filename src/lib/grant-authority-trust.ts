@@ -1,10 +1,12 @@
 import { validateOpaqueIdentifier } from "@/lib/validation-policy";
 import type { GrantAuthorityActor } from "@/lib/grant-types";
+import type { TechnicalAdminAuthority } from "@/lib/technical-admin-auth";
 
 const TRUSTED_AUTHORITY = Symbol("trusted-grant-authority");
 
 export type GrantAuthorityInput =
   | { kind: "technical-admin"; id: string }
+  | TechnicalAdminAuthority
   | { kind: "grant-session"; sessionBearer: string }
   | GrantAuthorityActor;
 

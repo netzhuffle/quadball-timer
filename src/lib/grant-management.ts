@@ -1,7 +1,12 @@
 import { requireGrantStorageCapabilities, type FoundationStorage } from "@/lib/foundation-storage";
 import type { GrantAuthorityOptions } from "@/lib/grant-authority";
 import { EVENT_ADMIN_GRANT_TYPE, GRANT_TYPE, PITCH_MANAGER_GRANT_TYPE } from "@/lib/grant-types";
-import { createGrant, reactivateGrant, updateGrantStatus } from "@/lib/grant-management-commands";
+import {
+  createGrant,
+  createGrantInTransaction,
+  reactivateGrant,
+  updateGrantStatus,
+} from "@/lib/grant-management-commands";
 import {
   revealGrant,
   rotateGrant,
@@ -14,6 +19,7 @@ import {
   admitGrant,
   acceptControlGrantSessionSwitch,
   authorizeGrant,
+  authorizeGrantInTransaction,
   authorizeControlGrantReplay,
   leaveGrantSession,
   revokeGrantSession,
@@ -53,6 +59,11 @@ export function createTypedGrantAuthority(
     createGrant: (input) => createGrant(storage, options, input),
     createEventAdminGrant: (input) =>
       createGrant(storage, options, { ...input, grantType: EVENT_ADMIN_GRANT_TYPE }),
+    createEventAdminGrantInTransaction: (transaction, input) =>
+      createGrantInTransaction(transaction, options, {
+        ...input,
+        grantType: EVENT_ADMIN_GRANT_TYPE,
+      }),
     createPitchManagerGrant: (input) =>
       createGrant(storage, options, { ...input, grantType: PITCH_MANAGER_GRANT_TYPE }),
     createControlGrant: (input) =>
@@ -66,6 +77,8 @@ export function createTypedGrantAuthority(
     admitGrantCode: (input) => admitGrantCode(storage, options, input),
     admitGrant: (input) => admitGrant(storage, options, input),
     authorizeGrant: (input) => authorizeGrant(storage, options, input),
+    authorizeGrantInTransaction: (transaction, input) =>
+      authorizeGrantInTransaction(transaction, options, input),
     acceptControlGrantSessionSwitch: (input) =>
       acceptControlGrantSessionSwitch(storage, options, input.sessionBearer),
     authorizeControlGrantReplay: (input) => authorizeControlGrantReplay(storage, options, input),

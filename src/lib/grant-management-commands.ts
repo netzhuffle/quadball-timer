@@ -3,7 +3,7 @@ import {
   createRandomIdentifier,
   encryptCredential,
 } from "@/lib/grant-crypto";
-import type { FoundationStorage } from "@/lib/foundation-storage";
+import type { FoundationStorage, FoundationStorageTransaction } from "@/lib/foundation-storage";
 import type { GrantAuthorityOptions } from "@/lib/grant-authority";
 import {
   GRANT_CREDENTIAL_FORMAT_VERSION,
@@ -44,6 +44,21 @@ export async function createGrant(
   options: GrantAuthorityOptions,
   input: CreateTypedGrantInput,
 ): Promise<TypedGrantCreated | TypedGrantMutation> {
+  try {
+    return await storage.transaction((transaction) =>
+      createGrantInTransaction(transaction, options, input),
+    );
+  } catch (error) {
+    if (error instanceof GrantUnauthorizedError) return unauthorizedGrant();
+    return unavailableGrant();
+  }
+}
+
+export function createGrantInTransaction(
+  transaction: FoundationStorageTransaction,
+  options: GrantAuthorityOptions,
+  input: CreateTypedGrantInput,
+): TypedGrantCreated | TypedGrantMutation {
   if (!isGrantRecord(input) || !isGrantType(input.grantType))
     return invalidGrant("Grant type is invalid.");
   const scope = validateGrantScope(input.grantType, input.scope);
@@ -80,24 +95,31 @@ export async function createGrant(
     expiresAtMs,
     credential: encryptCredential(qrCredential, binding, options.randomness, options.keyRing),
   };
-  try {
-    await storage.transaction((transaction) => {
-      const resolvedAuthority = resolveManagementAuthority(transaction, options, trustedAuthority);
-      if (
-        resolvedAuthority === null ||
-        !canCreateInTransaction(transaction, options, grant, resolvedAuthority)
+  const resolvedAuthority = resolveManagementAuthority(transaction, options, trustedAuthority);
+  if (
+    resolvedAuthority === null ||
+    !canCreateInTransaction(transaction, options, grant, resolvedAuthority)
+  )
+    throw new GrantUnauthorizedError();
+  if (
+    grant.grantType === "event-admin" &&
+    transaction
+      .listGrants()
+      .some(
+        (candidate) =>
+          candidate.grantType === "event-admin" && candidate.scope.eventId === grant.scope.eventId,
       )
-        throw new GrantUnauthorizedError();
-      transaction.insertGrant(grant);
-      transaction.appendGrantAudit(
-        createAuditEntry(options, auditInput("grant-created", grant, resolvedAuthority, "active")),
-      );
-      refreshEventAdminSession(transaction, options, resolvedAuthority);
-    });
-  } catch (error) {
-    if (error instanceof GrantUnauthorizedError) return unauthorizedGrant();
-    return unavailableGrant();
-  }
+  )
+    return {
+      status: "rejected",
+      reason: "invalid-state",
+      detail: "An Event Admin Grant already exists for this Event.",
+    };
+  transaction.insertGrant(grant);
+  transaction.appendGrantAudit(
+    createAuditEntry(options, auditInput("grant-created", grant, resolvedAuthority, "active")),
+  );
+  refreshEventAdminSession(transaction, options, resolvedAuthority);
   return {
     status: "created",
     grantId,

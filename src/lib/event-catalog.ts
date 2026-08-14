@@ -35,6 +35,16 @@ export type EventProjection = StoredEvent & {
   auditTrail: readonly EventAdministrationAuditEntry[];
 };
 
+/** Shared projection seam for composed Event Administration workflows. */
+export function projectEventProjection(
+  event: StoredEvent,
+  gameDays: readonly StoredGameDay[],
+  auditTrail: readonly EventAdministrationAuditEntry[],
+  nowMs: number,
+): EventProjection {
+  return project(event, gameDays, auditTrail, nowMs);
+}
+
 export type CatalogRejectedReason =
   | "invalid-input"
   | "unauthorized"
@@ -70,6 +80,7 @@ export type EventCatalogStorageSnapshot = {
 };
 
 export type EventCatalogStorageTransaction = EventCatalogStorageSnapshot & {
+  hasAttachedEventAdminGrant(eventId: string): boolean;
   insertEvent(event: StoredEvent): void;
   updateEvent(event: StoredEvent): void;
   deleteEvent(eventId: string): void;
@@ -427,6 +438,9 @@ export function createEventCatalog(
         if (transaction.listGameDays(event.eventId).length > 0) {
           return inUse("Event still contains Game Days.");
         }
+        if (transaction.hasAttachedEventAdminGrant(event.eventId)) {
+          return inUse("Event has an attached Event Admin Grant.");
+        }
         const audit = createAudit(
           ids,
           "event-removed",
@@ -712,6 +726,10 @@ function eventCatalogTransaction(
 ): EventCatalogStorageTransaction {
   return {
     ...eventCatalogSnapshot(transaction),
+    hasAttachedEventAdminGrant: (eventId) =>
+      transaction
+        .listGrants()
+        .some((grant) => grant.grantType === "event-admin" && grant.scope.eventId === eventId),
     insertEvent: (event) => transaction.insertEvent(event),
     updateEvent: (event) => transaction.updateEvent(event),
     deleteEvent: (eventId) => transaction.deleteEvent(eventId),

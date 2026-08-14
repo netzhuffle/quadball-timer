@@ -165,6 +165,10 @@ export async function admitGrant(
         eventGameId,
         grantSessionId: session.sessionId,
         sessionBearer: bearer,
+        sessionExpiresAtMs:
+          current.grantType === EVENT_ADMIN_GRANT_TYPE
+            ? Math.min(current.expiresAtMs ?? Number.MAX_SAFE_INTEGER, nowMs + 30 * DAY_MS)
+            : null,
       };
     });
   } catch {
@@ -293,6 +297,10 @@ export function authorizeGrantInTransaction(
     scope: structuredClone(grant.scope),
     eventGameId,
     grantSessionId: session.sessionId,
+    sessionExpiresAtMs:
+      grant.grantType === EVENT_ADMIN_GRANT_TYPE
+        ? Math.min(grant.expiresAtMs ?? Number.MAX_SAFE_INTEGER, nowMs + 30 * DAY_MS)
+        : null,
   };
 }
 

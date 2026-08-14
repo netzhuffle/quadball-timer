@@ -174,18 +174,166 @@ try {
   await page.getByRole("button", { name: "Add", exact: true }).click();
   const gameDayDate = page.locator('input[id^="game-day-date-"]');
   await expectValue(gameDayDate, "2026-08-14");
-  await page.getByText("current", { exact: true }).waitFor();
-  await gameDayDate.fill("2026-08-15");
-  await page.getByRole("button", { name: "Save Game Day" }).click();
-  await expectValue(gameDayDate, "2026-08-15");
-  await page.getByText("future", { exact: true }).waitFor();
+  await page.getByLabel("Add Game Day").fill("2026-08-15");
+  await page.getByRole("button", { name: "Add", exact: true }).click();
+  await page.locator('input[id^="game-day-date-"]').nth(1).waitFor();
+  assert(
+    (await page.locator('input[id^="game-day-date-"]').count()) === 2,
+    "browser flow did not create two Game Days",
+  );
+  await expectValue(page.locator('input[id^="game-day-date-"]').nth(0), "2026-08-14");
+  await expectValue(page.locator('input[id^="game-day-date-"]').nth(1), "2026-08-15");
   await page.locator("#selected-event-name").fill("Browser Event Updated");
   await page.getByRole("button", { name: "Save Event" }).click();
   await page.getByRole("heading", { name: "Browser Event Updated" }).waitFor();
-  await page.getByRole("button", { name: "Remove", exact: true }).click();
+  const eventsPayload = (await (
+    await context.request.get(`${origin}/api/admin/events`)
+  ).json()) as {
+    status: string;
+    value: Array<{ eventId: string; name: string }>;
+  };
+  const eventId = eventsPayload.value.find(
+    (event) => event.name === "Browser Event Updated",
+  )?.eventId;
+  if (!eventId) throw new Error("Browser Event was not returned by the catalog.");
+  await page.getByRole("button", { name: /Browser Event Updated/ }).click();
+  await page.getByRole("button", { name: "Create Grant" }).click();
+  const revealResponsePromise = page.waitForResponse(
+    (response) =>
+      response.url().includes(`/api/admin/events/${eventId}/event-admin-grant/reveal`) &&
+      response.request().method() === "POST",
+  );
+  await page.getByRole("button", { name: "Reveal QR credential" }).click();
+  const revealResponse = await revealResponsePromise;
+  const revealPayload = (await revealResponse.json()) as {
+    status: string;
+    value?: { qrCredential?: string };
+  };
+  const revealedCredential = revealPayload.value?.qrCredential ?? "";
+  assert(revealResponse.status() === 200 && revealedCredential.length > 0, "QR reveal succeeded");
+  const qrCode = page.getByAltText("Event Admin Grant QR code");
+  await qrCode.waitFor();
+  const qrSource = await qrCode.getAttribute("src");
+  assert(
+    qrSource?.startsWith("data:image/png;base64,") === true,
+    "browser reveal rendered a PNG QR code",
+  );
+  await page.getByRole("button", { name: "Open Event Hub" }).click();
+  await page.getByText("Event Hub", { exact: true }).waitFor();
+  await page.getByLabel("Game Day").selectOption({ index: 1 });
+  const eventAdminContext = await browser.newContext({ ignoreHTTPSErrors: true });
+  const eventAdminPage = await eventAdminContext.newPage();
+  eventAdminPage.setDefaultTimeout(5_000);
+  await eventAdminPage.goto(`${origin}/event-admin?eventId=${eventId}`);
+  await eventAdminPage.getByLabel("Scanned Event Admin QR value").fill(revealedCredential);
+  await eventAdminPage.getByRole("button", { name: "Admit Event Admin" }).click();
+  await eventAdminPage.getByText(/event-admin/u).waitFor();
+  const eventAdminGameDaySelector = eventAdminPage.getByLabel("Game Day");
+  await eventAdminGameDaySelector.selectOption({ index: 1 });
+  const firstSelectedGameDay = await expectSelectValue(eventAdminGameDaySelector, 1);
+  await eventAdminGameDaySelector.selectOption({ index: 2 });
+  const secondSelectedGameDay = await expectSelectValue(eventAdminGameDaySelector, 2);
+  assert(firstSelectedGameDay !== secondSelectedGameDay, "Game Day selector reused one option");
+  const sessionCookieBeforeRefresh = (await eventAdminContext.cookies()).find(
+    (cookie) => cookie.name === "__Host-event-admin-session",
+  );
+  await eventAdminPage.reload();
+  await eventAdminPage.getByText(/event-admin/u).waitFor();
+  const sessionCookieAfterRefresh = (await eventAdminContext.cookies()).find(
+    (cookie) => cookie.name === "__Host-event-admin-session",
+  );
+  assert(
+    sessionCookieBeforeRefresh !== undefined &&
+      sessionCookieAfterRefresh !== undefined &&
+      sessionCookieAfterRefresh.expires >= sessionCookieBeforeRefresh.expires,
+    "Event Admin Hub did not refresh the rolling session cookie",
+  );
+  const wrongEventResponse = await fetchFromPage(
+    eventAdminPage,
+    `${origin}/api/event-admin/hub?eventId=wrong-event`,
+  );
+  assert(wrongEventResponse.status === 401, "wrong-Event Event Admin authority was accepted");
+  await page.goto(`${origin}/admin`);
+  await page.getByRole("button", { name: /Browser Event Updated/ }).click();
+  const rotateResponsePromise = page.waitForResponse(
+    (response) =>
+      response.url().includes(`/api/admin/events/${eventId}/event-admin-grant/rotate`) &&
+      response.request().method() === "POST",
+  );
+  await page.getByRole("button", { name: "Rotate Grant" }).click();
+  assert((await rotateResponsePromise).status() === 200, "Grant rotation failed");
+  const staleAfterRotation = await fetchFromPage(
+    eventAdminPage,
+    `${origin}/api/event-admin/hub?eventId=${eventId}`,
+  );
+  assert(staleAfterRotation.status === 401, "rotated Event Admin session remained live");
+  const freshRevealResponsePromise = page.waitForResponse(
+    (response) =>
+      response.url().includes(`/api/admin/events/${eventId}/event-admin-grant/reveal`) &&
+      response.request().method() === "POST",
+  );
+  await page.getByRole("button", { name: "Reveal QR credential" }).click();
+  const freshRevealResponse = await freshRevealResponsePromise;
+  const freshRevealPayload = (await freshRevealResponse.json()) as {
+    status: string;
+    value?: { qrCredential?: string };
+  };
+  const freshCredential = freshRevealPayload.value?.qrCredential ?? "";
+  assert(
+    freshRevealResponse.status() === 200 && freshCredential.length > 0,
+    "fresh QR reveal failed",
+  );
+  const revokedEventAdminContext = await browser.newContext({ ignoreHTTPSErrors: true });
+  const revokedEventAdminPage = await revokedEventAdminContext.newPage();
+  revokedEventAdminPage.setDefaultTimeout(5_000);
+  await revokedEventAdminPage.goto(`${origin}/event-admin?eventId=${eventId}`);
+  await revokedEventAdminPage.getByLabel("Scanned Event Admin QR value").fill(freshCredential);
+  await revokedEventAdminPage.getByRole("button", { name: "Admit Event Admin" }).click();
+  await revokedEventAdminPage.getByText(/event-admin/u).waitFor();
+  const validFreshSession = await fetchFromPage(
+    revokedEventAdminPage,
+    `${origin}/api/event-admin/hub?eventId=${eventId}`,
+  );
+  assert(validFreshSession.status === 200, "newly admitted Event Admin session was not live");
+  assert(validFreshSession.cacheControl === "no-store", "private Event Hub response was cacheable");
+  const revokeResponsePromise = page.waitForResponse(
+    (response) =>
+      response.url().includes(`/api/admin/events/${eventId}/event-admin-grant/revoke`) &&
+      response.request().method() === "POST",
+  );
+  await page.getByRole("button", { name: "Revoke Grant" }).click();
+  assert((await revokeResponsePromise).status() === 200, "Grant revocation failed");
+  const revokedFreshSession = await fetchFromPage(
+    revokedEventAdminPage,
+    `${origin}/api/event-admin/hub?eventId=${eventId}`,
+  );
+  assert(
+    revokedFreshSession.status === 401,
+    "explicitly revoked live Event Admin session remained live",
+  );
+  await eventAdminContext.close();
+  await revokedEventAdminContext.close();
+  const removeButtons = page.getByRole("button", { name: "Remove", exact: true });
+  await removeButtons.nth(0).click();
+  await removeButtons.nth(0).click();
   await page.getByText("No Game Days.").waitFor();
-  await page.getByRole("button", { name: "Remove empty Event" }).click();
-  await page.getByText("No Events yet.").waitFor();
+  const attachedGrantRemoval = await page.evaluate(async (url) => {
+    const csrf = document.cookie
+      .split(";")
+      .map((part) => part.trim())
+      .find((part) => part.startsWith("__Host-technical-admin-csrf="))
+      ?.slice("__Host-technical-admin-csrf=".length);
+    return (
+      await fetch(url, {
+        method: "DELETE",
+        headers: { "x-technical-admin-csrf": csrf ?? "" },
+      })
+    ).status;
+  }, `${origin}/api/admin/events/${eventId}`);
+  assert(
+    attachedGrantRemoval === 409,
+    `attached Event Admin Grant removal returned ${attachedGrantRemoval}`,
+  );
   const staleCookies = await context.cookies();
   const staleCookieHeader = staleCookies
     .map((cookie) => `${cookie.name}=${cookie.value}`)
@@ -226,6 +374,10 @@ try {
       sessionRevocation: true,
       replacement: true,
       eventCatalog: true,
+      eventAdminGrantHandoff: true,
+      qrRender: true,
+      eventHubDelegation: true,
+      eventAdminRotationRevocationIsolation: true,
       forgedAuthorityRejected: true,
       revocationRevalidated: true,
     }),
@@ -233,7 +385,9 @@ try {
 } catch (error) {
   console.error(
     redactDiagnosticText(
-      error instanceof Error ? error.message : "Technical Admin browser test failed.",
+      error instanceof Error
+        ? (error.stack ?? error.message)
+        : JSON.stringify(error) || "Technical Admin browser test failed.",
     ),
   );
   if (browserPage) {
@@ -273,6 +427,19 @@ function assert(condition: boolean, message: string): asserts condition {
 async function expectValue(locator: ReturnType<Page["locator"]>, expected: string) {
   const actual = await locator.inputValue();
   assert(actual === expected, `Expected input value ${expected}, got ${actual}.`);
+}
+
+async function expectSelectValue(locator: ReturnType<Page["getByLabel"]>, index: number) {
+  const value = await locator.inputValue();
+  assert(value.length > 0, `Game Day selector option ${index} was not selected.`);
+  return value;
+}
+
+async function fetchFromPage(page: Page, url: string) {
+  return page.evaluate(async (requestUrl) => {
+    const response = await fetch(requestUrl);
+    return { status: response.status, cacheControl: response.headers.get("cache-control") };
+  }, url);
 }
 
 function redactBrowserUrl(value: string) {

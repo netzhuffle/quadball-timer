@@ -15,6 +15,7 @@ import {
   GENERIC_GRANT_STORAGE_FAILURE,
 } from "@/lib/grant-authority-types";
 import type { GrantAuthorityInput } from "@/lib/grant-authority-trust";
+import type { FoundationStorageTransaction } from "@/lib/foundation-storage";
 import type { GrantLifecycleMetadataCorrection } from "@/lib/grant-management-lifecycle";
 
 export type GrantManagementAuthority = GrantAuthorityInput;
@@ -47,6 +48,7 @@ export type TypedGrantAdmission =
       eventGameId: string | null;
       grantSessionId: string;
       sessionBearer: string;
+      sessionExpiresAtMs?: number | null;
     }
   | typeof GENERIC_GRANT_ADMISSION_FAILURE;
 
@@ -87,6 +89,7 @@ export type TypedGrantAuthorization =
       scope: GrantScope;
       eventGameId: string | null;
       grantSessionId: string;
+      sessionExpiresAtMs?: number | null;
     }
   | {
       status: "switch-required";
@@ -157,6 +160,14 @@ export type TypedGrantAuthority = {
   createEventAdminGrant(
     input: Omit<CreateTypedGrantInput, "grantType"> & { scope: EventAdminGrantScope },
   ): Promise<TypedGrantCreated | TypedGrantMutation>;
+  /**
+   * The composed Event Administration seam. Callers must invoke this inside the Foundation
+   * transaction that revalidates Event membership and Game Day state.
+   */
+  createEventAdminGrantInTransaction(
+    transaction: FoundationStorageTransaction,
+    input: Omit<CreateTypedGrantInput, "grantType"> & { scope: EventAdminGrantScope },
+  ): TypedGrantCreated | TypedGrantMutation;
   createPitchManagerGrant(
     input: Omit<CreateTypedGrantInput, "grantType"> & { scope: PitchManagerGrantScope },
   ): Promise<TypedGrantCreated | TypedGrantMutation>;
@@ -192,6 +203,11 @@ export type TypedGrantAuthority = {
     eventGameId?: string;
     controlSessionDecision?: ControlGrantSessionDecision;
   }): Promise<TypedGrantAuthorization>;
+  /** Revalidates and refreshes a Grant Session on the caller's existing transaction. */
+  authorizeGrantInTransaction(
+    transaction: FoundationStorageTransaction,
+    input: { sessionBearer: string },
+  ): TypedGrantAuthorization;
   acceptControlGrantSessionSwitch(input: {
     sessionBearer: string;
   }): Promise<TypedControlGrantSwitch>;
