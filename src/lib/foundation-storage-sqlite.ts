@@ -40,9 +40,17 @@ import {
   type StoredControlAction,
   type StoredControlAuditEntry,
   type StoredControlIdempotencyEntry,
+  type StoredAcceptanceBudget,
+  type StoredReplayAttempt,
+  type StoredReplayReceipt,
+  type StoredReplayReservation,
   type StoredEventGameRecordMetadata,
   type StoredEventGameRecordRoot,
 } from "@/lib/foundation-storage";
+import type {
+  AcceptanceIntegrityAnchor,
+  AcceptanceIntegritySubject,
+} from "@/lib/foundation-acceptance-integrity";
 import {
   actionIdentity,
   asRecord,
@@ -96,6 +104,87 @@ export class FoundationMigrationError extends Error {
   }
 }
 
+function readBudget(value: unknown): StoredAcceptanceBudget | null {
+  if (value === null || value === undefined) return null;
+  const row = value as Record<string, unknown>;
+  return {
+    bucketId: String(row.bucket_id),
+    bucketKind: String(row.bucket_kind) as StoredAcceptanceBudget["bucketKind"],
+    subjectId: String(row.subject_id),
+    capacity: Number(row.capacity),
+    refillPerSecond: Number(row.refill_per_second),
+    tokens: Number(row.tokens),
+    updatedAtMs: Number(row.updated_at_ms),
+    stateRevision: Number(row.state_revision),
+  };
+}
+
+function readReservation(value: unknown): StoredReplayReservation | null {
+  if (value === null || value === undefined) return null;
+  const row = value as Record<string, unknown>;
+  return {
+    reservationId: String(row.reservation_id),
+    recordId: String(row.record_id),
+    eventGameId: String(row.event_game_id),
+    originatingSessionId: String(row.originating_session_id),
+    replacementSessionId:
+      row.replacement_session_id === null ? null : readText(row.replacement_session_id),
+    actionCount: Number(row.action_count),
+    status: String(row.status) as StoredReplayReservation["status"],
+    batchDigest: row.batch_digest === null ? null : readText(row.batch_digest),
+    createdAtMs: Number(row.created_at_ms),
+    committedAtMs: row.committed_at_ms === null ? null : Number(row.committed_at_ms),
+    acknowledgedAtMs: row.acknowledged_at_ms === null ? null : Number(row.acknowledged_at_ms),
+    stateRevision: Number(row.state_revision),
+  };
+}
+
+function readAttempt(value: unknown): StoredReplayAttempt {
+  const row = value as Record<string, unknown>;
+  return {
+    attemptId: String(row.attempt_id),
+    reservationId: String(row.reservation_id),
+    operationId: String(row.operation_id),
+    status: String(row.status) as StoredReplayAttempt["status"],
+    actionFingerprint: row.action_fingerprint === null ? null : readText(row.action_fingerprint),
+    resultJson: row.result_json === null ? null : readText(row.result_json),
+    controlAuditId: row.control_audit_id === null ? null : readText(row.control_audit_id),
+    grantAuditId: row.grant_audit_id === null ? null : readText(row.grant_audit_id),
+    createdAtMs: Number(row.created_at_ms),
+    completedAtMs: row.completed_at_ms === null ? null : Number(row.completed_at_ms),
+    stateRevision: Number(row.state_revision),
+  };
+}
+
+function readReceipt(value: unknown): StoredReplayReceipt | null {
+  if (value === null || value === undefined) return null;
+  const row = value as Record<string, unknown>;
+  return {
+    receiptId: String(row.receipt_id),
+    reservationId: String(row.reservation_id),
+    receiptDigest: String(row.receipt_digest),
+    receiptKeyVersion: String(row.receipt_key_version),
+    status: String(row.status) as StoredReplayReceipt["status"],
+    actionCount: Number(row.action_count),
+    createdAtMs: Number(row.created_at_ms),
+    acknowledgedAtMs: row.acknowledged_at_ms === null ? null : Number(row.acknowledged_at_ms),
+    stateRevision: Number(row.state_revision),
+  };
+}
+
+function readIntegrityAnchor(value: unknown): AcceptanceIntegrityAnchor {
+  const row = value as Record<string, unknown>;
+  return {
+    anchorId: String(row.anchor_id),
+    subjectKind: String(row.subject_kind) as AcceptanceIntegritySubject,
+    subjectId: String(row.subject_id),
+    stateRevision: Number(row.state_revision),
+    keyVersion: String(row.key_version),
+    canonicalValue: String(row.canonical_value),
+    integrityTag: String(row.integrity_tag),
+  };
+}
+
 type SqlStatement = ReturnType<Database["query"]>;
 
 type RootStatements = {
@@ -115,6 +204,25 @@ type RootStatements = {
   idempotencyByRecordId: SqlStatement;
   insertAudit: SqlStatement;
   insertEvidenceProvenance: SqlStatement;
+  budgetById: SqlStatement;
+  upsertBudget: SqlStatement;
+  reservationById: SqlStatement;
+  reservationByTuple: SqlStatement;
+  reservationByOriginTuple: SqlStatement;
+  insertReservation: SqlStatement;
+  updateReservation: SqlStatement;
+  attemptsByReservation: SqlStatement;
+  insertAttempt: SqlStatement;
+  updateAttempt: SqlStatement;
+  discardAttempts: SqlStatement;
+  discardAnchors: SqlStatement;
+  discardReservation: SqlStatement;
+  receiptByDigest: SqlStatement;
+  receiptByReservationId: SqlStatement;
+  anchorsBySubject: SqlStatement;
+  insertReceipt: SqlStatement;
+  updateReceipt: SqlStatement;
+  insertAnchor: SqlStatement;
 };
 
 const ROOT_SELECT_COLUMNS = `
@@ -423,12 +531,163 @@ export class SqliteFoundationStorage implements FoundationStorage {
       listGrantSessions: (grantId) =>
         listGrantSessions(this.getGrantStatements().sessionsByGrant, grantId),
       listGrantAudit: (grantId) => listGrantAudit(this.getGrantStatements().auditByGrant, grantId),
+      findAcceptanceBudget: (bucketId) => readBudget(statements.budgetById.get(bucketId)),
+      findReplayReservation: (reservationId) =>
+        readReservation(statements.reservationById.get(reservationId)),
+      findReplayReservationByTuple: (
+        recordId,
+        eventGameId,
+        originatingSessionId,
+        actionCount,
+        batchDigest,
+      ) =>
+        (() => {
+          const matches = statements.reservationByTuple.all(
+            recordId,
+            eventGameId,
+            originatingSessionId,
+            actionCount,
+            batchDigest,
+          ) as unknown[];
+          return matches.length === 1 ? readReservation(matches[0]) : null;
+        })(),
+      findReplayReservationByOriginTuple: (
+        recordId,
+        eventGameId,
+        originatingSessionId,
+        actionCount,
+      ) =>
+        readReservation(
+          statements.reservationByOriginTuple.get(
+            recordId,
+            eventGameId,
+            originatingSessionId,
+            actionCount,
+          ),
+        ),
+      listReplayAttempts: (reservationId) =>
+        statements.attemptsByReservation.all(reservationId).map(readAttempt),
+      findReplayReceiptByDigest: (receiptDigest) =>
+        readReceipt(statements.receiptByDigest.get(receiptDigest)),
+      findReplayReceiptByReservationId: (reservationId) =>
+        readReceipt(statements.receiptByReservationId.get(reservationId)),
+      listAcceptanceIntegrityAnchors: (subjectKind, subjectId) =>
+        statements.anchorsBySubject.all(subjectKind, subjectId).map(readIntegrityAnchor),
       insertGrant: (grant) => insertGrant(this.getGrantStatements(), grant),
       updateGrant: (grant) => updateGrant(this.getGrantStatements(), grant),
       insertGrantSession: (session) => insertGrantSession(this.getGrantStatements(), session),
       updateGrantSession: (session) => updateGrantSession(this.getGrantStatements(), session),
       appendGrantAudit: (entry) =>
         appendGrantAudit(this.getGrantStatements(), entry, this.grantValidationContext.keyRing),
+      upsertAcceptanceBudget: (budget) =>
+        statements.upsertBudget.run(
+          budget.bucketId,
+          budget.bucketKind,
+          budget.subjectId,
+          budget.capacity,
+          budget.refillPerSecond,
+          budget.tokens,
+          budget.updatedAtMs,
+          budget.stateRevision,
+        ),
+      insertReplayReservation: (reservation) =>
+        statements.insertReservation.run(
+          reservation.reservationId,
+          reservation.recordId,
+          reservation.eventGameId,
+          reservation.originatingSessionId,
+          reservation.replacementSessionId,
+          reservation.actionCount,
+          reservation.status,
+          reservation.batchDigest,
+          reservation.createdAtMs,
+          reservation.committedAtMs,
+          reservation.acknowledgedAtMs,
+          reservation.stateRevision,
+        ),
+      updateReplayReservation: (reservation) =>
+        statements.updateReservation.run(
+          reservation.recordId,
+          reservation.eventGameId,
+          reservation.originatingSessionId,
+          reservation.replacementSessionId,
+          reservation.actionCount,
+          reservation.status,
+          reservation.batchDigest,
+          reservation.createdAtMs,
+          reservation.committedAtMs,
+          reservation.acknowledgedAtMs,
+          reservation.stateRevision,
+          reservation.reservationId,
+        ),
+      insertReplayAttempt: (attempt) =>
+        statements.insertAttempt.run(
+          attempt.attemptId,
+          attempt.reservationId,
+          attempt.operationId,
+          attempt.status,
+          attempt.actionFingerprint,
+          attempt.resultJson,
+          attempt.controlAuditId,
+          attempt.grantAuditId,
+          attempt.createdAtMs,
+          attempt.completedAtMs,
+          attempt.stateRevision,
+        ),
+      updateReplayAttempt: (attempt) =>
+        statements.updateAttempt.run(
+          attempt.reservationId,
+          attempt.operationId,
+          attempt.status,
+          attempt.actionFingerprint,
+          attempt.resultJson,
+          attempt.controlAuditId,
+          attempt.grantAuditId,
+          attempt.createdAtMs,
+          attempt.completedAtMs,
+          attempt.stateRevision,
+          attempt.attemptId,
+        ),
+      discardReplayAttempts: (reservationId) => statements.discardAttempts.run(reservationId),
+      discardReplayReservation: (reservationId) => {
+        statements.discardAnchors.run(reservationId, `${reservationId}:%`);
+        statements.discardAttempts.run(reservationId);
+        statements.discardReservation.run(reservationId);
+      },
+      insertReplayReceipt: (receipt) =>
+        statements.insertReceipt.run(
+          receipt.receiptId,
+          receipt.reservationId,
+          receipt.receiptDigest,
+          receipt.receiptKeyVersion,
+          receipt.status,
+          receipt.actionCount,
+          receipt.createdAtMs,
+          receipt.acknowledgedAtMs,
+          receipt.stateRevision,
+        ),
+      updateReplayReceipt: (receipt) =>
+        statements.updateReceipt.run(
+          receipt.reservationId,
+          receipt.receiptDigest,
+          receipt.receiptKeyVersion,
+          receipt.status,
+          receipt.actionCount,
+          receipt.createdAtMs,
+          receipt.acknowledgedAtMs,
+          receipt.stateRevision,
+          receipt.receiptId,
+        ),
+      insertAcceptanceIntegrityAnchor: (anchor) =>
+        statements.insertAnchor.run(
+          anchor.anchorId,
+          anchor.subjectKind,
+          anchor.subjectId,
+          anchor.stateRevision,
+          anchor.keyVersion,
+          anchor.canonicalValue,
+          anchor.integrityTag,
+        ),
     };
   }
 
@@ -679,6 +938,94 @@ export class SqliteFoundationStorage implements FoundationStorage {
         INSERT INTO foundation_control_evidence_provenance
           (evidence_kind, evidence_id, evidence_format, origin)
         VALUES (?, ?, 'current', 'post-75-current')
+      `),
+      budgetById: this.database.query(
+        `SELECT * FROM foundation_acceptance_budgets WHERE bucket_id = ?`,
+      ),
+      upsertBudget: this.database.query(`
+        INSERT INTO foundation_acceptance_budgets
+          (bucket_id, bucket_kind, subject_id, capacity, refill_per_second, tokens, updated_at_ms, state_revision)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(bucket_id) DO UPDATE SET
+          bucket_kind = excluded.bucket_kind, subject_id = excluded.subject_id,
+          capacity = excluded.capacity, refill_per_second = excluded.refill_per_second,
+          tokens = excluded.tokens, updated_at_ms = excluded.updated_at_ms,
+          state_revision = excluded.state_revision
+      `),
+      reservationById: this.database.query(
+        `SELECT * FROM foundation_replay_reservations WHERE reservation_id = ?`,
+      ),
+      reservationByTuple: this.database.query(
+        `SELECT * FROM foundation_replay_reservations
+         WHERE record_id = ? AND event_game_id = ? AND originating_session_id = ? AND action_count = ?
+           AND batch_digest = ?
+         ORDER BY state_revision DESC LIMIT 2`,
+      ),
+      reservationByOriginTuple: this.database.query(
+        `SELECT * FROM foundation_replay_reservations
+         WHERE record_id = ? AND event_game_id = ? AND originating_session_id = ? AND action_count = ?
+         ORDER BY state_revision DESC LIMIT 1`,
+      ),
+      insertReservation: this.database.query(`
+        INSERT INTO foundation_replay_reservations
+          (reservation_id, record_id, event_game_id, originating_session_id, replacement_session_id,
+           action_count, status, batch_digest, created_at_ms, committed_at_ms, acknowledged_at_ms, state_revision)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `),
+      updateReservation: this.database.query(`
+        UPDATE foundation_replay_reservations SET record_id = ?, event_game_id = ?,
+          originating_session_id = ?, replacement_session_id = ?, action_count = ?, status = ?,
+          batch_digest = ?, created_at_ms = ?, committed_at_ms = ?, acknowledged_at_ms = ?, state_revision = ?
+        WHERE reservation_id = ?
+      `),
+      attemptsByReservation: this.database.query(
+        `SELECT * FROM foundation_replay_attempts WHERE reservation_id = ? ORDER BY attempt_id`,
+      ),
+      insertAttempt: this.database.query(`
+        INSERT INTO foundation_replay_attempts
+          (attempt_id, reservation_id, operation_id, status, action_fingerprint, result_json,
+           control_audit_id, grant_audit_id, created_at_ms, completed_at_ms, state_revision)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `),
+      updateAttempt: this.database.query(`
+        UPDATE foundation_replay_attempts SET reservation_id = ?, operation_id = ?, status = ?,
+          action_fingerprint = ?, result_json = ?, control_audit_id = ?, grant_audit_id = ?,
+          created_at_ms = ?, completed_at_ms = ?, state_revision = ? WHERE attempt_id = ?
+      `),
+      discardAttempts: this.database.query(
+        `DELETE FROM foundation_replay_attempts WHERE reservation_id = ?`,
+      ),
+      discardAnchors: this.database.query(
+        `DELETE FROM foundation_acceptance_integrity_anchors
+         WHERE (subject_kind = 'reservation' AND subject_id = ?)
+            OR (subject_kind = 'attempt' AND subject_id LIKE ?)`,
+      ),
+      discardReservation: this.database.query(
+        `DELETE FROM foundation_replay_reservations WHERE reservation_id = ?`,
+      ),
+      receiptByDigest: this.database.query(
+        `SELECT * FROM foundation_replay_receipts WHERE receipt_digest = ?`,
+      ),
+      receiptByReservationId: this.database.query(
+        `SELECT * FROM foundation_replay_receipts WHERE reservation_id = ?`,
+      ),
+      anchorsBySubject: this.database.query(
+        `SELECT * FROM foundation_acceptance_integrity_anchors
+         WHERE subject_kind = ? AND subject_id = ? ORDER BY state_revision`,
+      ),
+      insertReceipt: this.database.query(`
+        INSERT INTO foundation_replay_receipts
+          (receipt_id, reservation_id, receipt_digest, receipt_key_version, status, action_count, created_at_ms, acknowledged_at_ms, state_revision)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `),
+      updateReceipt: this.database.query(`
+        UPDATE foundation_replay_receipts SET reservation_id = ?, receipt_digest = ?, receipt_key_version = ?, status = ?,
+          action_count = ?, created_at_ms = ?, acknowledged_at_ms = ?, state_revision = ? WHERE receipt_id = ?
+      `),
+      insertAnchor: this.database.query(`
+        INSERT INTO foundation_acceptance_integrity_anchors
+          (anchor_id, subject_kind, subject_id, state_revision, key_version, canonical_value, integrity_tag)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
       `),
     };
     return this.statements;

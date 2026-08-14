@@ -281,6 +281,14 @@ export function createEventGameRecord(
         findSessionByBearerVerifier: () => null,
         listGrantSessions: () => [],
         listGrantAudit: () => [],
+        findAcceptanceBudget: () => null,
+        findReplayReservation: () => null,
+        findReplayReservationByTuple: () => null,
+        findReplayReservationByOriginTuple: () => null,
+        listReplayAttempts: () => [],
+        findReplayReceiptByDigest: () => null,
+        findReplayReceiptByReservationId: () => null,
+        listAcceptanceIntegrityAnchors: () => [],
       };
       return rebuildRecordSnapshot(root, snapshot, codecRegistry, options.interpreter);
     } catch (error) {
@@ -800,7 +808,7 @@ export function createEventGameRecord(
   };
 }
 
-function appendConcurrentCorrectionAudits(
+export function appendConcurrentCorrectionAudits(
   transaction: FoundationStorageTransaction,
   recordId: string,
   acceptedAtMs: number,

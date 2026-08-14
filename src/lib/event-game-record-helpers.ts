@@ -300,6 +300,30 @@ function validateAuditLinkage(
   if (links === undefined || provenance === undefined) {
     return "Control Audit Trail evidence is missing.";
   }
+  if (entry.lockedReplay !== undefined) {
+    if (
+      entry.kind !== "action-rejected" ||
+      entry.operationId !== null ||
+      entry.outcome !== "rejected" ||
+      links.actionId !== null ||
+      links.targetFactId !== null ||
+      links.causalPredecessorIds.length !== 0 ||
+      links.relatedOperationIds.length !== 0 ||
+      links.ordering !== null ||
+      provenance.occurrence !== null ||
+      provenance.grant !== null ||
+      provenance.lifecycle !== null ||
+      provenance.override !== null ||
+      provenance.recoveryProvenance !== null ||
+      entry.lockedReplay.eventGameId !== root.eventGameId ||
+      entry.lockedReplay.count <= 0 ||
+      entry.lockedReplay.originatingSessionId.length === 0 ||
+      !Number.isSafeInteger(entry.lockedReplay.rejectedAtMs)
+    ) {
+      return "Locked replay discard evidence is inconsistent.";
+    }
+    return null;
+  }
   if (links.ordering === null) return "Control Audit Trail ordering linkage is missing.";
   if (
     entry.operationId !== null &&
@@ -667,6 +691,8 @@ export function createAuditEntry(
               acceptedContentFingerprint: collision.acceptedContentFingerprint,
               rejectedAttempt: {
                 input: structuredClone(rejectedAttempt.input),
+                codecIdentity: rejectedAttempt.codecIdentity,
+                codecFingerprint: rejectedAttempt.codecFingerprint,
                 canonicalContent: rejectedAttempt.canonicalContent,
                 contentFingerprint: rejectedAttempt.contentFingerprint,
                 interpretation: structuredClone(rejectedAttempt.interpretation),
@@ -790,6 +816,12 @@ export function constraintToConflict(
     case "grant-session-verifier":
     case "grant-session-context":
     case "grant-audit-id":
+    case "acceptance-budget-id":
+    case "replay-reservation-id":
+    case "replay-attempt-id":
+    case "replay-receipt-id":
+    case "replay-receipt-digest":
       return "content-conflict";
   }
+  return "content-conflict";
 }

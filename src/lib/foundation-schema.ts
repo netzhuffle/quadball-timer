@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { Database } from "bun:sqlite";
+import { canonicalizeJson } from "@/lib/event-game-action-json";
 import {
   FOUNDATION_ACTION_RECORD_INDEX_SQL,
   FOUNDATION_CURRENT_ACTION_TABLE_SQL,
@@ -41,10 +42,24 @@ import {
 import {
   computeGrantAuditIntegrityTag,
   computeLegacyGrantAuditIntegrityTag,
+  computeAcceptanceIntegrityTag,
 } from "@/lib/grant-crypto";
 import { readStoredGrantAuditEntry, scanGrantState } from "@/lib/grant-storage-sqlite";
 import type { GrantStateValidationContext } from "@/lib/grant-state-validation";
 import { GRANT_AUDIT_LEGACY_INTEGRITY_TAG } from "@/lib/grant-types";
+import {
+  anchorFor,
+  acceptanceAuditPairFailure,
+  replayAttemptResultFailure,
+} from "@/lib/foundation-acceptance-integrity";
+import type { AcceptanceIntegritySubject } from "@/lib/foundation-acceptance-integrity";
+import type { GrantKeyRing, StoredGrantAuditEntry } from "@/lib/grant-types";
+import type {
+  StoredControlAuditEntry,
+  StoredReplayAttempt,
+  StoredReplayReceipt,
+  StoredReplayReservation,
+} from "@/lib/foundation-storage";
 import {
   canonicalizeEventGameRecordRoot,
   cloneEventGameRecordRoot,
@@ -682,6 +697,136 @@ export function hasExpectedFoundationSchema(database: Database): boolean {
   return foundationSchemaFingerprint(database) === FOUNDATION_SCHEMA_FINGERPRINT;
 }
 
+function hasComposedAcceptanceSchema(database: Database): boolean {
+  const requiredTables = [
+    "foundation_acceptance_budgets",
+    "foundation_replay_reservations",
+    "foundation_replay_attempts",
+    "foundation_replay_receipts",
+    "foundation_acceptance_integrity_anchors",
+  ];
+  if (
+    requiredTables.some(
+      (name) =>
+        database
+          .query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?")
+          .get(name) === null,
+    )
+  )
+    return false;
+  const expectedColumns: Record<string, readonly string[]> = {
+    foundation_acceptance_budgets: [
+      "bucket_id",
+      "bucket_kind",
+      "subject_id",
+      "capacity",
+      "refill_per_second",
+      "tokens",
+      "updated_at_ms",
+      "state_revision",
+    ],
+    foundation_replay_reservations: [
+      "reservation_id",
+      "record_id",
+      "event_game_id",
+      "originating_session_id",
+      "replacement_session_id",
+      "action_count",
+      "status",
+      "batch_digest",
+      "created_at_ms",
+      "committed_at_ms",
+      "acknowledged_at_ms",
+      "state_revision",
+    ],
+    foundation_replay_attempts: [
+      "attempt_id",
+      "reservation_id",
+      "operation_id",
+      "status",
+      "action_fingerprint",
+      "result_json",
+      "control_audit_id",
+      "grant_audit_id",
+      "created_at_ms",
+      "completed_at_ms",
+      "state_revision",
+    ],
+    foundation_replay_receipts: [
+      "receipt_id",
+      "reservation_id",
+      "receipt_digest",
+      "receipt_key_version",
+      "status",
+      "action_count",
+      "created_at_ms",
+      "acknowledged_at_ms",
+      "state_revision",
+    ],
+    foundation_acceptance_integrity_anchors: [
+      "anchor_id",
+      "subject_kind",
+      "subject_id",
+      "state_revision",
+      "key_version",
+      "integrity_tag",
+      "canonical_value",
+    ],
+  };
+  for (const [table, columns] of Object.entries(expectedColumns)) {
+    const actual = database
+      .query(`PRAGMA table_info(${table})`)
+      .all()
+      .map((value) => String((value as Record<string, unknown>).name));
+    if (actual.length !== columns.length || actual.some((name, index) => name !== columns[index]))
+      return false;
+  }
+  const requiredIndexes = [
+    "foundation_replay_reservations_record_id",
+    "foundation_replay_attempts_reservation_id",
+  ];
+  if (
+    requiredIndexes.some(
+      (name) =>
+        database
+          .query("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?")
+          .get(name) === null,
+    )
+  )
+    return false;
+  const requiredTriggers = [
+    "foundation_acceptance_integrity_anchors_no_update",
+    "foundation_acceptance_integrity_anchors_no_delete",
+    "foundation_grant_audit_no_legacy_integrity_tag",
+    "foundation_grant_audit_provenance_after_insert",
+  ];
+  if (
+    requiredTriggers.some(
+      (name) =>
+        database
+          .query("SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = ?")
+          .get(name) === null,
+    )
+  )
+    return false;
+  const receiptColumns = database
+    .query("PRAGMA table_info(foundation_replay_receipts)")
+    .all()
+    .map((value) => String((value as Record<string, unknown>).name));
+  if (!receiptColumns.includes("receipt_key_version")) return false;
+  const columns = database
+    .query("PRAGMA table_info(foundation_grant_audit)")
+    .all()
+    .map((value) => String((value as Record<string, unknown>).name));
+  return [
+    "acceptance_id",
+    "control_audit_id",
+    "control_action_id",
+    "content_fingerprint",
+    "outcome_detail",
+  ].every((name) => columns.includes(name));
+}
+
 export function foundationSchemaFingerprint(database: Database): string {
   return fingerprint(readSchemaManifest(database));
 }
@@ -698,7 +843,8 @@ export function verifyFoundationSchema(
         detail: "The supported root table is missing.",
       };
     }
-    if (!hasExpectedFoundationSchema(database)) {
+    const composedAcceptance = hasComposedAcceptanceSchema(database);
+    if (!hasExpectedFoundationSchema(database) && !composedAcceptance) {
       return {
         ok: false,
         status: "integrity-failure",
@@ -733,6 +879,8 @@ export function verifyFoundationSchema(
     scanFoundationRoots(database);
     verifyGrantProvenance(database, grantValidationContext);
     scanFoundationGrantState(database, grantValidationContext);
+    if (composedAcceptance)
+      verifyComposedAcceptanceState(database, grantValidationContext?.keyRing);
     return { ok: true };
   } catch {
     return {
@@ -767,6 +915,637 @@ export function scanFoundationRoots(database: Database): void {
   for (const value of rows) {
     readValidatedFoundationRoot(database, asRecord(value));
   }
+}
+
+function verifyComposedAcceptanceState(database: Database, keyRing?: GrantKeyRing): void {
+  const anchors = database
+    .query("SELECT * FROM foundation_acceptance_integrity_anchors ORDER BY anchor_id")
+    .all() as unknown[];
+  if (
+    keyRing === undefined &&
+    (anchors.length !== 0 ||
+      database.query("SELECT 1 FROM foundation_acceptance_budgets LIMIT 1").get() !== null ||
+      database.query("SELECT 1 FROM foundation_replay_reservations LIMIT 1").get() !== null ||
+      database.query("SELECT 1 FROM foundation_replay_attempts LIMIT 1").get() !== null ||
+      database.query("SELECT 1 FROM foundation_replay_receipts LIMIT 1").get() !== null)
+  )
+    throw new Error("Acceptance integrity key material is unavailable.");
+  if (keyRing === undefined) return;
+  const budgets = database.query("SELECT * FROM foundation_acceptance_budgets").all() as unknown[];
+  for (const value of budgets) {
+    const row = asRecord(value);
+    const kind = readText(row.bucket_kind);
+    const subject = readText(row.subject_id);
+    const capacity = readInteger(row.capacity);
+    const refill = readInteger(row.refill_per_second);
+    const tokens = readReal(row.tokens);
+    if (
+      readText(row.bucket_id) !== `budget-${kind}:${subject}` ||
+      !["online-session", "online-event", "replay-session"].includes(kind) ||
+      capacity <= 0 ||
+      refill <= 0 ||
+      tokens < 0 ||
+      tokens > capacity ||
+      !Number.isSafeInteger(readInteger(row.updated_at_ms)) ||
+      !Number.isSafeInteger(readInteger(row.state_revision)) ||
+      !verifyAcceptanceAnchor(
+        database,
+        anchors,
+        "budget",
+        readText(row.bucket_id),
+        readInteger(row.state_revision),
+        row,
+        keyRing,
+      )
+    )
+      throw new Error("Acceptance budget state is inconsistent.");
+  }
+
+  const reservations = database
+    .query(
+      `SELECT reservations.*, roots.event_game_id AS root_event_game_id
+       FROM foundation_replay_reservations AS reservations
+       LEFT JOIN foundation_event_game_record_roots AS roots ON roots.record_id = reservations.record_id`,
+    )
+    .all() as unknown[];
+  const reservationIds = new Set<string>();
+  const reservationCounts = new Map<string, number>();
+  for (const value of reservations) {
+    const row = asRecord(value);
+    const reservationId = readText(row.reservation_id);
+    const status = readText(row.status);
+    const count = readInteger(row.action_count);
+    const digest = readNullableText(row.batch_digest);
+    if (
+      reservationIds.has(reservationId) ||
+      readText(row.root_event_game_id) !== readText(row.event_game_id) ||
+      count <= 0 ||
+      digest === null ||
+      !/^[a-f0-9]{64}$/.test(digest) ||
+      !["reserved", "committing", "committed", "partial", "discarded", "acknowledged"].includes(
+        status,
+      ) ||
+      !verifyAcceptanceAnchor(
+        database,
+        anchors,
+        "reservation",
+        reservationId,
+        readInteger(row.state_revision),
+        row,
+        keyRing,
+      )
+    )
+      throw new Error("Replay reservation state is inconsistent.");
+    const committedAt = readNullableInteger(row.committed_at_ms);
+    const acknowledgedAt = readNullableInteger(row.acknowledged_at_ms);
+    if (
+      ((status === "committed" || status === "acknowledged") && committedAt === null) ||
+      (status === "acknowledged" && acknowledgedAt === null) ||
+      (status === "discarded" && (committedAt !== null || acknowledgedAt !== null))
+    )
+      throw new Error("Replay reservation timestamps are inconsistent.");
+    if (
+      status === "discarded" &&
+      (digest !== null || readNullableText(row.replacement_session_id) !== null)
+    )
+      throw new Error("Discarded replay retained authorization provenance.");
+    reservationIds.add(reservationId);
+    reservationCounts.set(reservationId, count);
+  }
+
+  const attempts = database.query("SELECT * FROM foundation_replay_attempts").all() as unknown[];
+  const attemptsByReservation = new Map<string, number>();
+  for (const value of attempts) {
+    const row = asRecord(value);
+    const fingerprint = readNullableText(row.action_fingerprint);
+    const resultJson = readNullableText(row.result_json);
+    if (
+      !reservationIds.has(readText(row.reservation_id)) ||
+      readText(row.operation_id).length === 0 ||
+      (fingerprint !== null && !/^[a-f0-9]{64}$/.test(fingerprint)) ||
+      (resultJson !== null && !isValidJsonObject(resultJson)) ||
+      (readNullableText(row.control_audit_id) === null) !== (resultJson === null) ||
+      (readNullableText(row.grant_audit_id) === null) !== (resultJson === null) ||
+      !verifyAcceptanceAnchor(
+        database,
+        anchors,
+        "attempt",
+        readText(row.attempt_id),
+        readInteger(row.state_revision),
+        row,
+        keyRing,
+      )
+    )
+      throw new Error("Replay attempt state is inconsistent.");
+    if (resultJson === null || !isValidJsonObject(resultJson))
+      throw new Error("Replay attempt result evidence is missing.");
+    if (canonicalizeJson(JSON.parse(resultJson)) !== resultJson)
+      throw new Error("Replay attempt result JSON is not canonical.");
+    const result = JSON.parse(resultJson) as { status?: string };
+    const status = readText(row.status);
+    if (
+      typeof result.status !== "string" ||
+      (status === "accepted" && result.status !== "accepted") ||
+      (status === "duplicate-accepted" && result.status !== "duplicate-accepted") ||
+      (status === "retry-later" && result.status !== "retry-later") ||
+      (status === "rejected" &&
+        !["rejected", "dependency-blocked", "authority-expired"].includes(result.status))
+    )
+      throw new Error("Replay attempt result status is inconsistent.");
+    const createdAt = readInteger(row.created_at_ms);
+    const completedAt = readNullableInteger(row.completed_at_ms);
+    if (
+      (status === "retry-later") !== (completedAt === null) ||
+      createdAt < 0 ||
+      (completedAt !== null && completedAt < 0)
+    )
+      throw new Error("Replay attempt timestamps are inconsistent.");
+    const reservationId = readText(row.reservation_id);
+    attemptsByReservation.set(reservationId, (attemptsByReservation.get(reservationId) ?? 0) + 1);
+  }
+  for (const value of reservations) {
+    const row = asRecord(value);
+    const status = readText(row.status);
+    const attemptsCount = attemptsByReservation.get(readText(row.reservation_id)) ?? 0;
+    const receiptsCount = database
+      .query("SELECT COUNT(*) AS count FROM foundation_replay_receipts WHERE reservation_id = ?")
+      .get(readText(row.reservation_id));
+    const receiptCount = readInteger(asRecord(receiptsCount).count);
+    if (
+      (status === "reserved" && (attemptsCount !== 0 || receiptCount !== 0)) ||
+      (status === "partial" &&
+        (attemptsCount === 0 ||
+          attemptsCount > readInteger(row.action_count) ||
+          receiptCount !== 0)) ||
+      ((status === "committed" || status === "acknowledged") &&
+        (attemptsCount !== readInteger(row.action_count) || receiptCount !== 1)) ||
+      (status === "discarded" && (attemptsCount !== 0 || receiptCount !== 0))
+    )
+      throw new Error("Replay evidence cardinality is inconsistent.");
+  }
+
+  const receipts = database.query("SELECT * FROM foundation_replay_receipts").all() as unknown[];
+  for (const value of receipts) {
+    const row = asRecord(value);
+    const reservationId = readText(row.reservation_id);
+    if (
+      !reservationIds.has(reservationId) ||
+      readInteger(row.action_count) !== reservationCounts.get(reservationId) ||
+      !/^[a-f0-9]{64}$/.test(readText(row.receipt_digest)) ||
+      readText(row.receipt_key_version).length === 0 ||
+      !["committed", "acknowledged"].includes(readText(row.status)) ||
+      !verifyAcceptanceAnchor(
+        database,
+        anchors,
+        "receipt",
+        readText(row.receipt_id),
+        readInteger(row.state_revision),
+        row,
+        keyRing,
+      )
+    )
+      throw new Error("Replay receipt state is inconsistent.");
+    const receiptStatus = readText(row.status);
+    const acknowledgedAt = readNullableInteger(row.acknowledged_at_ms);
+    if (
+      (receiptStatus === "acknowledged") !== (acknowledgedAt !== null) ||
+      readInteger(row.created_at_ms) < 0
+    )
+      throw new Error("Replay receipt timestamps are inconsistent.");
+  }
+
+  const currentRevisions = new Map<string, number>();
+  for (const value of budgets) {
+    const row = asRecord(value);
+    currentRevisions.set(`budget:${readText(row.bucket_id)}`, readInteger(row.state_revision));
+  }
+  for (const value of reservations) {
+    const row = asRecord(value);
+    currentRevisions.set(
+      `reservation:${readText(row.reservation_id)}`,
+      readInteger(row.state_revision),
+    );
+  }
+  for (const value of attempts) {
+    const row = asRecord(value);
+    currentRevisions.set(
+      `attempt:${readText(row.reservation_id)}:${readText(row.attempt_id)}`,
+      readInteger(row.state_revision),
+    );
+  }
+  for (const value of receipts) {
+    const row = asRecord(value);
+    currentRevisions.set(`receipt:${readText(row.receipt_id)}`, readInteger(row.state_revision));
+  }
+  const anchorGroups = new Map<string, Record<string, unknown>[]>();
+  for (const value of anchors) {
+    const row = asRecord(value);
+    const subjectKind = readText(row.subject_kind) as AcceptanceIntegritySubject;
+    const subjectId = readText(row.subject_id);
+    const revision = readInteger(row.state_revision);
+    const canonicalValue = readText(row.canonical_value);
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(canonicalValue) as unknown;
+    } catch {
+      throw new Error("Acceptance integrity anchor evidence is not valid JSON.");
+    }
+    if (
+      !["budget", "reservation", "attempt", "receipt"].includes(subjectKind) ||
+      canonicalizeJson(parsed) !== canonicalValue ||
+      readText(row.anchor_id) !== `${subjectKind}:${subjectId}:${revision}`
+    )
+      throw new Error("Acceptance integrity anchor identity is inconsistent.");
+    let expectedTag: string;
+    try {
+      expectedTag = computeAcceptanceIntegrityTag(
+        canonicalizeJson({
+          domain: "foundation-acceptance-state-v1",
+          subjectKind,
+          subjectId,
+          stateRevision: revision,
+          value: parsed,
+        }),
+        keyRing,
+        readText(row.key_version),
+      );
+    } catch {
+      throw new Error("Acceptance integrity anchor key material is unavailable.");
+    }
+    if (readText(row.integrity_tag) !== expectedTag)
+      throw new Error("Acceptance integrity anchor authentication failed.");
+    const key = `${subjectKind}:${subjectId}`;
+    const group = anchorGroups.get(key) ?? [];
+    group.push(row);
+    anchorGroups.set(key, group);
+  }
+  for (const [key, group] of anchorGroups) {
+    const current = currentRevisions.get(key);
+    if (current === undefined || group.length !== current) {
+      throw new Error("Acceptance integrity anchor history is missing or orphaned.");
+    }
+    const revisions = group.map((row) => readInteger(row.state_revision)).sort((a, b) => a - b);
+    if (revisions.some((revision, index) => revision !== index + 1))
+      throw new Error("Acceptance integrity anchor history is not contiguous.");
+  }
+  if (anchorGroups.size !== currentRevisions.size)
+    throw new Error("Acceptance integrity anchor history has an extra or missing subject.");
+  for (const value of anchors) {
+    const row = asRecord(value);
+    const key = `${readText(row.subject_kind)}:${readText(row.subject_id)}`;
+    const currentRevision = currentRevisions.get(key);
+    if (currentRevision === undefined) {
+      const subject = readText(row.subject_id);
+      const separator = subject.lastIndexOf(":");
+      const reservationId = separator > 0 ? subject.slice(0, separator) : "";
+      const discarded = database
+        .query(
+          "SELECT 1 FROM foundation_replay_reservations WHERE reservation_id = ? AND status = 'discarded'",
+        )
+        .get(reservationId);
+      if (readText(row.subject_kind) !== "attempt" || discarded === null)
+        throw new Error("Acceptance integrity anchor is orphaned.");
+      continue;
+    }
+    if (readInteger(row.state_revision) > currentRevision)
+      throw new Error("Acceptance integrity anchor is orphaned.");
+  }
+  const maximumAnchorRevision = new Map<string, number>();
+  for (const value of anchors) {
+    const row = asRecord(value);
+    const key = `${readText(row.subject_kind)}:${readText(row.subject_id)}`;
+    maximumAnchorRevision.set(
+      key,
+      Math.max(maximumAnchorRevision.get(key) ?? 0, readInteger(row.state_revision)),
+    );
+  }
+  for (const value of budgets) {
+    const row = asRecord(value);
+    if (
+      maximumAnchorRevision.get(`budget:${readText(row.bucket_id)}`) !==
+      readInteger(row.state_revision)
+    )
+      throw new Error("Acceptance integrity history is not monotonic.");
+  }
+  for (const value of reservations) {
+    const row = asRecord(value);
+    if (
+      maximumAnchorRevision.get(`reservation:${readText(row.reservation_id)}`) !==
+      readInteger(row.state_revision)
+    )
+      throw new Error("Acceptance integrity history is not monotonic.");
+  }
+  for (const value of attempts) {
+    const row = asRecord(value);
+    if (
+      maximumAnchorRevision.get(
+        `attempt:${readText(row.reservation_id)}:${readText(row.attempt_id)}`,
+      ) !== readInteger(row.state_revision)
+    )
+      throw new Error("Acceptance integrity history is not monotonic.");
+  }
+  for (const value of receipts) {
+    const row = asRecord(value);
+    if (
+      maximumAnchorRevision.get(`receipt:${readText(row.receipt_id)}`) !==
+      readInteger(row.state_revision)
+    )
+      throw new Error("Acceptance integrity history is not monotonic.");
+  }
+
+  const controlAudits = database
+    .query("SELECT * FROM foundation_event_game_record_audit ORDER BY audit_id")
+    .all()
+    .map((value) => JSON.parse(readText(asRecord(value).audit_json)) as StoredControlAuditEntry);
+  const grantAudits = database
+    .query("SELECT * FROM foundation_grant_audit ORDER BY audit_id")
+    .all()
+    .map((value) => readStoredGrantAuditEntry(asRecord(value)));
+  const controlsById = new Map(controlAudits.map((audit) => [audit.auditId, audit]));
+  const grantsById = new Map(grantAudits.map((audit) => [audit.auditId, audit]));
+  const actionEvidence = new Map<
+    string,
+    { contentFingerprint: string; canonicalContent: string; actionJson: string }
+  >();
+  for (const value of database
+    .query(
+      "SELECT record_id, operation_id, content_fingerprint, canonical_content, action_json FROM foundation_event_game_record_actions",
+    )
+    .all()) {
+    const row = asRecord(value);
+    actionEvidence.set(`${readText(row.record_id)}:${readText(row.operation_id)}`, {
+      contentFingerprint: readText(row.content_fingerprint),
+      canonicalContent: readText(row.canonical_content),
+      actionJson: readText(row.action_json),
+    });
+  }
+  const idempotencyEvidence = new Map<string, string>();
+  for (const value of database
+    .query(
+      "SELECT record_id, operation_id, content_fingerprint FROM foundation_event_game_record_idempotency",
+    )
+    .all()) {
+    const row = asRecord(value);
+    idempotencyEvidence.set(
+      `${readText(row.record_id)}:${readText(row.operation_id)}`,
+      readText(row.content_fingerprint),
+    );
+  }
+  for (const control of controlAudits) {
+    const linkedGrantId = control.links?.grantAuditId;
+    if (linkedGrantId !== undefined && linkedGrantId !== null) {
+      const grant = grantsById.get(linkedGrantId);
+      if (
+        grant === undefined ||
+        acceptanceAuditPairFailure(control, grant) !== null ||
+        sqliteAcceptanceFingerprintFailure(control, grant, actionEvidence, idempotencyEvidence) !==
+          null
+      )
+        throw new Error("Control and Grant acceptance semantics are inconsistent.");
+    } else if (control.links?.acceptanceId !== undefined && control.links.acceptanceId !== null) {
+      throw new Error("Control acceptance evidence has no paired Grant audit.");
+    }
+  }
+  for (const grant of grantAudits) {
+    const hasAcceptanceFields =
+      grant.acceptanceId !== null ||
+      grant.controlAuditId !== null ||
+      grant.controlActionId !== null ||
+      grant.contentFingerprint !== null ||
+      grant.outcomeDetail !== null;
+    if (!hasAcceptanceFields) continue;
+    const control =
+      typeof grant.controlAuditId !== "string" ? undefined : controlsById.get(grant.controlAuditId);
+    if (
+      control === undefined ||
+      acceptanceAuditPairFailure(control, grant) !== null ||
+      sqliteAcceptanceFingerprintFailure(control, grant, actionEvidence, idempotencyEvidence) !==
+        null
+    )
+      throw new Error("Grant acceptance evidence has no exact paired Control audit.");
+  }
+
+  const linkedGrantAudits = database
+    .query(
+      `SELECT grants.audit_id, grants.acceptance_id, grants.control_audit_id,
+              grants.control_action_id,
+              json_extract(controls.audit_json, '$.auditId') AS control_id,
+              json_extract(controls.audit_json, '$.links.grantAuditId') AS linked_grant_id,
+              json_extract(controls.audit_json, '$.links.acceptanceId') AS linked_acceptance_id
+       FROM foundation_grant_audit AS grants
+       LEFT JOIN foundation_event_game_record_audit AS controls
+         ON json_extract(controls.audit_json, '$.auditId') = grants.control_audit_id
+       WHERE grants.acceptance_id IS NOT NULL`,
+    )
+    .all() as unknown[];
+  for (const value of linkedGrantAudits) {
+    const row = asRecord(value);
+    if (
+      readText(row.control_id) !== readText(row.control_audit_id) ||
+      readText(row.linked_grant_id) !== readText(row.audit_id) ||
+      readText(row.linked_acceptance_id) !== readText(row.acceptance_id) ||
+      readText(row.control_action_id).length === 0
+    )
+      throw new Error("Control and Grant acceptance evidence is not bidirectionally linked.");
+  }
+  const orphanedControlLinks = database
+    .query(
+      `SELECT controls.audit_id, json_extract(controls.audit_json, '$.links.grantAuditId') AS grant_id
+       FROM foundation_event_game_record_audit AS controls
+       LEFT JOIN foundation_grant_audit AS grants
+         ON grants.audit_id = json_extract(controls.audit_json, '$.links.grantAuditId')
+       WHERE json_extract(controls.audit_json, '$.links.grantAuditId') IS NOT NULL
+         AND (grants.audit_id IS NULL OR grants.control_audit_id <> controls.audit_id)`,
+    )
+    .all() as unknown[];
+  if (orphanedControlLinks.length !== 0)
+    throw new Error("Control acceptance evidence points to an orphan Grant audit.");
+  const orphanedAttempts = database
+    .query(
+      `SELECT attempts.attempt_id
+       FROM foundation_replay_attempts AS attempts
+       LEFT JOIN foundation_event_game_record_audit AS controls
+         ON controls.audit_id = attempts.control_audit_id
+       LEFT JOIN foundation_grant_audit AS grants
+         ON grants.audit_id = attempts.grant_audit_id
+       WHERE controls.audit_id IS NULL
+          OR grants.audit_id IS NULL
+          OR grants.control_audit_id <> controls.audit_id
+          OR json_extract(controls.audit_json, '$.links.grantAuditId') <> grants.audit_id
+          OR json_extract(controls.audit_json, '$.links.acceptanceId') <> grants.acceptance_id
+          OR grants.acceptance_id IS NULL
+          OR grants.content_fingerprint IS NULL
+          OR (attempts.action_fingerprint IS NOT NULL AND attempts.action_fingerprint <> grants.content_fingerprint)`,
+    )
+    .all() as unknown[];
+  if (orphanedAttempts.length !== 0)
+    throw new Error("Replay attempt evidence is not paired with its durable audits.");
+
+  for (const value of attempts) {
+    const row = asRecord(value);
+    const control = controlsById.get(readText(row.control_audit_id));
+    const grant = grantsById.get(readText(row.grant_audit_id));
+    if (control === undefined || grant === undefined) continue;
+    const attempt: StoredReplayAttempt = {
+      attemptId: readText(row.attempt_id),
+      reservationId: readText(row.reservation_id),
+      operationId: readText(row.operation_id),
+      status: readText(row.status) as StoredReplayAttempt["status"],
+      actionFingerprint: readNullableText(row.action_fingerprint),
+      resultJson: readNullableText(row.result_json),
+      controlAuditId: readNullableText(row.control_audit_id),
+      grantAuditId: readNullableText(row.grant_audit_id),
+      createdAtMs: readInteger(row.created_at_ms),
+      completedAtMs: readNullableInteger(row.completed_at_ms),
+      stateRevision: readInteger(row.state_revision),
+    };
+    const evidence = actionEvidence.get(`${control.recordId}:${control.operationId}`);
+    let result: unknown = null;
+    try {
+      result = JSON.parse(attempt.resultJson ?? "null");
+    } catch {
+      result = null;
+    }
+    const accepted = control.kind === "action-accepted" || control.kind === "action-duplicate";
+    const collisionFingerprint = control.links?.collision?.rejectedAttempt?.contentFingerprint;
+    const candidateFingerprint =
+      collisionFingerprint ?? control.links?.rejectedCandidate?.contentFingerprint;
+    const expectedFingerprint = accepted ? evidence?.contentFingerprint : candidateFingerprint;
+    if (
+      acceptanceAuditPairFailure(control, grant, attempt) !== null ||
+      sqliteAcceptanceFingerprintFailure(control, grant, actionEvidence, idempotencyEvidence) !==
+        null ||
+      (accepted &&
+        (evidence === undefined ||
+          grant.contentFingerprint !== evidence.contentFingerprint ||
+          attempt.actionFingerprint !== evidence.contentFingerprint ||
+          idempotencyEvidence.get(`${control.recordId}:${control.operationId}`) !==
+            evidence.contentFingerprint ||
+          !isRecord(result) ||
+          canonicalizeJson(result.action) !== canonicalizeJson(JSON.parse(evidence.actionJson)))) ||
+      (expectedFingerprint !== undefined &&
+        (grant.contentFingerprint !== expectedFingerprint ||
+          attempt.actionFingerprint !== expectedFingerprint)) ||
+      replayAttemptResultFailure(attempt) !== null
+    )
+      throw new Error("Replay attempt semantics are not paired with its Control/Grant audits.");
+  }
+}
+
+function sqliteAcceptanceFingerprintFailure(
+  control: StoredControlAuditEntry,
+  grant: StoredGrantAuditEntry,
+  actionEvidence: ReadonlyMap<
+    string,
+    { contentFingerprint: string; canonicalContent: string; actionJson: string }
+  >,
+  idempotencyEvidence: ReadonlyMap<string, string>,
+): string | null {
+  if (control.operationId === null || grant.contentFingerprint === null) return "missing";
+  const key = `${control.recordId}:${control.operationId}`;
+  const accepted = control.kind === "action-accepted" || control.kind === "action-duplicate";
+  const action = actionEvidence.get(key);
+  const collisionFingerprint = control.links?.collision?.rejectedAttempt?.contentFingerprint;
+  const candidateFingerprint =
+    collisionFingerprint ?? control.links?.rejectedCandidate?.contentFingerprint;
+  const expectedFingerprint = accepted ? action?.contentFingerprint : candidateFingerprint;
+  if (
+    expectedFingerprint === undefined ||
+    control.links?.contentFingerprint !== expectedFingerprint ||
+    grant.contentFingerprint !== expectedFingerprint
+  )
+    return "fingerprint";
+  if (accepted && (action === undefined || idempotencyEvidence.get(key) !== expectedFingerprint))
+    return "fingerprint";
+  return null;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function verifyAcceptanceAnchor(
+  _database: Database,
+  anchors: unknown[],
+  subjectKind: AcceptanceIntegritySubject,
+  subjectId: string,
+  stateRevision: number,
+  row: Record<string, unknown>,
+  keyRing: GrantKeyRing,
+): boolean {
+  const anchorSubjectId =
+    subjectKind === "attempt" ? `${readText(row.reservation_id)}:${subjectId}` : subjectId;
+  const anchorRow = anchors
+    .map(asRecord)
+    .find(
+      (candidate) =>
+        readText(candidate.subject_kind) === subjectKind &&
+        readText(candidate.subject_id) === anchorSubjectId &&
+        readInteger(candidate.state_revision) === stateRevision,
+    );
+  if (anchorRow === undefined) return false;
+  const value =
+    subjectKind === "budget"
+      ? {
+          bucketId: readText(row.bucket_id),
+          bucketKind: readText(row.bucket_kind) as
+            | "online-session"
+            | "online-event"
+            | "replay-session",
+          subjectId: readText(row.subject_id),
+          capacity: readInteger(row.capacity),
+          refillPerSecond: readInteger(row.refill_per_second),
+          tokens: readReal(row.tokens),
+          updatedAtMs: readInteger(row.updated_at_ms),
+          stateRevision,
+        }
+      : subjectKind === "reservation"
+        ? {
+            reservationId: readText(row.reservation_id),
+            recordId: readText(row.record_id),
+            eventGameId: readText(row.event_game_id),
+            originatingSessionId: readText(row.originating_session_id),
+            replacementSessionId: readNullableText(row.replacement_session_id),
+            actionCount: readInteger(row.action_count),
+            status: readText(row.status) as StoredReplayReservation["status"],
+            batchDigest: readNullableText(row.batch_digest),
+            createdAtMs: readInteger(row.created_at_ms),
+            committedAtMs: readNullableInteger(row.committed_at_ms),
+            acknowledgedAtMs: readNullableInteger(row.acknowledged_at_ms),
+            stateRevision,
+          }
+        : subjectKind === "attempt"
+          ? {
+              attemptId: readText(row.attempt_id),
+              reservationId: readText(row.reservation_id),
+              operationId: readText(row.operation_id),
+              status: readText(row.status) as StoredReplayAttempt["status"],
+              actionFingerprint: readNullableText(row.action_fingerprint),
+              resultJson: readNullableText(row.result_json),
+              controlAuditId: readNullableText(row.control_audit_id),
+              grantAuditId: readNullableText(row.grant_audit_id),
+              createdAtMs: readInteger(row.created_at_ms),
+              completedAtMs: readNullableInteger(row.completed_at_ms),
+              stateRevision,
+            }
+          : {
+              receiptId: readText(row.receipt_id),
+              reservationId: readText(row.reservation_id),
+              receiptDigest: readText(row.receipt_digest),
+              receiptKeyVersion: readText(row.receipt_key_version),
+              status: readText(row.status) as StoredReplayReceipt["status"],
+              actionCount: readInteger(row.action_count),
+              createdAtMs: readInteger(row.created_at_ms),
+              acknowledgedAtMs: readNullableInteger(row.acknowledged_at_ms),
+              stateRevision,
+            };
+  const expected = anchorFor(subjectKind, value, keyRing, readText(anchorRow.key_version));
+  return (
+    readText(anchorRow.anchor_id) === expected.anchorId &&
+    readText(anchorRow.key_version) === expected.keyVersion &&
+    readText(anchorRow.canonical_value) === expected.canonicalValue &&
+    readText(anchorRow.integrity_tag) === expected.integrityTag
+  );
 }
 
 function scanFoundationGrantState(
@@ -884,9 +1663,19 @@ function verifyGrantProvenance(
     "audit_integrity_tag",
     "created_at_ms",
   ] as const;
+  const currentColumns = [
+    ...columns.slice(0, -1),
+    "acceptance_id",
+    "control_audit_id",
+    "control_action_id",
+    "content_fingerprint",
+    "outcome_detail",
+    "created_at_ms",
+  ] as const;
   const select = columns.join(", ");
+  const currentSelect = currentColumns.join(", ");
   const current = database
-    .query(`SELECT ${select} FROM foundation_grant_audit ORDER BY audit_id`)
+    .query(`SELECT ${currentSelect} FROM foundation_grant_audit ORDER BY audit_id`)
     .all() as unknown[];
   const durable = database
     .query(`SELECT ${select} FROM foundation_grant_audit_provenance ORDER BY audit_id`)
@@ -1236,10 +2025,25 @@ function readInteger(value: unknown): number {
   return parsed;
 }
 
+function readReal(value: unknown): number {
+  const parsed = Number(readText(value));
+  if (!Number.isFinite(parsed)) throw new Error("SQLite returned an invalid schema real.");
+  return parsed;
+}
+
 function readNullableInteger(value: unknown): number | null {
   return value === null ? null : readInteger(value);
 }
 
 function readNullableText(value: unknown): string | null {
   return value === null ? null : readText(value);
+}
+
+function isValidJsonObject(value: string): boolean {
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed);
+  } catch {
+    return false;
+  }
 }

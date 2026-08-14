@@ -3,7 +3,7 @@ import {
   computeSessionVerifier,
   createRandomIdentifier,
 } from "@/lib/grant-crypto";
-import type { FoundationStorage } from "@/lib/foundation-storage";
+import type { FoundationStorage, FoundationStorageTransaction } from "@/lib/foundation-storage";
 import type { GrantAuthorityOptions } from "@/lib/grant-authority";
 import {
   EVENT_ADMIN_GRANT_TYPE,
@@ -168,99 +168,111 @@ export async function authorizeGrant(
   )
     return GENERIC_GRANT_AUTHORIZATION_FAILURE;
   try {
-    return await storage.transaction((transaction) => {
-      const session = findSessionByBearer(transaction, options, input.sessionBearer);
-      if (session === null) return GENERIC_GRANT_AUTHORIZATION_FAILURE;
-      const stored = transaction.findGrantById(session.grantId);
-      if (stored === null) return GENERIC_GRANT_AUTHORIZATION_FAILURE;
-      const grant = expireGrantIfDue(transaction, options, stored);
-      if (
-        grant.status !== "active" ||
-        session.status !== "active" ||
-        session.grantVersion !== grant.grantVersion
-      )
-        return GENERIC_GRANT_AUTHORIZATION_FAILURE;
-      const nowMs = readGrantNow(options);
-      if (
-        grant.grantType === EVENT_ADMIN_GRANT_TYPE &&
-        nowMs >=
-          Math.min(
-            grant.expiresAtMs ?? Number.MAX_SAFE_INTEGER,
-            session.lastActiveAtMs + 30 * DAY_MS,
-          )
-      ) {
-        expireSession(transaction, options, grant, session);
-        return GENERIC_GRANT_AUTHORIZATION_FAILURE;
-      }
-      let eventGameId: string | null = null;
-      if (grant.grantType === GRANT_TYPE) {
-        if (input.eventGameId === undefined) return GENERIC_GRANT_AUTHORIZATION_FAILURE;
-        const relationship = resolveControlSession(
-          options,
-          grant.scope as ControlGrantScope,
-          session.eventGameId,
-        );
-        if (relationship.status === "game-locked") {
-          terminateControlSessionForEventGame(
-            transaction,
-            options,
-            grant,
-            "game-locked",
-            relationship.eventGameId,
-          );
-          return GENERIC_GRANT_AUTHORIZATION_FAILURE;
-        }
-        if (relationship.status === "switchable") {
-          if (
-            input.controlSessionDecision === "stay" &&
-            input.eventGameId === relationship.previousEventGameId
-          ) {
-            eventGameId = relationship.previousEventGameId;
-          } else if (
-            input.eventGameId === relationship.currentEventGameId ||
-            (input.controlSessionDecision === undefined &&
-              input.eventGameId === relationship.previousEventGameId)
-          ) {
-            return {
-              status: "switch-required",
-              grantId: grant.grantId,
-              grantVersion: grant.grantVersion,
-              grantType: GRANT_TYPE,
-              scope: structuredClone(grant.scope as ControlGrantScope),
-              grantSessionId: session.sessionId,
-              previousEventGameId: relationship.previousEventGameId,
-              currentEventGameId: relationship.currentEventGameId,
-            } satisfies TypedGrantAuthorization;
-          } else {
-            return GENERIC_GRANT_AUTHORIZATION_FAILURE;
-          }
-        }
-        if (relationship.status === "pinned") {
-          if (input.eventGameId !== relationship.sessionEventGameId)
-            return GENERIC_GRANT_AUTHORIZATION_FAILURE;
-          eventGameId = relationship.sessionEventGameId;
-        } else if (relationship.status === "current") {
-          if (input.eventGameId !== relationship.eventGameId)
-            return GENERIC_GRANT_AUTHORIZATION_FAILURE;
-          eventGameId = relationship.eventGameId;
-        } else if (relationship.status !== "switchable") {
-          return GENERIC_GRANT_AUTHORIZATION_FAILURE;
-        }
-      }
-      transaction.updateGrantSession({ ...session, lastActiveAtMs: nowMs });
-      return {
-        status: "authorized",
-        grantId: grant.grantId,
-        grantVersion: grant.grantVersion,
-        grantType: grant.grantType,
-        scope: structuredClone(grant.scope),
-        eventGameId,
-        grantSessionId: session.sessionId,
-      };
-    });
+    return await storage.transaction((transaction) =>
+      authorizeGrantInTransaction(transaction, options, input),
+    );
   } catch {
     return GENERIC_GRANT_AUTHORIZATION_FAILURE;
   }
+}
+
+/** Transaction-local authorization used by the composed acceptance seam. */
+export function authorizeGrantInTransaction(
+  transaction: FoundationStorageTransaction,
+  options: GrantAuthorityOptions,
+  input: {
+    sessionBearer: string;
+    eventGameId?: string;
+    controlSessionDecision?: "stay";
+    readOnly?: boolean;
+  },
+): TypedGrantAuthorization {
+  const session = findSessionByBearer(transaction, options, input.sessionBearer);
+  if (session === null) return GENERIC_GRANT_AUTHORIZATION_FAILURE;
+  const stored = transaction.findGrantById(session.grantId);
+  if (stored === null) return GENERIC_GRANT_AUTHORIZATION_FAILURE;
+  // Batch preflight must not refresh sessions, expire grants, or emit lifecycle
+  // evidence. The accepting transaction repeats this check with the default
+  // mutating behavior before it commits any action evidence.
+  const grant = input.readOnly ? stored : expireGrantIfDue(transaction, options, stored);
+  if (
+    grant.status !== "active" ||
+    session.status !== "active" ||
+    session.grantVersion !== grant.grantVersion
+  )
+    return GENERIC_GRANT_AUTHORIZATION_FAILURE;
+  const nowMs = readGrantNow(options);
+  if (
+    grant.grantType === EVENT_ADMIN_GRANT_TYPE &&
+    nowMs >=
+      Math.min(grant.expiresAtMs ?? Number.MAX_SAFE_INTEGER, session.lastActiveAtMs + 30 * DAY_MS)
+  ) {
+    if (input.readOnly) return GENERIC_GRANT_AUTHORIZATION_FAILURE;
+    expireSession(transaction, options, grant, session);
+    return GENERIC_GRANT_AUTHORIZATION_FAILURE;
+  }
+  let eventGameId: string | null = null;
+  if (grant.grantType === GRANT_TYPE) {
+    if (input.eventGameId === undefined) return GENERIC_GRANT_AUTHORIZATION_FAILURE;
+    const relationship = resolveControlSession(
+      options,
+      grant.scope as ControlGrantScope,
+      session.eventGameId,
+    );
+    if (relationship.status === "game-locked") {
+      if (input.readOnly) return GENERIC_GRANT_AUTHORIZATION_FAILURE;
+      terminateControlSessionForEventGame(
+        transaction,
+        options,
+        grant,
+        "game-locked",
+        relationship.eventGameId,
+      );
+      return GENERIC_GRANT_AUTHORIZATION_FAILURE;
+    }
+    if (relationship.status === "switchable") {
+      if (
+        input.controlSessionDecision === "stay" &&
+        input.eventGameId === relationship.previousEventGameId
+      ) {
+        eventGameId = relationship.previousEventGameId;
+      } else if (
+        input.eventGameId === relationship.currentEventGameId ||
+        (input.controlSessionDecision === undefined &&
+          input.eventGameId === relationship.previousEventGameId)
+      ) {
+        return {
+          status: "switch-required",
+          grantId: grant.grantId,
+          grantVersion: grant.grantVersion,
+          grantType: GRANT_TYPE,
+          scope: structuredClone(grant.scope as ControlGrantScope),
+          grantSessionId: session.sessionId,
+          previousEventGameId: relationship.previousEventGameId,
+          currentEventGameId: relationship.currentEventGameId,
+        } satisfies TypedGrantAuthorization;
+      } else return GENERIC_GRANT_AUTHORIZATION_FAILURE;
+    }
+    if (relationship.status === "pinned") {
+      if (input.eventGameId !== relationship.sessionEventGameId)
+        return GENERIC_GRANT_AUTHORIZATION_FAILURE;
+      eventGameId = relationship.sessionEventGameId;
+    } else if (relationship.status === "current") {
+      if (input.eventGameId !== relationship.eventGameId)
+        return GENERIC_GRANT_AUTHORIZATION_FAILURE;
+      eventGameId = relationship.eventGameId;
+    } else if (relationship.status !== "switchable") return GENERIC_GRANT_AUTHORIZATION_FAILURE;
+  }
+  if (!input.readOnly) transaction.updateGrantSession({ ...session, lastActiveAtMs: nowMs });
+  return {
+    status: "authorized",
+    grantId: grant.grantId,
+    grantVersion: grant.grantVersion,
+    grantType: grant.grantType,
+    scope: structuredClone(grant.scope),
+    eventGameId,
+    grantSessionId: session.sessionId,
+  };
 }
 
 export async function acceptControlGrantSessionSwitch(

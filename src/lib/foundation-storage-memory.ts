@@ -4,7 +4,7 @@ import {
   validateEventGameRecordRoot,
   type EventGameRecordRoot,
 } from "@/lib/foundation-record-types";
-import { computeGrantAuditIntegrityTag } from "@/lib/grant-crypto";
+import { computeAcceptanceIntegrityTag, computeGrantAuditIntegrityTag } from "@/lib/grant-crypto";
 import {
   cloneStoredGrant,
   cloneStoredGrantAuditEntry,
@@ -26,17 +26,31 @@ import {
   type StoredControlAction,
   type StoredControlAuditEntry,
   type StoredControlIdempotencyEntry,
+  type StoredAcceptanceBudget,
+  type StoredReplayAttempt,
+  type StoredReplayReceipt,
+  type StoredReplayReservation,
   type StoredEventGameRecordMetadata,
   type StoredEventGameRecordRoot,
   isThenable,
   DURABLE_EVIDENCE_PROVENANCE,
 } from "@/lib/foundation-storage";
+import type {
+  AcceptanceIntegrityAnchor,
+  AcceptanceIntegritySubject,
+} from "@/lib/foundation-acceptance-integrity";
+import {
+  anchorFor,
+  acceptanceAuditPairFailure,
+  replayAttemptResultFailure,
+} from "@/lib/foundation-acceptance-integrity";
 import {
   CONTROL_AUDIT_VERSION,
   CONTROL_ACTION_VERSION,
   LEGACY_CONTROL_AUDIT_VERSION,
   LEGACY_CONTROL_ACTION_VERSION,
   actionIdentity,
+  canonicalizeJson,
   parseStoredControlAction,
 } from "@/lib/event-game-actions";
 import { validateGrantState, type GrantStateValidationContext } from "@/lib/grant-state-validation";
@@ -54,6 +68,11 @@ type MemoryState = {
   grantAudits: Map<string, StoredGrantAuditEntry>;
   grantAuditProvenance: Map<string, StoredGrantAuditEntry>;
   grantAuditIntegrityTags: Map<string, string>;
+  acceptanceBudgets: Map<string, StoredAcceptanceBudget>;
+  replayReservations: Map<string, StoredReplayReservation>;
+  replayAttempts: Map<string, StoredReplayAttempt>;
+  replayReceipts: Map<string, StoredReplayReceipt>;
+  integrityAnchors: Map<string, AcceptanceIntegrityAnchor>;
 };
 
 export function createInMemoryFoundationStorage(): FoundationStorage {
@@ -74,6 +93,11 @@ class InMemoryFoundationStorage implements FoundationStorage {
     grantAudits: new Map(),
     grantAuditProvenance: new Map(),
     grantAuditIntegrityTags: new Map(),
+    acceptanceBudgets: new Map(),
+    replayReservations: new Map(),
+    replayAttempts: new Map(),
+    replayReceipts: new Map(),
+    integrityAnchors: new Map(),
   };
   private writerTail: Promise<void> = Promise.resolve();
   private closed = false;
@@ -83,6 +107,18 @@ class InMemoryFoundationStorage implements FoundationStorage {
   transaction<T>(work: FoundationStorageTransactionWork<T>): Promise<T> {
     const operation = this.writerTail.then(() => {
       this.assertOpen();
+      const acceptanceFailure = acceptanceStateFailure(
+        this.state,
+        this.grantValidationContext.keyRing,
+      );
+      if (acceptanceFailure !== null) {
+        throw new FoundationStorageNotReadyError({
+          ok: false,
+          status: "integrity-failure",
+          detail: acceptanceFailure,
+          storage: "memory",
+        });
+      }
       const grantFailure = this.grantStateFailure();
       if (grantFailure !== null) {
         throw new FoundationStorageNotReadyError({
@@ -293,6 +329,18 @@ class InMemoryFoundationStorage implements FoundationStorage {
           storage: "memory",
         } satisfies FoundationStorageReadiness;
       }
+      const acceptanceFailure = acceptanceStateFailure(
+        this.state,
+        this.grantValidationContext.keyRing,
+      );
+      if (acceptanceFailure !== null) {
+        return {
+          ok: false,
+          status: "integrity-failure",
+          detail: acceptanceFailure,
+          storage: "memory",
+        } satisfies FoundationStorageReadiness;
+      }
       return {
         ok: true,
         schemaVersion: "memory",
@@ -335,6 +383,367 @@ class InMemoryFoundationStorage implements FoundationStorage {
       },
     );
   }
+}
+
+function acceptanceStateFailure(
+  state: MemoryState,
+  keyRing: GrantKeyRing | undefined,
+): string | null {
+  if (
+    keyRing === undefined &&
+    (state.integrityAnchors.size > 0 ||
+      state.acceptanceBudgets.size > 0 ||
+      state.replayReservations.size > 0 ||
+      state.replayAttempts.size > 0 ||
+      state.replayReceipts.size > 0)
+  )
+    return "Acceptance integrity key material is unavailable.";
+  if (keyRing === undefined) return null;
+  for (const budget of state.acceptanceBudgets.values()) {
+    if (
+      budget.bucketId !== `budget-${budget.bucketKind}:${budget.subjectId}` ||
+      !Number.isFinite(budget.tokens) ||
+      budget.capacity <= 0 ||
+      budget.refillPerSecond <= 0 ||
+      budget.tokens < 0 ||
+      budget.tokens > budget.capacity ||
+      !Number.isSafeInteger(budget.updatedAtMs) ||
+      !Number.isSafeInteger(budget.stateRevision) ||
+      !hasCurrentIntegrityAnchor(state, "budget", budget.bucketId, budget, keyRing)
+    )
+      return "In-memory acceptance budget state is inconsistent.";
+  }
+  const attemptsByReservation = new Map<string, StoredReplayAttempt[]>();
+  for (const attempt of state.replayAttempts.values()) {
+    const list = attemptsByReservation.get(attempt.reservationId) ?? [];
+    list.push(attempt);
+    attemptsByReservation.set(attempt.reservationId, list);
+  }
+  const receiptsByReservation = new Map<string, StoredReplayReceipt[]>();
+  for (const receipt of state.replayReceipts.values()) {
+    const list = receiptsByReservation.get(receipt.reservationId) ?? [];
+    list.push(receipt);
+    receiptsByReservation.set(receipt.reservationId, list);
+  }
+  for (const reservation of state.replayReservations.values()) {
+    const root = state.roots.get(reservation.recordId);
+    if (
+      root === undefined ||
+      root.root.eventGameId !== reservation.eventGameId ||
+      reservation.actionCount <= 0 ||
+      !Number.isSafeInteger(reservation.createdAtMs) ||
+      (reservation.committedAtMs !== null && !Number.isSafeInteger(reservation.committedAtMs)) ||
+      (reservation.acknowledgedAtMs !== null &&
+        !Number.isSafeInteger(reservation.acknowledgedAtMs)) ||
+      reservation.batchDigest === null ||
+      !/^[a-f0-9]{64}$/.test(reservation.batchDigest) ||
+      !Number.isSafeInteger(reservation.stateRevision) ||
+      !hasCurrentIntegrityAnchor(
+        state,
+        "reservation",
+        reservation.reservationId,
+        reservation,
+        keyRing,
+      ) ||
+      !["reserved", "committing", "committed", "partial", "discarded", "acknowledged"].includes(
+        reservation.status,
+      )
+    )
+      return "In-memory replay reservation state is inconsistent.";
+    if (
+      reservation.status === "discarded" &&
+      (reservation.batchDigest !== null || reservation.replacementSessionId !== null)
+    )
+      return "In-memory discarded replay retained authorization provenance.";
+    if (
+      (reservation.status === "committed" || reservation.status === "acknowledged") &&
+      reservation.committedAtMs === null
+    )
+      return "In-memory committed replay lacks a commit timestamp.";
+    if (reservation.status === "acknowledged" && reservation.acknowledgedAtMs === null)
+      return "In-memory acknowledged replay lacks an acknowledgement timestamp.";
+    const attempts = attemptsByReservation.get(reservation.reservationId) ?? [];
+    const receipts = receiptsByReservation.get(reservation.reservationId) ?? [];
+    if (
+      (reservation.status === "reserved" && (attempts.length !== 0 || receipts.length !== 0)) ||
+      (reservation.status === "partial" &&
+        (attempts.length === 0 ||
+          attempts.length > reservation.actionCount ||
+          receipts.length !== 0)) ||
+      ((reservation.status === "committed" || reservation.status === "acknowledged") &&
+        (attempts.length !== reservation.actionCount ||
+          attempts.some((attempt) => attempt.status === "retry-later") ||
+          receipts.length !== 1)) ||
+      (reservation.status === "discarded" && (attempts.length !== 0 || receipts.length !== 0))
+    )
+      return "In-memory replay evidence cardinality is inconsistent.";
+  }
+  const grantsByAudit = state.grantAudits;
+  for (const attempt of state.replayAttempts.values()) {
+    const controlAudit = [...state.controlAudits.values()]
+      .flatMap((audits) => [...audits.values()])
+      .find((audit) => audit.auditId === attempt.controlAuditId);
+    const grantAudit = grantsByAudit.get(attempt.grantAuditId ?? "");
+    const pairFailure =
+      controlAudit === undefined || grantAudit === undefined
+        ? "missing"
+        : acceptanceAuditPairFailure(controlAudit, grantAudit, attempt);
+    const expectedAction =
+      controlAudit === undefined ||
+      (controlAudit.kind !== "action-accepted" && controlAudit.kind !== "action-duplicate")
+        ? undefined
+        : state.actions.get(controlAudit.recordId)?.get(controlAudit.operationId ?? "")?.action;
+    const durableFingerprint =
+      controlAudit === undefined || grantAudit === undefined
+        ? null
+        : acceptanceFingerprintFailure(state, controlAudit, grantAudit, attempt);
+    if (
+      !state.replayReservations.has(attempt.reservationId) ||
+      attempt.operationId.length === 0 ||
+      (attempt.actionFingerprint !== null && !/^[a-f0-9]{64}$/.test(attempt.actionFingerprint)) ||
+      attempt.resultJson === null ||
+      replayAttemptResultFailure(attempt, expectedAction, controlAudit?.links?.reason) !== null ||
+      attempt.controlAuditId === null ||
+      attempt.grantAuditId === null ||
+      controlAudit === undefined ||
+      grantAudit === undefined ||
+      grantAudit.controlAuditId !== controlAudit.auditId ||
+      controlAudit.links?.grantAuditId !== grantAudit.auditId ||
+      grantAudit.acceptanceId !== controlAudit.links?.acceptanceId ||
+      grantAudit.contentFingerprint === null ||
+      (attempt.actionFingerprint !== null &&
+        attempt.actionFingerprint !== grantAudit.contentFingerprint) ||
+      pairFailure !== null ||
+      durableFingerprint !== null
+    )
+      return "In-memory replay attempt state is inconsistent.";
+    if (
+      !Number.isSafeInteger(attempt.createdAtMs) ||
+      (attempt.completedAtMs !== null && !Number.isSafeInteger(attempt.completedAtMs)) ||
+      !Number.isSafeInteger(attempt.stateRevision) ||
+      !hasCurrentIntegrityAnchor(state, "attempt", attempt.attemptId, attempt, keyRing) ||
+      (attempt.status === "retry-later") !== (attempt.completedAtMs === null)
+    )
+      return "In-memory replay attempt timestamps are inconsistent.";
+  }
+  for (const receipt of state.replayReceipts.values()) {
+    const reservation = state.replayReservations.get(receipt.reservationId);
+    if (
+      reservation === undefined ||
+      receipt.actionCount !== reservation.actionCount ||
+      !/^[a-f0-9]{64}$/.test(receipt.receiptDigest) ||
+      !["committed", "acknowledged"].includes(receipt.status) ||
+      !Number.isSafeInteger(receipt.stateRevision) ||
+      !hasCurrentIntegrityAnchor(state, "receipt", receipt.receiptId, receipt, keyRing)
+    )
+      return "In-memory replay receipt state is inconsistent.";
+    if (
+      !Number.isSafeInteger(receipt.createdAtMs) ||
+      (receipt.acknowledgedAtMs !== null && !Number.isSafeInteger(receipt.acknowledgedAtMs)) ||
+      (receipt.status === "acknowledged") !== (receipt.acknowledgedAtMs !== null)
+    )
+      return "In-memory replay receipt timestamps are inconsistent.";
+    if (reservation.status !== "committed" && reservation.status !== "acknowledged")
+      return "In-memory replay receipt points to an uncommitted reservation.";
+  }
+  for (const audits of state.controlAudits.values()) {
+    for (const audit of audits.values()) {
+      const grantAuditId = audit.links?.grantAuditId;
+      if (typeof grantAuditId === "string") {
+        const grantAudit = grantsByAudit.get(grantAuditId);
+        if (
+          grantAudit === undefined ||
+          acceptanceAuditPairFailure(audit, grantAudit) !== null ||
+          acceptanceFingerprintFailure(state, audit, grantAudit) !== null
+        )
+          return "In-memory Control and Grant audit linkage is inconsistent.";
+      }
+    }
+  }
+  for (const grantAudit of grantsByAudit.values()) {
+    const hasAcceptanceFields =
+      (grantAudit.acceptanceId !== null && grantAudit.acceptanceId !== undefined) ||
+      (grantAudit.controlAuditId !== null && grantAudit.controlAuditId !== undefined) ||
+      (grantAudit.controlActionId !== null && grantAudit.controlActionId !== undefined) ||
+      (grantAudit.contentFingerprint !== null && grantAudit.contentFingerprint !== undefined) ||
+      (grantAudit.outcomeDetail !== null && grantAudit.outcomeDetail !== undefined);
+    if (hasAcceptanceFields) {
+      const control = [...state.controlAudits.values()]
+        .flatMap((audits) => [...audits.values()])
+        .find((audit) => audit.auditId === grantAudit.controlAuditId);
+      if (
+        control === undefined ||
+        acceptanceAuditPairFailure(control, grantAudit) !== null ||
+        acceptanceFingerprintFailure(state, control, grantAudit) !== null
+      )
+        return "In-memory Grant acceptance evidence has no paired Control audit.";
+    }
+  }
+  const currentRevisions = new Map<string, number>();
+  for (const budget of state.acceptanceBudgets.values())
+    currentRevisions.set(`budget:${budget.bucketId}`, budget.stateRevision);
+  for (const reservation of state.replayReservations.values())
+    currentRevisions.set(`reservation:${reservation.reservationId}`, reservation.stateRevision);
+  for (const attempt of state.replayAttempts.values())
+    currentRevisions.set(
+      `attempt:${attempt.reservationId}:${attempt.attemptId}`,
+      attempt.stateRevision,
+    );
+  for (const receipt of state.replayReceipts.values())
+    currentRevisions.set(`receipt:${receipt.receiptId}`, receipt.stateRevision);
+
+  const anchorGroups = new Map<string, AcceptanceIntegrityAnchor[]>();
+  for (const anchor of state.integrityAnchors.values()) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(anchor.canonicalValue) as unknown;
+    } catch {
+      return "In-memory acceptance integrity anchor evidence is not valid JSON.";
+    }
+    if (
+      canonicalizeJson(parsed) !== anchor.canonicalValue ||
+      anchor.anchorId !== `${anchor.subjectKind}:${anchor.subjectId}:${anchor.stateRevision}`
+    )
+      return "In-memory acceptance integrity anchor identity is inconsistent.";
+    let expectedTag: string;
+    try {
+      expectedTag = computeAcceptanceIntegrityTag(
+        canonicalizeJson({
+          domain: "foundation-acceptance-state-v1",
+          subjectKind: anchor.subjectKind,
+          subjectId: anchor.subjectId,
+          stateRevision: anchor.stateRevision,
+          value: parsed,
+        }),
+        keyRing,
+        anchor.keyVersion,
+      );
+    } catch {
+      return "In-memory acceptance integrity anchor key material is unavailable.";
+    }
+    if (anchor.integrityTag !== expectedTag)
+      return "In-memory acceptance integrity anchor authentication failed.";
+    const key = `${anchor.subjectKind}:${anchor.subjectId}`;
+    const group = anchorGroups.get(key) ?? [];
+    group.push(anchor);
+    anchorGroups.set(key, group);
+  }
+  for (const [key, group] of anchorGroups) {
+    const currentRevision = currentRevisions.get(key);
+    if (currentRevision === undefined || group.length !== currentRevision)
+      return "In-memory acceptance integrity anchor history is missing or orphaned.";
+    const revisions = group.map((anchor) => anchor.stateRevision).sort((a, b) => a - b);
+    if (revisions.some((revision, index) => revision !== index + 1))
+      return "In-memory acceptance integrity anchor history is not contiguous.";
+  }
+  if (anchorGroups.size !== currentRevisions.size)
+    return "In-memory acceptance integrity anchor history has an extra or missing subject.";
+
+  const maximumAnchorRevision = new Map<string, number>();
+  for (const anchor of state.integrityAnchors.values()) {
+    const key = `${anchor.subjectKind}:${anchor.subjectId}`;
+    maximumAnchorRevision.set(
+      key,
+      Math.max(maximumAnchorRevision.get(key) ?? 0, anchor.stateRevision),
+    );
+  }
+  for (const [subjectId, budget] of state.acceptanceBudgets) {
+    if (maximumAnchorRevision.get(`budget:${subjectId}`) !== budget.stateRevision)
+      return "In-memory acceptance integrity history is not monotonic.";
+  }
+  for (const [subjectId, reservation] of state.replayReservations) {
+    if (maximumAnchorRevision.get(`reservation:${subjectId}`) !== reservation.stateRevision)
+      return "In-memory acceptance integrity history is not monotonic.";
+  }
+  for (const attempt of state.replayAttempts.values()) {
+    const anchorSubjectId = anchorFor("attempt", attempt, keyRing).subjectId;
+    if (maximumAnchorRevision.get(`attempt:${anchorSubjectId}`) !== attempt.stateRevision)
+      return "In-memory acceptance integrity history is not monotonic.";
+  }
+  for (const [subjectId, receipt] of state.replayReceipts) {
+    if (maximumAnchorRevision.get(`receipt:${subjectId}`) !== receipt.stateRevision)
+      return "In-memory acceptance integrity history is not monotonic.";
+  }
+  for (const anchor of state.integrityAnchors.values()) {
+    const currentRevision =
+      anchor.subjectKind === "budget"
+        ? state.acceptanceBudgets.get(anchor.subjectId)?.stateRevision
+        : anchor.subjectKind === "reservation"
+          ? state.replayReservations.get(anchor.subjectId)?.stateRevision
+          : anchor.subjectKind === "attempt"
+            ? state.replayAttempts.get(
+                anchor.subjectId.slice(anchor.subjectId.lastIndexOf(":") + 1),
+              )?.stateRevision
+            : state.replayReceipts.get(anchor.subjectId)?.stateRevision;
+    if (currentRevision === undefined) return "In-memory acceptance integrity anchor is orphaned.";
+    if (anchor.stateRevision > currentRevision)
+      return "In-memory acceptance integrity anchor is orphaned.";
+  }
+  return null;
+}
+
+function acceptanceFingerprintFailure(
+  state: MemoryState,
+  control: StoredControlAuditEntry,
+  grant: StoredGrantAuditEntry,
+  attempt?: StoredReplayAttempt,
+): string | null {
+  const operationId = control.operationId;
+  if (operationId === null || grant.contentFingerprint === null) return "missing";
+  const accepted = control.kind === "action-accepted" || control.kind === "action-duplicate";
+  const durableAction = state.actions.get(control.recordId)?.get(operationId);
+  const collisionFingerprint = control.links?.collision?.rejectedAttempt?.contentFingerprint;
+  const candidateFingerprint =
+    collisionFingerprint ?? control.links?.rejectedCandidate?.contentFingerprint;
+  const expectedFingerprint = accepted ? durableAction?.contentFingerprint : candidateFingerprint;
+  if (
+    expectedFingerprint === undefined ||
+    control.links?.contentFingerprint !== expectedFingerprint ||
+    expectedFingerprint !== grant.contentFingerprint
+  )
+    return "fingerprint";
+  if (attempt !== undefined && attempt.actionFingerprint !== expectedFingerprint)
+    return "fingerprint";
+  if (accepted) {
+    const idempotency = [...(state.idempotency.get(control.recordId)?.values() ?? [])].find(
+      (entry) => entry.operationId === operationId,
+    );
+    if (
+      durableAction === undefined ||
+      idempotency === undefined ||
+      idempotency.contentFingerprint !== expectedFingerprint ||
+      idempotency.contentFingerprint !== grant.contentFingerprint
+    )
+      return "fingerprint";
+  }
+  return null;
+}
+
+function hasCurrentIntegrityAnchor(
+  state: MemoryState,
+  subjectKind: AcceptanceIntegritySubject,
+  subjectId: string,
+  value:
+    | StoredAcceptanceBudget
+    | StoredReplayReservation
+    | StoredReplayAttempt
+    | StoredReplayReceipt,
+  keyRing: GrantKeyRing | undefined,
+): boolean {
+  if (keyRing === undefined) return false;
+  const expected = anchorFor(subjectKind, value, keyRing);
+  const anchor = state.integrityAnchors.get(
+    `${subjectKind}:${expected.subjectId}:${value.stateRevision}`,
+  );
+  if (anchor === undefined) return false;
+  const keyedExpected = anchorFor(subjectKind, value, keyRing, anchor.keyVersion);
+  return (
+    anchor.subjectId === keyedExpected.subjectId &&
+    anchor.stateRevision === keyedExpected.stateRevision &&
+    anchor.keyVersion === keyedExpected.keyVersion &&
+    anchor.canonicalValue === keyedExpected.canonicalValue &&
+    anchor.integrityTag === keyedExpected.integrityTag
+  );
 }
 
 function createTransaction(
@@ -535,6 +944,73 @@ function createTransaction(
         .sort((left, right) => left.auditId.localeCompare(right.auditId))
         .map(cloneStoredGrantAuditEntry);
     },
+    findAcceptanceBudget(bucketId) {
+      const budget = state.acceptanceBudgets.get(bucketId);
+      return budget === undefined ? null : structuredClone(budget);
+    },
+    findReplayReservation(reservationId) {
+      const reservation = state.replayReservations.get(reservationId);
+      return reservation === undefined ? null : structuredClone(reservation);
+    },
+    findReplayReservationByTuple(
+      recordId,
+      eventGameId,
+      originatingSessionId,
+      actionCount,
+      batchDigest,
+    ) {
+      let match: StoredReplayReservation | undefined;
+      for (const reservation of state.replayReservations.values()) {
+        if (
+          reservation.recordId === recordId &&
+          reservation.eventGameId === eventGameId &&
+          reservation.originatingSessionId === originatingSessionId &&
+          reservation.actionCount === actionCount &&
+          reservation.batchDigest === batchDigest
+        )
+          if (match !== undefined) return null;
+          else match = reservation;
+      }
+      return match === undefined ? null : structuredClone(match);
+    },
+    findReplayReservationByOriginTuple(recordId, eventGameId, originatingSessionId, actionCount) {
+      return (
+        [...state.replayReservations.values()]
+          .filter(
+            (reservation) =>
+              reservation.recordId === recordId &&
+              reservation.eventGameId === eventGameId &&
+              reservation.originatingSessionId === originatingSessionId &&
+              reservation.actionCount === actionCount,
+          )
+          .sort((left, right) => right.stateRevision - left.stateRevision)
+          .map((reservation) => structuredClone(reservation))[0] ?? null
+      );
+    },
+    listReplayAttempts(reservationId) {
+      return [...state.replayAttempts.values()]
+        .filter((attempt) => attempt.reservationId === reservationId)
+        .sort((left, right) => left.attemptId.localeCompare(right.attemptId))
+        .map((attempt) => structuredClone(attempt));
+    },
+    findReplayReceiptByDigest(receiptDigest) {
+      for (const receipt of state.replayReceipts.values()) {
+        if (receipt.receiptDigest === receiptDigest) return structuredClone(receipt);
+      }
+      return null;
+    },
+    findReplayReceiptByReservationId(reservationId) {
+      for (const receipt of state.replayReceipts.values()) {
+        if (receipt.reservationId === reservationId) return structuredClone(receipt);
+      }
+      return null;
+    },
+    listAcceptanceIntegrityAnchors(subjectKind: AcceptanceIntegritySubject, subjectId: string) {
+      return [...state.integrityAnchors.values()]
+        .filter((anchor) => anchor.subjectKind === subjectKind && anchor.subjectId === subjectId)
+        .sort((left, right) => left.stateRevision - right.stateRevision)
+        .map((anchor) => structuredClone(anchor));
+    },
     insertGrant(grant) {
       if (state.grants.has(grant.grantId)) {
         throw new FoundationStorageConstraintError("grant-id");
@@ -696,6 +1172,117 @@ function createTransaction(
         computeGrantAuditIntegrityTag(entry, keyRing),
       );
       undo.push(() => state.grantAuditIntegrityTags.delete(entry.auditId));
+    },
+    upsertAcceptanceBudget(budget) {
+      const previous = state.acceptanceBudgets.get(budget.bucketId);
+      state.acceptanceBudgets.set(budget.bucketId, structuredClone(budget));
+      undo.push(() => {
+        if (previous === undefined) state.acceptanceBudgets.delete(budget.bucketId);
+        else state.acceptanceBudgets.set(budget.bucketId, previous);
+      });
+    },
+    insertReplayReservation(reservation) {
+      if (state.replayReservations.has(reservation.reservationId))
+        throw new FoundationStorageConstraintError("replay-reservation-id");
+      state.replayReservations.set(reservation.reservationId, structuredClone(reservation));
+      undo.push(() => state.replayReservations.delete(reservation.reservationId));
+    },
+    updateReplayReservation(reservation) {
+      if (!state.replayReservations.has(reservation.reservationId))
+        throw new FoundationStorageConstraintError("replay-reservation-id");
+      const previous = state.replayReservations.get(reservation.reservationId);
+      state.replayReservations.set(reservation.reservationId, structuredClone(reservation));
+      undo.push(() => {
+        if (previous !== undefined)
+          state.replayReservations.set(reservation.reservationId, previous);
+      });
+    },
+    insertReplayAttempt(attempt) {
+      if (state.replayAttempts.has(attempt.attemptId))
+        throw new FoundationStorageConstraintError("integrity-anchor-id");
+      state.replayAttempts.set(attempt.attemptId, structuredClone(attempt));
+      undo.push(() => state.replayAttempts.delete(attempt.attemptId));
+    },
+    updateReplayAttempt(attempt) {
+      if (!state.replayAttempts.has(attempt.attemptId))
+        throw new FoundationStorageConstraintError("replay-attempt-id");
+      const previous = state.replayAttempts.get(attempt.attemptId);
+      state.replayAttempts.set(attempt.attemptId, structuredClone(attempt));
+      undo.push(() => {
+        if (previous !== undefined) state.replayAttempts.set(attempt.attemptId, previous);
+      });
+    },
+    discardReplayAttempts(reservationId) {
+      const previous = [...state.replayAttempts.entries()].filter(
+        ([, attempt]) => attempt.reservationId === reservationId,
+      );
+      for (const [attemptId] of previous) state.replayAttempts.delete(attemptId);
+      const previousAnchors = [...state.integrityAnchors.entries()].filter(
+        ([, anchor]) =>
+          anchor.subjectKind === "attempt" && anchor.subjectId.startsWith(`${reservationId}:`),
+      );
+      for (const [anchorId] of previousAnchors) state.integrityAnchors.delete(anchorId);
+      undo.push(() => {
+        for (const [attemptId, attempt] of previous) state.replayAttempts.set(attemptId, attempt);
+        for (const [anchorId, anchor] of previousAnchors)
+          state.integrityAnchors.set(anchorId, anchor);
+      });
+    },
+    discardReplayReservation(reservationId) {
+      const reservation = state.replayReservations.get(reservationId);
+      if (reservation === undefined) return;
+      const attempts = [...state.replayAttempts.entries()].filter(
+        ([, attempt]) => attempt.reservationId === reservationId,
+      );
+      const receipts = [...state.replayReceipts.entries()].filter(
+        ([, receipt]) => receipt.reservationId === reservationId,
+      );
+      const anchors = [...state.integrityAnchors.entries()].filter(([, anchor]) =>
+        anchor.subjectKind === "reservation"
+          ? anchor.subjectId === reservationId
+          : anchor.subjectKind === "attempt"
+            ? anchor.subjectId.startsWith(`${reservationId}:`)
+            : anchor.subjectKind === "receipt"
+              ? receipts.some(([, receipt]) => receipt.receiptId === anchor.subjectId)
+              : false,
+      );
+      state.replayReservations.delete(reservationId);
+      for (const [attemptId] of attempts) state.replayAttempts.delete(attemptId);
+      for (const [receiptId] of receipts) state.replayReceipts.delete(receiptId);
+      for (const [anchorId] of anchors) state.integrityAnchors.delete(anchorId);
+      undo.push(() => {
+        state.replayReservations.set(reservationId, reservation);
+        for (const [attemptId, attempt] of attempts) state.replayAttempts.set(attemptId, attempt);
+        for (const [receiptId, receipt] of receipts) state.replayReceipts.set(receiptId, receipt);
+        for (const [anchorId, anchor] of anchors) state.integrityAnchors.set(anchorId, anchor);
+      });
+    },
+    insertReplayReceipt(receipt) {
+      if (state.replayReceipts.has(receipt.receiptId))
+        throw new FoundationStorageConstraintError("replay-receipt-id");
+      if (
+        [...state.replayReceipts.values()].some(
+          (candidate) => candidate.receiptDigest === receipt.receiptDigest,
+        )
+      )
+        throw new FoundationStorageConstraintError("replay-receipt-digest");
+      state.replayReceipts.set(receipt.receiptId, structuredClone(receipt));
+      undo.push(() => state.replayReceipts.delete(receipt.receiptId));
+    },
+    updateReplayReceipt(receipt) {
+      if (!state.replayReceipts.has(receipt.receiptId))
+        throw new FoundationStorageConstraintError("replay-receipt-id");
+      const previous = state.replayReceipts.get(receipt.receiptId);
+      state.replayReceipts.set(receipt.receiptId, structuredClone(receipt));
+      undo.push(() => {
+        if (previous !== undefined) state.replayReceipts.set(receipt.receiptId, previous);
+      });
+    },
+    insertAcceptanceIntegrityAnchor(anchor: AcceptanceIntegrityAnchor) {
+      if (state.integrityAnchors.has(anchor.anchorId))
+        throw new FoundationStorageConstraintError("replay-attempt-id");
+      state.integrityAnchors.set(anchor.anchorId, structuredClone(anchor));
+      undo.push(() => state.integrityAnchors.delete(anchor.anchorId));
     },
   };
 }

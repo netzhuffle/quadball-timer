@@ -14,6 +14,7 @@ import {
   validateOverride,
   validatePredecessors,
   validateRecoveryProvenance,
+  validateRecoveryProvenanceShape,
   validateStoredInput,
   validateTimestamp,
   valid,
@@ -133,6 +134,8 @@ export type ControlAuditCollisionEvidence = {
   acceptedContentFingerprint: string;
   rejectedAttempt: {
     input: ControlActionInput;
+    codecIdentity?: string;
+    codecFingerprint?: string;
     canonicalContent: string;
     contentFingerprint: string;
     interpretation: ControlActionInterpretation;
@@ -148,6 +151,19 @@ export type ControlAuditLinkage = {
     trustedAtMs: number;
     operationId: string;
   } | null;
+  grantAuditId?: string | null;
+  acceptanceId?: string | null;
+  /** Acceptance-owned candidate identity, paired independently from Grant evidence. */
+  contentFingerprint?: string;
+  /** Acceptance-owned status discriminant for non-accepted outcomes. */
+  reason?: string;
+  /** Canonical rejected candidate retained independently from Grant evidence. */
+  rejectedCandidate?: {
+    codecIdentity: string;
+    codecFingerprint: string;
+    canonicalContent: string;
+    contentFingerprint: string;
+  };
   collision?: ControlAuditCollisionEvidence;
 };
 
@@ -193,6 +209,12 @@ export type ControlAuditEntry = {
   redactedDetail: string;
   links?: ControlAuditLinkage;
   provenance?: ControlAuditProvenance;
+  lockedReplay?: {
+    count: number;
+    originatingSessionId: string;
+    eventGameId: string;
+    rejectedAtMs: number;
+  };
 };
 
 export type EventGameRecordMetadata = {
@@ -253,12 +275,83 @@ export type ControlActionCodecRegistry = {
   entries(): readonly ControlActionCodec[];
 };
 
+export function controlActionCodecIdentity(
+  kind: { id: string; version: string },
+  registry: ControlActionCodecRegistry,
+): string {
+  const codec = registry.resolve(kind.id, kind.version);
+  return canonicalizeJson({
+    schema: "control-codec-identity-v1",
+    claimed: { id: kind.id, version: kind.version },
+    registered: codec === undefined ? null : { id: codec.kind, version: codec.version },
+  });
+}
+
 export type PreparedControlAction = {
   input: ControlActionInput;
+  codecIdentity: string;
+  codecFingerprint: string;
   canonicalContent: string;
   contentFingerprint: string;
   interpretation: ControlActionInterpretation;
 };
+
+/**
+ * The portion of an action that can be inspected before Grant authorization.
+ * Payload decoding, codec lookup, interpretation, and root-dependent checks
+ * deliberately do not belong here.
+ */
+export type ControlActionEnvelope = Omit<ControlActionInput, "payload"> & {
+  payload: unknown;
+};
+
+export function validateControlActionEnvelope(
+  input: unknown,
+  serverNowMs: number,
+): ValidationResult<ControlActionEnvelope> {
+  if (!isRecord(input)) return invalid("Control Action must be an object.");
+  const recordId = validateId(input.recordId, "recordId");
+  const eventGameId = validateId(input.eventGameId, "eventGameId");
+  const operationId = validateId(input.operationId, "operationId");
+  if (!recordId.ok) return recordId;
+  if (!eventGameId.ok) return eventGameId;
+  if (!operationId.ok) return operationId;
+
+  // Keep codec identity opaque at this boundary. In particular, resolving an
+  // unknown codec must not allow an invalid bearer to learn anything about it.
+  if (!isRecord(input.kind)) return invalid("Control Action kind must be an object.");
+  const kind = {
+    id: typeof input.kind.id === "string" ? input.kind.id : String(input.kind.id),
+    version:
+      typeof input.kind.version === "string" ? input.kind.version : String(input.kind.version),
+  };
+  const predecessors = validatePredecessors(input.causalPredecessorIds);
+  const occurrence = validateOccurrence(input.occurrence, serverNowMs);
+  const grant = validateGrant(input.grant);
+  const lifecycle = validateLifecycle(input.lifecycle);
+  const override = validateOverride(input.override);
+  const recovery = validateRecoveryProvenanceShape(input.recoveryProvenance);
+  if (!predecessors.ok) return predecessors;
+  if (!occurrence.ok) return occurrence;
+  if (!grant.ok) return grant;
+  if (!lifecycle.ok) return lifecycle;
+  if (!override.ok) return override;
+  if (!recovery.ok) return recovery;
+
+  return valid({
+    recordId: recordId.value,
+    eventGameId: eventGameId.value,
+    operationId: operationId.value,
+    kind,
+    payload: input.payload,
+    causalPredecessorIds: predecessors.value,
+    occurrence: occurrence.value,
+    grant: grant.value,
+    lifecycle: lifecycle.value,
+    ...(override.value === undefined ? {} : { override: override.value }),
+    ...(recovery.value === undefined ? {} : { recoveryProvenance: recovery.value }),
+  });
+}
 
 export type ActionHistoryReadiness = { ok: true } | { ok: false; detail: string };
 
@@ -286,7 +379,7 @@ export type ActionRebuildResult =
 
 export function prepareControlAction(
   input: unknown,
-  root: EventGameRecordRoot,
+  root: EventGameRecordRoot | null,
   registry: ControlActionCodecRegistry,
   serverNowMs: number,
   options: { allowConcurrentTeamAssignment?: boolean } = {},
@@ -299,25 +392,32 @@ export function prepareControlAction(
   if (!recordId.ok) return recordId;
   if (!eventGameId.ok) return eventGameId;
   if (!operationId.ok) return operationId;
-  if (recordId.value !== root.recordId) return invalid("Control Action references another record.");
-  if (eventGameId.value !== root.eventGameId) {
+  if (root !== null && recordId.value !== root.recordId)
+    return invalid("Control Action references another record.");
+  if (root !== null && eventGameId.value !== root.eventGameId) {
     return invalid("Control Action references another Event Game.");
   }
 
   const kindResult = validateKind(input.kind);
   if (!kindResult.ok) return kindResult;
+  const codecIdentity = controlActionCodecIdentity(kindResult.value, registry);
   const codec = registry.resolve(kindResult.value.id, kindResult.value.version);
   if (codec === undefined) {
     return invalid("The Control Action kind or version is unsupported.");
   }
 
-  const payloadResult = codec.decode(input.payload);
-  if (!payloadResult.ok) return payloadResult;
+  let decodedPayload: unknown;
   let canonicalPayloadValue: ActionJsonValue;
   let canonicalPayload: string;
   let codecFingerprint: string;
   let interpretation: ControlActionInterpretation;
   try {
+    // Codecs are supplied at the acceptance seam and are therefore untrusted
+    // implementations. Keep the complete codec call chain behind one
+    // fail-closed read-only preparation boundary.
+    const payloadResult = codec.decode(input.payload);
+    if (!payloadResult.ok) return payloadResult;
+    decodedPayload = payloadResult.value;
     canonicalPayload = codec.canonicalize(payloadResult.value);
     codecFingerprint = codec.fingerprint(payloadResult.value);
     interpretation = codec.interpret(payloadResult.value);
@@ -333,13 +433,13 @@ export function prepareControlAction(
   }
   const interpretationResult = validateInterpretation(interpretation);
   if (!interpretationResult.ok) return interpretationResult;
-  if (interpretationResult.value.type === "fact") {
+  if (root !== null && interpretationResult.value.type === "fact") {
     const { gameSideId } = interpretationResult.value;
     if (gameSideId !== null && !root.gameSides.some((side) => side.id === gameSideId)) {
       return invalid("Game Fact references an unknown stable Game Side.");
     }
   }
-  if (interpretationResult.value.type === "team-assignment-correction") {
+  if (root !== null && interpretationResult.value.type === "team-assignment-correction") {
     const { gameSideId, eventTeamId } = interpretationResult.value;
     if (!root.gameSides.some((candidate) => candidate.id === gameSideId)) {
       return invalid("Team Assignment Correction references an unknown stable Game Side.");
@@ -362,16 +462,15 @@ export function prepareControlAction(
   if (!grantResult.ok) return grantResult;
   const lifecycleResult = validateLifecycle(input.lifecycle);
   if (!lifecycleResult.ok) return lifecycleResult;
-  if (!sameLifecycle(lifecycleResult.value, root.lifecycle)) {
+  if (root !== null && !sameLifecycle(lifecycleResult.value, root.lifecycle)) {
     return invalid("Control Action lifecycle context is stale.");
   }
   const overrideResult = validateOverride(input.override);
   if (!overrideResult.ok) return overrideResult;
-  const recoveryResult = validateRecoveryProvenance(
-    input.recoveryProvenance,
-    root,
-    operationId.value,
-  );
+  const recoveryResult =
+    root === null
+      ? validateRecoveryProvenanceShape(input.recoveryProvenance)
+      : validateRecoveryProvenance(input.recoveryProvenance, root, operationId.value);
   if (!recoveryResult.ok) return recoveryResult;
 
   const normalizedInput: ControlActionInput = {
@@ -379,7 +478,7 @@ export function prepareControlAction(
     eventGameId: eventGameId.value,
     operationId: operationId.value,
     kind: kindResult.value,
-    payload: structuredClone(payloadResult.value),
+    payload: structuredClone(decodedPayload),
     causalPredecessorIds: predecessorResult.value,
     occurrence: occurrenceResult.value,
     grant: grantResult.value,
@@ -394,6 +493,8 @@ export function prepareControlAction(
   const contentFingerprint = sha256(`${codecFingerprint}:${canonicalContent}`);
   return valid({
     input: normalizedInput,
+    codecIdentity,
+    codecFingerprint,
     canonicalContent,
     contentFingerprint,
     interpretation: interpretationResult.value,

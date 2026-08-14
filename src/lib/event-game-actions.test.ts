@@ -525,6 +525,14 @@ async function readSnapshot(
     findSessionByBearerVerifier: () => null,
     listGrantSessions: () => [],
     listGrantAudit: () => [],
+    findAcceptanceBudget: () => null,
+    findReplayReservation: () => null,
+    findReplayReservationByTuple: () => null,
+    findReplayReservationByOriginTuple: () => null,
+    listReplayAttempts: () => [],
+    findReplayReceiptByDigest: () => null,
+    findReplayReceiptByReservationId: () => null,
+    listAcceptanceIntegrityAnchors: () => [],
   };
 }
 

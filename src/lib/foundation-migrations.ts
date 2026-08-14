@@ -1084,6 +1084,154 @@ const FOUNDATION_REPLAY_PROVENANCE_MIGRATION_SQL = `
   ${FOUNDATION_GRANT_AUDIT_PROVENANCE_AFTER_INSERT_TRIGGER_V16_SQL};
 `;
 
+const FOUNDATION_COMPOSED_GRANT_AUDIT_TABLE_SQL =
+  FOUNDATION_TYPED_GRANT_AUDIT_TABLE_V16_SQL.replace(
+    "'session-terminated', 'session-switched', 'replay-authorized'))",
+    "'session-terminated', 'session-switched', 'replay-authorized', 'control-action-accepted', 'control-action-duplicate', 'control-action-rejected', 'control-action-retry-later', 'control-action-dependency-blocked'))",
+  ).replace(
+    "    created_at_ms INTEGER NOT NULL",
+    "    acceptance_id TEXT,\n    control_audit_id TEXT,\n    control_action_id TEXT,\n    content_fingerprint TEXT,\n    outcome_detail TEXT,\n    created_at_ms INTEGER NOT NULL",
+  );
+
+/** Schema-17 is the append-only durable state for the composed acceptance seam. */
+const FOUNDATION_COMPOSED_ACCEPTANCE_MIGRATION_SQL = `
+  CREATE TABLE foundation_acceptance_budgets (
+    bucket_id TEXT PRIMARY KEY,
+    bucket_kind TEXT NOT NULL CHECK (bucket_kind IN ('online-session', 'online-event', 'replay-session')),
+    subject_id TEXT NOT NULL,
+    capacity INTEGER NOT NULL CHECK (capacity > 0),
+    refill_per_second INTEGER NOT NULL CHECK (refill_per_second > 0),
+    tokens REAL NOT NULL CHECK (tokens >= 0 AND tokens <= capacity),
+    updated_at_ms INTEGER NOT NULL,
+    state_revision INTEGER NOT NULL CHECK (state_revision > 0)
+  ) STRICT;
+  CREATE TABLE foundation_replay_reservations (
+    reservation_id TEXT PRIMARY KEY,
+    record_id TEXT NOT NULL REFERENCES foundation_event_game_record_roots(record_id) ON DELETE CASCADE,
+    event_game_id TEXT NOT NULL,
+    originating_session_id TEXT NOT NULL,
+    replacement_session_id TEXT,
+    action_count INTEGER NOT NULL CHECK (action_count > 0),
+    status TEXT NOT NULL CHECK (status IN ('reserved', 'committing', 'committed', 'partial', 'discarded', 'acknowledged')),
+    batch_digest TEXT,
+    created_at_ms INTEGER NOT NULL,
+    committed_at_ms INTEGER,
+    acknowledged_at_ms INTEGER,
+    state_revision INTEGER NOT NULL CHECK (state_revision > 0)
+  ) STRICT;
+  CREATE TABLE foundation_replay_attempts (
+    attempt_id TEXT PRIMARY KEY,
+    reservation_id TEXT NOT NULL REFERENCES foundation_replay_reservations(reservation_id) ON DELETE CASCADE,
+    operation_id TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'accepted', 'duplicate-accepted', 'rejected', 'retry-later')),
+    action_fingerprint TEXT,
+    result_json TEXT,
+    control_audit_id TEXT,
+    grant_audit_id TEXT,
+    created_at_ms INTEGER NOT NULL,
+    completed_at_ms INTEGER,
+    state_revision INTEGER NOT NULL CHECK (state_revision > 0),
+    UNIQUE (reservation_id, operation_id)
+  ) STRICT;
+  CREATE TABLE foundation_replay_receipts (
+    receipt_id TEXT PRIMARY KEY,
+    reservation_id TEXT NOT NULL REFERENCES foundation_replay_reservations(reservation_id) ON DELETE CASCADE,
+    receipt_digest TEXT NOT NULL UNIQUE,
+    receipt_key_version TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('committed', 'acknowledged')),
+    action_count INTEGER NOT NULL CHECK (action_count > 0),
+    created_at_ms INTEGER NOT NULL,
+    acknowledged_at_ms INTEGER,
+    state_revision INTEGER NOT NULL CHECK (state_revision > 0)
+  ) STRICT;
+  CREATE TABLE foundation_acceptance_integrity_anchors (
+    anchor_id TEXT PRIMARY KEY,
+    subject_kind TEXT NOT NULL CHECK (subject_kind IN ('budget', 'reservation', 'attempt', 'receipt')),
+    subject_id TEXT NOT NULL,
+    state_revision INTEGER NOT NULL CHECK (state_revision > 0),
+    key_version TEXT NOT NULL,
+    integrity_tag TEXT NOT NULL,
+    UNIQUE (subject_kind, subject_id, state_revision)
+  ) STRICT;
+  CREATE TRIGGER foundation_acceptance_integrity_anchors_no_update
+    BEFORE UPDATE ON foundation_acceptance_integrity_anchors
+    BEGIN SELECT RAISE(ABORT, 'Acceptance integrity anchors are immutable.'); END;
+  CREATE TRIGGER foundation_acceptance_integrity_anchors_no_delete
+    BEFORE DELETE ON foundation_acceptance_integrity_anchors
+    BEGIN SELECT RAISE(ABORT, 'Acceptance integrity anchors are immutable.'); END;
+  DROP TRIGGER IF EXISTS foundation_grant_audit_provenance_after_insert;
+  DROP TRIGGER IF EXISTS foundation_grant_audit_no_legacy_integrity_tag;
+  DROP INDEX IF EXISTS foundation_grant_audit_grant_id;
+  ALTER TABLE foundation_grant_audit_provenance ADD COLUMN acceptance_id TEXT;
+  ALTER TABLE foundation_grant_audit_provenance ADD COLUMN control_audit_id TEXT;
+  ALTER TABLE foundation_grant_audit_provenance ADD COLUMN control_action_id TEXT;
+  ALTER TABLE foundation_grant_audit_provenance ADD COLUMN content_fingerprint TEXT;
+  ALTER TABLE foundation_grant_audit_provenance ADD COLUMN outcome_detail TEXT;
+  ALTER TABLE foundation_grant_audit RENAME TO foundation_grant_audit_pre17;
+  ${FOUNDATION_COMPOSED_GRANT_AUDIT_TABLE_SQL};
+  INSERT INTO foundation_grant_audit (
+    audit_id, action, outcome, actor_reference, grant_id, grant_type, grant_version,
+    event_id, game_day_id, pitch_id, pitch_slot_id, session_id, replaced_session_id,
+    event_game_id, credential_kind, credential_fingerprint, before_status, after_status,
+    before_expires_at_ms, after_expires_at_ms, previous_event_game_id, replay_evidence_id,
+    terminal_reason, audit_integrity_tag, acceptance_id, control_audit_id,
+    control_action_id, content_fingerprint, outcome_detail, created_at_ms
+  ) SELECT audit_id, action, outcome, actor_reference, grant_id, grant_type, grant_version,
+    event_id, game_day_id, pitch_id, pitch_slot_id, session_id, replaced_session_id,
+    event_game_id, credential_kind, credential_fingerprint, before_status, after_status,
+    before_expires_at_ms, after_expires_at_ms, previous_event_game_id, replay_evidence_id,
+    terminal_reason, audit_integrity_tag, NULL, NULL, NULL, NULL, NULL, created_at_ms
+    FROM foundation_grant_audit_pre17;
+  DROP TABLE foundation_grant_audit_pre17;
+  CREATE INDEX foundation_grant_audit_grant_id ON foundation_grant_audit (grant_id, audit_id);
+  CREATE TRIGGER foundation_grant_audit_no_legacy_integrity_tag
+    BEFORE INSERT ON foundation_grant_audit
+    WHEN NEW.audit_integrity_tag = 'legacy-migration-v1'
+    BEGIN SELECT RAISE(ABORT, 'Legacy Grant Audit integrity tags are migration-owned.'); END;
+  CREATE TRIGGER foundation_grant_audit_provenance_after_insert
+    AFTER INSERT ON foundation_grant_audit
+    BEGIN
+      INSERT INTO foundation_grant_audit_provenance (
+        audit_id, action, outcome, actor_reference, grant_id, grant_type, grant_version,
+        event_id, game_day_id, pitch_id, pitch_slot_id, session_id, replaced_session_id,
+        event_game_id, previous_event_game_id, replay_evidence_id, credential_kind,
+        credential_fingerprint, before_status, after_status, before_expires_at_ms,
+        after_expires_at_ms, terminal_reason, audit_integrity_tag, acceptance_id,
+        control_audit_id, control_action_id, content_fingerprint, outcome_detail, created_at_ms
+      ) VALUES (
+        NEW.audit_id, NEW.action, NEW.outcome, NEW.actor_reference, NEW.grant_id,
+        NEW.grant_type, NEW.grant_version, NEW.event_id, NEW.game_day_id, NEW.pitch_id,
+        NEW.pitch_slot_id, NEW.session_id, NEW.replaced_session_id, NEW.event_game_id,
+        NEW.previous_event_game_id, NEW.replay_evidence_id, NEW.credential_kind,
+        NEW.credential_fingerprint, NEW.before_status, NEW.after_status,
+        NEW.before_expires_at_ms, NEW.after_expires_at_ms, NEW.terminal_reason,
+        NEW.audit_integrity_tag, NEW.acceptance_id, NEW.control_audit_id,
+        NEW.control_action_id, NEW.content_fingerprint, NEW.outcome_detail, NEW.created_at_ms
+      );
+    END;
+  CREATE INDEX foundation_replay_reservations_record_id
+    ON foundation_replay_reservations(record_id, created_at_ms);
+  CREATE INDEX foundation_replay_attempts_reservation_id
+    ON foundation_replay_attempts(reservation_id, attempt_id);
+`;
+
+const FOUNDATION_ACCEPTANCE_INTEGRITY_HISTORY_MIGRATION_SQL = `
+  ALTER TABLE foundation_acceptance_integrity_anchors
+    ADD COLUMN canonical_value TEXT NOT NULL DEFAULT '';
+  DROP TRIGGER foundation_acceptance_integrity_anchors_no_delete;
+  CREATE TRIGGER foundation_acceptance_integrity_anchors_no_delete
+    BEFORE DELETE ON foundation_acceptance_integrity_anchors
+    WHEN NOT EXISTS (
+      SELECT 1 FROM foundation_replay_reservations AS reservations
+      WHERE reservations.status IN ('reserved', 'partial')
+        AND (
+          (OLD.subject_kind = 'reservation' AND reservations.reservation_id = OLD.subject_id)
+          OR (OLD.subject_kind = 'attempt' AND OLD.subject_id LIKE reservations.reservation_id || ':%')
+        )
+    )
+    BEGIN SELECT RAISE(ABORT, 'Acceptance integrity anchors are immutable.'); END;
+`;
+
 export const FOUNDATION_MIGRATIONS: readonly FoundationMigration[] = Object.freeze([
   createMigration({
     id: "001-foundation-event-game-record-roots",
@@ -1180,6 +1328,18 @@ export const FOUNDATION_MIGRATIONS: readonly FoundationMigration[] = Object.free
     ordinal: 16,
     schemaVersion: 16,
     sql: FOUNDATION_REPLAY_PROVENANCE_MIGRATION_SQL,
+  }),
+  createMigration({
+    id: "017-composed-acceptance-state",
+    ordinal: 17,
+    schemaVersion: 17,
+    sql: FOUNDATION_COMPOSED_ACCEPTANCE_MIGRATION_SQL,
+  }),
+  createMigration({
+    id: "018-acceptance-integrity-history",
+    ordinal: 18,
+    schemaVersion: 18,
+    sql: FOUNDATION_ACCEPTANCE_INTEGRITY_HISTORY_MIGRATION_SQL,
   }),
 ]);
 

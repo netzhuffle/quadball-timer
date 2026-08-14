@@ -175,7 +175,12 @@ export type GrantAuditAction =
   | "session-admitted"
   | "session-replaced"
   | "session-switched"
-  | "replay-authorized";
+  | "replay-authorized"
+  | "control-action-accepted"
+  | "control-action-duplicate"
+  | "control-action-rejected"
+  | "control-action-retry-later"
+  | "control-action-dependency-blocked";
 
 export type StoredGrantAuditEntry = {
   auditId: string;
@@ -198,6 +203,11 @@ export type StoredGrantAuditEntry = {
   beforeExpiresAtMs: number | null;
   afterExpiresAtMs: number | null;
   terminalReason: TerminalGrantSessionReason | null;
+  acceptanceId?: string | null;
+  controlAuditId?: string | null;
+  controlActionId?: string | null;
+  contentFingerprint?: string | null;
+  outcomeDetail?: string | null;
   createdAtMs: number;
 };
 
