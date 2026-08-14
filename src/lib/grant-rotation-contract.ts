@@ -1,18 +1,20 @@
 import { expect } from "bun:test";
 
-import { computeLookupDigest } from "@/lib/grant-crypto";
 import {
-  createGrantAuthority,
   type ControlGrantScope,
-  type GrantAuthority,
   type GrantKeyRing,
   type GrantRandomness,
 } from "@/lib/grant-authority";
+import type { GrantAuthority } from "@/lib/grant-authority-types";
 import type {
   GrantAuthorityContractFactory,
   GrantAuthorityContractRegistrar,
 } from "@/lib/grant-authority-contract";
 import type { FoundationStorage } from "@/lib/foundation-storage";
+import {
+  createGrantTestAuthorityVerifier,
+  createLegacyControlGrantTestAuthority,
+} from "@/lib/grant-authority-test-support";
 
 export function registerGrantRotationContract(
   register: GrantAuthorityContractRegistrar,
@@ -67,11 +69,14 @@ export function registerGrantRotationContract(
     });
   });
 
-  register("rolls back credential rotation on index collision or audit failure", async () => {
-    await verifyCollisionRollback(createStorage);
-    await verifyAuditRollback(createStorage);
-    await verifyCryptographicRollback(createStorage);
-  });
+  register(
+    "fails closed on corrupt Grant state and rolls back audit or crypto failures",
+    async () => {
+      await verifyCorruptGrantState(createStorage);
+      await verifyAuditRollback(createStorage);
+      await verifyCryptographicRollback(createStorage);
+    },
+  );
 
   register("rotates retained credentials without changing disabled or revoked status", async () => {
     for (const status of ["disabled", "revoked"] as const) {
@@ -142,16 +147,15 @@ export function registerGrantRotationContract(
   });
 }
 
-async function verifyCollisionRollback(
+async function verifyCorruptGrantState(
   createStorage: GrantAuthorityContractFactory,
 ): Promise<void> {
   await withStorage(createStorage, async (storage) => {
     const originalKeyRing = createKeyRing();
-    const rotatedKeyRing = createRotatedKeyRing(originalKeyRing);
     const randomness = createDeterministicRandomness();
     const original = createAuthority(storage, { randomness, keyRing: originalKeyRing });
     const created = await createGrant(original);
-    const before = await storage.transaction((transaction) => {
+    await storage.transaction((transaction) => {
       const grant = transaction.findGrantById(created.grantId);
       if (grant === null) throw new Error("Expected the stored Grant.");
       transaction.insertGrant({
@@ -161,21 +165,21 @@ async function verifyCollisionRollback(
         scope: { ...grant.scope, pitchSlotId: "slot-rotation-collision" },
         credential: {
           ...grant.credential,
-          lookupKeyVersion: rotatedKeyRing.lookup.currentVersion,
-          lookupDigest: computeLookupDigest(created.qrCredential, rotatedKeyRing),
-          fingerprint: "fingerprint-rotation-collision",
+          lookupDigest: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+          fingerprint: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
         },
       });
-      return grant;
     });
-    const rotated = createAuthority(storage, { randomness, keyRing: rotatedKeyRing });
-    expect(await rotated.rotateControlGrantCredentialKeys(created.grantId, createActor())).toEqual(
-      rotationFailure,
-    );
-    expect(await findGrant(storage, created.grantId)).toEqual(before);
-    expect(await admit(original, created.qrCredential, "browser-collision")).toMatchObject({
-      grantId: created.grantId,
+    expect(await storage.readiness()).toMatchObject({
+      ok: false,
+      status: "integrity-failure",
     });
+    expect(
+      await original.createControlGrant({
+        scope: { ...createScope(), pitchSlotId: "slot-unrelated" },
+        actor: createActor(),
+      }),
+    ).toEqual(expect.objectContaining({ status: "rejected", reason: "unavailable" }));
   });
 }
 
@@ -281,11 +285,12 @@ function createAuthority(
     nowMs?: () => number;
   } = {},
 ): GrantAuthority {
-  return createGrantAuthority(storage, {
+  return createLegacyControlGrantTestAuthority(storage, {
     environmentId: "test-environment",
     clock: { nowMs: configuration.nowMs ?? (() => 1_000) },
     randomness: configuration.randomness ?? createDeterministicRandomness(),
     keyRing: configuration.keyRing ?? createKeyRing(),
+    privilegedAuthorityVerifier: createGrantTestAuthorityVerifier(),
     controlScopeResolver: {
       resolve(scope) {
         expect(scope).toEqual(createScope());
@@ -360,6 +365,10 @@ function createKeyRing(): GrantKeyRing {
       currentVersion: "lookup-v1",
       keys: new Map([["lookup-v1", Uint8Array.from({ length: 32 }, (_, index) => index + 33)]]),
     },
+    audit: {
+      currentVersion: "audit-v1",
+      keys: new Map([["audit-v1", Uint8Array.from({ length: 32 }, (_, index) => index + 65)]]),
+    },
   };
 }
 
@@ -379,6 +388,7 @@ function createRotatedKeyRing(original: GrantKeyRing): GrantKeyRing {
         ["lookup-v2", Uint8Array.from({ length: 32 }, (_, index) => index + 65)],
       ]),
     },
+    audit: original.audit,
   };
 }
 
@@ -397,5 +407,6 @@ function keepOnlyCurrentKeys(keyRing: GrantKeyRing): GrantKeyRing {
       currentVersion: keyRing.lookup.currentVersion,
       keys: new Map([[keyRing.lookup.currentVersion, lookupKey]]),
     },
+    audit: keyRing.audit,
   };
 }

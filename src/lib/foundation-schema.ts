@@ -15,15 +15,33 @@ import {
   FOUNDATION_SIDE_RECORD_INDEX_SQL,
   FOUNDATION_SIDE_TABLE_SQL,
   FOUNDATION_GRANT_AUDIT_GRANT_INDEX_SQL,
-  FOUNDATION_GRANT_AUDIT_TABLE_SQL,
+  FOUNDATION_TYPED_GRANT_AUDIT_TABLE_V11_SQL,
   FOUNDATION_GRANT_SESSION_CONTEXT_INDEX_SQL,
   FOUNDATION_GRANT_SESSION_GRANT_INDEX_SQL,
-  FOUNDATION_GRANT_SESSION_TABLE_SQL,
-  FOUNDATION_GRANT_TABLE_SQL,
   FOUNDATION_EVIDENCE_PROVENANCE_TABLE_SQL,
   FOUNDATION_EVIDENCE_PROVENANCE_UPDATE_TRIGGER_SQL,
   FOUNDATION_EVIDENCE_PROVENANCE_DELETE_TRIGGER_SQL,
+  FOUNDATION_TYPED_GRANT_TABLE_SQL,
+  FOUNDATION_TYPED_GRANT_SESSION_TABLE_SQL,
+  FOUNDATION_GRANT_MIGRATION_PROVENANCE_TABLE_SQL,
+  FOUNDATION_GRANT_MIGRATION_PROVENANCE_STATE_TABLE_SQL,
+  FOUNDATION_GRANT_AUDIT_PROVENANCE_TABLE_SQL,
+  FOUNDATION_GRANT_AUDIT_PROVENANCE_GRANT_INDEX_SQL,
+  FOUNDATION_GRANT_MIGRATION_PROVENANCE_NO_UPDATE_TRIGGER_SQL,
+  FOUNDATION_GRANT_MIGRATION_PROVENANCE_NO_INSERT_TRIGGER_SQL,
+  FOUNDATION_GRANT_MIGRATION_PROVENANCE_NO_DELETE_TRIGGER_SQL,
+  FOUNDATION_GRANT_MIGRATION_PROVENANCE_STATE_NO_UPDATE_TRIGGER_SQL,
+  FOUNDATION_GRANT_MIGRATION_PROVENANCE_STATE_NO_INSERT_TRIGGER_SQL,
+  FOUNDATION_GRANT_MIGRATION_PROVENANCE_STATE_NO_DELETE_TRIGGER_SQL,
+  FOUNDATION_GRANT_AUDIT_PROVENANCE_NO_UPDATE_TRIGGER_SQL,
+  FOUNDATION_GRANT_AUDIT_PROVENANCE_NO_DELETE_TRIGGER_SQL,
+  FOUNDATION_GRANT_AUDIT_PROVENANCE_AFTER_INSERT_TRIGGER_SQL,
+  FOUNDATION_GRANT_AUDIT_NO_LEGACY_TAG_INSERT_TRIGGER_SQL,
 } from "@/lib/foundation-migrations";
+import { computeGrantAuditIntegrityTag } from "@/lib/grant-crypto";
+import { readStoredGrantAuditEntry, scanGrantState } from "@/lib/grant-storage-sqlite";
+import type { GrantStateValidationContext } from "@/lib/grant-state-validation";
+import { GRANT_AUDIT_LEGACY_INTEGRITY_TAG } from "@/lib/grant-types";
 import {
   canonicalizeEventGameRecordRoot,
   cloneEventGameRecordRoot,
@@ -84,6 +102,9 @@ const GRANT_TABLE = "foundation_grant_roots";
 const GRANT_SESSION_TABLE = "foundation_grant_sessions";
 const GRANT_AUDIT_TABLE = "foundation_grant_audit";
 const PROVENANCE_TABLE = "foundation_control_evidence_provenance";
+const GRANT_MIGRATION_PROVENANCE_TABLE = "foundation_grant_migration_provenance";
+const GRANT_MIGRATION_PROVENANCE_STATE_TABLE = "foundation_grant_migration_provenance_state";
+const GRANT_AUDIT_PROVENANCE_TABLE = "foundation_grant_audit_provenance";
 
 const expectedManifest: FoundationSchemaManifest = {
   objects: [
@@ -94,9 +115,19 @@ const expectedManifest: FoundationSchemaManifest = {
     object("table", IDEMPOTENCY_TABLE, IDEMPOTENCY_TABLE, FOUNDATION_IDEMPOTENCY_TABLE_SQL),
     object("table", METADATA_TABLE, METADATA_TABLE, FOUNDATION_METADATA_TABLE_SQL),
     object("table", AUDIT_TABLE, AUDIT_TABLE, FOUNDATION_CURRENT_AUDIT_TABLE_SQL),
-    object("table", GRANT_TABLE, GRANT_TABLE, FOUNDATION_GRANT_TABLE_SQL),
-    object("table", GRANT_SESSION_TABLE, GRANT_SESSION_TABLE, FOUNDATION_GRANT_SESSION_TABLE_SQL),
-    object("table", GRANT_AUDIT_TABLE, GRANT_AUDIT_TABLE, FOUNDATION_GRANT_AUDIT_TABLE_SQL),
+    object("table", GRANT_TABLE, GRANT_TABLE, FOUNDATION_TYPED_GRANT_TABLE_SQL),
+    object(
+      "table",
+      GRANT_SESSION_TABLE,
+      GRANT_SESSION_TABLE,
+      FOUNDATION_TYPED_GRANT_SESSION_TABLE_SQL,
+    ),
+    object(
+      "table",
+      GRANT_AUDIT_TABLE,
+      GRANT_AUDIT_TABLE,
+      FOUNDATION_TYPED_GRANT_AUDIT_TABLE_V11_SQL,
+    ),
     object("table", PROVENANCE_TABLE, PROVENANCE_TABLE, FOUNDATION_EVIDENCE_PROVENANCE_TABLE_SQL),
     object(
       "trigger",
@@ -109,6 +140,84 @@ const expectedManifest: FoundationSchemaManifest = {
       "foundation_control_evidence_provenance_no_delete",
       PROVENANCE_TABLE,
       FOUNDATION_EVIDENCE_PROVENANCE_DELETE_TRIGGER_SQL,
+    ),
+    object(
+      "table",
+      GRANT_MIGRATION_PROVENANCE_TABLE,
+      GRANT_MIGRATION_PROVENANCE_TABLE,
+      FOUNDATION_GRANT_MIGRATION_PROVENANCE_TABLE_SQL,
+    ),
+    object(
+      "table",
+      GRANT_MIGRATION_PROVENANCE_STATE_TABLE,
+      GRANT_MIGRATION_PROVENANCE_STATE_TABLE,
+      FOUNDATION_GRANT_MIGRATION_PROVENANCE_STATE_TABLE_SQL,
+    ),
+    object(
+      "table",
+      GRANT_AUDIT_PROVENANCE_TABLE,
+      GRANT_AUDIT_PROVENANCE_TABLE,
+      FOUNDATION_GRANT_AUDIT_PROVENANCE_TABLE_SQL,
+    ),
+    object(
+      "trigger",
+      "foundation_grant_migration_provenance_no_update",
+      GRANT_MIGRATION_PROVENANCE_TABLE,
+      FOUNDATION_GRANT_MIGRATION_PROVENANCE_NO_UPDATE_TRIGGER_SQL,
+    ),
+    object(
+      "trigger",
+      "foundation_grant_migration_provenance_no_insert",
+      GRANT_MIGRATION_PROVENANCE_TABLE,
+      FOUNDATION_GRANT_MIGRATION_PROVENANCE_NO_INSERT_TRIGGER_SQL,
+    ),
+    object(
+      "trigger",
+      "foundation_grant_migration_provenance_no_delete",
+      GRANT_MIGRATION_PROVENANCE_TABLE,
+      FOUNDATION_GRANT_MIGRATION_PROVENANCE_NO_DELETE_TRIGGER_SQL,
+    ),
+    object(
+      "trigger",
+      "foundation_grant_migration_provenance_state_no_update",
+      GRANT_MIGRATION_PROVENANCE_STATE_TABLE,
+      FOUNDATION_GRANT_MIGRATION_PROVENANCE_STATE_NO_UPDATE_TRIGGER_SQL,
+    ),
+    object(
+      "trigger",
+      "foundation_grant_migration_provenance_state_no_insert",
+      GRANT_MIGRATION_PROVENANCE_STATE_TABLE,
+      FOUNDATION_GRANT_MIGRATION_PROVENANCE_STATE_NO_INSERT_TRIGGER_SQL,
+    ),
+    object(
+      "trigger",
+      "foundation_grant_migration_provenance_state_no_delete",
+      GRANT_MIGRATION_PROVENANCE_STATE_TABLE,
+      FOUNDATION_GRANT_MIGRATION_PROVENANCE_STATE_NO_DELETE_TRIGGER_SQL,
+    ),
+    object(
+      "trigger",
+      "foundation_grant_audit_provenance_no_update",
+      GRANT_AUDIT_PROVENANCE_TABLE,
+      FOUNDATION_GRANT_AUDIT_PROVENANCE_NO_UPDATE_TRIGGER_SQL,
+    ),
+    object(
+      "trigger",
+      "foundation_grant_audit_provenance_no_delete",
+      GRANT_AUDIT_PROVENANCE_TABLE,
+      FOUNDATION_GRANT_AUDIT_PROVENANCE_NO_DELETE_TRIGGER_SQL,
+    ),
+    object(
+      "trigger",
+      "foundation_grant_audit_no_legacy_integrity_tag",
+      GRANT_AUDIT_TABLE,
+      FOUNDATION_GRANT_AUDIT_NO_LEGACY_TAG_INSERT_TRIGGER_SQL,
+    ),
+    object(
+      "trigger",
+      "foundation_grant_audit_provenance_after_insert",
+      GRANT_AUDIT_TABLE,
+      FOUNDATION_GRANT_AUDIT_PROVENANCE_AFTER_INSERT_TRIGGER_SQL,
     ),
     object(
       "index",
@@ -163,6 +272,12 @@ const expectedManifest: FoundationSchemaManifest = {
       "foundation_grant_audit_grant_id",
       GRANT_AUDIT_TABLE,
       FOUNDATION_GRANT_AUDIT_GRANT_INDEX_SQL,
+    ),
+    object(
+      "index",
+      "foundation_grant_audit_provenance_grant_id",
+      GRANT_AUDIT_PROVENANCE_TABLE,
+      FOUNDATION_GRANT_AUDIT_PROVENANCE_GRANT_INDEX_SQL,
     ),
   ].sort(compareNamed),
   tables: [
@@ -300,6 +415,8 @@ const expectedManifest: FoundationSchemaManifest = {
         column("created_at_ms", "INTEGER", 1, 0),
         column("last_active_at_ms", "INTEGER", 1, 0),
         column("revoked_at_ms", "INTEGER", 0, 0),
+        column("device_class", "TEXT", 1, 0),
+        column("browser_class", "TEXT", 1, 0),
       ],
       foreignKeys: [
         {
@@ -427,6 +544,10 @@ const expectedManifest: FoundationSchemaManifest = {
         column("credential_fingerprint", "TEXT", 0, 0),
         column("before_status", "TEXT", 0, 0),
         column("after_status", "TEXT", 0, 0),
+        column("before_expires_at_ms", "INTEGER", 0, 0),
+        column("after_expires_at_ms", "INTEGER", 0, 0),
+        column("terminal_reason", "TEXT", 0, 0),
+        column("audit_integrity_tag", "TEXT", 1, 0),
         column("created_at_ms", "INTEGER", 1, 0),
       ],
       foreignKeys: [
@@ -452,6 +573,79 @@ const expectedManifest: FoundationSchemaManifest = {
       ],
       foreignKeys: [],
     },
+    {
+      name: GRANT_MIGRATION_PROVENANCE_TABLE,
+      columns: [
+        column("grant_id", "TEXT", 1, 1),
+        column("migration_id", "TEXT", 1, 0),
+        column("original_status", "TEXT", 1, 0),
+        column("original_grant_version", "TEXT", 1, 0),
+        column("original_event_id", "TEXT", 1, 0),
+        column("original_game_day_id", "TEXT", 1, 0),
+        column("original_pitch_id", "TEXT", 1, 0),
+        column("original_pitch_slot_id", "TEXT", 1, 0),
+        column("original_created_at_ms", "INTEGER", 1, 0),
+        column("original_expires_at_ms", "INTEGER", 0, 0),
+        column("retained_opaque_reference", "TEXT", 1, 0),
+      ],
+      foreignKeys: [
+        {
+          id: 0,
+          sequence: 0,
+          table: GRANT_TABLE,
+          from: "grant_id",
+          to: "grant_id",
+          onUpdate: "NO ACTION",
+          onDelete: "RESTRICT",
+          match: "NONE",
+        },
+      ],
+    },
+    {
+      name: GRANT_MIGRATION_PROVENANCE_STATE_TABLE,
+      columns: [column("state_id", "INTEGER", 0, 1), column("migration_id", "TEXT", 1, 0)],
+      foreignKeys: [],
+    },
+    {
+      name: GRANT_AUDIT_PROVENANCE_TABLE,
+      columns: [
+        column("audit_id", "TEXT", 1, 1),
+        column("action", "TEXT", 1, 0),
+        column("outcome", "TEXT", 1, 0),
+        column("actor_reference", "TEXT", 1, 0),
+        column("grant_id", "TEXT", 1, 0),
+        column("grant_type", "TEXT", 1, 0),
+        column("grant_version", "TEXT", 1, 0),
+        column("event_id", "TEXT", 1, 0),
+        column("game_day_id", "TEXT", 1, 0),
+        column("pitch_id", "TEXT", 1, 0),
+        column("pitch_slot_id", "TEXT", 1, 0),
+        column("session_id", "TEXT", 0, 0),
+        column("replaced_session_id", "TEXT", 0, 0),
+        column("event_game_id", "TEXT", 0, 0),
+        column("credential_kind", "TEXT", 0, 0),
+        column("credential_fingerprint", "TEXT", 0, 0),
+        column("before_status", "TEXT", 0, 0),
+        column("after_status", "TEXT", 0, 0),
+        column("before_expires_at_ms", "INTEGER", 0, 0),
+        column("after_expires_at_ms", "INTEGER", 0, 0),
+        column("terminal_reason", "TEXT", 0, 0),
+        column("audit_integrity_tag", "TEXT", 1, 0),
+        column("created_at_ms", "INTEGER", 1, 0),
+      ],
+      foreignKeys: [
+        {
+          id: 0,
+          sequence: 0,
+          table: GRANT_TABLE,
+          from: "grant_id",
+          to: "grant_id",
+          onUpdate: "NO ACTION",
+          onDelete: "RESTRICT",
+          match: "NONE",
+        },
+      ],
+    },
   ].sort(compareNamed),
   indexes: [
     index("foundation_event_game_record_roots_event_id", 0, ["event_id"]),
@@ -463,6 +657,7 @@ const expectedManifest: FoundationSchemaManifest = {
     index("foundation_grant_sessions_grant_id", 0, ["grant_id"]),
     index("foundation_grant_sessions_active_context", 1, ["grant_id", "browser_context_digest"], 1),
     index("foundation_grant_audit_grant_id", 0, ["grant_id", "audit_id"]),
+    index("foundation_grant_audit_provenance_grant_id", 0, ["grant_id", "audit_id"]),
   ].sort(compareNamed),
 };
 
@@ -484,7 +679,10 @@ export function foundationSchemaFingerprint(database: Database): string {
   return fingerprint(readSchemaManifest(database));
 }
 
-export function verifyFoundationSchema(database: Database): FoundationSchemaVerification {
+export function verifyFoundationSchema(
+  database: Database,
+  grantValidationContext?: GrantStateValidationContext,
+): FoundationSchemaVerification {
   try {
     if (!tableExists(database, ROOT_TABLE)) {
       return {
@@ -526,7 +724,8 @@ export function verifyFoundationSchema(database: Database): FoundationSchemaVeri
       };
     }
     scanFoundationRoots(database);
-    scanFoundationGrantState(database);
+    verifyGrantProvenance(database, grantValidationContext);
+    scanFoundationGrantState(database, grantValidationContext);
     return { ok: true };
   } catch {
     return {
@@ -563,7 +762,10 @@ export function scanFoundationRoots(database: Database): void {
   }
 }
 
-function scanFoundationGrantState(database: Database): void {
+function scanFoundationGrantState(
+  database: Database,
+  grantValidationContext?: GrantStateValidationContext,
+): void {
   const invalidGrant = database
     .query(
       `SELECT grant_id FROM foundation_grant_roots
@@ -583,6 +785,132 @@ function scanFoundationGrantState(database: Database): void {
     .get();
   if (invalidSession !== null) {
     throw new Error("Stored Grant Session lifecycle and bearer material state do not match.");
+  }
+  scanGrantState(database, grantValidationContext);
+}
+
+function verifyGrantProvenance(
+  database: Database,
+  validationContext?: GrantStateValidationContext,
+): void {
+  const stateRows = database
+    .query("SELECT state_id, migration_id FROM foundation_grant_migration_provenance_state")
+    .all() as unknown[];
+  if (
+    stateRows.length !== 1 ||
+    readInteger(asRecord(stateRows[0]).state_id) !== 1 ||
+    readText(asRecord(stateRows[0]).migration_id) !== "014-grant-provenance-integrity"
+  ) {
+    throw new Error("Grant migration provenance state is incomplete.");
+  }
+
+  const provenanceRows = database
+    .query(
+      `SELECT grant_id, migration_id, original_status, original_grant_version,
+              original_event_id, original_game_day_id, original_pitch_id,
+              original_pitch_slot_id, original_created_at_ms, original_expires_at_ms,
+              retained_opaque_reference
+       FROM foundation_grant_migration_provenance ORDER BY grant_id`,
+    )
+    .all() as unknown[];
+  const provenance = new Map<string, Record<string, unknown>>();
+  for (const value of provenanceRows) {
+    const row = asRecord(value);
+    const grantId = readText(row.grant_id);
+    const reference = readText(row.retained_opaque_reference);
+    if (
+      readText(row.migration_id) !== "006-grant-cryptographic-erasure" ||
+      !/^opaque-migration-reference-v1:[a-f0-9]{64}$/.test(reference) ||
+      provenance.has(grantId)
+    ) {
+      throw new Error("Grant migration provenance is invalid.");
+    }
+    provenance.set(grantId, row);
+  }
+  const grants = database
+    .query("SELECT grant_id, credential_fingerprint FROM foundation_grant_roots ORDER BY grant_id")
+    .all() as unknown[];
+  for (const value of grants) {
+    const row = asRecord(value);
+    const grantId = readText(row.grant_id);
+    const fingerprint = readText(row.credential_fingerprint);
+    const recorded = provenance.get(grantId);
+    if (fingerprint.startsWith("opaque-migration-reference-v1:")) {
+      if (recorded === undefined || readText(recorded.retained_opaque_reference) !== fingerprint) {
+        throw new Error("An opaque migration Grant lacks bound durable provenance.");
+      }
+    }
+  }
+  for (const [grantId, row] of provenance) {
+    if (!grants.some((value) => readText(asRecord(value).grant_id) === grantId)) {
+      throw new Error("Grant migration provenance references an unknown Grant.");
+    }
+    if (readText(row.original_grant_version).length === 0) {
+      throw new Error("Grant migration provenance lacks original Grant evidence.");
+    }
+  }
+
+  const columns = [
+    "audit_id",
+    "action",
+    "outcome",
+    "actor_reference",
+    "grant_id",
+    "grant_type",
+    "grant_version",
+    "event_id",
+    "game_day_id",
+    "pitch_id",
+    "pitch_slot_id",
+    "session_id",
+    "replaced_session_id",
+    "event_game_id",
+    "credential_kind",
+    "credential_fingerprint",
+    "before_status",
+    "after_status",
+    "before_expires_at_ms",
+    "after_expires_at_ms",
+    "terminal_reason",
+    "audit_integrity_tag",
+    "created_at_ms",
+  ] as const;
+  const select = columns.join(", ");
+  const current = database
+    .query(`SELECT ${select} FROM foundation_grant_audit ORDER BY audit_id`)
+    .all() as unknown[];
+  const durable = database
+    .query(`SELECT ${select} FROM foundation_grant_audit_provenance ORDER BY audit_id`)
+    .all() as unknown[];
+  for (const value of current) {
+    const row = asRecord(value);
+    const tag = readText(row.audit_integrity_tag);
+    if (tag === GRANT_AUDIT_LEGACY_INTEGRITY_TAG) continue;
+    if (validationContext?.keyRing === undefined) {
+      throw new Error("Grant Audit Trail integrity cannot be verified.");
+    }
+    const audit = readStoredGrantAuditEntry(row);
+    const tagParts = tag.split(":");
+    const keyVersion = tagParts[1];
+    if (
+      tagParts.length !== 3 ||
+      keyVersion === undefined ||
+      computeGrantAuditIntegrityTag(audit, validationContext.keyRing, keyVersion) !== tag
+    ) {
+      throw new Error("Grant Audit Trail integrity is invalid.");
+    }
+  }
+  if (current.length !== durable.length) {
+    throw new Error("Grant Audit Trail provenance history is incomplete.");
+  }
+  for (let index = 0; index < current.length; index += 1) {
+    const currentRow = asRecord(current[index]);
+    const durableRow = asRecord(durable[index]);
+    for (const column of columns) {
+      if (currentRow[column] !== durableRow[column]) {
+        throw new Error("Grant Audit Trail evidence has been mutated.");
+      }
+    }
   }
 }
 
@@ -695,6 +1023,9 @@ function readSchemaManifest(database: Database): FoundationSchemaManifest {
     GRANT_SESSION_TABLE,
     GRANT_AUDIT_TABLE,
     PROVENANCE_TABLE,
+    GRANT_MIGRATION_PROVENANCE_TABLE,
+    GRANT_MIGRATION_PROVENANCE_STATE_TABLE,
+    GRANT_AUDIT_PROVENANCE_TABLE,
   ].map((name) => ({
     name,
     columns: readColumns(database, name),
@@ -710,6 +1041,7 @@ function readSchemaManifest(database: Database): FoundationSchemaManifest {
     "foundation_grant_sessions_grant_id",
     "foundation_grant_sessions_active_context",
     "foundation_grant_audit_grant_id",
+    "foundation_grant_audit_provenance_grant_id",
   ].map((name) => readIndex(database, name));
 
   return {
@@ -807,6 +1139,7 @@ function readIndex(database: Database, name: string): SchemaIndex {
 
 function indexTable(name: string): string {
   if (name.startsWith("foundation_grant_sessions")) return GRANT_SESSION_TABLE;
+  if (name.startsWith("foundation_grant_audit_provenance")) return GRANT_AUDIT_PROVENANCE_TABLE;
   if (name.startsWith("foundation_grant_audit")) return GRANT_AUDIT_TABLE;
   if (name.includes("sides")) return SIDE_TABLE;
   if (name.includes("actions")) return ACTION_TABLE;

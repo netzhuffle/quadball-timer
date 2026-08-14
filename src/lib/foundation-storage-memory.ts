@@ -4,17 +4,21 @@ import {
   validateEventGameRecordRoot,
   type EventGameRecordRoot,
 } from "@/lib/foundation-record-types";
+import { computeGrantAuditIntegrityTag } from "@/lib/grant-crypto";
 import {
-  cloneStoredControlGrant,
+  cloneStoredGrant,
   cloneStoredGrantAuditEntry,
   cloneStoredGrantSession,
-  type StoredControlGrant,
+  type GrantKeyRing,
+  type ControlGrantScope,
+  type StoredGrant,
   type StoredGrantAuditEntry,
   type StoredGrantSession,
 } from "@/lib/grant-types";
 import {
   FoundationStorageClosedError,
   FoundationStorageConstraintError,
+  FoundationStorageNotReadyError,
   type FoundationStorage,
   type FoundationStorageReadiness,
   type FoundationStorageTransaction,
@@ -35,6 +39,7 @@ import {
   actionIdentity,
   parseStoredControlAction,
 } from "@/lib/event-game-actions";
+import { validateGrantState, type GrantStateValidationContext } from "@/lib/grant-state-validation";
 
 type MemoryState = {
   roots: Map<string, StoredEventGameRecordRoot>;
@@ -44,9 +49,11 @@ type MemoryState = {
   controlAudits: Map<string, Map<string, StoredControlAuditEntry>>;
   actionProvenance: Map<string, Map<string, "current" | "legacy">>;
   auditProvenance: Map<string, Map<string, "current" | "legacy">>;
-  grants: Map<string, StoredControlGrant>;
+  grants: Map<string, StoredGrant>;
   sessions: Map<string, StoredGrantSession>;
   grantAudits: Map<string, StoredGrantAuditEntry>;
+  grantAuditProvenance: Map<string, StoredGrantAuditEntry>;
+  grantAuditIntegrityTags: Map<string, string>;
 };
 
 export function createInMemoryFoundationStorage(): FoundationStorage {
@@ -65,17 +72,31 @@ class InMemoryFoundationStorage implements FoundationStorage {
     grants: new Map(),
     sessions: new Map(),
     grantAudits: new Map(),
+    grantAuditProvenance: new Map(),
+    grantAuditIntegrityTags: new Map(),
   };
   private writerTail: Promise<void> = Promise.resolve();
   private closed = false;
   private revision = 0;
+  private grantValidationContext: GrantStateValidationContext = {};
 
   transaction<T>(work: FoundationStorageTransactionWork<T>): Promise<T> {
     const operation = this.writerTail.then(() => {
       this.assertOpen();
+      const grantFailure = this.grantStateFailure();
+      if (grantFailure !== null) {
+        throw new FoundationStorageNotReadyError({
+          ok: false,
+          status: "integrity-failure",
+          detail: grantFailure,
+          storage: "memory",
+        });
+      }
       const undo: (() => void)[] = [];
       try {
-        const result = work(createTransaction(this.state, undo, this.revision));
+        const result = work(
+          createTransaction(this.state, undo, this.revision, this.grantValidationContext.keyRing),
+        );
         if (isThenable(result)) {
           throw new TypeError("Foundation storage transactions must complete synchronously.");
         }
@@ -263,6 +284,15 @@ class InMemoryFoundationStorage implements FoundationStorage {
           } satisfies FoundationStorageReadiness;
         }
       }
+      const grantFailure = this.grantStateFailure();
+      if (grantFailure !== null) {
+        return {
+          ok: false,
+          status: "integrity-failure",
+          detail: grantFailure,
+          storage: "memory",
+        } satisfies FoundationStorageReadiness;
+      }
       return {
         ok: true,
         schemaVersion: "memory",
@@ -275,8 +305,35 @@ class InMemoryFoundationStorage implements FoundationStorage {
     this.closed = true;
   }
 
+  setGrantKeyRing(keyRing: GrantKeyRing): void {
+    this.grantValidationContext = { ...this.grantValidationContext, keyRing };
+  }
+
+  setGrantValidationContext(context: GrantStateValidationContext): void {
+    this.grantValidationContext = {
+      ...this.grantValidationContext,
+      ...context,
+      ...(context.migrationProvenance === undefined
+        ? {}
+        : { migrationProvenance: new Map(context.migrationProvenance) }),
+    };
+  }
+
   private assertOpen(): void {
     if (this.closed) throw new FoundationStorageClosedError();
+  }
+
+  private grantStateFailure(): string | null {
+    return validateGrantState(
+      this.state.grants.values(),
+      this.state.sessions.values(),
+      this.state.grantAudits.values(),
+      {
+        ...this.grantValidationContext,
+        auditProvenance: this.state.grantAuditProvenance,
+        auditIntegrityTags: this.state.grantAuditIntegrityTags,
+      },
+    );
   }
 }
 
@@ -284,6 +341,7 @@ function createTransaction(
   state: MemoryState,
   undo: (() => void)[],
   revision: number,
+  keyRing: GrantKeyRing | undefined,
 ): FoundationStorageTransaction {
   return {
     revision,
@@ -438,7 +496,7 @@ function createTransaction(
     },
     findGrantById(grantId) {
       const grant = state.grants.get(grantId);
-      return grant === undefined ? null : cloneStoredControlGrant(grant);
+      return grant === undefined ? null : cloneStoredGrant(grant);
     },
     findGrantByCredentialLookupDigest(lookupDigest) {
       return findGrant(state.grants, (grant) => grant.credential.lookupDigest === lookupDigest);
@@ -490,14 +548,17 @@ function createTransaction(
         throw new FoundationStorageConstraintError("grant-credential-digest");
       }
       if (
+        grant.grantType === "control" &&
         findGrant(
           state.grants,
-          (candidate) => candidate.scope.pitchSlotId === grant.scope.pitchSlotId,
+          (candidate) =>
+            (candidate.scope as ControlGrantScope).pitchSlotId ===
+            (grant.scope as ControlGrantScope).pitchSlotId,
         )
       ) {
         throw new FoundationStorageConstraintError("grant-pitch-slot-id");
       }
-      state.grants.set(grant.grantId, cloneStoredControlGrant(grant));
+      state.grants.set(grant.grantId, cloneStoredGrant(grant));
       undo.push(() => state.grants.delete(grant.grantId));
     },
     updateGrant(grant) {
@@ -514,11 +575,13 @@ function createTransaction(
         throw new FoundationStorageConstraintError("grant-version");
       }
       if (
+        grant.grantType === "control" &&
         findGrant(
           state.grants,
           (candidate) =>
             candidate.grantId !== grant.grantId &&
-            candidate.scope.pitchSlotId === grant.scope.pitchSlotId,
+            (candidate.scope as ControlGrantScope).pitchSlotId ===
+              (grant.scope as ControlGrantScope).pitchSlotId,
         )
       ) {
         throw new FoundationStorageConstraintError("grant-pitch-slot-id");
@@ -535,7 +598,7 @@ function createTransaction(
         throw new FoundationStorageConstraintError("grant-credential-digest");
       }
       const previous = state.grants.get(grant.grantId);
-      state.grants.set(grant.grantId, cloneStoredControlGrant(grant));
+      state.grants.set(grant.grantId, cloneStoredGrant(grant));
       undo.push(() => {
         if (previous !== undefined) state.grants.set(grant.grantId, previous);
       });
@@ -610,6 +673,9 @@ function createTransaction(
       });
     },
     appendGrantAudit(entry) {
+      if (keyRing === undefined) {
+        throw new Error("Grant Audit Trail integrity requires the Grant key ring.");
+      }
       if (state.grantAudits.has(entry.auditId)) {
         throw new FoundationStorageConstraintError("grant-audit-id");
       }
@@ -618,6 +684,13 @@ function createTransaction(
       }
       state.grantAudits.set(entry.auditId, cloneStoredGrantAuditEntry(entry));
       undo.push(() => state.grantAudits.delete(entry.auditId));
+      state.grantAuditProvenance.set(entry.auditId, cloneStoredGrantAuditEntry(entry));
+      undo.push(() => state.grantAuditProvenance.delete(entry.auditId));
+      state.grantAuditIntegrityTags.set(
+        entry.auditId,
+        computeGrantAuditIntegrityTag(entry, keyRing),
+      );
+      undo.push(() => state.grantAuditIntegrityTags.delete(entry.auditId));
     },
   };
 }
@@ -671,11 +744,11 @@ function cloneAudits(
 }
 
 function findGrant(
-  state: Map<string, StoredControlGrant>,
-  predicate: (grant: StoredControlGrant) => boolean,
-): StoredControlGrant | null {
+  state: Map<string, StoredGrant>,
+  predicate: (grant: StoredGrant) => boolean,
+): StoredGrant | null {
   for (const grant of state.values()) {
-    if (predicate(grant)) return cloneStoredControlGrant(grant);
+    if (predicate(grant)) return cloneStoredGrant(grant);
   }
   return null;
 }

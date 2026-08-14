@@ -3,11 +3,13 @@ import {
   GRANT_CREDENTIAL_FORMAT_VERSION,
   GRANT_CREDENTIAL_KIND,
   GRANT_TYPE,
-  validateControlGrantScope,
-  type ControlGrantScope,
+  validateGrantScope,
+  type GrantScope,
+  type GrantType,
   type GrantKeyRing,
   type GrantRandomness,
-  type StoredControlGrant,
+  type StoredGrant,
+  type StoredGrantAuditEntry,
   type StoredGrantCredential,
 } from "@/lib/grant-types";
 
@@ -21,17 +23,14 @@ export type CredentialEnvelope = {
   formatVersion: typeof GRANT_CREDENTIAL_FORMAT_VERSION;
   environmentId: string;
   grantId: string;
-  grantType: typeof GRANT_TYPE;
-  scope: ControlGrantScope;
+  grantType: GrantType;
+  scope: GrantScope;
   grantVersion: string;
   credentialKind: typeof GRANT_CREDENTIAL_KIND;
   entropy: string;
 };
 
-type CredentialBinding = Pick<
-  StoredControlGrant,
-  "grantId" | "grantType" | "grantVersion" | "scope"
-> & {
+type CredentialBinding = Pick<StoredGrant, "grantId" | "grantType" | "grantVersion" | "scope"> & {
   environmentId: string;
 };
 
@@ -83,7 +82,9 @@ export function parseCredentialToken(value: unknown): CredentialEnvelope | null 
     parsed.formatVersion !== GRANT_CREDENTIAL_FORMAT_VERSION ||
     typeof parsed.environmentId !== "string" ||
     typeof parsed.grantId !== "string" ||
-    parsed.grantType !== GRANT_TYPE ||
+    (parsed.grantType !== GRANT_TYPE &&
+      parsed.grantType !== "event-admin" &&
+      parsed.grantType !== "pitch-manager") ||
     typeof parsed.grantVersion !== "string" ||
     parsed.credentialKind !== GRANT_CREDENTIAL_KIND ||
     typeof parsed.entropy !== "string"
@@ -91,7 +92,7 @@ export function parseCredentialToken(value: unknown): CredentialEnvelope | null 
     return null;
   }
 
-  const scope = validateControlGrantScope(parsed.scope);
+  const scope = validateGrantScope(parsed.grantType, parsed.scope);
   if (!scope.ok) return null;
   const entropy = decodeBase64Url(parsed.entropy);
   if (entropy === null || entropy.byteLength !== CREDENTIAL_ENTROPY_BYTES) return null;
@@ -100,7 +101,7 @@ export function parseCredentialToken(value: unknown): CredentialEnvelope | null 
     formatVersion: GRANT_CREDENTIAL_FORMAT_VERSION,
     environmentId: parsed.environmentId,
     grantId: parsed.grantId,
-    grantType: GRANT_TYPE,
+    grantType: parsed.grantType,
     scope: scope.value,
     grantVersion: parsed.grantVersion,
     credentialKind: GRANT_CREDENTIAL_KIND,
@@ -144,8 +145,18 @@ export function encryptCredential(
     ciphertext: encodeBase64Url(ciphertext),
     tag: encodeBase64Url(tag),
     lookupDigest: encodeBase64Url(lookupDigest),
-    fingerprint: encodeBase64Url(hmac(lookupKey, `grant-fingerprint:${token}`)),
+    fingerprint: computeCredentialFingerprint(token, keyRing, lookupKeyVersion),
   };
+}
+
+export function computeCredentialFingerprint(
+  token: string,
+  keyRing: GrantKeyRing,
+  keyVersion = keyRing.lookup.currentVersion,
+): string {
+  return encodeBase64Url(
+    hmac(getKey(keyRing.lookup.keys, keyVersion, HMAC_KEY_MIN_BYTES), `grant-fingerprint:${token}`),
+  );
 }
 
 export function decryptCredential(
@@ -215,6 +226,38 @@ export function computeSessionVerifier(
   keyVersion = keyRing.lookup.currentVersion,
 ): string {
   return computeLookupDigest(bearer, keyRing, keyVersion);
+}
+
+export function computeGrantAuditIntegrityTag(
+  entry: StoredGrantAuditEntry,
+  keyRing: GrantKeyRing,
+  keyVersion = keyRing.audit.currentVersion,
+): string {
+  const payload = JSON.stringify({
+    domain: "grant-audit-integrity-v1",
+    auditId: entry.auditId,
+    action: entry.action,
+    outcome: entry.outcome,
+    actorReference: entry.actorReference,
+    grantId: entry.grantId,
+    grantType: entry.grantType,
+    grantVersion: entry.grantVersion,
+    scope: entry.scope,
+    sessionId: entry.sessionId,
+    replacedSessionId: entry.replacedSessionId,
+    eventGameId: entry.eventGameId,
+    credentialKind: entry.credentialKind,
+    credentialFingerprint: entry.credentialFingerprint,
+    beforeStatus: entry.beforeStatus,
+    afterStatus: entry.afterStatus,
+    beforeExpiresAtMs: entry.beforeExpiresAtMs,
+    afterExpiresAtMs: entry.afterExpiresAtMs,
+    terminalReason: entry.terminalReason,
+    createdAtMs: entry.createdAtMs,
+  });
+  return `hmac-sha256-v1:${keyVersion}:${encodeBase64Url(
+    hmac(getKey(keyRing.audit.keys, keyVersion, HMAC_KEY_MIN_BYTES), payload),
+  )}`;
 }
 
 export function computeBrowserContextDigest(

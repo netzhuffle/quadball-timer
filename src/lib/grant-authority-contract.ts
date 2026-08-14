@@ -1,18 +1,22 @@
 import { expect } from "bun:test";
 import { parseCredentialToken } from "@/lib/grant-crypto";
+import { validateGrantState } from "@/lib/grant-state-validation";
 import { registerGrantRotationContract } from "@/lib/grant-rotation-contract";
 import {
   GENERIC_GRANT_ADMISSION_FAILURE,
-  createGrantAuthority,
   type ControlGrantScope,
   type ControlGrantScopeResolution,
-  type GrantAuthority,
   type GrantAuthorityActor,
   type GrantKeyRing,
   type GrantRandomness,
 } from "@/lib/grant-authority";
+import type { GrantAuthority } from "@/lib/grant-authority-types";
 import type { FoundationStorage } from "@/lib/foundation-storage";
 import { FoundationStorageConstraintError } from "@/lib/foundation-storage";
+import {
+  createGrantTestAuthorityVerifier,
+  createLegacyControlGrantTestAuthority,
+} from "@/lib/grant-authority-test-support";
 
 export type GrantAuthorityContractStorage = {
   storage: FoundationStorage;
@@ -40,6 +44,26 @@ export function registerGrantAuthorityContract(
       });
     },
   );
+
+  register("rejects a Grant Audit Trail with deleted mandatory creation evidence", async () => {
+    await withStorage(createStorage, async (storage) => {
+      const authority = createAuthority(storage);
+      const created = await createGrant(authority);
+      const snapshot = await storage.transaction((transaction) => ({
+        grant: transaction.findGrantById(created.grantId),
+        sessions: transaction.listGrantSessions(created.grantId),
+        audits: transaction.listGrantAudit(created.grantId),
+      }));
+      expect(snapshot.grant).not.toBeNull();
+      expect(
+        validateGrantState(
+          snapshot.grant === null ? [] : [snapshot.grant],
+          snapshot.sessions,
+          snapshot.audits.filter((audit) => audit.action !== "grant-created"),
+        ),
+      ).not.toBeNull();
+    });
+  });
 
   register("derives pseudonymous audit actors from structured authority input", async () => {
     await withStorage(createStorage, async (storage) => {
@@ -87,12 +111,11 @@ export function registerGrantAuthorityContract(
       ).toMatchObject({ status: "authorized", grantSessionId: replacement.grantSessionId });
 
       const sessions = await readGrantSessions(authority, created.grantId);
-      expect(sessions).toEqual(
-        expect.arrayContaining([
-          expect.objectContaining({ sessionId: first.grantSessionId, status: "revoked" }),
-          expect.objectContaining({ sessionId: otherContext.grantSessionId, status: "active" }),
-          expect.objectContaining({ sessionId: replacement.grantSessionId, status: "active" }),
-        ]),
+      expect(sessions).toHaveLength(3);
+      expect(sessions.filter((session) => session.status === "revoked")).toHaveLength(1);
+      expect(sessions.filter((session) => session.status === "active")).toHaveLength(2);
+      expect(sessions.every((session) => /^session-[A-Za-z0-9_-]{12}$/.test(session.label))).toBe(
+        true,
       );
       const audit = await readGrantAudit(authority, created.grantId);
       expect(audit).toEqual(
@@ -185,6 +208,99 @@ export function registerGrantAuthorityContract(
       );
     });
   });
+
+  register("rejects repeated Grant status transitions without audit mutation", async () => {
+    await withStorage(createStorage, async (storage) => {
+      const authority = createAuthority(storage);
+      const created = await createGrant(authority);
+      const disabled = await authority.disableControlGrant(created.grantId, createActor());
+      expect(disabled).toMatchObject({ status: "updated" });
+      const afterDisable = await readGrantAudit(authority, created.grantId);
+      expect(await authority.disableControlGrant(created.grantId, createActor())).toMatchObject({
+        status: "rejected",
+        reason: "invalid-state",
+      });
+      expect(await readGrantAudit(authority, created.grantId)).toEqual(afterDisable);
+
+      const revoked = await authority.revokeControlGrant(created.grantId, createActor());
+      expect(revoked).toMatchObject({ status: "updated" });
+      const afterRevoke = await readGrantAudit(authority, created.grantId);
+      expect(await authority.revokeControlGrant(created.grantId, createActor())).toMatchObject({
+        status: "rejected",
+        reason: "invalid-state",
+      });
+      expect(await readGrantAudit(authority, created.grantId)).toEqual(afterRevoke);
+    });
+  });
+
+  register(
+    "freezes writes when current Grant material is downgraded to migration-shaped data",
+    async () => {
+      await withStorage(createStorage, async (storage) => {
+        const authority = createAuthority(storage);
+        const created = await createGrant(authority);
+        await storage.transaction((transaction) => {
+          const grant = transaction.findGrantById(created.grantId);
+          if (grant === null) throw new Error("Expected the stored Grant.");
+          transaction.updateGrant({
+            ...grant,
+            credential: {
+              ...grant.credential,
+              iv: "iv-current-downgrade",
+              ciphertext: "ciphertext-current-downgrade",
+              tag: "tag-current-downgrade",
+              lookupDigest: "digest-current-downgrade",
+              fingerprint: `opaque-migration-reference-v1:${"a".repeat(64)}`,
+            },
+          });
+        });
+        expect(await storage.readiness()).toMatchObject({
+          ok: false,
+          status: "integrity-failure",
+        });
+        expect(
+          await authority.createControlGrant({
+            scope: { ...createScope(), pitchSlotId: "slot-after-active-downgrade" },
+            actor: createActor(),
+          }),
+        ).toMatchObject({ status: "rejected", reason: "unavailable" });
+      });
+
+      await withStorage(createStorage, async (storage) => {
+        const authority = createAuthority(storage);
+        const created = await createGrant(authority);
+        await storage.transaction((transaction) => {
+          const grant = transaction.findGrantById(created.grantId);
+          if (grant === null) throw new Error("Expected the stored Grant.");
+          transaction.updateGrant({
+            ...grant,
+            status: "expired",
+            credential: {
+              ...grant.credential,
+              materialState: "erased",
+              encryptionKeyVersion: null,
+              lookupKeyVersion: null,
+              iv: null,
+              ciphertext: null,
+              tag: null,
+              lookupDigest: null,
+              fingerprint: `opaque-migration-reference-v1:${"b".repeat(64)}`,
+            },
+          });
+        });
+        expect(await storage.readiness()).toMatchObject({
+          ok: false,
+          status: "integrity-failure",
+        });
+        expect(
+          await authority.createControlGrant({
+            scope: { ...createScope(), pitchSlotId: "slot-after-erased-downgrade" },
+            actor: createActor(),
+          }),
+        ).toMatchObject({ status: "rejected", reason: "unavailable" });
+      });
+    },
+  );
 
   register(
     "erases every capability secret across terminal expiry states exactly once",
@@ -358,12 +474,12 @@ export function registerGrantAuthorityContract(
         reason: "unavailable",
         detail: "The Grant credential cannot be rotated.",
       });
-      expect(await authority.listGrantSessions("grant-failure")).toEqual({
+      expect(await authority.listGrantSessions("grant-failure", createActor())).toEqual({
         status: "unavailable",
         code: "grant-storage-unavailable",
         message: "Grant authority storage is temporarily unavailable.",
       });
-      expect(await authority.listGrantAudit("grant-failure")).toEqual({
+      expect(await authority.listGrantAudit("grant-failure", createActor())).toEqual({
         status: "unavailable",
         code: "grant-storage-unavailable",
         message: "Grant authority storage is temporarily unavailable.",
@@ -452,14 +568,14 @@ async function admit(authority: GrantAuthority, qrCredential: string, browserCon
 }
 
 async function readGrantSessions(authority: GrantAuthority, grantId: string) {
-  const result = await authority.listGrantSessions(grantId);
+  const result = await authority.listGrantSessions(grantId, createActor());
   expect(result.status).toBe("ok");
   if (result.status !== "ok") throw new Error("Expected Grant Session read evidence.");
   return result.value;
 }
 
 async function readGrantAudit(authority: GrantAuthority, grantId: string) {
-  const result = await authority.listGrantAudit(grantId);
+  const result = await authority.listGrantAudit(grantId, createActor());
   expect(result.status).toBe("ok");
   if (result.status !== "ok") throw new Error("Expected Grant Audit read evidence.");
   return result.value;
@@ -475,11 +591,12 @@ function createAuthority(
     resolve?: (scope: ControlGrantScope) => ControlGrantScopeResolution;
   } = {},
 ): GrantAuthority {
-  return createGrantAuthority(storage, {
+  return createLegacyControlGrantTestAuthority(storage, {
     environmentId: configuration.environmentId ?? "test-environment",
     clock: { nowMs: configuration.nowMs ?? (() => 1_000) },
     randomness: configuration.randomness ?? createDeterministicRandomness(),
     keyRing: configuration.keyRing ?? createKeyRing(),
+    privilegedAuthorityVerifier: createGrantTestAuthorityVerifier(),
     controlScopeResolver: {
       resolve(scope) {
         if (configuration.resolve !== undefined) return configuration.resolve(scope);
@@ -543,6 +660,10 @@ function createKeyRing(): GrantKeyRing {
       currentVersion: "lookup-v1",
       keys: new Map([["lookup-v1", Uint8Array.from({ length: 32 }, (_, index) => index + 33)]]),
     },
+    audit: {
+      currentVersion: "audit-v1",
+      keys: new Map([["audit-v1", Uint8Array.from({ length: 32 }, (_, index) => index + 65)]]),
+    },
   };
 }
 
@@ -562,6 +683,7 @@ function createRotatedKeyRing(original: GrantKeyRing): GrantKeyRing {
         ["lookup-v2", Uint8Array.from({ length: 32 }, (_, index) => index + 65)],
       ]),
     },
+    audit: original.audit,
   };
 }
 
@@ -580,6 +702,7 @@ function keepOnlyCurrentKeys(keyRing: GrantKeyRing): GrantKeyRing {
       currentVersion: keyRing.lookup.currentVersion,
       keys: new Map([[keyRing.lookup.currentVersion, lookupKey]]),
     },
+    audit: keyRing.audit,
   };
 }
 

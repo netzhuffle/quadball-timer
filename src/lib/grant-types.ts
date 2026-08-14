@@ -3,10 +3,17 @@ import { validateOpaqueIdentifier, type ValidationResult } from "@/lib/validatio
 export const GRANT_CREDENTIAL_FORMAT_VERSION = 1 as const;
 export const GRANT_CREDENTIAL_KIND = "qr" as const;
 export const GRANT_TYPE = "control" as const;
+export const EVENT_ADMIN_GRANT_TYPE = "event-admin" as const;
+export const PITCH_MANAGER_GRANT_TYPE = "pitch-manager" as const;
 export const OPAQUE_MIGRATION_CREDENTIAL_REFERENCE_PREFIX =
   "opaque-migration-reference-v1:" as const;
+export const GRANT_AUDIT_LEGACY_INTEGRITY_TAG = "legacy-migration-v1" as const;
+export const GRANT_AUDIT_INTEGRITY_TAG_PREFIX = "hmac-sha256-v1:" as const;
 
-export type GrantType = typeof GRANT_TYPE;
+export type GrantType =
+  | typeof EVENT_ADMIN_GRANT_TYPE
+  | typeof PITCH_MANAGER_GRANT_TYPE
+  | typeof GRANT_TYPE;
 export type GrantCredentialKind = typeof GRANT_CREDENTIAL_KIND;
 
 export type ControlGrantScope = {
@@ -15,6 +22,22 @@ export type ControlGrantScope = {
   pitchId: string;
   pitchSlotId: string;
 };
+
+export type EventAdminGrantScope = {
+  eventId: string;
+  eventTimeZone: string;
+  finalGameDayDate: string;
+};
+
+export type PitchManagerGrantScope = {
+  eventId: string;
+  gameDayId: string;
+  gameDayDate: string;
+  eventTimeZone: string;
+  pitchId: string;
+};
+
+export type GrantScope = ControlGrantScope | EventAdminGrantScope | PitchManagerGrantScope;
 
 export type GrantClock = {
   nowMs(): number;
@@ -27,6 +50,7 @@ export type GrantRandomness = {
 export type GrantKeyRing = {
   encryption: GrantKeySet;
   lookup: GrantKeySet;
+  audit: GrantKeySet;
 };
 
 export type GrantKeySet = {
@@ -41,6 +65,11 @@ export type GrantAuthorityActor = {
 
 export type ControlGrantScopeResolution =
   | { status: "eligible"; eventGameId: string }
+  | {
+      status: "terminal";
+      reason: "accepted-game-switch" | "past-game-day" | "game-locked";
+      eventGameId?: string;
+    }
   | { status: "empty" | "conflict" | "mismatch" | "unavailable"; detail?: string };
 
 export type ControlGrantScopeResolver = {
@@ -62,18 +91,25 @@ export type StoredGrantCredential = {
   fingerprint: string;
 };
 
-export type StoredControlGrant = {
+export type StoredGrant = {
   grantId: string;
   grantType: GrantType;
   grantVersion: string;
-  scope: ControlGrantScope;
+  scope: GrantScope;
   status: StoredGrantStatus;
   createdAtMs: number;
   expiresAtMs: number | null;
   credential: StoredGrantCredential;
 };
 
+export type StoredControlGrant = StoredGrant & {
+  grantType: typeof GRANT_TYPE;
+  scope: ControlGrantScope;
+};
+
 export type StoredGrantSessionStatus = "active" | "revoked" | "expired";
+
+export type TerminalGrantSessionReason = "game-locked" | "accepted-game-switch" | "past-game-day";
 
 export type StoredGrantSession = {
   sessionId: string;
@@ -89,6 +125,8 @@ export type StoredGrantSession = {
   createdAtMs: number;
   lastActiveAtMs: number;
   revokedAtMs: number | null;
+  deviceClass?: string;
+  browserClass?: string;
 };
 
 export type GrantAuditAction =
@@ -98,6 +136,10 @@ export type GrantAuditAction =
   | "grant-expired"
   | "grant-disabled"
   | "grant-revoked"
+  | "grant-reactivated"
+  | "grant-metadata-updated"
+  | "session-revoked"
+  | "session-terminated"
   | "session-admitted"
   | "session-replaced";
 
@@ -109,7 +151,7 @@ export type StoredGrantAuditEntry = {
   grantId: string;
   grantType: GrantType;
   grantVersion: string;
-  scope: ControlGrantScope;
+  scope: GrantScope;
   sessionId: string | null;
   replacedSessionId: string | null;
   eventGameId: string | null;
@@ -117,18 +159,20 @@ export type StoredGrantAuditEntry = {
   credentialFingerprint: string | null;
   beforeStatus: StoredGrantStatus | null;
   afterStatus: StoredGrantStatus | null;
+  beforeExpiresAtMs: number | null;
+  afterExpiresAtMs: number | null;
+  terminalReason: TerminalGrantSessionReason | null;
   createdAtMs: number;
 };
 
 export type GrantSessionSummary = {
-  sessionId: string;
-  grantId: string;
-  grantVersion: string;
-  eventGameId: string;
+  label: string;
   status: StoredGrantSessionStatus;
   createdAtMs: number;
   lastActiveAtMs: number;
   revokedAtMs: number | null;
+  deviceClass: string;
+  browserClass: string;
 };
 
 export function validateControlGrantScope(value: unknown): ValidationResult<ControlGrantScope> {
@@ -151,7 +195,85 @@ export function validateControlGrantScope(value: unknown): ValidationResult<Cont
   });
 }
 
+export function validateEventAdminGrantScope(
+  value: unknown,
+): ValidationResult<EventAdminGrantScope> {
+  if (!isRecord(value)) return invalid("Event Admin Grant scope must be an object.");
+  const eventId = validateOpaqueIdentifier(value.eventId, "scope.eventId");
+  const eventTimeZone = validateTimeZone(value.eventTimeZone, "scope.eventTimeZone");
+  const finalGameDayDate = validateDate(value.finalGameDayDate, "scope.finalGameDayDate");
+  if (!eventId.ok) return eventId;
+  if (!eventTimeZone.ok) return eventTimeZone;
+  if (!finalGameDayDate.ok) return finalGameDayDate;
+  return valid({
+    eventId: eventId.value,
+    eventTimeZone: eventTimeZone.value,
+    finalGameDayDate: finalGameDayDate.value,
+  });
+}
+
+export function validatePitchManagerGrantScope(
+  value: unknown,
+): ValidationResult<PitchManagerGrantScope> {
+  if (!isRecord(value)) return invalid("Pitch Manager Grant scope must be an object.");
+  const eventId = validateOpaqueIdentifier(value.eventId, "scope.eventId");
+  const gameDayId = validateOpaqueIdentifier(value.gameDayId, "scope.gameDayId");
+  const gameDayDate = validateDate(value.gameDayDate, "scope.gameDayDate");
+  const eventTimeZone = validateTimeZone(value.eventTimeZone, "scope.eventTimeZone");
+  const pitchId = validateOpaqueIdentifier(value.pitchId, "scope.pitchId");
+  if (!eventId.ok) return eventId;
+  if (!gameDayId.ok) return gameDayId;
+  if (!gameDayDate.ok) return gameDayDate;
+  if (!eventTimeZone.ok) return eventTimeZone;
+  if (!pitchId.ok) return pitchId;
+  return valid({
+    eventId: eventId.value,
+    gameDayId: gameDayId.value,
+    gameDayDate: gameDayDate.value,
+    eventTimeZone: eventTimeZone.value,
+    pitchId: pitchId.value,
+  });
+}
+
+export function validateGrantScope(type: GrantType, value: unknown): ValidationResult<GrantScope> {
+  if (type === EVENT_ADMIN_GRANT_TYPE) return validateEventAdminGrantScope(value);
+  if (type === PITCH_MANAGER_GRANT_TYPE) return validatePitchManagerGrantScope(value);
+  return validateControlGrantScope(value);
+}
+
+function validateDate(value: unknown, field: string): ValidationResult<string> {
+  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+    return invalid(`${field} must be an ISO calendar date.`);
+  }
+  const [year, month, day] = value.split("-").map(Number);
+  const date = new Date(Date.UTC(year ?? 0, (month ?? 0) - 1, day ?? 0));
+  if (
+    date.getUTCFullYear() !== year ||
+    date.getUTCMonth() !== (month ?? 0) - 1 ||
+    date.getUTCDate() !== day
+  ) {
+    return invalid(`${field} must be a valid ISO calendar date.`);
+  }
+  return valid(value);
+}
+
+function validateTimeZone(value: unknown, field: string): ValidationResult<string> {
+  if (typeof value !== "string" || value.length === 0 || value.length > 128) {
+    return invalid(`${field} must be a valid IANA time zone.`);
+  }
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: value }).format();
+  } catch {
+    return invalid(`${field} must be a valid IANA time zone.`);
+  }
+  return valid(value);
+}
+
 export function cloneStoredControlGrant(grant: StoredControlGrant): StoredControlGrant {
+  return structuredClone(grant);
+}
+
+export function cloneStoredGrant(grant: StoredGrant): StoredGrant {
   return structuredClone(grant);
 }
 

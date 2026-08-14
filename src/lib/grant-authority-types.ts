@@ -5,6 +5,7 @@ import type {
   GrantSessionSummary,
   StoredGrantAuditEntry,
 } from "@/lib/grant-types";
+import type { GrantAuthorityInput } from "@/lib/grant-authority-trust";
 
 export const GENERIC_GRANT_ADMISSION_FAILURE = Object.freeze({
   status: "rejected",
@@ -80,7 +81,7 @@ export type GrantMutationResult =
   | { status: "updated"; grantId: string }
   | {
       status: "rejected";
-      reason: "not-found" | "invalid-input" | "unavailable";
+      reason: "not-found" | "invalid-input" | "invalid-state" | "unavailable";
       detail?: string;
     };
 
@@ -125,6 +126,9 @@ export type GrantAuthority = {
   authorizeControlGrant(input: AuthorizeControlGrantInput): Promise<AuthorizeControlGrantResult>;
   disableControlGrant(grantId: string, actor: GrantAuthorityActor): Promise<GrantMutationResult>;
   revokeControlGrant(grantId: string, actor: GrantAuthorityActor): Promise<GrantMutationResult>;
-  listGrantSessions(grantId: string): Promise<GrantSessionListResult>;
-  listGrantAudit(grantId: string): Promise<GrantAuditListResult>;
+  listGrantSessions(
+    grantId: string,
+    authority: GrantAuthorityInput,
+  ): Promise<GrantSessionListResult>;
+  listGrantAudit(grantId: string, authority: GrantAuthorityInput): Promise<GrantAuditListResult>;
 };

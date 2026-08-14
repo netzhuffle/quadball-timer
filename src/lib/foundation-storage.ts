@@ -5,10 +5,12 @@ import type {
   EventGameRecordMetadata,
 } from "@/lib/event-game-actions";
 import type {
-  StoredControlGrant,
+  GrantKeyRing,
+  StoredGrant,
   StoredGrantAuditEntry,
   StoredGrantSession,
 } from "@/lib/grant-types";
+import type { GrantStateValidationContext } from "@/lib/grant-state-validation";
 
 export type StoredEventGameRecordRoot = {
   root: EventGameRecordRoot;
@@ -78,8 +80,8 @@ export type FoundationStorageSnapshot = {
   listIdempotencyEntries(recordId: string): StoredControlIdempotencyEntry[];
   readRecordMetadata(recordId: string): StoredEventGameRecordMetadata | null;
   listAuditEntries(recordId: string): StoredControlAuditEntry[];
-  findGrantById(grantId: string): StoredControlGrant | null;
-  findGrantByCredentialLookupDigest(lookupDigest: string): StoredControlGrant | null;
+  findGrantById(grantId: string): StoredGrant | null;
+  findGrantByCredentialLookupDigest(lookupDigest: string): StoredGrant | null;
   findActiveSessionByGrantAndContext(
     grantId: string,
     browserContextDigest: string,
@@ -97,8 +99,8 @@ export type FoundationStorageTransaction = FoundationStorageSnapshot & {
   insertAction(action: StoredControlAction): void;
   upsertRecordMetadata(metadata: StoredEventGameRecordMetadata): void;
   appendAuditEntry(entry: StoredControlAuditEntry): void;
-  insertGrant(grant: StoredControlGrant): void;
-  updateGrant(grant: StoredControlGrant): void;
+  insertGrant(grant: StoredGrant): void;
+  updateGrant(grant: StoredGrant): void;
   insertGrantSession(session: StoredGrantSession): void;
   updateGrantSession(session: StoredGrantSession): void;
   appendGrantAudit(entry: StoredGrantAuditEntry): void;
@@ -114,6 +116,10 @@ export interface FoundationStorage {
   readRecordMetadata(recordId: string): Promise<StoredEventGameRecordMetadata | null>;
   readAuditEntries(recordId: string): Promise<StoredControlAuditEntry[]>;
   readiness(): Promise<FoundationStorageReadiness>;
+  /** Configure the key material required to validate persisted Grant state. */
+  setGrantKeyRing?(keyRing: GrantKeyRing): void;
+  /** Configure the environment and key material required for deep Grant validation. */
+  setGrantValidationContext?(context: GrantStateValidationContext): void;
   close(): void;
 }
 

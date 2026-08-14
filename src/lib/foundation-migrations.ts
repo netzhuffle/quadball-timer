@@ -369,6 +369,42 @@ export const FOUNDATION_GRANT_AUDIT_TABLE_SQL = `
   ) STRICT
 `;
 
+export const FOUNDATION_TYPED_GRANT_TABLE_SQL = FOUNDATION_GRANT_TABLE_SQL.replace(
+  "CHECK (grant_type = 'control')",
+  "CHECK (grant_type IN ('control', 'event-admin', 'pitch-manager'))",
+);
+
+export const FOUNDATION_TYPED_GRANT_AUDIT_TABLE_V1_SQL = FOUNDATION_GRANT_AUDIT_TABLE_SQL.replace(
+  "CHECK (action IN ('grant-created', 'credential-revealed', 'credential-rotated', 'grant-expired', 'grant-disabled', 'grant-revoked', 'session-admitted', 'session-replaced'))",
+  "CHECK (action IN ('grant-created', 'credential-revealed', 'credential-rotated', 'grant-expired', 'grant-disabled', 'grant-revoked', 'grant-reactivated', 'grant-metadata-updated', 'session-admitted', 'session-replaced', 'session-revoked'))",
+).replace(
+  "CHECK (grant_type = 'control')",
+  "CHECK (grant_type IN ('control', 'event-admin', 'pitch-manager'))",
+);
+
+export const FOUNDATION_TYPED_GRANT_AUDIT_TABLE_V9_SQL =
+  FOUNDATION_TYPED_GRANT_AUDIT_TABLE_V1_SQL.replace(
+    "'session-revoked'))",
+    "'session-revoked', 'session-terminated'))",
+  );
+
+export const FOUNDATION_TYPED_GRANT_AUDIT_TABLE_SQL =
+  FOUNDATION_TYPED_GRANT_AUDIT_TABLE_V9_SQL.replace(
+    "    created_at_ms INTEGER NOT NULL",
+    "    before_expires_at_ms INTEGER,\n    after_expires_at_ms INTEGER,\n    terminal_reason TEXT CHECK (terminal_reason IS NULL OR terminal_reason IN ('game-locked', 'accepted-game-switch', 'past-game-day')),\n    created_at_ms INTEGER NOT NULL",
+  );
+
+export const FOUNDATION_TYPED_GRANT_AUDIT_TABLE_V11_SQL =
+  FOUNDATION_TYPED_GRANT_AUDIT_TABLE_SQL.replace(
+    "    created_at_ms INTEGER NOT NULL",
+    "    audit_integrity_tag TEXT NOT NULL CHECK (audit_integrity_tag = 'legacy-migration-v1' OR audit_integrity_tag GLOB 'hmac-sha256-v1:*'),\n    created_at_ms INTEGER NOT NULL",
+  );
+
+export const FOUNDATION_TYPED_GRANT_SESSION_TABLE_SQL = FOUNDATION_GRANT_SESSION_TABLE_SQL.replace(
+  "    revoked_at_ms INTEGER,",
+  "    revoked_at_ms INTEGER,\n    device_class TEXT NOT NULL,\n    browser_class TEXT NOT NULL,",
+);
+
 export const FOUNDATION_GRANT_SESSION_GRANT_INDEX_SQL = `
   CREATE INDEX foundation_grant_sessions_grant_id
     ON foundation_grant_sessions (grant_id)
@@ -383,6 +419,196 @@ export const FOUNDATION_GRANT_SESSION_CONTEXT_INDEX_SQL = `
 export const FOUNDATION_GRANT_AUDIT_GRANT_INDEX_SQL = `
   CREATE INDEX foundation_grant_audit_grant_id
     ON foundation_grant_audit (grant_id, audit_id)
+`;
+
+export const FOUNDATION_GRANT_MIGRATION_PROVENANCE_TABLE_SQL = `
+  CREATE TABLE foundation_grant_migration_provenance (
+    grant_id TEXT PRIMARY KEY REFERENCES foundation_grant_roots(grant_id) ON DELETE RESTRICT,
+    migration_id TEXT NOT NULL CHECK (migration_id = '006-grant-cryptographic-erasure'),
+    original_status TEXT NOT NULL CHECK (original_status IN ('active', 'disabled', 'revoked', 'expired')),
+    original_grant_version TEXT NOT NULL,
+    original_event_id TEXT NOT NULL,
+    original_game_day_id TEXT NOT NULL,
+    original_pitch_id TEXT NOT NULL,
+    original_pitch_slot_id TEXT NOT NULL,
+    original_created_at_ms INTEGER NOT NULL,
+    original_expires_at_ms INTEGER,
+    retained_opaque_reference TEXT NOT NULL UNIQUE
+      CHECK (retained_opaque_reference GLOB 'opaque-migration-reference-v1:*')
+  ) STRICT
+`;
+
+export const FOUNDATION_GRANT_MIGRATION_PROVENANCE_STATE_TABLE_SQL = `
+  CREATE TABLE foundation_grant_migration_provenance_state (
+    state_id INTEGER PRIMARY KEY CHECK (state_id = 1),
+    migration_id TEXT NOT NULL CHECK (migration_id = '014-grant-provenance-integrity')
+  ) STRICT
+`;
+
+export const FOUNDATION_GRANT_AUDIT_PROVENANCE_TABLE_SQL = `
+  CREATE TABLE foundation_grant_audit_provenance (
+    audit_id TEXT PRIMARY KEY,
+    action TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    actor_reference TEXT NOT NULL,
+    grant_id TEXT NOT NULL REFERENCES foundation_grant_roots(grant_id) ON DELETE RESTRICT,
+    grant_type TEXT NOT NULL,
+    grant_version TEXT NOT NULL,
+    event_id TEXT NOT NULL,
+    game_day_id TEXT NOT NULL,
+    pitch_id TEXT NOT NULL,
+    pitch_slot_id TEXT NOT NULL,
+    session_id TEXT,
+    replaced_session_id TEXT,
+    event_game_id TEXT,
+    credential_kind TEXT,
+    credential_fingerprint TEXT,
+    before_status TEXT,
+    after_status TEXT,
+    before_expires_at_ms INTEGER,
+    after_expires_at_ms INTEGER,
+    terminal_reason TEXT,
+    audit_integrity_tag TEXT NOT NULL CHECK (audit_integrity_tag = 'legacy-migration-v1' OR audit_integrity_tag GLOB 'hmac-sha256-v1:*'),
+    created_at_ms INTEGER NOT NULL
+  ) STRICT
+`;
+
+export const FOUNDATION_GRANT_AUDIT_PROVENANCE_GRANT_INDEX_SQL = `
+  CREATE INDEX foundation_grant_audit_provenance_grant_id
+    ON foundation_grant_audit_provenance (grant_id, audit_id)
+`;
+
+export const FOUNDATION_GRANT_MIGRATION_PROVENANCE_NO_UPDATE_TRIGGER_SQL = `
+  CREATE TRIGGER foundation_grant_migration_provenance_no_update
+    BEFORE UPDATE ON foundation_grant_migration_provenance
+    BEGIN SELECT RAISE(ABORT, 'Grant migration provenance is immutable.'); END
+`;
+export const FOUNDATION_GRANT_MIGRATION_PROVENANCE_NO_INSERT_TRIGGER_SQL = `
+  CREATE TRIGGER foundation_grant_migration_provenance_no_insert
+    BEFORE INSERT ON foundation_grant_migration_provenance
+    BEGIN SELECT RAISE(ABORT, 'Grant migration provenance is migration-owned.'); END
+`;
+export const FOUNDATION_GRANT_MIGRATION_PROVENANCE_NO_DELETE_TRIGGER_SQL = `
+  CREATE TRIGGER foundation_grant_migration_provenance_no_delete
+    BEFORE DELETE ON foundation_grant_migration_provenance
+    BEGIN SELECT RAISE(ABORT, 'Grant migration provenance is immutable.'); END
+`;
+export const FOUNDATION_GRANT_MIGRATION_PROVENANCE_STATE_NO_UPDATE_TRIGGER_SQL = `
+  CREATE TRIGGER foundation_grant_migration_provenance_state_no_update
+    BEFORE UPDATE ON foundation_grant_migration_provenance_state
+    BEGIN SELECT RAISE(ABORT, 'Grant migration provenance state is immutable.'); END
+`;
+export const FOUNDATION_GRANT_MIGRATION_PROVENANCE_STATE_NO_INSERT_TRIGGER_SQL = `
+  CREATE TRIGGER foundation_grant_migration_provenance_state_no_insert
+    BEFORE INSERT ON foundation_grant_migration_provenance_state
+    BEGIN SELECT RAISE(ABORT, 'Grant migration provenance state is migration-owned.'); END
+`;
+export const FOUNDATION_GRANT_MIGRATION_PROVENANCE_STATE_NO_DELETE_TRIGGER_SQL = `
+  CREATE TRIGGER foundation_grant_migration_provenance_state_no_delete
+    BEFORE DELETE ON foundation_grant_migration_provenance_state
+    BEGIN SELECT RAISE(ABORT, 'Grant migration provenance state is immutable.'); END
+`;
+export const FOUNDATION_GRANT_AUDIT_PROVENANCE_NO_UPDATE_TRIGGER_SQL = `
+  CREATE TRIGGER foundation_grant_audit_provenance_no_update
+    BEFORE UPDATE ON foundation_grant_audit_provenance
+    BEGIN SELECT RAISE(ABORT, 'Grant audit provenance is immutable.'); END
+`;
+export const FOUNDATION_GRANT_AUDIT_PROVENANCE_NO_DELETE_TRIGGER_SQL = `
+  CREATE TRIGGER foundation_grant_audit_provenance_no_delete
+    BEFORE DELETE ON foundation_grant_audit_provenance
+    BEGIN SELECT RAISE(ABORT, 'Grant audit provenance is immutable.'); END
+`;
+export const FOUNDATION_GRANT_AUDIT_PROVENANCE_AFTER_INSERT_TRIGGER_SQL = `
+  CREATE TRIGGER foundation_grant_audit_provenance_after_insert
+    AFTER INSERT ON foundation_grant_audit
+    BEGIN
+      INSERT INTO foundation_grant_audit_provenance (
+        audit_id, action, outcome, actor_reference, grant_id, grant_type, grant_version,
+        event_id, game_day_id, pitch_id, pitch_slot_id, session_id, replaced_session_id,
+        event_game_id, credential_kind, credential_fingerprint, before_status, after_status,
+        before_expires_at_ms, after_expires_at_ms, terminal_reason, audit_integrity_tag, created_at_ms
+      ) VALUES (
+        NEW.audit_id, NEW.action, NEW.outcome, NEW.actor_reference, NEW.grant_id, NEW.grant_type,
+        NEW.grant_version, NEW.event_id, NEW.game_day_id, NEW.pitch_id, NEW.pitch_slot_id,
+        NEW.session_id, NEW.replaced_session_id, NEW.event_game_id, NEW.credential_kind,
+        NEW.credential_fingerprint, NEW.before_status, NEW.after_status,
+        NEW.before_expires_at_ms, NEW.after_expires_at_ms, NEW.terminal_reason, NEW.audit_integrity_tag,
+        NEW.created_at_ms
+      );
+    END
+`;
+export const FOUNDATION_GRANT_AUDIT_NO_LEGACY_TAG_INSERT_TRIGGER_SQL = `
+  CREATE TRIGGER foundation_grant_audit_no_legacy_integrity_tag
+    BEFORE INSERT ON foundation_grant_audit
+    WHEN NEW.audit_integrity_tag = 'legacy-migration-v1'
+    BEGIN SELECT RAISE(ABORT, 'Legacy Grant Audit integrity tags are migration-owned.'); END
+`;
+
+export const FOUNDATION_GRANT_PROVENANCE_IMMUTABILITY_SQL = `
+  ${FOUNDATION_GRANT_MIGRATION_PROVENANCE_NO_UPDATE_TRIGGER_SQL};
+  ${FOUNDATION_GRANT_MIGRATION_PROVENANCE_NO_INSERT_TRIGGER_SQL};
+  ${FOUNDATION_GRANT_MIGRATION_PROVENANCE_NO_DELETE_TRIGGER_SQL};
+  ${FOUNDATION_GRANT_MIGRATION_PROVENANCE_STATE_NO_UPDATE_TRIGGER_SQL};
+  ${FOUNDATION_GRANT_MIGRATION_PROVENANCE_STATE_NO_INSERT_TRIGGER_SQL};
+  ${FOUNDATION_GRANT_MIGRATION_PROVENANCE_STATE_NO_DELETE_TRIGGER_SQL};
+  ${FOUNDATION_GRANT_AUDIT_PROVENANCE_NO_UPDATE_TRIGGER_SQL};
+  ${FOUNDATION_GRANT_AUDIT_PROVENANCE_NO_DELETE_TRIGGER_SQL};
+  ${FOUNDATION_GRANT_AUDIT_NO_LEGACY_TAG_INSERT_TRIGGER_SQL};
+  ${FOUNDATION_GRANT_AUDIT_PROVENANCE_AFTER_INSERT_TRIGGER_SQL};
+`;
+
+export const FOUNDATION_GRANT_PROVENANCE_MIGRATION_SQL = `
+  -- One-time compatibility trust transition: schema-006 completed before keyed
+  -- provenance existed, so its derivable root and audit relationships are
+  -- recorded here. Keyed integrity is authoritative for all later writes.
+  CREATE TABLE foundation_grant_audit_integrity_copy AS SELECT * FROM foundation_grant_audit;
+  DROP TABLE foundation_grant_audit;
+  ${FOUNDATION_TYPED_GRANT_AUDIT_TABLE_V11_SQL};
+  INSERT INTO foundation_grant_audit (
+    audit_id, action, outcome, actor_reference, grant_id, grant_type, grant_version,
+    event_id, game_day_id, pitch_id, pitch_slot_id, session_id, replaced_session_id,
+    event_game_id, credential_kind, credential_fingerprint, before_status, after_status,
+    before_expires_at_ms, after_expires_at_ms, terminal_reason, audit_integrity_tag, created_at_ms
+  )
+  SELECT
+    audit_id, action, outcome, actor_reference, grant_id, grant_type, grant_version,
+    event_id, game_day_id, pitch_id, pitch_slot_id, session_id, replaced_session_id,
+    event_game_id, credential_kind, credential_fingerprint, before_status, after_status,
+    before_expires_at_ms, after_expires_at_ms, terminal_reason, 'legacy-migration-v1', created_at_ms
+  FROM foundation_grant_audit_integrity_copy;
+  DROP TABLE foundation_grant_audit_integrity_copy;
+  ${FOUNDATION_GRANT_AUDIT_GRANT_INDEX_SQL};
+  ${FOUNDATION_GRANT_MIGRATION_PROVENANCE_TABLE_SQL};
+  ${FOUNDATION_GRANT_MIGRATION_PROVENANCE_STATE_TABLE_SQL};
+  ${FOUNDATION_GRANT_AUDIT_PROVENANCE_TABLE_SQL};
+  INSERT INTO foundation_grant_migration_provenance (
+    grant_id, migration_id, original_status, original_grant_version, original_event_id,
+    original_game_day_id, original_pitch_id, original_pitch_slot_id, original_created_at_ms,
+    original_expires_at_ms, retained_opaque_reference
+  )
+  SELECT
+    grant_id, '006-grant-cryptographic-erasure', status, grant_version, event_id,
+    game_day_id, pitch_id, pitch_slot_id, created_at_ms, expires_at_ms, credential_fingerprint
+  FROM foundation_grant_roots
+  WHERE credential_fingerprint GLOB 'opaque-migration-reference-v1:*';
+  INSERT INTO foundation_grant_migration_provenance_state (state_id, migration_id)
+    VALUES (1, '014-grant-provenance-integrity');
+  INSERT INTO foundation_grant_audit_provenance (
+    audit_id, action, outcome, actor_reference, grant_id, grant_type, grant_version,
+    event_id, game_day_id, pitch_id, pitch_slot_id, session_id, replaced_session_id,
+    event_game_id, credential_kind, credential_fingerprint, before_status, after_status,
+    before_expires_at_ms, after_expires_at_ms, terminal_reason, audit_integrity_tag, created_at_ms
+  )
+  SELECT
+    audit_id, action, outcome, actor_reference, grant_id, grant_type, grant_version,
+    event_id, game_day_id, pitch_id, pitch_slot_id, session_id, replaced_session_id,
+    event_game_id, credential_kind, credential_fingerprint, before_status, after_status,
+    before_expires_at_ms, after_expires_at_ms, terminal_reason, audit_integrity_tag, created_at_ms
+  FROM foundation_grant_audit;
+  ${FOUNDATION_GRANT_AUDIT_PROVENANCE_GRANT_INDEX_SQL};
+  ${FOUNDATION_GRANT_PROVENANCE_IMMUTABILITY_SQL};
+  DROP TABLE IF EXISTS foundation_grant_migration_provenance_legacy;
+  DROP TABLE IF EXISTS foundation_grant_migration_provenance_state_legacy
 `;
 
 const FOUNDATION_INITIAL_ROOT_MIGRATION_SQL = `
@@ -632,6 +858,81 @@ const FOUNDATION_EVIDENCE_PROVENANCE_MIGRATION_SQL = `
   ${FOUNDATION_EVIDENCE_PROVENANCE_DELETE_TRIGGER_SQL};
 `;
 
+const FOUNDATION_TYPED_GRANT_MIGRATION_SQL = `
+  CREATE TABLE foundation_grant_sessions_typed_copy AS SELECT * FROM foundation_grant_sessions;
+  CREATE TABLE foundation_grant_audit_typed_copy AS SELECT * FROM foundation_grant_audit;
+  DROP TABLE foundation_grant_sessions;
+  DROP TABLE foundation_grant_audit;
+  ${FOUNDATION_TYPED_GRANT_TABLE_SQL.replace(
+    "CREATE TABLE foundation_grant_roots",
+    "CREATE TABLE foundation_grant_roots_typed",
+  )};
+  INSERT INTO foundation_grant_roots_typed SELECT * FROM foundation_grant_roots;
+  DROP TABLE foundation_grant_roots;
+  ALTER TABLE foundation_grant_roots_typed RENAME TO foundation_grant_roots;
+  ${FOUNDATION_GRANT_SESSION_TABLE_SQL};
+  INSERT INTO foundation_grant_sessions SELECT * FROM foundation_grant_sessions_typed_copy;
+  DROP TABLE foundation_grant_sessions_typed_copy;
+  ${FOUNDATION_GRANT_SESSION_GRANT_INDEX_SQL};
+  ${FOUNDATION_GRANT_SESSION_CONTEXT_INDEX_SQL};
+  ${FOUNDATION_TYPED_GRANT_AUDIT_TABLE_V1_SQL};
+  INSERT INTO foundation_grant_audit SELECT * FROM foundation_grant_audit_typed_copy;
+  DROP TABLE foundation_grant_audit_typed_copy;
+  ${FOUNDATION_GRANT_AUDIT_GRANT_INDEX_SQL};
+`;
+
+const FOUNDATION_TYPED_GRANT_SESSION_SUMMARY_MIGRATION_SQL = `
+  CREATE TABLE foundation_grant_sessions_summary_copy AS
+    SELECT *, 'unknown' AS device_class, 'unknown' AS browser_class
+    FROM foundation_grant_sessions;
+  DROP TABLE foundation_grant_sessions;
+  ${FOUNDATION_TYPED_GRANT_SESSION_TABLE_SQL};
+  INSERT INTO foundation_grant_sessions (
+    session_id, grant_id, grant_version, event_game_id, browser_context_digest,
+    browser_context_key_version, bearer_material_state, bearer_lookup_verifier,
+    bearer_lookup_key_version, status, created_at_ms, last_active_at_ms, revoked_at_ms,
+    device_class, browser_class
+  )
+  SELECT
+    session_id, grant_id, grant_version, event_game_id, browser_context_digest,
+    browser_context_key_version, bearer_material_state, bearer_lookup_verifier,
+    bearer_lookup_key_version, status, created_at_ms, last_active_at_ms, revoked_at_ms,
+    device_class, browser_class
+  FROM foundation_grant_sessions_summary_copy;
+  DROP TABLE foundation_grant_sessions_summary_copy;
+  ${FOUNDATION_GRANT_SESSION_GRANT_INDEX_SQL};
+  ${FOUNDATION_GRANT_SESSION_CONTEXT_INDEX_SQL};
+`;
+
+const FOUNDATION_TYPED_GRANT_TERMINAL_AUDIT_MIGRATION_SQL = `
+  CREATE TABLE foundation_grant_audit_terminal_copy AS SELECT * FROM foundation_grant_audit;
+  DROP TABLE foundation_grant_audit;
+  ${FOUNDATION_TYPED_GRANT_AUDIT_TABLE_V9_SQL};
+  INSERT INTO foundation_grant_audit SELECT * FROM foundation_grant_audit_terminal_copy;
+  DROP TABLE foundation_grant_audit_terminal_copy;
+  ${FOUNDATION_GRANT_AUDIT_GRANT_INDEX_SQL};
+`;
+
+const FOUNDATION_TYPED_GRANT_AUDIT_EVIDENCE_MIGRATION_SQL = `
+  CREATE TABLE foundation_grant_audit_evidence_copy AS SELECT * FROM foundation_grant_audit;
+  DROP TABLE foundation_grant_audit;
+  ${FOUNDATION_TYPED_GRANT_AUDIT_TABLE_SQL};
+  INSERT INTO foundation_grant_audit (
+    audit_id, action, outcome, actor_reference, grant_id, grant_type, grant_version,
+    event_id, game_day_id, pitch_id, pitch_slot_id, session_id, replaced_session_id,
+    event_game_id, credential_kind, credential_fingerprint, before_status, after_status,
+    before_expires_at_ms, after_expires_at_ms, terminal_reason, created_at_ms
+  )
+  SELECT
+    audit_id, action, outcome, actor_reference, grant_id, grant_type, grant_version,
+    event_id, game_day_id, pitch_id, pitch_slot_id, session_id, replaced_session_id,
+    event_game_id, credential_kind, credential_fingerprint, before_status, after_status,
+    NULL, NULL, NULL, created_at_ms
+  FROM foundation_grant_audit_evidence_copy;
+  DROP TABLE foundation_grant_audit_evidence_copy;
+  ${FOUNDATION_GRANT_AUDIT_GRANT_INDEX_SQL};
+`;
+
 export const FOUNDATION_MIGRATIONS: readonly FoundationMigration[] = Object.freeze([
   createMigration({
     id: "001-foundation-event-game-record-roots",
@@ -686,6 +987,36 @@ export const FOUNDATION_MIGRATIONS: readonly FoundationMigration[] = Object.free
     ordinal: 9,
     schemaVersion: 9,
     sql: FOUNDATION_EVIDENCE_PROVENANCE_MIGRATION_SQL,
+  }),
+  createMigration({
+    id: "010-typed-grant-storage",
+    ordinal: 10,
+    schemaVersion: 10,
+    sql: FOUNDATION_TYPED_GRANT_MIGRATION_SQL,
+  }),
+  createMigration({
+    id: "011-persist-session-summary-labels",
+    ordinal: 11,
+    schemaVersion: 11,
+    sql: FOUNDATION_TYPED_GRANT_SESSION_SUMMARY_MIGRATION_SQL,
+  }),
+  createMigration({
+    id: "012-terminal-grant-session-audit",
+    ordinal: 12,
+    schemaVersion: 12,
+    sql: FOUNDATION_TYPED_GRANT_TERMINAL_AUDIT_MIGRATION_SQL,
+  }),
+  createMigration({
+    id: "013-grant-audit-evidence-fields",
+    ordinal: 13,
+    schemaVersion: 13,
+    sql: FOUNDATION_TYPED_GRANT_AUDIT_EVIDENCE_MIGRATION_SQL,
+  }),
+  createMigration({
+    id: "014-grant-provenance-integrity",
+    ordinal: 14,
+    schemaVersion: 14,
+    sql: FOUNDATION_GRANT_PROVENANCE_MIGRATION_SQL,
   }),
 ]);
 

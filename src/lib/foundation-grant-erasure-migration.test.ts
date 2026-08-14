@@ -114,6 +114,36 @@ describe("Grant cryptographic erasure migration", () => {
           "active",
           1_000,
         );
+      database
+        .query(
+          `INSERT INTO foundation_grant_audit (
+             audit_id, action, outcome, actor_reference, grant_id, grant_type, grant_version,
+             event_id, game_day_id, pitch_id, pitch_slot_id, session_id, replaced_session_id,
+             event_game_id, credential_kind, credential_fingerprint, before_status, after_status,
+             created_at_ms
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          "audit-legacy-session",
+          "session-admitted",
+          "accepted",
+          "actor-legacy",
+          "grant-legacy",
+          "control",
+          "grant-version-legacy",
+          "event-1",
+          "day-1",
+          "pitch-1",
+          "slot-legacy",
+          "session-legacy",
+          null,
+          "game-1",
+          "qr",
+          null,
+          null,
+          null,
+          1_000,
+        );
       database.close();
 
       const current = openSqliteFoundationStorage(databasePath);
@@ -136,6 +166,12 @@ describe("Grant cryptographic erasure migration", () => {
           action: "grant-created",
           actorReference: "actor-legacy",
           credentialFingerprint: null,
+        }),
+        expect.objectContaining({
+          auditId: "audit-legacy-session",
+          action: "session-admitted",
+          sessionId: "session-legacy",
+          eventGameId: "game-1",
         }),
       ]);
       current.close();
@@ -174,7 +210,7 @@ describe("Grant cryptographic erasure migration", () => {
 
       const current = openSqliteFoundationStorage(databasePath);
       await current.applyMigrations({ requireCandidate: false });
-      expect(await current.readiness()).toMatchObject({ ok: true, schemaVersion: "9" });
+      expect(await current.readiness()).toMatchObject({ ok: true, schemaVersion: "14" });
       current.close();
 
       const raw = new Database(databasePath);
@@ -228,7 +264,9 @@ describe("Grant cryptographic erasure migration", () => {
         } else {
           expect(grant?.credential_fingerprint).toBe(seed.credentialFingerprint);
           expect(
-            grantAudit.every((row) => row.credential_fingerprint === seed.credentialFingerprint),
+            grantAudit
+              .filter((row) => row.action !== "session-admitted")
+              .every((row) => row.credential_fingerprint === seed.credentialFingerprint),
           ).toBe(true);
           if (seed.expiresAtMs !== null) {
             expect(grantAudit.find((row) => row.action === "grant-expired")).toMatchObject({
@@ -244,7 +282,29 @@ describe("Grant cryptographic erasure migration", () => {
           seed.status === "active" && seed.expiresAtMs === null ? 0 : 1,
         );
       }
-      expect(audit).toHaveLength(15);
+      expect(audit).toHaveLength(21);
+      const provenanceColumns = raw
+        .query("PRAGMA table_info('foundation_grant_migration_provenance')")
+        .all() as { name?: string }[];
+      expect(provenanceColumns.some((column) => column.name === "original_lookup_digest")).toBe(
+        false,
+      );
+      expect(
+        raw
+          .query(
+            "SELECT credential_lookup_digest FROM foundation_grant_roots WHERE grant_id = 'grant-expired'",
+          )
+          .get(),
+      ).toEqual({ credential_lookup_digest: null });
+      expect(
+        JSON.stringify(
+          raw
+            .query(
+              "SELECT retained_opaque_reference FROM foundation_grant_migration_provenance WHERE grant_id = 'grant-expired'",
+            )
+            .get(),
+        ),
+      ).not.toContain("digest-expired");
       expect(() =>
         raw
           .query(
@@ -270,7 +330,7 @@ describe("Grant cryptographic erasure migration", () => {
       raw.close();
 
       const reopened = openSqliteFoundationStorage(databasePath);
-      expect(await reopened.readiness()).toMatchObject({ ok: true, schemaVersion: "9" });
+      expect(await reopened.readiness()).toMatchObject({ ok: true, schemaVersion: "14" });
       const restartedAudit = await reopened.transaction((transaction) =>
         transaction.listGrantAudit("grant-expired"),
       );
@@ -332,7 +392,7 @@ describe("Grant cryptographic erasure migration", () => {
         preserved.query("SELECT COUNT(*) AS count FROM foundation_grant_sessions").get(),
       ).toEqual({ count: 4 });
       expect(preserved.query("SELECT COUNT(*) AS count FROM foundation_grant_audit").get()).toEqual(
-        { count: 8 },
+        { count: 12 },
       );
       expect(
         preserved
@@ -442,7 +502,7 @@ function seedLegacyGrant(database: Database, seed: LegacyGrantSeed): void {
     "grant-created",
     `audit-${seed.suffix}-created`,
     null,
-    seed.status,
+    seed.status === "expired" ? "active" : seed.status,
   );
   seedLegacyAudit(
     database,
@@ -452,6 +512,40 @@ function seedLegacyGrant(database: Database, seed: LegacyGrantSeed): void {
     seed.status === "expired" ? "active" : seed.status,
     seed.status,
   );
+  seedLegacySessionAdmission(database, seed);
+}
+
+function seedLegacySessionAdmission(database: Database, seed: LegacyGrantSeed): void {
+  database
+    .query(
+      `INSERT INTO foundation_grant_audit (
+         audit_id, action, outcome, actor_reference, grant_id, grant_type, grant_version,
+         event_id, game_day_id, pitch_id, pitch_slot_id, session_id, replaced_session_id,
+         event_game_id, credential_kind, credential_fingerprint, before_status, after_status,
+         created_at_ms
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      `audit-${seed.suffix}-session`,
+      "session-admitted",
+      "accepted",
+      `actor-${seed.suffix}`,
+      `grant-${seed.suffix}`,
+      "control",
+      `grant-version-${seed.suffix}`,
+      "event-legacy",
+      "day-legacy",
+      `pitch-${seed.suffix}`,
+      `slot-${seed.suffix}`,
+      `session-${seed.suffix}`,
+      null,
+      `game-${seed.suffix}`,
+      "qr",
+      null,
+      null,
+      null,
+      1_000,
+    );
 }
 
 function seedLegacyAudit(

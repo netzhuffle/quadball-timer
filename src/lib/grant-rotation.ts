@@ -10,6 +10,7 @@ import type { GrantAuthorityOptions } from "@/lib/grant-authority";
 import type { RotateControlGrantCredentialKeysResult } from "@/lib/grant-authority-types";
 import { createAuditEntry, expireGrantIfDue, validateActor } from "@/lib/grant-lifecycle";
 import type { ControlGrantScope, GrantAuthorityActor, StoredControlGrant } from "@/lib/grant-types";
+import { verifyGrantAuthority } from "@/lib/grant-authority-trust";
 
 export async function rotateControlGrantCredentialKeys(
   storage: FoundationStorage,
@@ -20,6 +21,8 @@ export async function rotateControlGrantCredentialKeys(
 ): Promise<RotateControlGrantCredentialKeysResult> {
   const actor = validateActor(actorInput);
   if (!actor.ok) return rotationFailure();
+  const trustedActor = verifyGrantAuthority(options.privilegedAuthorityVerifier, actorInput);
+  if (trustedActor?.kind !== "fixture") return rotationFailure();
 
   return storage
     .transaction<RotateControlGrantCredentialKeysResult>((transaction) => {
@@ -27,8 +30,16 @@ export async function rotateControlGrantCredentialKeys(
       if (storedGrant === null) {
         return { status: "rejected", reason: "not-found", detail: "The Grant was not found." };
       }
-      const grant = expireGrantIfDue(transaction, options, storedGrant);
-      if (grant.status === "expired" || grant.credential.materialState !== "present") {
+      const grant = expireGrantIfDue(
+        transaction,
+        options,
+        storedGrant as StoredControlGrant,
+      ) as StoredControlGrant;
+      if (
+        grant.grantType !== "control" ||
+        grant.status === "expired" ||
+        grant.credential.materialState !== "present"
+      ) {
         return rotationFailure();
       }
       const binding = bindingForGrant(environmentId, grant);
@@ -43,7 +54,7 @@ export async function rotateControlGrantCredentialKeys(
       transaction.appendGrantAudit(
         createAuditEntry(options, {
           action: "credential-rotated",
-          actor: { kind: "authority", value: actor.value },
+          actor: { kind: "authority", value: trustedActor },
           grant: rotatedGrant,
           sessionId: null,
           replacedSessionId: null,
@@ -84,7 +95,7 @@ function credentialCanRotate(
     parsed.grantVersion === grant.grantVersion &&
     parsed.credentialKind === grant.credential.kind &&
     parsed.formatVersion === grant.credential.formatVersion &&
-    sameScope(parsed.scope, grant.scope) &&
+    sameScope(parsed.scope as ControlGrantScope, grant.scope) &&
     sameSecret(
       grant.credential.lookupDigest,
       computeLookupDigest(token, options.keyRing, grant.credential.lookupKeyVersion),

@@ -1,8 +1,9 @@
 import { existsSync } from "node:fs";
-import { createGrantAuthority } from "@/lib/grant-authority";
+import { createTypedGrantAuthority } from "@/lib/grant-authority";
 import { createGrantTestKeyRing, createGrantTestRandomness } from "@/lib/grant-authority-contract";
 import { readPrivateGrantCredential } from "@/lib/grant-concurrency-process";
 import { openSqliteFoundationStorage } from "@/lib/foundation-storage-sqlite";
+import { createGrantTestAuthorityVerifier } from "@/lib/grant-authority-test-support";
 
 const [databasePath, readyPath, startPath, credentialPath, seedValue] = Bun.argv.slice(2);
 if (
@@ -16,11 +17,12 @@ if (
 }
 
 const storage = openSqliteFoundationStorage(databasePath);
-const authority = createGrantAuthority(storage, {
+const authority = createTypedGrantAuthority(storage, {
   environmentId: "test-environment",
   clock: { nowMs: () => 1_000 },
   randomness: createGrantTestRandomness(Number(seedValue)),
   keyRing: createGrantTestKeyRing(),
+  privilegedAuthorityVerifier: createGrantTestAuthorityVerifier(),
   controlScopeResolver: {
     resolve() {
       return { status: "eligible", eventGameId: "game-1" };
@@ -41,7 +43,7 @@ try {
   }
   if (process.exitCode !== 1) {
     const qrCredential = await readPrivateGrantCredential(credentialPath);
-    const result = await authority.admitControlGrant({
+    const result = await authority.admitGrant({
       qrCredential,
       browserContext: "browser-process-barrier",
     });

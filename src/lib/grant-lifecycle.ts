@@ -3,12 +3,12 @@ import type { FoundationStorageTransaction } from "@/lib/foundation-storage";
 import type { GrantAuthorityOptions } from "@/lib/grant-authority";
 import {
   GRANT_CREDENTIAL_KIND,
-  GRANT_TYPE,
   OPAQUE_MIGRATION_CREDENTIAL_REFERENCE_PREFIX,
   type GrantAuthorityActor,
-  type StoredControlGrant,
+  type StoredGrant,
   type StoredGrantAuditEntry,
   type StoredGrantStatus,
+  type TerminalGrantSessionReason,
 } from "@/lib/grant-types";
 import { validateOpaqueIdentifier } from "@/lib/validation-policy";
 
@@ -29,14 +29,17 @@ export function createAuditEntry(
     action: StoredGrantAuditEntry["action"];
     actor:
       | { kind: "authority"; value: GrantAuthorityActor }
-      | { kind: "session"; sessionId: string }
-      | { kind: "system"; value: "grant-expiry" };
-    grant: StoredControlGrant;
+      | { kind: "session"; sessionId: string; pseudonymKeyVersion: string }
+      | { kind: "system"; value: "grant-expiry" | "grant-session-termination" };
+    grant: StoredGrant;
     sessionId: string | null;
     replacedSessionId: string | null;
     eventGameId: string | null;
     beforeStatus: StoredGrantStatus | null;
     afterStatus: StoredGrantStatus | null;
+    beforeExpiresAtMs?: number | null;
+    afterExpiresAtMs?: number | null;
+    terminalReason?: TerminalGrantSessionReason | null;
   },
 ): StoredGrantAuditEntry {
   const auditId = createRandomIdentifier("grant-audit", options.randomness);
@@ -46,7 +49,7 @@ export function createAuditEntry(
     outcome: "accepted",
     actorReference: deriveAuditActorReference(options, input.grant.grantId, input.actor),
     grantId: input.grant.grantId,
-    grantType: GRANT_TYPE,
+    grantType: input.grant.grantType,
     grantVersion: input.grant.grantVersion,
     scope: structuredClone(input.grant.scope),
     sessionId: input.sessionId,
@@ -60,6 +63,10 @@ export function createAuditEntry(
       : input.grant.credential.fingerprint,
     beforeStatus: input.beforeStatus,
     afterStatus: input.afterStatus,
+    beforeExpiresAtMs:
+      input.beforeExpiresAtMs ?? (input.beforeStatus === null ? null : input.grant.expiresAtMs),
+    afterExpiresAtMs: input.afterExpiresAtMs ?? input.grant.expiresAtMs,
+    terminalReason: input.terminalReason ?? null,
     createdAtMs: readNow(options),
   };
 }
@@ -67,13 +74,13 @@ export function createAuditEntry(
 export function expireGrantIfDue(
   transaction: FoundationStorageTransaction,
   options: GrantAuthorityOptions,
-  grant: StoredControlGrant,
-): StoredControlGrant {
+  grant: StoredGrant,
+): StoredGrant {
   if (grant.status === "expired" || grant.expiresAtMs === null) return grant;
   const nowMs = readNow(options);
   if (nowMs < grant.expiresAtMs) return grant;
 
-  const expiredGrant: StoredControlGrant = {
+  const expiredGrant: StoredGrant = {
     ...grant,
     status: "expired",
     credential: eraseGrantCredential(grant.credential),
@@ -110,9 +117,7 @@ export function expireGrantIfDue(
   return expiredGrant;
 }
 
-function eraseGrantCredential(
-  credential: StoredControlGrant["credential"],
-): StoredControlGrant["credential"] {
+function eraseGrantCredential(credential: StoredGrant["credential"]): StoredGrant["credential"] {
   return {
     materialState: "erased",
     formatVersion: credential.formatVersion,
@@ -132,8 +137,8 @@ function deriveAuditActorReference(
   grantId: string,
   actor:
     | { kind: "authority"; value: GrantAuthorityActor }
-    | { kind: "session"; sessionId: string }
-    | { kind: "system"; value: "grant-expiry" },
+    | { kind: "session"; sessionId: string; pseudonymKeyVersion: string }
+    | { kind: "system"; value: "grant-expiry" | "grant-session-termination" },
 ): string {
   const source =
     actor.kind === "authority"
@@ -141,7 +146,11 @@ function deriveAuditActorReference(
       : actor.kind === "session"
         ? { source: actor.kind, sessionId: actor.sessionId }
         : { source: actor.kind, operation: actor.value };
-  return `actor-${computeLookupDigest(JSON.stringify({ domain: "grant-audit", grantId, source }), options.keyRing)}`;
+  return `actor-${computeLookupDigest(
+    JSON.stringify({ domain: "grant-audit", grantId, source }),
+    options.keyRing,
+    actor.kind === "session" ? actor.pseudonymKeyVersion : undefined,
+  )}`;
 }
 
 function readNow(options: GrantAuthorityOptions): number {

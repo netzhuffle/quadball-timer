@@ -16,6 +16,8 @@ import {
   updateGrantSession,
   type GrantSqliteStatements,
 } from "@/lib/grant-storage-sqlite";
+import type { GrantKeyRing } from "@/lib/grant-types";
+import type { GrantStateValidationContext } from "@/lib/grant-state-validation";
 import {
   assessMigrationReadiness,
   FOUNDATION_MIGRATION_LEDGER_SQL,
@@ -47,6 +49,7 @@ import {
   readAudit,
   readIdempotency,
   readInteger,
+  readNullableInteger,
   readMetadata,
   readStoredAction,
   readText,
@@ -59,6 +62,8 @@ export type SqliteFoundationStorageOptions = {
   busyTimeoutMs?: number;
   /** Test-only synchronization seam immediately before acquiring the writer lock. */
   beforeWriteTransactionLock?: () => void;
+  grantKeyRing?: GrantKeyRing;
+  grantValidationContext?: GrantStateValidationContext;
 };
 
 export type SqliteFoundationSettings = {
@@ -126,6 +131,8 @@ const ROOT_SELECT_COLUMNS = `
   roots.canonical_content AS canonical_content, roots.root_json AS root_json
 `;
 
+const OPAQUE_MIGRATION_REFERENCE_PATTERN = /^opaque-migration-reference-v1:[a-f0-9]{64}$/;
+
 export class SqliteFoundationStorage implements FoundationStorage {
   readonly databasePath: string;
 
@@ -133,6 +140,7 @@ export class SqliteFoundationStorage implements FoundationStorage {
   private readonly migrations: readonly FoundationMigration[];
   private readonly busyTimeoutMs: number;
   private readonly beforeWriteTransactionLock: (() => void) | undefined;
+  private grantValidationContext: GrantStateValidationContext;
   private writerTail: Promise<void> = Promise.resolve();
   private statements: RootStatements | undefined;
   private grantStatements: GrantSqliteStatements | undefined;
@@ -145,6 +153,9 @@ export class SqliteFoundationStorage implements FoundationStorage {
     this.migrations = options.migrations ?? FOUNDATION_MIGRATIONS;
     this.busyTimeoutMs = options.busyTimeoutMs ?? 5_000;
     this.beforeWriteTransactionLock = options.beforeWriteTransactionLock;
+    this.grantValidationContext = options.grantValidationContext ?? {
+      keyRing: options.grantKeyRing,
+    };
     this.database = new Database(databasePath);
     this.configureDatabase();
     this.dataVersion = this.readDataVersion();
@@ -268,6 +279,7 @@ export class SqliteFoundationStorage implements FoundationStorage {
       candidate = new SqliteFoundationStorage(candidatePath, {
         migrations: this.migrations,
         busyTimeoutMs: this.busyTimeoutMs,
+        grantValidationContext: this.grantValidationContext,
       });
       const migration = await candidate.applyMigrations({ requireCandidate: false });
       const readiness = await candidate.readiness();
@@ -290,6 +302,14 @@ export class SqliteFoundationStorage implements FoundationStorage {
     if (this.closed) return;
     this.closed = true;
     this.database.close();
+  }
+
+  setGrantKeyRing(keyRing: GrantKeyRing): void {
+    this.grantValidationContext = { ...this.grantValidationContext, keyRing };
+  }
+
+  setGrantValidationContext(context: GrantStateValidationContext): void {
+    this.grantValidationContext = { ...this.grantValidationContext, ...context };
   }
 
   private applyMigrationsSync(): FoundationMigrationReport {
@@ -324,7 +344,6 @@ export class SqliteFoundationStorage implements FoundationStorage {
             readiness,
           );
         }
-
         this.database
           .query(
             `INSERT INTO foundation_migration_ledger
@@ -406,7 +425,8 @@ export class SqliteFoundationStorage implements FoundationStorage {
       updateGrant: (grant) => updateGrant(this.getGrantStatements(), grant),
       insertGrantSession: (session) => insertGrantSession(this.getGrantStatements(), session),
       updateGrantSession: (session) => updateGrantSession(this.getGrantStatements(), session),
-      appendGrantAudit: (entry) => appendGrantAudit(this.getGrantStatements(), entry),
+      appendGrantAudit: (entry) =>
+        appendGrantAudit(this.getGrantStatements(), entry, this.grantValidationContext.keyRing),
     };
   }
 
@@ -723,7 +743,12 @@ export class SqliteFoundationStorage implements FoundationStorage {
           storage: "sqlite",
         };
       }
-      const schemaVerification = verifyFoundationSchema(this.database);
+      if (
+        migrationReadiness.schemaVersion >= 6 &&
+        this.migrations.some((migration) => migration.id === "006-grant-cryptographic-erasure")
+      )
+        this.refreshGrantMigrationProvenance();
+      const schemaVerification = verifyFoundationSchema(this.database, this.grantValidationContext);
       if (!schemaVerification.ok) {
         return { ...schemaVerification, storage: "sqlite" };
       }
@@ -766,6 +791,42 @@ export class SqliteFoundationStorage implements FoundationStorage {
       synchronous: readInteger(this.database.query("PRAGMA synchronous").get()),
       foreignKeys: readInteger(this.database.query("PRAGMA foreign_keys").get()),
       busyTimeoutMs: readInteger(this.database.query("PRAGMA busy_timeout").get()),
+    };
+  }
+
+  private refreshGrantMigrationProvenance(): void {
+    const state = this.database
+      .query(
+        "SELECT migration_id FROM foundation_grant_migration_provenance_state WHERE state_id = 1",
+      )
+      .get() as RootRow | null;
+    if (state === null || readText(state.migration_id) !== "014-grant-provenance-integrity")
+      throw new Error("Grant migration provenance is incomplete.");
+    const provenance = new Map<string, string>();
+    const expiryProvenance = new Map<string, number | null>();
+    const rows = this.database
+      .query(
+        `SELECT grant_id, retained_opaque_reference, migration_id, original_expires_at_ms
+         FROM foundation_grant_migration_provenance ORDER BY grant_id`,
+      )
+      .all() as unknown[];
+    for (const value of rows) {
+      const row = asRecord(value);
+      const grantId = readText(row.grant_id);
+      const fingerprint = readText(row.retained_opaque_reference);
+      if (
+        readText(row.migration_id) !== "006-grant-cryptographic-erasure" ||
+        !OPAQUE_MIGRATION_REFERENCE_PATTERN.test(fingerprint) ||
+        provenance.has(grantId)
+      )
+        throw new Error("Grant migration provenance is invalid.");
+      provenance.set(grantId, fingerprint);
+      expiryProvenance.set(grantId, readNullableInteger(row.original_expires_at_ms));
+    }
+    this.grantValidationContext = {
+      ...this.grantValidationContext,
+      migrationProvenance: provenance,
+      migrationExpiryProvenance: expiryProvenance,
     };
   }
 

@@ -1,26 +1,35 @@
-# Scoped Control Grant lifecycle
+# Typed Grant authority lifecycle
 
-The Control Grant authority creates a QR-bound capability for one validated
-event, game day, pitch, and pitch slot. The public lifecycle is:
+The public Grant authority has one typed lifecycle for Event Admin, Pitch
+Manager, and Control Grants. The two public factory names expose the same
+trusted-authority contract; historical Control-only names exist only in test
+support. The public lifecycle is:
 
-1. `createControlGrant` validates the scope and a structured fixture authority,
-   then returns the QR credential once. The durable Grant stores only its
-   encrypted credential envelope and keyed lookup material.
-2. `revealControlGrant` decrypts the credential for an authorized authority and
+1. Typed create methods validate the exact scope and revalidate an injected,
+   cryptographically verified Technical Admin or Grant Session authority.
+   Callers cannot create trusted authority by object shape. The new Grant
+   returns its QR credential once; durable storage keeps only the encrypted
+   envelope and keyed lookup material.
+2. `revealGrant` decrypts the credential for an authorized authority and
    returns it without exposing stored plaintext.
-3. `rotateControlGrantCredentialKeys` decrypts a retained credential with its
+3. `rotateGrantCredentialKeys` decrypts a retained credential with its
    recorded old encryption key, verifies its complete binding and lookup
    digest, then re-encrypts and re-indexes it with the current keys. The Grant
    update and permanent `credential-rotated` audit evidence commit atomically;
    any cryptographic, collision, audit, or storage failure leaves the old
    credential and versions usable.
-4. `admitControlGrant` validates the QR credential, resolves the current event
+4. `admitGrant` validates the QR credential, resolves the current event
    game, and creates a separately random session bearer. A second admission in
    the same browser context revokes that context's active session and records a
    replacement; other contexts remain active.
-5. `authorizeControlGrant` accepts only the session bearer and rechecks the
+5. `authorizeGrant` accepts only the session bearer and rechecks the
    Grant version, lifecycle, scope resolution, and session state.
-6. `disableControlGrant` and `revokeControlGrant` are administrative lifecycle
+6. Disable, revoke, rotation, metadata correction, targeted session
+   revocation, reveal, and reads all re-resolve the current trusted authority
+   and management matrix in their transaction. Metadata correction rebinds
+   the corrected scope to a fresh Grant version and credential, revoking prior
+   sessions; an expired Grant never revives.
+7. Disable and revoke are administrative lifecycle
    transitions. A Grant reaching its expiry time transitions every non-expired
    Grant (including disabled and revoked Grants) and all sessions to `expired`,
    appends exactly one `grant-expired` audit entry, and never revives. This is
@@ -30,12 +39,15 @@ event, game day, pitch, and pitch slot. The public lifecycle is:
 
 ## Privacy and authority boundary
 
-Authority callers provide `{ kind: "fixture", id }`, not a free-form audit
-actor string. The ID is validated for the narrow boundary and immediately
-included only as input to a keyed HMAC derivation. Durable audit reads expose a
-pseudonymous `actor-*` reference; QR credentials, session bearers, browser
+Production callers pass inputs to an injected verifier that wraps actual
+Technical Admin Passkey or Grant Session verification and owns the internal
+trust brand. Permissive fixture authority exists only in test support. Durable
+audit reads expose a pseudonymous `actor-*` reference; QR credentials, session bearers, browser
 contexts, human identities, and caller-selected actor text are not persisted in
-Grant rows or audit evidence. Grant reveal material uses AES-256-GCM, while
+Grant rows or audit evidence. Session management labels and audit provenance
+derive from each session's retained pseudonym key version, so they remain
+stable when current credential keys rotate. Grant reveal material uses
+AES-256-GCM, while
 credential lookup and session bearer verification use separately keyed HMAC
 material. Injected randomness must provide at least 256 bits for credentials
 and independently random session bearers.
@@ -57,6 +69,22 @@ Grant Audit Trail fingerprint fields. Runtime audit creation likewise omits them
 only newly derived keyed credential fingerprints may occupy those fields. A
 non-expired migrated Grant replaces the compatibility reference with a keyed
 fingerprint when its retained credential keys are rotated.
+
+## Schema-006 compatibility trust transition
+
+Migration 011 is the one-time trust transition for databases that completed
+accepted migrations through schema 006 before keyed provenance existed. Its
+append-only SQL records each legacy opaque reference directly from the durable
+schema-006 Grant root, retaining only non-secret Grant metadata and the opaque
+compatibility reference. This transition is intentionally not retroactive
+cryptographic attestation: a legacy audit row or opaque-shaped value inserted
+before integrity metadata is indistinguishable from genuine legacy evidence.
+Migration 011 therefore validates every relationship derivable from the
+legacy schema—Grant, version, scope, lifecycle, credential material, expiry,
+session, and audit completeness—and freezes any inconsistency. Once 011
+completes, SQLite and memory adapters require keyed audit integrity for new
+evidence; provenance and audit history are immutable and direct writers cannot
+manufacture current trusted evidence.
 
 ## Test routing
 
@@ -85,5 +113,5 @@ bun run test:focused:grant
 
 The focused file is intentionally outside ordinary test discovery. This slice
 does not implement QR URL or fragment handling, cookies, React UI, Technical
-Admin authentication, Grant Codes, or the complete three-type lifecycle
-matrix.
+Admin Passkey authentication itself, Grant Codes, Event administration UI, or
+Pitch Slot/Event Game catalog binding.
