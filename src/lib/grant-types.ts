@@ -72,8 +72,40 @@ export type ControlGrantScopeResolution =
     }
   | { status: "empty" | "conflict" | "mismatch" | "unavailable"; detail?: string };
 
+export type ControlGrantSessionResolution =
+  | { status: "current"; eventGameId: string }
+  | {
+      status: "switchable";
+      previousEventGameId: string;
+      currentEventGameId: string;
+    }
+  | {
+      status: "pinned";
+      sessionEventGameId: string;
+      currentEventGameId: string;
+    }
+  | { status: "game-locked"; eventGameId: string }
+  | { status: "empty" | "conflict" | "mismatch" | "unavailable"; detail?: string };
+
+export type ControlGrantReplayResolution =
+  | { status: "eligible"; eventGameId: string }
+  | { status: "finished" | "game-locked" | "mismatch" | "unavailable"; detail?: string };
+
+export type ControlGrantSessionDecision = "stay";
+
 export type ControlGrantScopeResolver = {
   resolve(scope: ControlGrantScope): ControlGrantScopeResolution;
+  /** Optional lifecycle-aware seam used after a session has already been admitted. */
+  resolveSession?: (
+    scope: ControlGrantScope,
+    sessionEventGameId: string,
+  ) => ControlGrantSessionResolution;
+  /** Optional lifecycle-aware seam used by explicit offline replay authorization. */
+  resolveReplay?: (
+    scope: ControlGrantScope,
+    eventGameId: string,
+    replayEvidenceId: string,
+  ) => ControlGrantReplayResolution;
 };
 
 export type StoredGrantStatus = "active" | "disabled" | "revoked" | "expired";
@@ -141,7 +173,9 @@ export type GrantAuditAction =
   | "session-revoked"
   | "session-terminated"
   | "session-admitted"
-  | "session-replaced";
+  | "session-replaced"
+  | "session-switched"
+  | "replay-authorized";
 
 export type StoredGrantAuditEntry = {
   auditId: string;
@@ -155,6 +189,8 @@ export type StoredGrantAuditEntry = {
   sessionId: string | null;
   replacedSessionId: string | null;
   eventGameId: string | null;
+  previousEventGameId?: string | null;
+  replayEvidenceId?: string | null;
   credentialKind: GrantCredentialKind | null;
   credentialFingerprint: string | null;
   beforeStatus: StoredGrantStatus | null;

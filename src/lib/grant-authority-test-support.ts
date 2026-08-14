@@ -77,11 +77,24 @@ export function createLegacyControlGrantTestAuthority(
         lookupKeyVersion: options.keyRing.lookup.currentVersion,
       };
     },
+    async rotateControlGrant(grantId, actor) {
+      return (await typed.rotateGrant(grantId, actor)) as GrantMutationResult;
+    },
     async admitControlGrant(input) {
       return (await typed.admitGrant(input)) as AdmitControlGrantResult;
     },
     async authorizeControlGrant(input) {
       return (await typed.authorizeGrant(input)) as AuthorizeControlGrantResult;
+    },
+    async acceptControlGrantSessionSwitch(input) {
+      return (await typed.acceptControlGrantSessionSwitch(input)) as Awaited<
+        ReturnType<GrantAuthority["acceptControlGrantSessionSwitch"]>
+      >;
+    },
+    async authorizeControlGrantReplay(input) {
+      return (await typed.authorizeControlGrantReplay(input)) as Awaited<
+        ReturnType<GrantAuthority["authorizeControlGrantReplay"]>
+      >;
     },
     async disableControlGrant(grantId, actor) {
       return (await typed.disableGrant(grantId, actor)) as GrantMutationResult;

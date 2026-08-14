@@ -81,6 +81,7 @@ export type FoundationStorageSnapshot = {
   readRecordMetadata(recordId: string): StoredEventGameRecordMetadata | null;
   listAuditEntries(recordId: string): StoredControlAuditEntry[];
   findGrantById(grantId: string): StoredGrant | null;
+  listGrants(): StoredGrant[];
   findGrantByCredentialLookupDigest(lookupDigest: string): StoredGrant | null;
   findActiveSessionByGrantAndContext(
     grantId: string,

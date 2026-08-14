@@ -9,6 +9,7 @@ import {
   insertGrant,
   insertGrantSession,
   listGrantAudit,
+  listGrants,
   listGrantSessions,
   readGrantByStatement,
   readSessionByStatement,
@@ -404,6 +405,7 @@ export class SqliteFoundationStorage implements FoundationStorage {
       appendAuditEntry: (entry) => this.appendAuditEntry(statements, entry),
       findGrantById: (grantId) =>
         readGrantByStatement(this.getGrantStatements().byGrantId, grantId),
+      listGrants: () => listGrants(this.getGrantStatements().allGrants),
       findGrantByCredentialLookupDigest: (lookupDigest) =>
         readGrantByStatement(this.getGrantStatements().byCredentialDigest, lookupDigest),
       findActiveSessionByGrantAndContext: (grantId, browserContextDigest) =>

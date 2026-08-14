@@ -9,6 +9,7 @@ import {
   EVENT_ADMIN_GRANT_TYPE,
   GRANT_TYPE,
   type ControlGrantScope,
+  type ControlGrantSessionResolution,
   type StoredGrantSession,
 } from "@/lib/grant-types";
 import {
@@ -27,7 +28,7 @@ import {
   findSessionByBearer,
   refreshEventAdminSession,
   resolveManagementAuthority,
-  terminateControlSession,
+  terminateControlSessionForEventGame,
 } from "@/lib/grant-management-policy";
 import { verifyGrantAuthority } from "@/lib/grant-authority-trust";
 import { auditInput, coarse, sessionLabel } from "@/lib/grant-management-audit";
@@ -35,6 +36,8 @@ import type {
   GrantManagementAuthority,
   TypedGrantAdmission,
   TypedGrantAuthorization,
+  TypedControlGrantSwitch,
+  TypedGrantReplayAuthorization,
   TypedGrantMutation,
 } from "@/lib/grant-management-types";
 import {
@@ -73,7 +76,11 @@ export async function admitGrant(
       let eventGameId: string | null = null;
       if (current.grantType === GRANT_TYPE) {
         const resolved = options.controlScopeResolver.resolve(current.scope as ControlGrantScope);
-        if (resolved.status !== "eligible") return GENERIC_GRANT_ADMISSION_FAILURE;
+        if (
+          resolved.status !== "eligible" ||
+          !validateOpaqueIdentifier(resolved.eventGameId, "eventGameId").ok
+        )
+          return GENERIC_GRANT_ADMISSION_FAILURE;
         eventGameId = resolved.eventGameId;
       }
       const nowMs = readGrantNow(options);
@@ -147,12 +154,22 @@ export async function admitGrant(
 export async function authorizeGrant(
   storage: FoundationStorage,
   options: GrantAuthorityOptions,
-  bearer: string,
+  input: {
+    sessionBearer: string;
+    eventGameId?: string;
+    controlSessionDecision?: "stay";
+  },
 ): Promise<TypedGrantAuthorization> {
-  if (!isValidGrantSecret(bearer)) return GENERIC_GRANT_AUTHORIZATION_FAILURE;
+  if (
+    !isValidGrantSecret(input.sessionBearer) ||
+    (input.eventGameId !== undefined &&
+      !validateOpaqueIdentifier(input.eventGameId, "eventGameId").ok) ||
+    (input.controlSessionDecision !== undefined && input.controlSessionDecision !== "stay")
+  )
+    return GENERIC_GRANT_AUTHORIZATION_FAILURE;
   try {
     return await storage.transaction((transaction) => {
-      const session = findSessionByBearer(transaction, options, bearer);
+      const session = findSessionByBearer(transaction, options, input.sessionBearer);
       if (session === null) return GENERIC_GRANT_AUTHORIZATION_FAILURE;
       const stored = transaction.findGrantById(session.grantId);
       if (stored === null) return GENERIC_GRANT_AUTHORIZATION_FAILURE;
@@ -177,14 +194,58 @@ export async function authorizeGrant(
       }
       let eventGameId: string | null = null;
       if (grant.grantType === GRANT_TYPE) {
-        const resolved = options.controlScopeResolver.resolve(grant.scope as ControlGrantScope);
-        if (resolved.status === "terminal") {
-          terminateControlSession(transaction, options, grant, resolved.reason);
+        if (input.eventGameId === undefined) return GENERIC_GRANT_AUTHORIZATION_FAILURE;
+        const relationship = resolveControlSession(
+          options,
+          grant.scope as ControlGrantScope,
+          session.eventGameId,
+        );
+        if (relationship.status === "game-locked") {
+          terminateControlSessionForEventGame(
+            transaction,
+            options,
+            grant,
+            "game-locked",
+            relationship.eventGameId,
+          );
           return GENERIC_GRANT_AUTHORIZATION_FAILURE;
         }
-        if (resolved.status !== "eligible" || resolved.eventGameId !== session.eventGameId)
+        if (relationship.status === "switchable") {
+          if (
+            input.controlSessionDecision === "stay" &&
+            input.eventGameId === relationship.previousEventGameId
+          ) {
+            eventGameId = relationship.previousEventGameId;
+          } else if (
+            input.eventGameId === relationship.currentEventGameId ||
+            (input.controlSessionDecision === undefined &&
+              input.eventGameId === relationship.previousEventGameId)
+          ) {
+            return {
+              status: "switch-required",
+              grantId: grant.grantId,
+              grantVersion: grant.grantVersion,
+              grantType: GRANT_TYPE,
+              scope: structuredClone(grant.scope as ControlGrantScope),
+              grantSessionId: session.sessionId,
+              previousEventGameId: relationship.previousEventGameId,
+              currentEventGameId: relationship.currentEventGameId,
+            } satisfies TypedGrantAuthorization;
+          } else {
+            return GENERIC_GRANT_AUTHORIZATION_FAILURE;
+          }
+        }
+        if (relationship.status === "pinned") {
+          if (input.eventGameId !== relationship.sessionEventGameId)
+            return GENERIC_GRANT_AUTHORIZATION_FAILURE;
+          eventGameId = relationship.sessionEventGameId;
+        } else if (relationship.status === "current") {
+          if (input.eventGameId !== relationship.eventGameId)
+            return GENERIC_GRANT_AUTHORIZATION_FAILURE;
+          eventGameId = relationship.eventGameId;
+        } else if (relationship.status !== "switchable") {
           return GENERIC_GRANT_AUTHORIZATION_FAILURE;
-        eventGameId = resolved.eventGameId;
+        }
       }
       transaction.updateGrantSession({ ...session, lastActiveAtMs: nowMs });
       return {
@@ -200,6 +261,278 @@ export async function authorizeGrant(
   } catch {
     return GENERIC_GRANT_AUTHORIZATION_FAILURE;
   }
+}
+
+export async function acceptControlGrantSessionSwitch(
+  storage: FoundationStorage,
+  options: GrantAuthorityOptions,
+  bearer: string,
+): Promise<TypedControlGrantSwitch> {
+  if (!isValidGrantSecret(bearer)) return GENERIC_GRANT_AUTHORIZATION_FAILURE;
+  try {
+    return await storage.transaction((transaction) => {
+      const session = findSessionByBearer(transaction, options, bearer);
+      if (session === null || session.status !== "active")
+        return GENERIC_GRANT_AUTHORIZATION_FAILURE;
+      const stored = transaction.findGrantById(session.grantId);
+      if (stored === null || stored.grantType !== GRANT_TYPE)
+        return GENERIC_GRANT_AUTHORIZATION_FAILURE;
+      const grant = expireGrantIfDue(transaction, options, stored);
+      if (grant.status !== "active" || grant.grantVersion !== session.grantVersion)
+        return GENERIC_GRANT_AUTHORIZATION_FAILURE;
+      const relationship = resolveControlSession(
+        options,
+        grant.scope as ControlGrantScope,
+        session.eventGameId,
+      );
+      if (relationship.status !== "switchable") return GENERIC_GRANT_AUTHORIZATION_FAILURE;
+      const nowMs = readGrantNow(options);
+      transaction.updateGrantSession({
+        ...session,
+        eventGameId: relationship.currentEventGameId,
+        lastActiveAtMs: nowMs,
+      });
+      transaction.appendGrantAudit(
+        createAuditEntry(
+          options,
+          auditInput(
+            "session-switched",
+            grant,
+            {
+              kind: "session",
+              sessionId: session.sessionId,
+              pseudonymKeyVersion: session.browserContextKeyVersion,
+            },
+            "active",
+            session.sessionId,
+            null,
+            relationship.currentEventGameId,
+            null,
+            null,
+            null,
+            null,
+            relationship.previousEventGameId,
+          ),
+        ),
+      );
+      return {
+        status: "switched",
+        grantId: grant.grantId,
+        grantVersion: grant.grantVersion,
+        grantSessionId: session.sessionId,
+        previousEventGameId: relationship.previousEventGameId,
+        eventGameId: relationship.currentEventGameId,
+      } satisfies TypedControlGrantSwitch;
+    });
+  } catch {
+    return GENERIC_GRANT_AUTHORIZATION_FAILURE;
+  }
+}
+
+export async function lockControlGrantEventGame(
+  storage: FoundationStorage,
+  options: GrantAuthorityOptions,
+  evidence: unknown,
+): Promise<
+  | {
+      status: "locked";
+      eventGameId: string;
+      terminatedSessionCount: number;
+    }
+  | { status: "rejected"; reason: "invalid-input" | "unavailable" }
+> {
+  let transition:
+    | {
+        eventGameId: string;
+        apply(transaction: import("@/lib/foundation-storage").FoundationStorageTransaction): void;
+      }
+    | null
+    | undefined;
+  try {
+    transition = options.controlGrantLifecycle?.resolveEventGameLock(evidence);
+  } catch {
+    return { status: "rejected", reason: "unavailable" };
+  }
+  if (
+    transition === undefined ||
+    transition === null ||
+    !validateOpaqueIdentifier(transition.eventGameId, "eventGameId").ok ||
+    typeof transition.apply !== "function"
+  )
+    return { status: "rejected", reason: "invalid-input" };
+  try {
+    return await storage.transaction((transaction) => {
+      let terminatedSessionCount = 0;
+      for (const grant of transaction.listGrants()) {
+        if (grant.grantType !== GRANT_TYPE) continue;
+        terminatedSessionCount += terminateControlSessionForEventGame(
+          transaction,
+          options,
+          grant,
+          "game-locked",
+          transition.eventGameId,
+        );
+      }
+      transition.apply(transaction);
+      return { status: "locked", eventGameId: transition.eventGameId, terminatedSessionCount };
+    });
+  } catch {
+    return { status: "rejected", reason: "unavailable" };
+  }
+}
+
+export async function authorizeControlGrantReplay(
+  storage: FoundationStorage,
+  options: GrantAuthorityOptions,
+  input: {
+    sessionBearer: string;
+    originatingSessionId: string;
+    eventGameId: string;
+    replayEvidenceId: string;
+  },
+): Promise<TypedGrantReplayAuthorization> {
+  if (
+    !isValidGrantSecret(input.sessionBearer) ||
+    !validateOpaqueIdentifier(input.originatingSessionId, "originatingSessionId").ok ||
+    !validateOpaqueIdentifier(input.eventGameId, "eventGameId").ok ||
+    !validateOpaqueIdentifier(input.replayEvidenceId, "replayEvidenceId").ok
+  )
+    return GENERIC_GRANT_AUTHORIZATION_FAILURE;
+  try {
+    return await storage.transaction((transaction) => {
+      const replacement = findSessionByBearer(transaction, options, input.sessionBearer);
+      if (replacement === null || replacement.status !== "active")
+        return GENERIC_GRANT_AUTHORIZATION_FAILURE;
+      const stored = transaction.findGrantById(replacement.grantId);
+      if (stored === null || stored.grantType !== GRANT_TYPE)
+        return GENERIC_GRANT_AUTHORIZATION_FAILURE;
+      const grant = expireGrantIfDue(transaction, options, stored);
+      if (
+        grant.status !== "active" ||
+        replacement.grantVersion !== grant.grantVersion ||
+        replacement.eventGameId !== input.eventGameId
+      )
+        return GENERIC_GRANT_AUTHORIZATION_FAILURE;
+      const replay = options.controlScopeResolver.resolveReplay?.(
+        grant.scope as ControlGrantScope,
+        input.eventGameId,
+        input.replayEvidenceId,
+      );
+      if (replay === undefined) return GENERIC_GRANT_AUTHORIZATION_FAILURE;
+      if (replay.status !== "eligible" || replay.eventGameId !== input.eventGameId)
+        return GENERIC_GRANT_AUTHORIZATION_FAILURE;
+      const originating = transaction
+        .listGrantSessions(grant.grantId)
+        .find((candidate) => candidate.sessionId === input.originatingSessionId);
+      if (
+        originating === undefined ||
+        originating.sessionId === replacement.sessionId ||
+        originating.status === "active" ||
+        originating.grantId !== grant.grantId ||
+        originating.eventGameId !== input.eventGameId
+      )
+        return GENERIC_GRANT_AUTHORIZATION_FAILURE;
+      const originatingEvidence = transaction
+        .listGrantAudit(grant.grantId)
+        .some(
+          (audit) =>
+            (audit.action === "session-admitted" || audit.action === "session-replaced") &&
+            audit.sessionId === originating.sessionId &&
+            audit.grantVersion === originating.grantVersion &&
+            audit.eventGameId === input.eventGameId &&
+            audit.grantId === originating.grantId,
+        );
+      if (!originatingEvidence) return GENERIC_GRANT_AUTHORIZATION_FAILURE;
+      transaction.updateGrantSession({
+        ...replacement,
+        lastActiveAtMs: readGrantNow(options),
+      });
+      transaction.appendGrantAudit(
+        createAuditEntry(
+          options,
+          auditInput(
+            "replay-authorized",
+            grant,
+            {
+              kind: "session",
+              sessionId: replacement.sessionId,
+              pseudonymKeyVersion: replacement.browserContextKeyVersion,
+            },
+            "active",
+            replacement.sessionId,
+            originating.sessionId,
+            input.eventGameId,
+            null,
+            null,
+            null,
+            null,
+            null,
+            input.replayEvidenceId,
+          ),
+        ),
+      );
+      return {
+        status: "authorized",
+        grantId: grant.grantId,
+        grantVersion: grant.grantVersion,
+        grantSessionId: replacement.sessionId,
+        originatingSessionId: originating.sessionId,
+        eventGameId: input.eventGameId,
+        replayEvidenceId: input.replayEvidenceId,
+      } satisfies TypedGrantReplayAuthorization;
+    });
+  } catch {
+    return GENERIC_GRANT_AUTHORIZATION_FAILURE;
+  }
+}
+
+function resolveControlSession(
+  options: GrantAuthorityOptions,
+  scope: ControlGrantScope,
+  sessionEventGameId: string,
+): ControlGrantSessionResolution {
+  if (options.controlScopeResolver.resolveSession !== undefined) {
+    const resolved = options.controlScopeResolver.resolveSession(scope, sessionEventGameId);
+    if (resolved.status === "current")
+      return resolved.eventGameId === sessionEventGameId &&
+        validateOpaqueIdentifier(resolved.eventGameId, "eventGameId").ok
+        ? resolved
+        : { status: "mismatch" };
+    if (resolved.status === "pinned")
+      return resolved.sessionEventGameId === sessionEventGameId &&
+        validateOpaqueIdentifier(resolved.sessionEventGameId, "sessionEventGameId").ok &&
+        validateOpaqueIdentifier(resolved.currentEventGameId, "currentEventGameId").ok
+        ? resolved
+        : { status: "mismatch" };
+    if (resolved.status === "switchable")
+      return resolved.previousEventGameId === sessionEventGameId &&
+        resolved.previousEventGameId !== resolved.currentEventGameId &&
+        validateOpaqueIdentifier(resolved.previousEventGameId, "previousEventGameId").ok &&
+        validateOpaqueIdentifier(resolved.currentEventGameId, "currentEventGameId").ok
+        ? resolved
+        : { status: "mismatch" };
+    if (resolved.status === "game-locked")
+      return resolved.eventGameId === sessionEventGameId &&
+        validateOpaqueIdentifier(resolved.eventGameId, "eventGameId").ok
+        ? resolved
+        : { status: "mismatch" };
+    return resolved;
+  }
+  const current = options.controlScopeResolver.resolve(scope);
+  if (
+    current.status === "eligible" &&
+    current.eventGameId === sessionEventGameId &&
+    validateOpaqueIdentifier(current.eventGameId, "eventGameId").ok
+  )
+    return { status: "current", eventGameId: current.eventGameId };
+  if (
+    current.status === "terminal" &&
+    current.reason === "game-locked" &&
+    current.eventGameId === sessionEventGameId &&
+    validateOpaqueIdentifier(current.eventGameId, "eventGameId").ok
+  )
+    return { status: "game-locked", eventGameId: current.eventGameId };
+  return { status: "mismatch" };
 }
 
 export async function revokeGrantSession(

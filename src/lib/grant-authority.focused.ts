@@ -9,6 +9,7 @@ import { FOUNDATION_MIGRATIONS } from "@/lib/foundation-migrations";
 import {
   createTypedGrantAuthority,
   type ControlGrantScope,
+  type ControlGrantSessionResolution,
   type ControlGrantScopeResolution,
   type GrantKeyRing,
 } from "@/lib/grant-authority";
@@ -140,7 +141,7 @@ describe("focused SQLite Grant authority boundary", () => {
           /^opaque-migration-reference-v1:[a-f0-9]{64}$/,
         );
         expect(beforeRotation.audit[0]?.credentialFingerprint).toBeNull();
-        expect(await current.readiness()).toMatchObject({ ok: true, schemaVersion: "14" });
+        expect(await current.readiness()).toMatchObject({ ok: true, schemaVersion: "16" });
 
         const forged = new Database(databasePath);
         expect(() =>
@@ -224,6 +225,219 @@ describe("focused SQLite Grant authority boundary", () => {
     } finally {
       legacy.close();
       await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("freezes SQLite after previous Event Game audit provenance tampering", async () => {
+    const handle = await createStorage();
+    let relationship: ControlGrantSessionResolution = {
+      status: "current",
+      eventGameId: "game-1",
+    };
+    const authority = createAuthority(
+      handle.storage,
+      createGrantTestRandomness(201),
+      createGrantTestKeyRing(),
+      () => 1_000,
+      () => relationship,
+    );
+    try {
+      const created = await createGrant(authority);
+      const admitted = await admit(authority, created.qrCredential, "tamper-switch");
+      relationship = {
+        status: "switchable",
+        previousEventGameId: "game-1",
+        currentEventGameId: "game-2",
+      };
+      expect(await authority.acceptControlGrantSessionSwitch(admitted)).toMatchObject({
+        status: "switched",
+      });
+      relationship = {
+        status: "switchable",
+        previousEventGameId: "game-2",
+        currentEventGameId: "game-3",
+      };
+      expect(await authority.acceptControlGrantSessionSwitch(admitted)).toMatchObject({
+        status: "switched",
+      });
+      const restarted = openSqliteFoundationStorage(handle.databasePath, {
+        grantKeyRing: createGrantTestKeyRing(),
+      });
+      expect(await restarted.readiness()).toMatchObject({ ok: true, schemaVersion: "16" });
+      restarted.close();
+      const database = new Database(handle.databasePath);
+      database
+        .query(
+          "UPDATE foundation_grant_audit SET previous_event_game_id = ? WHERE action = 'session-switched' AND event_game_id = ?",
+        )
+        .run("game-3", "game-2");
+      database.close();
+      expect(await handle.storage.readiness()).toMatchObject({
+        ok: false,
+        status: "integrity-failure",
+      });
+      expect(
+        await authority.createControlGrant({
+          scope: createGrantTestScope(),
+          actor: createActor(),
+        }),
+      ).toMatchObject({ status: "rejected", reason: "unavailable" });
+    } finally {
+      await handle.cleanup();
+    }
+  });
+
+  test("freezes restarted SQLite after external Grant Session Event Game mutation", async () => {
+    const handle = await createStorage();
+    const keyRing = createGrantTestKeyRing();
+    const authority = createAuthority(handle.storage, createGrantTestRandomness(203), keyRing);
+    try {
+      const created = await createGrant(authority);
+      const admitted = await admit(authority, created.qrCredential, "external-game-tamper");
+      const gameTamperDatabase = new Database(handle.databasePath);
+      gameTamperDatabase
+        .query("UPDATE foundation_grant_sessions SET event_game_id = ? WHERE session_id = ?")
+        .run("game-forged", admitted.grantSessionId);
+      gameTamperDatabase.close();
+
+      const restarted = openSqliteFoundationStorage(handle.databasePath, { grantKeyRing: keyRing });
+      try {
+        expect(await restarted.readiness()).toMatchObject({
+          ok: false,
+          status: "integrity-failure",
+        });
+        const restartedAuthority = createAuthority(
+          restarted,
+          createGrantTestRandomness(204),
+          keyRing,
+        );
+        expect(
+          await restartedAuthority.createControlGrant({
+            scope: createGrantTestScope(),
+            actor: createActor(),
+          }),
+        ).toMatchObject({ status: "rejected", reason: "unavailable" });
+      } finally {
+        restarted.close();
+      }
+    } finally {
+      await handle.cleanup();
+    }
+  });
+
+  test("rejects replay self-links and active origins across SQLite restart validation", async () => {
+    const handle = await createStorage();
+    const keyRing = createGrantTestKeyRing();
+    const options = {
+      environmentId: "test-environment",
+      clock: { nowMs: () => 1_000 },
+      randomness: createGrantTestRandomness(205),
+      keyRing,
+      privilegedAuthorityVerifier: createGrantTestAuthorityVerifier(),
+      controlScopeResolver: {
+        resolve: () => ({ status: "eligible" as const, eventGameId: "game-1" }),
+        resolveReplay: (
+          _scope: ControlGrantScope,
+          eventGameId: string,
+          replayEvidenceId: string,
+        ) =>
+          eventGameId === "game-1" && replayEvidenceId === "replay-sqlite"
+            ? { status: "eligible" as const, eventGameId: "game-1" }
+            : { status: "mismatch" as const },
+      },
+    };
+    const authority = createLegacyControlGrantTestAuthority(handle.storage, options);
+    try {
+      const created = await createGrant(authority);
+      const origin = await admit(authority, created.qrCredential, "sqlite-origin");
+      const replacement = await admit(authority, created.qrCredential, "sqlite-replacement");
+      expect(
+        await authority.authorizeControlGrantReplay({
+          sessionBearer: replacement.sessionBearer,
+          originatingSessionId: replacement.grantSessionId,
+          eventGameId: "game-1",
+          replayEvidenceId: "replay-sqlite",
+        }),
+      ).toMatchObject({ status: "rejected" });
+      expect(
+        await authority.authorizeControlGrantReplay({
+          sessionBearer: replacement.sessionBearer,
+          originatingSessionId: origin.grantSessionId,
+          eventGameId: "game-1",
+          replayEvidenceId: "replay-sqlite",
+        }),
+      ).toMatchObject({ status: "rejected" });
+      const originReplacement = await admit(authority, created.qrCredential, "sqlite-origin");
+      expect(
+        await authority.authorizeControlGrantReplay({
+          sessionBearer: replacement.sessionBearer,
+          originatingSessionId: origin.grantSessionId,
+          eventGameId: "game-1",
+          replayEvidenceId: "replay-sqlite",
+        }),
+      ).toMatchObject({ status: "authorized" });
+
+      const readyRestart = openSqliteFoundationStorage(handle.databasePath, {
+        grantKeyRing: keyRing,
+      });
+      expect(await readyRestart.readiness()).toMatchObject({ ok: true, schemaVersion: "16" });
+      readyRestart.close();
+
+      const selfLinkDatabase = new Database(handle.databasePath);
+      selfLinkDatabase
+        .query(
+          "UPDATE foundation_grant_audit SET replaced_session_id = session_id WHERE action = 'replay-authorized'",
+        )
+        .run();
+      selfLinkDatabase.close();
+      const selfLinkedRestart = openSqliteFoundationStorage(handle.databasePath, {
+        grantKeyRing: keyRing,
+      });
+      expect(await selfLinkedRestart.readiness()).toMatchObject({
+        ok: false,
+        status: "integrity-failure",
+      });
+      selfLinkedRestart.close();
+
+      const repairedDatabase = new Database(handle.databasePath);
+      repairedDatabase
+        .query(
+          "UPDATE foundation_grant_audit SET replaced_session_id = ? WHERE action = 'replay-authorized'",
+        )
+        .run(origin.grantSessionId);
+      repairedDatabase.close();
+      const repairedRestart = openSqliteFoundationStorage(handle.databasePath, {
+        grantKeyRing: keyRing,
+      });
+      expect(await repairedRestart.readiness()).toMatchObject({ ok: true, schemaVersion: "16" });
+      repairedRestart.close();
+
+      const activeOriginDatabase = new Database(handle.databasePath);
+      activeOriginDatabase
+        .query(
+          "UPDATE foundation_grant_sessions SET status = 'revoked', revoked_at_ms = ? WHERE session_id = ?",
+        )
+        .run(2_000, originReplacement.grantSessionId);
+      activeOriginDatabase
+        .query(
+          "UPDATE foundation_grant_sessions SET status = 'active', revoked_at_ms = NULL WHERE session_id = ?",
+        )
+        .run(origin.grantSessionId);
+      activeOriginDatabase.close();
+
+      const rejectedRestart = openSqliteFoundationStorage(handle.databasePath, {
+        grantKeyRing: keyRing,
+      });
+      try {
+        expect(await rejectedRestart.readiness()).toMatchObject({
+          ok: false,
+          status: "integrity-failure",
+        });
+      } finally {
+        rejectedRestart.close();
+      }
+    } finally {
+      await handle.cleanup();
     }
   });
 
@@ -405,7 +619,7 @@ describe("focused SQLite Grant authority boundary", () => {
       let currentClosed = false;
       try {
         const report = await current.applyMigrations({ requireCandidate: false });
-        expect(report.schemaVersion).toBe(14);
+        expect(report.schemaVersion).toBe(16);
         expect(report.appliedMigrationIds).toEqual([
           "007-anchor-control-action-audit-versions",
           "008-anchor-current-evidence-format",
@@ -415,10 +629,12 @@ describe("focused SQLite Grant authority boundary", () => {
           "012-terminal-grant-session-audit",
           "013-grant-audit-evidence-fields",
           "014-grant-provenance-integrity",
+          "015-control-session-binding",
+          "016-replay-content-provenance",
         ]);
         expect(await current.readiness()).toMatchObject({
           ok: true,
-          schemaVersion: "14",
+          schemaVersion: "16",
         });
         const migrated = await current.transaction((transaction) => ({
           grant: transaction.findGrantById(grantId),
@@ -467,7 +683,7 @@ describe("focused SQLite Grant authority boundary", () => {
 
         const restarted = openSqliteFoundationStorage(databasePath, { grantKeyRing: keyRing });
         try {
-          expect(await restarted.readiness()).toMatchObject({ ok: true, schemaVersion: "14" });
+          expect(await restarted.readiness()).toMatchObject({ ok: true, schemaVersion: "16" });
           const restartedAudit = await restarted.transaction((transaction) =>
             transaction.listGrantAudit(grantId),
           );
@@ -864,7 +1080,7 @@ describe("focused SQLite Grant authority boundary", () => {
         grantKeyRing: options.keyRing,
       });
       try {
-        expect(await reopened.readiness()).toMatchObject({ ok: true, schemaVersion: "14" });
+        expect(await reopened.readiness()).toMatchObject({ ok: true, schemaVersion: "16" });
         const rotated = createTypedGrantAuthority(reopened, {
           ...options,
           keyRing: createGrantTestRotatedKeyRing(keyRing),
@@ -957,7 +1173,12 @@ describe("focused SQLite Grant authority boundary", () => {
         throw new Error("Expected Control Sessions.");
 
       resolution = { status: "terminal", reason: "game-locked", eventGameId: "game-1" };
-      expect(await authority.authorizeGrant({ sessionBearer: first.sessionBearer })).toMatchObject({
+      expect(
+        await authority.authorizeGrant({
+          sessionBearer: first.sessionBearer,
+          eventGameId: "game-1",
+        }),
+      ).toMatchObject({
         status: "rejected",
       });
       const sessions = await authority.listGrantSessions(control.grantId, {
@@ -987,7 +1208,7 @@ describe("focused SQLite Grant authority boundary", () => {
         grantKeyRing: options.keyRing,
       });
       try {
-        expect(await reopened.readiness()).toMatchObject({ ok: true, schemaVersion: "14" });
+        expect(await reopened.readiness()).toMatchObject({ ok: true, schemaVersion: "16" });
         const reopenedAuthority = createTypedGrantAuthority(reopened, options);
         const reopenedAudit = await reopenedAuthority.listGrantAudit(control.grantId, {
           kind: "technical-admin",
@@ -1040,6 +1261,7 @@ describe("focused SQLite Grant authority boundary", () => {
         expect(
           await reopenedAuthority.authorizeControlGrant({
             sessionBearer: readmitted.sessionBearer,
+            eventGameId: "game-1",
           }),
         ).toMatchObject({ status: "authorized", grantId: created.grantId });
       } finally {
@@ -1307,6 +1529,7 @@ function createAuthority(
   randomness: ReturnType<typeof createGrantTestRandomness>,
   keyRing: GrantKeyRing = createGrantTestKeyRing(),
   nowMs: () => number = () => 1_000,
+  resolveSession?: () => ControlGrantSessionResolution,
 ): GrantAuthority {
   return createLegacyControlGrantTestAuthority(storage, {
     environmentId: "test-environment",
@@ -1319,6 +1542,7 @@ function createAuthority(
         expect(scope).toEqual(createGrantTestScope());
         return { status: "eligible", eventGameId: "game-1" };
       },
+      resolveSession,
     },
   });
 }

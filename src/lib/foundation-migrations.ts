@@ -400,6 +400,23 @@ export const FOUNDATION_TYPED_GRANT_AUDIT_TABLE_V11_SQL =
     "    audit_integrity_tag TEXT NOT NULL CHECK (audit_integrity_tag = 'legacy-migration-v1' OR audit_integrity_tag GLOB 'hmac-sha256-v1:*'),\n    created_at_ms INTEGER NOT NULL",
   );
 
+/** Schema-15 audit shape. Earlier migration SQL remains byte-stable. */
+export const FOUNDATION_TYPED_GRANT_AUDIT_TABLE_V15_SQL =
+  FOUNDATION_TYPED_GRANT_AUDIT_TABLE_V11_SQL.replace(
+    "'session-terminated'))",
+    "'session-terminated', 'session-switched', 'replay-authorized'))",
+  ).replace(
+    "    terminal_reason TEXT CHECK (terminal_reason IS NULL OR terminal_reason IN ('game-locked', 'accepted-game-switch', 'past-game-day'))",
+    "    previous_event_game_id TEXT,\n    terminal_reason TEXT CHECK (terminal_reason IS NULL OR terminal_reason IN ('game-locked', 'accepted-game-switch', 'past-game-day'))",
+  );
+
+/** Schema-16 adds immutable content-bound replay provenance. */
+export const FOUNDATION_TYPED_GRANT_AUDIT_TABLE_V16_SQL =
+  FOUNDATION_TYPED_GRANT_AUDIT_TABLE_V15_SQL.replace(
+    "    previous_event_game_id TEXT,",
+    "    previous_event_game_id TEXT,\n    replay_evidence_id TEXT,",
+  );
+
 export const FOUNDATION_TYPED_GRANT_SESSION_TABLE_SQL = FOUNDATION_GRANT_SESSION_TABLE_SQL.replace(
   "    revoked_at_ms INTEGER,",
   "    revoked_at_ms INTEGER,\n    device_class TEXT NOT NULL,\n    browser_class TEXT NOT NULL,",
@@ -473,6 +490,18 @@ export const FOUNDATION_GRANT_AUDIT_PROVENANCE_TABLE_SQL = `
   ) STRICT
 `;
 
+export const FOUNDATION_GRANT_AUDIT_PROVENANCE_TABLE_V15_SQL =
+  FOUNDATION_GRANT_AUDIT_PROVENANCE_TABLE_SQL.replace(
+    "    terminal_reason TEXT,",
+    "    previous_event_game_id TEXT,\n    terminal_reason TEXT,",
+  );
+
+export const FOUNDATION_GRANT_AUDIT_PROVENANCE_TABLE_V16_SQL =
+  FOUNDATION_GRANT_AUDIT_PROVENANCE_TABLE_V15_SQL.replace(
+    "    previous_event_game_id TEXT,",
+    "    previous_event_game_id TEXT,\n    replay_evidence_id TEXT,",
+  );
+
 export const FOUNDATION_GRANT_AUDIT_PROVENANCE_GRANT_INDEX_SQL = `
   CREATE INDEX foundation_grant_audit_provenance_grant_id
     ON foundation_grant_audit_provenance (grant_id, audit_id)
@@ -537,6 +566,36 @@ export const FOUNDATION_GRANT_AUDIT_PROVENANCE_AFTER_INSERT_TRIGGER_SQL = `
       );
     END
 `;
+
+export const FOUNDATION_GRANT_AUDIT_PROVENANCE_AFTER_INSERT_TRIGGER_V15_SQL = `
+  CREATE TRIGGER foundation_grant_audit_provenance_after_insert
+    AFTER INSERT ON foundation_grant_audit
+    BEGIN
+      INSERT INTO foundation_grant_audit_provenance (
+        audit_id, action, outcome, actor_reference, grant_id, grant_type, grant_version,
+        event_id, game_day_id, pitch_id, pitch_slot_id, session_id, replaced_session_id,
+        event_game_id, previous_event_game_id, credential_kind, credential_fingerprint,
+        before_status, after_status, before_expires_at_ms, after_expires_at_ms,
+        terminal_reason, audit_integrity_tag, created_at_ms
+      ) VALUES (
+        NEW.audit_id, NEW.action, NEW.outcome, NEW.actor_reference, NEW.grant_id, NEW.grant_type,
+        NEW.grant_version, NEW.event_id, NEW.game_day_id, NEW.pitch_id, NEW.pitch_slot_id,
+        NEW.session_id, NEW.replaced_session_id, NEW.event_game_id, NEW.previous_event_game_id,
+        NEW.credential_kind, NEW.credential_fingerprint, NEW.before_status, NEW.after_status,
+        NEW.before_expires_at_ms, NEW.after_expires_at_ms, NEW.terminal_reason,
+        NEW.audit_integrity_tag, NEW.created_at_ms
+      );
+    END
+`;
+
+export const FOUNDATION_GRANT_AUDIT_PROVENANCE_AFTER_INSERT_TRIGGER_V16_SQL =
+  FOUNDATION_GRANT_AUDIT_PROVENANCE_AFTER_INSERT_TRIGGER_V15_SQL.replace(
+    "event_game_id, previous_event_game_id, credential_kind",
+    "event_game_id, previous_event_game_id, replay_evidence_id, credential_kind",
+  ).replace(
+    "NEW.event_game_id, NEW.previous_event_game_id,\n        NEW.credential_kind",
+    "NEW.event_game_id, NEW.previous_event_game_id, NEW.replay_evidence_id,\n        NEW.credential_kind",
+  );
 export const FOUNDATION_GRANT_AUDIT_NO_LEGACY_TAG_INSERT_TRIGGER_SQL = `
   CREATE TRIGGER foundation_grant_audit_no_legacy_integrity_tag
     BEFORE INSERT ON foundation_grant_audit
@@ -933,6 +992,98 @@ const FOUNDATION_TYPED_GRANT_AUDIT_EVIDENCE_MIGRATION_SQL = `
   ${FOUNDATION_GRANT_AUDIT_GRANT_INDEX_SQL};
 `;
 
+const FOUNDATION_CONTROL_SESSION_BINDING_MIGRATION_SQL = `
+  CREATE TABLE foundation_grant_audit_control_session_copy AS SELECT * FROM foundation_grant_audit;
+  DROP TABLE foundation_grant_audit;
+  ${FOUNDATION_TYPED_GRANT_AUDIT_TABLE_V15_SQL};
+  INSERT INTO foundation_grant_audit (
+    audit_id, action, outcome, actor_reference, grant_id, grant_type, grant_version,
+    event_id, game_day_id, pitch_id, pitch_slot_id, session_id, replaced_session_id,
+    event_game_id, previous_event_game_id, credential_kind, credential_fingerprint,
+    before_status, after_status, before_expires_at_ms, after_expires_at_ms,
+    terminal_reason, audit_integrity_tag, created_at_ms
+  )
+  SELECT
+    audit_id, action, outcome, actor_reference, grant_id, grant_type, grant_version,
+    event_id, game_day_id, pitch_id, pitch_slot_id, session_id, replaced_session_id,
+    event_game_id, NULL, credential_kind, credential_fingerprint, before_status,
+    after_status, before_expires_at_ms, after_expires_at_ms, terminal_reason,
+    audit_integrity_tag, created_at_ms
+  FROM foundation_grant_audit_control_session_copy;
+  DROP TABLE foundation_grant_audit_control_session_copy;
+  CREATE TABLE foundation_grant_audit_provenance_control_session_copy AS
+    SELECT * FROM foundation_grant_audit_provenance;
+  DROP TABLE foundation_grant_audit_provenance;
+  ${FOUNDATION_GRANT_AUDIT_PROVENANCE_TABLE_V15_SQL};
+  INSERT INTO foundation_grant_audit_provenance (
+    audit_id, action, outcome, actor_reference, grant_id, grant_type, grant_version,
+    event_id, game_day_id, pitch_id, pitch_slot_id, session_id, replaced_session_id,
+    event_game_id, previous_event_game_id, credential_kind, credential_fingerprint,
+    before_status, after_status, before_expires_at_ms, after_expires_at_ms,
+    terminal_reason, audit_integrity_tag, created_at_ms
+  )
+  SELECT
+    audit_id, action, outcome, actor_reference, grant_id, grant_type, grant_version,
+    event_id, game_day_id, pitch_id, pitch_slot_id, session_id, replaced_session_id,
+    event_game_id, NULL, credential_kind, credential_fingerprint, before_status,
+    after_status, before_expires_at_ms, after_expires_at_ms, terminal_reason,
+    audit_integrity_tag, created_at_ms
+  FROM foundation_grant_audit_provenance_control_session_copy;
+  DROP TABLE foundation_grant_audit_provenance_control_session_copy;
+  ${FOUNDATION_GRANT_AUDIT_PROVENANCE_GRANT_INDEX_SQL};
+  ${FOUNDATION_GRANT_AUDIT_PROVENANCE_NO_UPDATE_TRIGGER_SQL};
+  ${FOUNDATION_GRANT_AUDIT_PROVENANCE_NO_DELETE_TRIGGER_SQL};
+  ${FOUNDATION_GRANT_AUDIT_GRANT_INDEX_SQL};
+  ${FOUNDATION_GRANT_AUDIT_NO_LEGACY_TAG_INSERT_TRIGGER_SQL};
+  ${FOUNDATION_GRANT_AUDIT_PROVENANCE_AFTER_INSERT_TRIGGER_V15_SQL};
+`;
+
+const FOUNDATION_REPLAY_PROVENANCE_MIGRATION_SQL = `
+  CREATE TABLE foundation_grant_audit_replay_provenance_copy AS SELECT * FROM foundation_grant_audit;
+  DROP TABLE foundation_grant_audit;
+  ${FOUNDATION_TYPED_GRANT_AUDIT_TABLE_V16_SQL};
+  INSERT INTO foundation_grant_audit (
+    audit_id, action, outcome, actor_reference, grant_id, grant_type, grant_version,
+    event_id, game_day_id, pitch_id, pitch_slot_id, session_id, replaced_session_id,
+    event_game_id, previous_event_game_id, replay_evidence_id, credential_kind,
+    credential_fingerprint, before_status, after_status, before_expires_at_ms,
+    after_expires_at_ms, terminal_reason, audit_integrity_tag, created_at_ms
+  )
+  SELECT
+    audit_id, action, outcome, actor_reference, grant_id, grant_type, grant_version,
+    event_id, game_day_id, pitch_id, pitch_slot_id, session_id, replaced_session_id,
+    event_game_id, previous_event_game_id, NULL, credential_kind, credential_fingerprint,
+    before_status, after_status, before_expires_at_ms, after_expires_at_ms, terminal_reason,
+    audit_integrity_tag, created_at_ms
+  FROM foundation_grant_audit_replay_provenance_copy;
+  DROP TABLE foundation_grant_audit_replay_provenance_copy;
+  CREATE TABLE foundation_grant_audit_provenance_replay_copy AS
+    SELECT * FROM foundation_grant_audit_provenance;
+  DROP TABLE foundation_grant_audit_provenance;
+  ${FOUNDATION_GRANT_AUDIT_PROVENANCE_TABLE_V16_SQL};
+  INSERT INTO foundation_grant_audit_provenance (
+    audit_id, action, outcome, actor_reference, grant_id, grant_type, grant_version,
+    event_id, game_day_id, pitch_id, pitch_slot_id, session_id, replaced_session_id,
+    event_game_id, previous_event_game_id, replay_evidence_id, credential_kind,
+    credential_fingerprint, before_status, after_status, before_expires_at_ms,
+    after_expires_at_ms, terminal_reason, audit_integrity_tag, created_at_ms
+  )
+  SELECT
+    audit_id, action, outcome, actor_reference, grant_id, grant_type, grant_version,
+    event_id, game_day_id, pitch_id, pitch_slot_id, session_id, replaced_session_id,
+    event_game_id, previous_event_game_id, NULL, credential_kind, credential_fingerprint,
+    before_status, after_status, before_expires_at_ms, after_expires_at_ms, terminal_reason,
+    audit_integrity_tag, created_at_ms
+  FROM foundation_grant_audit_provenance_replay_copy;
+  DROP TABLE foundation_grant_audit_provenance_replay_copy;
+  ${FOUNDATION_GRANT_AUDIT_PROVENANCE_GRANT_INDEX_SQL};
+  ${FOUNDATION_GRANT_AUDIT_PROVENANCE_NO_UPDATE_TRIGGER_SQL};
+  ${FOUNDATION_GRANT_AUDIT_PROVENANCE_NO_DELETE_TRIGGER_SQL};
+  ${FOUNDATION_GRANT_AUDIT_GRANT_INDEX_SQL};
+  ${FOUNDATION_GRANT_AUDIT_NO_LEGACY_TAG_INSERT_TRIGGER_SQL};
+  ${FOUNDATION_GRANT_AUDIT_PROVENANCE_AFTER_INSERT_TRIGGER_V16_SQL};
+`;
+
 export const FOUNDATION_MIGRATIONS: readonly FoundationMigration[] = Object.freeze([
   createMigration({
     id: "001-foundation-event-game-record-roots",
@@ -1017,6 +1168,18 @@ export const FOUNDATION_MIGRATIONS: readonly FoundationMigration[] = Object.free
     ordinal: 14,
     schemaVersion: 14,
     sql: FOUNDATION_GRANT_PROVENANCE_MIGRATION_SQL,
+  }),
+  createMigration({
+    id: "015-control-session-binding",
+    ordinal: 15,
+    schemaVersion: 15,
+    sql: FOUNDATION_CONTROL_SESSION_BINDING_MIGRATION_SQL,
+  }),
+  createMigration({
+    id: "016-replay-content-provenance",
+    ordinal: 16,
+    schemaVersion: 16,
+    sql: FOUNDATION_REPLAY_PROVENANCE_MIGRATION_SQL,
   }),
 ]);
 

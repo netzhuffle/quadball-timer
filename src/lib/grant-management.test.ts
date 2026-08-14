@@ -317,12 +317,20 @@ describe("typed Grant management", () => {
       }),
     ).toMatchObject({ status: "updated" });
     expect(
-      await authority.authorizeGrant({ sessionBearer: controllerSession.sessionBearer }),
+      await authority.authorizeGrant({
+        sessionBearer: controllerSession.sessionBearer,
+        eventGameId: "game-1",
+      }),
     ).toMatchObject({ status: "rejected" });
     expect(await authority.leaveGrantSession(leaver.sessionBearer)).toMatchObject({
       status: "updated",
     });
-    expect(await authority.authorizeGrant({ sessionBearer: leaver.sessionBearer })).toMatchObject({
+    expect(
+      await authority.authorizeGrant({
+        sessionBearer: leaver.sessionBearer,
+        eventGameId: "game-1",
+      }),
+    ).toMatchObject({
       status: "rejected",
     });
     expect(
@@ -608,11 +616,21 @@ describe("typed Grant management", () => {
     });
     if (secondSession.status !== "admitted") throw new Error("Expected second Control Session.");
     resolution = { status: "terminal", reason: "game-locked", eventGameId: "game-1" };
-    expect(await authority.authorizeGrant({ sessionBearer: session.sessionBearer })).toMatchObject({
+    expect(
+      await authority.authorizeGrant({
+        sessionBearer: session.sessionBearer,
+        eventGameId: "game-1",
+      }),
+    ).toMatchObject({
       status: "rejected",
     });
     resolution = { status: "eligible", eventGameId: "game-1" };
-    expect(await authority.authorizeGrant({ sessionBearer: session.sessionBearer })).toMatchObject({
+    expect(
+      await authority.authorizeGrant({
+        sessionBearer: session.sessionBearer,
+        eventGameId: "game-1",
+      }),
+    ).toMatchObject({
       status: "rejected",
     });
     const stored = await storage.transaction((transaction) =>

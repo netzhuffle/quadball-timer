@@ -64,7 +64,10 @@ export function registerGrantRotationContract(
       });
       const admitted = await admit(currentOnly, created.qrCredential, "browser-a");
       expect(
-        await currentOnly.authorizeControlGrant({ sessionBearer: admitted.sessionBearer }),
+        await currentOnly.authorizeControlGrant({
+          sessionBearer: admitted.sessionBearer,
+          eventGameId: "game-1",
+        }),
       ).toMatchObject({ status: "authorized" });
     });
   });

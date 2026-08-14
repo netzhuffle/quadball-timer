@@ -1,5 +1,6 @@
 import {
   computeGrantAuditIntegrityTag,
+  computeLegacyGrantAuditIntegrityTag,
   computeCredentialFingerprint,
   computeLookupDigest,
   decryptCredential,
@@ -64,7 +65,10 @@ export function validateGrantState(
       if (
         tagParts.length !== 3 ||
         keyVersion === undefined ||
-        tag !== computeGrantAuditIntegrityTag(audit, context.keyRing, keyVersion)
+        (tag !== computeGrantAuditIntegrityTag(audit, context.keyRing, keyVersion) &&
+          (audit.action === "session-switched" ||
+            audit.action === "replay-authorized" ||
+            tag !== computeLegacyGrantAuditIntegrityTag(audit, context.keyRing, keyVersion)))
       ) {
         return "Stored Grant Audit Trail integrity is invalid.";
       }
@@ -101,10 +105,13 @@ export function validateGrantState(
     sessionMap.set(session.sessionId, session);
   }
 
+  const switchFailure = validateSessionSwitchChains(auditEntries, sessionMap, grantMap);
+  if (switchFailure !== null) return switchFailure;
+
   for (const audit of auditEntries) {
     const grant = grantMap.get(audit.grantId);
     if (grant === undefined) return "Stored Grant Audit Trail references an unknown Grant.";
-    const failure = validateAudit(audit, grant, sessionMap, context);
+    const failure = validateAudit(audit, grant, sessionMap, auditEntries, context);
     if (failure !== null) return failure;
   }
   for (const grant of grantMap.values()) {
@@ -414,7 +421,7 @@ function validateSession(
     !validateOpaqueIdentifier(session.sessionId, "sessionId").ok ||
     !validateOpaqueIdentifier(session.grantId, "session.grantId").ok ||
     !validateOpaqueIdentifier(session.grantVersion, "session.grantVersion").ok ||
-    session.eventGameId.length === 0 ||
+    !validateOpaqueIdentifier(session.eventGameId, "session.eventGameId").ok ||
     session.browserContextKeyVersion.length === 0 ||
     !isStoredGrantSessionStatus(session.status) ||
     !Number.isSafeInteger(session.createdAtMs) ||
@@ -457,6 +464,7 @@ function validateAudit(
   audit: StoredGrantAuditEntry,
   grant: StoredGrant,
   sessions: ReadonlyMap<string, StoredGrantSession>,
+  audits: readonly StoredGrantAuditEntry[],
   context: GrantStateValidationContext,
 ): string | null {
   const deepCredentialValidation =
@@ -474,6 +482,8 @@ function validateAudit(
     "session-replaced",
     "session-revoked",
     "session-terminated",
+    "session-switched",
+    "replay-authorized",
   ];
   const allowedTerminalReasons: readonly TerminalGrantSessionReason[] = [
     "game-locked",
@@ -500,8 +510,9 @@ function validateAudit(
     (audit.afterExpiresAtMs !== null &&
       (!Number.isSafeInteger(audit.afterExpiresAtMs) || audit.afterExpiresAtMs < 0)) ||
     (audit.terminalReason !== null && !allowedTerminalReasons.includes(audit.terminalReason))
-  )
+  ) {
     return "Stored Grant Audit Trail provenance is invalid.";
+  }
   if (audit.action === "session-terminated") {
     if (audit.terminalReason === null || audit.sessionId === null || audit.eventGameId === null)
       return "Stored terminal Grant Audit Trail evidence is incomplete.";
@@ -516,6 +527,73 @@ function validateAudit(
   } else if (audit.terminalReason !== null) {
     return "Stored non-terminal Grant Audit Trail evidence has a terminal reason.";
   }
+  if (audit.action === "session-admitted" || audit.action === "session-replaced") {
+    if (audit.sessionId === null || (grant.grantType === "control" && audit.eventGameId === null))
+      return "Stored admitted Grant Audit Trail evidence is incomplete.";
+    const session = sessions.get(audit.sessionId);
+    if (
+      session === undefined ||
+      session.grantId !== audit.grantId ||
+      session.grantVersion !== audit.grantVersion ||
+      (audit.eventGameId !== null &&
+        !validateOpaqueIdentifier(audit.eventGameId, "audit.eventGameId").ok)
+    )
+      return "Stored admitted Grant Audit Trail provenance is invalid.";
+  }
+  if (audit.action === "session-switched") {
+    if (
+      audit.sessionId === null ||
+      audit.eventGameId === null ||
+      audit.previousEventGameId === null
+    )
+      return "Stored switched Grant Audit Trail evidence is incomplete.";
+    const session = sessions.get(audit.sessionId);
+    if (
+      session === undefined ||
+      session.grantId !== audit.grantId ||
+      session.grantVersion !== audit.grantVersion
+    ) {
+      return "Stored switched Grant Audit Trail provenance is invalid.";
+    }
+  }
+  if (
+    audit.action !== "session-switched" &&
+    audit.action !== "replay-authorized" &&
+    audit.previousEventGameId !== null
+  )
+    return "Stored Grant Audit Trail previous Event Game provenance is invalid.";
+  if (audit.action === "replay-authorized") {
+    if (audit.sessionId === null || audit.replacedSessionId === null || audit.eventGameId === null)
+      return "Stored replay Grant Audit Trail evidence is incomplete.";
+    const replacement = sessions.get(audit.sessionId);
+    const originating = sessions.get(audit.replacedSessionId);
+    if (
+      replacement === undefined ||
+      originating === undefined ||
+      replacement.sessionId === originating.sessionId ||
+      originating.status === "active" ||
+      replacement.grantId !== audit.grantId ||
+      originating.grantId !== audit.grantId ||
+      replacement.grantVersion !== audit.grantVersion ||
+      replacement.eventGameId !== audit.eventGameId ||
+      originating.eventGameId !== audit.eventGameId ||
+      (audit.replayEvidenceId !== null &&
+        audit.replayEvidenceId !== undefined &&
+        !validateOpaqueIdentifier(audit.replayEvidenceId, "replayEvidenceId").ok)
+    )
+      return "Stored replay Grant Audit Trail provenance is invalid.";
+    if (
+      !audits.some(
+        (candidate) =>
+          (candidate.action === "session-admitted" || candidate.action === "session-replaced") &&
+          candidate.sessionId === originating.sessionId &&
+          candidate.grantId === originating.grantId &&
+          candidate.grantVersion === originating.grantVersion &&
+          candidate.eventGameId === audit.eventGameId,
+      )
+    )
+      return "Stored replay Grant Audit Trail originating evidence is invalid.";
+  }
   if (audit.credentialFingerprint !== null) {
     if (migrationReferenceFor(grant, context) !== null)
       return "Stored migration Grant Audit Trail credential evidence must be erased.";
@@ -525,6 +603,58 @@ function validateAudit(
       !isBase64UrlBytes(audit.credentialFingerprint, 32)
     )
       return "Stored Grant Audit Trail credential evidence is malformed.";
+  }
+  return null;
+}
+
+function validateSessionSwitchChains(
+  audits: readonly StoredGrantAuditEntry[],
+  sessions: ReadonlyMap<string, StoredGrantSession>,
+  grants: ReadonlyMap<string, StoredGrant>,
+): string | null {
+  const switchedBySession = new Map<string, StoredGrantAuditEntry[]>();
+  for (const audit of audits) {
+    if (audit.action !== "session-switched" || audit.sessionId === null) continue;
+    const history = switchedBySession.get(audit.sessionId) ?? [];
+    history.push(audit);
+    switchedBySession.set(audit.sessionId, history);
+  }
+  for (const session of sessions.values()) {
+    const grant = grants.get(session.grantId);
+    if (grant?.grantType !== "control") continue;
+    const admissions = audits.filter(
+      (audit) =>
+        (audit.action === "session-admitted" || audit.action === "session-replaced") &&
+        audit.sessionId === session.sessionId,
+    );
+    if (admissions.length !== 1)
+      return "Stored Grant Session lacks exactly one admission provenance record.";
+    const admission = admissions[0];
+    if (
+      admission === undefined ||
+      admission.eventGameId === null ||
+      admission.grantId !== session.grantId ||
+      admission.grantVersion !== session.grantVersion
+    )
+      return "Stored Grant Session admission provenance is invalid.";
+    let expectedPreviousEventGameId = admission.eventGameId;
+    const remaining = [...(switchedBySession.get(session.sessionId) ?? [])];
+    while (remaining.length > 0) {
+      const index = remaining.findIndex(
+        (audit) => audit.previousEventGameId === expectedPreviousEventGameId,
+      );
+      if (index < 0) return "Stored switched Grant Audit Trail relationship chain is invalid.";
+      const [audit] = remaining.splice(index, 1);
+      if (
+        audit === undefined ||
+        audit.eventGameId === null ||
+        audit.eventGameId === expectedPreviousEventGameId
+      )
+        return "Stored switched Grant Audit Trail relationship chain is invalid.";
+      expectedPreviousEventGameId = audit.eventGameId;
+    }
+    if (session.eventGameId !== expectedPreviousEventGameId)
+      return "Stored switched Grant Audit Trail relationship chain is incomplete.";
   }
   return null;
 }

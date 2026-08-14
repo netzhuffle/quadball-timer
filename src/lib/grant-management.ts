@@ -11,7 +11,9 @@ import { recalculateExpiry } from "@/lib/grant-management-lifecycle";
 import { listAudit, listSessions } from "@/lib/grant-management-queries";
 import {
   admitGrant,
+  acceptControlGrantSessionSwitch,
   authorizeGrant,
+  authorizeControlGrantReplay,
   leaveGrantSession,
   revokeGrantSession,
 } from "@/lib/grant-management-sessions";
@@ -24,6 +26,8 @@ export type {
   TypedGrantAuthorization,
   TypedGrantAuthority,
   TypedGrantCreated,
+  TypedControlGrantSwitch,
+  TypedGrantReplayAuthorization,
   TypedGrantMutation,
   TypedGrantReveal,
   TypedSessionSummary,
@@ -49,7 +53,10 @@ export function createTypedGrantAuthority(
     createControlGrant: (input) =>
       createGrant(storage, options, { ...input, grantType: GRANT_TYPE }),
     admitGrant: (input) => admitGrant(storage, options, input),
-    authorizeGrant: (input) => authorizeGrant(storage, options, input.sessionBearer),
+    authorizeGrant: (input) => authorizeGrant(storage, options, input),
+    acceptControlGrantSessionSwitch: (input) =>
+      acceptControlGrantSessionSwitch(storage, options, input.sessionBearer),
+    authorizeControlGrantReplay: (input) => authorizeControlGrantReplay(storage, options, input),
     revealGrant: (grantId, authority) => revealGrant(storage, options, grantId, authority),
     disableGrant: (grantId, authority) =>
       updateGrantStatus(storage, options, grantId, authority, "disabled", "grant-disabled"),

@@ -1,6 +1,7 @@
 import {
   GRANT_CREDENTIAL_FORMAT_VERSION,
   type ControlGrantScope,
+  type ControlGrantSessionDecision,
   type EventAdminGrantScope,
   type GrantScope,
   type GrantType,
@@ -59,6 +60,39 @@ export type TypedGrantAuthorization =
       eventGameId: string | null;
       grantSessionId: string;
     }
+  | {
+      status: "switch-required";
+      grantId: string;
+      grantVersion: string;
+      grantType: "control";
+      scope: ControlGrantScope;
+      grantSessionId: string;
+      previousEventGameId: string;
+      currentEventGameId: string;
+    }
+  | typeof GENERIC_GRANT_AUTHORIZATION_FAILURE;
+
+export type TypedControlGrantSwitch =
+  | {
+      status: "switched";
+      grantId: string;
+      grantVersion: string;
+      grantSessionId: string;
+      previousEventGameId: string;
+      eventGameId: string;
+    }
+  | typeof GENERIC_GRANT_AUTHORIZATION_FAILURE;
+
+export type TypedGrantReplayAuthorization =
+  | {
+      status: "authorized";
+      grantId: string;
+      grantVersion: string;
+      grantSessionId: string;
+      originatingSessionId: string;
+      eventGameId: string;
+      replayEvidenceId: string;
+    }
   | typeof GENERIC_GRANT_AUTHORIZATION_FAILURE;
 
 export type TypedGrantMutation =
@@ -107,7 +141,20 @@ export type TypedGrantAuthority = {
     deviceClass?: string;
     browserClass?: string;
   }): Promise<TypedGrantAdmission>;
-  authorizeGrant(input: { sessionBearer: string }): Promise<TypedGrantAuthorization>;
+  authorizeGrant(input: {
+    sessionBearer: string;
+    eventGameId?: string;
+    controlSessionDecision?: ControlGrantSessionDecision;
+  }): Promise<TypedGrantAuthorization>;
+  acceptControlGrantSessionSwitch(input: {
+    sessionBearer: string;
+  }): Promise<TypedControlGrantSwitch>;
+  authorizeControlGrantReplay(input: {
+    sessionBearer: string;
+    originatingSessionId: string;
+    eventGameId: string;
+    replayEvidenceId: string;
+  }): Promise<TypedGrantReplayAuthorization>;
   revealGrant(grantId: string, authority: GrantManagementAuthority): Promise<TypedGrantReveal>;
   disableGrant(grantId: string, authority: GrantManagementAuthority): Promise<TypedGrantMutation>;
   revokeGrant(grantId: string, authority: GrantManagementAuthority): Promise<TypedGrantMutation>;

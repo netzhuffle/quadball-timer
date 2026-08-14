@@ -15,7 +15,7 @@ import {
   FOUNDATION_SIDE_RECORD_INDEX_SQL,
   FOUNDATION_SIDE_TABLE_SQL,
   FOUNDATION_GRANT_AUDIT_GRANT_INDEX_SQL,
-  FOUNDATION_TYPED_GRANT_AUDIT_TABLE_V11_SQL,
+  FOUNDATION_TYPED_GRANT_AUDIT_TABLE_V16_SQL,
   FOUNDATION_GRANT_SESSION_CONTEXT_INDEX_SQL,
   FOUNDATION_GRANT_SESSION_GRANT_INDEX_SQL,
   FOUNDATION_EVIDENCE_PROVENANCE_TABLE_SQL,
@@ -25,7 +25,7 @@ import {
   FOUNDATION_TYPED_GRANT_SESSION_TABLE_SQL,
   FOUNDATION_GRANT_MIGRATION_PROVENANCE_TABLE_SQL,
   FOUNDATION_GRANT_MIGRATION_PROVENANCE_STATE_TABLE_SQL,
-  FOUNDATION_GRANT_AUDIT_PROVENANCE_TABLE_SQL,
+  FOUNDATION_GRANT_AUDIT_PROVENANCE_TABLE_V16_SQL,
   FOUNDATION_GRANT_AUDIT_PROVENANCE_GRANT_INDEX_SQL,
   FOUNDATION_GRANT_MIGRATION_PROVENANCE_NO_UPDATE_TRIGGER_SQL,
   FOUNDATION_GRANT_MIGRATION_PROVENANCE_NO_INSERT_TRIGGER_SQL,
@@ -35,10 +35,13 @@ import {
   FOUNDATION_GRANT_MIGRATION_PROVENANCE_STATE_NO_DELETE_TRIGGER_SQL,
   FOUNDATION_GRANT_AUDIT_PROVENANCE_NO_UPDATE_TRIGGER_SQL,
   FOUNDATION_GRANT_AUDIT_PROVENANCE_NO_DELETE_TRIGGER_SQL,
-  FOUNDATION_GRANT_AUDIT_PROVENANCE_AFTER_INSERT_TRIGGER_SQL,
+  FOUNDATION_GRANT_AUDIT_PROVENANCE_AFTER_INSERT_TRIGGER_V16_SQL,
   FOUNDATION_GRANT_AUDIT_NO_LEGACY_TAG_INSERT_TRIGGER_SQL,
 } from "@/lib/foundation-migrations";
-import { computeGrantAuditIntegrityTag } from "@/lib/grant-crypto";
+import {
+  computeGrantAuditIntegrityTag,
+  computeLegacyGrantAuditIntegrityTag,
+} from "@/lib/grant-crypto";
 import { readStoredGrantAuditEntry, scanGrantState } from "@/lib/grant-storage-sqlite";
 import type { GrantStateValidationContext } from "@/lib/grant-state-validation";
 import { GRANT_AUDIT_LEGACY_INTEGRITY_TAG } from "@/lib/grant-types";
@@ -126,7 +129,7 @@ const expectedManifest: FoundationSchemaManifest = {
       "table",
       GRANT_AUDIT_TABLE,
       GRANT_AUDIT_TABLE,
-      FOUNDATION_TYPED_GRANT_AUDIT_TABLE_V11_SQL,
+      FOUNDATION_TYPED_GRANT_AUDIT_TABLE_V16_SQL,
     ),
     object("table", PROVENANCE_TABLE, PROVENANCE_TABLE, FOUNDATION_EVIDENCE_PROVENANCE_TABLE_SQL),
     object(
@@ -157,7 +160,7 @@ const expectedManifest: FoundationSchemaManifest = {
       "table",
       GRANT_AUDIT_PROVENANCE_TABLE,
       GRANT_AUDIT_PROVENANCE_TABLE,
-      FOUNDATION_GRANT_AUDIT_PROVENANCE_TABLE_SQL,
+      FOUNDATION_GRANT_AUDIT_PROVENANCE_TABLE_V16_SQL,
     ),
     object(
       "trigger",
@@ -217,7 +220,7 @@ const expectedManifest: FoundationSchemaManifest = {
       "trigger",
       "foundation_grant_audit_provenance_after_insert",
       GRANT_AUDIT_TABLE,
-      FOUNDATION_GRANT_AUDIT_PROVENANCE_AFTER_INSERT_TRIGGER_SQL,
+      FOUNDATION_GRANT_AUDIT_PROVENANCE_AFTER_INSERT_TRIGGER_V16_SQL,
     ),
     object(
       "index",
@@ -546,6 +549,8 @@ const expectedManifest: FoundationSchemaManifest = {
         column("after_status", "TEXT", 0, 0),
         column("before_expires_at_ms", "INTEGER", 0, 0),
         column("after_expires_at_ms", "INTEGER", 0, 0),
+        column("previous_event_game_id", "TEXT", 0, 0),
+        column("replay_evidence_id", "TEXT", 0, 0),
         column("terminal_reason", "TEXT", 0, 0),
         column("audit_integrity_tag", "TEXT", 1, 0),
         column("created_at_ms", "INTEGER", 1, 0),
@@ -629,6 +634,8 @@ const expectedManifest: FoundationSchemaManifest = {
         column("after_status", "TEXT", 0, 0),
         column("before_expires_at_ms", "INTEGER", 0, 0),
         column("after_expires_at_ms", "INTEGER", 0, 0),
+        column("previous_event_game_id", "TEXT", 0, 0),
+        column("replay_evidence_id", "TEXT", 0, 0),
         column("terminal_reason", "TEXT", 0, 0),
         column("audit_integrity_tag", "TEXT", 1, 0),
         column("created_at_ms", "INTEGER", 1, 0),
@@ -871,6 +878,8 @@ function verifyGrantProvenance(
     "after_status",
     "before_expires_at_ms",
     "after_expires_at_ms",
+    "previous_event_game_id",
+    "replay_evidence_id",
     "terminal_reason",
     "audit_integrity_tag",
     "created_at_ms",
@@ -890,12 +899,23 @@ function verifyGrantProvenance(
       throw new Error("Grant Audit Trail integrity cannot be verified.");
     }
     const audit = readStoredGrantAuditEntry(row);
+    if (
+      audit.action !== "session-switched" &&
+      audit.action !== "replay-authorized" &&
+      audit.previousEventGameId !== null
+    ) {
+      throw new Error("Grant Audit Trail previous Event Game provenance is invalid.");
+    }
     const tagParts = tag.split(":");
     const keyVersion = tagParts[1];
     if (
       tagParts.length !== 3 ||
       keyVersion === undefined ||
-      computeGrantAuditIntegrityTag(audit, validationContext.keyRing, keyVersion) !== tag
+      (computeGrantAuditIntegrityTag(audit, validationContext.keyRing, keyVersion) !== tag &&
+        (audit.action === "session-switched" ||
+          audit.action === "replay-authorized" ||
+          computeLegacyGrantAuditIntegrityTag(audit, validationContext.keyRing, keyVersion) !==
+            tag))
     ) {
       throw new Error("Grant Audit Trail integrity is invalid.");
     }

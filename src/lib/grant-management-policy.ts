@@ -147,7 +147,15 @@ export function canManageInTransaction(
   if (caller.grantType === "control") {
     const resolved = options.controlScopeResolver.resolve(caller.scope as ControlGrantScope);
     if (resolved.status === "terminal") {
-      terminateControlSession(transaction, options, caller, resolved.reason);
+      if (resolved.reason === "game-locked")
+        terminateControlSessionForEventGame(
+          transaction,
+          options,
+          caller,
+          resolved.reason,
+          resolved.eventGameId ?? session.eventGameId,
+        );
+      else terminateControlSession(transaction, options, caller, resolved.reason);
       return false;
     }
     if (resolved.status !== "eligible" || resolved.eventGameId !== session.eventGameId)
@@ -197,7 +205,15 @@ export function canCreateInTransaction(
   if (caller.grantType === "control") {
     const resolved = options.controlScopeResolver.resolve(caller.scope as ControlGrantScope);
     if (resolved.status === "terminal") {
-      terminateControlSession(transaction, options, caller, resolved.reason);
+      if (resolved.reason === "game-locked")
+        terminateControlSessionForEventGame(
+          transaction,
+          options,
+          caller,
+          resolved.reason,
+          resolved.eventGameId ?? session.eventGameId,
+        );
+      else terminateControlSession(transaction, options, caller, resolved.reason);
       return false;
     }
     if (resolved.status !== "eligible" || resolved.eventGameId !== session.eventGameId)
@@ -359,9 +375,24 @@ export function terminateControlSession(
   grant: StoredGrant,
   reason: "accepted-game-switch" | "past-game-day" | "game-locked",
 ): void {
+  terminateControlSessionForEventGame(transaction, options, grant, reason, null);
+}
+
+export function terminateControlSessionForEventGame(
+  transaction: FoundationStorageTransaction,
+  options: GrantAuthorityOptions,
+  grant: StoredGrant,
+  reason: "accepted-game-switch" | "past-game-day" | "game-locked",
+  eventGameId: string | null,
+): number {
   const nowMs = readNow(options);
+  let terminated = 0;
   for (const affected of transaction.listGrantSessions(grant.grantId)) {
-    if (affected.status !== "active") continue;
+    if (
+      affected.status !== "active" ||
+      (eventGameId !== null && affected.eventGameId !== eventGameId)
+    )
+      continue;
     transaction.updateGrantSession({
       ...affected,
       status: "expired",
@@ -383,7 +414,9 @@ export function terminateControlSession(
         terminalReason: reason,
       }),
     );
+    terminated += 1;
   }
+  return terminated;
 }
 
 function sameScope(left: GrantScope, right: GrantScope): boolean {

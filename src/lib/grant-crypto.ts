@@ -233,6 +233,24 @@ export function computeGrantAuditIntegrityTag(
   keyRing: GrantKeyRing,
   keyVersion = keyRing.audit.currentVersion,
 ): string {
+  return computeGrantAuditIntegrityTagWithPreviousEventGameId(entry, keyRing, keyVersion, true);
+}
+
+/** Compatibility verifier for keyed audit rows written before migration 015. */
+export function computeLegacyGrantAuditIntegrityTag(
+  entry: StoredGrantAuditEntry,
+  keyRing: GrantKeyRing,
+  keyVersion = keyRing.audit.currentVersion,
+): string {
+  return computeGrantAuditIntegrityTagWithPreviousEventGameId(entry, keyRing, keyVersion, false);
+}
+
+function computeGrantAuditIntegrityTagWithPreviousEventGameId(
+  entry: StoredGrantAuditEntry,
+  keyRing: GrantKeyRing,
+  keyVersion: string,
+  includePreviousEventGameId: boolean,
+): string {
   const payload = JSON.stringify({
     domain: "grant-audit-integrity-v1",
     auditId: entry.auditId,
@@ -246,6 +264,12 @@ export function computeGrantAuditIntegrityTag(
     sessionId: entry.sessionId,
     replacedSessionId: entry.replacedSessionId,
     eventGameId: entry.eventGameId,
+    ...(includePreviousEventGameId
+      ? { previousEventGameId: entry.previousEventGameId ?? null }
+      : {}),
+    ...(includePreviousEventGameId && entry.replayEvidenceId !== null
+      ? { replayEvidenceId: entry.replayEvidenceId }
+      : {}),
     credentialKind: entry.credentialKind,
     credentialFingerprint: entry.credentialFingerprint,
     beforeStatus: entry.beforeStatus,

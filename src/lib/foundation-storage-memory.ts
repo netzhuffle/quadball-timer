@@ -498,6 +498,11 @@ function createTransaction(
       const grant = state.grants.get(grantId);
       return grant === undefined ? null : cloneStoredGrant(grant);
     },
+    listGrants() {
+      return [...state.grants.values()]
+        .sort((left, right) => left.grantId.localeCompare(right.grantId))
+        .map(cloneStoredGrant);
+    },
     findGrantByCredentialLookupDigest(lookupDigest) {
       return findGrant(state.grants, (grant) => grant.credential.lookupDigest === lookupDigest);
     },

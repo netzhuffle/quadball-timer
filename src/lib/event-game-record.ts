@@ -275,6 +275,7 @@ export function createEventGameRecord(
         readRecordMetadata: () => metadata,
         listAuditEntries: () => auditEntries,
         findGrantById: () => null,
+        listGrants: () => [],
         findGrantByCredentialLookupDigest: () => null,
         findActiveSessionByGrantAndContext: () => null,
         findSessionByBearerVerifier: () => null,

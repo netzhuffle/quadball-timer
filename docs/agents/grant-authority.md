@@ -18,12 +18,20 @@ support. The public lifecycle is:
    update and permanent `credential-rotated` audit evidence commit atomically;
    any cryptographic, collision, audit, or storage failure leaves the old
    credential and versions usable.
-4. `admitGrant` validates the QR credential, resolves the current event
-   game, and creates a separately random session bearer. A second admission in
+4. `admitGrant` validates the QR credential and, for a Control Grant, resolves
+   exactly one eligible Event Game for its Pitch Slot through the injected
+   scope resolver. It generically rejects missing, conflicted, or malformed
+   resolution and otherwise creates a separately random session bearer bound
+   to that Event Game. A second admission in
    the same browser context revokes that context's active session and records a
    replacement; other contexts remain active.
-5. `authorizeGrant` accepts only the session bearer and rechecks the
-   Grant version, lifecycle, scope resolution, and session state.
+5. `authorizeGrant` accepts the session bearer and, for a Control Grant, the
+   explicit Event Game identity of the work being authorized. It rechecks the
+   Grant version, lifecycle, scope resolution, and Grant Session state without
+   inferring a new Event Game for queued work. Before Game Commencement the
+   caller may retain the prior Event Game binding or atomically accept the
+   resolver's old/new switch relationship; after commencement the Grant
+   Session remains pinned to its unfinished Event Game.
 6. Disable, revoke, rotation, metadata correction, targeted session
    revocation, reveal, and reads all re-resolve the current trusted authority
    and management matrix in their transaction. Metadata correction rebinds
@@ -58,6 +66,14 @@ operation contains storage failures at the module boundary; list operations
 return a typed unavailable result and mutations return redacted failure
 details. Storage writes for a Grant and its mandatory audit evidence are
 transactional in both adapters, including expiry erasure and audit evidence.
+Accepted Game Lock evidence drives a trusted internal lifecycle transition
+that terminates only Control Grant Sessions bound to the locked Event Game and
+atomically invokes the future Grant Code state hook. Reopening permits fresh
+admission but never revives old session or code authority. Fresh current Grant
+Sessions may authorize content-bound replay only for preserved work from a
+different, non-active originating Grant Session on the same unfinished,
+unlocked Event Game; the permanent audit binds both sessions, their Grant
+versions, and the replay evidence identity.
 Expired Grants have no credential key versions, ciphertext, IV, authentication
 tag, lookup digest, or session verifier material and cannot rotate. Migration
 006 upgrades legacy active, disabled, revoked, due, and expired rows in one
@@ -91,8 +107,10 @@ manufacture current trusted evidence.
 The reusable semantic contract runs against in-memory storage in the ordinary
 Fast Test boundary and against disposable SQLite storage in the focused
 integration boundary. The SQLite contract covers replacement, generic failure,
+Event Game binding and switching, replay provenance, trusted Game Lock,
 atomic credential key rotation, expiry erasure, migration upgrade and rollback,
-redaction, restart, and real independent-worker admission contention. The
+tamper-triggered write freeze, redaction, restart, and real independent-worker
+admission contention. The
 contention harness uses an allowlisted child environment, a private owner-only
 credential file, capped streaming diagnostics, and one bounded deadline for
 barrier, work, TERM/KILL escalation, reap, and artifact cleanup. The focused
@@ -114,4 +132,5 @@ bun run test:focused:grant
 The focused file is intentionally outside ordinary test discovery. This slice
 does not implement QR URL or fragment handling, cookies, React UI, Technical
 Admin Passkey authentication itself, Grant Codes, Event administration UI, or
-Pitch Slot/Event Game catalog binding.
+the Event catalog implementation behind the injected Pitch Slot/Event Game
+resolver.

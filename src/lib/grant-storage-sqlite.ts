@@ -24,6 +24,7 @@ type GrantRow = Record<string, unknown>;
 
 export type GrantSqliteStatements = {
   byGrantId: SqlStatement;
+  allGrants: SqlStatement;
   byCredentialDigest: SqlStatement;
   activeSessionByContext: SqlStatement;
   sessionByBearer: SqlStatement;
@@ -79,6 +80,8 @@ const AUDIT_SELECT_COLUMNS = `
   audit.before_status AS before_status, audit.after_status AS after_status,
   audit.before_expires_at_ms AS before_expires_at_ms,
   audit.after_expires_at_ms AS after_expires_at_ms,
+  audit.previous_event_game_id AS previous_event_game_id,
+  audit.replay_evidence_id AS replay_evidence_id,
   audit.terminal_reason AS terminal_reason,
   audit.created_at_ms AS created_at_ms
 `;
@@ -87,6 +90,9 @@ export function createGrantSqliteStatements(database: Database): GrantSqliteStat
   return {
     byGrantId: database.query(
       `SELECT ${GRANT_SELECT_COLUMNS} FROM foundation_grant_roots AS grants WHERE grants.grant_id = ?`,
+    ),
+    allGrants: database.query(
+      `SELECT ${GRANT_SELECT_COLUMNS} FROM foundation_grant_roots AS grants ORDER BY grants.grant_id`,
     ),
     byCredentialDigest: database.query(
       `SELECT ${GRANT_SELECT_COLUMNS} FROM foundation_grant_roots AS grants WHERE grants.credential_lookup_digest = ?`,
@@ -148,8 +154,10 @@ export function createGrantSqliteStatements(database: Database): GrantSqliteStat
         audit_id, action, outcome, actor_reference, grant_id, grant_type, grant_version,
         event_id, game_day_id, pitch_id, pitch_slot_id, session_id, replaced_session_id,
         event_game_id, credential_kind, credential_fingerprint, before_status, after_status,
-        before_expires_at_ms, after_expires_at_ms, terminal_reason, audit_integrity_tag, created_at_ms
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        before_expires_at_ms, after_expires_at_ms, previous_event_game_id, replay_evidence_id,
+        terminal_reason,
+        audit_integrity_tag, created_at_ms
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `),
   };
 }
@@ -160,6 +168,10 @@ export function readGrantByStatement(
 ): StoredGrant | null {
   const row = statement.get(...parameters) as GrantRow | null;
   return row === null ? null : readStoredControlGrant(row);
+}
+
+export function listGrants(statement: SqlStatement): StoredGrant[] {
+  return statement.all().map((row) => readStoredControlGrant(asRecord(row)));
 }
 
 export function readSessionByStatement(
@@ -337,6 +349,8 @@ export function appendGrantAudit(
     entry.afterStatus,
     entry.beforeExpiresAtMs,
     entry.afterExpiresAtMs,
+    entry.previousEventGameId ?? null,
+    entry.replayEvidenceId ?? null,
     entry.terminalReason,
     integrityTag,
     entry.createdAtMs,
@@ -570,6 +584,8 @@ export function readStoredGrantAuditEntry(row: GrantRow): StoredGrantAuditEntry 
     "grant-metadata-updated",
     "session-revoked",
     "session-terminated",
+    "session-switched",
+    "replay-authorized",
   ];
   if (!allowedActions.includes(action)) {
     throw new Error("Stored Grant Audit Trail action is invalid.");
@@ -628,6 +644,8 @@ export function readStoredGrantAuditEntry(row: GrantRow): StoredGrantAuditEntry 
     afterStatus: afterStatus as StoredGrantAuditEntry["afterStatus"],
     beforeExpiresAtMs,
     afterExpiresAtMs,
+    previousEventGameId: readNullableText(row.previous_event_game_id),
+    replayEvidenceId: readNullableText(row.replay_evidence_id),
     terminalReason: terminalReason as StoredGrantAuditEntry["terminalReason"],
     createdAtMs: readInteger(row.created_at_ms),
   };

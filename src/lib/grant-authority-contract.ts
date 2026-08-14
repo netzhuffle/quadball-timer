@@ -6,6 +6,8 @@ import {
   GENERIC_GRANT_ADMISSION_FAILURE,
   type ControlGrantScope,
   type ControlGrantScopeResolution,
+  type ControlGrantSessionResolution,
+  type ControlGrantReplayResolution,
   type GrantAuthorityActor,
   type GrantKeyRing,
   type GrantRandomness,
@@ -17,6 +19,8 @@ import {
   createGrantTestAuthorityVerifier,
   createLegacyControlGrantTestAuthority,
 } from "@/lib/grant-authority-test-support";
+import { lockControlGrantEventGame } from "@/lib/grant-management-sessions";
+import type { GrantAuthorityOptions } from "@/lib/grant-authority";
 
 export type GrantAuthorityContractStorage = {
   storage: FoundationStorage;
@@ -96,18 +100,27 @@ export function registerGrantAuthorityContract(
       const otherContext = await admit(authority, created.qrCredential, "browser-b");
       const replacement = await admit(authority, created.qrCredential, "browser-a");
 
-      expect(await authority.authorizeControlGrant({ sessionBearer: first.sessionBearer })).toEqual(
-        {
-          status: "rejected",
-          code: "grant-authorization-failed",
-          message: "Unable to authorize this Grant Session.",
-        },
-      );
       expect(
-        await authority.authorizeControlGrant({ sessionBearer: otherContext.sessionBearer }),
+        await authority.authorizeControlGrant({
+          sessionBearer: first.sessionBearer,
+          eventGameId: "game-1",
+        }),
+      ).toEqual({
+        status: "rejected",
+        code: "grant-authorization-failed",
+        message: "Unable to authorize this Grant Session.",
+      });
+      expect(
+        await authority.authorizeControlGrant({
+          sessionBearer: otherContext.sessionBearer,
+          eventGameId: "game-1",
+        }),
       ).toMatchObject({ status: "authorized", grantSessionId: otherContext.grantSessionId });
       expect(
-        await authority.authorizeControlGrant({ sessionBearer: replacement.sessionBearer }),
+        await authority.authorizeControlGrant({
+          sessionBearer: replacement.sessionBearer,
+          eventGameId: "game-1",
+        }),
       ).toMatchObject({ status: "authorized", grantSessionId: replacement.grantSessionId });
 
       const sessions = await readGrantSessions(authority, created.grantId);
@@ -189,7 +202,10 @@ export function registerGrantAuthorityContract(
         }),
       ).toEqual(GENERIC_GRANT_ADMISSION_FAILURE);
       expect(
-        await authority.authorizeControlGrant({ sessionBearer: admitted.sessionBearer }),
+        await authority.authorizeControlGrant({
+          sessionBearer: admitted.sessionBearer,
+          eventGameId: "game-1",
+        }),
       ).toMatchObject({ status: "rejected" });
 
       const lifecycle = await storage.transaction((transaction) => ({
@@ -208,6 +224,45 @@ export function registerGrantAuthorityContract(
       );
     });
   });
+
+  register(
+    "rejects malformed eligible Event Game identities without admission mutation",
+    async () => {
+      await withStorage(createStorage, async (storage) => {
+        let eventGameId = "game-1";
+        const authority = createAuthority(storage, {
+          resolve: () => ({ status: "eligible", eventGameId }),
+        });
+        const created = await createGrant(authority);
+        for (const malformed of ["", "game-☃", "g".repeat(129)]) {
+          eventGameId = malformed;
+          const before = await storage.transaction((transaction) => ({
+            sessions: transaction.listGrantSessions(created.grantId),
+            audits: transaction.listGrantAudit(created.grantId),
+          }));
+          expect(
+            await authority.admitControlGrant({
+              qrCredential: created.qrCredential,
+              browserContext: "browser-malformed-scope",
+            }),
+          ).toEqual(GENERIC_GRANT_ADMISSION_FAILURE);
+          expect(
+            await storage.transaction((transaction) => ({
+              sessions: transaction.listGrantSessions(created.grantId),
+              audits: transaction.listGrantAudit(created.grantId),
+            })),
+          ).toEqual(before);
+        }
+        eventGameId = "game-1";
+        expect(
+          await authority.admitControlGrant({
+            qrCredential: created.qrCredential,
+            browserContext: "browser-malformed-scope",
+          }),
+        ).toMatchObject({ status: "admitted", eventGameId: "game-1" });
+      });
+    },
+  );
 
   register("rejects repeated Grant status transitions without audit mutation", async () => {
     await withStorage(createStorage, async (storage) => {
@@ -487,6 +542,510 @@ export function registerGrantAuthorityContract(
     });
   });
 
+  register("binds Grant Sessions to eligible Event Games through reassignment", async () => {
+    await withStorage(createStorage, async (storage) => {
+      let currentEventGameId = "game-1";
+      let relationship: ControlGrantSessionResolution = {
+        status: "current",
+        eventGameId: "game-1",
+      };
+      const authority = createAuthority(storage, {
+        resolve: () => ({ status: "eligible", eventGameId: currentEventGameId }),
+        resolveSession: (_scope, sessionEventGameId) =>
+          sessionEventGameId === "game-3"
+            ? { status: "current", eventGameId: "game-3" }
+            : relationship,
+      });
+      const created = await createGrant(authority);
+      const admitted = await admit(authority, created.qrCredential, "browser-bind");
+
+      relationship = {
+        status: "switchable",
+        previousEventGameId: "game-1",
+        currentEventGameId: "game-2",
+      };
+      currentEventGameId = "game-2";
+      expect(
+        await authority.authorizeControlGrant({
+          sessionBearer: admitted.sessionBearer,
+          eventGameId: "game-1",
+        }),
+      ).toMatchObject({
+        status: "switch-required",
+        previousEventGameId: "game-1",
+        currentEventGameId: "game-2",
+      });
+      expect(
+        await authority.authorizeControlGrant({
+          sessionBearer: admitted.sessionBearer,
+          eventGameId: "game-1",
+          controlSessionDecision: "stay",
+        }),
+      ).toMatchObject({ status: "authorized", eventGameId: "game-1" });
+      expect(await authority.acceptControlGrantSessionSwitch(admitted)).toEqual({
+        status: "switched",
+        grantId: created.grantId,
+        grantVersion: created.grantVersion,
+        grantSessionId: admitted.grantSessionId,
+        previousEventGameId: "game-1",
+        eventGameId: "game-2",
+      });
+      expect(
+        await authority.authorizeControlGrant({
+          sessionBearer: admitted.sessionBearer,
+          eventGameId: "game-1",
+        }),
+      ).toMatchObject({ status: "rejected" });
+      expect(
+        await authority.authorizeControlGrant({ sessionBearer: admitted.sessionBearer }),
+      ).toMatchObject({ status: "rejected" });
+
+      relationship = {
+        status: "pinned",
+        sessionEventGameId: "game-2",
+        currentEventGameId: "game-3",
+      };
+      currentEventGameId = "game-3";
+      expect(
+        await authority.authorizeControlGrant({
+          sessionBearer: admitted.sessionBearer,
+          eventGameId: "game-2",
+        }),
+      ).toMatchObject({ status: "authorized", eventGameId: "game-2" });
+      const fresh = await admit(authority, created.qrCredential, "browser-fresh");
+      expect(fresh.eventGameId).toBe("game-3");
+
+      const acceptedLockEvidence = { kind: "accepted-event-game-lock", eventGameId: "game-3" };
+      let lockHookEventGameId: string | null = null;
+      let failLockTransition = false;
+      const lockAuthority = createAuthority(storage, {
+        resolve: () => ({ status: "eligible", eventGameId: currentEventGameId }),
+        resolveSession: (_scope, sessionEventGameId) =>
+          sessionEventGameId === "game-3"
+            ? { status: "current", eventGameId: "game-3" }
+            : relationship,
+        resolveEventGameLock: (evidence) =>
+          evidence === acceptedLockEvidence
+            ? {
+                eventGameId: "game-3",
+                apply: () => {
+                  lockHookEventGameId = "game-3";
+                  if (failLockTransition) throw new Error("future Grant-Code mutation failed");
+                },
+              }
+            : null,
+      });
+      expect("lockControlGrantEventGame" in lockAuthority).toBe(false);
+      expect(
+        await lockAuthority.lockControlGrantEventGameForTest({
+          eventGameId: "game-3",
+        }),
+      ).toMatchObject({ status: "rejected" });
+      expect(
+        await lockAuthority.authorizeControlGrant({
+          sessionBearer: fresh.sessionBearer,
+          eventGameId: "game-3",
+        }),
+      ).toMatchObject({ status: "authorized", eventGameId: "game-3" });
+      expect(await lockAuthority.lockControlGrantEventGameForTest(acceptedLockEvidence)).toEqual({
+        status: "locked",
+        eventGameId: "game-3",
+        terminatedSessionCount: 1,
+      });
+      if (lockHookEventGameId !== "game-3") throw new Error("Expected the lock lifecycle hook.");
+      expect(
+        await lockAuthority.authorizeControlGrant({
+          sessionBearer: fresh.sessionBearer,
+          eventGameId: "game-3",
+        }),
+      ).toMatchObject({
+        status: "rejected",
+      });
+      expect(
+        await lockAuthority.authorizeControlGrant({
+          sessionBearer: admitted.sessionBearer,
+          eventGameId: "game-2",
+        }),
+      ).toMatchObject({ status: "authorized", eventGameId: "game-2" });
+
+      relationship = { status: "current", eventGameId: "game-3" };
+      const reopened = await admit(authority, created.qrCredential, "browser-reopened");
+      expect(reopened.eventGameId).toBe("game-3");
+      failLockTransition = true;
+      expect(await lockAuthority.lockControlGrantEventGameForTest(acceptedLockEvidence)).toEqual({
+        status: "rejected",
+        reason: "unavailable",
+      });
+      expect(
+        await lockAuthority.authorizeControlGrant({
+          sessionBearer: reopened.sessionBearer,
+          eventGameId: "game-3",
+        }),
+      ).toMatchObject({ status: "authorized", eventGameId: "game-3" });
+      const audit = await readGrantAudit(authority, created.grantId);
+      expect(audit).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            action: "session-switched",
+            previousEventGameId: "game-1",
+            eventGameId: "game-2",
+          }),
+          expect.objectContaining({
+            action: "session-terminated",
+            terminalReason: "game-locked",
+          }),
+        ]),
+      );
+    });
+  });
+
+  register(
+    "validates repeated Control Grant Session switches as an ordered immutable chain",
+    async () => {
+      await withStorage(createStorage, async (storage) => {
+        let relationship: ControlGrantSessionResolution = {
+          status: "current",
+          eventGameId: "game-1",
+        };
+        const authority = createAuthority(storage, { resolveSession: () => relationship });
+        const created = await createGrant(authority);
+        const admitted = await admit(authority, created.qrCredential, "browser-switch-chain");
+        relationship = {
+          status: "switchable",
+          previousEventGameId: "game-1",
+          currentEventGameId: "game-2",
+        };
+        expect(await authority.acceptControlGrantSessionSwitch(admitted)).toMatchObject({
+          status: "switched",
+          previousEventGameId: "game-1",
+          eventGameId: "game-2",
+        });
+        relationship = {
+          status: "switchable",
+          previousEventGameId: "game-2",
+          currentEventGameId: "game-3",
+        };
+        expect(await authority.acceptControlGrantSessionSwitch(admitted)).toMatchObject({
+          status: "switched",
+          previousEventGameId: "game-2",
+          eventGameId: "game-3",
+        });
+        const snapshot = await storage.transaction((transaction) => ({
+          grant: transaction.findGrantById(created.grantId),
+          sessions: transaction.listGrantSessions(created.grantId),
+          audits: transaction.listGrantAudit(created.grantId),
+        }));
+        expect(snapshot.grant).not.toBeNull();
+        const switches = snapshot.audits.filter((audit) => audit.action === "session-switched");
+        expect(switches).toHaveLength(2);
+        expect(await storage.readiness()).toMatchObject({ ok: true });
+        const firstSwitch = switches[0];
+        expect(firstSwitch).not.toBeUndefined();
+        if (snapshot.grant === null || firstSwitch === undefined)
+          throw new Error("Expected repeated-switch evidence.");
+        const tampered = snapshot.audits.map((audit) =>
+          audit.auditId === firstSwitch.auditId
+            ? { ...audit, previousEventGameId: "game-3" }
+            : audit,
+        );
+        expect(validateGrantState([snapshot.grant], snapshot.sessions, tampered)).not.toBeNull();
+      });
+    },
+  );
+
+  register("binds Grant Session state to admission provenance", async () => {
+    await withStorage(createStorage, async (storage) => {
+      const authority = createAuthority(storage);
+      const created = await createGrant(authority);
+      const admitted = await admit(authority, created.qrCredential, "browser-admission-provenance");
+      const snapshot = await storage.transaction((transaction) => ({
+        grant: transaction.findGrantById(created.grantId),
+        sessions: transaction.listGrantSessions(created.grantId),
+        audits: transaction.listGrantAudit(created.grantId),
+      }));
+      if (snapshot.grant === null) throw new Error("Expected the stored Grant.");
+      expect(
+        validateGrantState(
+          [snapshot.grant],
+          snapshot.sessions.map((session) =>
+            session.sessionId === admitted.grantSessionId
+              ? { ...session, eventGameId: "game-forged" }
+              : session,
+          ),
+          snapshot.audits,
+        ),
+      ).not.toBeNull();
+      const admission = snapshot.audits.find(
+        (audit) =>
+          audit.action === "session-admitted" && audit.sessionId === admitted.grantSessionId,
+      );
+      if (admission === undefined) throw new Error("Expected admission provenance.");
+      for (const tampered of [
+        { ...admission, grantId: "grant-forged" },
+        { ...admission, grantVersion: "grant-version-forged" },
+        { ...admission, eventGameId: "game-forged" },
+      ]) {
+        expect(
+          validateGrantState(
+            [snapshot.grant],
+            snapshot.sessions,
+            snapshot.audits.map((audit) =>
+              audit.auditId === admission.auditId ? tampered : audit,
+            ),
+          ),
+        ).not.toBeNull();
+      }
+    });
+  });
+
+  register(
+    "authorizes content-bound same Event Game replay across devices and Grant rotation",
+    async () => {
+      await withStorage(createStorage, async (storage) => {
+        let currentEventGameId = "game-1";
+        const replayEvidenceId = "replay-content-1";
+        let replay: ControlGrantReplayResolution = { status: "eligible", eventGameId: "game-1" };
+        const authority = createAuthority(storage, {
+          resolve: () => ({ status: "eligible", eventGameId: currentEventGameId }),
+          resolveReplay: (_scope, eventGameId, evidenceId) =>
+            replay.status === "eligible" &&
+            (replay.eventGameId !== eventGameId || evidenceId !== replayEvidenceId)
+              ? { status: "mismatch" }
+              : replay,
+        });
+        const created = await createGrant(authority);
+        const originating = await admit(authority, created.qrCredential, "browser-origin");
+        const unrelated = await admit(authority, created.qrCredential, "browser-unrelated");
+        const replacement = await admit(authority, created.qrCredential, "browser-fresh-device");
+        expect(replacement.eventGameId).toBe("game-1");
+        expect(
+          await authority.authorizeControlGrantReplay({
+            sessionBearer: replacement.sessionBearer,
+            originatingSessionId: replacement.grantSessionId,
+            eventGameId: "game-1",
+            replayEvidenceId,
+          }),
+        ).toMatchObject({ status: "rejected" });
+        expect(
+          await authority.authorizeControlGrantReplay({
+            sessionBearer: replacement.sessionBearer,
+            originatingSessionId: originating.grantSessionId,
+            eventGameId: "game-1",
+            replayEvidenceId,
+          }),
+        ).toMatchObject({ status: "rejected" });
+        await admit(authority, created.qrCredential, "browser-origin");
+        expect(
+          await authority.authorizeControlGrant({
+            sessionBearer: originating.sessionBearer,
+            eventGameId: "game-1",
+          }),
+        ).toMatchObject({ status: "rejected" });
+
+        currentEventGameId = "game-2";
+        expect(
+          await authority.authorizeControlGrantReplay({
+            sessionBearer: replacement.sessionBearer,
+            originatingSessionId: unrelated.grantSessionId,
+            eventGameId: "game-1",
+            replayEvidenceId: "unrelated-content",
+          }),
+        ).toMatchObject({ status: "rejected" });
+        expect(
+          await authority.authorizeControlGrantReplay({
+            sessionBearer: replacement.sessionBearer,
+            originatingSessionId: originating.grantSessionId,
+            eventGameId: "game-1",
+            replayEvidenceId,
+          }),
+        ).toMatchObject({
+          status: "authorized",
+          grantSessionId: replacement.grantSessionId,
+          originatingSessionId: originating.grantSessionId,
+          eventGameId: "game-1",
+          replayEvidenceId,
+        });
+        expect(await readGrantAudit(authority, created.grantId)).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              action: "replay-authorized",
+              sessionId: replacement.grantSessionId,
+              replacedSessionId: originating.grantSessionId,
+              replayEvidenceId,
+            }),
+          ]),
+        );
+        const replaySnapshot = await storage.transaction((transaction) => ({
+          grant: transaction.findGrantById(created.grantId),
+          sessions: transaction.listGrantSessions(created.grantId),
+          audits: transaction.listGrantAudit(created.grantId),
+        }));
+        if (replaySnapshot.grant === null) throw new Error("Expected replay Grant state.");
+        const replayAudit = replaySnapshot.audits.find(
+          (audit) => audit.action === "replay-authorized",
+        );
+        if (replayAudit === undefined) throw new Error("Expected replay provenance.");
+        expect(
+          validateGrantState(
+            [replaySnapshot.grant],
+            replaySnapshot.sessions,
+            replaySnapshot.audits.map((audit) =>
+              audit.auditId === replayAudit.auditId
+                ? { ...audit, replacedSessionId: replayAudit.sessionId }
+                : audit,
+            ),
+          ),
+        ).not.toBeNull();
+        expect(
+          validateGrantState(
+            [replaySnapshot.grant],
+            replaySnapshot.sessions.map((session) =>
+              session.sessionId === originating.grantSessionId
+                ? { ...session, status: "active", revokedAtMs: null }
+                : session,
+            ),
+            replaySnapshot.audits,
+          ),
+        ).not.toBeNull();
+
+        replay = { status: "finished" };
+        expect(
+          await authority.authorizeControlGrantReplay({
+            sessionBearer: replacement.sessionBearer,
+            originatingSessionId: originating.grantSessionId,
+            eventGameId: "game-1",
+            replayEvidenceId,
+          }),
+        ).toMatchObject({ status: "rejected" });
+        expect(await authority.rotateControlGrant(created.grantId, createActor())).toMatchObject({
+          status: "updated",
+        });
+        expect(
+          await authority.authorizeControlGrant({
+            sessionBearer: replacement.sessionBearer,
+            eventGameId: "game-1",
+          }),
+        ).toMatchObject({ status: "rejected" });
+        currentEventGameId = "game-1";
+        const rotatedCredential = await authority.revealControlGrant(
+          created.grantId,
+          createActor(),
+        );
+        expect(rotatedCredential.status).toBe("revealed");
+        if (rotatedCredential.status !== "revealed")
+          throw new Error("Expected the rotated Grant credential.");
+        replay = { status: "eligible", eventGameId: "game-1" };
+        const postRotation = await admit(
+          authority,
+          rotatedCredential.qrCredential,
+          "browser-post-rotation",
+        );
+        expect(
+          await authority.authorizeControlGrantReplay({
+            sessionBearer: postRotation.sessionBearer,
+            originatingSessionId: originating.grantSessionId,
+            eventGameId: "game-1",
+            replayEvidenceId,
+          }),
+        ).toMatchObject({ status: "authorized", eventGameId: "game-1" });
+        expect(
+          await authority.authorizeControlGrantReplay({
+            sessionBearer: postRotation.sessionBearer,
+            originatingSessionId: originating.grantSessionId,
+            eventGameId: "game-2",
+            replayEvidenceId,
+          }),
+        ).toMatchObject({ status: "rejected" });
+
+        const otherGrantResult = await authority.createControlGrant({
+          scope: { ...createScope(), pitchSlotId: "slot-other-grant" },
+          actor: createActor(),
+        });
+        expect(otherGrantResult.status).toBe("created");
+        if (otherGrantResult.status !== "created") throw new Error("Expected the unrelated Grant.");
+        const otherOrigin = await admit(
+          authority,
+          otherGrantResult.qrCredential,
+          "browser-other-grant",
+        );
+        expect(
+          await authority.authorizeControlGrantReplay({
+            sessionBearer: postRotation.sessionBearer,
+            originatingSessionId: otherOrigin.grantSessionId,
+            eventGameId: "game-1",
+            replayEvidenceId,
+          }),
+        ).toMatchObject({ status: "rejected" });
+
+        const revokedGrantResult = await authority.createControlGrant({
+          scope: { ...createScope(), pitchSlotId: "slot-revoked" },
+          actor: createActor(),
+        });
+        expect(revokedGrantResult.status).toBe("created");
+        if (revokedGrantResult.status !== "created")
+          throw new Error("Expected a revoked replay Grant.");
+        const revokedGrant = revokedGrantResult;
+        const revokedOrigin = await admit(authority, revokedGrant.qrCredential, "browser-revoked");
+        const revokedReplacement = await admit(
+          authority,
+          revokedGrant.qrCredential,
+          "browser-revoked-fresh",
+        );
+        expect(
+          await authority.revokeControlGrant(revokedGrant.grantId, createActor()),
+        ).toMatchObject({
+          status: "updated",
+        });
+        expect(
+          await authority.authorizeControlGrantReplay({
+            sessionBearer: revokedReplacement.sessionBearer,
+            originatingSessionId: revokedOrigin.grantSessionId,
+            eventGameId: "game-1",
+            replayEvidenceId,
+          }),
+        ).toMatchObject({ status: "rejected" });
+        const unavailableReplayAuthority = createAuthority(storage, {
+          resolve: () => ({ status: "eligible", eventGameId: "game-1" }),
+        });
+        expect(
+          await unavailableReplayAuthority.authorizeControlGrantReplay({
+            sessionBearer: postRotation.sessionBearer,
+            originatingSessionId: originating.grantSessionId,
+            eventGameId: "game-1",
+            replayEvidenceId,
+          }),
+        ).toMatchObject({ status: "rejected" });
+      });
+    },
+  );
+
+  register("rejects malformed Grant Session lifecycle relationships", async () => {
+    await withStorage(createStorage, async (storage) => {
+      let relationship: ControlGrantSessionResolution = {
+        status: "current",
+        eventGameId: "game-1",
+      };
+      const authority = createAuthority(storage, { resolveSession: () => relationship });
+      const created = await createGrant(authority);
+      const admitted = await admit(authority, created.qrCredential, "browser-malformed");
+      const malformed: ControlGrantSessionResolution[] = [
+        { status: "current", eventGameId: "game-2" },
+        { status: "switchable", previousEventGameId: "game-2", currentEventGameId: "game-2" },
+        { status: "pinned", sessionEventGameId: "game-2", currentEventGameId: "game-3" },
+        { status: "game-locked", eventGameId: "game-2" },
+      ];
+      for (const candidate of malformed) {
+        relationship = candidate;
+        expect(
+          await authority.authorizeControlGrant({
+            sessionBearer: admitted.sessionBearer,
+            eventGameId: "game-1",
+          }),
+        ).toMatchObject({ status: "rejected" });
+      }
+    });
+  });
+
   registerGrantRotationContract(register, createStorage);
 }
 
@@ -544,7 +1103,10 @@ async function runGrantScenario(storage: FoundationStorage): Promise<void> {
   expect(admitted.eventGameId).toBe("game-1");
   expect(admitted.sessionBearer).toEqual(expect.any(String));
   expect(
-    await authority.authorizeControlGrant({ sessionBearer: admitted.sessionBearer }),
+    await authority.authorizeControlGrant({
+      sessionBearer: admitted.sessionBearer,
+      eventGameId: "game-1",
+    }),
   ).toMatchObject({
     status: "authorized",
     grantId: created.grantId,
@@ -589,9 +1151,23 @@ function createAuthority(
     randomness?: GrantRandomness;
     nowMs?: () => number;
     resolve?: (scope: ControlGrantScope) => ControlGrantScopeResolution;
+    resolveSession?: (
+      scope: ControlGrantScope,
+      sessionEventGameId: string,
+    ) => ControlGrantSessionResolution;
+    resolveReplay?: (
+      scope: ControlGrantScope,
+      eventGameId: string,
+      replayEvidenceId: string,
+    ) => ControlGrantReplayResolution;
+    resolveEventGameLock?: NonNullable<
+      GrantAuthorityOptions["controlGrantLifecycle"]
+    >["resolveEventGameLock"];
   } = {},
-): GrantAuthority {
-  return createLegacyControlGrantTestAuthority(storage, {
+): GrantAuthority & {
+  lockControlGrantEventGameForTest(evidence: unknown): Promise<unknown>;
+} {
+  const options: GrantAuthorityOptions = {
     environmentId: configuration.environmentId ?? "test-environment",
     clock: { nowMs: configuration.nowMs ?? (() => 1_000) },
     randomness: configuration.randomness ?? createDeterministicRandomness(),
@@ -603,8 +1179,21 @@ function createAuthority(
         expect(scope).toEqual(createScope());
         return { status: "eligible", eventGameId: "game-1" };
       },
+      resolveSession: configuration.resolveSession,
+      resolveReplay: configuration.resolveReplay,
     },
+    controlGrantLifecycle:
+      configuration.resolveEventGameLock === undefined
+        ? undefined
+        : { resolveEventGameLock: configuration.resolveEventGameLock },
+  };
+  const authority = createLegacyControlGrantTestAuthority(storage, options) as GrantAuthority & {
+    lockControlGrantEventGameForTest(evidence: unknown): Promise<unknown>;
+  };
+  Object.defineProperty(authority, "lockControlGrantEventGameForTest", {
+    value: (evidence: unknown) => lockControlGrantEventGame(storage, options, evidence),
   });
+  return authority;
 }
 
 export function createGrantTestScope(): ControlGrantScope {

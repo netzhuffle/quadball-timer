@@ -1,6 +1,7 @@
 import { GRANT_CREDENTIAL_FORMAT_VERSION, GRANT_TYPE } from "@/lib/grant-types";
 import type {
   ControlGrantScope,
+  ControlGrantSessionDecision,
   GrantAuthorityActor,
   GrantSessionSummary,
   StoredGrantAuditEntry,
@@ -63,6 +64,8 @@ export type AdmitControlGrantResult =
 
 export type AuthorizeControlGrantInput = {
   sessionBearer: string;
+  eventGameId?: string;
+  controlSessionDecision?: ControlGrantSessionDecision;
 };
 
 export type AuthorizeControlGrantResult =
@@ -74,6 +77,28 @@ export type AuthorizeControlGrantResult =
       scope: ControlGrantScope;
       eventGameId: string;
       grantSessionId: string;
+    }
+  | typeof GENERIC_GRANT_AUTHORIZATION_FAILURE;
+
+export type ControlGrantSessionSwitchResult =
+  | {
+      status: "switched";
+      grantId: string;
+      grantVersion: string;
+      grantSessionId: string;
+      previousEventGameId: string;
+      eventGameId: string;
+    }
+  | typeof GENERIC_GRANT_AUTHORIZATION_FAILURE;
+
+export type ControlGrantReplayAuthorizationResult =
+  | {
+      status: "authorized";
+      grantId: string;
+      grantVersion: string;
+      grantSessionId: string;
+      originatingSessionId: string;
+      eventGameId: string;
     }
   | typeof GENERIC_GRANT_AUTHORIZATION_FAILURE;
 
@@ -122,8 +147,18 @@ export type GrantAuthority = {
     grantId: string,
     actor: GrantAuthorityActor,
   ): Promise<RotateControlGrantCredentialKeysResult>;
+  rotateControlGrant(grantId: string, actor: GrantAuthorityActor): Promise<GrantMutationResult>;
   admitControlGrant(input: AdmitControlGrantInput): Promise<AdmitControlGrantResult>;
   authorizeControlGrant(input: AuthorizeControlGrantInput): Promise<AuthorizeControlGrantResult>;
+  acceptControlGrantSessionSwitch(input: {
+    sessionBearer: string;
+  }): Promise<ControlGrantSessionSwitchResult>;
+  authorizeControlGrantReplay(input: {
+    sessionBearer: string;
+    originatingSessionId: string;
+    eventGameId: string;
+    replayEvidenceId: string;
+  }): Promise<ControlGrantReplayAuthorizationResult>;
   disableControlGrant(grantId: string, actor: GrantAuthorityActor): Promise<GrantMutationResult>;
   revokeControlGrant(grantId: string, actor: GrantAuthorityActor): Promise<GrantMutationResult>;
   listGrantSessions(

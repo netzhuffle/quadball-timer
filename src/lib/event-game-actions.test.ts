@@ -519,6 +519,7 @@ async function readSnapshot(
     readRecordMetadata: () => metadata,
     listAuditEntries: () => audits,
     findGrantById: () => null,
+    listGrants: () => [],
     findGrantByCredentialLookupDigest: () => null,
     findActiveSessionByGrantAndContext: () => null,
     findSessionByBearerVerifier: () => null,

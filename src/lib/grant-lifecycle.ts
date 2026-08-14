@@ -35,6 +35,8 @@ export function createAuditEntry(
     sessionId: string | null;
     replacedSessionId: string | null;
     eventGameId: string | null;
+    previousEventGameId?: string | null;
+    replayEvidenceId?: string | null;
     beforeStatus: StoredGrantStatus | null;
     afterStatus: StoredGrantStatus | null;
     beforeExpiresAtMs?: number | null;
@@ -55,6 +57,8 @@ export function createAuditEntry(
     sessionId: input.sessionId,
     replacedSessionId: input.replacedSessionId,
     eventGameId: input.eventGameId,
+    previousEventGameId: input.previousEventGameId ?? null,
+    replayEvidenceId: input.replayEvidenceId ?? null,
     credentialKind: GRANT_CREDENTIAL_KIND,
     credentialFingerprint: input.grant.credential.fingerprint.startsWith(
       OPAQUE_MIGRATION_CREDENTIAL_REFERENCE_PREFIX,

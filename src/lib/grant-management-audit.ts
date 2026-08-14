@@ -24,6 +24,8 @@ export function auditInput(
   terminalReason: TerminalGrantSessionReason | null = null,
   beforeExpiresAtMs: number | null = null,
   afterExpiresAtMs: number | null = null,
+  previousEventGameId: string | null = null,
+  replayEvidenceId: string | null = null,
 ) {
   let actor:
     | { kind: "authority"; value: GrantAuthorityActor }
@@ -48,6 +50,8 @@ export function auditInput(
     sessionId,
     replacedSessionId,
     eventGameId,
+    previousEventGameId,
+    replayEvidenceId,
     beforeStatus,
     afterStatus,
     beforeExpiresAtMs,

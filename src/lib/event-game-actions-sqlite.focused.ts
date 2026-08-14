@@ -922,7 +922,7 @@ describe("SQLite immutable Event Game actions", () => {
       database.close();
 
       const current = openSqliteFoundationStorage(databasePath);
-      expect((await current.applyMigrations()).schemaVersion).toBe(14);
+      expect((await current.applyMigrations()).schemaVersion).toBe(16);
       const currentRecord = createRecord(current, root);
       expect(await currentRecord.registerRoot(root)).toMatchObject({ status: "idempotent" });
       expect(await currentRecord.readiness()).toMatchObject({ ok: true, actionCount: 1 });
@@ -937,7 +937,7 @@ describe("SQLite immutable Event Game actions", () => {
       await seedLegacyConflictHistory(databasePath, root);
 
       const storage = openSqliteFoundationStorage(databasePath);
-      expect((await storage.applyMigrations()).schemaVersion).toBe(14);
+      expect((await storage.applyMigrations()).schemaVersion).toBe(16);
       const record = createRecord(storage, root);
       expect(await record.registerRoot(root)).toMatchObject({ status: "idempotent" });
       expect(await record.readiness()).toMatchObject({ ok: true, actionCount: 3 });
@@ -958,7 +958,7 @@ describe("SQLite immutable Event Game actions", () => {
       await seedLegacyConflictHistory(databasePath, root);
 
       const storage = openSqliteFoundationStorage(databasePath);
-      expect((await storage.applyMigrations()).schemaVersion).toBe(14);
+      expect((await storage.applyMigrations()).schemaVersion).toBe(16);
       const record = createRecord(storage, root);
       expect(await record.registerRoot(root)).toMatchObject({ status: "idempotent" });
       expect(
