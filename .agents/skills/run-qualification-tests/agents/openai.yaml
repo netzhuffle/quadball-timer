@@ -1,0 +1,4 @@
+interface:
+  display_name: "Run Qualification Tests"
+  short_description: "Run one registered qualification test through guarded preflight"
+  default_prompt: "Run the explicitly requested registered qualification test after checking the testing policy and safety boundaries."
