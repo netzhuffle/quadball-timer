@@ -46,6 +46,9 @@ import {
   type StoredReplayReservation,
   type StoredEventGameRecordMetadata,
   type StoredEventGameRecordRoot,
+  type StoredEventCatalogEvent,
+  type StoredEventCatalogGameDay,
+  type EventCatalogAuditEntry,
 } from "@/lib/foundation-storage";
 import type {
   AcceptanceIntegrityAnchor,
@@ -185,6 +188,45 @@ function readIntegrityAnchor(value: unknown): AcceptanceIntegrityAnchor {
   };
 }
 
+function readEvent(value: unknown): StoredEventCatalogEvent | null {
+  if (value === null || value === undefined) return null;
+  const row = value as Record<string, unknown>;
+  return {
+    eventId: String(row.eventId),
+    name: String(row.name),
+    timeZone: String(row.timeZone),
+    publicationStatus: "unpublished",
+    createdAtMs: Number(row.createdAtMs),
+    updatedAtMs: Number(row.updatedAtMs),
+  };
+}
+
+function readGameDay(value: unknown): StoredEventCatalogGameDay {
+  const row = value as Record<string, unknown>;
+  return {
+    gameDayId: String(row.gameDayId),
+    eventId: String(row.eventId),
+    date: String(row.date),
+    createdAtMs: Number(row.createdAtMs),
+    updatedAtMs: Number(row.updatedAtMs),
+  };
+}
+
+function readEventAudit(value: unknown): EventCatalogAuditEntry {
+  const row = value as Record<string, unknown>;
+  return {
+    auditId: String(row.auditId),
+    operationId: String(row.operationId),
+    action: String(row.action) as EventCatalogAuditEntry["action"],
+    eventId: String(row.eventId),
+    gameDayId: row.gameDayId === null ? null : String(row.gameDayId as string),
+    actorReference: String(row.actorReference),
+    occurredAtMs: Number(row.occurredAtMs),
+    before: row.beforeJson === null ? null : JSON.parse(String(row.beforeJson as string)),
+    after: JSON.parse(String(row.afterJson)),
+  };
+}
+
 type SqlStatement = ReturnType<Database["query"]>;
 
 type RootStatements = {
@@ -223,6 +265,17 @@ type RootStatements = {
   insertReceipt: SqlStatement;
   updateReceipt: SqlStatement;
   insertAnchor: SqlStatement;
+  eventById: SqlStatement;
+  allEvents: SqlStatement;
+  gameDaysByEventId: SqlStatement;
+  eventAuditsByEventId: SqlStatement;
+  insertEvent: SqlStatement;
+  updateEvent: SqlStatement;
+  deleteEvent: SqlStatement;
+  insertGameDay: SqlStatement;
+  updateGameDay: SqlStatement;
+  deleteGameDay: SqlStatement;
+  insertEventAudit: SqlStatement;
 };
 
 const ROOT_SELECT_COLUMNS = `
@@ -508,6 +561,15 @@ export class SqliteFoundationStorage implements FoundationStorage {
       },
       listAuditEntries: (recordId) =>
         this.readAuditByRecordId(statements.auditByRecordId, recordId),
+      findEvent: (eventId) => readEvent(statements.eventById.get(eventId)),
+      listEvents: () =>
+        statements.allEvents
+          .all()
+          .map(readEvent)
+          .filter((event): event is StoredEventCatalogEvent => event !== null),
+      listGameDays: (eventId) => statements.gameDaysByEventId.all(eventId).map(readGameDay),
+      listEventAuditTrail: (eventId) =>
+        statements.eventAuditsByEventId.all(eventId).map(readEventAudit),
       insertAction: (storedAction) => this.insertAction(statements, storedAction),
       upsertRecordMetadata: (metadata) => this.upsertRecordMetadata(statements, metadata),
       appendAuditEntry: (entry) => this.appendAuditEntry(statements, entry),
@@ -687,6 +749,52 @@ export class SqliteFoundationStorage implements FoundationStorage {
           anchor.keyVersion,
           anchor.canonicalValue,
           anchor.integrityTag,
+        ),
+      insertEvent: (event) =>
+        statements.insertEvent.run(
+          event.eventId,
+          event.name,
+          event.timeZone,
+          event.publicationStatus,
+          event.createdAtMs,
+          event.updatedAtMs,
+        ),
+      updateEvent: (event) =>
+        statements.updateEvent.run(
+          event.name,
+          event.timeZone,
+          event.publicationStatus,
+          event.updatedAtMs,
+          event.eventId,
+        ),
+      deleteEvent: (eventId) => statements.deleteEvent.run(eventId),
+      insertGameDay: (gameDay) =>
+        statements.insertGameDay.run(
+          gameDay.gameDayId,
+          gameDay.eventId,
+          gameDay.date,
+          gameDay.createdAtMs,
+          gameDay.updatedAtMs,
+        ),
+      updateGameDay: (gameDay) =>
+        statements.updateGameDay.run(
+          gameDay.eventId,
+          gameDay.date,
+          gameDay.updatedAtMs,
+          gameDay.gameDayId,
+        ),
+      deleteGameDay: (gameDayId) => statements.deleteGameDay.run(gameDayId),
+      appendEventAudit: (entry) =>
+        statements.insertEventAudit.run(
+          entry.auditId,
+          entry.operationId,
+          entry.action,
+          entry.eventId,
+          entry.gameDayId,
+          entry.actorReference,
+          entry.occurredAtMs,
+          entry.before === null ? null : JSON.stringify(entry.before),
+          JSON.stringify(entry.after),
         ),
     };
   }
@@ -938,6 +1046,64 @@ export class SqliteFoundationStorage implements FoundationStorage {
         INSERT INTO foundation_control_evidence_provenance
           (evidence_kind, evidence_id, evidence_format, origin)
         VALUES (?, ?, 'current', 'post-75-current')
+      `),
+      eventById: this.database.query(`
+        SELECT event_id AS eventId, name, time_zone AS timeZone,
+               publication_status AS publicationStatus, created_at_ms AS createdAtMs,
+               updated_at_ms AS updatedAtMs
+        FROM foundation_event_catalog_events WHERE event_id = ?
+      `),
+      allEvents: this.database.query(`
+        SELECT event_id AS eventId, name, time_zone AS timeZone,
+               publication_status AS publicationStatus, created_at_ms AS createdAtMs,
+               updated_at_ms AS updatedAtMs
+        FROM foundation_event_catalog_events ORDER BY event_id
+      `),
+      gameDaysByEventId: this.database.query(`
+        SELECT game_day_id AS gameDayId, event_id AS eventId, game_day_date AS date,
+               created_at_ms AS createdAtMs, updated_at_ms AS updatedAtMs
+        FROM foundation_event_catalog_game_days
+        WHERE event_id = ? ORDER BY game_day_date, game_day_id
+      `),
+      eventAuditsByEventId: this.database.query(`
+        SELECT audit_id AS auditId, operation_id AS operationId, action,
+               event_id AS eventId, game_day_id AS gameDayId,
+               actor_reference AS actorReference, occurred_at_ms AS occurredAtMs,
+               before_json AS beforeJson, after_json AS afterJson
+        FROM foundation_event_catalog_audit
+        WHERE event_id = ? ORDER BY occurred_at_ms, audit_id
+      `),
+      insertEvent: this.database.query(`
+        INSERT INTO foundation_event_catalog_events
+          (event_id, name, time_zone, publication_status, created_at_ms, updated_at_ms)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `),
+      updateEvent: this.database.query(`
+        UPDATE foundation_event_catalog_events
+        SET name = ?, time_zone = ?, publication_status = ?, updated_at_ms = ?
+        WHERE event_id = ?
+      `),
+      deleteEvent: this.database.query(
+        `DELETE FROM foundation_event_catalog_events WHERE event_id = ?`,
+      ),
+      insertGameDay: this.database.query(`
+        INSERT INTO foundation_event_catalog_game_days
+          (game_day_id, event_id, game_day_date, created_at_ms, updated_at_ms)
+        VALUES (?, ?, ?, ?, ?)
+      `),
+      updateGameDay: this.database.query(`
+        UPDATE foundation_event_catalog_game_days
+        SET event_id = ?, game_day_date = ?, updated_at_ms = ?
+        WHERE game_day_id = ?
+      `),
+      deleteGameDay: this.database.query(
+        `DELETE FROM foundation_event_catalog_game_days WHERE game_day_id = ?`,
+      ),
+      insertEventAudit: this.database.query(`
+        INSERT INTO foundation_event_catalog_audit
+          (audit_id, operation_id, action, event_id, game_day_id, actor_reference,
+           occurred_at_ms, before_json, after_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       `),
       budgetById: this.database.query(
         `SELECT * FROM foundation_acceptance_budgets WHERE bucket_id = ?`,

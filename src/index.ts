@@ -29,8 +29,19 @@ import {
   type AuthResult,
   type CeremonyBinding,
   type TechnicalAdminAuth,
+  type TechnicalAdminAuthority,
 } from "@/lib/technical-admin-auth";
 import { readTechnicalAdminConfig } from "@/lib/technical-admin-config";
+import {
+  createEventCatalog,
+  createFoundationEventCatalogStorage,
+  createUnavailableEventCatalogStorage,
+  type CatalogOutcome,
+} from "@/lib/event-catalog";
+import { createInMemoryFoundationStorage } from "@/lib/foundation-storage-memory";
+import { openSqliteFoundationStorage } from "@/lib/foundation-storage-sqlite";
+import type { FoundationStorage } from "@/lib/foundation-storage";
+import { createStartupCleanup } from "@/lib/startup-resources";
 
 type ManagedGame = {
   state: GameState;
@@ -75,395 +86,563 @@ async function main() {
     return;
   }
 
-  startServer();
+  await startServer();
 }
 
-function startServer() {
-  const port = Number(process.env.PORT ?? 3000);
-  const technicalAdminConfig = readTechnicalAdminConfig();
-  const { environment } = technicalAdminConfig;
-  const databasePath =
-    technicalAdminConfig.databasePath ?? `data/${environment}/technical-admin.sqlite`;
-  const technicalAdminRepository = createSqliteTechnicalAdminAuthRepository(databasePath, {
-    environment: technicalAdminConfig.environment,
-    origin: technicalAdminConfig.origin,
-    rpId: technicalAdminConfig.rpId,
-  });
-  const technicalAdminAuth = createTechnicalAdminAuth(
-    technicalAdminConfig,
-    technicalAdminRepository,
-  );
-  technicalAdminAuth.storageStatus();
-  technicalAdminAuth.startRetentionMaintenance(createTechnicalAdminRetentionScheduler());
-  const tls =
-    process.env.TLS_CERT_FILE && process.env.TLS_KEY_FILE
-      ? { cert: Bun.file(process.env.TLS_CERT_FILE), key: Bun.file(process.env.TLS_KEY_FILE) }
-      : undefined;
-
+async function startServer() {
+  let technicalAdminRepository:
+    | ReturnType<typeof createSqliteTechnicalAdminAuthRepository>
+    | undefined;
+  let technicalAdminAuth!: ReturnType<typeof createTechnicalAdminAuth>;
+  let foundationStorage: FoundationStorage | undefined;
   let server: Bun.Server<SessionData> | undefined;
-  const shutdown = () => {
-    technicalAdminAuth.close();
-    technicalAdminRepository.close();
-    void server?.stop();
-  };
-  process.once("SIGTERM", shutdown);
-  process.once("SIGINT", shutdown);
+  let shutdown: (() => void) | undefined;
+  const startupCleanup = createStartupCleanup();
+  const cleanup = () => startupCleanup.run();
 
-  server = serve<SessionData>({
-    hostname: process.env.HOST ?? "127.0.0.1",
-    port,
-    ...(tls ? { tls } : {}),
-    routes: {
-      "/ws": (req: Bun.BunRequest<"/ws">, routeServer: Bun.Server<SessionData>) => {
-        if (!isAllowedWebSocketOrigin(req.headers.get("origin"), req.headers.get("host"))) {
+  try {
+    const port = Number(process.env.PORT ?? 3000);
+    const technicalAdminConfig = readTechnicalAdminConfig();
+    const { environment } = technicalAdminConfig;
+    const databasePath =
+      technicalAdminConfig.databasePath ?? `data/${environment}/technical-admin.sqlite`;
+    technicalAdminRepository = createSqliteTechnicalAdminAuthRepository(databasePath, {
+      environment: technicalAdminConfig.environment,
+      origin: technicalAdminConfig.origin,
+      rpId: technicalAdminConfig.rpId,
+    });
+    startupCleanup.add(() => technicalAdminRepository?.close());
+    technicalAdminAuth = createTechnicalAdminAuth(technicalAdminConfig, technicalAdminRepository);
+    startupCleanup.add(() => {
+      technicalAdminAuth.stopRetentionMaintenance();
+      technicalAdminAuth.close();
+    });
+    technicalAdminAuth.storageStatus();
+    technicalAdminAuth.startRetentionMaintenance(createTechnicalAdminRetentionScheduler());
+
+    const foundationDatabasePath =
+      process.env.FOUNDATION_DATABASE?.trim() || `data/${environment}/foundation.sqlite`;
+    let eventCatalogStorage;
+    let candidateFoundation: FoundationStorage | undefined;
+    try {
+      candidateFoundation =
+        environment === "test" && !process.env.FOUNDATION_DATABASE?.trim()
+          ? createInMemoryFoundationStorage()
+          : openSqliteFoundationStorage(foundationDatabasePath);
+      const readiness = await candidateFoundation.readiness();
+      if (readiness.ok) {
+        const readyFoundation = candidateFoundation;
+        foundationStorage = readyFoundation;
+        candidateFoundation = undefined;
+        startupCleanup.add(() => readyFoundation.close());
+        eventCatalogStorage = createFoundationEventCatalogStorage(readyFoundation);
+      } else {
+        candidateFoundation.close();
+        candidateFoundation = undefined;
+        eventCatalogStorage = createUnavailableEventCatalogStorage(
+          `Event catalog foundation storage is not ready: ${readiness.status}.`,
+        );
+      }
+    } catch (error) {
+      candidateFoundation?.close();
+      foundationStorage?.close();
+      foundationStorage = undefined;
+      eventCatalogStorage = createUnavailableEventCatalogStorage(
+        error instanceof Error
+          ? `Event catalog foundation storage is unavailable: ${error.message}`
+          : "Event catalog foundation storage is unavailable.",
+      );
+    }
+
+    const eventCatalog = createEventCatalog(eventCatalogStorage, {});
+    const tls =
+      process.env.TLS_CERT_FILE && process.env.TLS_KEY_FILE
+        ? { cert: Bun.file(process.env.TLS_CERT_FILE), key: Bun.file(process.env.TLS_KEY_FILE) }
+        : undefined;
+
+    shutdown = () => {
+      cleanup();
+    };
+    process.once("SIGTERM", shutdown);
+    process.once("SIGINT", shutdown);
+
+    server = serve<SessionData>({
+      hostname: process.env.HOST ?? "127.0.0.1",
+      port,
+      ...(tls ? { tls } : {}),
+      routes: {
+        "/ws": (req: Bun.BunRequest<"/ws">, routeServer: Bun.Server<SessionData>) => {
+          if (!isAllowedWebSocketOrigin(req.headers.get("origin"), req.headers.get("host"))) {
+            return json(
+              {
+                error: "WebSocket origin not allowed.",
+              },
+              403,
+            );
+          }
+
+          const upgraded = routeServer.upgrade(req, {
+            data: {
+              id: crypto.randomUUID(),
+              subscription: { type: "none" },
+            },
+          });
+
+          if (upgraded) {
+            return;
+          }
+
+          console.warn("WebSocket upgrade failed", {
+            url: req.url,
+            upgrade: req.headers.get("upgrade"),
+            connection: req.headers.get("connection"),
+          });
+
           return json(
             {
-              error: "WebSocket origin not allowed.",
+              error: "WebSocket upgrade failed.",
             },
-            403,
+            400,
           );
-        }
+        },
+        "/api/games": {
+          GET() {
+            const nowMs = Date.now();
+            const snapshots = [...games.values()]
+              .map((game) => projectGameSummary(game.state, nowMs))
+              .sort((a, b) => b.updatedAtMs - a.updatedAtMs);
 
-        const upgraded = routeServer.upgrade(req, {
-          data: {
-            id: crypto.randomUUID(),
-            subscription: { type: "none" },
+            return json({ games: snapshots });
           },
-        });
-
-        if (upgraded) {
-          return;
-        }
-
-        console.warn("WebSocket upgrade failed", {
-          url: req.url,
-          upgrade: req.headers.get("upgrade"),
-          connection: req.headers.get("connection"),
-        });
-
-        return json(
-          {
-            error: "WebSocket upgrade failed.",
+          POST(req: Request) {
+            return createGame(req);
           },
-          400,
-        );
-      },
-      "/api/games": {
-        GET() {
-          const nowMs = Date.now();
-          const snapshots = [...games.values()]
-            .map((game) => projectGameSummary(game.state, nowMs))
-            .sort((a, b) => b.updatedAtMs - a.updatedAtMs);
-
-          return json({ games: snapshots });
         },
-        POST(req: Request) {
-          return createGame(req);
-        },
-      },
-      "/api/games/:gameId": {
-        GET(req: Request) {
-          const gameId = new URL(req.url).pathname.replace("/api/games/", "");
-          const game = games.get(gameId);
-          if (game === undefined) {
-            return json({ error: "Game not found." }, 404);
-          }
-
-          return json({ game: projectGameView(game.state, Date.now()) });
-        },
-      },
-      "/api/admin/enrollment/options": {
-        async POST(req: Request) {
-          const body = await readJsonRecord(req);
-          const token = body?.token;
-          if (typeof token !== "string") return genericAuthFailure(400);
-          const result = technicalAdminAuth.beginEnrollment(token, requestBinding(req));
-          return result.ok
-            ? sensitiveJson(result.value)
-            : genericAuthFailure(result.error === "not-enrollable" ? 409 : 401);
-        },
-      },
-      "/api/admin/enrollment/complete": {
-        async POST(req: Request) {
-          const body = await readCeremonyBody(req);
-          if (body === null) {
-            return genericAuthFailure(400);
-          }
-          const result = await technicalAdminAuth.completeEnrollment(
-            body.challengeId,
-            body.response,
-            requestBinding(req),
-            technicalAdminAuth.correlateSource(
-              requestSource(req, technicalAdminConfig.trustProxyHeaders),
-            ),
-          );
-          return result.ok ? sensitiveJson({ enrolled: true }) : authFailureResponse(result);
-        },
-      },
-      "/api/admin/authentication/options": {
-        POST(req: Request) {
-          const result = technicalAdminAuth.beginAuthentication(requestBinding(req));
-          return result.ok ? sensitiveJson(result.value) : genericAuthFailure(401);
-        },
-      },
-      "/api/admin/authentication/complete": {
-        async POST(req: Request) {
-          const body = await readCeremonyBody(req);
-          if (body === null) {
-            return genericAuthFailure(400);
-          }
-          const result = await technicalAdminAuth.completeAuthentication(
-            body.challengeId,
-            body.response,
-            requestBinding(req),
-            technicalAdminAuth.correlateSource(
-              requestSource(req, technicalAdminConfig.trustProxyHeaders),
-            ),
-          );
-          if (!result.ok) return authFailureResponse(result);
-          return sensitiveJson({ authenticated: true }, 200, [
-            ["set-cookie", technicalAdminCookie(result.value.token)],
-            ["set-cookie", technicalAdminCsrfCookie(result.value.csrfToken)],
-          ]);
-        },
-      },
-      "/api/admin/session": {
-        GET(req: Request) {
-          const token = readTechnicalAdminCookie(req.headers.get("cookie"));
-          if (token === null || !technicalAdminAuth.authenticateSession(token))
-            return genericAuthFailure(401);
-          return sensitiveJson({
-            authenticated: true,
-            environment,
-            activeSessionCount: technicalAdminAuth.activeSessionCount(),
-          });
-        },
-      },
-      "/api/admin/logout": {
-        POST(req: Request) {
-          const token = requireAdminMutation(req, technicalAdminAuth);
-          if (token === null) return genericAuthFailure(401);
-          technicalAdminAuth.logout(token);
-          return sensitiveJson({ loggedOut: true }, 200, [
-            ["set-cookie", clearTechnicalAdminCookie()],
-            ["set-cookie", clearTechnicalAdminCsrfCookie()],
-          ]);
-        },
-      },
-      "/api/admin/step-up/options": {
-        async POST(req: Request) {
-          const token = requireAdminMutation(req, technicalAdminAuth);
-          if (token === null) return genericAuthFailure(401);
-          const body = await readJsonRecord(req);
-          const purpose = body?.purpose;
-          if (purpose !== "replace-credential" && purpose !== "revoke-other-sessions") {
-            return genericAuthFailure(400);
-          }
-          const result = technicalAdminAuth.beginFreshVerification(
-            token,
-            purpose,
-            requestBinding(req),
-          );
-          return result.ok ? sensitiveJson(result.value) : genericAuthFailure(401);
-        },
-      },
-      "/api/admin/step-up/complete": {
-        async POST(req: Request) {
-          const token = requireAdminMutation(req, technicalAdminAuth);
-          if (token === null) return genericAuthFailure(401);
-          const body = await readCeremonyBody(req);
-          if (body === null) {
-            return genericAuthFailure(400);
-          }
-          const result = await technicalAdminAuth.completeFreshVerification(
-            token,
-            body.challengeId,
-            body.response,
-            requestBinding(req),
-            technicalAdminAuth.correlateSource(
-              requestSource(req, technicalAdminConfig.trustProxyHeaders),
-            ),
-          );
-          return result.ok ? sensitiveJson({ verified: true }) : authFailureResponse(result);
-        },
-      },
-      "/api/admin/replacement/options": {
-        POST(req: Request) {
-          const token = requireAdminMutation(req, technicalAdminAuth);
-          if (token === null) return genericAuthFailure(401);
-          const result = technicalAdminAuth.beginReplacement(token, requestBinding(req));
-          return result.ok ? sensitiveJson(result.value) : genericAuthFailure(401);
-        },
-      },
-      "/api/admin/replacement/complete": {
-        async POST(req: Request) {
-          const token = requireAdminMutation(req, technicalAdminAuth);
-          if (token === null) return genericAuthFailure(401);
-          const body = await readCeremonyBody(req);
-          if (body === null) {
-            return genericAuthFailure(400);
-          }
-          const result = await technicalAdminAuth.completeReplacement(
-            token,
-            body.challengeId,
-            body.response,
-            requestBinding(req),
-            technicalAdminAuth.correlateSource(
-              requestSource(req, technicalAdminConfig.trustProxyHeaders),
-            ),
-          );
-          if (!result.ok) return authFailureResponse(result);
-          return sensitiveJson({ replaced: true }, 200, [
-            ["set-cookie", technicalAdminCookie(result.value.token)],
-            ["set-cookie", technicalAdminCsrfCookie(result.value.csrfToken)],
-          ]);
-        },
-      },
-      "/api/admin/sessions/revoke-others": {
-        POST(req: Request) {
-          const token = requireAdminMutation(req, technicalAdminAuth);
-          if (token === null) return genericAuthFailure(401);
-          const result = technicalAdminAuth.revokeOtherSessions(token);
-          return result.ok ? sensitiveJson(result.value) : authFailureResponse(result);
-        },
-      },
-      "/internal/healthz": {
-        GET(req: Request) {
-          if (!isInternalHealthHost(req.headers.get("host"))) {
-            return json({ error: "Not found." }, 404);
-          }
-
-          return json({ ok: true });
-        },
-      },
-      "/*": index,
-    },
-    development: process.env.NODE_ENV !== "production" && {
-      hmr: true,
-      console: true,
-    },
-    websocket: {
-      open(ws) {
-        sockets.add(ws);
-      },
-      close(ws) {
-        sockets.delete(ws);
-      },
-      message(ws, message) {
-        if (typeof message !== "string") {
-          sendMessage(ws, {
-            type: "error",
-            message: "Unsupported message format.",
-          });
-          return;
-        }
-
-        const parsed = parseClientWsMessage(message, {
-          serverNowMs: Date.now(),
-        });
-        if (!parsed.ok) {
-          sendMessage(ws, {
-            type: "error",
-            message: parsed.error,
-          });
-          return;
-        }
-
-        switch (parsed.message.type) {
-          case "subscribe-lobby": {
-            ws.data.subscription = {
-              type: "lobby",
-            };
-            sendLobbySnapshot(ws);
-            return;
-          }
-
-          case "subscribe-game": {
-            const game = games.get(parsed.message.gameId);
+        "/api/games/:gameId": {
+          GET(req: Request) {
+            const gameId = new URL(req.url).pathname.replace("/api/games/", "");
+            const game = games.get(gameId);
             if (game === undefined) {
-              sendMessage(ws, {
-                type: "error",
-                message: "Game not found.",
-              });
-              return;
+              return json({ error: "Game not found." }, 404);
             }
 
-            ws.data.subscription = {
-              type: "game",
-              gameId: parsed.message.gameId,
-              role: parsed.message.role,
-            };
-
-            sendGameSnapshot({
-              ws,
-              game,
-              ackedCommandIds: [],
+            return json({ game: projectGameView(game.state, Date.now()) });
+          },
+        },
+        "/api/admin/enrollment/options": {
+          async POST(req: Request) {
+            const body = await readJsonRecord(req);
+            const token = body?.token;
+            if (typeof token !== "string") return genericAuthFailure(400);
+            const result = technicalAdminAuth.beginEnrollment(token, requestBinding(req));
+            return result.ok
+              ? sensitiveJson(result.value)
+              : genericAuthFailure(result.error === "not-enrollable" ? 409 : 401);
+          },
+        },
+        "/api/admin/enrollment/complete": {
+          async POST(req: Request) {
+            const body = await readCeremonyBody(req);
+            if (body === null) {
+              return genericAuthFailure(400);
+            }
+            const result = await technicalAdminAuth.completeEnrollment(
+              body.challengeId,
+              body.response,
+              requestBinding(req),
+              technicalAdminAuth.correlateSource(
+                requestSource(req, technicalAdminConfig.trustProxyHeaders),
+              ),
+            );
+            return result.ok ? sensitiveJson({ enrolled: true }) : authFailureResponse(result);
+          },
+        },
+        "/api/admin/authentication/options": {
+          POST(req: Request) {
+            const result = technicalAdminAuth.beginAuthentication(requestBinding(req));
+            return result.ok ? sensitiveJson(result.value) : genericAuthFailure(401);
+          },
+        },
+        "/api/admin/authentication/complete": {
+          async POST(req: Request) {
+            const body = await readCeremonyBody(req);
+            if (body === null) {
+              return genericAuthFailure(400);
+            }
+            const result = await technicalAdminAuth.completeAuthentication(
+              body.challengeId,
+              body.response,
+              requestBinding(req),
+              technicalAdminAuth.correlateSource(
+                requestSource(req, technicalAdminConfig.trustProxyHeaders),
+              ),
+            );
+            if (!result.ok) return authFailureResponse(result);
+            return sensitiveJson({ authenticated: true }, 200, [
+              ["set-cookie", technicalAdminCookie(result.value.token)],
+              ["set-cookie", technicalAdminCsrfCookie(result.value.csrfToken)],
+            ]);
+          },
+        },
+        "/api/admin/session": {
+          GET(req: Request) {
+            const token = readTechnicalAdminCookie(req.headers.get("cookie"));
+            if (token === null || !technicalAdminAuth.authenticateSession(token))
+              return genericAuthFailure(401);
+            return sensitiveJson({
+              authenticated: true,
+              environment,
+              activeSessionCount: technicalAdminAuth.activeSessionCount(),
             });
-            return;
-          }
-
-          case "apply-commands": {
-            if (ws.data.subscription.type !== "game") {
-              sendMessage(ws, {
-                type: "error",
-                message: "Not subscribed to a game.",
-              });
-              return;
+          },
+        },
+        "/api/admin/logout": {
+          POST(req: Request) {
+            const token = requireAdminMutation(req, technicalAdminAuth);
+            if (token === null) return genericAuthFailure(401);
+            technicalAdminAuth.logout(token);
+            return sensitiveJson({ loggedOut: true }, 200, [
+              ["set-cookie", clearTechnicalAdminCookie()],
+              ["set-cookie", clearTechnicalAdminCsrfCookie()],
+            ]);
+          },
+        },
+        "/api/admin/step-up/options": {
+          async POST(req: Request) {
+            const token = requireAdminMutation(req, technicalAdminAuth);
+            if (token === null) return genericAuthFailure(401);
+            const body = await readJsonRecord(req);
+            const purpose = body?.purpose;
+            if (purpose !== "replace-credential" && purpose !== "revoke-other-sessions") {
+              return genericAuthFailure(400);
+            }
+            const result = technicalAdminAuth.beginFreshVerification(
+              token,
+              purpose,
+              requestBinding(req),
+            );
+            return result.ok ? sensitiveJson(result.value) : genericAuthFailure(401);
+          },
+        },
+        "/api/admin/step-up/complete": {
+          async POST(req: Request) {
+            const token = requireAdminMutation(req, technicalAdminAuth);
+            if (token === null) return genericAuthFailure(401);
+            const body = await readCeremonyBody(req);
+            if (body === null) {
+              return genericAuthFailure(400);
+            }
+            const result = await technicalAdminAuth.completeFreshVerification(
+              token,
+              body.challengeId,
+              body.response,
+              requestBinding(req),
+              technicalAdminAuth.correlateSource(
+                requestSource(req, technicalAdminConfig.trustProxyHeaders),
+              ),
+            );
+            return result.ok ? sensitiveJson({ verified: true }) : authFailureResponse(result);
+          },
+        },
+        "/api/admin/replacement/options": {
+          POST(req: Request) {
+            const token = requireAdminMutation(req, technicalAdminAuth);
+            if (token === null) return genericAuthFailure(401);
+            const result = technicalAdminAuth.beginReplacement(token, requestBinding(req));
+            return result.ok ? sensitiveJson(result.value) : genericAuthFailure(401);
+          },
+        },
+        "/api/admin/replacement/complete": {
+          async POST(req: Request) {
+            const token = requireAdminMutation(req, technicalAdminAuth);
+            if (token === null) return genericAuthFailure(401);
+            const body = await readCeremonyBody(req);
+            if (body === null) {
+              return genericAuthFailure(400);
+            }
+            const result = await technicalAdminAuth.completeReplacement(
+              token,
+              body.challengeId,
+              body.response,
+              requestBinding(req),
+              technicalAdminAuth.correlateSource(
+                requestSource(req, technicalAdminConfig.trustProxyHeaders),
+              ),
+            );
+            if (!result.ok) return authFailureResponse(result);
+            return sensitiveJson({ replaced: true }, 200, [
+              ["set-cookie", technicalAdminCookie(result.value.token)],
+              ["set-cookie", technicalAdminCsrfCookie(result.value.csrfToken)],
+            ]);
+          },
+        },
+        "/api/admin/sessions/revoke-others": {
+          POST(req: Request) {
+            const token = requireAdminMutation(req, technicalAdminAuth);
+            if (token === null) return genericAuthFailure(401);
+            const result = technicalAdminAuth.revokeOtherSessions(token);
+            return result.ok ? sensitiveJson(result.value) : authFailureResponse(result);
+          },
+        },
+        "/api/admin/events": {
+          async GET(req: Request) {
+            const token = requireTechnicalAdminToken(req, technicalAdminAuth);
+            if (token === null) return genericAuthFailure(401);
+            return catalogResponse(await eventCatalog.listEvents(token));
+          },
+          async POST(req: Request) {
+            const token = requireTechnicalAdminMutationToken(req, technicalAdminAuth);
+            if (token === null) return genericAuthFailure(401);
+            const body = await readJsonRecord(req);
+            if (body === null)
+              return json(
+                {
+                  status: "rejected",
+                  reason: "invalid-input",
+                  detail: "JSON body must be an object.",
+                },
+                400,
+              );
+            return catalogResponse(
+              await eventCatalog.createEvent({ name: body.name, timeZone: body.timeZone }, token),
+              201,
+            );
+          },
+        },
+        "/api/admin/events/:eventId": {
+          async GET(req: Request) {
+            const token = requireTechnicalAdminToken(req, technicalAdminAuth);
+            if (token === null) return genericAuthFailure(401);
+            const eventId = new URL(req.url).pathname.split("/").at(-1) ?? "";
+            return catalogResponse(await eventCatalog.inspectEvent(eventId, token));
+          },
+          async PATCH(req: Request) {
+            const token = requireTechnicalAdminMutationToken(req, technicalAdminAuth);
+            if (token === null) return genericAuthFailure(401);
+            const eventId = new URL(req.url).pathname.split("/").at(-1) ?? "";
+            const body = await readJsonRecord(req);
+            if (body === null)
+              return json(
+                {
+                  status: "rejected",
+                  reason: "invalid-input",
+                  detail: "JSON body must be an object.",
+                },
+                400,
+              );
+            return catalogResponse(
+              await eventCatalog.updateEvent(
+                eventId,
+                { name: body.name, timeZone: body.timeZone },
+                token,
+              ),
+            );
+          },
+          async DELETE(req: Request) {
+            const token = requireTechnicalAdminMutationToken(req, technicalAdminAuth);
+            if (token === null) return genericAuthFailure(401);
+            const eventId = new URL(req.url).pathname.split("/").at(-1) ?? "";
+            return catalogResponse(await eventCatalog.removeEvent(eventId, token));
+          },
+        },
+        "/api/admin/events/:eventId/game-days": {
+          async POST(req: Request) {
+            const token = requireTechnicalAdminMutationToken(req, technicalAdminAuth);
+            if (token === null) return genericAuthFailure(401);
+            const path = new URL(req.url).pathname.split("/");
+            const eventId = path.at(-2) ?? "";
+            const body = await readJsonRecord(req);
+            if (body === null)
+              return json(
+                {
+                  status: "rejected",
+                  reason: "invalid-input",
+                  detail: "JSON body must be an object.",
+                },
+                400,
+              );
+            return catalogResponse(
+              await eventCatalog.addGameDay(eventId, { date: body.date }, token),
+              201,
+            );
+          },
+        },
+        "/api/admin/events/:eventId/game-days/:gameDayId": {
+          async PATCH(req: Request) {
+            const token = requireTechnicalAdminMutationToken(req, technicalAdminAuth);
+            if (token === null) return genericAuthFailure(401);
+            const path = new URL(req.url).pathname.split("/");
+            const eventId = path.at(-3) ?? "";
+            const gameDayId = path.at(-1) ?? "";
+            const body = await readJsonRecord(req);
+            if (body === null)
+              return json(
+                {
+                  status: "rejected",
+                  reason: "invalid-input",
+                  detail: "JSON body must be an object.",
+                },
+                400,
+              );
+            return catalogResponse(
+              await eventCatalog.updateGameDay(eventId, gameDayId, { date: body.date }, token),
+            );
+          },
+          async DELETE(req: Request) {
+            const token = requireTechnicalAdminMutationToken(req, technicalAdminAuth);
+            if (token === null) return genericAuthFailure(401);
+            const path = new URL(req.url).pathname.split("/");
+            const eventId = path.at(-3) ?? "";
+            const gameDayId = path.at(-1) ?? "";
+            return catalogResponse(await eventCatalog.removeGameDay(eventId, gameDayId, token));
+          },
+        },
+        "/internal/healthz": {
+          GET(req: Request) {
+            if (!isInternalHealthHost(req.headers.get("host"))) {
+              return json({ error: "Not found." }, 404);
             }
 
-            if (ws.data.subscription.role !== "controller") {
-              sendMessage(ws, {
-                type: "error",
-                message: "Spectators cannot apply commands.",
-              });
-              return;
-            }
-
-            if (ws.data.subscription.gameId !== parsed.message.gameId) {
-              sendMessage(ws, {
-                type: "error",
-                message: "Command gameId mismatch.",
-              });
-              return;
-            }
-
-            const game = games.get(parsed.message.gameId);
-            if (game === undefined) {
-              sendMessage(ws, {
-                type: "error",
-                message: "Game not found.",
-              });
-              return;
-            }
-
-            const ackedCommandIds = applyCommandsToGame({
-              managedGame: game,
-              commands: parsed.message.commands,
-            });
-
-            broadcastGameSnapshot({
-              gameId: parsed.message.gameId,
-              game,
-              sender: ws,
-              senderAckedCommandIds: ackedCommandIds,
-            });
-            broadcastLobbySnapshot();
-            return;
-          }
-
-          default: {
-            const _never: never = parsed.message;
-            return _never;
-          }
-        }
+            return json({ ok: true });
+          },
+        },
+        "/*": index,
       },
-    },
-  });
+      development: process.env.NODE_ENV !== "production" && {
+        hmr: true,
+        console: true,
+      },
+      websocket: {
+        open(ws) {
+          sockets.add(ws);
+        },
+        close(ws) {
+          sockets.delete(ws);
+        },
+        message(ws, message) {
+          if (typeof message !== "string") {
+            sendMessage(ws, {
+              type: "error",
+              message: "Unsupported message format.",
+            });
+            return;
+          }
 
-  console.log(`Server running at ${server.url}`);
+          const parsed = parseClientWsMessage(message, {
+            serverNowMs: Date.now(),
+          });
+          if (!parsed.ok) {
+            sendMessage(ws, {
+              type: "error",
+              message: parsed.error,
+            });
+            return;
+          }
+
+          switch (parsed.message.type) {
+            case "subscribe-lobby": {
+              ws.data.subscription = {
+                type: "lobby",
+              };
+              sendLobbySnapshot(ws);
+              return;
+            }
+
+            case "subscribe-game": {
+              const game = games.get(parsed.message.gameId);
+              if (game === undefined) {
+                sendMessage(ws, {
+                  type: "error",
+                  message: "Game not found.",
+                });
+                return;
+              }
+
+              ws.data.subscription = {
+                type: "game",
+                gameId: parsed.message.gameId,
+                role: parsed.message.role,
+              };
+
+              sendGameSnapshot({
+                ws,
+                game,
+                ackedCommandIds: [],
+              });
+              return;
+            }
+
+            case "apply-commands": {
+              if (ws.data.subscription.type !== "game") {
+                sendMessage(ws, {
+                  type: "error",
+                  message: "Not subscribed to a game.",
+                });
+                return;
+              }
+
+              if (ws.data.subscription.role !== "controller") {
+                sendMessage(ws, {
+                  type: "error",
+                  message: "Spectators cannot apply commands.",
+                });
+                return;
+              }
+
+              if (ws.data.subscription.gameId !== parsed.message.gameId) {
+                sendMessage(ws, {
+                  type: "error",
+                  message: "Command gameId mismatch.",
+                });
+                return;
+              }
+
+              const game = games.get(parsed.message.gameId);
+              if (game === undefined) {
+                sendMessage(ws, {
+                  type: "error",
+                  message: "Game not found.",
+                });
+                return;
+              }
+
+              const ackedCommandIds = applyCommandsToGame({
+                managedGame: game,
+                commands: parsed.message.commands,
+              });
+
+              broadcastGameSnapshot({
+                gameId: parsed.message.gameId,
+                game,
+                sender: ws,
+                senderAckedCommandIds: ackedCommandIds,
+              });
+              broadcastLobbySnapshot();
+              return;
+            }
+
+            default: {
+              const _never: never = parsed.message;
+              return _never;
+            }
+          }
+        },
+      },
+    });
+    startupCleanup.add(() => void server?.stop());
+
+    console.log(`Server running at ${server.url}`);
+  } catch (error) {
+    if (shutdown !== undefined) {
+      process.removeListener("SIGTERM", shutdown);
+      process.removeListener("SIGINT", shutdown);
+    }
+    cleanup();
+    throw error;
+  }
 }
 
-void main();
+if (import.meta.main) void main();
 
 async function runProbeMode(
   invocation: Exclude<SqliteProbeInvocation, { kind: "none" } | { kind: "invalid" }>,
@@ -769,6 +948,41 @@ function authFailureResponse(result: AuthResult<unknown>) {
     result.error === "throttled" ? 429 : 401,
     headers,
   );
+}
+
+function requireTechnicalAdminToken(
+  req: Request,
+  technicalAdminAuth: ReturnType<typeof createTechnicalAdminAuth>,
+): TechnicalAdminAuthority | null {
+  const token = readTechnicalAdminCookie(req.headers.get("cookie"));
+  return token === null ? null : technicalAdminAuth.resolveCurrentAuthority(token);
+}
+
+function requireTechnicalAdminMutationToken(
+  req: Request,
+  technicalAdminAuth: ReturnType<typeof createTechnicalAdminAuth>,
+): TechnicalAdminAuthority | null {
+  if (
+    req.headers.get("x-technical-admin-csrf") !== "1" ||
+    !technicalAdminAuth.isExpectedBinding(requestBinding(req))
+  ) {
+    return null;
+  }
+  return requireTechnicalAdminToken(req, technicalAdminAuth);
+}
+
+function catalogResponse<T>(result: CatalogOutcome<T>, acceptedStatus = 200) {
+  if (result.status === "accepted") return json(result, acceptedStatus);
+  if (result.status === "retryable-failure") return json(result, 503);
+  const status =
+    result.reason === "unauthorized"
+      ? 401
+      : result.reason === "not-found"
+        ? 404
+        : result.reason === "invalid-input"
+          ? 400
+          : 409;
+  return json(result, status);
 }
 
 function readTechnicalAdminCookie(header: string | null): string | null {

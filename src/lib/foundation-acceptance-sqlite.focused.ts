@@ -79,7 +79,7 @@ describe("focused SQLite composed acceptance", () => {
       storage.close();
 
       const reopened = openSqliteFoundationStorage(databasePath, { grantKeyRing: createKeyRing() });
-      expect(await reopened.readiness()).toMatchObject({ ok: true, schemaVersion: "18" });
+      expect(await reopened.readiness()).toMatchObject({ ok: true, schemaVersion: "19" });
       expect(await reopened.readActions(root.recordId)).toHaveLength(1);
       expect(await reopened.readAuditEntries(root.recordId)).toHaveLength(1);
       reopened.close();
@@ -707,7 +707,7 @@ describe("focused SQLite composed acceptance", () => {
       expect(await reopenedAcceptance.acknowledgeReplay(rejectionReceipt!)).toEqual({
         status: "acknowledged",
       });
-      expect(await reopened.readiness()).toMatchObject({ ok: true, schemaVersion: "18" });
+      expect(await reopened.readiness()).toMatchObject({ ok: true, schemaVersion: "19" });
       reopened.close();
     });
   });

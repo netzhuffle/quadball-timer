@@ -5,7 +5,7 @@ This context describes the target domain language being planned for preparing, c
 ## Language
 
 **Event**:
-A named quadball gathering configured by the Technical Admin with a local timezone and zero or more Game Days. It may remain Unpublished without a Game Day; once scheduled, it is current on each Game Day, future before its next Game Day, and past after its final Game Day.
+A named quadball gathering configured by the Technical Admin with a local timezone and zero or more Game Days. An Event with zero Game Days is **unscheduled**. Once scheduled, it is current on an actual Game Day in its configured timezone, future between Game Days when a later Game Day exists, and past after its final Game Day.
 _Avoid_: Tournament, event window
 
 **Event Catalog Removal**:

@@ -46,6 +46,41 @@ export type StoredControlAuditEntry = ControlAuditEntry & {
 
 export type StoredEventGameRecordMetadata = EventGameRecordMetadata;
 
+export type StoredEventCatalogEvent = {
+  eventId: string;
+  name: string;
+  timeZone: string;
+  publicationStatus: "unpublished";
+  createdAtMs: number;
+  updatedAtMs: number;
+};
+
+export type StoredEventCatalogGameDay = {
+  gameDayId: string;
+  eventId: string;
+  date: string;
+  createdAtMs: number;
+  updatedAtMs: number;
+};
+
+export type EventCatalogAuditEntry = {
+  auditId: string;
+  operationId: string;
+  action:
+    | "event-created"
+    | "event-updated"
+    | "event-removed"
+    | "game-day-added"
+    | "game-day-updated"
+    | "game-day-removed";
+  eventId: string;
+  gameDayId: string | null;
+  actorReference: string;
+  occurredAtMs: number;
+  before: unknown;
+  after: unknown;
+};
+
 export type StoredAcceptanceBudget = {
   bucketId: string;
   bucketKind: "online-session" | "online-event" | "replay-session";
@@ -167,6 +202,10 @@ export type FoundationStorageSnapshot = {
     subjectKind: import("@/lib/foundation-acceptance-integrity").AcceptanceIntegritySubject,
     subjectId: string,
   ): import("@/lib/foundation-acceptance-integrity").AcceptanceIntegrityAnchor[];
+  findEvent(eventId: string): StoredEventCatalogEvent | null;
+  listEvents(): StoredEventCatalogEvent[];
+  listGameDays(eventId: string): StoredEventCatalogGameDay[];
+  listEventAuditTrail(eventId: string): EventCatalogAuditEntry[];
 };
 
 export type FoundationStorageTransaction = FoundationStorageSnapshot & {
@@ -191,6 +230,13 @@ export type FoundationStorageTransaction = FoundationStorageSnapshot & {
   insertAcceptanceIntegrityAnchor(
     anchor: import("@/lib/foundation-acceptance-integrity").AcceptanceIntegrityAnchor,
   ): void;
+  insertEvent(event: StoredEventCatalogEvent): void;
+  updateEvent(event: StoredEventCatalogEvent): void;
+  deleteEvent(eventId: string): void;
+  insertGameDay(gameDay: StoredEventCatalogGameDay): void;
+  updateGameDay(gameDay: StoredEventCatalogGameDay): void;
+  deleteGameDay(gameDayId: string): void;
+  appendEventAudit(entry: EventCatalogAuditEntry): void;
 };
 
 export type FoundationStorageTransactionWork<T> = (transaction: FoundationStorageTransaction) => T;
@@ -230,7 +276,12 @@ export type FoundationStorageConstraint =
   | "replay-attempt-id"
   | "replay-receipt-id"
   | "replay-receipt-digest"
-  | "integrity-anchor-id";
+  | "integrity-anchor-id"
+  | "event-id"
+  | "game-day-id"
+  | "game-day-date"
+  | "event-audit-id"
+  | "event-operation-id";
 
 export class FoundationStorageConstraintError extends Error {
   readonly constraint: FoundationStorageConstraint;

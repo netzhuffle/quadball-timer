@@ -59,6 +59,33 @@ export type TechnicalAdminAuthority = {
   readonly [technicalAdminAuthorityBrand]: true;
 };
 
+export function isTechnicalAdminAuthority(value: unknown): value is TechnicalAdminAuthority {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    (value as Record<PropertyKey, unknown>)[technicalAdminAuthorityBrand] === true &&
+    (value as { kind?: unknown }).kind === "technical-admin" &&
+    typeof (value as { environment?: unknown }).environment === "string" &&
+    typeof (value as { sessionId?: unknown }).sessionId === "string" &&
+    (value as { sessionId: string }).sessionId.length > 0
+  );
+}
+
+/**
+ * Host-local administration is the CLI's non-browser authority path. It is issued by this
+ * owning module from the configured environment, never from a caller-selected role or token.
+ */
+function issueHostLocalTechnicalAdminAuthority(
+  config: Pick<TechnicalAdminAuthConfig, "environment">,
+): TechnicalAdminAuthority {
+  return {
+    kind: "technical-admin",
+    environment: config.environment,
+    sessionId: "host-local-cli",
+    [technicalAdminAuthorityBrand]: true,
+  };
+}
+
 export type TechnicalAdminStorageStatus = {
   state: "ready" | "unavailable" | "corrupt" | "read-only";
   credentialPresent: boolean;
@@ -1005,6 +1032,10 @@ export function createTechnicalAdminAuth(
       }
     },
 
+    resolveHostLocalAuthority(): TechnicalAdminAuthority {
+      return issueHostLocalTechnicalAdminAuthority(config);
+    },
+
     storageStatus(): TechnicalAdminStorageStatus {
       try {
         const current = now();
@@ -1133,6 +1164,7 @@ export interface TechnicalAdminAuth {
   verifyCsrf(token: string, csrfToken: string): boolean;
   activeSessionCount(): number;
   resolveCurrentAuthority(token: string): TechnicalAdminAuthority | null;
+  resolveHostLocalAuthority(): TechnicalAdminAuthority;
   storageStatus(): TechnicalAdminStorageStatus;
   startRetentionMaintenance(scheduler: TechnicalAdminRetentionScheduler): void;
   stopRetentionMaintenance(): void;

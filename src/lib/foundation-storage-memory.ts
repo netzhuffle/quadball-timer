@@ -32,6 +32,9 @@ import {
   type StoredReplayReservation,
   type StoredEventGameRecordMetadata,
   type StoredEventGameRecordRoot,
+  type StoredEventCatalogEvent,
+  type StoredEventCatalogGameDay,
+  type EventCatalogAuditEntry,
   isThenable,
   DURABLE_EVIDENCE_PROVENANCE,
 } from "@/lib/foundation-storage";
@@ -73,6 +76,9 @@ type MemoryState = {
   replayAttempts: Map<string, StoredReplayAttempt>;
   replayReceipts: Map<string, StoredReplayReceipt>;
   integrityAnchors: Map<string, AcceptanceIntegrityAnchor>;
+  events: Map<string, StoredEventCatalogEvent>;
+  gameDays: Map<string, StoredEventCatalogGameDay>;
+  eventAudits: Map<string, EventCatalogAuditEntry>;
 };
 
 export function createInMemoryFoundationStorage(): FoundationStorage {
@@ -98,6 +104,9 @@ class InMemoryFoundationStorage implements FoundationStorage {
     replayAttempts: new Map(),
     replayReceipts: new Map(),
     integrityAnchors: new Map(),
+    events: new Map(),
+    gameDays: new Map(),
+    eventAudits: new Map(),
   };
   private writerTail: Promise<void> = Promise.resolve();
   private closed = false;
@@ -791,6 +800,112 @@ function createTransaction(
     },
     listAuditEntries(recordId) {
       return cloneAudits(state.controlAudits.get(recordId), state.auditProvenance.get(recordId));
+    },
+    findEvent(eventId) {
+      const event = state.events.get(eventId);
+      return event === undefined ? null : structuredClone(event);
+    },
+    listEvents() {
+      return [...state.events.values()]
+        .sort((left, right) => left.eventId.localeCompare(right.eventId))
+        .map((event) => structuredClone(event));
+    },
+    listGameDays(eventId) {
+      return [...state.gameDays.values()]
+        .filter((gameDay) => gameDay.eventId === eventId)
+        .sort((left, right) =>
+          left.date === right.date
+            ? left.gameDayId.localeCompare(right.gameDayId)
+            : left.date.localeCompare(right.date),
+        )
+        .map((gameDay) => structuredClone(gameDay));
+    },
+    listEventAuditTrail(eventId) {
+      return [...state.eventAudits.values()]
+        .filter((audit) => audit.eventId === eventId)
+        .sort((left, right) =>
+          left.occurredAtMs === right.occurredAtMs
+            ? left.auditId.localeCompare(right.auditId)
+            : left.occurredAtMs - right.occurredAtMs,
+        )
+        .map((audit) => structuredClone(audit));
+    },
+    insertEvent(event) {
+      if (state.events.has(event.eventId)) {
+        throw new FoundationStorageConstraintError("event-id");
+      }
+      state.events.set(event.eventId, structuredClone(event));
+      undo.push(() => state.events.delete(event.eventId));
+    },
+    updateEvent(event) {
+      if (!state.events.has(event.eventId)) {
+        throw new FoundationStorageConstraintError("event-id");
+      }
+      const previous = state.events.get(event.eventId);
+      state.events.set(event.eventId, structuredClone(event));
+      undo.push(() => {
+        if (previous === undefined) state.events.delete(event.eventId);
+        else state.events.set(event.eventId, previous);
+      });
+    },
+    deleteEvent(eventId) {
+      const previous = state.events.get(eventId);
+      if (previous === undefined) throw new FoundationStorageConstraintError("event-id");
+      state.events.delete(eventId);
+      undo.push(() => state.events.set(eventId, previous));
+    },
+    insertGameDay(gameDay) {
+      if (!state.events.has(gameDay.eventId)) {
+        throw new FoundationStorageConstraintError("event-id");
+      }
+      if (state.gameDays.has(gameDay.gameDayId)) {
+        throw new FoundationStorageConstraintError("game-day-id");
+      }
+      if (
+        [...state.gameDays.values()].some(
+          (candidate) => candidate.eventId === gameDay.eventId && candidate.date === gameDay.date,
+        )
+      ) {
+        throw new FoundationStorageConstraintError("game-day-date");
+      }
+      state.gameDays.set(gameDay.gameDayId, structuredClone(gameDay));
+      undo.push(() => state.gameDays.delete(gameDay.gameDayId));
+    },
+    updateGameDay(gameDay) {
+      const previous = state.gameDays.get(gameDay.gameDayId);
+      if (previous === undefined) throw new FoundationStorageConstraintError("game-day-id");
+      if (
+        [...state.gameDays.values()].some(
+          (candidate) =>
+            candidate.gameDayId !== gameDay.gameDayId &&
+            candidate.eventId === gameDay.eventId &&
+            candidate.date === gameDay.date,
+        )
+      ) {
+        throw new FoundationStorageConstraintError("game-day-date");
+      }
+      state.gameDays.set(gameDay.gameDayId, structuredClone(gameDay));
+      undo.push(() => state.gameDays.set(gameDay.gameDayId, previous));
+    },
+    deleteGameDay(gameDayId) {
+      const previous = state.gameDays.get(gameDayId);
+      if (previous === undefined) throw new FoundationStorageConstraintError("game-day-id");
+      state.gameDays.delete(gameDayId);
+      undo.push(() => state.gameDays.set(gameDayId, previous));
+    },
+    appendEventAudit(entry) {
+      if (state.eventAudits.has(entry.auditId)) {
+        throw new FoundationStorageConstraintError("event-audit-id");
+      }
+      if (
+        [...state.eventAudits.values()].some(
+          (candidate) => candidate.operationId === entry.operationId,
+        )
+      ) {
+        throw new FoundationStorageConstraintError("event-operation-id");
+      }
+      state.eventAudits.set(entry.auditId, structuredClone(entry));
+      undo.push(() => state.eventAudits.delete(entry.auditId));
     },
     insertRoot(storedRoot) {
       if (state.roots.has(storedRoot.root.recordId)) {

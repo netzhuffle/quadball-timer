@@ -38,6 +38,11 @@ import {
   FOUNDATION_GRANT_AUDIT_PROVENANCE_NO_DELETE_TRIGGER_SQL,
   FOUNDATION_GRANT_AUDIT_PROVENANCE_AFTER_INSERT_TRIGGER_V16_SQL,
   FOUNDATION_GRANT_AUDIT_NO_LEGACY_TAG_INSERT_TRIGGER_SQL,
+  FOUNDATION_EVENT_CATALOG_EVENTS_TABLE_SQL,
+  FOUNDATION_EVENT_CATALOG_GAME_DAYS_TABLE_SQL,
+  FOUNDATION_EVENT_CATALOG_AUDIT_TABLE_SQL,
+  FOUNDATION_EVENT_CATALOG_GAME_DAYS_EVENT_INDEX_SQL,
+  FOUNDATION_EVENT_CATALOG_AUDIT_EVENT_INDEX_SQL,
 } from "@/lib/foundation-migrations";
 import {
   computeGrantAuditIntegrityTag,
@@ -123,6 +128,9 @@ const PROVENANCE_TABLE = "foundation_control_evidence_provenance";
 const GRANT_MIGRATION_PROVENANCE_TABLE = "foundation_grant_migration_provenance";
 const GRANT_MIGRATION_PROVENANCE_STATE_TABLE = "foundation_grant_migration_provenance_state";
 const GRANT_AUDIT_PROVENANCE_TABLE = "foundation_grant_audit_provenance";
+const EVENT_CATALOG_EVENTS_TABLE = "foundation_event_catalog_events";
+const EVENT_CATALOG_GAME_DAYS_TABLE = "foundation_event_catalog_game_days";
+const EVENT_CATALOG_AUDIT_TABLE = "foundation_event_catalog_audit";
 
 const expectedManifest: FoundationSchemaManifest = {
   objects: [
@@ -176,6 +184,24 @@ const expectedManifest: FoundationSchemaManifest = {
       GRANT_AUDIT_PROVENANCE_TABLE,
       GRANT_AUDIT_PROVENANCE_TABLE,
       FOUNDATION_GRANT_AUDIT_PROVENANCE_TABLE_V16_SQL,
+    ),
+    object(
+      "table",
+      EVENT_CATALOG_EVENTS_TABLE,
+      EVENT_CATALOG_EVENTS_TABLE,
+      FOUNDATION_EVENT_CATALOG_EVENTS_TABLE_SQL,
+    ),
+    object(
+      "table",
+      EVENT_CATALOG_GAME_DAYS_TABLE,
+      EVENT_CATALOG_GAME_DAYS_TABLE,
+      FOUNDATION_EVENT_CATALOG_GAME_DAYS_TABLE_SQL,
+    ),
+    object(
+      "table",
+      EVENT_CATALOG_AUDIT_TABLE,
+      EVENT_CATALOG_AUDIT_TABLE,
+      FOUNDATION_EVENT_CATALOG_AUDIT_TABLE_SQL,
     ),
     object(
       "trigger",
@@ -296,6 +322,18 @@ const expectedManifest: FoundationSchemaManifest = {
       "foundation_grant_audit_provenance_grant_id",
       GRANT_AUDIT_PROVENANCE_TABLE,
       FOUNDATION_GRANT_AUDIT_PROVENANCE_GRANT_INDEX_SQL,
+    ),
+    object(
+      "index",
+      "foundation_event_catalog_game_days_event_id",
+      EVENT_CATALOG_GAME_DAYS_TABLE,
+      FOUNDATION_EVENT_CATALOG_GAME_DAYS_EVENT_INDEX_SQL,
+    ),
+    object(
+      "index",
+      "foundation_event_catalog_audit_event_id",
+      EVENT_CATALOG_AUDIT_TABLE,
+      FOUNDATION_EVENT_CATALOG_AUDIT_EVENT_INDEX_SQL,
     ),
   ].sort(compareNamed),
   tables: [
@@ -668,6 +706,55 @@ const expectedManifest: FoundationSchemaManifest = {
         },
       ],
     },
+    {
+      name: EVENT_CATALOG_EVENTS_TABLE,
+      columns: [
+        column("event_id", "TEXT", 1, 1),
+        column("name", "TEXT", 1, 0),
+        column("time_zone", "TEXT", 1, 0),
+        column("publication_status", "TEXT", 1, 0),
+        column("created_at_ms", "INTEGER", 1, 0),
+        column("updated_at_ms", "INTEGER", 1, 0),
+      ],
+      foreignKeys: [],
+    },
+    {
+      name: EVENT_CATALOG_GAME_DAYS_TABLE,
+      columns: [
+        column("game_day_id", "TEXT", 1, 1),
+        column("event_id", "TEXT", 1, 0),
+        column("game_day_date", "TEXT", 1, 0),
+        column("created_at_ms", "INTEGER", 1, 0),
+        column("updated_at_ms", "INTEGER", 1, 0),
+      ],
+      foreignKeys: [
+        {
+          id: 0,
+          sequence: 0,
+          table: EVENT_CATALOG_EVENTS_TABLE,
+          from: "event_id",
+          to: "event_id",
+          onUpdate: "NO ACTION",
+          onDelete: "CASCADE",
+          match: "NONE",
+        },
+      ],
+    },
+    {
+      name: EVENT_CATALOG_AUDIT_TABLE,
+      columns: [
+        column("audit_id", "TEXT", 1, 1),
+        column("operation_id", "TEXT", 1, 0),
+        column("action", "TEXT", 1, 0),
+        column("event_id", "TEXT", 1, 0),
+        column("game_day_id", "TEXT", 0, 0),
+        column("actor_reference", "TEXT", 1, 0),
+        column("occurred_at_ms", "INTEGER", 1, 0),
+        column("before_json", "TEXT", 0, 0),
+        column("after_json", "TEXT", 1, 0),
+      ],
+      foreignKeys: [],
+    },
   ].sort(compareNamed),
   indexes: [
     index("foundation_event_game_record_roots_event_id", 0, ["event_id"]),
@@ -680,6 +767,8 @@ const expectedManifest: FoundationSchemaManifest = {
     index("foundation_grant_sessions_active_context", 1, ["grant_id", "browser_context_digest"], 1),
     index("foundation_grant_audit_grant_id", 0, ["grant_id", "audit_id"]),
     index("foundation_grant_audit_provenance_grant_id", 0, ["grant_id", "audit_id"]),
+    index("foundation_event_catalog_game_days_event_id", 0, ["event_id", "game_day_date"]),
+    index("foundation_event_catalog_audit_event_id", 0, ["event_id", "occurred_at_ms", "audit_id"]),
   ].sort(compareNamed),
 };
 
@@ -1835,6 +1924,9 @@ function readSchemaManifest(database: Database): FoundationSchemaManifest {
     GRANT_MIGRATION_PROVENANCE_TABLE,
     GRANT_MIGRATION_PROVENANCE_STATE_TABLE,
     GRANT_AUDIT_PROVENANCE_TABLE,
+    EVENT_CATALOG_EVENTS_TABLE,
+    EVENT_CATALOG_GAME_DAYS_TABLE,
+    EVENT_CATALOG_AUDIT_TABLE,
   ].map((name) => ({
     name,
     columns: readColumns(database, name),
@@ -1851,6 +1943,8 @@ function readSchemaManifest(database: Database): FoundationSchemaManifest {
     "foundation_grant_sessions_active_context",
     "foundation_grant_audit_grant_id",
     "foundation_grant_audit_provenance_grant_id",
+    "foundation_event_catalog_game_days_event_id",
+    "foundation_event_catalog_audit_event_id",
   ].map((name) => readIndex(database, name));
 
   return {
@@ -1947,6 +2041,8 @@ function readIndex(database: Database, name: string): SchemaIndex {
 }
 
 function indexTable(name: string): string {
+  if (name.startsWith("foundation_event_catalog_game_days")) return EVENT_CATALOG_GAME_DAYS_TABLE;
+  if (name.startsWith("foundation_event_catalog_audit")) return EVENT_CATALOG_AUDIT_TABLE;
   if (name.startsWith("foundation_grant_sessions")) return GRANT_SESSION_TABLE;
   if (name.startsWith("foundation_grant_audit_provenance")) return GRANT_AUDIT_PROVENANCE_TABLE;
   if (name.startsWith("foundation_grant_audit")) return GRANT_AUDIT_TABLE;
