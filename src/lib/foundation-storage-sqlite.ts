@@ -273,7 +273,9 @@ function readEvent(value: unknown): StoredEventCatalogEvent | null {
     eventId: String(row.eventId),
     name: String(row.name),
     timeZone: String(row.timeZone),
-    publicationStatus: "unpublished",
+    publicationStatus: String(
+      row.publicationStatus,
+    ) as StoredEventCatalogEvent["publicationStatus"],
     createdAtMs: Number(row.createdAtMs),
     updatedAtMs: Number(row.updatedAtMs),
   };

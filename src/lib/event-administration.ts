@@ -8,6 +8,7 @@ import {
   type EventCatalogMutationOperations,
   type EventTeamProjection,
   type EventProjection,
+  type EventPublicationStatusChange,
   type StoredPitch,
   type StoredRosterEntry,
   type GameplaySlot,
@@ -128,6 +129,11 @@ export type EventAdministration = {
     gameDayId?: unknown;
     authority: EventAdministrationAuthority;
   }): Promise<EventAdministrationOutcome<EventHubProjection>>;
+  changePublicationStatus(
+    eventId: unknown,
+    input: { status: unknown; impactConfirmed?: unknown },
+    authority: EventAdministrationAuthority,
+  ): Promise<EventAdministrationMutationOutcome<EventPublicationStatusChange>>;
   createEventTeam(
     eventId: unknown,
     input: { name: unknown; defaultColor?: unknown },
@@ -369,6 +375,12 @@ export function createEventAdministration(
       } catch {
         return unavailable();
       }
+    },
+
+    async changePublicationStatus(eventId, input, authority) {
+      return runCatalogMutation(catalog, options, eventId, authority, (operations) =>
+        operations.changePublicationStatus(eventId, input),
+      );
     },
 
     async createEventTeam(eventId, input, authority) {

@@ -13,7 +13,7 @@ const migrations: readonly FoundationMigration[] = [
 ];
 
 describe("foundation migration ledger compatibility", () => {
-  test("keeps accepted migrations 001 through 023 byte-for-byte immutable and pins 024", () => {
+  test("keeps accepted migrations 001 through 024 byte-for-byte immutable and pins 025", () => {
     expect(FOUNDATION_MIGRATIONS.map(({ id, checksum }) => ({ id, checksum }))).toEqual([
       {
         id: "001-foundation-event-game-record-roots",
@@ -110,6 +110,10 @@ describe("foundation migration ledger compatibility", () => {
       {
         id: "024-event-schedule-slots-and-games",
         checksum: "aaf67baece0503c2c7ac91f3f26ca69b65e416e2514ef8a3889d7739679ae175",
+      },
+      {
+        id: "025-event-publication-status",
+        checksum: "c53a6d6d178217ed050086d40dad7a281f3ecd071ef6ab3e429fdef8787637ee",
       },
     ]);
   });

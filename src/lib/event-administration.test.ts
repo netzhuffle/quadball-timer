@@ -736,6 +736,64 @@ describe("Event Administration handoff", () => {
       ],
     });
   });
+
+  test("lets Technical and Event Admin authority publish and hide without revoking the Grant", async () => {
+    const fixture = createFixture();
+    const event = await fixture.catalog.createEvent(
+      { name: "Publication Event", timeZone: "UTC" },
+      fixture.technical,
+    );
+    if (event.status !== "accepted") throw new Error("Expected Event.");
+    await fixture.catalog.addGameDay(
+      event.value.eventId,
+      { date: "2026-08-14" },
+      fixture.technical,
+    );
+    const grant = await fixture.administration.createEventAdminGrant(
+      event.value.eventId,
+      fixture.technical,
+    );
+    if (grant.status !== "accepted") throw new Error("Expected Grant.");
+    const revealed = await fixture.grants.revealGrant(grant.value.grantId, fixture.technical);
+    if (revealed.status !== "revealed") throw new Error("Expected Grant reveal.");
+    const admission = await fixture.administration.admitEventAdmin({
+      qrCredential: revealed.qrCredential,
+      browserContext: "publication-browser",
+    });
+    if (admission.status !== "admitted") throw new Error("Expected Event Admin admission.");
+    const eventAdmin = { kind: "grant-session" as const, sessionBearer: admission.sessionBearer };
+
+    expect(
+      await fixture.administration.changePublicationStatus(
+        event.value.eventId,
+        { status: "published" },
+        eventAdmin,
+      ),
+    ).toMatchObject({ status: "accepted", value: { publicationStatus: "published" } });
+    expect(
+      await fixture.administration.changePublicationStatus(
+        event.value.eventId,
+        { status: "cancelled" },
+        eventAdmin,
+      ),
+    ).toMatchObject({ status: "rejected", reason: "invalid-input" });
+    expect(
+      await fixture.administration.changePublicationStatus(
+        event.value.eventId,
+        { status: "cancelled", impactConfirmed: true },
+        eventAdmin,
+      ),
+    ).toMatchObject({ status: "accepted", value: { publicationStatus: "cancelled" } });
+    expect(
+      await fixture.administration.openEventHub({
+        eventId: event.value.eventId,
+        authority: eventAdmin,
+      }),
+    ).toMatchObject({ status: "accepted", value: { event: { publicationStatus: "cancelled" } } });
+    expect(
+      await fixture.administration.inspectEventAdminGrant(event.value.eventId, fixture.technical),
+    ).toMatchObject({ status: "accepted", value: { status: "active" } });
+  });
 });
 
 function createFixture(storage: FoundationStorage = createInMemoryFoundationStorage()) {

@@ -321,6 +321,12 @@ describe("ws-protocol", () => {
     expect(parsed.error).toContain("Unsupported event type");
   });
 
+  test("keeps Audience publication outside the existing game WebSocket contract", () => {
+    expect(
+      parseClientWsMessage(JSON.stringify({ type: "subscribe-audience-event", eventId: "event" })),
+    ).toMatchObject({ ok: false });
+  });
+
   test("rejects unsupported command types in apply-commands", () => {
     const parsed = parseClientWsMessage(
       JSON.stringify({

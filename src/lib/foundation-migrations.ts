@@ -1506,6 +1506,12 @@ export const FOUNDATION_EVENT_CATALOG_EVENTS_TABLE_SQL = `
   ) STRICT
 `;
 
+const FOUNDATION_EVENT_CATALOG_EVENTS_TABLE_V25_SQL =
+  FOUNDATION_EVENT_CATALOG_EVENTS_TABLE_SQL.replace(
+    "publication_status TEXT NOT NULL CHECK (publication_status = 'unpublished')",
+    "publication_status TEXT NOT NULL CHECK (publication_status IN ('unpublished', 'published', 'cancelled'))",
+  );
+
 export const FOUNDATION_EVENT_CATALOG_GAME_DAYS_TABLE_SQL = `
   CREATE TABLE foundation_event_catalog_game_days (
     game_day_id TEXT PRIMARY KEY,
@@ -1729,6 +1735,101 @@ export const FOUNDATION_EVENT_SCHEDULE_MIGRATION_SQL = `
   ${FOUNDATION_EVENT_CATALOG_GAMES_INDEX_SQL};
 `;
 
+function foundationEventCatalogV25Sql(sql: string): string {
+  return sql.replaceAll("foundation_event_catalog_", "foundation_event_catalog_v25_");
+}
+
+const FOUNDATION_EVENT_PUBLICATION_MIGRATION_SQL = `
+  ${foundationEventCatalogV25Sql(FOUNDATION_EVENT_CATALOG_EVENTS_TABLE_V25_SQL)};
+  ${foundationEventCatalogV25Sql(FOUNDATION_EVENT_CATALOG_GAME_DAYS_TABLE_SQL)};
+  ${foundationEventCatalogV25Sql(FOUNDATION_EVENT_CATALOG_TEAMS_TABLE_SQL)};
+  ${foundationEventCatalogV25Sql(FOUNDATION_EVENT_CATALOG_ROSTER_TABLE_SQL)};
+  ${foundationEventCatalogV25Sql(FOUNDATION_EVENT_CATALOG_PITCHES_TABLE_SQL)};
+  ${foundationEventCatalogV25Sql(FOUNDATION_EVENT_CATALOG_GAMEPLAY_SLOTS_TABLE_SQL)};
+  ${foundationEventCatalogV25Sql(FOUNDATION_EVENT_CATALOG_PITCH_SLOTS_TABLE_SQL)};
+  ${foundationEventCatalogV25Sql(FOUNDATION_EVENT_CATALOG_GAMES_TABLE_SQL)};
+  INSERT INTO foundation_event_catalog_v25_events
+    (event_id, name, time_zone, publication_status, created_at_ms, updated_at_ms)
+  SELECT event_id, name, time_zone, publication_status, created_at_ms, updated_at_ms
+  FROM foundation_event_catalog_events;
+  INSERT INTO foundation_event_catalog_v25_game_days
+    (game_day_id, event_id, game_day_date, created_at_ms, updated_at_ms)
+  SELECT game_day_id, event_id, game_day_date, created_at_ms, updated_at_ms
+  FROM foundation_event_catalog_game_days;
+  INSERT INTO foundation_event_catalog_v25_teams
+    (event_team_id, event_id, name, default_color, created_at_ms, updated_at_ms)
+  SELECT event_team_id, event_id, name, default_color, created_at_ms, updated_at_ms
+  FROM foundation_event_catalog_teams;
+  INSERT INTO foundation_event_catalog_v25_roster
+    (roster_entry_id, event_id, event_team_id, player_number, public_name, created_at_ms, updated_at_ms)
+  SELECT roster_entry_id, event_id, event_team_id, player_number, public_name, created_at_ms, updated_at_ms
+  FROM foundation_event_catalog_roster;
+  INSERT INTO foundation_event_catalog_v25_pitches
+    (pitch_id, event_id, name, created_at_ms, updated_at_ms)
+  SELECT pitch_id, event_id, name, created_at_ms, updated_at_ms
+  FROM foundation_event_catalog_pitches;
+  INSERT INTO foundation_event_catalog_v25_gameplay_slots
+    (gameplay_slot_id, event_id, game_day_id, sequence_number, scheduled_start_ms, created_at_ms, updated_at_ms)
+  SELECT gameplay_slot_id, event_id, game_day_id, sequence_number, scheduled_start_ms, created_at_ms, updated_at_ms
+  FROM foundation_event_catalog_gameplay_slots;
+  INSERT INTO foundation_event_catalog_v25_pitch_slots
+    (pitch_slot_id, event_id, game_day_id, pitch_id, gameplay_slot_id, sequence_number, created_at_ms, updated_at_ms)
+  SELECT pitch_slot_id, event_id, game_day_id, pitch_id, gameplay_slot_id, sequence_number, created_at_ms, updated_at_ms
+  FROM foundation_event_catalog_pitch_slots;
+  INSERT INTO foundation_event_catalog_v25_games
+    (event_game_id, event_id, game_day_id, gameplay_slot_id, pitch_slot_id,
+     game_code, game_designation, side_a_id, side_a_event_team_id, side_a_event_team_name,
+     side_a_source_label, side_a_confirmed_at_ms, side_b_id, side_b_event_team_id,
+     side_b_event_team_name, side_b_source_label, side_b_confirmed_at_ms, created_at_ms, updated_at_ms)
+  SELECT event_game_id, event_id, game_day_id, gameplay_slot_id, pitch_slot_id,
+     game_code, game_designation, side_a_id, side_a_event_team_id, side_a_event_team_name,
+     side_a_source_label, side_a_confirmed_at_ms, side_b_id, side_b_event_team_id,
+     side_b_event_team_name, side_b_source_label, side_b_confirmed_at_ms, created_at_ms, updated_at_ms
+  FROM foundation_event_catalog_games;
+
+  DROP TABLE foundation_event_catalog_games;
+  DROP TABLE foundation_event_catalog_pitch_slots;
+  DROP TABLE foundation_event_catalog_gameplay_slots;
+  DROP TABLE foundation_event_catalog_roster;
+  DROP TABLE foundation_event_catalog_pitches;
+  DROP TABLE foundation_event_catalog_teams;
+  DROP TABLE foundation_event_catalog_game_days;
+  DROP TABLE foundation_event_catalog_events;
+  ALTER TABLE foundation_event_catalog_v25_events RENAME TO foundation_event_catalog_events;
+  ALTER TABLE foundation_event_catalog_v25_game_days RENAME TO foundation_event_catalog_game_days;
+  ALTER TABLE foundation_event_catalog_v25_teams RENAME TO foundation_event_catalog_teams;
+  ALTER TABLE foundation_event_catalog_v25_roster RENAME TO foundation_event_catalog_roster;
+  ALTER TABLE foundation_event_catalog_v25_pitches RENAME TO foundation_event_catalog_pitches;
+  ALTER TABLE foundation_event_catalog_v25_gameplay_slots RENAME TO foundation_event_catalog_gameplay_slots;
+  ALTER TABLE foundation_event_catalog_v25_pitch_slots RENAME TO foundation_event_catalog_pitch_slots;
+  ALTER TABLE foundation_event_catalog_v25_games RENAME TO foundation_event_catalog_games;
+  ${FOUNDATION_EVENT_CATALOG_GAME_DAYS_EVENT_INDEX_SQL};
+  ${FOUNDATION_EVENT_CATALOG_ROSTER_TEAM_INDEX_SQL};
+  ${FOUNDATION_EVENT_CATALOG_PITCHES_EVENT_INDEX_SQL};
+  ${FOUNDATION_EVENT_CATALOG_GAMEPLAY_SLOTS_INDEX_SQL};
+  ${FOUNDATION_EVENT_CATALOG_PITCH_SLOTS_INDEX_SQL};
+  ${FOUNDATION_EVENT_CATALOG_GAMES_INDEX_SQL};
+
+  CREATE TABLE foundation_event_catalog_audit_v25 AS SELECT * FROM foundation_event_catalog_audit;
+  DROP TABLE foundation_event_catalog_audit;
+  ${FOUNDATION_EVENT_CATALOG_AUDIT_TABLE_V3_SQL.replace(
+    "CREATE TABLE foundation_event_catalog_audit",
+    "CREATE TABLE foundation_event_catalog_audit_rebuilt",
+  ).replace(
+    "'event-game-teams-confirmed'",
+    "'event-game-teams-confirmed', 'event-publication-changed'",
+  )};
+  INSERT INTO foundation_event_catalog_audit_rebuilt
+    (audit_id, operation_id, action, event_id, game_day_id, actor_reference,
+     occurred_at_ms, before_json, after_json)
+  SELECT audit_id, operation_id, action, event_id, game_day_id, actor_reference,
+         occurred_at_ms, before_json, after_json
+  FROM foundation_event_catalog_audit_v25;
+  DROP TABLE foundation_event_catalog_audit_v25;
+  ALTER TABLE foundation_event_catalog_audit_rebuilt RENAME TO foundation_event_catalog_audit;
+  ${FOUNDATION_EVENT_CATALOG_AUDIT_EVENT_INDEX_SQL};
+`;
+
 export const FOUNDATION_MIGRATIONS: readonly FoundationMigration[] = Object.freeze([
   createMigration({
     id: "001-foundation-event-game-record-roots",
@@ -1873,6 +1974,12 @@ export const FOUNDATION_MIGRATIONS: readonly FoundationMigration[] = Object.free
     ordinal: 24,
     schemaVersion: 24,
     sql: FOUNDATION_EVENT_SCHEDULE_MIGRATION_SQL,
+  }),
+  createMigration({
+    id: "025-event-publication-status",
+    ordinal: 25,
+    schemaVersion: 25,
+    sql: FOUNDATION_EVENT_PUBLICATION_MIGRATION_SQL,
   }),
 ]);
 
