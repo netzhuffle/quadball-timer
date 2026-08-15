@@ -139,6 +139,14 @@ describe("App", () => {
     });
   });
 
+  test("parses the stable public Event route", () => {
+    expect(parseRoute("/events/event-123", "")).toEqual({
+      type: "event",
+      eventId: "event-123",
+    });
+    expect(parseRoute("/events", "?view=all")).toEqual({ type: "home", showAll: true });
+  });
+
   beforeEach(() => {
     testWindow = new Window({
       url: "http://localhost:3000/game/test-game?mode=controller",
@@ -912,5 +920,258 @@ describe("App", () => {
       (section) => section.getAttribute("data-color-preview") === "true",
     );
     expect(previews).toHaveLength(100);
+  });
+
+  test("lists public Events with the Ad Hoc handoff between upcoming and past content", async () => {
+    testWindow.history.replaceState(null, "", "/events");
+    (globalThis.fetch as typeof fetch) = (async (input: string | URL | Request) => {
+      const url =
+        typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (!url.endsWith("/api/audience/events")) return new Response("Not found", { status: 404 });
+      return new Response(
+        JSON.stringify({
+          status: "accepted",
+          value: {
+            events: [
+              {
+                eventId: "current",
+                name: "Current Event",
+                timeZone: "UTC",
+                publicationStatus: "published",
+                gameDays: ["2026-08-14"],
+                lifecycle: "current",
+                canonicalPath: "/events/current",
+                teams: [],
+                pitches: [],
+              },
+              {
+                eventId: "future",
+                name: "Future Event",
+                timeZone: "UTC",
+                publicationStatus: "published",
+                gameDays: ["2026-08-15"],
+                lifecycle: "future",
+                canonicalPath: "/events/future",
+                teams: [],
+                pitches: [],
+              },
+              {
+                eventId: "unscheduled",
+                name: "Unscheduled Event",
+                timeZone: "UTC",
+                publicationStatus: "published",
+                gameDays: [],
+                lifecycle: "unscheduled",
+                canonicalPath: "/events/unscheduled",
+                teams: [],
+                pitches: [],
+              },
+              {
+                eventId: "current-two",
+                name: "Another Current Event",
+                timeZone: "UTC",
+                publicationStatus: "published",
+                gameDays: ["2026-08-14"],
+                lifecycle: "current",
+                canonicalPath: "/events/current-two",
+                teams: [],
+                pitches: [],
+              },
+              {
+                eventId: "past",
+                name: "Past Event",
+                timeZone: "UTC",
+                publicationStatus: "published",
+                gameDays: ["2026-08-13"],
+                lifecycle: "past",
+                canonicalPath: "/events/past",
+                teams: [],
+                pitches: [],
+              },
+            ],
+          },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }) as typeof fetch;
+
+    await act(async () => {
+      root.render(<App />);
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const text = container.textContent ?? "";
+    expect(text).toContain("Current Event");
+    expect(text).toContain("Future Event");
+    expect(text).toContain("Unscheduled Events");
+    expect(text).toContain("Start Ad Hoc Game");
+    expect(text).toContain("Past Event");
+    expect(text.indexOf("Future Event")).toBeLessThan(text.indexOf("Start Ad Hoc Game"));
+    expect(text.indexOf("Start Ad Hoc Game")).toBeLessThan(text.indexOf("Past Event"));
+  });
+
+  test("opens the sole current Published Event from Home", async () => {
+    testWindow.history.replaceState(null, "", "/events");
+    (globalThis.fetch as typeof fetch) = (async (input: string | URL | Request) => {
+      const url =
+        typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (!url.endsWith("/api/audience/events")) return new Response("Not found", { status: 404 });
+      return new Response(
+        JSON.stringify({
+          status: "accepted",
+          value: {
+            events: [
+              {
+                eventId: "only-current",
+                name: "Only Current Event",
+                timeZone: "UTC",
+                publicationStatus: "published",
+                gameDays: ["2026-08-14"],
+                lifecycle: "current",
+                canonicalPath: "/events/only-current",
+                teams: [],
+                pitches: [],
+              },
+            ],
+          },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }) as typeof fetch;
+
+    await act(async () => {
+      root.render(<App />);
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(testWindow.location.pathname).toBe("/events/only-current");
+  });
+
+  test("shows the discovery list when no Event is current", async () => {
+    testWindow.history.replaceState(null, "", "/events");
+    (globalThis.fetch as typeof fetch) = (async () =>
+      new Response(
+        JSON.stringify({
+          status: "accepted",
+          value: {
+            events: [
+              {
+                eventId: "future-only",
+                name: "Future Only Event",
+                timeZone: "UTC",
+                publicationStatus: "published",
+                gameDays: ["2026-08-15"],
+                lifecycle: "future",
+                canonicalPath: "/events/future-only",
+                teams: [],
+                pitches: [],
+              },
+            ],
+          },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      )) as unknown as typeof fetch;
+
+    await act(async () => {
+      root.render(<App />);
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(testWindow.location.pathname).toBe("/events");
+    expect(container.textContent).toContain("No Event is current today.");
+    expect(container.textContent).toContain("Future Only Event");
+  });
+
+  test("renders a navigable generic page for a direct unavailable Event visit", async () => {
+    testWindow.history.replaceState(null, "", "/events/hidden-event");
+    (globalThis.fetch as typeof fetch) = (async () =>
+      new Response('{"status":"unavailable"}', {
+        status: 404,
+        headers: { "content-type": "application/json" },
+      })) as unknown as typeof fetch;
+
+    await act(async () => {
+      root.render(<App />);
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(container.textContent).toContain("Event unavailable");
+    expect(container.textContent).toContain("Back to Home");
+    expect(container.textContent).not.toContain('{"status":"unavailable"}');
+  });
+
+  test("uses the canonical Event link and escapes to the full list without redirecting", async () => {
+    testWindow.history.replaceState(null, "", "/events/visible-event");
+    (globalThis.fetch as typeof fetch) = (async (input: string | URL | Request) => {
+      const url =
+        typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.endsWith("/api/audience/events/visible-event")) {
+        return new Response(
+          JSON.stringify({
+            status: "accepted",
+            value: {
+              eventId: "visible-event",
+              name: "Visible Event",
+              timeZone: "UTC",
+              publicationStatus: "published",
+              gameDays: ["2026-08-14"],
+              lifecycle: "current",
+              canonicalPath: "/events/visible-event",
+              teams: [],
+              pitches: [],
+            },
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      return new Response(
+        JSON.stringify({
+          status: "accepted",
+          value: {
+            events: [
+              {
+                eventId: "visible-event",
+                name: "Visible Event",
+                timeZone: "UTC",
+                publicationStatus: "published",
+                gameDays: ["2026-08-14"],
+                lifecycle: "current",
+                canonicalPath: "/events/visible-event",
+                teams: [],
+                pitches: [],
+              },
+            ],
+          },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }) as typeof fetch;
+
+    await act(async () => {
+      root.render(<App />);
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const allEvents = Array.from(container.getElementsByTagName("button")).find((button) =>
+      (button.textContent ?? "").includes("All events"),
+    );
+    expect(allEvents).not.toBeNull();
+    await act(async () => {
+      allEvents?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(testWindow.location.pathname).toBe("/events");
+    expect(testWindow.location.search).toBe("?view=all");
   });
 });
