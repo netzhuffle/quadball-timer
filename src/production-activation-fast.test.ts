@@ -62,7 +62,15 @@ async function createRelease(base: string): Promise<string> {
   ];
   const records: Array<{ path: string; sha256: string }> = [];
   for (const member of members) {
-    const contents = `fast fixture ${member}\n`;
+    const contents =
+      member === "quadball-timer"
+        ? `#!/usr/bin/env bash
+if [[ "$1" == "--emit-operational-failure" ]]; then
+  printf 'operational %s %s %s %s %s\\n' "$2" "$3" "$5" "$7" "$9" >>"$QBT_FAST_LOG"
+  [[ "\${QBT_OPERATIONAL_MONITORING_OUTAGE:-}" == 1 ]] && exit 1
+fi
+`
+        : `fast fixture ${member}\n`;
     const path = join(release, member);
     await mkdir(join(path, ".."), { recursive: true });
     await writeFile(path, contents);
@@ -89,29 +97,49 @@ async function createHarness(): Promise<{
   log: string;
   pointer: string;
   probe: string;
+  reportSignal: string;
   root: string;
   state: string;
+  testBase: string;
   testCanary: string;
+  testDatabase: string;
+  testState: string;
   wrapper: string;
 }> {
   const root = await realpath(await mkdtemp(join(tmpdir(), "quadball-activation-fast-")));
   roots.push(root);
   const base = join(root, "srv", "quadball-timer");
+  const testBase = join(root, "srv", "quadball-timer-test");
   const bin = join(root, "bin");
   const state = join(root, "state");
+  const testState = join(root, "test-state");
   const previous = join(base, "releases", previousReleaseId);
+  const testPrevious = join(testBase, "releases", previousReleaseId);
   const database = join(state, "foundation.sqlite");
+  const testDatabase = join(testState, "foundation.sqlite");
   const log = join(state, "operations.log");
   const pointer = join(state, "retained-pointer");
   const probe = join(state, "probe-results");
+  const reportSignal = join(root, "report-signal");
   const testCanary = join(root, "srv", "quadball-timer-test", "canary");
   await Promise.all([
     mkdir(bin, { recursive: true }),
     mkdir(previous, { recursive: true }),
+    mkdir(testPrevious, { recursive: true }),
     mkdir(join(testCanary, ".."), { recursive: true }),
     mkdir(state, { recursive: true }),
+    mkdir(testState, { recursive: true }),
   ]);
+  await executable(
+    join(bin, "realpath"),
+    `#!/usr/bin/env bash
+if [[ "$1" == -e ]]; then shift; fi
+if [[ "$1" == -- ]]; then shift; fi
+exec /bin/realpath "$@"
+`,
+  );
   await createRelease(base);
+  await createRelease(testBase);
   const previousExecutable = "prior executable\n";
   await writeFile(join(previous, "quadball-timer"), previousExecutable);
   await chmod(join(previous, "quadball-timer"), 0o555);
@@ -125,10 +153,24 @@ async function createHarness(): Promise<{
     }),
   );
   await symlink(previous, join(base, "current"));
+  await writeFile(join(testPrevious, "quadball-timer"), previousExecutable);
+  await chmod(join(testPrevious, "quadball-timer"), 0o555);
+  await writeFile(
+    join(testPrevious, "release-manifest.json"),
+    JSON.stringify({
+      releaseAttemptId: previousReleaseId,
+      executableSha256: digest(previousExecutable),
+      schemaCompatibility: "26",
+      supportedFoundationSchemaVersions: ["26"],
+    }),
+  );
+  await symlink(testPrevious, join(testBase, "current"));
   await writeFile(database, "schema-before\n");
+  await writeFile(testDatabase, "schema-before\n");
   await writeFile(pointer, "retained-before\n");
   await writeFile(log, "");
   await writeFile(probe, "");
+  expect(Bun.spawnSync({ cmd: ["mkfifo", reportSignal] }).exitCode).toBe(0);
   await writeFile(testCanary, "test-untouched\n");
 
   await executable(
@@ -140,9 +182,15 @@ if [[ "$1" == show ]]; then
   property=""
   for argument in "$@"; do [[ "$argument" == --property=* ]] && property="\${argument#--property=}"; done
   case "$property" in
-    Environment) echo "QUADBALL_ENVIRONMENT=production FOUNDATION_DATABASE=/var/lib/quadball-timer/foundation.sqlite TECHNICAL_ADMIN_DATABASE=/var/lib/quadball-timer/technical-admin.sqlite GRANT_KEY_RING_FILE=/etc/quadball-timer/production-grant-key-ring.json" ;;
+    Environment)
+      if [[ "\${QBT_FAST_ENVIRONMENT:-production}" == test ]]; then
+        echo "QUADBALL_ENVIRONMENT=test PUBLIC_ORIGIN=https://test.timer.quadball.app FOUNDATION_DATABASE=/var/lib/quadball-timer-test/foundation.sqlite TECHNICAL_ADMIN_DATABASE=/var/lib/quadball-timer-test/technical-admin.sqlite EVENT_GAME_DATABASE=/var/lib/quadball-timer-test/event-game.sqlite GRANT_KEY_RING_FILE=/etc/quadball-timer/test-grant-key-ring.json"
+      else
+        echo "QUADBALL_ENVIRONMENT=production FOUNDATION_DATABASE=/var/lib/quadball-timer/foundation.sqlite TECHNICAL_ADMIN_DATABASE=/var/lib/quadball-timer/technical-admin.sqlite GRANT_KEY_RING_FILE=/etc/quadball-timer/production-grant-key-ring.json"
+      fi
+      ;;
     ExecStart) echo "$QBT_FAST_BASE/current/quadball-timer" ;;
-    StateDirectory) echo "quadball-timer" ;;
+    StateDirectory) [[ "\${QBT_FAST_ENVIRONMENT:-production}" == test ]] && echo "quadball-timer-test" || echo "quadball-timer" ;;
     StateDirectoryMode) echo "0750" ;;
     ActiveState) echo "active" ;;
     SubState) echo "running" ;;
@@ -171,7 +219,13 @@ case "$url" in
     ;;
   */ws) printf 'HTTP/1.1 101 Switching Protocols\\r\\n\\r\\n' ;;
   */api/audience/events|*/internal/healthz) printf '{}\\n' ;;
-  */) printf '<!doctype html>\\n' ;;
+  */)
+    if [[ "\${QBT_FAST_ENVIRONMENT:-production}" == test ]]; then
+      printf 'Test environment — not for live games\\n'
+    else
+      printf '<!doctype html>\\n'
+    fi
+    ;;
 esac
 `,
   );
@@ -182,31 +236,181 @@ esac
 set -euo pipefail
 echo "maintenance $1 $3" >> "$QBT_FAST_LOG"
 operation="$3"
+release_attempt="\${2##*/}"
+fail_if_focused() {
+  local phase="$1" operation_name="$2" category="$3"
+  if [[ "\${QBT_FOCUSED_FAILURE_PHASE:-}" == "$phase" ]]; then
+    echo "Focused activation failure at $phase." >&2
+    printf 'report-operational %s %s %s %s failed %s %s\\n' "\${QBT_FAST_ENVIRONMENT:-production}" "$release_attempt" "$operation_name" "$phase" "$category" "$QBT_OPERATIONAL_MONITORING_OUTAGE" >> "$QBT_FAST_LOG"
+    if [[ -n "\${QBT_FAST_REPORT_SIGNAL:-}" ]]; then printf 'report\\n' > "$QBT_FAST_REPORT_SIGNAL"; fi
+    exit 1
+  fi
+}
 case "$operation" in
-  preflight) printf '{"schemaVersion":26}\\n' ;;
+  preflight)
+    fail_if_focused preflight deployment readiness
+    printf '{"schemaVersion":26}\\n'
+    ;;
+  report-operational|report-operational-attempt)
+    if [[ "$operation" == report-operational-attempt ]]; then release_attempt="$8"; fi
+    printf 'report-operational %s %s %s %s %s %s %s\\n' "$1" "$release_attempt" "$4" "$5" "$6" "$7" "$QBT_OPERATIONAL_MONITORING_OUTAGE" >> "$QBT_FAST_LOG"
+    if [[ -n "\${QBT_FAST_REPORT_SIGNAL:-}" ]]; then printf 'report\\n' > "$QBT_FAST_REPORT_SIGNAL"; fi
+    ;;
   backup)
+    fail_if_focused backup-create backup backup-candidate
     candidate="$QBT_FAST_STATE/backup-candidate"
     mkdir -p "$candidate"
     printf 'snapshot\\n' > "$candidate/foundation.sqlite"
     printf 'manifest\\n' > "$candidate/manifest.json"
     printf '{"manifestPath":"%s"}\\n' "$candidate/manifest.json"
     ;;
-  verify-backup) test -f "$4" ;;
+  verify-backup)
+    fail_if_focused backup-verify backup backup-candidate
+    test -f "$4"
+    ;;
   promote)
+    fail_if_focused backup-promote backup backup-candidate
     test -f "$4"
     printf 'retained-after\\n' > "$QBT_FAST_POINTER.next"
     mv "$QBT_FAST_POINTER.next" "$QBT_FAST_POINTER"
     ;;
-  validate-migration) : ;;
-  apply-migrations) printf 'schema-after\\n' > "$QBT_FAST_DATABASE" ;;
+  validate-migration)
+    fail_if_focused candidate-validation migration migration-candidate
+    ;;
+  apply-migrations)
+    fail_if_focused live-migration migration migration-candidate
+    printf 'schema-after\\n' > "$QBT_FAST_DATABASE"
+    ;;
   *) exit 64 ;;
 esac
 `,
   );
-  return { base, bin, database, log, pointer, probe, root, state, testCanary, wrapper };
+  return {
+    base,
+    bin,
+    database,
+    log,
+    pointer,
+    probe,
+    reportSignal,
+    root,
+    state,
+    testBase,
+    testCanary,
+    testDatabase,
+    testState,
+    wrapper,
+  };
 }
 
 describe("Production activation Fast phase matrix", () => {
+  test("reports a rejected staged bundle through the installed immutable release", async () => {
+    const harness = await createHarness();
+    const release = join(harness.base, "releases", releaseId);
+    const staged = join(harness.base, ".staging", releaseId);
+    Bun.spawnSync({ cmd: ["chmod", "-R", "u+w", release] });
+    await rm(release, { recursive: true, force: true });
+    await mkdir(staged, { recursive: true });
+    await writeFile(join(staged, "private-token"), secretSentinel);
+    const reportReader = Bun.spawn({
+      cmd: ["bash", "-c", 'read -r _ < "$QBT_FAST_REPORT_SIGNAL"'],
+      env: { ...process.env, QBT_FAST_REPORT_SIGNAL: harness.reportSignal },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const child = Bun.spawn({
+      cmd: [
+        "bash",
+        join(repositoryRoot, "deploy/activate-release.sh"),
+        "--base-dir",
+        harness.base,
+        "--staged-dir",
+        staged,
+        "--release",
+        releaseId,
+        "--service",
+        "quadball-timer",
+        "--port",
+        "3099",
+      ],
+      env: {
+        ...process.env,
+        PATH: `${harness.bin}:${process.env.PATH ?? ""}`,
+        QBT_FAST_BASE: harness.base,
+        QBT_FAST_DATABASE: harness.database,
+        QBT_FAST_LOG: harness.log,
+        QBT_FAST_POINTER: harness.pointer,
+        QBT_FAST_RELEASE: releaseId,
+        QBT_FAST_REPORT_SIGNAL: harness.reportSignal,
+        QBT_FAST_STATE: harness.state,
+        QBT_FOCUSED_TEST_MAINTENANCE_WRAPPER: harness.wrapper,
+        QBT_FOCUSED_TEST_MODE: "1",
+        QBT_FOCUSED_TEST_ROOT: harness.root,
+        QBT_OPERATIONAL_MONITORING_OUTAGE: "1",
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    expect(await child.exited).not.toBe(0);
+    expect(await reportReader.exited).toBe(0);
+    const output = `${await new Response(child.stdout).text()}${await new Response(child.stderr).text()}`;
+    expect(output).not.toContain(secretSentinel);
+    const testRelease = join(harness.testBase, "releases", releaseId);
+    const testStaged = join(harness.testBase, ".staging", releaseId);
+    Bun.spawnSync({ cmd: ["chmod", "-R", "u+w", testRelease] });
+    await rm(testRelease, { recursive: true, force: true });
+    await mkdir(testStaged, { recursive: true });
+    await writeFile(join(testStaged, "private-token"), secretSentinel);
+    const testReportReader = Bun.spawn({
+      cmd: ["bash", "-c", 'read -r _ < "$QBT_FAST_REPORT_SIGNAL"'],
+      env: { ...process.env, QBT_FAST_REPORT_SIGNAL: harness.reportSignal },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const testChild = Bun.spawn({
+      cmd: [
+        "bash",
+        join(repositoryRoot, "deploy/activate-test-release.sh"),
+        "--base-dir",
+        harness.testBase,
+        "--staged-dir",
+        testStaged,
+        "--release",
+        releaseId,
+      ],
+      env: {
+        ...process.env,
+        PATH: `${harness.bin}:${process.env.PATH ?? ""}`,
+        QBT_FAST_BASE: harness.testBase,
+        QBT_FAST_DATABASE: harness.testDatabase,
+        QBT_FAST_ENVIRONMENT: "test",
+        QBT_FAST_LOG: harness.log,
+        QBT_FAST_POINTER: harness.pointer,
+        QBT_FAST_RELEASE: releaseId,
+        QBT_FAST_REPORT_SIGNAL: harness.reportSignal,
+        QBT_FAST_STATE: harness.testState,
+        QBT_FOCUSED_TEST_MAINTENANCE_WRAPPER: harness.wrapper,
+        QBT_FOCUSED_TEST_MODE: "1",
+        QBT_FOCUSED_TEST_ROOT: harness.root,
+        QBT_OPERATIONAL_MONITORING_OUTAGE: "1",
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    expect(await testChild.exited).not.toBe(0);
+    expect(await testReportReader.exited).toBe(0);
+    const testOutput = `${await new Response(testChild.stdout).text()}${await new Response(testChild.stderr).text()}`;
+    expect(testOutput).not.toContain(secretSentinel);
+    expect(
+      (await readFile(harness.log, "utf8"))
+        .split("\n")
+        .filter((line) => line.startsWith("report-operational ")),
+    ).toEqual([
+      `report-operational production ${releaseId} deployment preflight failed atomic-install 1`,
+      `report-operational test ${releaseId} deployment preflight failed atomic-install 1`,
+    ]);
+  });
+
   test("injects every shipped orchestration phase without false or cross-Environment success", async () => {
     const cases = [
       ["preflight", "migration", false, false],
@@ -221,8 +425,14 @@ describe("Production activation Fast phase matrix", () => {
       ["rollback-restart", "activation", true, true],
       ["final-report", "activation", true, true],
     ] as const;
-
     const harness = await createHarness();
+    const testActivationSource = await readFile(
+      join(repositoryRoot, "deploy/activate-test-release.sh"),
+      "utf8",
+    );
+    expect(testActivationSource).toContain("report-operational");
+    expect(testActivationSource).toContain("maintenance_wrapper");
+    expect(testActivationSource).toContain("binary-rollback");
     const linkedState = join(harness.root, "state-link");
     await symlink(harness.state, linkedState);
     const command = [
@@ -255,6 +465,7 @@ describe("Production activation Fast phase matrix", () => {
       QBT_FOCUSED_TEST_RELEASE_VERIFIED: "1",
       QBT_FOCUSED_TEST_ROOT: harness.root,
       QBT_SECRET_SENTINEL: secretSentinel,
+      QBT_OPERATIONAL_MONITORING_OUTAGE: "1",
     };
     const batchOnlyRoot = await realpath(
       await mkdtemp(join(tmpdir(), "quadball-activation-batch-only-")),
@@ -387,6 +598,47 @@ describe("Production activation Fast phase matrix", () => {
       expect(await readFile(join(phaseDirectory, "database"), "utf8"), failurePhase).toBe(
         migrationApplied ? "schema-after\n" : "schema-before\n",
       );
+      const reports = operations
+        .split("\n")
+        .filter((line) => line.startsWith("report-operational "));
+      const expectedReports = {
+        preflight: ["deployment preflight failed readiness 1"],
+        "quiesce-stop": ["deployment quiesce-stop failed atomic-install 1"],
+        "backup-create": ["backup backup-create failed backup-candidate 1"],
+        "backup-verify": ["backup backup-verify failed backup-candidate 1"],
+        "backup-promote": ["backup backup-promote failed backup-candidate 1"],
+        "candidate-validation": ["migration candidate-validation failed migration-candidate 1"],
+        "live-migration": ["migration live-migration failed migration-candidate 1"],
+        "release-switch": ["deployment release-switch failed atomic-install 1"],
+        readiness: [
+          "deployment readiness failed readiness 1",
+          "deployment rollback-restart failed binary-rollback 1",
+        ],
+        "rollback-restart": [
+          "deployment startup failed atomic-install 1",
+          "deployment rollback-restart failed binary-rollback 1",
+        ],
+        "final-report": ["deployment final-report failed atomic-install 1"],
+      }[failurePhase].map((report) => `report-operational production ${releaseId} ${report}`);
+      expect([...reports].sort(), failurePhase).toEqual([...expectedReports].sort());
+      const maintenanceCommand = (
+        {
+          preflight: "preflight",
+          "backup-create": "backup",
+          "backup-verify": "verify-backup",
+          "backup-promote": "promote",
+          "candidate-validation": "validate-migration",
+          "live-migration": "apply-migrations",
+        } as Record<string, string | undefined>
+      )[failurePhase];
+      if (maintenanceCommand !== undefined) {
+        expect(
+          operations
+            .split("\n")
+            .filter((line) => line === `maintenance production ${maintenanceCommand}`),
+          failurePhase,
+        ).toHaveLength(1);
+      }
       expect(await readFile(harness.testCanary, "utf8"), failurePhase).toBe("test-untouched\n");
       expect(operations, failurePhase).not.toContain("quadball-timer-test");
       expect(operations.includes("systemctl stop quadball-timer"), failurePhase).toBe(
@@ -409,6 +661,135 @@ describe("Production activation Fast phase matrix", () => {
       );
     }
     expect(await readFile(harness.probe, "utf8")).toBe("0 1 1\n");
+
+    const testCases = {
+      preflight: {
+        reports: ["deployment preflight failed readiness 1"],
+        current: previousReleaseId,
+        database: "schema-before\n",
+      },
+      "candidate-validation": {
+        reports: ["migration candidate-validation failed migration-candidate 1"],
+        current: previousReleaseId,
+        database: "schema-before\n",
+      },
+      "live-migration": {
+        reports: ["migration live-migration failed migration-candidate 1"],
+        current: previousReleaseId,
+        database: "schema-before\n",
+      },
+      "quiesce-stop": {
+        reports: ["deployment quiesce-stop failed atomic-install 1"],
+        current: previousReleaseId,
+        database: "schema-before\n",
+      },
+      "release-switch": {
+        reports: ["deployment release-switch failed atomic-install 1"],
+        current: previousReleaseId,
+        database: "schema-after\n",
+      },
+      readiness: {
+        reports: [
+          "deployment readiness failed readiness 1",
+          "deployment rollback-restart failed binary-rollback 1",
+        ],
+        current: previousReleaseId,
+        database: "schema-after\n",
+      },
+      "rollback-restart": {
+        reports: [
+          "deployment startup failed atomic-install 1",
+          "deployment rollback-restart failed binary-rollback 1",
+        ],
+        current: previousReleaseId,
+        database: "schema-after\n",
+      },
+      "final-report": {
+        reports: ["deployment final-report failed atomic-install 1"],
+        current: releaseId,
+        database: "schema-after\n",
+      },
+    } as const;
+    for (const [failurePhase, testCase] of Object.entries(testCases)) {
+      await rm(join(harness.testBase, "current"), { force: true });
+      await symlink(
+        join(harness.testBase, "releases", previousReleaseId),
+        join(harness.testBase, "current"),
+      );
+      await writeFile(harness.testDatabase, "schema-before\n");
+      await writeFile(harness.log, "");
+      const reportSignalReader = Bun.spawn({
+        cmd: [
+          "bash",
+          "-c",
+          `count=0; while (( count < ${testCase.reports.length} )); do read -r < "$QBT_FAST_REPORT_SIGNAL" || true; count=$((count + 1)); done`,
+        ],
+        env: { ...process.env, QBT_FAST_REPORT_SIGNAL: harness.reportSignal },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const testProcess = Bun.spawnSync({
+        cmd: [
+          "bash",
+          join(repositoryRoot, "deploy/activate-test-release.sh"),
+          "--base-dir",
+          harness.testBase,
+          "--release",
+          releaseId,
+        ],
+        env: {
+          ...process.env,
+          PATH: `${harness.bin}:${process.env.PATH ?? ""}`,
+          QBT_FAST_BASE: harness.testBase,
+          QBT_FAST_DATABASE: harness.testDatabase,
+          QBT_FAST_ENVIRONMENT: "test",
+          QBT_FAST_LOG: harness.log,
+          QBT_FAST_RELEASE: releaseId,
+          QBT_FAST_REPORT_SIGNAL: harness.reportSignal,
+          QBT_FAST_STATE: harness.testState,
+          QBT_FOCUSED_TEST_MAINTENANCE_WRAPPER: harness.wrapper,
+          QBT_FOCUSED_TEST_MODE: "1",
+          QBT_FOCUSED_TEST_RELEASE_VERIFIED: "1",
+          QBT_FOCUSED_TEST_ROOT: harness.root,
+          QBT_FOCUSED_FAILURE_PHASE: failurePhase,
+          QBT_SECRET_SENTINEL: secretSentinel,
+          QBT_OPERATIONAL_MONITORING_OUTAGE: "1",
+        },
+        stderr: "pipe",
+        stdout: "pipe",
+      });
+      const output = `${testProcess.stdout.toString()}${testProcess.stderr.toString()}`;
+      expect(await reportSignalReader.exited).toBe(0);
+      const reports = (await readFile(harness.log, "utf8"))
+        .split("\n")
+        .filter((line) => line.startsWith("report-operational "));
+      expect(testProcess.exitCode, failurePhase).not.toBe(0);
+      expect(output, failurePhase).toContain(`Focused activation failure at ${failurePhase}.`);
+      expect(output, failurePhase).not.toContain(secretSentinel);
+      expect(output, failurePhase).not.toContain("production");
+      expect([...reports].sort(), failurePhase).toEqual(
+        testCase.reports.map((report) => `report-operational test ${releaseId} ${report}`).sort(),
+      );
+      const maintenanceCommand = {
+        preflight: "preflight",
+        "candidate-validation": "validate-migration",
+        "live-migration": "apply-migrations",
+      }[failurePhase];
+      if (maintenanceCommand !== undefined) {
+        expect(
+          (await readFile(harness.log, "utf8"))
+            .split("\n")
+            .filter((line) => line === `maintenance test ${maintenanceCommand}`),
+          failurePhase,
+        ).toHaveLength(1);
+      }
+      expect(
+        await readFile(join(harness.testBase, "current", "release-manifest.json"), "utf8"),
+        failurePhase,
+      ).toContain(`"releaseAttemptId":"${testCase.current}"`);
+      expect(await readFile(harness.testDatabase, "utf8"), failurePhase).toBe(testCase.database);
+      expect(await readFile(harness.testCanary, "utf8"), failurePhase).toBe("test-untouched\n");
+    }
   }, 30_000);
 
   test("uses one bounded semantic Test readiness deadline for delayed and unhealthy services", async () => {

@@ -115,6 +115,16 @@ import {
   browserMonitoringPublicConfig,
   serializeBrowserMonitoringConfig,
 } from "@/lib/monitoring-redaction";
+import {
+  OPERATIONAL_CATEGORIES,
+  OPERATIONAL_OPERATIONS,
+  OPERATIONAL_OUTCOMES,
+  OPERATIONAL_PHASES,
+  createOperationalMonitoringAdapter,
+  createOperationalMonitoringAdapterForMaintenance,
+  type OperationalFailureInput,
+  type OperationalMonitoringAdapter,
+} from "@/lib/operational-monitoring";
 import { runProductionActivationCli } from "@/lib/production-activation-cli";
 import { createPublicHealthRoute } from "@/lib/public-health";
 
@@ -162,9 +172,27 @@ async function main() {
     return;
   }
 
+  const operationalFailureIndex = process.argv.indexOf("--emit-operational-failure");
+  if (operationalFailureIndex !== -1) {
+    await emitOperationalFailure(process.argv.slice(operationalFailureIndex + 1));
+    return;
+  }
+
   const maintenanceIndex = process.argv.indexOf("--production-activation");
   if (maintenanceIndex !== -1) {
-    process.exitCode = await runProductionActivationCli(process.argv.slice(maintenanceIndex + 1));
+    const operationalReportFile = process.env.QBT_OPERATIONAL_REPORT_FILE?.trim();
+    // The root wrapper supplies a private spool and owns detached delivery.
+    // Direct CLI invocations remain authoritative and must not read release
+    // identity or initialize monitoring before the operation starts.
+    const operationalMonitoring =
+      operationalReportFile === undefined
+        ? createOperationalMonitoringAdapter({ enabled: false })
+        : createOperationalMonitoringAdapterForMaintenance(operationalReportFile);
+    const result = await runProductionActivationCli(
+      process.argv.slice(maintenanceIndex + 1),
+      operationalMonitoring,
+    );
+    process.exitCode = result;
     return;
   }
 
@@ -200,6 +228,11 @@ async function startServer() {
   let grantAuthorityOptions: ReturnType<typeof readGrantAuthorityOptions>;
   let server: Bun.Server<SessionData> | undefined;
   let shutdown: (() => void) | undefined;
+  let monitoringEnvironment: "production" | "test" = "test";
+  let operationalMonitoring: OperationalMonitoringAdapter = createOperationalMonitoringAdapter({
+    enabled: false,
+  });
+  let deferredStartupOperationalFailure: OperationalFailureInput | undefined;
   let monitoring: ServerMonitoring = initializeServerMonitoring({
     environment: "test",
     release: "startup",
@@ -212,6 +245,7 @@ async function startServer() {
     const port = Number(process.env.PORT ?? 3000);
     const { technicalAdmin: technicalAdminConfig, storagePaths } = readRuntimeConfig();
     const { environment } = technicalAdminConfig;
+    monitoringEnvironment = environment;
     const monitoringIdentity = await readTrustedMonitoringIdentity(environment);
     monitoring =
       monitoringIdentity === null
@@ -224,6 +258,7 @@ async function startServer() {
             ...monitoringIdentity,
             dsn: process.env.GLITCHTIP_DSN?.trim() || undefined,
           });
+    operationalMonitoring = createOperationalMonitoringAdapterForServer(monitoring);
     assertProductionStateBoundary(environment, storagePaths);
     grantAuthorityOptions = readGrantAuthorityOptions(environment);
     const adHocDatabasePath =
@@ -309,6 +344,14 @@ async function startServer() {
         startupCleanup.add(() => readyFoundation.close());
         eventCatalogStorage = createFoundationEventCatalogStorage(readyFoundation);
       } else {
+        operationalMonitoring.reportFailure({
+          operation: "readiness",
+          environment,
+          ...(monitoringIdentity === null ? {} : { releaseAttempt: monitoringIdentity.release }),
+          phase: "readiness",
+          outcome: "failed",
+          category: (readiness.evidence?.keys.missingCount ?? 0) > 0 ? "key-version" : "readiness",
+        });
         candidateFoundation.close();
         candidateFoundation = undefined;
         eventCatalogStorage = createUnavailableEventCatalogStorage(
@@ -316,6 +359,22 @@ async function startServer() {
         );
       }
     } catch (error) {
+      const failure: OperationalFailureInput = {
+        operation: "readiness",
+        environment,
+        ...(monitoringIdentity === null ? {} : { releaseAttempt: monitoringIdentity.release }),
+        phase: "readiness",
+        outcome: "failed",
+        category:
+          error instanceof GrantKeyRingCustodyError && error.category === "missing-key-version"
+            ? "key-version"
+            : "readiness",
+      };
+      if (error instanceof GrantKeyRingCustodyError) {
+        deferredStartupOperationalFailure = failure;
+      } else {
+        operationalMonitoring.reportFailure(failure);
+      }
       monitoring.captureException(error, {
         category: "startup",
         component: "foundation-storage",
@@ -2529,14 +2588,77 @@ async function startServer() {
 
     console.log(`Server running at ${server.url}`);
   } catch (error) {
+    const startupFailure =
+      deferredStartupOperationalFailure ??
+      ({
+        operation: "deployment",
+        environment: monitoringEnvironment,
+        phase: "startup",
+        outcome: "failed",
+        category:
+          error instanceof GrantKeyRingCustodyError && error.category === "missing-key-version"
+            ? "key-version"
+            : "atomic-install",
+      } satisfies OperationalFailureInput);
     monitoring.captureException(error, { category: "startup", component: "server" });
     if (shutdown !== undefined) {
       process.removeListener("SIGTERM", shutdown);
       process.removeListener("SIGINT", shutdown);
     }
     cleanup();
+    detachStartupOperationalFailure(startupFailure);
     throw error;
   }
+}
+
+function detachStartupOperationalFailure(failure: OperationalFailureInput): void {
+  const bunExecutable = Bun.which("bun");
+  const command =
+    bunExecutable !== null && process.execPath === bunExecutable
+      ? [process.execPath, "run", import.meta.path]
+      : [process.execPath];
+  try {
+    const reporter = Bun.spawn({
+      cmd: [
+        "/bin/bash",
+        "-c",
+        'exec 9>&-; exec "$@"',
+        "qbt-operational-reporter",
+        ...command,
+        "--emit-operational-failure",
+        "--operation",
+        failure.operation,
+        "--phase",
+        failure.phase,
+        "--outcome",
+        failure.outcome,
+        "--category",
+        failure.category,
+      ],
+      env: process.env,
+      stdin: "ignore",
+      stdout: "ignore",
+      stderr: "ignore",
+    });
+    reporter.unref();
+  } catch {
+    // Startup failure remains authoritative when the reporter cannot start.
+  }
+}
+
+function createOperationalMonitoringAdapterForServer(
+  monitoring: ServerMonitoring,
+): OperationalMonitoringAdapter {
+  return createOperationalMonitoringAdapter({
+    enabled: monitoring.enabled,
+    send: async (event) => {
+      if (!monitoring.captureOperationalFailure(event)) return false;
+      return await monitoring.flush(250);
+    },
+    onDelivery: (delivery) => {
+      console.error(delivery);
+    },
+  });
 }
 
 export async function createHtmlRoute({
@@ -2653,12 +2775,77 @@ async function emitTestMonitoringError(): Promise<void> {
     dsn: process.env.GLITCHTIP_DSN?.trim() || undefined,
   });
   if (!monitoring.enabled) throw new Error("GLITCHTIP_DSN is not configured.");
-  monitoring.captureMessage("Quadball Timer Test monitoring event", {
-    category: "test-monitoring",
-    component: "host-local",
-    operation: "emit-test-error",
+  const operationalMonitoring = createOperationalMonitoringAdapter({
+    enabled: monitoring.enabled,
+    send: async (event) => {
+      if (!monitoring.captureOperationalFailure(event)) return false;
+      return await monitoring.flush(250);
+    },
   });
-  if (!(await monitoring.flush(5_000))) throw new Error("Monitoring event was not delivered.");
+  const delivery = await operationalMonitoring.deliverFailure({
+    operation: "deployment",
+    environment: "test",
+    releaseAttempt: identity.release,
+    phase: "startup",
+    outcome: "failed",
+    category: "readiness",
+  });
+  if (delivery !== "sent") throw new Error("Operational monitoring event was not delivered.");
+}
+
+async function emitOperationalFailure(argv: readonly string[]): Promise<void> {
+  const readOption = (name: string): string | undefined => {
+    const index = argv.indexOf(name);
+    return index === -1 ? undefined : argv[index + 1];
+  };
+  const operation = allowlistedOperationalOption(readOption("--operation"), OPERATIONAL_OPERATIONS);
+  const phase = allowlistedOperationalOption(readOption("--phase"), OPERATIONAL_PHASES);
+  const outcome = allowlistedOperationalOption(readOption("--outcome"), OPERATIONAL_OUTCOMES);
+  const category = allowlistedOperationalOption(readOption("--category"), OPERATIONAL_CATEGORIES);
+  if (
+    operation === undefined ||
+    phase === undefined ||
+    outcome === undefined ||
+    category === undefined
+  ) {
+    throw new Error("Operational failure fields are required.");
+  }
+  const environment = process.env.QUADBALL_ENVIRONMENT === "production" ? "production" : "test";
+  const identity = await readTrustedMonitoringIdentity(environment);
+  const monitoring =
+    identity === null
+      ? initializeServerMonitoring({
+          environment,
+          release: "unavailable",
+          browserCorrelation: "release-unavailable",
+        })
+      : initializeServerMonitoring({
+          ...identity,
+          dsn: process.env.GLITCHTIP_DSN?.trim() || undefined,
+        });
+  const adapter = createOperationalMonitoringAdapter({
+    enabled: monitoring.enabled,
+    send: async (event) => {
+      if (!monitoring.captureOperationalFailure(event)) return false;
+      return await monitoring.flush(250);
+    },
+  });
+  const delivery = await adapter.deliverFailure({
+    operation,
+    environment,
+    releaseAttempt: identity?.release,
+    phase,
+    outcome,
+    category,
+  });
+  console.log(delivery);
+}
+
+function allowlistedOperationalOption<const Values extends readonly string[]>(
+  value: string | undefined,
+  values: Values,
+): Values[number] | undefined {
+  return value !== undefined && values.includes(value) ? value : undefined;
 }
 
 async function runProbeMode(

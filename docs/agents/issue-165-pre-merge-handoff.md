@@ -1,5 +1,10 @@
 # Issue #165 pre-merge activation handoff
 
+> Historical record only. This document pins the pre-#168 privileged wrapper
+> and must not be used as the current installation procedure. The reviewed
+> superseding handoff is `docs/agents/issue-168-pre-merge-handoff.md`, which
+> carries the current wrapper checksum and fish-compatible operator path.
+
 This is the bounded, operator-run host prerequisite for the schema-aware
 activation in Draft PR #222. It is intentionally separate from deployment:
 the agent does not SSH, upload, install, restart, or change the live server.

@@ -114,6 +114,7 @@ jobs:
       phase: ${{ steps.deployment-outcome.outputs.phase }}
       releaseAttemptId: ${{ steps.deployment-outcome.outputs.releaseAttemptId }}
       failureCategory: ${{ steps.deployment-outcome.outputs.failureCategory }}
+      monitoringDelivery: ${{ steps.deployment-outcome.outputs.monitoringDelivery }}
     runs-on: ubuntu-latest
     environment:
       name: test
@@ -181,7 +182,7 @@ jobs:
           base_dir="${DEPLOY_BASE:-/srv/quadball-timer-test}"
           release_id="${RELEASE_ATTEMPT_ID}"
           stage_dir="${base_dir}/.staging/${release_id}"
-          ssh_opts="-i ${SSH_DIR}/id_ed25519 -o StrictHostKeyChecking=yes -o UserKnownHostsFile=${SSH_DIR}/known_hosts"
+          ssh_opts="-i ${SSH_DIR}/id_ed25519 -o StrictHostKeyChecking=yes -o UserKnownHostsFile=${SSH_DIR}/known_hosts -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=1"
           cleanup_remote_stage() {
             ssh $ssh_opts "${DEPLOY_USER}@${DEPLOY_HOST}" "chmod -R u+w -- '${stage_dir}' 2>/dev/null || true; rm -rf -- '${stage_dir}'" || true
             rm -rf -- "$SSH_DIR"
@@ -194,7 +195,14 @@ jobs:
           activation_status=${PIPESTATUS[0]}
           set -e
           phase="$(sed -n 's/^ACTIVATION_PHASE=//p' "$RUNNER_TEMP/quadball-test-deployment.log" | tail -n 1)"
+          monitoring_delivery="unavailable"
+          if (( activation_status != 0 )); then
+            sleep 3
+            monitoring_delivery="$(timeout --signal=KILL 5s ssh $ssh_opts "${DEPLOY_USER}@${DEPLOY_HOST}" "reporter='${base_dir}/releases/${release_id}'; if [[ ! -x \"\$reporter/quadball-timer\" || ! -f \"\$reporter/release-manifest.json\" ]]; then reporter=\$(readlink -f '${base_dir}/current' 2>/dev/null || true); fi; [[ \"\$reporter\" == '${base_dir}/releases/'* ]] && sudo /usr/local/sbin/quadball-timer-activation-maintenance test \"\$reporter\" read-operational-delivery '${release_id}'" 2>/dev/null || true)"
+          fi
+          case "$monitoring_delivery" in sent|failed|unavailable) ;; *) monitoring_delivery="unavailable" ;; esac
           echo "DEPLOYMENT_PHASE=${phase:-activation}" >> "$GITHUB_ENV"
+          echo "MONITORING_DELIVERY=$monitoring_delivery" >> "$GITHUB_ENV"
           exit "$activation_status"
 
       - name: Record Test deployment outcome
@@ -204,6 +212,7 @@ jobs:
           JOB_STATUS: ${{ job.status }}
           RELEASE_ATTEMPT: ${{ env.RELEASE_ATTEMPT_ID }}
           FAILED_PHASE: ${{ env.DEPLOYMENT_PHASE }}
+          MONITORING_DELIVERY: ${{ env.MONITORING_DELIVERY || 'unavailable' }}
         run: |
           set -euo pipefail
           case "$JOB_STATUS" in
@@ -225,6 +234,7 @@ jobs:
             echo "phase=$phase"
             echo "releaseAttemptId=$RELEASE_ATTEMPT"
             echo "failureCategory=$failure_category"
+            echo "monitoringDelivery=$MONITORING_DELIVERY"
           } >> "$GITHUB_OUTPUT"
 
   deploy-production:
@@ -235,6 +245,7 @@ jobs:
       phase: ${{ steps.deployment-outcome.outputs.phase }}
       releaseAttemptId: ${{ steps.deployment-outcome.outputs.releaseAttemptId }}
       failureCategory: ${{ steps.deployment-outcome.outputs.failureCategory }}
+      monitoringDelivery: ${{ steps.deployment-outcome.outputs.monitoringDelivery }}
     runs-on: ubuntu-latest
     environment:
       name: production
@@ -306,7 +317,7 @@ jobs:
           app_port="${PROD_APP_PORT:-3000}"
           release_id="${RELEASE_ATTEMPT_ID}"
           stage_dir="${base_dir}/.staging/${release_id}"
-          ssh_opts="-i ${SSH_DIR}/id_ed25519 -o StrictHostKeyChecking=yes -o UserKnownHostsFile=${SSH_DIR}/known_hosts"
+          ssh_opts="-i ${SSH_DIR}/id_ed25519 -o StrictHostKeyChecking=yes -o UserKnownHostsFile=${SSH_DIR}/known_hosts -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=1"
           cleanup_remote_stage() {
             ssh $ssh_opts "${DEPLOY_USER}@${DEPLOY_HOST}" "chmod -R u+w -- '${stage_dir}' 2>/dev/null || true; rm -rf -- '${stage_dir}'" || true
             rm -rf -- "$SSH_DIR"
@@ -319,7 +330,14 @@ jobs:
           activation_status=${PIPESTATUS[0]}
           set -e
           phase="$(sed -n 's/^ACTIVATION_PHASE=//p' "$RUNNER_TEMP/quadball-production-deployment.log" | tail -n 1)"
+          monitoring_delivery="unavailable"
+          if (( activation_status != 0 )); then
+            sleep 3
+            monitoring_delivery="$(timeout --signal=KILL 5s ssh $ssh_opts "${DEPLOY_USER}@${DEPLOY_HOST}" "reporter='${base_dir}/releases/${release_id}'; if [[ ! -x \"\$reporter/quadball-timer\" || ! -f \"\$reporter/release-manifest.json\" ]]; then reporter=\$(readlink -f '${base_dir}/current' 2>/dev/null || true); fi; [[ \"\$reporter\" == '${base_dir}/releases/'* ]] && sudo /usr/local/sbin/quadball-timer-activation-maintenance production \"\$reporter\" read-operational-delivery '${release_id}'" 2>/dev/null || true)"
+          fi
+          case "$monitoring_delivery" in sent|failed|unavailable) ;; *) monitoring_delivery="unavailable" ;; esac
           echo "DEPLOYMENT_PHASE=${phase:-activation}" >> "$GITHUB_ENV"
+          echo "MONITORING_DELIVERY=$monitoring_delivery" >> "$GITHUB_ENV"
           if (( activation_status != 0 )); then exit "$activation_status"; fi
           curl --fail --silent --show-error --max-time 10 https://timer.quadball.app/ | grep -qi "<!doctype html"
 
@@ -330,6 +348,7 @@ jobs:
           JOB_STATUS: ${{ job.status }}
           RELEASE_ATTEMPT: ${{ env.RELEASE_ATTEMPT_ID }}
           FAILED_PHASE: ${{ env.DEPLOYMENT_PHASE }}
+          MONITORING_DELIVERY: ${{ env.MONITORING_DELIVERY || 'unavailable' }}
         run: |
           set -euo pipefail
           case "$JOB_STATUS" in
@@ -351,6 +370,7 @@ jobs:
             echo "phase=$phase"
             echo "releaseAttemptId=$RELEASE_ATTEMPT"
             echo "failureCategory=$failure_category"
+            echo "monitoringDelivery=$MONITORING_DELIVERY"
           } >> "$GITHUB_OUTPUT"
 
   report:
@@ -364,9 +384,11 @@ jobs:
           TEST_STATUS: ${{ needs.deploy-test.outputs.status || needs.deploy-test.result }}
           TEST_PHASE: ${{ needs.deploy-test.outputs.phase || 'deployment' }}
           TEST_FAILURE_CATEGORY: ${{ needs.deploy-test.outputs.failureCategory || 'job-skipped' }}
+          TEST_MONITORING_DELIVERY: ${{ needs.deploy-test.outputs.monitoringDelivery || 'unavailable' }}
           PRODUCTION_STATUS: ${{ needs.deploy-production.outputs.status || needs.deploy-production.result }}
           PRODUCTION_PHASE: ${{ needs.deploy-production.outputs.phase || 'deployment' }}
           PRODUCTION_FAILURE_CATEGORY: ${{ needs.deploy-production.outputs.failureCategory || 'job-skipped' }}
+          PRODUCTION_MONITORING_DELIVERY: ${{ needs.deploy-production.outputs.monitoringDelivery || 'unavailable' }}
         run: |
           set -euo pipefail
           cat > deployment-report.json <<EOF
@@ -375,12 +397,14 @@ jobs:
             "test": {
               "status": "${TEST_STATUS}",
               "phase": "${TEST_PHASE}",
-              "failureCategory": "${TEST_FAILURE_CATEGORY}"
+              "failureCategory": "${TEST_FAILURE_CATEGORY}",
+              "monitoringDelivery": "${TEST_MONITORING_DELIVERY}"
             },
             "production": {
               "status": "${PRODUCTION_STATUS}",
               "phase": "${PRODUCTION_PHASE}",
-              "failureCategory": "${PRODUCTION_FAILURE_CATEGORY}"
+              "failureCategory": "${PRODUCTION_FAILURE_CATEGORY}",
+              "monitoringDelivery": "${PRODUCTION_MONITORING_DELIVERY}"
             }
           }
           EOF
