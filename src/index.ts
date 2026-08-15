@@ -2197,10 +2197,6 @@ async function startServer() {
         "/healthz": createPublicHealthRoute({
           foundationStorage,
           technicalAdminAuth,
-          authoritativeServices: {
-            eventAdministration: eventAdministration !== null,
-            liveEventRuntime,
-          },
         }),
         "/internal/healthz": {
           GET(req: Request) {

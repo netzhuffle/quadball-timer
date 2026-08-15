@@ -1,16 +1,13 @@
 import type { FoundationStorage } from "@/lib/foundation-storage";
-import type { LiveEventGameRuntime } from "@/lib/live-event-game-runtime";
 import type { TechnicalAdminAuth, TechnicalAdminStorageStatus } from "@/lib/technical-admin-auth";
 
-/** The intentionally small dependency surface of the public health contract. */
+/**
+ * The intentionally small core dependency surface of the public health contract. Optional
+ * Event, Ad Hoc, and Grant operation modules own their separate fail-closed boundaries.
+ */
 export type PublicHealthDependencies = {
   foundationStorage: Pick<FoundationStorage, "readiness"> | undefined;
   technicalAdminAuth: Pick<TechnicalAdminAuth, "storageStatus">;
-  /** The SQM-critical authoritative services that must remain available. */
-  authoritativeServices: {
-    eventAdministration: boolean;
-    liveEventRuntime: Pick<LiveEventGameRuntime, "readiness"> | null;
-  };
 };
 
 const PUBLIC_HEALTH_HEADERS = {
@@ -41,17 +38,6 @@ export function createPublicHealthRoute(dependencies: PublicHealthDependencies) 
 }
 
 export async function isPubliclyHealthy(dependencies: PublicHealthDependencies): Promise<boolean> {
-  if (
-    !dependencies.authoritativeServices.eventAdministration ||
-    dependencies.authoritativeServices.liveEventRuntime === null
-  ) {
-    return false;
-  }
-
-  if (!(await isFoundationStorageHealthy(dependencies.authoritativeServices.liveEventRuntime))) {
-    return false;
-  }
-
   let technicalAdminStatus: TechnicalAdminStorageStatus;
   try {
     technicalAdminStatus = dependencies.technicalAdminAuth.storageStatus();
