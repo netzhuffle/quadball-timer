@@ -91,6 +91,15 @@ import {
   AD_HOC_MAX_CONNECTED_CONTROLLERS,
   AD_HOC_MAX_QUEUED_OUTPUT_BYTES,
 } from "@/lib/ad-hoc-resource-budgets";
+import {
+  initializeServerMonitoring,
+  readTrustedMonitoringIdentity,
+  type ServerMonitoring,
+} from "@/lib/monitoring-server";
+import {
+  browserMonitoringPublicConfig,
+  serializeBrowserMonitoringConfig,
+} from "@/lib/monitoring-redaction";
 
 type SessionSubscription =
   | {
@@ -127,6 +136,11 @@ async function main() {
     return;
   }
 
+  if (process.argv.includes("--emit-test-monitoring-error")) {
+    await emitTestMonitoringError();
+    return;
+  }
+
   if (grantKeyRingInvocation.kind === "invalid") {
     console.error(grantKeyRingInvocation.error);
     process.exitCode = 1;
@@ -159,6 +173,11 @@ async function startServer() {
   let grantAuthorityOptions: ReturnType<typeof readGrantAuthorityOptions>;
   let server: Bun.Server<SessionData> | undefined;
   let shutdown: (() => void) | undefined;
+  let monitoring: ServerMonitoring = initializeServerMonitoring({
+    environment: "test",
+    release: "startup",
+    browserCorrelation: "release-startup",
+  });
   const startupCleanup = createStartupCleanup();
   const cleanup = () => startupCleanup.run();
 
@@ -166,6 +185,18 @@ async function startServer() {
     const port = Number(process.env.PORT ?? 3000);
     const { technicalAdmin: technicalAdminConfig, storagePaths } = readRuntimeConfig();
     const { environment } = technicalAdminConfig;
+    const monitoringIdentity = await readTrustedMonitoringIdentity(environment);
+    monitoring =
+      monitoringIdentity === null
+        ? initializeServerMonitoring({
+            environment,
+            release: "unavailable",
+            browserCorrelation: "release-unavailable",
+          })
+        : initializeServerMonitoring({
+            ...monitoringIdentity,
+            dsn: process.env.GLITCHTIP_DSN?.trim() || undefined,
+          });
     assertProductionStateBoundary(environment, storagePaths);
     grantAuthorityOptions = readGrantAuthorityOptions(environment);
     const adHocDatabasePath =
@@ -262,6 +293,11 @@ async function startServer() {
         );
       }
     } catch (error) {
+      monitoring.captureException(error, {
+        category: "startup",
+        component: "foundation-storage",
+        operation: "open",
+      });
       candidateFoundation?.close();
       foundationStorage?.close();
       foundationStorage = undefined;
@@ -313,6 +349,11 @@ async function startServer() {
         });
         startupCleanup.add(() => liveEventRuntime?.close());
       } catch (error) {
+        monitoring.captureException(error, {
+          category: "startup",
+          component: "event-runtime",
+          operation: "open",
+        });
         console.warn("Durable Event Game Controller is unavailable.", error);
       }
     }
@@ -505,14 +546,30 @@ async function startServer() {
     process.once("SIGTERM", shutdown);
     process.once("SIGINT", shutdown);
 
+    const browserMonitoringDsn =
+      monitoringIdentity === null
+        ? undefined
+        : process.env.PUBLIC_GLITCHTIP_DSN?.trim() || undefined;
     const htmlRoute =
-      environment === "test" && process.env.NODE_ENV === "production"
-        ? await createTestHtmlRoute()
+      monitoringIdentity !== null &&
+      ((environment === "test" && process.env.NODE_ENV === "production") ||
+        browserMonitoringDsn !== undefined)
+        ? await createHtmlRoute({
+            testEnvironment: environment === "test" && process.env.NODE_ENV === "production",
+            browserMonitoring: browserMonitoringPublicConfig(
+              monitoringIdentity,
+              browserMonitoringDsn,
+            ),
+          })
         : index;
 
     server = serve<SessionData>({
       hostname: process.env.HOST ?? "127.0.0.1",
       port,
+      error(error) {
+        monitoring.captureException(error, { category: "server", component: "http" });
+        return json({ error: "Internal server error." }, 500);
+      },
       ...(tls ? { tls } : {}),
       routes: {
         "/ws": async (req: Bun.BunRequest<"/ws">, routeServer: Bun.Server<SessionData>) => {
@@ -2213,6 +2270,7 @@ async function startServer() {
 
     console.log(`Server running at ${server.url}`);
   } catch (error) {
+    monitoring.captureException(error, { category: "startup", component: "server" });
     if (shutdown !== undefined) {
       process.removeListener("SIGTERM", shutdown);
       process.removeListener("SIGINT", shutdown);
@@ -2222,7 +2280,18 @@ async function startServer() {
   }
 }
 
-async function createTestHtmlRoute() {
+async function createHtmlRoute({
+  testEnvironment,
+  browserMonitoring,
+}: {
+  testEnvironment: boolean;
+  browserMonitoring: {
+    dsn?: string;
+    environment: "production" | "test";
+    release: string;
+    browserCorrelation: string;
+  };
+}) {
   const html = await Bun.file(index.index)
     .text()
     .catch(() => null);
@@ -2230,20 +2299,30 @@ async function createTestHtmlRoute() {
     throw new Error("Test HTML presentation bundle is unavailable.");
   }
 
-  const body = html
-    .replace(
-      "</head>",
-      '<meta name="robots" content="noindex, nofollow, noarchive, noimageindex" /></head>',
-    )
-    .replace(
-      "<body>",
-      '<body><div class="test-environment-banner">Test environment — not for live games</div>',
-    );
-  const headers = {
-    "cache-control": "no-store",
+  const monitoringScript = `<script>globalThis.__QUADBALL_TIMER_MONITORING__=${serializeBrowserMonitoringConfig(
+    browserMonitoring,
+  )};</script>`;
+  const bodyWithMonitoring = html.replace("</head>", `${monitoringScript}</head>`);
+  const body = testEnvironment
+    ? bodyWithMonitoring
+        .replace(
+          "</head>",
+          '<meta name="robots" content="noindex, nofollow, noarchive, noimageindex" /></head>',
+        )
+        .replace(
+          "<body>",
+          '<body><div class="test-environment-banner">Test environment — not for live games</div>',
+        )
+    : bodyWithMonitoring;
+  const headers = new Headers({
     "content-type": "text/html; charset=utf-8",
-    "x-robots-tag": "noindex, nofollow, noarchive, noimageindex",
-  };
+    ...(testEnvironment
+      ? {
+          "cache-control": "no-store",
+          "x-robots-tag": "noindex, nofollow, noarchive, noimageindex",
+        }
+      : {}),
+  });
   const assetDirectory = dirname(index.index);
   const assetPaths = new Map<string, string>();
   for (const match of html.matchAll(/(?:href|src)="\.\/([a-zA-Z0-9._-]+)"/gu)) {
@@ -2257,12 +2336,37 @@ async function createTestHtmlRoute() {
     return assetPath === undefined
       ? new Response(body, { headers })
       : new Response(Bun.file(assetPath), {
-          headers: { "cache-control": "no-store", "x-robots-tag": headers["x-robots-tag"] },
+          headers: {
+            "cache-control": "no-store",
+            ...(testEnvironment
+              ? { "x-robots-tag": "noindex, nofollow, noarchive, noimageindex" }
+              : {}),
+          },
         });
   };
 }
 
 if (import.meta.main) void main();
+
+async function emitTestMonitoringError(): Promise<void> {
+  const { technicalAdmin } = readRuntimeConfig();
+  if (technicalAdmin.environment !== "test") {
+    throw new Error("The monitoring test action is available only in the Test environment.");
+  }
+  const identity = await readTrustedMonitoringIdentity("test");
+  if (identity === null) throw new Error("Immutable Test release identity is unavailable.");
+  const monitoring = initializeServerMonitoring({
+    ...identity,
+    dsn: process.env.GLITCHTIP_DSN?.trim() || undefined,
+  });
+  if (!monitoring.enabled) throw new Error("GLITCHTIP_DSN is not configured.");
+  monitoring.captureMessage("Quadball Timer Test monitoring event", {
+    category: "test-monitoring",
+    component: "host-local",
+    operation: "emit-test-error",
+  });
+  if (!(await monitoring.flush(5_000))) throw new Error("Monitoring event was not delivered.");
+}
 
 async function runProbeMode(
   invocation: Exclude<SqliteProbeInvocation, { kind: "none" } | { kind: "invalid" }>,
