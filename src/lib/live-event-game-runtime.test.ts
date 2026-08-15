@@ -5,6 +5,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createEventGameRecord } from "@/lib/event-game-record";
+import { createFoundationAcceptance } from "@/lib/foundation-acceptance";
 import type { EventGameRecordRoot } from "@/lib/foundation-record-types";
 import type { FoundationStorageSnapshot } from "@/lib/foundation-storage";
 import { FOUNDATION_MIGRATIONS } from "@/lib/foundation-migrations";
@@ -254,6 +255,183 @@ describe("Live Event Game SQLite runtime", () => {
       });
     } finally {
       runtime.close();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("locks an inactive finished Game, terminates its Grant Session, and discards replay evidence", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "quadball-event-game-runtime-"));
+    const databasePath = join(directory, "event-game.sqlite");
+    const keyRing = createKeyRing();
+    const root = createRoot();
+    let nowMs = 10_000;
+    const finishedRoot = {
+      ...root,
+      lifecycle: {
+        ...root.lifecycle,
+        phase: "finished" as const,
+        commencedAtMs: nowMs,
+        finishedAtMs: nowMs,
+      },
+    };
+    let qrCredential: string;
+    try {
+      const setupStorage = openSqliteFoundationStorage(databasePath, { grantKeyRing: keyRing });
+      try {
+        await setupStorage.applyMigrations({ requireCandidate: false });
+        const setupRecord = createEventGameRecord(setupStorage, {
+          externalScopeResolver: createExternalScopeResolver(root),
+          interpreter: createLiveEventGameIqaInterpreter(),
+          clock: () => nowMs,
+          auditAuthorityVerifier: { verify: () => true },
+        });
+        expect(await setupRecord.registerRoot(finishedRoot)).toMatchObject({
+          status: "registered",
+        });
+        expect(
+          await setupRecord.acceptAction({
+            recordId: root.recordId,
+            eventGameId: root.eventGameId,
+            operationId: "runtime-lock-existing-goal",
+            kind: { id: "game-fact", version: "1" },
+            payload: {
+              factId: "runtime-lock-existing-fact",
+              factType: "forfeit",
+              gameSideId: "side-a",
+              gameTimeMs: 0,
+              data: null,
+            },
+            causalPredecessorIds: [],
+            occurrence: { trustedAtMs: nowMs, clientOriginAtMs: nowMs, source: "online" },
+            grant: {
+              sessionId: "runtime-lock-setup-session",
+              versionId: "runtime-lock-setup-grant",
+            },
+            lifecycle: {
+              ...root.lifecycle,
+              phase: "finished",
+              commencedAtMs: nowMs,
+              finishedAtMs: nowMs,
+            },
+          }),
+        ).toMatchObject({ status: "accepted" });
+        const authority = createTypedGrantAuthority(
+          setupStorage,
+          createGrantOptions("runtime-test", keyRing),
+        );
+        const created = await authority.createControlGrant({
+          scope: root.externalScope,
+          authority: { kind: "fixture", id: "runtime-fixture" },
+          expiresAtMs: nowMs + 2_000_000,
+        });
+        if (created.status !== "created") throw new Error("Expected a runtime Control Grant.");
+        qrCredential = created.qrCredential;
+      } finally {
+        setupStorage.close();
+      }
+
+      const runtime = await openLiveEventGameRuntime({
+        databasePath,
+        environmentId: "runtime-test",
+        keyRing,
+        clock: () => nowMs,
+      });
+      try {
+        const opened = await runtime.control.openController({
+          qrCredential,
+          browserContext: "runtime-lock-device",
+        });
+        if (opened.status !== "opened") throw new Error("Expected the runtime Controller to open.");
+        const replayInput = {
+          sessionBearer: opened.session.sessionBearer,
+          eventGameId: root.eventGameId,
+          batchId: "runtime-lock-replay-batch",
+          replicaGeneration: "runtime-lock-replay-generation",
+          expectedGrantSessionId: opened.session.grantSessionId,
+          expectedGrantVersion: opened.session.grantVersion,
+          actions: [
+            {
+              eventGameId: root.eventGameId,
+              intent: {
+                version: LIVE_EVENT_CONTROL_INTENT_VERSION,
+                type: "record-goal",
+                operationId: "runtime-lock-offline-goal",
+                factId: "runtime-lock-offline-fact",
+                gameSideId: "side-a",
+                gameTimeMs: 0,
+                occurrence: { clientOriginAtMs: 9_000, source: "offline" },
+              },
+              causalPredecessorIds: [],
+            },
+          ],
+        };
+        const held = await runtime.control.replayControllerActions(replayInput);
+        expect(held).toMatchObject({
+          status: "synchronized",
+          outcomes: [{ operationId: "runtime-lock-offline-goal", status: "held-for-correction" }],
+        });
+        nowMs += 15 * 60 * 1000;
+
+        const replay = await runtime.control.replayControllerActions(replayInput);
+        expect(replay).toMatchObject({
+          status: "synchronized",
+          discardedCount: 1,
+          outcomes: [
+            {
+              operationId: "runtime-lock-offline-goal",
+              status: "locked-discarded",
+            },
+          ],
+        });
+      } finally {
+        runtime.close();
+      }
+
+      const verification = openSqliteFoundationStorage(databasePath, { grantKeyRing: keyRing });
+      try {
+        createFoundationAcceptance(verification, {
+          grant: createGrantOptions("runtime-test", keyRing),
+          externalScopeResolver: createExternalScopeResolver(root),
+          interpreter: createLiveEventGameIqaInterpreter(),
+          clock: () => nowMs,
+        });
+        expect(await verification.readRoot(root.recordId)).toMatchObject({
+          lifecycle: { phase: "finished", lockReason: "finished-inactivity", lockedAtMs: nowMs },
+        });
+        expect(await verification.readActions(root.recordId)).toHaveLength(1);
+        expect(
+          (await verification.readAuditEntries(root.recordId)).find(
+            (entry) => entry.lockedReplay !== undefined,
+          ),
+        ).toMatchObject({
+          lockedReplay: {
+            count: 1,
+            eventGameId: root.eventGameId,
+            originatingSessionId: expect.any(String),
+            rejectedAtMs: nowMs,
+          },
+        });
+        const state = await verification.transaction((transaction) => {
+          const grant = transaction.listGrants()[0];
+          return grant === undefined
+            ? null
+            : {
+                sessions: transaction.listGrantSessions(grant.grantId),
+              };
+        });
+        expect(state).toMatchObject({
+          sessions: [{ status: "expired" }],
+        });
+        const raw = new Database(databasePath, { readonly: true });
+        try {
+          expect(raw.query("SELECT state FROM foundation_grant_codes").get()).toBeNull();
+        } finally {
+          raw.close();
+        }
+      } finally {
+        verification.close();
+      }
+    } finally {
       await rm(directory, { recursive: true, force: true });
     }
   });

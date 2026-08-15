@@ -19,10 +19,12 @@ import {
   canonicalizeEventGameRecordRoot,
   validateEventGameRecordRoot,
 } from "@/lib/foundation-record-types";
+import { lockControlGrantEventGame } from "@/lib/grant-management-sessions";
 import type {
   FoundationStorageSnapshot,
   FoundationStorageTransaction,
 } from "@/lib/foundation-storage";
+import type { FoundationStorage } from "@/lib/foundation-storage";
 
 export type LiveEventGameRuntime = {
   control: ReturnType<typeof createLiveEventGameControl>;
@@ -46,16 +48,75 @@ export async function openLiveEventGameRuntime(input: {
   try {
     const clock = input.clock ?? (() => Date.now());
     let refreshEventCapacitySnapshot = () => {};
-    const grantOptions = createGrantOptions(input.environmentId, input.keyRing, clock, () =>
-      refreshEventCapacitySnapshot(),
+    const grantOptions = createGrantOptions(
+      input.environmentId,
+      input.keyRing,
+      clock,
+      () => refreshEventCapacitySnapshot(),
+      storage,
     );
     const authority = createTypedGrantAuthority(storage, grantOptions);
     const scopeResolver = createExternalScopeResolver();
+    const lockedReplayCapabilities = new Map<
+      string,
+      { replayDigest: string; reservationId: string | null; authorized: boolean }
+    >();
+    const lockedReplayCapability = {
+      issue(replayDigest: string) {
+        const evidence = randomBytes(32).toString("base64url");
+        lockedReplayCapabilities.set(evidence, {
+          replayDigest,
+          reservationId: null,
+          authorized: false,
+        });
+        return evidence;
+      },
+      remember(input: { evidence: string; replayDigest: string; reservationId: string }) {
+        const current = lockedReplayCapabilities.get(input.evidence);
+        if (current?.replayDigest !== input.replayDigest) return;
+        lockedReplayCapabilities.set(input.evidence, {
+          replayDigest: input.replayDigest,
+          reservationId: input.reservationId,
+          authorized: current.authorized,
+        });
+      },
+      find(replayDigest: string) {
+        for (const [evidence, capability] of lockedReplayCapabilities) {
+          if (capability.replayDigest === replayDigest && capability.reservationId !== null)
+            return evidence;
+        }
+        return null;
+      },
+      authorize(replayDigest: string) {
+        for (const [evidence, capability] of lockedReplayCapabilities) {
+          if (capability.replayDigest === replayDigest) {
+            lockedReplayCapabilities.set(evidence, { ...capability, authorized: true });
+          }
+        }
+      },
+      authorized(evidence: string) {
+        return lockedReplayCapabilities.get(evidence)?.authorized === true;
+      },
+      reservationId(evidence: string) {
+        return lockedReplayCapabilities.get(evidence)?.reservationId ?? null;
+      },
+    };
     const acceptance = createFoundationAcceptance(storage, {
       grant: grantOptions,
       externalScopeResolver: scopeResolver,
       interpreter: createLiveEventGameIqaInterpreter(),
       clock,
+      verifyLockedReplay: ({ evidence }) =>
+        typeof evidence === "string" &&
+        lockedReplayCapability.reservationId(evidence) !== null &&
+        lockedReplayCapability.authorized(evidence),
+      authorizeLockedReplay: ({ evidence }) => lockedReplayCapability.authorized(evidence),
+      lockedReplayReservationId: (evidence) =>
+        typeof evidence === "string" ? lockedReplayCapability.reservationId(evidence) : null,
+      replayEligibility: ({ replayEvidenceId }) =>
+        lockedReplayCapability.reservationId(replayEvidenceId) !== null
+          ? { status: "eligible" }
+          : { status: "ineligible" },
       validateActionInTransaction: ({ transaction, root, action }) =>
         validateLiveEventGameActionInTransaction(
           transaction.listActions(root.recordId),
@@ -63,6 +124,11 @@ export async function openLiveEventGameRuntime(input: {
           action,
         ),
     });
+    const hasLifecycleInventory = await storage.transaction(
+      (transaction) => typeof transaction.listRoots === "function",
+    );
+    if (!hasLifecycleInventory)
+      throw new Error("Durable Event Game lifecycle inventory is not available.");
     const records = new Map<string, EventGameRecord>();
     const resolveEventGameRecord = async (eventGameId: string) => {
       const root = await storage.transaction((transaction) =>
@@ -88,13 +154,49 @@ export async function openLiveEventGameRuntime(input: {
       acceptance,
       grantAuthority: authority,
       clock,
+      listEventGameRoots: async () =>
+        storage.transaction((transaction) => {
+          if (typeof transaction.listRoots !== "function")
+            throw new Error("Durable Event Game lifecycle inventory is not available.");
+          return transaction.listRoots();
+        }),
+      lockedReplayCapability,
+      authorizeLockedReplay: async ({
+        sessionBearer,
+        eventGameId,
+        grantSessionId,
+        grantVersion,
+      }) => {
+        const authorized = await authority.authorizeGrant({
+          sessionBearer,
+          eventGameId,
+          readOnly: true,
+        });
+        return (
+          authorized.status === "authorized" &&
+          authorized.grantType === "control" &&
+          authorized.eventGameId === eventGameId &&
+          authorized.grantSessionId === grantSessionId &&
+          authorized.grantVersion === grantVersion
+        );
+      },
+      lockEventGame: (eventGameId, lockedAtMs) =>
+        lockControlGrantEventGame(storage, grantOptions, {
+          kind: "event-game-lock",
+          eventGameId,
+          lockedAtMs,
+        }),
     });
+    const lockTimer = setInterval(() => {
+      void control.reconcileEventGameLocks();
+    }, 1_000);
     refreshEventCapacitySnapshot = () => {
       void control.reconcileActiveControllerSessions();
     };
     return {
       control,
       close() {
+        clearInterval(lockTimer);
         control.close();
         storage.close();
       },
@@ -124,8 +226,9 @@ function createGrantOptions(
   keyRing: GrantKeyRing,
   clock: () => number,
   onLifecycleChange?: () => void,
+  storage?: FoundationStorage,
 ): GrantAuthorityOptions {
-  return {
+  const options: GrantAuthorityOptions = {
     environmentId,
     clock: { nowMs: clock },
     randomness: { bytes: (length) => new Uint8Array(randomBytes(length)) },
@@ -134,6 +237,49 @@ function createGrantOptions(
     privilegedAuthorityVerifier: { verify: () => null },
     onLifecycleChange,
   };
+  if (storage !== undefined) {
+    options.controlGrantLifecycle = {
+      resolveEventGameLock(evidence) {
+        if (!isRecord(evidence) || evidence.kind !== "event-game-lock") return null;
+        const eventGameId = evidence.eventGameId;
+        const lockedAtMs = evidence.lockedAtMs;
+        if (
+          typeof eventGameId !== "string" ||
+          typeof lockedAtMs !== "number" ||
+          !Number.isSafeInteger(lockedAtMs) ||
+          lockedAtMs < 0
+        )
+          return null;
+        return {
+          eventGameId,
+          apply(transaction) {
+            const current = transaction.findRootByEventGameId(eventGameId);
+            if (
+              current === null ||
+              current.lifecycle.phase !== "finished" ||
+              current.lifecycle.finishedAtMs === null ||
+              current.lifecycle.lockedAtMs !== null
+            )
+              throw new Error("Only an unlocked finished Event Game may be locked.");
+            const locked = validateEventGameRecordRoot({
+              ...current,
+              lifecycle: {
+                ...current.lifecycle,
+                lockedAtMs,
+                lockReason: "finished-inactivity",
+              },
+            });
+            if (!locked.ok) throw new Error(locked.error);
+            transaction.updateRoot({
+              root: locked.value,
+              canonicalContent: canonicalizeEventGameRecordRoot(locked.value),
+            });
+          },
+        };
+      },
+    };
+  }
+  return options;
 }
 
 export function createControlScopeResolver(

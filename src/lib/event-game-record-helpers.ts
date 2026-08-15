@@ -117,6 +117,23 @@ export function validateAuditHistory(
       }
       continue;
     }
+    if (entry.lockedReplay !== undefined) {
+      if (
+        entry.redactedDetail !== undefined ||
+        entry.links !== undefined ||
+        entry.provenance !== undefined ||
+        entry.kind !== "action-rejected" ||
+        entry.operationId !== null ||
+        entry.outcome !== "rejected" ||
+        entry.lockedReplay.eventGameId !== root.eventGameId ||
+        !Number.isSafeInteger(entry.lockedReplay.count) ||
+        entry.lockedReplay.count <= 0 ||
+        entry.lockedReplay.originatingSessionId.length === 0 ||
+        !Number.isSafeInteger(entry.lockedReplay.rejectedAtMs)
+      )
+        return "Locked replay discard evidence is inconsistent.";
+      continue;
+    }
     if (entry.links === undefined || entry.provenance === undefined) {
       return "#75 Control Audit Trail linkage and provenance are mandatory.";
     }
@@ -295,34 +312,26 @@ function validateAuditLinkage(
   contentFingerprintsByOperationId: ReadonlyMap<string, string>,
   registry: ControlActionCodecRegistry,
 ): string | null {
-  const links = entry.links;
-  const provenance = entry.provenance;
-  if (links === undefined || provenance === undefined) {
-    return "Control Audit Trail evidence is missing.";
-  }
   if (entry.lockedReplay !== undefined) {
     if (
+      entry.redactedDetail !== undefined ||
+      entry.links !== undefined ||
+      entry.provenance !== undefined ||
       entry.kind !== "action-rejected" ||
       entry.operationId !== null ||
       entry.outcome !== "rejected" ||
-      links.actionId !== null ||
-      links.targetFactId !== null ||
-      links.causalPredecessorIds.length !== 0 ||
-      links.relatedOperationIds.length !== 0 ||
-      links.ordering !== null ||
-      provenance.occurrence !== null ||
-      provenance.grant !== null ||
-      provenance.lifecycle !== null ||
-      provenance.override !== null ||
-      provenance.recoveryProvenance !== null ||
       entry.lockedReplay.eventGameId !== root.eventGameId ||
       entry.lockedReplay.count <= 0 ||
       entry.lockedReplay.originatingSessionId.length === 0 ||
       !Number.isSafeInteger(entry.lockedReplay.rejectedAtMs)
-    ) {
+    )
       return "Locked replay discard evidence is inconsistent.";
-    }
     return null;
+  }
+  const links = entry.links;
+  const provenance = entry.provenance;
+  if (links === undefined || provenance === undefined) {
+    return "Control Audit Trail evidence is missing.";
   }
   if (links.ordering === null) return "Control Audit Trail ordering linkage is missing.";
   if (

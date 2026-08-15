@@ -357,6 +357,9 @@ describe("adversarial composed acceptance", () => {
       eventGameId: locked.root.eventGameId,
     });
     const lockedAudit = (await locked.storage.readAuditEntries(locked.root.recordId))[0];
+    expect(lockedAudit?.redactedDetail).toBeUndefined();
+    expect(lockedAudit?.links).toBeUndefined();
+    expect(lockedAudit?.provenance).toBeUndefined();
     expect(lockedAudit?.lockedReplay).toEqual({
       count: 1,
       originatingSessionId: "origin-session",
@@ -365,12 +368,35 @@ describe("adversarial composed acceptance", () => {
     });
     expect(await locked.storage.readActions(locked.root.recordId)).toHaveLength(0);
     expect(await locked.storage.readiness()).toMatchObject({ ok: true });
+
+    const unreserved = await createHarness({ locked: true });
+    await unreserved.storage.transaction((transaction) => {
+      transaction.discardReplayReservation("seed-locked-reservation");
+    });
+    const unreservedResult = await unreserved.acceptance.submitBatch({
+      mode: "replay",
+      recordId: unreserved.root.recordId,
+      eventGameId: unreserved.root.eventGameId,
+      replay: {
+        sessionBearer: unreserved.sessionBearer,
+        originatingSessionId: "origin-session",
+        replayEvidenceId: "trusted-lock-evidence",
+      },
+      actions: [
+        createFact(unreserved.root, "locked-action", unreserved.sessionId, unreserved.grantVersion),
+      ],
+    });
+    expect(unreservedResult.results[0]).toMatchObject({
+      status: "authority-expired",
+      reason: "game-locked",
+    });
+    expect(await unreserved.storage.readAuditEntries(unreserved.root.recordId)).toHaveLength(0);
     const differentContent = await locked.acceptance.submitBatch({
       mode: "replay",
       recordId: locked.root.recordId,
       eventGameId: locked.root.eventGameId,
       replay: {
-        sessionBearer: "expired-or-absent-bearer",
+        sessionBearer: locked.sessionBearer,
         originatingSessionId: "origin-session",
         replayEvidenceId: "trusted-lock-evidence",
       },
@@ -380,14 +406,14 @@ describe("adversarial composed acceptance", () => {
     });
     expect(differentContent.results[0]).toMatchObject({
       status: "authority-expired",
-      reason: "grant-session",
+      reason: "game-locked",
     });
     const repeated = await locked.acceptance.submitBatch({
       mode: "replay",
       recordId: locked.root.recordId,
       eventGameId: locked.root.eventGameId,
       replay: {
-        sessionBearer: "expired-or-absent-bearer",
+        sessionBearer: locked.sessionBearer,
         originatingSessionId: "origin-session",
         replayEvidenceId: "trusted-lock-evidence",
       },
@@ -1242,6 +1268,10 @@ async function createHarness(
     clock: () => nowMs.value,
     interpreter: createDeterministicTestIqaInterpreter("rules-v1"),
     limits: input.limits,
+    authorizeLockedReplay:
+      input.locked === true
+        ? ({ sessionBearer }) => sessionBearer === admitted.sessionBearer
+        : undefined,
     failureInjector:
       input.failureBoundary === undefined
         ? undefined

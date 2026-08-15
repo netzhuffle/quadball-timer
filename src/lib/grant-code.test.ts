@@ -940,13 +940,10 @@ describe("Grant Codes", () => {
 
     for (const rejectedMode of ["past-day", "switch"] as const) {
       resolutionMode = rejectedMode;
-      const beforeRejectedTerminal = await snapshot();
-      expect(await lockControlGrantEventGame(storage, options, { accepted: true })).toEqual({
-        status: "rejected",
-        reason: "unavailable",
+      expect(await lockControlGrantEventGame(storage, options, { accepted: true })).toMatchObject({
+        status: "locked",
+        eventGameId: "game-lock",
       });
-      expect(await snapshot()).toEqual(beforeRejectedTerminal);
-      expect(lockApplied).toBe(false);
     }
 
     resolutionMode = "normal";
@@ -1338,9 +1335,10 @@ describe("Grant Codes", () => {
     }
   });
 
-  test("keeps a pinned Game-A session active when reassigned Game B locks", async () => {
+  test("cleans a pinned Game-A session when reassignment leaves its slot", async () => {
     const storage = createInMemoryFoundationStorage();
     let currentEventGame = "game-a";
+    let lockEventGame = "game-a";
     const options = createOptions({
       resolve: () => ({ status: "eligible" as const, eventGameId: currentEventGame }),
       resolveSession: (_scope, sessionEventGameId) =>
@@ -1351,7 +1349,7 @@ describe("Grant Codes", () => {
               currentEventGameId: "game-b",
             }
           : { status: "current" as const, eventGameId: sessionEventGameId },
-      resolveEventGameLock: () => ({ eventGameId: "game-b", apply: () => {} }),
+      resolveEventGameLock: () => ({ eventGameId: lockEventGame, apply: () => {} }),
     });
     const authority = createTypedGrantAuthority(storage, options);
     const admin = await authority.createEventAdminGrant({
@@ -1399,8 +1397,8 @@ describe("Grant Codes", () => {
     currentEventGame = "game-b";
     expect(await lockControlGrantEventGame(storage, options, { accepted: true })).toEqual({
       status: "locked",
-      eventGameId: "game-b",
-      terminatedSessionCount: 0,
+      eventGameId: "game-a",
+      terminatedSessionCount: 1,
     });
     const state = await storage.transaction((transaction) => ({
       grant: transaction.findGrantById(grant.grantId),
@@ -1408,14 +1406,7 @@ describe("Grant Codes", () => {
       audit: transaction.listGrantAudit(grant.grantId),
     }));
     expect(state.grant?.code).toMatchObject({ state: "erased", ciphertext: null });
-    expect(state.sessions[0]).toMatchObject({ status: "active", eventGameId: "game-a" });
-    expect(
-      await authority.authorizeGrant({
-        sessionBearer: session.sessionBearer,
-        eventGameId: "game-a",
-        controlSessionDecision: "stay",
-      }),
-    ).toMatchObject({ status: "authorized", eventGameId: "game-a" });
+    expect(state.sessions[0]).toMatchObject({ status: "expired", eventGameId: "game-a" });
     expect(
       validateGrantState([state.grant!], state.sessions, state.audit, {
         environmentId: options.environmentId,

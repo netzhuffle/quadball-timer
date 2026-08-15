@@ -7,13 +7,24 @@ import {
   createInitialClockBaseline,
   projectClockBaseline,
   projectClockSample,
+  SEEKER_RELEASE_MS,
 } from "@/lib/clock-authority";
 import type {
   ControllerProjection,
   LiveEventGameControlResult,
   LiveEventControllerIntent,
 } from "@/lib/live-event-game-control";
-import { LIVE_EVENT_CONTROL_INTENT_VERSION } from "@/lib/live-event-game-control";
+import type { OfficialOverrideMetadata } from "@/lib/event-game-actions";
+import {
+  CLOSE_PLAY_ADJUDICATION_WINDOW_MS,
+  LIVE_EVENT_CONTROL_INTENT_VERSION,
+} from "@/lib/live-event-game-control";
+import {
+  deriveLivePenaltyProjection,
+  type LiveCardType,
+  type LivePenaltyProjection,
+  type LivePenaltyReason,
+} from "@/lib/live-event-penalties";
 import { validateGameClockMs } from "@/lib/validation-policy";
 import { readControllerDeviceContext } from "@/lib/controller-device-context";
 import {
@@ -66,6 +77,29 @@ type ReplayRequest = { state: ControllerReplicaState; authority: ReplayAuthority
 
 type ActiveReplay = ReplayRequest & { requestToken: symbol };
 
+type PendingClosePlayAdjudication = {
+  intentType: "record-goal" | "record-flag-catch";
+  gameSideId: string;
+  gameTimeMs: number;
+  flagCatchBoundaryRunning: boolean | null;
+  relatedFacts: readonly {
+    factType: "goal" | "flag-catch";
+    factId: string;
+    gameTimeMs: number;
+  }[];
+};
+
+type PendingFlagCatchBoundaryOverride = {
+  gameSideId: string;
+  gameTimeMs: number;
+  running: boolean;
+  sportingOrderAdjudication?: {
+    relatedFactId: string;
+    relation: "before" | "after";
+  };
+  sportingOrderOverride?: OfficialOverrideMetadata;
+};
+
 type ClockReceiptAnchor = {
   projection: ControllerProjection["clock"];
   localMonotonicMs: number;
@@ -93,8 +127,20 @@ export function EventGameControllerPage() {
   const [localMonotonicMs, setLocalMonotonicMs] = useState(readMonotonicNow);
   const [clockCorrectionInput, setClockCorrectionInput] = useState("");
   const [takeoverAdjustmentInput, setTakeoverAdjustmentInput] = useState("");
+  const [cardGameSideId, setCardGameSideId] = useState("");
+  const [cardPlayerNumber, setCardPlayerNumber] = useState("");
+  const [cardType, setCardType] = useState<LiveCardType>("blue");
+  const [cardFoulBeforeScore, setCardFoulBeforeScore] = useState(false);
+  const [cardSeekerPenaltyConfirmed, setCardSeekerPenaltyConfirmed] = useState(false);
+  const [skippedPenaltyReasonCardIds, setSkippedPenaltyReasonCardIds] = useState<
+    ReadonlySet<string>
+  >(() => new Set());
   const [message, setMessage] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [pendingClosePlayAdjudication, setPendingClosePlayAdjudication] =
+    useState<PendingClosePlayAdjudication | null>(null);
+  const [pendingFlagCatchBoundaryOverride, setPendingFlagCatchBoundaryOverride] =
+    useState<PendingFlagCatchBoundaryOverride | null>(null);
   const [persistedReplicaLoad] = useState<ControllerReplicaLoad>(() =>
     readPersistedControllerReplica(persisted?.eventGameId),
   );
@@ -188,6 +234,17 @@ export function EventGameControllerPage() {
       document.removeEventListener("visibilitychange", reconcileWhenForegrounded);
     };
   }, [eventGameId, sessionBearer]);
+
+  const livePenalties =
+    projection === null
+      ? null
+      : clockProjection === null
+        ? projection.penalties
+        : deriveLivePenaltyProjection(projection.gameFacts ?? [], clockProjection.gameTimeMs);
+
+  function controllerGameTimeMs(): number {
+    return clockProjection?.gameTimeMs ?? projection?.clock.gameTimeMs ?? 0;
+  }
 
   async function openController() {
     const hasQrCredential = qrCredential.length > 0;
@@ -426,18 +483,262 @@ export function EventGameControllerPage() {
   }
 
   function recordGoal(gameSideId: string) {
+    recordScoringFact("record-goal", gameSideId);
+  }
+
+  function recordFlagCatch(gameSideId: string) {
+    recordScoringFact("record-flag-catch", gameSideId);
+  }
+
+  function recordScoringFact(intentType: "record-goal" | "record-flag-catch", gameSideId: string) {
+    const gameTimeMs = currentSportingTimeMs();
+    if (gameTimeMs === null) return;
+    const running = clockProjection?.running ?? projection?.clock.running ?? false;
+    const flagCatchBoundaryRunning =
+      intentType === "record-flag-catch" && (gameTimeMs < SEEKER_RELEASE_MS || running)
+        ? running
+        : null;
+    const relatedFacts = (projection?.gameFacts ?? []).filter(
+      (fact) =>
+        fact.effective &&
+        fact.gameTimeMs !== null &&
+        Math.abs(fact.gameTimeMs - gameTimeMs) <= CLOSE_PLAY_ADJUDICATION_WINDOW_MS &&
+        ((intentType === "record-goal" && fact.factType === "flag-catch") ||
+          (intentType === "record-flag-catch" && fact.factType === "goal")),
+    );
+    if (relatedFacts.length > 0) {
+      setPendingClosePlayAdjudication({
+        intentType,
+        gameSideId,
+        gameTimeMs,
+        flagCatchBoundaryRunning,
+        relatedFacts: relatedFacts.map((fact) => ({
+          factType: fact.factType as "goal" | "flag-catch",
+          factId: fact.factId,
+          gameTimeMs: fact.gameTimeMs ?? gameTimeMs,
+        })),
+      });
+      setMessage("Head Referee adjudication is required to order this close goal and flag catch.");
+      return;
+    }
+    if (flagCatchBoundaryRunning !== null) {
+      setPendingFlagCatchBoundaryOverride({ gameSideId, gameTimeMs, running });
+      setMessage(
+        "Head Referee confirmation is required for a flag catch before seeker release or while play is running.",
+      );
+      return;
+    }
     queueIntent({
       version: LIVE_EVENT_CONTROL_INTENT_VERSION,
-      type: "record-goal",
+      type: intentType,
       operationId: crypto.randomUUID(),
       factId: crypto.randomUUID(),
       gameSideId,
-      gameTimeMs: 0,
+      gameTimeMs,
+      sportingOrder: gameTimeMs,
       occurrence: { clientOriginAtMs: Date.now() },
     });
   }
 
+  function submitClosePlayAdjudication(order: "before" | "after", relatedFactId: string) {
+    const pending = pendingClosePlayAdjudication;
+    if (pending === null) return;
+    const relatedFact = pending.relatedFacts.find((fact) => fact.factId === relatedFactId);
+    if (relatedFact === undefined) return;
+    const override: OfficialOverrideMetadata = {
+      guardrail: "sporting-order-adjudication",
+      direction: "head-referee-adjudicated-sporting-order",
+      confirmation: "head-referee-confirmed",
+      authorityReference: "head-referee",
+      gameTimeMs: pending.gameTimeMs,
+      beforeValue: {
+        candidateGameTimeMs: pending.gameTimeMs,
+        relatedFactId: relatedFact.factId,
+        relatedGameTimeMs: relatedFact.gameTimeMs,
+      },
+      afterValue: {
+        relation: order,
+        sportingOrder: "explicit-pair-order",
+      },
+      reason: "head-referee-direction",
+    };
+    if (pending.flagCatchBoundaryRunning !== null) {
+      setPendingFlagCatchBoundaryOverride({
+        gameSideId: pending.gameSideId,
+        gameTimeMs: pending.gameTimeMs,
+        running: pending.flagCatchBoundaryRunning,
+        sportingOrderAdjudication: {
+          relatedFactId: relatedFact.factId,
+          relation: order,
+        },
+        sportingOrderOverride: override,
+      });
+      setPendingClosePlayAdjudication(null);
+      setMessage(
+        "Sporting Order recorded. Separately confirm the flag-catch boundary override before submission.",
+      );
+      return;
+    }
+    queueIntent({
+      version: LIVE_EVENT_CONTROL_INTENT_VERSION,
+      type: pending.intentType,
+      operationId: crypto.randomUUID(),
+      factId: crypto.randomUUID(),
+      gameSideId: pending.gameSideId,
+      gameTimeMs: pending.gameTimeMs,
+      sportingOrderAdjudication: {
+        relatedFactId: relatedFact.factId,
+        relation: order,
+      },
+      override,
+      occurrence: { clientOriginAtMs: Date.now() },
+    });
+    setPendingClosePlayAdjudication(null);
+  }
+
+  function submitFlagCatchBoundaryOverride() {
+    const pending = pendingFlagCatchBoundaryOverride;
+    if (pending === null) return;
+    queueIntent({
+      version: LIVE_EVENT_CONTROL_INTENT_VERSION,
+      type: "record-flag-catch",
+      operationId: crypto.randomUUID(),
+      factId: crypto.randomUUID(),
+      gameSideId: pending.gameSideId,
+      gameTimeMs: pending.gameTimeMs,
+      override: flagCatchBoundaryOverride(pending.gameTimeMs, pending.running),
+      ...(pending.sportingOrderAdjudication === undefined
+        ? {}
+        : {
+            sportingOrderAdjudication: pending.sportingOrderAdjudication,
+            sportingOrderOverride: pending.sportingOrderOverride,
+          }),
+      occurrence: { clientOriginAtMs: Date.now() },
+    });
+    setPendingFlagCatchBoundaryOverride(null);
+  }
+
+  function recordConcession(gameSideId: string) {
+    const gameTimeMs = currentSportingTimeMs();
+    if (gameTimeMs === null) return;
+    queueIntent({
+      version: LIVE_EVENT_CONTROL_INTENT_VERSION,
+      type: "record-concession",
+      operationId: crypto.randomUUID(),
+      factId: crypto.randomUUID(),
+      gameSideId,
+      gameTimeMs,
+      sportingOrder: gameTimeMs,
+      occurrence: { clientOriginAtMs: Date.now() },
+    });
+  }
+
+  function recordForfeit(gameSideId: string) {
+    const gameTimeMs = currentSportingTimeMs();
+    if (gameTimeMs === null) return;
+    queueIntent({
+      version: LIVE_EVENT_CONTROL_INTENT_VERSION,
+      type: "record-forfeit",
+      operationId: crypto.randomUUID(),
+      factId: crypto.randomUUID(),
+      gameSideId,
+      gameTimeMs,
+      sportingOrder: gameTimeMs,
+      occurrence: { clientOriginAtMs: Date.now() },
+    });
+  }
+
+  function recordDoubleForfeit() {
+    const gameTimeMs = currentSportingTimeMs();
+    if (gameTimeMs === null) return;
+    queueIntent({
+      version: LIVE_EVENT_CONTROL_INTENT_VERSION,
+      type: "record-double-forfeit",
+      operationId: crypto.randomUUID(),
+      factId: crypto.randomUUID(),
+      gameTimeMs,
+      sportingOrder: gameTimeMs,
+      occurrence: { clientOriginAtMs: Date.now() },
+    });
+  }
+
+  function recordCard() {
+    if (cardGameSideId === "") return;
+    const parsedPlayerNumber = cardPlayerNumber === "" ? null : Number(cardPlayerNumber);
+    if (parsedPlayerNumber !== null && !Number.isSafeInteger(parsedPlayerNumber)) return;
+    queueIntent({
+      version: LIVE_EVENT_CONTROL_INTENT_VERSION,
+      type: "record-card",
+      operationId: crypto.randomUUID(),
+      factId: crypto.randomUUID(),
+      gameSideId: cardGameSideId,
+      playerNumber: parsedPlayerNumber,
+      cardType,
+      ...(cardType === "blue" || cardType === "yellow"
+        ? { foulBeforeScore: cardFoulBeforeScore }
+        : {}),
+      ...(cardSeekerPenaltyConfirmed ? { seekerPenalty: "head-referee-confirmed" as const } : {}),
+      gameTimeMs: controllerGameTimeMs(),
+      occurrence: { clientOriginAtMs: Date.now() },
+    });
+  }
+
+  function recordPenaltyReason(targetCardFactId: string, reason: LivePenaltyReason) {
+    setSkippedPenaltyReasonCardIds((current) => {
+      if (!current.has(targetCardFactId)) return current;
+      const next = new Set(current);
+      next.delete(targetCardFactId);
+      return next;
+    });
+    const cardOperationId = replicaRef.current?.pendingActions.find(
+      (action) => action.intent.type === "record-card" && action.intent.factId === targetCardFactId,
+    )?.intent.operationId;
+    queueIntent(
+      {
+        version: LIVE_EVENT_CONTROL_INTENT_VERSION,
+        type: "record-penalty-reason",
+        operationId: crypto.randomUUID(),
+        factId: crypto.randomUUID(),
+        targetCardFactId,
+        reason,
+        gameTimeMs: controllerGameTimeMs(),
+        occurrence: { clientOriginAtMs: Date.now() },
+      },
+      cardOperationId === undefined ? {} : { causalPredecessorIds: [cardOperationId] },
+    );
+  }
+
+  function skipPenaltyReason(targetCardFactId: string) {
+    setSkippedPenaltyReasonCardIds((current) => {
+      const next = new Set(current);
+      next.add(targetCardFactId);
+      return next;
+    });
+  }
+
+  function resolvePenaltyExpiration(pendingId: string, scoreFactId: string, playerKey: string) {
+    const scoreOperationId = replicaRef.current?.pendingActions.find(
+      (action) => action.intent.type === "record-goal" && action.intent.factId === scoreFactId,
+    )?.intent.operationId;
+    queueIntent(
+      {
+        version: LIVE_EVENT_CONTROL_INTENT_VERSION,
+        type: "resolve-penalty-expiration",
+        operationId: crypto.randomUUID(),
+        factId: crypto.randomUUID(),
+        pendingId,
+        scoreFactId,
+        playerKey,
+        gameTimeMs: controllerGameTimeMs(),
+        occurrence: { clientOriginAtMs: Date.now() },
+      },
+      scoreOperationId === undefined ? {} : { causalPredecessorIds: [scoreOperationId] },
+    );
+  }
+
   function correctFact(factId: string, effective: boolean) {
+    const gameTimeMs = currentSportingTimeMs();
+    if (gameTimeMs === null) return;
     queueIntent({
       version: LIVE_EVENT_CONTROL_INTENT_VERSION,
       type: "correct-fact",
@@ -445,34 +746,58 @@ export function EventGameControllerPage() {
       factId: crypto.randomUUID(),
       targetFactId: factId,
       effective,
-      gameTimeMs: projection?.clock.gameTimeMs ?? 0,
+      gameTimeMs,
+      sportingOrder: gameTimeMs,
       occurrence: { clientOriginAtMs: Date.now() },
     });
   }
 
   function trigger(type: "card" | "timeout" | "suspension" | "result") {
+    const gameTimeMs = currentSportingTimeMs();
+    if (gameTimeMs === null) return;
     queueIntent({
       version: LIVE_EVENT_CONTROL_INTENT_VERSION,
       type: "substantive",
       trigger: type,
       operationId: crypto.randomUUID(),
       factId: crypto.randomUUID(),
-      gameTimeMs: 0,
+      gameTimeMs,
+      sportingOrder: gameTimeMs,
       occurrence: { clientOriginAtMs: Date.now() },
     });
   }
 
-  function queueIntent(candidate: LiveEventControllerIntent) {
+  function queueIntent(
+    candidate: LiveEventControllerIntent,
+    options: { causalPredecessorIds?: readonly string[] } = {},
+  ) {
     const current = replicaRef.current;
     if (current === null) return;
     try {
-      const dispatched = dispatchControllerAction(current, {
-        ...candidate,
-        occurrence: {
-          ...candidate.occurrence,
-          source: navigator.onLine === false ? "offline" : "online",
+      const relatedFactId = candidate.sportingOrderAdjudication?.relatedFactId;
+      const relatedPendingOperationId =
+        relatedFactId === undefined
+          ? undefined
+          : current.pendingActions.find((action) => action.intent.factId === relatedFactId)?.intent
+              .operationId;
+      const dispatched = dispatchControllerAction(
+        current,
+        {
+          ...candidate,
+          occurrence: {
+            ...candidate.occurrence,
+            source: navigator.onLine === false ? "offline" : "online",
+          },
         },
-      });
+        {
+          ...options,
+          causalPredecessorIds: [
+            ...(options.causalPredecessorIds ?? []),
+            ...(relatedPendingOperationId === undefined ? [] : [relatedPendingOperationId]),
+          ],
+          nowMs: Math.floor(readMonotonicNow()),
+        },
+      );
       replicaRef.current = dispatched.state;
       setReplica(dispatched.state);
       setProjection(dispatched.state.projection);
@@ -481,6 +806,15 @@ export function EventGameControllerPage() {
     } catch {
       setMessage("The Controller action could not be retained safely.");
     }
+  }
+
+  function currentSportingTimeMs(): number | null {
+    const value = clockProjection?.gameTimeMs ?? projection?.clock.gameTimeMs;
+    if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+      setMessage("The current Game time is unavailable; resynchronize before recording a fact.");
+      return null;
+    }
+    return value;
   }
 
   async function flushReplica(state: ControllerReplicaState, bearer = sessionBearer) {
@@ -526,6 +860,11 @@ export function EventGameControllerPage() {
       const nextReplica = reconcileControllerReplay(replicaRef.current ?? prepared.state, response);
       commitReplica(nextReplica);
       receiveProjection(response.projection);
+      if (response.discardedCount !== undefined) {
+        setMessage(
+          `${response.discardedCount} queued Controller action(s) were discarded after Game Lock.`,
+        );
+      }
       if (
         response.status === "synchronized" &&
         nextReplica.pendingActions.some((action) => action.status === "pending")
@@ -1059,9 +1398,86 @@ export function EventGameControllerPage() {
                     Emergency clock takeover
                   </Button>
                 </div>
-                <Button variant="outline" onClick={() => trigger("card")} disabled={busy}>
-                  Record card
-                </Button>
+                <div className="flex w-full flex-wrap items-end gap-2 rounded border p-2 text-left">
+                  <div className="min-w-32 flex-1 space-y-1">
+                    <Label htmlFor="penalty-game-side">Penalized Game Side</Label>
+                    <select
+                      id="penalty-game-side"
+                      className="h-10 w-full rounded-md border bg-background px-3 text-sm"
+                      value={cardGameSideId}
+                      onChange={(event) => setCardGameSideId(event.target.value)}
+                      disabled={busy}
+                    >
+                      <option value="">Choose side</option>
+                      {Object.keys(projection?.scoreByGameSide ?? {}).map((sideId) => (
+                        <option key={sideId} value={sideId}>
+                          {sideId}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  <div className="w-24 space-y-1">
+                    <Label htmlFor="penalty-player-number">Player #</Label>
+                    <Input
+                      id="penalty-player-number"
+                      inputMode="numeric"
+                      value={cardPlayerNumber}
+                      onChange={(event) => setCardPlayerNumber(event.target.value)}
+                      placeholder="optional"
+                      disabled={busy}
+                    />
+                  </div>
+                  <div className="min-w-24 space-y-1">
+                    <Label htmlFor="penalty-card-type">Card</Label>
+                    <select
+                      id="penalty-card-type"
+                      className="h-10 w-full rounded-md border bg-background px-3 text-sm"
+                      value={cardType}
+                      onChange={(event) => {
+                        const nextCardType = event.target.value as LiveCardType;
+                        setCardType(nextCardType);
+                        if (nextCardType === "red" || nextCardType === "ejection") {
+                          setCardFoulBeforeScore(false);
+                        }
+                      }}
+                      disabled={busy}
+                    >
+                      <option value="blue">Blue</option>
+                      <option value="yellow">Yellow</option>
+                      <option value="red">Red</option>
+                      <option value="ejection">Ejection</option>
+                    </select>
+                  </div>
+                  <p className="max-w-52 self-center text-xs text-muted-foreground">
+                    Timing follows the live Game Clock: pregame cards begin at sticks up and
+                    confirmed seeker penalties during the seeker floor begin at 20:00.
+                  </p>
+                  <Button
+                    variant="outline"
+                    onClick={recordCard}
+                    disabled={busy || cardGameSideId === ""}
+                  >
+                    Accept card
+                  </Button>
+                  <label className="flex items-center gap-2 text-xs">
+                    <input
+                      type="checkbox"
+                      checked={cardFoulBeforeScore}
+                      onChange={(event) => setCardFoulBeforeScore(event.target.checked)}
+                      disabled={busy || cardType === "red" || cardType === "ejection"}
+                    />
+                    Foul before score
+                  </label>
+                  <label className="flex items-center gap-2 text-xs">
+                    <input
+                      type="checkbox"
+                      checked={cardSeekerPenaltyConfirmed}
+                      onChange={(event) => setCardSeekerPenaltyConfirmed(event.target.checked)}
+                      disabled={busy}
+                    />
+                    Penalized player is the seeker (Head Referee confirmed)
+                  </label>
+                </div>
                 <Button variant="outline" onClick={() => trigger("timeout")} disabled={busy}>
                   Start timeout
                 </Button>
@@ -1076,14 +1492,112 @@ export function EventGameControllerPage() {
                 <div className="space-y-3">
                   <p className="text-sm text-muted-foreground">
                     Phase: {projection.phase} · Goals: {projection.goalCount}
+                    {projection.overtime ? " · Overtime" : ""}
                   </p>
+                  {projection.overtime ? (
+                    <p data-overtime-target="true" className="text-sm font-semibold">
+                      Overtime target: {projection.overtimeTarget ?? projection.targetScore ?? "—"}
+                    </p>
+                  ) : null}
+                  {pendingClosePlayAdjudication === null ? null : (
+                    <div
+                      data-close-play-adjudication="true"
+                      className="space-y-2 rounded-lg border border-amber-500/60 bg-amber-50 p-3 text-sm text-amber-950"
+                    >
+                      <p className="font-medium">Head Referee close goal/catch ordering</p>
+                      <p>
+                        The{" "}
+                        {pendingClosePlayAdjudication.intentType === "record-goal"
+                          ? "goal"
+                          : "flag catch"}{" "}
+                        has {pendingClosePlayAdjudication.relatedFacts.length} opposing close-play
+                        candidate
+                        {pendingClosePlayAdjudication.relatedFacts.length === 1 ? "" : "s"}. Choose
+                        the exact paired fact and adjudicated sporting order without changing either
+                        Game Clock time.
+                      </p>
+                      {pendingClosePlayAdjudication.relatedFacts.map((relatedFact) => (
+                        <div
+                          key={relatedFact.factId}
+                          data-close-play-related-fact-id={relatedFact.factId}
+                          className="space-y-1"
+                        >
+                          <p>
+                            Existing {relatedFact.factType} at {relatedFact.gameTimeMs}
+                          </p>
+                          <div className="flex flex-wrap gap-2">
+                            <Button
+                              variant="outline"
+                              onClick={() =>
+                                submitClosePlayAdjudication("before", relatedFact.factId)
+                              }
+                              disabled={busy}
+                            >
+                              {pendingClosePlayAdjudication.intentType === "record-goal"
+                                ? "Goal before catch"
+                                : "Catch before goal"}
+                            </Button>
+                            <Button
+                              variant="outline"
+                              onClick={() =>
+                                submitClosePlayAdjudication("after", relatedFact.factId)
+                              }
+                              disabled={busy}
+                            >
+                              {pendingClosePlayAdjudication.intentType === "record-goal"
+                                ? "Goal after catch"
+                                : "Catch after goal"}
+                            </Button>
+                          </div>
+                        </div>
+                      ))}
+                      <div>
+                        <Button
+                          variant="ghost"
+                          onClick={() => setPendingClosePlayAdjudication(null)}
+                          disabled={busy}
+                        >
+                          Cancel
+                        </Button>
+                      </div>
+                    </div>
+                  )}
+                  {pendingFlagCatchBoundaryOverride === null ? null : (
+                    <div
+                      data-flag-catch-boundary-override="true"
+                      className="space-y-2 rounded-lg border border-amber-500/60 bg-amber-50 p-3 text-sm text-amber-950"
+                    >
+                      <p className="font-medium">Head Referee flag-catch boundary override</p>
+                      <p>
+                        Confirm the catch despite unreleased seekers or running play. This records
+                        the affected guardrail separately from any Sporting Order decision.
+                      </p>
+                      <div className="flex flex-wrap gap-2">
+                        <Button onClick={submitFlagCatchBoundaryOverride} disabled={busy}>
+                          Confirm boundary override
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          onClick={() => setPendingFlagCatchBoundaryOverride(null)}
+                          disabled={busy}
+                        >
+                          Cancel
+                        </Button>
+                      </div>
+                    </div>
+                  )}
                   <p className="text-xs text-muted-foreground">
                     Timeout: {projection.timeout?.status ?? "inactive"} · Stoppage:{" "}
                     {projection.stoppage?.status ?? "none"} · Heat:{" "}
                     {projection.heat?.status ?? "inactive"}
                     {projection.result === null || projection.result === undefined
                       ? ""
-                      : " · Result recorded"}
+                      : projection.winnerGameSideId !== null &&
+                          projection.winnerGameSideId !== undefined
+                        ? ` · Winner: Game Side ${projection.winnerGameSideId}`
+                        : isDoubleForfeitResult(projection.result)
+                          ? " · Double-forfeit: no winner"
+                          : " · Result recorded"}
                   </p>
                   {Object.entries(projection.scoreByGameSide).map(([gameSideId, score]) => (
                     <div key={gameSideId} className="flex items-center justify-between gap-3">
@@ -1093,9 +1607,143 @@ export function EventGameControllerPage() {
                         <Button onClick={() => recordGoal(gameSideId)} disabled={busy}>
                           Record 10-point goal
                         </Button>
+                        <Button
+                          variant="outline"
+                          onClick={() => recordFlagCatch(gameSideId)}
+                          disabled={busy}
+                        >
+                          Record flag catch
+                        </Button>
+                        {projection.overtime &&
+                        projection.phase !== "finished" &&
+                        projection.winnerGameSideId === null ? (
+                          <Button
+                            variant="outline"
+                            onClick={() => recordConcession(gameSideId)}
+                            disabled={busy}
+                          >
+                            Concede
+                          </Button>
+                        ) : null}
+                        <Button
+                          variant="outline"
+                          onClick={() => recordForfeit(gameSideId)}
+                          disabled={busy}
+                        >
+                          Directed forfeit
+                        </Button>
                       </div>
                     </div>
                   ))}
+                  <Button variant="outline" onClick={recordDoubleForfeit} disabled={busy}>
+                    Record double-forfeit
+                  </Button>
+                  <div className="space-y-3 rounded-lg border p-3">
+                    <p className="text-sm font-medium">Penalties</p>
+                    {(livePenalties?.players ?? []).length === 0 ? (
+                      <p className="text-sm text-muted-foreground">No active penalties.</p>
+                    ) : (
+                      (livePenalties?.players ?? []).map((player) => (
+                        <div
+                          key={player.playerKey}
+                          className="flex items-center justify-between gap-3 text-sm"
+                        >
+                          <span>{formatPenaltyPlayerLabel(player.playerKey, livePenalties)}</span>
+                          <span className="tabular-nums">
+                            {formatClock(
+                              player.segments.reduce(
+                                (sum, segment) => sum + segment.remainingMs,
+                                0,
+                              ),
+                            )}
+                          </span>
+                        </div>
+                      ))
+                    )}
+                    {(livePenalties?.pendingExpirations ?? []).map((pending) => (
+                      <div
+                        key={pending.id}
+                        className="space-y-2 rounded border border-amber-500/50 bg-amber-50 p-2 text-sm"
+                      >
+                        <p>
+                          Goal release: choose a penalty ({formatClock(pending.serviceDurationMs)}).
+                          {pending.requiresOfficialChoice
+                            ? " Complete tie requires official choice."
+                            : ""}
+                        </p>
+                        <div className="flex flex-wrap gap-2">
+                          {pending.candidatePlayerKeys.map((playerKey) => (
+                            <Button
+                              key={playerKey}
+                              size="sm"
+                              variant="outline"
+                              onClick={() =>
+                                resolvePenaltyExpiration(pending.id, pending.scoreFactId, playerKey)
+                              }
+                              disabled={busy}
+                            >
+                              Release {formatPenaltyPlayerLabel(playerKey, livePenalties)}
+                            </Button>
+                          ))}
+                        </div>
+                      </div>
+                    ))}
+                    {(livePenalties?.releases ?? []).map((release) => (
+                      <p key={release.id} className="text-xs text-emerald-700">
+                        Released {formatPenaltyPlayerLabel(release.playerKey, livePenalties)} after
+                        {release.releaseCause === "foul-before-score"
+                          ? " foul-before-score"
+                          : " opposing score"}{" "}
+                        at {formatClock(release.releasedMs)}.
+                      </p>
+                    ))}
+                    {(livePenalties?.cards ?? []).map((card) => (
+                      <div key={card.factId} className="flex flex-wrap items-center gap-2 text-xs">
+                        <span>
+                          {card.cardType} ·{" "}
+                          {formatPenaltyPlayerLabel(card.playerKey, livePenalties, {
+                            gameSideId: card.gameSideId,
+                            playerNumber: card.playerNumber,
+                          })}
+                        </span>
+                        <span>
+                          {card.reason === null
+                            ? skippedPenaltyReasonCardIds.has(card.factId)
+                              ? "reason skipped; add later"
+                              : "reason later/skipped"
+                            : `reason: ${card.reason}`}
+                        </span>
+                        {card.reason === null ? (
+                          <>
+                            {(
+                              [
+                                ["contact-safety", "Contact/Safety"],
+                                ["ball-interaction", "Ball Interaction"],
+                                ["position-boundary", "Position/Boundary"],
+                                ["procedure-substitution", "Procedure/Substitution"],
+                                ["conduct", "Conduct"],
+                                ["skip", "Skip"],
+                              ] as const
+                            ).map(([reason, label]) => (
+                              <Button
+                                key={reason}
+                                size="sm"
+                                variant="ghost"
+                                onClick={() =>
+                                  reason === "skip"
+                                    ? skipPenaltyReason(card.factId)
+                                    : recordPenaltyReason(card.factId, reason as LivePenaltyReason)
+                                }
+                                disabled={busy}
+                              >
+                                {label}
+                              </Button>
+                            ))}
+                          </>
+                        ) : null}
+                      </div>
+                    ))}
+                  </div>
                   <div className="space-y-2 rounded-lg border p-3">
                     <p className="text-sm font-medium">Game Facts</p>
                     {(projection.gameFacts ?? []).length === 0 ? (
@@ -1150,6 +1798,22 @@ export function EventGameControllerPage() {
   );
 }
 
+function flagCatchBoundaryOverride(gameTimeMs: number, running: boolean): OfficialOverrideMetadata {
+  return {
+    guardrail: "flag-catch-requires-seeker-release-and-stopped-play",
+    direction: "head-referee-directed-flag-catch-boundary",
+    confirmation: "head-referee-confirmed",
+    authorityReference: "head-referee",
+    gameTimeMs,
+    beforeValue: {
+      seekerReleased: gameTimeMs >= SEEKER_RELEASE_MS,
+      running,
+    },
+    afterValue: { flagCatch: "accepted" },
+    reason: "head-referee-direction",
+  };
+}
+
 function formatClock(milliseconds: number): string {
   const totalSeconds = Math.floor(milliseconds / 1000);
   const minutes = Math.floor(totalSeconds / 60);
@@ -1157,8 +1821,39 @@ function formatClock(milliseconds: number): string {
   return `${minutes.toString().padStart(2, "0")}:${seconds.toString().padStart(2, "0")}`;
 }
 
+function formatPenaltyPlayerLabel(
+  playerKey: string | null,
+  penalties: LivePenaltyProjection | null | undefined,
+  fallback?: { gameSideId: string; playerNumber: number | null },
+): string {
+  const player =
+    playerKey === null || penalties === null || penalties === undefined
+      ? undefined
+      : penalties.players.find((candidate) => candidate.playerKey === playerKey);
+  const card =
+    player === undefined && playerKey !== null && penalties !== null && penalties !== undefined
+      ? penalties.cards.find((candidate) => candidate.playerKey === playerKey)
+      : undefined;
+  const gameSideId = player?.gameSideId ?? card?.gameSideId ?? fallback?.gameSideId ?? "unknown";
+  const playerNumber = player?.playerNumber ?? card?.playerNumber ?? fallback?.playerNumber ?? null;
+  return `Game Side ${gameSideId} · ${
+    playerNumber === null ? "Player unknown" : `Player #${playerNumber}`
+  }`;
+}
+
 function formatSynchronizationTime(milliseconds: number | null | undefined): string {
   return typeof milliseconds !== "number" ? "not available" : new Date(milliseconds).toISOString();
+}
+
+function isDoubleForfeitResult(result: ControllerProjection["result"]): boolean {
+  return (
+    result !== null &&
+    result !== undefined &&
+    typeof result.data === "object" &&
+    result.data !== null &&
+    !Array.isArray(result.data) &&
+    result.data.resultKind === "double-forfeit"
+  );
 }
 
 function readMonotonicNow(): number {

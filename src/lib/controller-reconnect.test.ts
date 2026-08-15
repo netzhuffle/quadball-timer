@@ -37,6 +37,79 @@ describe("Controller reconnect replica", () => {
     expect(buildControllerReplayBatch(state)?.actions).toHaveLength(2);
   });
 
+  test("rebuilds optimistic catch, overtime, winner, and correction state from effective facts", () => {
+    let state = createReplica();
+    state = dispatchControllerAction(state, goal("pre-catch", "pre-catch-fact"), {
+      nowMs: 100,
+    }).state;
+    state = dispatchControllerAction(state, flagCatch("catch", "catch-fact", "side-b"), {
+      nowMs: 101,
+    }).state;
+    expect(state.projection).toMatchObject({
+      scoreByGameSide: { "side-a": 10, "side-b": 30 },
+      winnerGameSideId: "side-b",
+      phase: "finished",
+      catch: { catchingGameSideId: "side-b" },
+    });
+
+    state = dispatchControllerAction(
+      state,
+      correction("correct-catch", "correction-catch", false, "catch-fact"),
+      { nowMs: 102 },
+    ).state;
+    expect(state.projection).toMatchObject({
+      scoreByGameSide: { "side-a": 10, "side-b": 0 },
+      winnerGameSideId: null,
+      phase: "in-progress",
+      catch: null,
+    });
+  });
+
+  test("rebuilds result correction and reinstatement without stale finished state", () => {
+    let state = dispatchControllerAction(createReplica(), substantive("result", "result"), {
+      nowMs: 100,
+    }).state;
+    expect(state.projection).toMatchObject({
+      phase: "finished",
+      result: { factId: "fact-result" },
+    });
+    state = dispatchControllerAction(
+      state,
+      correction("correct-result", "correction-result", false, "fact-result"),
+      { nowMs: 101 },
+    ).state;
+    expect(state.projection).toMatchObject({ phase: "in-progress", result: null });
+    state = dispatchControllerAction(
+      state,
+      correction("reinstate-result", "reinstate-result", true, "fact-result"),
+      { nowMs: 102 },
+    ).state;
+    expect(state.projection).toMatchObject({
+      phase: "finished",
+      result: { factId: "fact-result" },
+    });
+  });
+
+  test("retains an overflowing catch without projecting an impossible overtime target", () => {
+    let state = createReplica();
+    for (let index = 0; index < 98; index += 1) {
+      state = dispatchControllerAction(state, goal(`bound-goal-${index}`, `bound-fact-${index}`), {
+        nowMs: index,
+      }).state;
+    }
+    state = dispatchControllerAction(
+      state,
+      flagCatch("overflowing-catch", "overflowing-catch-fact", "side-b"),
+      { nowMs: 100 },
+    ).state;
+    expect(state.pendingActions).toHaveLength(99);
+    expect(state.projection).toMatchObject({
+      scoreByGameSide: { "side-a": 980, "side-b": 0 },
+      overtime: false,
+      catch: null,
+    });
+  });
+
   test("optimistically applies every ordinary Controller action family with existing lifecycle semantics", () => {
     for (const trigger of ["card", "timeout", "suspension"] as const) {
       const next = dispatchControllerAction(
@@ -53,6 +126,15 @@ describe("Controller reconnect replica", () => {
       { nowMs: 101 },
     ).state;
     expect(finished.projection.phase).toBe("finished");
+    const sideScoped = dispatchControllerAction(
+      createReplica(),
+      substantive("substantive-forfeit", "forfeit", "side-b"),
+      { nowMs: 101 },
+    ).state;
+    expect(sideScoped.projection.gameFacts?.at(-1)).toMatchObject({
+      factType: "forfeit",
+      gameSideId: "side-b",
+    });
     const resetState = dispatchControllerAction(createReplica(), reset("reset", "reset-fact"), {
       nowMs: 102,
     }).state;
@@ -63,6 +145,50 @@ describe("Controller reconnect replica", () => {
     expect(undoState.pendingActions).toHaveLength(1);
     expect(resetState.projection.phase).toBe("scheduled");
     expect(undoState.projection.phase).toBe("scheduled");
+  });
+
+  test("materializes passive commencement before classifying an offline card", () => {
+    let state = dispatchControllerClockAction(createReplica(), clock("start-clock", true), {
+      nowMs: 100,
+    }).state;
+    state = dispatchControllerAction(state, card("card-after-passive-boundary"), {
+      nowMs: 10_200,
+    }).state;
+    expect(state.projection.commencement).toMatchObject({
+      status: "commenced",
+      commencedAtMs: 10_100,
+    });
+    expect(state.projection.gameFacts?.at(-1)?.data).toMatchObject({
+      penaltyStart: "immediate",
+    });
+  });
+
+  test("anchors an optimistic delayed tie choice to its score fact", () => {
+    let state = dispatchControllerAction(createReplica(), goal("tie-score", "tie-score-fact"), {
+      nowMs: 100,
+    }).state;
+    state = dispatchControllerAction(
+      state,
+      {
+        version: LIVE_EVENT_CONTROL_INTENT_VERSION,
+        type: "resolve-penalty-expiration",
+        operationId: "delayed-choice",
+        factId: "delayed-choice-fact",
+        pendingId: "penalty-expiration:tie-score-fact",
+        scoreFactId: "tie-score-fact",
+        playerKey: "side-b:7",
+        gameTimeMs: 90_000,
+        sportingOrder: 90_000,
+        occurrence: { clientOriginAtMs: 90_000, source: "offline" as const },
+      },
+      { nowMs: 90_000 },
+    ).state;
+    expect(state.projection.gameFacts?.at(-1)).toMatchObject({
+      factType: "penalty-release",
+      gameTimeMs: 42,
+      sportingOrder: 42,
+      data: { scoreFactId: "tie-score-fact", sportingOrder: 42 },
+    });
   });
 
   test("keeps mixed causal optimistic effects while unrelated actions progress", () => {
@@ -292,6 +418,28 @@ describe("Controller reconnect replica", () => {
       ...state.authoritativeProjection,
       scoreByGameSide: { "side-a": 20, "side-b": 0 },
       goalCount: 2,
+      gameFacts: [
+        {
+          factId: "authoritative-goal",
+          factType: "goal",
+          gameSideId: "side-a",
+          gameTimeMs: 10,
+          sportingOrder: 10,
+          synchronizationOrder: 1,
+          effective: true,
+          data: { points: 10, sportingOrder: 10 },
+        },
+        {
+          factId: "authoritative-goal-2",
+          factType: "goal",
+          gameSideId: "side-a",
+          gameTimeMs: 20,
+          sportingOrder: 20,
+          synchronizationOrder: 2,
+          effective: true,
+          data: { points: 10, sportingOrder: 20 },
+        },
+      ],
     };
     const replaced = rebindControllerReplica(
       secondNullRebind,
@@ -489,6 +637,46 @@ function goal(operationId: string, factId: string) {
   };
 }
 
+function flagCatch(operationId: string, factId: string, gameSideId: string) {
+  return {
+    version: LIVE_EVENT_CONTROL_INTENT_VERSION,
+    type: "record-flag-catch" as const,
+    operationId,
+    factId,
+    gameSideId,
+    gameTimeMs: 1_200_000,
+    sportingOrder: 1_200_000,
+    occurrence: { clientOriginAtMs: 1_200_000, source: "offline" as const },
+  };
+}
+
+function correction(operationId: string, factId: string, effective: boolean, targetFactId: string) {
+  return {
+    version: LIVE_EVENT_CONTROL_INTENT_VERSION,
+    type: "correct-fact" as const,
+    operationId,
+    factId,
+    targetFactId,
+    effective,
+    gameTimeMs: 1_300_000,
+    occurrence: { clientOriginAtMs: 1_300_000, source: "offline" as const },
+  };
+}
+
+function card(operationId: string) {
+  return {
+    version: LIVE_EVENT_CONTROL_INTENT_VERSION,
+    type: "record-card" as const,
+    operationId,
+    factId: `fact-${operationId}`,
+    gameSideId: "side-b",
+    playerNumber: 7,
+    cardType: "blue" as const,
+    gameTimeMs: 10_000,
+    occurrence: { clientOriginAtMs: 10_000, source: "offline" as const },
+  };
+}
+
 function reset(operationId: string, factId: string) {
   return {
     version: LIVE_EVENT_CONTROL_INTENT_VERSION,
@@ -500,7 +688,19 @@ function reset(operationId: string, factId: string) {
   };
 }
 
-function substantive(operationId: string, trigger: "card" | "timeout" | "suspension" | "result") {
+function substantive(
+  operationId: string,
+  trigger:
+    | "card"
+    | "timeout"
+    | "suspension"
+    | "result"
+    | "flag-catch"
+    | "concession"
+    | "forfeit"
+    | "double-forfeit",
+  gameSideId?: string,
+) {
   return {
     version: LIVE_EVENT_CONTROL_INTENT_VERSION,
     type: "substantive" as const,
@@ -508,6 +708,7 @@ function substantive(operationId: string, trigger: "card" | "timeout" | "suspens
     operationId,
     factId: `fact-${operationId}`,
     gameTimeMs: 0,
+    ...(gameSideId === undefined ? {} : { gameSideId }),
     occurrence: { clientOriginAtMs: 0, source: "offline" as const },
   };
 }

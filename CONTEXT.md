@@ -108,6 +108,38 @@ _Avoid_: Rule exception, forced command
 An accepted sporting or operational occurrence, such as a goal, card, catch, result, or stoppage, that may contribute to the current game state.
 _Avoid_: Mutable event, current value
 
+**Sporting Order**:
+The explicit adjudicated order of close sporting Game Facts, independent of Controller arrival order, device synchronization order, or their actual Game Clock times. A Head Referee close-play decision names the paired opposing fact and whether the candidate is before or after it; it never rewrites either Game Clock time.
+_Avoid_: Arrival order, device timestamp, rewritten Game time
+
+**Goal**:
+An accepted scoring Game Fact worth 10 points for its recorded Game Side.
+_Avoid_: Manual score edit, target score command
+
+**Flag Catch**:
+An accepted scoring Game Fact worth 30 points after seeker release and stopped play, subject to Head Referee adjudication where a close goal/catch pair requires an explicit Sporting Order.
+_Avoid_: Automatic winner command, catch-time rewrite
+
+**Overtime Target**:
+The fixed score required after a trailing or tied Flag Catch: the non-catching Game Side's adjudicated score at the catch plus 30. It is rebuilt when effective pre-catch facts change and cannot be changed by post-catch scoring.
+_Avoid_: Manual target, moving target
+
+**Concession**:
+An accepted overtime result fact. A Concession is admitted only while the Derived Game State is unfinished overtime and applies the trailing, tied, or leading outcome rules without changing the fixed Overtime Target.
+_Avoid_: Pre-overtime concession, generic result
+
+**Directed Forfeit**:
+An accepted result fact recorded against the named Game Side. The other Game Side wins; the existing scores are preserved and no scoring points are added by the forfeit.
+_Avoid_: Self-awarded winner, score reset
+
+**Double Forfeit**:
+An accepted result fact recorded for both Game Sides. It produces a finished result with no winner and preserves both existing scores without adding points.
+_Avoid_: Draw winner, automatic score change
+
+**Derived Result**:
+The winner, unfinished overtime, or double-forfeit outcome rebuilt from effective scoring and result facts. It is not a manually recorded target winner and remains auditable through Corrections and reinstatement.
+_Avoid_: Stored winner, manual target winner
+
 **Correction**:
 A Control Action that names one stable Game Fact and makes it ineffective or effective again without removing either the fact or earlier Corrections from the Control Audit Trail.
 _Avoid_: Delete, edit history, undo latest
@@ -129,7 +161,7 @@ An immutable Controller-submitted or Event Admin-submitted record accepted for a
 _Avoid_: Mutable command, audit entry
 
 **Derived Game State**:
-The current score, phase, overtime target, result, stoppages, and other game state rebuilt from effective Game Facts and Locked-Game Corrections whenever either changes the record.
+The current score, phase, overtime target, result, stoppages, and other game state rebuilt from effective Game Facts and Locked-Game Corrections whenever either changes the record. Its scoring bounds and lifecycle must agree with the durable Event Game Record root.
 _Avoid_: Stored result, patched state
 
 **Controller Device**:
@@ -147,6 +179,10 @@ _Avoid_: Scorekeeper app role, score-only Controller
 **Penalty Reason**:
 An optional broad classification of why a penalty card was issued in the app, supplementary to the exact foul recorded on the Official Score Sheet.
 _Avoid_: Foul text, official penalty record
+
+**Penalty Release Cause**:
+The sporting occurrence that ends penalty service early, such as an opposing score or a foul-before-score ruling; it is distinct from the optional Penalty Reason that classifies why the card was issued.
+_Avoid_: Penalty Reason, foul classification
 
 **Control Grant**:
 A Pitch Slot-scoped shared capability that admits Controllers to the one Event Game currently assigned to that slot. Its QR credential remains with the Pitch Slot when the schedule or Game assignment changes.
