@@ -1,10 +1,14 @@
 #!/usr/bin/env bun
 import { chromium, type Page } from "playwright";
 import { Database } from "bun:sqlite";
-import { mkdtempSync, rmSync } from "node:fs";
+import { copyFileSync, existsSync, mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { createAdHocGamesService, openSqliteAdHocStore } from "@/lib/ad-hoc-games";
+import {
+  createAdHocGamesService,
+  createSqliteAdHocRecoveryAdapter,
+  openSqliteAdHocStore,
+} from "@/lib/ad-hoc-games";
 
 let directory = "";
 let certificatePath = "";
@@ -200,6 +204,44 @@ async function run() {
         await waitForGameRoute(second, gameId);
         await second.getByText("Paused", { exact: true }).waitFor();
         await assertAccessibleQr(second, "recreated second browser after restart");
+
+        const recoverySnapshotPath = join(directory, "ad-hoc-recovery.snapshot.sqlite");
+        const recoveryAdapter = createSqliteAdHocRecoveryAdapter(
+          databasePath,
+          "adhoc-browser-test",
+        );
+        await recoveryAdapter.createRecoveryVacuumSnapshot(recoverySnapshotPath);
+        await stopServer();
+        await secondContext.setOffline(true);
+        await second.getByRole("button", { name: "Start game" }).click();
+        await second.getByText(/Offline 1/u).waitFor();
+        replaceAdHocDatabaseFromSnapshot(recoverySnapshotPath);
+        await startServer();
+        await first.reload();
+        await waitForGameRoute(first, gameId);
+        await first.waitForFunction(async (id) => {
+          const response = await fetch(`/api/games/${id}`);
+          if (!response.ok) return false;
+          const payload = (await response.json()) as {
+            game?: { state?: { isRunning?: unknown } };
+          };
+          return payload.game?.state?.isRunning === false;
+        }, gameId);
+        const restoredServerState = await first.evaluate(async (id) => {
+          const response = await fetch(`/api/games/${id}`);
+          return (await response.json()) as { game?: { state?: { isRunning?: boolean } } };
+        }, gameId);
+        if (restoredServerState.game?.state?.isRunning !== false) {
+          throw new Error("Restored server state was silently overwritten by newer local state.");
+        }
+        await second.getByText(/Offline 1/u).waitFor();
+        await secondContext.setOffline(false);
+        await second.reload();
+        await waitForGameRoute(second, gameId);
+        await second.getByText("Live", { exact: true }).waitFor();
+        await first.getByText("Running", { exact: true }).waitFor();
+        await second.getByRole("button", { name: "Pause game" }).click();
+        await first.getByText("Paused", { exact: true }).waitFor();
 
         await second.getByRole("button", { name: "Start game" }).click();
         await first.getByText("Running", { exact: true }).waitFor();
@@ -536,6 +578,14 @@ async function waitForUnfinishedGame(page: Page, gameId: string) {
     };
     return payload.game?.state?.isFinished === false && typeof payload.game.controlQr === "string";
   }, gameId);
+}
+
+function replaceAdHocDatabaseFromSnapshot(snapshotPath: string) {
+  for (const sidecar of [`${databasePath}-wal`, `${databasePath}-shm`]) {
+    rmSync(sidecar, { force: true });
+  }
+  if (!existsSync(snapshotPath)) throw new Error("Ad Hoc recovery snapshot was not created.");
+  copyFileSync(snapshotPath, databasePath);
 }
 
 async function seedCapacity(connected: boolean) {

@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
+import { createHash } from "node:crypto";
 import {
   chmodSync,
   copyFileSync,
@@ -23,6 +24,11 @@ import { createEventGameRecord } from "@/lib/event-game-record";
 import type { EventGameRecordRoot } from "@/lib/foundation-record-types";
 import { FOUNDATION_MIGRATIONS } from "@/lib/foundation-migrations";
 import { createFoundationRecovery } from "@/lib/foundation-recovery";
+import {
+  AD_HOC_RECOVERY_MANIFEST_VERSION,
+  type AdHocRecoveryAdapter,
+  type AdHocRecoveryFacts,
+} from "@/lib/ad-hoc-games";
 import { FoundationBackupPolicyError } from "@/lib/foundation-recovery-sqlite";
 import { openSqliteFoundationStorage } from "@/lib/foundation-storage-sqlite";
 
@@ -155,6 +161,60 @@ describe("Event foundation recovery", () => {
       expect(harness.recovery.createPreDeploymentBackup()).rejects.toThrow(
         "owned non-symlink 0700",
       );
+      harness.storage.close();
+    });
+  });
+
+  test("composes Ad Hoc backup, cutover, failed-image preservation, and rollback", async () => {
+    await withRecoveryPaths(async ({ livePath, backupDirectory }) => {
+      const harness = await createHarness(livePath, backupDirectory, () => "fast-composed");
+      const adHocPath = join(dirname(livePath), "ad-hoc.sqlite");
+      const adHoc = await createFastAdHocRecoveryAdapter(adHocPath, "snapshot");
+      const recovery = createFoundationRecovery(harness.storage, {
+        ...harness.options,
+        adHoc: adHoc.adapter,
+        createId: () => "fast-composed",
+      });
+      const manifest = await recovery.createPreDeploymentBackup();
+      const manifestPath = join(backupDirectory, `${manifest.snapshotId}.manifest.json`);
+      expect(manifest.adHoc).toMatchObject({
+        databaseFile: `${manifest.snapshotId}.ad-hoc.sqlite`,
+        facts: { retainedGameCount: 1 },
+      });
+      expect(await recovery.verifyBackup(manifestPath)).toEqual(manifest);
+      adHoc.setLive("newer-live-state");
+      const restored = await recovery.restore(manifestPath);
+      expect(restored).toMatchObject({ completed: true, potentiallyNewerWork: true });
+      expect(adHoc.readLive()).toBe("snapshot");
+      expect(restored.failedAdHocDatabasePath).not.toBeNull();
+      expect(await readFile(restored.failedAdHocDatabasePath!, "utf8")).toBe("newer-live-state");
+      harness.storage.close();
+    });
+
+    await withRecoveryPaths(async ({ livePath, backupDirectory }) => {
+      const harness = await createHarness(livePath, backupDirectory, () => "fast-rollback");
+      const adHocPath = join(dirname(livePath), "ad-hoc.sqlite");
+      const adHoc = await createFastAdHocRecoveryAdapter(adHocPath, "snapshot");
+      const initial = createFoundationRecovery(harness.storage, {
+        ...harness.options,
+        adHoc: adHoc.adapter,
+        createId: () => "fast-rollback",
+      });
+      const manifest = await initial.createPreDeploymentBackup();
+      const manifestPath = join(backupDirectory, `${manifest.snapshotId}.manifest.json`);
+      adHoc.setLive("newer-live-state");
+      const rollback = createFoundationRecovery(harness.storage, {
+        ...harness.options,
+        adHoc: adHoc.adapter,
+        createId: () => "fast-rollback-restore",
+        faultInjector(phase) {
+          if (phase === "before-live-replacement") throw new Error("fast rollback");
+        },
+      });
+      await expectRejected(rollback.restore(manifestPath), "fast rollback");
+      expect(adHoc.readLive()).toBe("newer-live-state");
+      expect(existsSync(`${adHocPath}.failed-fast-rollback-restore`)).toBe(false);
+      expect(existsSync(`${livePath}.failed-fast-rollback-restore`)).toBe(false);
       harness.storage.close();
     });
   });
@@ -1030,6 +1090,63 @@ describe("Event foundation recovery", () => {
     });
   });
 });
+
+async function createFastAdHocRecoveryAdapter(databasePath: string, liveContent: string) {
+  const factsFor = (content: string): AdHocRecoveryFacts => ({
+    version: AD_HOC_RECOVERY_MANIFEST_VERSION,
+    schemaVersion: 1,
+    environmentIdentity: "test",
+    retainedGameCount: 1,
+    unfinishedGameCount: 1,
+    creationEventCount: 1,
+    logicalDigest: createHash("sha256").update(content).digest("hex"),
+    capacityEvidenceDigest: createHash("sha256").update(`capacity:${content}`).digest("hex"),
+  });
+  await writeFile(databasePath, liveContent, { mode: 0o600 });
+  let current = liveContent;
+  const adapter: AdHocRecoveryAdapter = {
+    databasePath,
+    environmentIdentity: "test",
+    async createRecoveryVacuumSnapshot(destinationPath) {
+      await writeFile(destinationPath, current, { mode: 0o600 });
+      return factsFor(current);
+    },
+    async verifyRecoverySnapshot(path, expected) {
+      const actual = factsFor(await readFile(path, "utf8"));
+      if (JSON.stringify(actual) !== JSON.stringify(expected))
+        throw new Error("Fast Ad Hoc snapshot facts changed.");
+      return actual;
+    },
+    inspectRecoveryDatabase(path) {
+      return factsFor(readFileSync(path, "utf8"));
+    },
+    readiness() {
+      return { ok: true, status: "ready", facts: factsFor(current) };
+    },
+    async quiesceForRecovery() {},
+  };
+  return {
+    adapter,
+    setLive(content: string) {
+      current = content;
+      writeFileSync(databasePath, content, { mode: 0o600 });
+    },
+    readLive() {
+      return readFileSync(databasePath, "utf8");
+    },
+  };
+}
+
+async function expectRejected(promise: Promise<unknown>, message?: string): Promise<void> {
+  let failure: unknown;
+  try {
+    await promise;
+  } catch (error) {
+    failure = error;
+  }
+  expect(failure).toBeInstanceOf(Error);
+  if (message !== undefined) expect((failure as Error).message).toContain(message);
+}
 
 async function withRecoveryPaths(
   work: (paths: { livePath: string; backupDirectory: string }) => Promise<void>,

@@ -1,12 +1,24 @@
 import { describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { existsSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { applyGameCommand, createInitialGameState } from "@/lib/game-engine";
+import {
+  createControlActionCodecRegistry,
+  createDeterministicTestIqaInterpreter,
+} from "@/lib/event-game-actions";
 import { createEventCatalog, createInMemoryEventCatalogStorage } from "@/lib/event-catalog";
+import type { GrantAuthorityOptions } from "@/lib/grant-authority";
+import { createGrantTestKeyRing, createGrantTestRandomness } from "@/lib/grant-authority-contract";
+import { createGrantTestAuthorityVerifier } from "@/lib/grant-authority-test-support";
+import {
+  createFoundationRecovery,
+  type FoundationRecoveryOptions,
+} from "@/lib/foundation-recovery";
+import { openSqliteFoundationStorage } from "@/lib/foundation-storage-sqlite";
 import {
   MemoryTechnicalAdminAuthRepository,
   createTechnicalAdminAuth,
@@ -14,6 +26,7 @@ import {
 import {
   AD_HOC_DISCONNECTED_GRACE_MS,
   createAdHocGamesService,
+  createSqliteAdHocRecoveryAdapter,
   createInMemoryAdHocStore,
   openSqliteAdHocStore,
 } from "@/lib/ad-hoc-games";
@@ -580,7 +593,347 @@ describe("Ad Hoc SQLite focused integration", () => {
     });
     eventAuth.close();
   });
+
+  test("rejects mixed-environment recovery images before publication or activation", async () => {
+    const root = await mkdtemp(join(tmpdir(), "quadball-timer-adhoc-recovery-focused-"));
+    const livePath = join(root, "ad-hoc.sqlite");
+    const validSnapshotPath = join(root, "valid-snapshot.sqlite");
+    const contaminatedPath = join(root, "contaminated.sqlite");
+    const rejectedPublicationPath = join(root, "rejected-publication.sqlite");
+    const environmentIdentity = "sqm-test";
+    try {
+      const store = openSqliteAdHocStore(livePath, environmentIdentity);
+      const service = createAdHocGamesService({
+        store,
+        environmentIdentity,
+        now: () => 2_000,
+      });
+      const created = await service.create({
+        homeName: "Home",
+        awayName: "Away",
+        sourceKey: "recovery-focused-source",
+        nowMs: 1_000,
+      });
+      if (created.status !== "accepted") throw new Error("recovery setup creation failed");
+      const secondCreated = await service.create({
+        homeName: "Second Home",
+        awayName: "Second Away",
+        sourceKey: "recovery-focused-second-source",
+        nowMs: 1_001,
+      });
+      if (secondCreated.status !== "accepted")
+        throw new Error("second recovery setup creation failed");
+      const recovery = store.recovery;
+      if (recovery === undefined) throw new Error("SQLite recovery adapter is unavailable");
+      const validFacts = await recovery.createRecoveryVacuumSnapshot(validSnapshotPath);
+      expect(validFacts).toMatchObject({
+        environmentIdentity,
+        retainedGameCount: 2,
+        unfinishedGameCount: 2,
+        creationEventCount: 2,
+      });
+      await recovery.quiesceForRecovery();
+      service.close();
+
+      copyFileSync(validSnapshotPath, contaminatedPath);
+      const otherStore = openSqliteAdHocStore(contaminatedPath, "other-environment");
+      const otherService = createAdHocGamesService({
+        store: otherStore,
+        environmentIdentity: "other-environment",
+        now: () => 2_000,
+      });
+      const otherCreated = await otherService.create({
+        homeName: "Other Home",
+        awayName: "Other Away",
+        sourceKey: "other-recovery-focused-source",
+        nowMs: 1_001,
+      });
+      if (otherCreated.status !== "accepted") throw new Error("mixed-environment setup failed");
+      otherService.close();
+      const contaminatedRecovery = createSqliteAdHocRecoveryAdapter(
+        contaminatedPath,
+        environmentIdentity,
+      );
+      await expectRejected(
+        contaminatedRecovery.createRecoveryVacuumSnapshot(rejectedPublicationPath),
+      );
+      expect(existsSync(rejectedPublicationPath)).toBe(false);
+      await expectRejected(
+        contaminatedRecovery.verifyRecoverySnapshot(contaminatedPath, validFacts),
+      );
+      expect(contaminatedRecovery.readiness(contaminatedPath)).toMatchObject({
+        ok: false,
+        status: "integrity-failure",
+      });
+
+      const validLiveFacts = createSqliteAdHocRecoveryAdapter(
+        livePath,
+        environmentIdentity,
+      ).inspectRecoveryDatabase(livePath);
+      expect(validLiveFacts).toEqual(validFacts);
+      expect(validLiveFacts.retainedGameCount).toBe(2);
+      expect(validLiveFacts.creationEventCount).toBe(2);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("requires authoritative Ad Hoc writeability for readiness", async () => {
+    const root = await mkdtemp(join(tmpdir(), "quadball-timer-adhoc-readiness-focused-"));
+    const databasePath = join(root, "ad-hoc.sqlite");
+    try {
+      const store = openSqliteAdHocStore(databasePath, "sqm-test");
+      const service = createAdHocGamesService({
+        store,
+        environmentIdentity: "sqm-test",
+        now: () => 3_000,
+      });
+      expect((await service.create({ homeName: "Home", awayName: "Away" })).status).toBe(
+        "accepted",
+      );
+      service.close();
+
+      const adapter = createSqliteAdHocRecoveryAdapter(databasePath, "sqm-test");
+      chmodSync(databasePath, 0o444);
+      expect(adapter.readiness()).toMatchObject({ ok: false, status: "unavailable" });
+      chmodSync(databasePath, 0o600);
+      for (const sidecar of [`${databasePath}-wal`, `${databasePath}-shm`]) {
+        if (existsSync(sidecar)) chmodSync(sidecar, 0o600);
+      }
+
+      const locker = new Database(databasePath, { create: false, strict: true });
+      locker.run("PRAGMA busy_timeout = 0");
+      locker.run("BEGIN IMMEDIATE");
+      try {
+        expect(adapter.readiness()).toMatchObject({ ok: false, status: "unavailable" });
+      } finally {
+        locker.run("ROLLBACK");
+        locker.close();
+      }
+
+      const injected = createSqliteAdHocRecoveryAdapter(databasePath, "sqm-test", {
+        recoveryWriteabilityProbe: () => {
+          throw new Error("ENOSPC injected for readiness probe");
+        },
+      });
+      expect(injected.readiness()).toMatchObject({ ok: false, status: "unavailable" });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("restores Ad Hoc through the composed Foundation recovery boundary", async () => {
+    const root = await mkdtemp(join(tmpdir(), "quadball-timer-adhoc-foundation-focused-"));
+    const liveDirectory = join(root, "live");
+    await mkdir(liveDirectory, { recursive: true });
+    const foundationPath = join(liveDirectory, "foundation.sqlite");
+    const adHocPath = join(liveDirectory, "ad-hoc.sqlite");
+    const backupDirectory = join(root, "backup");
+    const technicalAdminPath = join(root, "technical-admin.sqlite");
+    let foundationStorage: ReturnType<typeof openSqliteFoundationStorage> | null = null;
+    let adHocService: ReturnType<typeof createAdHocGamesService> | null = null;
+    try {
+      const keyRing = createGrantTestKeyRing();
+      const readinessContext = {
+        actionCodecRegistry: createControlActionCodecRegistry(),
+        interpreter: createDeterministicTestIqaInterpreter("rules-v1"),
+      };
+      const grant: GrantAuthorityOptions = {
+        environmentId: "test",
+        clock: { nowMs: () => 10 },
+        randomness: createGrantTestRandomness(),
+        keyRing,
+        controlScopeResolver: {
+          resolve: () => ({ status: "eligible", eventGameId: "game-1" }),
+          resolveSession: (_scope, sessionEventGameId) => ({
+            status: "current",
+            eventGameId: sessionEventGameId,
+          }),
+        },
+        privilegedAuthorityVerifier: createGrantTestAuthorityVerifier(),
+      };
+      foundationStorage = openSqliteFoundationStorage(foundationPath, {
+        grantKeyRing: keyRing,
+        grantValidationContext: { environmentId: "test", keyRing },
+      });
+      await foundationStorage.applyMigrations({ requireCandidate: false });
+      foundationStorage.setReadinessContext(readinessContext);
+
+      const adHocStore = openSqliteAdHocStore(adHocPath, "sqm-test");
+      adHocService = createAdHocGamesService({
+        store: adHocStore,
+        environmentIdentity: "sqm-test",
+        now: () => 2_000,
+      });
+      const created = await adHocService.create({
+        homeName: "Home",
+        awayName: "Away",
+        sourceKey: "foundation-composed-source",
+        nowMs: 1_000,
+      });
+      if (created.status !== "accepted") throw new Error("composed setup creation failed");
+      const snapshotOperation = await adHocService.apply({
+        gameId: created.gameId,
+        sessionId: created.sessionId,
+        operations: [
+          {
+            id: "snapshot-operation",
+            clientSentAtMs: 1_100,
+            command: { type: "change-score", team: "home", delta: 1, reason: "goal" },
+          },
+        ],
+      });
+      expect(snapshotOperation.status).toBe("accepted");
+
+      const foundationOptions: FoundationRecoveryOptions = {
+        backupDirectory,
+        keyRing,
+        readinessContext,
+        grant,
+        acceptance: {
+          externalScopeResolver: {
+            resolve: (scope) => ({ status: "resolved" as const, scope: structuredClone(scope) }),
+            resolveEventTeam: () => ({ status: "resolved" as const }),
+          },
+          clock: () => 10,
+          interpreter: readinessContext.interpreter,
+        },
+        technicalAdminAuth: { databasePath: technicalAdminPath, async quiesce() {} },
+        nowMs: () => 10,
+      };
+      let recovery = createFoundationRecovery(foundationStorage, {
+        ...foundationOptions,
+        adHoc: adHocStore.recovery,
+        createId: () => "composed-snapshot",
+      });
+      const manifest = await recovery.createPreDeploymentBackup();
+      const manifestPath = join(backupDirectory, `${manifest.snapshotId}.manifest.json`);
+      expect(manifest.adHoc).toBeDefined();
+      expect(await recovery.verifyBackup(manifestPath)).toEqual(manifest);
+      const adHocBackupPath = join(backupDirectory, manifest.adHoc!.databaseFile);
+      const validAdHocBackup = readFileSync(adHocBackupPath);
+
+      const finished = await adHocService.apply({
+        gameId: created.gameId,
+        sessionId: created.sessionId,
+        operations: [
+          {
+            id: "finish-after-snapshot",
+            clientSentAtMs: 1_200,
+            command: { type: "record-double-forfeit" },
+          },
+        ],
+      });
+      expect(finished.status).toBe("accepted");
+      if (finished.status === "accepted") expect(finished.game.state.isFinished).toBe(true);
+      expect(
+        await adHocService.leave({ gameId: created.gameId, sessionId: created.sessionId }),
+      ).toBe(true);
+
+      const tampered = Buffer.from(validAdHocBackup);
+      writeFileSync(adHocBackupPath, tampered);
+      const invalidDatabase = new Database(adHocBackupPath, { create: false, strict: true });
+      invalidDatabase.run("UPDATE adhoc_games SET control_qr_hash = ?", ["0".repeat(64)]);
+      invalidDatabase.close();
+      await expectRejected(recovery.restore(manifestPath));
+      expect(adHocStore.readGame(created.gameId)?.state.isFinished).toBe(true);
+      writeFileSync(adHocBackupPath, validAdHocBackup);
+
+      const rollbackRecovery = createFoundationRecovery(foundationStorage, {
+        ...foundationOptions,
+        adHoc: adHocStore.recovery,
+        createId: () => "composed-rollback",
+        faultInjector(phase) {
+          if (phase === "before-live-replacement") throw new Error("composed rollback");
+        },
+      });
+      await expectRejected(rollbackRecovery.restore(manifestPath), "composed rollback");
+      expect(existsSync(adHocPath)).toBe(true);
+      expect(existsSync(`${adHocPath}.failed-composed-rollback`)).toBe(false);
+      expect(existsSync(foundationPath)).toBe(true);
+      expect(existsSync(`${foundationPath}.failed-composed-rollback`)).toBe(false);
+
+      adHocService = null;
+      foundationStorage = null;
+      const reopenedAdHocStore = openSqliteAdHocStore(adHocPath, "sqm-test");
+      const reopenedAdHoc = createAdHocGamesService({
+        store: reopenedAdHocStore,
+        environmentIdentity: "sqm-test",
+        now: () => 2_001,
+      });
+      const reopenedFoundation = openSqliteFoundationStorage(foundationPath, {
+        grantKeyRing: keyRing,
+        grantValidationContext: { environmentId: "test", keyRing },
+      });
+      reopenedFoundation.setReadinessContext(readinessContext);
+      recovery = createFoundationRecovery(reopenedFoundation, {
+        ...foundationOptions,
+        adHoc: reopenedAdHocStore.recovery,
+        createId: () => "composed-restore",
+      });
+      const restored = await recovery.restore(manifestPath);
+      expect(restored.failedAdHocDatabasePath).not.toBeNull();
+      reopenedAdHoc.close();
+      reopenedFoundation.close();
+
+      const restoredAdHocStore = openSqliteAdHocStore(adHocPath, "sqm-test");
+      const restoredAdHoc = createAdHocGamesService({
+        store: restoredAdHocStore,
+        environmentIdentity: "sqm-test",
+        now: () => 2_002,
+      });
+      const resumed = await restoredAdHoc.read({
+        gameId: created.gameId,
+        sessionId: created.sessionId,
+        nowMs: 2_002,
+      });
+      expect(resumed).toMatchObject({
+        status: "accepted",
+        game: { gameId: created.gameId, controlQr: created.controlQr },
+      });
+      if (resumed.status !== "accepted") throw new Error("restored session did not resume");
+      expect(resumed.game.state.isFinished).toBe(false);
+      expect(
+        (
+          await restoredAdHoc.admit({
+            gameId: created.gameId,
+            controlQr: created.controlQr,
+            browserId: "restored-browser",
+            nowMs: 2_003,
+          })
+        ).status,
+      ).toBe("accepted");
+      const postSnapshot = await restoredAdHoc.apply({
+        gameId: created.gameId,
+        sessionId: created.sessionId,
+        operations: [
+          {
+            id: "finish-after-snapshot",
+            clientSentAtMs: 1_200,
+            command: { type: "record-double-forfeit" },
+          },
+        ],
+      });
+      expect(postSnapshot.status).toBe("accepted");
+      restoredAdHoc.close();
+    } finally {
+      adHocService?.close();
+      foundationStorage?.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 });
+
+async function expectRejected(promise: Promise<unknown>, message?: string): Promise<void> {
+  let failure: unknown;
+  try {
+    await promise;
+  } catch (error) {
+    failure = error;
+  }
+  expect(failure).toBeInstanceOf(Error);
+  if (message !== undefined) expect((failure as Error).message).toContain(message);
+}
 
 async function runWorker(worker: string, databasePath: string, mode: string, ...args: string[]) {
   return await startWorker(worker, databasePath, mode, ...args).result;

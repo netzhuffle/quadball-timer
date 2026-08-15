@@ -42,6 +42,7 @@ import {
 } from "@/lib/foundation-storage-sqlite";
 import type { FoundationStorageReadinessContext } from "@/lib/foundation-storage";
 import type { FoundationStorageTransaction } from "@/lib/foundation-storage";
+import type { AdHocRecoveryAdapter, AdHocRecoveryFacts } from "@/lib/ad-hoc-games";
 import {
   FOUNDATION_BACKUP_POLICY_VERSION,
   inspectRecoveryDatabase,
@@ -72,6 +73,11 @@ export type FoundationRecoveryManifest = {
     grantVersion: string;
   }[];
   excludedRelations: readonly string[];
+  adHoc?: {
+    databaseFile: string;
+    databaseSha256: string;
+    facts: AdHocRecoveryFacts;
+  };
   verifiedAtMs: number;
 };
 
@@ -88,6 +94,8 @@ export type FoundationRecoveryOptions = {
     /** Stops new auth writes and drains/closes the repository before replacement. */
     quiesce(): Promise<void>;
   };
+  /** Optional Ad Hoc database included in the same staged recovery boundary. */
+  adHoc?: AdHocRecoveryAdapter;
   nowMs?: () => number;
   createId?: () => string;
   faultInjector?: (
@@ -133,6 +141,7 @@ export type FoundationRecovery = {
     restoreId: string;
     failedDatabasePath: string;
     failedTechnicalAdminDatabasePath: string | null;
+    failedAdHocDatabasePath: string | null;
     completed: true;
     evidencePath: string;
     completionEvidencePath: string | null;
@@ -173,17 +182,26 @@ export function createFoundationRecovery(
     const stagedPath = join(backupDirectory, `.${snapshotId}.staged.sqlite`);
     const databasePath = join(backupDirectory, `${snapshotId}.sqlite`);
     const manifestPath = join(backupDirectory, `${snapshotId}.manifest.json`);
+    const adHocRawPath = join(backupDirectory, `.${snapshotId}.ad-hoc.raw.sqlite`);
+    const adHocDatabasePath = join(backupDirectory, `${snapshotId}.ad-hoc.sqlite`);
     const snapshotAtMs = readTime(nowMs);
     let publishedDatabaseIdentity: StableFileIdentity | null = null;
     let publishedManifestIdentity: StableFileIdentity | null = null;
     let rawIdentity: StableFileIdentity | null = null;
     let stagedIdentity: StableFileIdentity | null = null;
+    let adHocRawIdentity: StableFileIdentity | null = null;
+    let publishedAdHocIdentity: StableFileIdentity | null = null;
+    let adHocFacts: AdHocRecoveryFacts | null = null;
     let completed = false;
     try {
       await assertPathAbsent(rawPath, "raw recovery snapshot");
       await assertPathAbsent(stagedPath, "sanitized recovery snapshot");
       await assertPathAbsent(databasePath, "verified recovery snapshot");
       await assertPathAbsent(manifestPath, "recovery manifest");
+      if (options.adHoc !== undefined) {
+        await assertPathAbsent(adHocRawPath, "raw Ad Hoc recovery snapshot");
+        await assertPathAbsent(adHocDatabasePath, "verified Ad Hoc recovery snapshot");
+      }
       const sourceFacts = await storage.createRecoveryVacuumSnapshot(rawPath);
       rawIdentity = await assertOwnedPrivateFile(rawPath, "raw recovery snapshot");
       options.faultInjector?.("after-vacuum");
@@ -199,6 +217,17 @@ export function createFoundationRecovery(
       stagedIdentity = await assertOwnedPrivateFile(stagedPath, "sanitized recovery snapshot");
       const verified = await verifyDatabase(stagedPath, sourceFacts);
       options.faultInjector?.("after-verification");
+      if (options.adHoc !== undefined) {
+        adHocFacts = await options.adHoc.createRecoveryVacuumSnapshot(adHocRawPath);
+        adHocRawIdentity = await assertOwnedPrivateFile(
+          adHocRawPath,
+          "raw Ad Hoc recovery snapshot",
+        );
+        await options.adHoc.verifyRecoverySnapshot(adHocRawPath, adHocFacts);
+        publishedAdHocIdentity = await copyStablePrivateFile(adHocRawPath, adHocDatabasePath);
+        await removeStablePath(adHocRawPath, adHocRawIdentity);
+        adHocRawIdentity = null;
+      }
       const manifest: FoundationRecoveryManifest = {
         version: RECOVERY_MANIFEST_VERSION,
         snapshotId,
@@ -211,6 +240,15 @@ export function createFoundationRecovery(
         representedKeyVersions: verified.keyVersions,
         restoredGrantVersions: redactGrantVersions(verified.facts),
         excludedRelations: sourceFacts.excludedRelations,
+        ...(options.adHoc === undefined || adHocFacts === null
+          ? {}
+          : {
+              adHoc: {
+                databaseFile: basename(adHocDatabasePath),
+                databaseSha256: await sha256File(adHocDatabasePath),
+                facts: adHocFacts,
+              },
+            }),
         verifiedAtMs: readTime(nowMs),
       };
       publishedDatabaseIdentity = await copyStablePrivateFile(stagedPath, databasePath);
@@ -223,8 +261,11 @@ export function createFoundationRecovery(
     } finally {
       if (rawIdentity !== null) await removeStablePath(rawPath, rawIdentity);
       if (stagedIdentity !== null) await removeStablePath(stagedPath, stagedIdentity);
+      if (adHocRawIdentity !== null) await removeStablePath(adHocRawPath, adHocRawIdentity);
       if (!completed && publishedDatabaseIdentity !== null)
         await removeStablePath(databasePath, publishedDatabaseIdentity);
+      if (!completed && publishedAdHocIdentity !== null)
+        await removeStablePath(adHocDatabasePath, publishedAdHocIdentity);
       if (!completed && publishedManifestIdentity !== null)
         await removeStablePath(manifestPath, publishedManifestIdentity);
     }
@@ -237,7 +278,15 @@ export function createFoundationRecovery(
       backupDirectory,
       `.${manifest.snapshotId}.verify-${boundedId(createId(), "verificationId")}.sqlite`,
     );
+    const adHocVerificationPath =
+      manifest.adHoc === undefined
+        ? null
+        : join(
+            backupDirectory,
+            `.${manifest.snapshotId}.verify-${boundedId(createId(), "verificationId")}.ad-hoc.sqlite`,
+          );
     let verificationIdentity: StableFileIdentity | null = null;
+    let adHocVerificationIdentity: StableFileIdentity | null = null;
     try {
       verificationIdentity = await copyStablePrivateFile(
         resolveBackupDatabasePath(manifestPath, manifest, backupDirectory),
@@ -255,10 +304,23 @@ export function createFoundationRecovery(
       ) {
         throw new Error("Verified backup key-version representation changed.");
       }
+      if (manifest.adHoc !== undefined) {
+        if (options.adHoc === undefined || adHocVerificationPath === null) {
+          throw new Error("Ad Hoc recovery adapter is required to verify this backup.");
+        }
+        adHocVerificationIdentity = await copyStablePrivateFile(
+          resolveBackupAdHocDatabasePath(manifestPath, manifest, backupDirectory),
+          adHocVerificationPath,
+          manifest.adHoc.databaseSha256,
+        );
+        await options.adHoc.verifyRecoverySnapshot(adHocVerificationPath, manifest.adHoc.facts);
+      }
       return manifest;
     } finally {
       if (verificationIdentity !== null)
         await removeStablePath(verificationPath, verificationIdentity);
+      if (adHocVerificationIdentity !== null && adHocVerificationPath !== null)
+        await removeStablePath(adHocVerificationPath, adHocVerificationIdentity);
       await rm(`${verificationPath}-wal`, { force: true });
       await rm(`${verificationPath}-shm`, { force: true });
       await rm(`${verificationPath}.quarantine`, { force: true });
@@ -273,6 +335,13 @@ export function createFoundationRecovery(
     const stagedPath = join(liveDirectory, `.${basename(livePath)}.${restoreId}.staged`);
     const failedDatabasePath = `${livePath}.failed-${restoreId}`;
     const failedTechnicalAdminDatabasePath = `${technicalAdminPath}.failed-${restoreId}`;
+    const adHocLivePath = options.adHoc?.databasePath ?? null;
+    const stagedAdHocPath =
+      adHocLivePath === null
+        ? null
+        : join(dirname(adHocLivePath), `.${basename(adHocLivePath)}.${restoreId}.staged`);
+    const failedAdHocDatabasePath =
+      adHocLivePath === null ? null : `${adHocLivePath}.failed-${restoreId}`;
     const evidencePath = join(backupDirectory, `${restoreId}.restore-evidence.json`);
     const completionEvidenceCandidatePath = join(
       backupDirectory,
@@ -280,10 +349,13 @@ export function createFoundationRecovery(
     );
     let staged: SqliteFoundationStorage | undefined;
     let stagedIdentity: StableFileIdentity | null = null;
+    let stagedAdHocIdentity: StableFileIdentity | null = null;
     let evidenceIdentity: StableFileIdentity | null = null;
     try {
       await assertPathAbsent(failedDatabasePath, "failed Event foundation image");
       await assertPathAbsent(failedTechnicalAdminDatabasePath, "failed Technical Admin image");
+      if (failedAdHocDatabasePath !== null)
+        await assertPathAbsent(failedAdHocDatabasePath, "failed Ad Hoc image");
       await assertPathAbsent(evidencePath, "restore evidence");
       await assertPathAbsent(completionEvidenceCandidatePath, "completed restore evidence");
       stagedIdentity = await copyStablePrivateFile(backupPath, stagedPath, manifest.databaseSha256);
@@ -297,6 +369,22 @@ export function createFoundationRecovery(
         JSON.stringify(verified.keyVersions) !== JSON.stringify(manifest.representedKeyVersions)
       ) {
         throw new Error("Verified backup key-version representation changed.");
+      }
+      if (manifest.adHoc !== undefined) {
+        if (
+          options.adHoc === undefined ||
+          adHocLivePath === null ||
+          stagedAdHocPath === null ||
+          failedAdHocDatabasePath === null
+        ) {
+          throw new Error("Ad Hoc recovery adapter is required to restore this backup.");
+        }
+        stagedAdHocIdentity = await copyStablePrivateFile(
+          resolveBackupAdHocDatabasePath(manifestPath, manifest, backupDirectory),
+          stagedAdHocPath,
+          manifest.adHoc.databaseSha256,
+        );
+        await options.adHoc.verifyRecoverySnapshot(stagedAdHocPath, manifest.adHoc.facts);
       }
       options.faultInjector?.("after-restore-staging");
 
@@ -317,6 +405,7 @@ export function createFoundationRecovery(
       // later writer is rejected by the closed repositories.
       await options.technicalAdminAuth.quiesce();
       await storage.quiesceForRecovery();
+      await options.adHoc?.quiesceForRecovery();
       options.faultInjector?.("after-authoritative-quiescence");
 
       await assertStablePrivateFile(
@@ -354,8 +443,19 @@ export function createFoundationRecovery(
       const liveIdentity = stableIdentity(await lstat(livePath));
       const liveFacts = safelyInspectClosedDatabase(livePath);
       await assertStableFileIdentity(livePath, liveIdentity, "quiesced Event foundation image");
+      const adHocLiveIdentity =
+        adHocLivePath === null ? null : stableIdentity(await lstat(adHocLivePath));
+      const adHocLiveFacts =
+        options.adHoc === undefined || adHocLivePath === null
+          ? null
+          : options.adHoc.inspectRecoveryDatabase(adHocLivePath);
       const potentiallyNewerWork =
-        liveFacts === null ? null : liveFacts.logicalDigest !== manifest.logicalDigest;
+        liveFacts === null
+          ? null
+          : liveFacts.logicalDigest !== manifest.logicalDigest ||
+            (manifest.adHoc !== undefined &&
+              adHocLiveFacts !== null &&
+              JSON.stringify(adHocLiveFacts) !== JSON.stringify(manifest.adHoc.facts));
       const movedSidecars: Array<{
         from: string;
         to: string;
@@ -414,6 +514,37 @@ export function createFoundationRecovery(
           );
           movedSidecars.push({ from: failed, to: source, identity: failedIdentity });
         }
+        if (
+          manifest.adHoc !== undefined &&
+          adHocLivePath !== null &&
+          failedAdHocDatabasePath !== null &&
+          adHocLiveIdentity !== null
+        ) {
+          const failedIdentity = await moveToExclusivePath(
+            adHocLivePath,
+            failedAdHocDatabasePath,
+            "failed Ad Hoc image",
+            adHocLiveIdentity,
+          );
+          movedSidecars.push({
+            from: failedAdHocDatabasePath,
+            to: adHocLivePath,
+            identity: failedIdentity,
+          });
+          for (const suffix of ["-wal", "-shm"] as const) {
+            const source = `${adHocLivePath}${suffix}`;
+            if (!(await pathExists(source))) continue;
+            const failed = `${failedAdHocDatabasePath}${suffix}`;
+            const sourceIdentity = stableIdentity(await lstat(source));
+            const failedIdentity = await moveToExclusivePath(
+              source,
+              failed,
+              "failed Ad Hoc sidecar",
+              sourceIdentity,
+            );
+            movedSidecars.push({ from: failed, to: source, identity: failedIdentity });
+          }
+        }
         options.faultInjector?.("after-live-preserved");
         options.faultInjector?.("before-live-replacement");
         installedPaths.push({
@@ -441,9 +572,46 @@ export function createFoundationRecovery(
             });
           }
         }
+        if (manifest.adHoc !== undefined && stagedAdHocPath !== null && adHocLivePath !== null) {
+          if (stagedAdHocIdentity === null)
+            throw new Error("Ad Hoc restore staging is unavailable.");
+          await assertStablePrivateFile(
+            stagedAdHocPath,
+            stagedAdHocIdentity,
+            "verified Ad Hoc restore staging image",
+          );
+          installedPaths.push({
+            path: adHocLivePath,
+            identity: await moveToExclusivePath(
+              stagedAdHocPath,
+              adHocLivePath,
+              "restored Ad Hoc image",
+              stagedAdHocIdentity,
+            ),
+          });
+          stagedAdHocIdentity = null;
+          for (const suffix of ["-wal", "-shm"] as const) {
+            if (await pathExists(`${stagedAdHocPath}${suffix}`)) {
+              const stagedSidecarPath = `${stagedAdHocPath}${suffix}`;
+              const stagedSidecarIdentity = stableIdentity(await lstat(stagedSidecarPath));
+              installedPaths.push({
+                path: `${adHocLivePath}${suffix}`,
+                identity: await moveToExclusivePath(
+                  stagedSidecarPath,
+                  `${adHocLivePath}${suffix}`,
+                  "restored Ad Hoc sidecar",
+                  stagedSidecarIdentity,
+                ),
+              });
+            }
+          }
+        }
         await syncDirectory(liveDirectory);
         if (dirname(technicalAdminPath) !== liveDirectory) {
           await syncDirectory(dirname(technicalAdminPath));
+        }
+        if (adHocLivePath !== null && dirname(adHocLivePath) !== liveDirectory) {
+          await syncDirectory(dirname(adHocLivePath));
         }
       } catch (error) {
         for (const installed of installedPaths.reverse())
@@ -461,9 +629,16 @@ export function createFoundationRecovery(
         if (dirname(technicalAdminPath) !== liveDirectory) {
           await syncDirectory(dirname(technicalAdminPath));
         }
+        if (adHocLivePath !== null && dirname(adHocLivePath) !== liveDirectory) {
+          await syncDirectory(dirname(adHocLivePath));
+        }
         throw error;
       }
       const restoredFacts = safelyInspectClosedDatabase(livePath);
+      const restoredAdHocFacts =
+        options.adHoc !== undefined && adHocLivePath !== null
+          ? options.adHoc.inspectRecoveryDatabase(adHocLivePath)
+          : null;
       const evidence = {
         version: RECOVERY_EVIDENCE_VERSION,
         kind: "restore",
@@ -475,10 +650,23 @@ export function createFoundationRecovery(
         snapshotActionCount: manifest.actionCount,
         liveActionCountBeforeRestore: liveFacts?.actionCount ?? null,
         potentiallyNewerWork,
+        adHoc:
+          manifest.adHoc === undefined
+            ? null
+            : {
+                retainedGameCount: manifest.adHoc.facts.retainedGameCount,
+                unfinishedGameCount: manifest.adHoc.facts.unfinishedGameCount,
+                resurrectionExposure: "older-snapshot-may-resurrect-departed-session",
+                restoredLogicalDigest: restoredAdHocFacts?.logicalDigest ?? null,
+              },
         failedDatabasePath,
         failedTechnicalAdminDatabasePath: (await pathExists(failedTechnicalAdminDatabasePath))
           ? failedTechnicalAdminDatabasePath
           : null,
+        failedAdHocDatabasePath:
+          failedAdHocDatabasePath !== null && (await pathExists(failedAdHocDatabasePath))
+            ? failedAdHocDatabasePath
+            : null,
         technicalAdminAuthRevived: false,
         restoredGrantVersions:
           restoredFacts === null
@@ -504,6 +692,10 @@ export function createFoundationRecovery(
         failedTechnicalAdminDatabasePath: (await pathExists(failedTechnicalAdminDatabasePath))
           ? failedTechnicalAdminDatabasePath
           : null,
+        failedAdHocDatabasePath:
+          failedAdHocDatabasePath !== null && (await pathExists(failedAdHocDatabasePath))
+            ? failedAdHocDatabasePath
+            : null,
         completed: true as const,
         evidencePath,
         completionEvidencePath,
@@ -513,8 +705,14 @@ export function createFoundationRecovery(
     } finally {
       staged?.close();
       if (stagedIdentity !== null) await removeStablePath(stagedPath, stagedIdentity);
+      if (stagedAdHocIdentity !== null && stagedAdHocPath !== null)
+        await removeStablePath(stagedAdHocPath, stagedAdHocIdentity);
       await rm(`${stagedPath}-wal`, { force: true });
       await rm(`${stagedPath}-shm`, { force: true });
+      if (stagedAdHocPath !== null) {
+        await rm(`${stagedAdHocPath}-wal`, { force: true });
+        await rm(`${stagedAdHocPath}-shm`, { force: true });
+      }
     }
   }
 
@@ -1018,7 +1216,35 @@ async function readManifest(
   if (manifest.databaseFile !== `${manifest.snapshotId}.sqlite`) {
     throw new Error("Recovery manifest database identity is invalid.");
   }
+  if (manifest.adHoc !== undefined) {
+    if (
+      typeof manifest.adHoc !== "object" ||
+      manifest.adHoc === null ||
+      manifest.adHoc.databaseFile !== `${manifest.snapshotId}.ad-hoc.sqlite` ||
+      !/^[a-f0-9]{64}$/.test(manifest.adHoc.databaseSha256) ||
+      manifest.adHoc.facts?.version !== "ad-hoc-recovery-manifest-v1"
+    ) {
+      throw new Error("Recovery manifest Ad Hoc database identity is invalid.");
+    }
+  }
   return manifest;
+}
+
+function resolveBackupAdHocDatabasePath(
+  manifestPath: string,
+  manifest: FoundationRecoveryManifest,
+  backupDirectory: string,
+): string {
+  if (manifest.adHoc === undefined) throw new Error("Recovery manifest has no Ad Hoc database.");
+  const databasePath = resolve(backupDirectory, manifest.adHoc.databaseFile);
+  if (
+    dirname(databasePath) !== backupDirectory ||
+    basename(databasePath) !== manifest.adHoc.databaseFile ||
+    resolve(manifestPath) === databasePath
+  ) {
+    throw new Error("Recovery manifest Ad Hoc database path is invalid.");
+  }
+  return databasePath;
 }
 
 async function pathExists(path: string): Promise<boolean> {
