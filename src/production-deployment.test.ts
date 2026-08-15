@@ -21,15 +21,34 @@ describe("Production deployment contract", () => {
     );
   });
 
-  test("ships the canonical unit with every release", () => {
+  test("builds one shared immutable artifact for independent environment jobs", () => {
     const workflow = readFileSync(
       join(repositoryRoot, ".github/workflows/deploy-production.yml"),
       "utf8",
     );
 
-    expect(workflow).toContain(
-      "install -m 644 deploy/systemd/quadball-timer.service release/deploy/systemd/quadball-timer.service",
+    expect(workflow).toContain("bun run build:executable");
+    expect(workflow).toContain("bun scripts/create-release-bundle.ts");
+    expect(workflow).toContain("Upload one shared release artifact");
+    expect(workflow).toContain("deploy-test:");
+    expect(workflow).toContain("deploy-production:");
+    expect(workflow).toContain("needs: [deploy-test, deploy-production]");
+  });
+
+  test("preserves executable modes across the GitHub artifact boundary", () => {
+    const workflow = readFileSync(
+      join(repositoryRoot, ".github/workflows/deploy-production.yml"),
+      "utf8",
     );
+
+    expect(workflow).toContain("tar --create --gzip --file=release-bundle.tar.gz");
+    expect(workflow).toContain("path: release-bundle.tar.gz");
+    expect(workflow).toContain(
+      'tar --extract --gzip --file="$archive" --directory=release --no-same-owner',
+    );
+    expect(workflow).toContain("test \"$(stat -c '%a' release/quadball-timer)\" = 555");
+    expect(workflow).toContain("test \"$(stat -c '%a' release/deploy/activate-release.sh)\" = 555");
+    expect(workflow).toContain("chmod -R u+w -- '${stage_dir}' 2>/dev/null || true");
   });
 
   test("reports bounded non-secret service state when activation fails", () => {
@@ -44,6 +63,17 @@ describe("Production deployment contract", () => {
     const activation = readFileSync(join(repositoryRoot, "deploy/activate-release.sh"), "utf8");
 
     expect(activation).toContain("check_service_state_contract");
+    expect(activation).toContain("--staged-dir");
+    expect(activation).toContain(
+      "Release-attempt identity already exists and cannot be overwritten",
+    );
+    expect(activation).toContain("check_release_identity");
+    expect(activation).toContain('check_health "$release_id" "$release_dir"');
+    expect(activation).toContain('check_health "$previous_release_id" "$previous_release"');
+    expect(activation).toContain(
+      'check_release_identity "$selected_release_id" "$selected_release_dir"',
+    );
+    expect(activation).toContain("chmod -R a-w");
     expect(activation).toContain(
       'systemctl show "$service_name" --property=StateDirectory --value',
     );
@@ -56,5 +86,13 @@ describe("Production deployment contract", () => {
     expect(activation).toContain(
       "Install ${release_dir}/deploy/systemd/quadball-timer.service and run systemctl daemon-reload before activation.",
     );
+  });
+
+  test("restores staging write permission before failed-stage cleanup", () => {
+    const activation = readFileSync(join(repositoryRoot, "deploy/activate-release.sh"), "utf8");
+
+    expect(activation).toContain('chmod -R u+w -- "$staged_dir" 2>/dev/null || true');
+    expect(activation).toContain('rm -rf -- "$staged_dir"');
+    expect(activation).toContain('chmod -R a-w -- "$release_dir"');
   });
 });

@@ -133,8 +133,8 @@ and load the unit after that upload. Replace `$release_id` with the
 40-character commit shown by that workflow, then rerun the same workflow:
 
 ```fish
-set release_id "REPLACE_WITH_40_CHARACTER_WORKFLOW_COMMIT"
-set unit_source /srv/quadball-timer-test/releases/$release_id/deploy/quadball-timer-test.service
+set release_id "REPLACE_WITH_RELEASE_ATTEMPT_ID"
+set unit_source /srv/quadball-timer-test/releases/$release_id/deploy/systemd/quadball-timer-test.service
 
 sudo install -o root -g root -m 0644 $unit_source /etc/systemd/system/quadball-timer-test.service
 sudo systemctl daemon-reload

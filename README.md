@@ -49,7 +49,9 @@ uses the separate `foundation.sqlite` file. Activation fails before switching a
 release when the installed unit does not provide this state contract.
 
 The permanent Test Environment is deployed independently at
-`https://test.timer.quadball.app` by `.github/workflows/deploy-test.yml`. It uses
+`https://test.timer.quadball.app` by the Test job in
+`.github/workflows/deploy-production.yml`. The workflow builds one immutable
+release attempt and gives Production and Test independent activation jobs. Test uses
 the separate `quadball-timer-test` service on `127.0.0.1:3001`, release root
 `/srv/quadball-timer-test`, and state directory `/var/lib/quadball-timer-test`.
 Its root-controlled key file is `/etc/quadball-timer/test.env`; Test keys must

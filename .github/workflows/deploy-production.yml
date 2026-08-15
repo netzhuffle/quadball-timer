@@ -1,4 +1,4 @@
-name: Deploy production
+name: Deploy environments
 
 on:
   push:
@@ -16,12 +16,19 @@ permissions:
   contents: read
 
 concurrency:
-  group: timer-production-deploy
+  group: timer-deploy-${{ github.ref }}
   cancel-in-progress: false
 
+env:
+  RELEASE_ARTIFACT: release-${{ github.run_id }}-${{ github.run_attempt }}
+  RELEASE_ATTEMPT_ID: sha-${{ github.sha }}-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+
 jobs:
-  ci:
+  build:
     runs-on: ubuntu-latest
+    outputs:
+      release-artifact: ${{ steps.release-metadata.outputs.release-artifact }}
+      release-attempt-id: ${{ steps.release-metadata.outputs.release-attempt-id }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -40,46 +47,165 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
+      - name: Record immutable release-attempt metadata
+        id: release-metadata
+        run: |
+          set -euo pipefail
+          echo "release-artifact=${RELEASE_ARTIFACT}" >> "$GITHUB_OUTPUT"
+          echo "release-attempt-id=${RELEASE_ATTEMPT_ID}" >> "$GITHUB_OUTPUT"
+
       - name: Check
         run: bun run check
 
       - name: Test
         run: bun run test
 
-      - name: Build
+      - name: Build exact Linux executable once
         run: bun run build:executable
 
-      - name: Prepare release bundle
+      - name: Prepare and verify immutable release bundle
+        env:
+          SOURCE_COMMIT: ${{ github.sha }}
+          WORKFLOW_RUN_ID: ${{ github.run_id }}
+          WORKFLOW_ATTEMPT: ${{ github.run_attempt }}
+        run: bun scripts/create-release-bundle.ts
+
+      - name: Confirm manifest is present in the uploaded bundle
+        run: test -s release/release-manifest.json
+
+      - name: Archive bundle while preserving verified modes
         run: |
           set -euo pipefail
-          install -d release/deploy/systemd
-          install -m 755 dist/quadball-timer release/quadball-timer
-          install -m 755 deploy/activate-release.sh release/deploy/activate-release.sh
-          install -m 644 deploy/systemd/quadball-timer.service release/deploy/systemd/quadball-timer.service
+          tar --create --gzip --file=release-bundle.tar.gz --directory=release .
+          test -s release-bundle.tar.gz
 
-      - name: Upload release artifact
+      - name: Upload one shared release artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: release-${{ github.sha }}
-          path: release
+          name: ${{ env.RELEASE_ARTIFACT }}
+          path: release-bundle.tar.gz
           if-no-files-found: error
           retention-days: 7
 
-  deploy:
+  deploy-test:
     if: github.ref == 'refs/heads/main'
-    needs: ci
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: test
+      url: https://test.timer.quadball.app
+    steps:
+      - name: Download shared release artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: ${{ needs.build.outputs.release-artifact }}
+          path: .
+
+      - name: Safely extract and verify release bundle modes
+        run: |
+          set -euo pipefail
+          archive="release-bundle.tar.gz"
+          install -d -m 700 release
+          while IFS= read -r member; do
+            case "$member" in
+              ./) ;;
+              ./*)
+                relative="${member#./}"
+                case "$relative" in
+                  ""|/*|../*|*/../*|*/..) echo "Unsafe archive member: ${member}" >&2; exit 1 ;;
+                esac
+                ;;
+              *) echo "Unsafe archive member: ${member}" >&2; exit 1 ;;
+            esac
+          done < <(tar --list --gzip --file="$archive")
+          tar --extract --gzip --file="$archive" --directory=release --no-same-owner
+          ! find release -type l -print -quit | grep -q .
+          test -x release/quadball-timer
+          test -x release/deploy/activate-test-release.sh
+          test -x release/deploy/activate-release.sh
+          test "$(stat -c '%a' release/quadball-timer)" = 555
+          test "$(stat -c '%a' release/deploy/activate-test-release.sh)" = 555
+          test "$(stat -c '%a' release/deploy/activate-release.sh)" = 555
+
+      - name: Configure temporary Test SSH material
+        env:
+          TEST_SSH_KEY: ${{ secrets.TEST_SSH_KEY }}
+          TEST_KNOWN_HOSTS: ${{ secrets.TEST_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          : "${TEST_SSH_KEY:?Missing TEST_SSH_KEY secret}"
+          : "${TEST_KNOWN_HOSTS:?Missing TEST_KNOWN_HOSTS secret}"
+          ssh_dir="${RUNNER_TEMP}/quadball-test-ssh-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          install -m 700 -d "$ssh_dir"
+          printf '%s\n' "$TEST_SSH_KEY" > "$ssh_dir/id_ed25519"
+          chmod 600 "$ssh_dir/id_ed25519"
+          printf '%s\n' "$TEST_KNOWN_HOSTS" > "$ssh_dir/known_hosts"
+          chmod 644 "$ssh_dir/known_hosts"
+          echo "SSH_DIR=$ssh_dir" >> "$GITHUB_ENV"
+
+      - name: Transfer and activate Test release
+        env:
+          DEPLOY_HOST: ${{ secrets.TEST_HOST }}
+          DEPLOY_USER: ${{ secrets.TEST_USER }}
+          DEPLOY_BASE: ${{ vars.TEST_DEPLOY_BASE }}
+        run: |
+          set -euo pipefail
+          : "${DEPLOY_HOST:?Missing TEST_HOST secret}"
+          : "${DEPLOY_USER:?Missing TEST_USER secret}"
+          base_dir="${DEPLOY_BASE:-/srv/quadball-timer-test}"
+          release_id="${RELEASE_ATTEMPT_ID}"
+          stage_dir="${base_dir}/.staging/${release_id}"
+          ssh_opts="-i ${SSH_DIR}/id_ed25519 -o StrictHostKeyChecking=yes -o UserKnownHostsFile=${SSH_DIR}/known_hosts"
+          cleanup_remote_stage() {
+            ssh $ssh_opts "${DEPLOY_USER}@${DEPLOY_HOST}" "chmod -R u+w -- '${stage_dir}' 2>/dev/null || true; rm -rf -- '${stage_dir}'" || true
+            rm -rf -- "$SSH_DIR"
+          }
+          trap cleanup_remote_stage EXIT
+          ssh $ssh_opts "${DEPLOY_USER}@${DEPLOY_HOST}" "test ! -e '${stage_dir}' && install -d -m 750 '${stage_dir}'"
+          rsync -a -e "ssh ${ssh_opts}" release/ "${DEPLOY_USER}@${DEPLOY_HOST}:${stage_dir}/"
+          ssh $ssh_opts "${DEPLOY_USER}@${DEPLOY_HOST}" "'${stage_dir}/deploy/activate-test-release.sh' --base-dir '${base_dir}' --staged-dir '${stage_dir}' --release '${release_id}'"
+
+  deploy-production:
+    if: github.ref == 'refs/heads/main'
+    needs: build
     runs-on: ubuntu-latest
     environment:
       name: production
       url: https://timer.quadball.app
     steps:
-      - name: Download release artifact
+      - name: Download shared release artifact
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
-          name: release-${{ github.sha }}
-          path: release
+          name: ${{ needs.build.outputs.release-artifact }}
+          path: .
 
-      - name: Configure SSH
+      - name: Safely extract and verify release bundle modes
+        run: |
+          set -euo pipefail
+          archive="release-bundle.tar.gz"
+          install -d -m 700 release
+          while IFS= read -r member; do
+            case "$member" in
+              ./) ;;
+              ./*)
+                relative="${member#./}"
+                case "$relative" in
+                  ""|/*|../*|*/../*|*/..) echo "Unsafe archive member: ${member}" >&2; exit 1 ;;
+                esac
+                ;;
+              *) echo "Unsafe archive member: ${member}" >&2; exit 1 ;;
+            esac
+          done < <(tar --list --gzip --file="$archive")
+          tar --extract --gzip --file="$archive" --directory=release --no-same-owner
+          ! find release -type l -print -quit | grep -q .
+          test -x release/quadball-timer
+          test -x release/deploy/activate-test-release.sh
+          test -x release/deploy/activate-release.sh
+          test "$(stat -c '%a' release/quadball-timer)" = 555
+          test "$(stat -c '%a' release/deploy/activate-test-release.sh)" = 555
+          test "$(stat -c '%a' release/deploy/activate-release.sh)" = 555
+
+      - name: Configure temporary Production SSH material
         env:
           PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
           PROD_KNOWN_HOSTS: ${{ secrets.PROD_KNOWN_HOSTS }}
@@ -87,36 +213,15 @@ jobs:
           set -euo pipefail
           : "${PROD_SSH_KEY:?Missing PROD_SSH_KEY secret}"
           : "${PROD_KNOWN_HOSTS:?Missing PROD_KNOWN_HOSTS secret}"
+          ssh_dir="${RUNNER_TEMP}/quadball-production-ssh-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          install -m 700 -d "$ssh_dir"
+          printf '%s\n' "$PROD_SSH_KEY" > "$ssh_dir/id_ed25519"
+          chmod 600 "$ssh_dir/id_ed25519"
+          printf '%s\n' "$PROD_KNOWN_HOSTS" > "$ssh_dir/known_hosts"
+          chmod 644 "$ssh_dir/known_hosts"
+          echo "SSH_DIR=$ssh_dir" >> "$GITHUB_ENV"
 
-          install -m 700 -d ~/.ssh
-          printf '%s\n' "$PROD_SSH_KEY" > ~/.ssh/id_ed25519
-          chmod 600 ~/.ssh/id_ed25519
-          printf '%s\n' "$PROD_KNOWN_HOSTS" > ~/.ssh/known_hosts
-          chmod 644 ~/.ssh/known_hosts
-
-      - name: Sync release to server
-        env:
-          DEPLOY_HOST: ${{ secrets.PROD_HOST }}
-          DEPLOY_USER: ${{ secrets.PROD_USER }}
-          DEPLOY_BASE: ${{ vars.PROD_DEPLOY_BASE }}
-        run: |
-          set -euo pipefail
-          : "${DEPLOY_HOST:?Missing PROD_HOST secret}"
-          : "${DEPLOY_USER:?Missing PROD_USER secret}"
-
-          base_dir="${DEPLOY_BASE:-/srv/quadball-timer}"
-          release_id="${GITHUB_SHA}"
-          remote_release_dir="${base_dir}/releases/${release_id}"
-          ssh_opts="-i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=yes"
-
-          ssh $ssh_opts "${DEPLOY_USER}@${DEPLOY_HOST}" "mkdir -p '${remote_release_dir}'"
-
-          rsync -az --delete \
-            -e "ssh $ssh_opts" \
-            release/ \
-            "${DEPLOY_USER}@${DEPLOY_HOST}:${remote_release_dir}/"
-
-      - name: Activate release
+      - name: Transfer and activate Production release
         env:
           DEPLOY_HOST: ${{ secrets.PROD_HOST }}
           DEPLOY_USER: ${{ secrets.PROD_USER }}
@@ -127,23 +232,32 @@ jobs:
           set -euo pipefail
           : "${DEPLOY_HOST:?Missing PROD_HOST secret}"
           : "${DEPLOY_USER:?Missing PROD_USER secret}"
-
           base_dir="${DEPLOY_BASE:-/srv/quadball-timer}"
           service_name="${PROD_SERVICE_NAME:-quadball-timer}"
           app_port="${PROD_APP_PORT:-3000}"
-          release_id="${GITHUB_SHA}"
-          remote_release_dir="${base_dir}/releases/${release_id}"
-          ssh_opts="-i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=yes"
+          release_id="${RELEASE_ATTEMPT_ID}"
+          stage_dir="${base_dir}/.staging/${release_id}"
+          ssh_opts="-i ${SSH_DIR}/id_ed25519 -o StrictHostKeyChecking=yes -o UserKnownHostsFile=${SSH_DIR}/known_hosts"
+          cleanup_remote_stage() {
+            ssh $ssh_opts "${DEPLOY_USER}@${DEPLOY_HOST}" "chmod -R u+w -- '${stage_dir}' 2>/dev/null || true; rm -rf -- '${stage_dir}'" || true
+            rm -rf -- "$SSH_DIR"
+          }
+          trap cleanup_remote_stage EXIT
+          ssh $ssh_opts "${DEPLOY_USER}@${DEPLOY_HOST}" "test ! -e '${stage_dir}' && install -d -m 750 '${stage_dir}'"
+          rsync -a -e "ssh ${ssh_opts}" release/ "${DEPLOY_USER}@${DEPLOY_HOST}:${stage_dir}/"
+          ssh $ssh_opts "${DEPLOY_USER}@${DEPLOY_HOST}" "'${stage_dir}/deploy/activate-release.sh' --base-dir '${base_dir}' --staged-dir '${stage_dir}' --release '${release_id}' --service '${service_name}' --port '${app_port}'"
+          curl --fail --silent --show-error --max-time 10 https://timer.quadball.app/ | grep -qi "<!doctype html"
 
-          ssh $ssh_opts "${DEPLOY_USER}@${DEPLOY_HOST}" "\
-            chmod +x '${remote_release_dir}/deploy/activate-release.sh' '${remote_release_dir}/quadball-timer' && \
-            '${remote_release_dir}/deploy/activate-release.sh' \
-              --base-dir '${base_dir}' \
-              --release '${release_id}' \
-              --service '${service_name}' \
-              --port '${app_port}'"
-
-      - name: Public smoke test
+  report:
+    if: always() && github.ref == 'refs/heads/main'
+    needs: [deploy-test, deploy-production]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report both independent environment outcomes
         run: |
           set -euo pipefail
-          curl --fail --silent --show-error --max-time 10 https://timer.quadball.app/ | grep -qi "<!doctype html"
+          echo "Test deployment: ${{ needs.deploy-test.result }}"
+          echo "Production deployment: ${{ needs.deploy-production.result }}"
+          if [[ "${{ needs.deploy-test.result }}" != "success" || "${{ needs.deploy-production.result }}" != "success" ]]; then
+            exit 1
+          fi

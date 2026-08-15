@@ -57,6 +57,7 @@ import {
   type AdHocGameView,
   type AdHocGamesService,
 } from "@/lib/ad-hoc-games";
+import { readBuiltRuntimeIdentity, readRunningReleaseIdentity } from "@/lib/release-identity";
 
 type SessionSubscription =
   | {
@@ -84,6 +85,11 @@ const defaultAdHocService = createAdHocGamesService();
 const probeInvocation = parseSqliteProbeInvocation(process.argv.slice(1));
 
 async function main() {
+  if (process.argv.includes("--release-runtime-identity")) {
+    console.log(JSON.stringify(readBuiltRuntimeIdentity()));
+    return;
+  }
+
   if (probeInvocation.kind === "invalid") {
     console.error(probeInvocation.error);
     process.exitCode = 1;
@@ -751,6 +757,31 @@ async function startServer() {
             }
 
             return json({ ok: true });
+          },
+        },
+        "/internal/release": {
+          async GET(req: Request) {
+            if (!isInternalHealthHost(req.headers.get("host"))) {
+              return json({ error: "Not found." }, 404);
+            }
+
+            try {
+              const identity = await readRunningReleaseIdentity();
+              return json({
+                releaseAttemptId: identity.releaseAttemptId,
+                sourceCommit: identity.sourceCommit,
+                workflowRunId: identity.workflowRunId,
+                workflowAttempt: identity.workflowAttempt,
+                executableSha256: identity.executableSha256,
+                runningExecutableSha256: identity.runningExecutableSha256,
+                bunVersion: identity.bunVersion,
+                bunRevision: identity.bunRevision,
+                sqliteVersion: identity.sqliteVersion,
+                schemaCompatibility: identity.schemaCompatibility,
+              });
+            } catch {
+              return json({ error: "Release identity unavailable." }, 503);
+            }
           },
         },
         "/game/:gameId": htmlRoute,
