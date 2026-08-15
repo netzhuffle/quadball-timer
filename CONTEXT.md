@@ -318,8 +318,12 @@ A controller-only, disposable game created without an account or Event Grant for
 _Avoid_: Game from scratch, unassigned game
 
 **Ad Hoc Controller**:
-A participant admitted through an unfinished Ad Hoc Game's Control QR. All Ad Hoc Controllers for the Game have equal authority; its creator is not an owner or primary Controller, and an admitted browser retains its authority across ordinary browser and server restarts until it explicitly leaves or capacity cleanup removes the Game.
+A participant admitted through an unfinished Ad Hoc Game's Control QR. All Ad Hoc Controllers for the Game have equal authority; its creator is not an owner or primary Controller, and an admitted browser retains its authority across ordinary browser and server restarts until its Controller Leave Grace Period expires or capacity cleanup removes the Game.
 _Avoid_: Ad Hoc Game owner, creator role, primary Controller
+
+**Controller Leave Grace Period**:
+The five-minute interval after a Controller leaves an Ad Hoc Game or Event Game during which the departing browser can resume its most recently left control authority from Home, subject to the Game's current authority rules. The opportunity survives an ordinary browser restart, replaces any earlier Leave Grace Period for that browser, and makes the departure final only when it expires.
+_Avoid_: Undo leave, logout timeout, session expiry
 
 **Ad Hoc Control QR**:
 A reusable, non-rotatable, high-entropy capability QR that any Ad Hoc Controller may display while the Game is unfinished to admit another Ad Hoc Controller without an account, Event Grant, or claimed identity. Finishing the Game stops display and new admission but does not revoke existing Ad Hoc Controllers; correcting it back to unfinished enables the same QR again.
