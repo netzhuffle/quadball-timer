@@ -212,6 +212,11 @@ _Avoid_: Pitch Manager account
 A team registered within an event, with an Event Admin-managed name and default color. Its name remains fixed during a game, while its Displayed Team Color and Pitch Orientation may change without changing its identity.
 _Avoid_: Home team, away team
 
+**Event Team Roster**:
+An Event Admin-managed mapping from each player number used by an Event Team to that player's public name, intended for public Game Timeline display rather than accounts, eligibility decisions, or individual authority.
+A game event may use an unmapped player number without being blocked; public output then shows the number alone, and later roster additions or corrections retroactively relabel that Event Team and number's Game Timeline events.
+_Avoid_: User directory, private roster, player account
+
 **Game Side**:
 One of the two stable participant positions within an Event Game. Game Facts remain attached to the Game Side; correcting its assigned Event Team changes how the whole record is identified without moving or rewriting those facts.
 _Avoid_: Home team, away team, display side, physical end
@@ -269,7 +274,7 @@ Automatic removal when creating an Ad Hoc Game would exceed the 50-Game capacity
 _Avoid_: Manual removal, finished-game cleanup, retention expiry
 
 **Game Timeline**:
-The spectator-visible history of sporting events, such as goals and cards, ordered by their game time and updated when a correction changes the record.
+The spectator-visible complete history of effective game events, ordered newest-first by game time and updated when a Correction changes the record. Player names, player numbers, Penalty Reasons, and other game-event details are intentionally public; correction provenance and Audit Trail evidence remain private.
 _Avoid_: Audit log, command log
 
 **Game Commencement**:
