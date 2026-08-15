@@ -47,6 +47,7 @@ export type TypedGrantAdmission =
       eventGameId: string | null;
       grantSessionId: string;
       sessionBearer: string;
+      replayProvenanceProof: string;
       sessionExpiresAtMs?: number | null;
     }
   | typeof GENERIC_GRANT_ADMISSION_FAILURE;
@@ -89,6 +90,7 @@ export type TypedGrantAuthorization =
       scope: GrantScope;
       eventGameId: string | null;
       grantSessionId: string;
+      replayProvenanceProof: string;
       sessionExpiresAtMs?: number | null;
     }
   | {
@@ -98,6 +100,7 @@ export type TypedGrantAuthorization =
       grantType: "control";
       scope: ControlGrantScope;
       grantSessionId: string;
+      replayProvenanceProof: string;
       previousEventGameId: string;
       currentEventGameId: string;
     }
@@ -109,6 +112,7 @@ export type TypedControlGrantSwitch =
       grantId: string;
       grantVersion: string;
       grantSessionId: string;
+      replayProvenanceProof: string;
       previousEventGameId: string;
       eventGameId: string;
       sessionExpiresAtMs?: number | null;
@@ -122,6 +126,7 @@ export type TypedGrantReplayAuthorization =
       grantVersion: string;
       grantSessionId: string;
       originatingSessionId: string;
+      originatingGrantVersion: string;
       eventGameId: string;
       replayEvidenceId: string;
     }
@@ -255,6 +260,7 @@ export type TypedGrantAuthority = {
   authorizeControlGrantReplay(input: {
     sessionBearer: string;
     originatingSessionId: string;
+    originatingSessionProof?: string;
     eventGameId: string;
     replayEvidenceId: string;
   }): Promise<TypedGrantReplayAuthorization>;

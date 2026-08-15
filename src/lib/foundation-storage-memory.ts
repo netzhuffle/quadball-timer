@@ -79,6 +79,16 @@ import {
   type GrantStateValidationContext,
 } from "@/lib/grant-state-validation";
 import { bindGrantAuditChain } from "@/lib/grant-audit-chain";
+import {
+  presentationEvidenceFailure,
+  presentationIntegrityAnchorFor,
+  type PresentationIntegrityAnchor,
+} from "@/lib/presentation-integrity";
+import type {
+  StoredGamePresentationAuditEntry,
+  StoredGamePresentationAuditRevision,
+  StoredGamePresentationChange,
+} from "@/lib/game-presentation";
 
 type MemoryState = {
   roots: Map<string, StoredEventGameRecordRoot>;
@@ -86,6 +96,9 @@ type MemoryState = {
   idempotency: Map<string, Map<string, StoredControlIdempotencyEntry>>;
   metadata: Map<string, StoredEventGameRecordMetadata>;
   controlAudits: Map<string, Map<string, StoredControlAuditEntry>>;
+  presentationChanges: Map<string, Map<string, StoredGamePresentationChange>>;
+  presentationAudits: Map<string, Map<string, StoredGamePresentationAuditEntry>>;
+  presentationIntegrityAnchors: Map<string, PresentationIntegrityAnchor[]>;
   actionProvenance: Map<string, Map<string, "current" | "legacy">>;
   auditProvenance: Map<string, Map<string, "current" | "legacy">>;
   grants: Map<string, StoredGrant>;
@@ -132,6 +145,9 @@ class InMemoryFoundationStorage implements FoundationStorage {
     idempotency: new Map(),
     metadata: new Map(),
     controlAudits: new Map(),
+    presentationChanges: new Map(),
+    presentationAudits: new Map(),
+    presentationIntegrityAnchors: new Map(),
     actionProvenance: new Map(),
     auditProvenance: new Map(),
     grants: new Map(),
@@ -179,6 +195,18 @@ class InMemoryFoundationStorage implements FoundationStorage {
           storage: "memory",
         });
       }
+      const presentationFailure = presentationStorageFailure(
+        this.state,
+        this.grantValidationContext.keyRing,
+      );
+      if (presentationFailure !== null) {
+        throw new FoundationStorageNotReadyError({
+          ok: false,
+          status: "integrity-failure",
+          detail: presentationFailure,
+          storage: "memory",
+        });
+      }
       const grantFailure = this.grantStateFailure();
       if (grantFailure !== null) {
         throw new FoundationStorageNotReadyError({
@@ -198,6 +226,18 @@ class InMemoryFoundationStorage implements FoundationStorage {
         );
         if (isThenable(result)) {
           throw new TypeError("Foundation storage transactions must complete synchronously.");
+        }
+        const presentationFailure = presentationStorageFailure(
+          this.state,
+          this.grantValidationContext.keyRing,
+        );
+        if (presentationFailure !== null) {
+          throw new FoundationStorageNotReadyError({
+            ok: false,
+            status: "integrity-failure",
+            detail: presentationFailure,
+            storage: "memory",
+          });
         }
         const semanticFailure = validateGrantState(
           this.state.grants.values(),
@@ -421,6 +461,18 @@ class InMemoryFoundationStorage implements FoundationStorage {
           ok: false,
           status: "integrity-failure",
           detail: acceptanceFailure,
+          storage: "memory",
+        } satisfies FoundationStorageReadiness;
+      }
+      const presentationFailure = presentationStorageFailure(
+        this.state,
+        this.grantValidationContext.keyRing,
+      );
+      if (presentationFailure !== null) {
+        return {
+          ok: false,
+          status: "integrity-failure",
+          detail: presentationFailure,
           storage: "memory",
         } satisfies FoundationStorageReadiness;
       }
@@ -1007,6 +1059,37 @@ function hasCurrentIntegrityAnchor(
   );
 }
 
+function presentationStorageFailure(
+  state: MemoryState,
+  keyRing: GrantKeyRing | undefined,
+): string | null {
+  const recordIds = new Set([
+    ...state.presentationChanges.keys(),
+    ...state.presentationAudits.keys(),
+    ...state.presentationIntegrityAnchors.keys(),
+  ]);
+  for (const recordId of recordIds) {
+    const changes = [...(state.presentationChanges.get(recordId)?.values() ?? [])];
+    const audits = [...(state.presentationAudits.get(recordId)?.values() ?? [])];
+    const anchors = state.presentationIntegrityAnchors.get(recordId) ?? [];
+    const failure = presentationEvidenceFailure({
+      root: state.roots.get(recordId)?.root ?? null,
+      changes,
+      audits,
+      anchors,
+      sessions: [...state.sessions.values()],
+      actionOperationIds: new Set(
+        [...(state.actions.get(recordId)?.values() ?? [])].map(
+          (action) => action.action.operationId,
+        ),
+      ),
+      keyRing,
+    });
+    if (failure !== null) return failure;
+  }
+  return null;
+}
+
 function createTransaction(
   state: MemoryState,
   undo: (() => void)[],
@@ -1058,6 +1141,27 @@ function createTransaction(
     },
     listAuditEntries(recordId) {
       return cloneAudits(state.controlAudits.get(recordId), state.auditProvenance.get(recordId));
+    },
+    findPresentationChangeByOperationId(recordId, operationId) {
+      const change = state.presentationChanges.get(recordId)?.get(operationId);
+      return change === undefined ? null : structuredClone(change);
+    },
+    listPresentationChanges(recordId) {
+      return [...(state.presentationChanges.get(recordId)?.values() ?? [])]
+        .sort(
+          (left, right) =>
+            left.acceptedAtMs - right.acceptedAtMs ||
+            left.operationId.localeCompare(right.operationId),
+        )
+        .map((change) => structuredClone(change));
+    },
+    listPresentationAuditEntries(recordId) {
+      return [...(state.presentationAudits.get(recordId)?.values() ?? [])]
+        .sort(
+          (left, right) =>
+            left.createdAtMs - right.createdAtMs || left.auditId.localeCompare(right.auditId),
+        )
+        .map((audit) => structuredClone(audit));
     },
     findEvent(eventId) {
       const event = state.events.get(eventId);
@@ -1661,6 +1765,69 @@ function createTransaction(
       provenance.set(entry.auditId, "current");
       undo.push(() => provenance?.delete(entry.auditId));
       undo.push(() => audits?.delete(entry.auditId));
+    },
+    insertPresentationChange(change) {
+      if (!state.roots.has(change.recordId))
+        throw new FoundationStorageConstraintError("record-id");
+      let changes = state.presentationChanges.get(change.recordId);
+      if (changes === undefined) {
+        changes = new Map();
+        state.presentationChanges.set(change.recordId, changes);
+        undo.push(() => state.presentationChanges.delete(change.recordId));
+      }
+      if (changes.has(change.operationId))
+        throw new FoundationStorageConstraintError("operation-id");
+      if (
+        [...changes.values()].some(
+          (candidate) => candidate.presentationChangeId === change.presentationChangeId,
+        )
+      )
+        throw new FoundationStorageConstraintError("presentation-change-id");
+      changes.set(change.operationId, structuredClone(change));
+      undo.push(() => changes?.delete(change.operationId));
+    },
+    appendPresentationAuditEntry(entry) {
+      if (!state.roots.has(entry.recordId)) throw new FoundationStorageConstraintError("record-id");
+      let audits = state.presentationAudits.get(entry.recordId);
+      if (audits === undefined) {
+        audits = new Map();
+        state.presentationAudits.set(entry.recordId, audits);
+        undo.push(() => state.presentationAudits.delete(entry.recordId));
+      }
+      if (audits.has(entry.auditId)) throw new FoundationStorageConstraintError("audit-id");
+      audits.set(entry.auditId, structuredClone(entry));
+      undo.push(() => audits?.delete(entry.auditId));
+    },
+    appendPresentationAuditRevision(entry: StoredGamePresentationAuditRevision) {
+      if (entry.supersedesAuditId === entry.auditId)
+        throw new FoundationStorageConstraintError("audit-id");
+      if (!state.roots.has(entry.recordId)) throw new FoundationStorageConstraintError("record-id");
+      let audits = state.presentationAudits.get(entry.recordId);
+      if (audits === undefined) {
+        audits = new Map();
+        state.presentationAudits.set(entry.recordId, audits);
+        undo.push(() => state.presentationAudits.delete(entry.recordId));
+      }
+      if (audits.has(entry.auditId)) throw new FoundationStorageConstraintError("audit-id");
+      audits.set(entry.auditId, structuredClone(entry));
+      undo.push(() => audits?.delete(entry.auditId));
+    },
+    sealPresentationEvidence(recordId) {
+      if (keyRing === undefined)
+        throw new Error("Presentation evidence key material is unavailable.");
+      const changes = [...(state.presentationChanges.get(recordId)?.values() ?? [])];
+      const audits = [...(state.presentationAudits.get(recordId)?.values() ?? [])];
+      const previous = state.presentationIntegrityAnchors.get(recordId) ?? [];
+      const anchor = presentationIntegrityAnchorFor(
+        { recordId, changes, audits },
+        previous.length + 1,
+        keyRing,
+      );
+      state.presentationIntegrityAnchors.set(recordId, [...previous, anchor]);
+      undo.push(() => {
+        if (previous.length === 0) state.presentationIntegrityAnchors.delete(recordId);
+        else state.presentationIntegrityAnchors.set(recordId, previous);
+      });
     },
     findGrantById(grantId) {
       const grant = state.grants.get(grantId);

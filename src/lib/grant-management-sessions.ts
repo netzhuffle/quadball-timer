@@ -2,6 +2,7 @@ import {
   computeBrowserContextDigest,
   computeSessionVerifier,
   createRandomIdentifier,
+  listLookupKeyVersions,
 } from "@/lib/grant-crypto";
 import type { FoundationStorage, FoundationStorageTransaction } from "@/lib/foundation-storage";
 import type { GrantAuthorityOptions } from "@/lib/grant-authority";
@@ -185,6 +186,7 @@ export async function admitGrant(
         eventGameId,
         grantSessionId: session.sessionId,
         sessionBearer: bearer,
+        replayProvenanceProof: session.bearerLookupVerifier!,
         sessionExpiresAtMs: sessionExpiresAtMsForGrant(current, nowMs),
       };
     });
@@ -306,6 +308,7 @@ export function authorizeGrantInTransaction(
           grantType: GRANT_TYPE,
           scope: structuredClone(grant.scope as ControlGrantScope),
           grantSessionId: session.sessionId,
+          replayProvenanceProof: session.bearerLookupVerifier!,
           previousEventGameId: relationship.previousEventGameId,
           currentEventGameId: relationship.currentEventGameId,
         } satisfies TypedGrantAuthorization;
@@ -333,6 +336,7 @@ export function authorizeGrantInTransaction(
     scope: structuredClone(grant.scope),
     eventGameId,
     grantSessionId: session.sessionId,
+    replayProvenanceProof: session.bearerLookupVerifier!,
     sessionExpiresAtMs:
       grant.grantType === EVENT_ADMIN_GRANT_TYPE
         ? Math.min(
@@ -404,6 +408,7 @@ export async function acceptControlGrantSessionSwitch(
         grantId: grant.grantId,
         grantVersion: grant.grantVersion,
         grantSessionId: session.sessionId,
+        replayProvenanceProof: session.bearerLookupVerifier!,
         previousEventGameId: relationship.previousEventGameId,
         eventGameId: relationship.currentEventGameId,
         ...(grant.expiresAtMs === null ? {} : { sessionExpiresAtMs: grant.expiresAtMs }),
@@ -540,12 +545,14 @@ export async function authorizeControlGrantReplay(
   input: {
     sessionBearer: string;
     originatingSessionId: string;
+    originatingSessionProof?: string;
     eventGameId: string;
     replayEvidenceId: string;
   },
 ): Promise<TypedGrantReplayAuthorization> {
   if (
     !isValidGrantSecret(input.sessionBearer) ||
+    !isValidGrantSecret(input.originatingSessionProof ?? "") ||
     !validateOpaqueIdentifier(input.originatingSessionId, "originatingSessionId").ok ||
     !validateOpaqueIdentifier(input.eventGameId, "eventGameId").ok ||
     !validateOpaqueIdentifier(input.replayEvidenceId, "replayEvidenceId").ok
@@ -574,11 +581,15 @@ export async function authorizeControlGrantReplay(
       if (replay === undefined) return GENERIC_GRANT_AUTHORIZATION_FAILURE;
       if (replay.status !== "eligible" || replay.eventGameId !== input.eventGameId)
         return GENERIC_GRANT_AUTHORIZATION_FAILURE;
-      const originating = transaction
-        .listGrantSessions(grant.grantId)
-        .find((candidate) => candidate.sessionId === input.originatingSessionId);
+      const originating = listLookupKeyVersions(options.keyRing).reduce<StoredGrantSession | null>(
+        (found, keyVersion) =>
+          found ??
+          transaction.findSessionByBearerVerifier(input.originatingSessionProof ?? "", keyVersion),
+        null,
+      );
       if (
-        originating === undefined ||
+        originating === null ||
+        originating.sessionId !== input.originatingSessionId ||
         originating.sessionId === replacement.sessionId ||
         originating.status === "active" ||
         originating.grantId !== grant.grantId ||
@@ -630,6 +641,7 @@ export async function authorizeControlGrantReplay(
         grantVersion: grant.grantVersion,
         grantSessionId: replacement.sessionId,
         originatingSessionId: originating.sessionId,
+        originatingGrantVersion: originating.grantVersion,
         eventGameId: input.eventGameId,
         replayEvidenceId: input.replayEvidenceId,
       } satisfies TypedGrantReplayAuthorization;

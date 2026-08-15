@@ -364,6 +364,7 @@ describe("focused SQLite Grant authority boundary", () => {
         await authority.authorizeControlGrantReplay({
           sessionBearer: replacement.sessionBearer,
           originatingSessionId: replacement.grantSessionId,
+          originatingSessionProof: replacement.replayProvenanceProof,
           eventGameId: "game-1",
           replayEvidenceId: "replay-sqlite",
         }),
@@ -372,6 +373,7 @@ describe("focused SQLite Grant authority boundary", () => {
         await authority.authorizeControlGrantReplay({
           sessionBearer: replacement.sessionBearer,
           originatingSessionId: origin.grantSessionId,
+          originatingSessionProof: origin.replayProvenanceProof,
           eventGameId: "game-1",
           replayEvidenceId: "replay-sqlite",
         }),
@@ -381,6 +383,7 @@ describe("focused SQLite Grant authority boundary", () => {
         await authority.authorizeControlGrantReplay({
           sessionBearer: replacement.sessionBearer,
           originatingSessionId: origin.grantSessionId,
+          originatingSessionProof: origin.replayProvenanceProof,
           eventGameId: "game-1",
           replayEvidenceId: "replay-sqlite",
         }),
@@ -652,6 +655,11 @@ describe("focused SQLite Grant authority boundary", () => {
           "020-grant-codes-and-admission-telemetry",
           "021-grant-code-game-lock-erasure-evidence",
           "022-control-session-stay-binding",
+          "023-event-teams-rosters-and-pitches",
+          "024-event-schedule-slots-and-games",
+          "025-event-publication-status",
+          "026-event-schedule-expected-delays-and-conflicts",
+          "027-event-game-presentation-integrity",
         ]);
         expect(await current.readiness()).toMatchObject({
           ok: true,

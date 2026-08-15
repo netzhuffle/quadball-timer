@@ -44,6 +44,16 @@ import {
 } from "@/lib/event-game-actions";
 import { validateIdempotencyHistory } from "@/lib/event-game-record-helpers";
 import {
+  presentationEvidenceFailure,
+  presentationIntegrityAnchorFor,
+  type PresentationIntegrityAnchor,
+} from "@/lib/presentation-integrity";
+import type {
+  StoredGamePresentationAuditEntry,
+  StoredGamePresentationAuditRevision,
+  StoredGamePresentationChange,
+} from "@/lib/game-presentation";
+import {
   assessMigrationReadiness,
   FOUNDATION_MIGRATION_LEDGER_SQL,
   FOUNDATION_MIGRATIONS,
@@ -198,6 +208,36 @@ function readBudget(value: unknown): StoredAcceptanceBudget | null {
     updatedAtMs: Number(row.updated_at_ms),
     stateRevision: Number(row.state_revision),
   };
+}
+
+function readPresentationChange(value: unknown): StoredGamePresentationChange {
+  const row = value as Record<string, unknown>;
+  return {
+    recordId: String(row.record_id),
+    eventGameId: String(row.event_game_id),
+    operationId: String(row.operation_id),
+    presentationChangeId: String(row.presentation_change_id),
+    change: JSON.parse(String(row.change_json)) as StoredGamePresentationChange["change"],
+    causalPredecessorIds: JSON.parse(String(row.causal_predecessor_ids_json)) as string[],
+    occurrence: JSON.parse(
+      String(row.occurrence_json),
+    ) as StoredGamePresentationChange["occurrence"],
+    grant: JSON.parse(String(row.grant_json)) as StoredGamePresentationChange["grant"],
+    acceptedAtMs: Number(row.accepted_at_ms),
+    canonicalContent: String(row.canonical_content),
+    contentFingerprint: String(row.content_fingerprint),
+  };
+}
+
+function readPresentationAudit(value: unknown): StoredGamePresentationAuditEntry {
+  const row = value as Record<string, unknown>;
+  const audit = JSON.parse(String(row.audit_json)) as StoredGamePresentationAuditEntry;
+  if (row.supersedes_audit_id === null || row.supersedes_audit_id === undefined) {
+    delete audit.supersedesAuditId;
+  } else {
+    audit.supersedesAuditId = readText(row.supersedes_audit_id);
+  }
+  return audit;
 }
 
 function readReservation(value: unknown): StoredReplayReservation | null {
@@ -418,6 +458,13 @@ type RootStatements = {
   auditByRecordId: SqlStatement;
   idempotencyByRecordId: SqlStatement;
   insertAudit: SqlStatement;
+  presentationChangeByOperationId: SqlStatement;
+  presentationChangesByRecordId: SqlStatement;
+  insertPresentationChange: SqlStatement;
+  presentationAuditsByRecordId: SqlStatement;
+  insertPresentationAudit: SqlStatement;
+  presentationIntegrityByRecordId: SqlStatement;
+  insertPresentationIntegrity: SqlStatement;
   insertEvidenceProvenance: SqlStatement;
   budgetById: SqlStatement;
   upsertBudget: SqlStatement;
@@ -678,6 +725,15 @@ export class SqliteFoundationStorage implements FoundationStorage {
         const result = work(this.createTransaction());
         if (isThenable(result)) {
           throw new TypeError("Foundation storage transactions must complete synchronously.");
+        }
+        const presentationFailure = this.verifyPresentationEvidence();
+        if (presentationFailure !== null) {
+          throw new FoundationStorageNotReadyError({
+            ok: false,
+            status: "integrity-failure",
+            detail: presentationFailure,
+            storage: "sqlite",
+          });
         }
         scanGrantState(this.database, this.grantValidationContext);
         const keyRing = this.grantValidationContext.keyRing;
@@ -1163,6 +1219,14 @@ export class SqliteFoundationStorage implements FoundationStorage {
       },
       listAuditEntries: (recordId) =>
         this.readAuditByRecordId(statements.auditByRecordId, recordId),
+      findPresentationChangeByOperationId: (recordId, operationId) => {
+        const row = statements.presentationChangeByOperationId.get(recordId, operationId);
+        return row === null ? null : readPresentationChange(row);
+      },
+      listPresentationChanges: (recordId) =>
+        statements.presentationChangesByRecordId.all(recordId).map(readPresentationChange),
+      listPresentationAuditEntries: (recordId) =>
+        statements.presentationAuditsByRecordId.all(recordId).map(readPresentationAudit),
       findEvent: (eventId) => readEvent(statements.eventById.get(eventId)),
       listEvents: () =>
         statements.allEvents
@@ -1210,6 +1274,11 @@ export class SqliteFoundationStorage implements FoundationStorage {
       insertAction: (storedAction) => this.insertAction(statements, storedAction),
       upsertRecordMetadata: (metadata) => this.upsertRecordMetadata(statements, metadata),
       appendAuditEntry: (entry) => this.appendAuditEntry(statements, entry),
+      insertPresentationChange: (change) => this.insertPresentationChange(statements, change),
+      appendPresentationAuditEntry: (entry) => this.appendPresentationAuditEntry(statements, entry),
+      appendPresentationAuditRevision: (entry) =>
+        this.appendPresentationAuditRevision(statements, entry),
+      sealPresentationEvidence: (recordId) => this.sealPresentationEvidence(statements, recordId),
       findGrantById: (grantId) =>
         readGrantByStatement(this.getGrantStatements().byGrantId, grantId),
       listGrants: () => listGrants(this.getGrantStatements().allGrants),
@@ -1711,6 +1780,78 @@ export class SqliteFoundationStorage implements FoundationStorage {
     statements.insertEvidenceProvenance.run("audit", entry.auditId);
   }
 
+  private insertPresentationChange(
+    statements: RootStatements,
+    change: StoredGamePresentationChange,
+  ): void {
+    statements.insertPresentationChange.run(
+      change.recordId,
+      change.eventGameId,
+      change.operationId,
+      change.presentationChangeId,
+      JSON.stringify(change.change),
+      JSON.stringify(change.causalPredecessorIds),
+      JSON.stringify(change.occurrence),
+      JSON.stringify(change.grant),
+      change.acceptedAtMs,
+      change.canonicalContent,
+      change.contentFingerprint,
+    );
+  }
+
+  private appendPresentationAuditEntry(
+    statements: RootStatements,
+    entry: StoredGamePresentationAuditEntry,
+  ): void {
+    statements.insertPresentationAudit.run(
+      entry.auditId,
+      entry.recordId,
+      entry.eventGameId,
+      entry.operationId,
+      entry.presentationChangeId,
+      entry.kind,
+      entry.outcome,
+      entry.createdAtMs,
+      entry.redactedDetail,
+      entry.change === null ? null : JSON.stringify(entry.change),
+      entry.grant === null ? null : JSON.stringify(entry.grant),
+      entry.supersedesAuditId ?? null,
+      JSON.stringify(entry),
+    );
+  }
+
+  private appendPresentationAuditRevision(
+    statements: RootStatements,
+    entry: StoredGamePresentationAuditRevision,
+  ): void {
+    this.appendPresentationAuditEntry(statements, entry);
+  }
+
+  private sealPresentationEvidence(statements: RootStatements, recordId: string): void {
+    const keyRing = this.grantValidationContext.keyRing;
+    if (keyRing === undefined)
+      throw new Error("Presentation evidence key material is unavailable.");
+    const changes = statements.presentationChangesByRecordId
+      .all(recordId)
+      .map(readPresentationChange);
+    const audits = statements.presentationAuditsByRecordId.all(recordId).map(readPresentationAudit);
+    const anchors = statements.presentationIntegrityByRecordId.all(recordId) as Array<
+      Record<string, unknown>
+    >;
+    const anchor = presentationIntegrityAnchorFor(
+      { recordId, changes, audits },
+      anchors.length + 1,
+      keyRing,
+    );
+    statements.insertPresentationIntegrity.run(
+      anchor.recordId,
+      anchor.stateRevision,
+      anchor.keyVersion,
+      anchor.canonicalValue,
+      anchor.integrityTag,
+    );
+  }
+
   private readRootByStatement(
     statement: SqlStatement,
     ...parameters: string[]
@@ -1861,6 +2002,49 @@ export class SqliteFoundationStorage implements FoundationStorage {
                created_at_ms, redacted_detail, audit_json, audit_version,
                audit_evidence_format
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `),
+      presentationChangeByOperationId: this.database.query(`
+        SELECT record_id, event_game_id, operation_id, presentation_change_id,
+               change_json, causal_predecessor_ids_json, occurrence_json, grant_json,
+               accepted_at_ms, canonical_content, content_fingerprint
+        FROM foundation_event_game_presentation_changes
+        WHERE record_id = ? AND operation_id = ?
+      `),
+      presentationChangesByRecordId: this.database.query(`
+        SELECT record_id, event_game_id, operation_id, presentation_change_id,
+               change_json, causal_predecessor_ids_json, occurrence_json, grant_json,
+               accepted_at_ms, canonical_content, content_fingerprint
+        FROM foundation_event_game_presentation_changes
+        WHERE record_id = ? ORDER BY rowid
+      `),
+      insertPresentationChange: this.database.query(`
+        INSERT INTO foundation_event_game_presentation_changes (
+          record_id, event_game_id, operation_id, presentation_change_id, change_json,
+          causal_predecessor_ids_json, occurrence_json, grant_json, accepted_at_ms,
+          canonical_content, content_fingerprint
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `),
+      presentationAuditsByRecordId: this.database.query(`
+        SELECT audit_json, supersedes_audit_id
+        FROM foundation_event_game_presentation_audit
+        WHERE record_id = ? ORDER BY rowid
+      `),
+      insertPresentationAudit: this.database.query(`
+        INSERT INTO foundation_event_game_presentation_audit (
+          audit_id, record_id, event_game_id, operation_id, presentation_change_id,
+          audit_kind, outcome, created_at_ms, redacted_detail, change_json, grant_json,
+          supersedes_audit_id, audit_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `),
+      presentationIntegrityByRecordId: this.database.query(`
+        SELECT record_id, state_revision, key_version, canonical_value, integrity_tag
+        FROM foundation_event_game_presentation_integrity
+        WHERE record_id = ? ORDER BY state_revision
+      `),
+      insertPresentationIntegrity: this.database.query(`
+        INSERT INTO foundation_event_game_presentation_integrity
+          (record_id, state_revision, key_version, canonical_value, integrity_tag)
+        VALUES (?, ?, ?, ?, ?)
       `),
       insertEvidenceProvenance: this.database.query(`
         INSERT INTO foundation_control_evidence_provenance
@@ -2283,6 +2467,16 @@ export class SqliteFoundationStorage implements FoundationStorage {
       if (!schemaVerification.ok) {
         return { ...schemaVerification, storage: "sqlite", evidence };
       }
+      const presentationFailure = this.verifyPresentationEvidence();
+      if (presentationFailure !== null) {
+        return {
+          ok: false,
+          status: "integrity-failure",
+          detail: presentationFailure,
+          storage: "sqlite",
+          evidence,
+        };
+      }
       const idempotencyFailure = this.verifyIdempotencyParity();
       if (idempotencyFailure !== null) {
         return {
@@ -2672,6 +2866,54 @@ export class SqliteFoundationStorage implements FoundationStorage {
       .query("SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = ?")
       .get(name) as RootRow | null;
     return row !== null;
+  }
+
+  private verifyPresentationEvidence(): string | null {
+    if (
+      !this.tableExists("foundation_event_game_presentation_changes") ||
+      !this.tableExists("foundation_event_game_presentation_audit") ||
+      !this.tableExists("foundation_event_game_presentation_integrity")
+    )
+      return null;
+    const recordIds = new Set<string>();
+    for (const row of this.database
+      .query(
+        "SELECT DISTINCT record_id FROM foundation_event_game_presentation_changes UNION SELECT DISTINCT record_id FROM foundation_event_game_presentation_audit UNION SELECT DISTINCT record_id FROM foundation_event_game_presentation_integrity",
+      )
+      .all() as Array<Record<string, unknown>>) {
+      recordIds.add(String(row.record_id));
+    }
+    if (recordIds.size === 0) return null;
+    const transaction = this.createTransaction();
+    const sessions = listGrants(this.getGrantStatements().allGrants).flatMap((grant) =>
+      listGrantSessions(this.getGrantStatements().sessionsByGrant, grant.grantId),
+    );
+    for (const recordId of recordIds) {
+      const failure = presentationEvidenceFailure({
+        root: transaction.findRootByRecordId(recordId),
+        changes: transaction.listPresentationChanges?.(recordId) ?? [],
+        audits: transaction.listPresentationAuditEntries?.(recordId) ?? [],
+        anchors: (
+          this.getStatements().presentationIntegrityByRecordId.all(recordId) as unknown[]
+        ).map((row) => {
+          const value = row as Record<string, unknown>;
+          return {
+            recordId: String(value.record_id),
+            stateRevision: Number(value.state_revision),
+            keyVersion: String(value.key_version),
+            canonicalValue: String(value.canonical_value),
+            integrityTag: String(value.integrity_tag),
+          } satisfies PresentationIntegrityAnchor;
+        }),
+        sessions,
+        actionOperationIds: new Set(
+          transaction.listActions(recordId).map((action) => action.action.operationId),
+        ),
+        keyRing: this.grantValidationContext.keyRing,
+      });
+      if (failure !== null) return failure;
+    }
+    return null;
   }
 
   private verifyIdempotencyParity(): string | null {

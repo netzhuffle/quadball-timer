@@ -1294,7 +1294,21 @@ export type FoundationSchemaVerification =
     };
 
 export function hasExpectedFoundationSchema(database: Database): boolean {
-  return foundationSchemaFingerprint(database) === FOUNDATION_SCHEMA_FINGERPRINT;
+  if (foundationSchemaFingerprint(database) === FOUNDATION_SCHEMA_FINGERPRINT) return true;
+  const actual = readSchemaManifest(database);
+  const extensionPrefix = "foundation_event_game_presentation_";
+  const withoutPresentation = {
+    ...actual,
+    objects: actual.objects.filter((entry) => !entry.name.startsWith(extensionPrefix)),
+    tables: actual.tables.filter((entry) => !entry.name.startsWith(extensionPrefix)),
+    indexes: actual.indexes.filter((entry) => !entry.name.startsWith(extensionPrefix)),
+  };
+  const hasPresentationObjects = actual.objects.some(
+    (entry) => entry.name === "foundation_event_game_presentation_changes",
+  );
+  return (
+    hasPresentationObjects && fingerprint(withoutPresentation) === FOUNDATION_SCHEMA_FINGERPRINT
+  );
 }
 
 function hasComposedAcceptanceSchema(database: Database): boolean {
