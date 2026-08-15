@@ -110,12 +110,21 @@ describe("Event operations catalog through foundation SQLite", () => {
       if (event.status !== "accepted") throw new Error("Expected Event.");
       const team = await catalog.createEventTeam(event.value.eventId, { name: "Blue" }, authority);
       if (team.status !== "accepted") throw new Error("Expected Team.");
+      expect(
+        await catalog.lookupAudienceRoster(event.value.eventId, team.value.eventTeamId, 12),
+      ).toMatchObject({
+        status: "accepted",
+        value: { playerNumber: 12, publicName: null },
+      });
       await catalog.upsertEventTeamRoster(
         event.value.eventId,
         team.value.eventTeamId,
         { playerNumber: 12, publicName: "Before" },
         authority,
       );
+      expect(
+        await catalog.lookupAudienceRoster(event.value.eventId, team.value.eventTeamId, 12),
+      ).toMatchObject({ status: "accepted", value: { publicName: "Before" } });
       const pitch = await catalog.createPitch(
         event.value.eventId,
         { name: "Pitch One" },
@@ -158,6 +167,98 @@ describe("Event operations catalog through foundation SQLite", () => {
       ]);
       reopenedFoundation.close();
     } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("covers the deterministic two-Day, six-Pitch, 96-Game production envelope", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "quadball-event-envelope-"));
+    const foundation = openSqliteFoundationStorage(join(directory, "catalog.sqlite"));
+    await foundation.applyMigrations();
+    try {
+      const catalog = createEventCatalog(createFoundationEventCatalogStorage(foundation), {
+        clock: { nowMs: () => Date.UTC(2026, 7, 14, 12) },
+      });
+      const event = await catalog.createEvent(
+        { name: "Envelope Event", timeZone: "UTC" },
+        authority,
+      );
+      if (event.status !== "accepted") throw new Error("Expected Event.");
+      const days = [];
+      for (const date of ["2026-08-14", "2026-08-15"]) {
+        const day = await catalog.addGameDay(event.value.eventId, { date }, authority);
+        if (day.status !== "accepted") throw new Error("Expected Game Day.");
+        days.push(day.value);
+      }
+      for (let pitchIndex = 1; pitchIndex <= 6; pitchIndex += 1) {
+        const pitch = await catalog.createPitch(
+          event.value.eventId,
+          { name: `Pitch ${pitchIndex}` },
+          authority,
+        );
+        if (pitch.status !== "accepted") throw new Error("Expected Pitch.");
+      }
+
+      let gameCount = 0;
+      for (const [dayIndex, day] of days.entries()) {
+        for (let sequence = 1; sequence <= 8; sequence += 1) {
+          const slot = await catalog.createGameplaySlot(
+            event.value.eventId,
+            day.gameDayId,
+            {
+              sequence,
+              scheduledStart: `2026-08-${14 + dayIndex}T${String(10 + sequence).padStart(2, "0")}:00`,
+            },
+            authority,
+          );
+          if (slot.status !== "accepted") throw new Error("Expected Gameplay Slot.");
+          const pitchSlots = await foundation.transaction((transaction) =>
+            transaction.listPitchSlots(day.gameDayId),
+          );
+          for (const pitchSlot of pitchSlots.filter(
+            (candidate) => candidate.gameplaySlotId === slot.value.gameplaySlotId,
+          )) {
+            const game = await catalog.createEventGame(
+              event.value.eventId,
+              day.gameDayId,
+              {
+                gameplaySlotId: slot.value.gameplaySlotId,
+                pitchSlotId: pitchSlot.pitchSlotId,
+                gameCode: `D${dayIndex + 1}-G${gameCount + 1}`,
+                sideA: { sourceLabel: "Winner A" },
+                sideB: { sourceLabel: "Winner B" },
+              },
+              authority,
+            );
+            if (game.status !== "accepted") throw new Error("Expected Event Game.");
+            gameCount += 1;
+          }
+        }
+      }
+
+      const projection = await catalog.inspectEvent(event.value.eventId, authority);
+      expect(projection.status).toBe("accepted");
+      if (projection.status !== "accepted") return;
+      expect(gameCount).toBe(96);
+      expect(projection.value.gameDays).toHaveLength(2);
+      expect(projection.value.gameDays.map((day) => day.date).sort()).toEqual([
+        "2026-08-14",
+        "2026-08-15",
+      ]);
+      expect(projection.value.pitches).toHaveLength(6);
+      expect(projection.value.pitches.map((pitch) => pitch.name).sort()).toEqual([
+        "Pitch 1",
+        "Pitch 2",
+        "Pitch 3",
+        "Pitch 4",
+        "Pitch 5",
+        "Pitch 6",
+      ]);
+      expect(projection.value.pitchSlots).toHaveLength(96);
+      expect(projection.value.eventGames).toHaveLength(96);
+      expect(projection.value.eventGames.every((game) => !game.scheduleConflict)).toBe(true);
+    } finally {
+      foundation.close();
       await rm(directory, { recursive: true, force: true });
     }
   });

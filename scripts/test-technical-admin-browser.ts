@@ -429,6 +429,14 @@ try {
   await eventAdminPage.getByLabel("Scanned Event Admin QR value").fill(revealedCredential);
   await eventAdminPage.getByRole("button", { name: "Admit Event Admin" }).click();
   await eventAdminPage.getByText("Event Hub", { exact: true }).waitFor();
+  await eventAdminPage.getByRole("heading", { name: "Operations health" }).waitFor();
+  assert(
+    (await eventAdminPage.getByText("Unresolved team assignments: 0", { exact: true }).count()) ===
+      1 &&
+      (await eventAdminPage.getByText("Schedule conflicts: 0", { exact: true }).count()) === 1 &&
+      (await eventAdminPage.getByText("Grant problems: 0", { exact: true }).count()) === 1,
+    "Event Hub did not expose its bounded operations health summary",
+  );
   await eventAdminPage.getByText("Administrative audit evidence", { exact: true }).waitFor();
   await eventAdminPage.getByText("Event Administration", { exact: true }).waitFor();
   await eventAdminPage.getByText("Grant Audit", { exact: true }).waitFor();
@@ -778,7 +786,7 @@ try {
   );
   const removalStatusText = await eventAdminPage
     .getByRole("status")
-    .filter({ hasText: "catalog descendants 0" })
+    .filter({ hasText: "catalog descendants" })
     .innerText();
   assert(
     removalStatusText.includes("catalog descendants 0") &&
@@ -1103,7 +1111,128 @@ try {
   );
   await eventAdminPage.getByRole("button", { name: "Add unresolved Event Game" }).click();
   assert((await secondGameResponsePromise).status() === 201, "second Event Game creation failed");
-  await eventAdminPage.getByRole("button", { name: "Refresh Slot setup" }).click();
+  await eventAdminPage.getByText("Unresolved team assignments: 1", { exact: true }).waitFor();
+  await eventAdminPage.getByText("Grant problems: 2", { exact: true }).waitFor();
+  await eventAdminPage.setViewportSize({ width: 360, height: 900 });
+  const eventHubLayout = await eventAdminPage.evaluate(() => ({
+    healthFits: (() => {
+      const section = document.querySelector("section[aria-labelledby='operations-health-title']");
+      return section !== null && section.scrollWidth <= section.clientWidth;
+    })(),
+    controlsStayInViewport: Array.from(document.querySelectorAll("button, input, select"))
+      .filter((element) => {
+        const style = getComputedStyle(element);
+        return style.display !== "none" && style.visibility !== "hidden";
+      })
+      .every((element) => {
+        const rect = element.getBoundingClientRect();
+        return rect.left >= -1 && rect.right <= window.innerWidth + 1;
+      }),
+    healthHeading: document.querySelector("#operations-health-title")?.textContent,
+    healthSectionLabel: document
+      .querySelector("section[aria-labelledby='operations-health-title']")
+      ?.getAttribute("aria-labelledby"),
+  }));
+  assert(
+    eventHubLayout.healthFits &&
+      eventHubLayout.controlsStayInViewport &&
+      eventHubLayout.healthHeading === "Operations health" &&
+      eventHubLayout.healthSectionLabel === "operations-health-title",
+    `Event Hub was not accessible and 360px-safe: ${JSON.stringify(eventHubLayout)}`,
+  );
+  await eventAdminPage.setViewportSize({ width: 1280, height: 900 });
+  const desktopAccessibility = await eventAdminPage.evaluate(() => {
+    const visible = Array.from(document.querySelectorAll("button, input, select")).filter(
+      (element) => {
+        const style = getComputedStyle(element);
+        return style.display !== "none" && style.visibility !== "hidden";
+      },
+    );
+    const unlabeled = visible.filter((element) => {
+      const labelledBy = element.getAttribute("aria-labelledby");
+      const label = element.getAttribute("aria-label");
+      const text = element.textContent?.trim();
+      const associated = element.id
+        ? document.querySelector(`label[for='${CSS.escape(element.id)}']`)?.textContent?.trim()
+        : undefined;
+      const ancestorLabel = element.closest("label")?.textContent?.trim();
+      return !labelledBy && !label && !text && !associated && !ancestorLabel;
+    });
+    const buttonByName = (name: string) =>
+      Array.from(document.querySelectorAll("button")).find(
+        (element) => element.textContent?.trim() === name,
+      ) ?? null;
+    const critical = [
+      document.querySelector("#game-day-selector"),
+      buttonByName("Add Team"),
+      buttonByName("Save Roster"),
+    ].filter((element): element is HTMLElement => element instanceof HTMLElement);
+    return {
+      unlabeled: unlabeled.map((element) => element.outerHTML.slice(0, 120)),
+      criticalTargets: critical.map((element) => {
+        const rect = element.getBoundingClientRect();
+        return { width: rect.width, height: rect.height };
+      }),
+      nonColorState: document.body.textContent?.includes("Operations health") === true,
+    };
+  });
+  assert(
+    desktopAccessibility.unlabeled.length === 0 &&
+      desktopAccessibility.criticalTargets.every(
+        ({ width, height }) => width >= 40 && height >= 40,
+      ) &&
+      desktopAccessibility.nonColorState,
+    `desktop admin accessibility evidence failed: ${JSON.stringify(desktopAccessibility)}`,
+  );
+  const focusableCount = await eventAdminPage.evaluate(
+    () => document.querySelectorAll("button, input, select, textarea, a[href], [tabindex]").length,
+  );
+  await eventAdminPage.evaluate(() => {
+    document.body.tabIndex = -1;
+    document.body.focus();
+  });
+  let focusOrderSteps = 0;
+  for (; focusOrderSteps <= focusableCount + 1; focusOrderSteps += 1) {
+    await eventAdminPage.keyboard.press("Tab");
+    const activeText = await eventAdminPage.evaluate(
+      () =>
+        document.activeElement?.textContent?.trim() ||
+        document.activeElement?.getAttribute("aria-label") ||
+        "",
+    );
+    if (activeText === "Refresh Slot setup") break;
+  }
+  assert(
+    focusOrderSteps <= focusableCount + 1,
+    "critical admin focus order did not reach the target deterministically",
+  );
+  const focusIndicator = await eventAdminPage.evaluate(() => {
+    const target = Array.from(document.querySelectorAll("button")).find(
+      (element) =>
+        element.textContent?.trim() === "Refresh Slot setup" ||
+        element.getAttribute("aria-label") === "Refresh Slot setup",
+    );
+    if (!(target instanceof HTMLElement)) return null;
+    const style = getComputedStyle(target);
+    return {
+      active: document.activeElement === target,
+      outline: `${style.outlineStyle}/${style.outlineWidth}`,
+      boxShadow: style.boxShadow,
+    };
+  });
+  assert(
+    focusIndicator?.active === true &&
+      ((focusIndicator.outline !== "none/0px" && !focusIndicator.outline.endsWith("/0px")) ||
+        focusIndicator.boxShadow !== "none"),
+    `critical admin focus indicator was not rendered: ${JSON.stringify(focusIndicator)}`,
+  );
+  const refreshSlotResponsePromise = eventAdminPage.waitForResponse(
+    (response) =>
+      response.url().includes("/api/event-admin/slot-setup?") &&
+      response.request().method() === "GET",
+  );
+  await eventAdminPage.keyboard.press("Enter");
+  await refreshSlotResponsePromise;
   await eventAdminPage
     .getByRole("option", { name: "Opening", exact: true })
     .waitFor({ state: "attached" });
@@ -1125,6 +1254,95 @@ try {
     publishedAudiencePayload.value?.auditTrail === undefined &&
       publishedAudiencePayload.value?.publicationStatus === "published",
     "anonymous projection leaked private publication history",
+  );
+  const rosterHubPayload = (await (
+    await eventAdminContext.request.get(`${origin}/api/event-admin/hub?eventId=${eventId}`)
+  ).json()) as {
+    status: string;
+    value?: {
+      event?: {
+        teams?: Array<{
+          eventTeamId: string;
+          name: string;
+          roster?: Array<{ playerNumber: number; publicName: string }>;
+        }>;
+        eventGames?: Array<{
+          eventGameId: string;
+          gameCode: string | null;
+          gameDesignation: string | null;
+          sideA: { eventTeamId: string | null; sourceLabel: string | null };
+          sideB: { eventTeamId: string | null; sourceLabel: string | null };
+          expectedStartMs: number;
+          expectedPlayingPeriod: { startMs: number; endMs: number };
+        }>;
+      };
+    };
+  };
+  const rosterTeamId = rosterHubPayload.value?.event?.teams?.find(
+    (team) => team.name === "Blue Updated",
+  )?.eventTeamId;
+  if (rosterTeamId === undefined) throw new Error("Roster Event Team was not projected.");
+  const readRosterFromOperationsHub = async () => {
+    const response = await eventAdminContext.request.get(
+      `${origin}/api/event-admin/hub?eventId=${eventId}`,
+    );
+    assert(response.status() === 200, "Event operations Hub was not available for roster lookup.");
+    return (await response.json()) as typeof rosterHubPayload;
+  };
+  const rosterEntry = (
+    payload: typeof rosterHubPayload,
+    playerNumber: number,
+  ): { playerNumber: number; publicName: string } | null =>
+    payload.value?.event?.teams
+      ?.find((team) => team.eventTeamId === rosterTeamId)
+      ?.roster?.find((entry) => entry.playerNumber === playerNumber) ?? null;
+  const retainedGameFacts = rosterHubPayload.value?.event?.eventGames?.map((game) => ({
+    eventGameId: game.eventGameId,
+    gameCode: game.gameCode,
+    gameDesignation: game.gameDesignation,
+    sideA: game.sideA,
+    sideB: game.sideB,
+    expectedStartMs: game.expectedStartMs,
+    expectedPlayingPeriod: game.expectedPlayingPeriod,
+  }));
+  if (retainedGameFacts === undefined) throw new Error("Retained Event Game facts were absent.");
+  const absentRoster = rosterEntry(rosterHubPayload, 8);
+  assert(
+    absentRoster === null,
+    "Event operations catalog lookup did not return semantic roster absence",
+  );
+  await eventAdminPage.getByLabel("Roster Event Team").selectOption({ label: "Blue Updated" });
+  await eventAdminPage.getByLabel("Player number").fill("8");
+  await eventAdminPage.getByLabel("Player public name").fill("Player Eight");
+  await eventAdminPage.getByRole("button", { name: "Save Roster" }).click();
+  await eventAdminPage.getByText("#8 Player Eight", { exact: true }).waitFor();
+  const addedRoster = rosterEntry(await readRosterFromOperationsHub(), 8);
+  assert(
+    addedRoster?.publicName === "Player Eight",
+    "Event operations catalog roster addition lookup failed",
+  );
+  await eventAdminPage.getByLabel("Player number").fill("8");
+  await eventAdminPage.getByLabel("Player public name").fill("Player Eight Corrected");
+  await eventAdminPage.getByRole("button", { name: "Save Roster" }).click();
+  await eventAdminPage.getByText("#8 Player Eight Corrected", { exact: true }).waitFor();
+  const correctedRosterHub = await readRosterFromOperationsHub();
+  const correctedRoster = rosterEntry(correctedRosterHub, 8);
+  assert(
+    correctedRoster?.publicName === "Player Eight Corrected",
+    "Event operations catalog roster correction lookup did not return the current public name",
+  );
+  const correctedGameFacts = correctedRosterHub.value?.event?.eventGames?.map((game) => ({
+    eventGameId: game.eventGameId,
+    gameCode: game.gameCode,
+    gameDesignation: game.gameDesignation,
+    sideA: game.sideA,
+    sideB: game.sideB,
+    expectedStartMs: game.expectedStartMs,
+    expectedPlayingPeriod: game.expectedPlayingPeriod,
+  }));
+  assert(
+    JSON.stringify(correctedGameFacts ?? []) === JSON.stringify(retainedGameFacts),
+    "roster correction changed retained Event Game facts",
   );
   const unpublishedButton = eventAdminPage.getByRole("button", {
     name: "Unpublished Event",

@@ -6,6 +6,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { AdministrativeAuditBrowser } from "@/pages/administrative-audit-browser";
 import { createGrantSecretOwner, type GrantSecretToken } from "@/lib/grant-secret-owner";
+import { isEventOperationsHealth, type EventOperationsHealth } from "@/lib/event-operations-health";
 
 type HubResponse = {
   status: "accepted";
@@ -71,6 +72,7 @@ type HubResponse = {
     };
     selectedGameDayId: string | null;
     authority: "technical-admin" | "event-admin";
+    health: EventOperationsHealth;
   };
 };
 
@@ -296,6 +298,7 @@ export function EventAdminPage({
   const [credential, setCredential] = useState("");
   const [grantCode, setGrantCode] = useState("");
   const [hub, setHub] = useState<HubResponse["value"] | null>(null);
+  const [healthUnavailable, setHealthUnavailable] = useState(false);
   const [selectedGameDayId, setSelectedGameDayId] = useState<string | null>(null);
   const [pitchManagerGameDayId, setPitchManagerGameDayId] = useState("");
   const [message, setMessage] = useState<string | null>(null);
@@ -446,6 +449,7 @@ export function EventAdminPage({
     invalidateLockedGameRequest();
     invalidateGrantSecrets();
     setHub(null);
+    setHealthUnavailable(false);
     setSelectedGameDayId(null);
     setPitchManagerGameDayId("");
     setTeamDrafts({});
@@ -546,6 +550,7 @@ export function EventAdminPage({
         | { status: "rejected" | "retryable-failure"; message?: string };
       if (!response.ok || payload.status !== "accepted")
         throw new Error("Unable to open the Event Hub.");
+      const validHealth = isEventOperationsHealth(payload.value.health);
       if (!secretOwner.current(token)) return;
       secretOwner.commit(token, () => {
         setTeamDrafts(
@@ -565,6 +570,7 @@ export function EventAdminPage({
           ),
         );
         setHub(payload.value);
+        setHealthUnavailable(!validHealth);
         setSelectedGameDayId(payload.value.selectedGameDayId);
         setSchedule({
           gameDayId: payload.value.selectedGameDayId ?? "",
@@ -1701,6 +1707,30 @@ export function EventAdminPage({
                 </p>
               </div>
               <AdministrativeAuditBrowser eventId={hub.event.eventId} route="event-admin" />
+              <section
+                aria-labelledby="operations-health-title"
+                className="space-y-2 rounded-lg border p-3"
+              >
+                <h2 className="font-semibold" id="operations-health-title">
+                  Operations health
+                </h2>
+                <p className="text-sm text-muted-foreground">
+                  Resolve these signals before handing a Game Day to operators. Counts are
+                  allowlisted summaries; Grant credentials and audit details stay private.
+                </p>
+                {healthUnavailable ? (
+                  <p role="status" aria-live="polite">
+                    Operations health unavailable. No readiness counts are shown.
+                  </p>
+                ) : (
+                  <ul className="grid gap-1 text-sm sm:grid-cols-2" aria-live="polite">
+                    <li>Unresolved team assignments: {hub.health.unresolvedTeamCount}</li>
+                    <li>Schedule conflicts: {hub.health.scheduleConflictCount}</li>
+                    <li>Team schedule conflicts: {hub.health.teamScheduleConflictCount}</li>
+                    <li>Grant problems: {hub.health.grantProblemCount}</li>
+                  </ul>
+                )}
+              </section>
               <div className="space-y-3 rounded-lg border p-3">
                 <div>
                   <p className="font-semibold">Locked Event Game administration</p>
@@ -2106,6 +2136,7 @@ export function EventAdminPage({
                     onChange={(event) => setTeamColor(event.target.value)}
                   />
                   <Button
+                    className="min-h-10"
                     disabled={busy || teamName.trim().length === 0}
                     onClick={() =>
                       void run(async () => {
@@ -2151,6 +2182,7 @@ export function EventAdminPage({
                     onChange={(event) => setPlayerName(event.target.value)}
                   />
                   <Button
+                    className="min-h-10"
                     disabled={
                       busy ||
                       rosterTeamId.length === 0 ||

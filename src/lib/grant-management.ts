@@ -17,6 +17,7 @@ import {
 } from "@/lib/grant-management-credentials";
 import { recalculateExpiry, retireGrantInTransaction } from "@/lib/grant-management-lifecycle";
 import { listAudit, listSessions, listSessionsInTransaction } from "@/lib/grant-management-queries";
+import { isGrantCurrentlyUsableInTransaction } from "@/lib/grant-management-policy";
 import { admitGrantCode, createGrantCode, disableGrantCode } from "@/lib/grant-management-code";
 import {
   admitGrant,
@@ -123,6 +124,8 @@ export function createTypedGrantAuthority(
         : notifyLifecycleChange(authorizeGrant(storage, options, input), ["authorized"]),
     authorizeGrantInTransaction: (transaction, input) =>
       authorizeGrantInTransaction(transaction, options, input),
+    isGrantCurrentlyUsableInTransaction: (transaction, grant) =>
+      isGrantCurrentlyUsableInTransaction(transaction, options, grant),
     acceptControlGrantSessionSwitch: (input) =>
       notifyLifecycleChange(acceptControlGrantSessionSwitch(storage, options, input.sessionBearer)),
     authorizeControlGrantReplay: (input) => authorizeControlGrantReplay(storage, options, input),

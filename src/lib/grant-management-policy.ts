@@ -14,6 +14,7 @@ import type {
 import type { GrantAuthorityOptions } from "@/lib/grant-authority";
 import { DAY_MS } from "@/lib/grant-calendar";
 import { createAuditEntry, expireGrantIfDue } from "@/lib/grant-lifecycle";
+import { validateGrantScope } from "@/lib/grant-types";
 import type {
   ControlGrantScope,
   EventAdminGrantScope,
@@ -46,6 +47,41 @@ export function hasCurrentAdmissionEligibility(
       resolved.status === "eligible" &&
       validateOpaqueIdentifier(resolved.eventGameId, "eventGameId").ok
     );
+  } catch {
+    return false;
+  }
+}
+
+/** Read-only health composition seam for a Grant already selected by its owning projection. */
+export function isGrantCurrentlyUsableInTransaction(
+  snapshot: FoundationStorageSnapshot,
+  options: GrantAuthorityOptions,
+  grant: StoredGrant,
+): boolean {
+  try {
+    const nowMs = readNow(options);
+    if (grant.status !== "active") return false;
+    if (
+      grant.expiresAtMs !== null &&
+      (!Number.isSafeInteger(grant.expiresAtMs) || nowMs >= grant.expiresAtMs)
+    )
+      return false;
+    if (!validateGrantScope(grant.grantType, grant.scope).ok) return false;
+    const token = decryptCredential(grant.credential, bindingFor(options, grant), options.keyRing);
+    if (
+      token === null ||
+      grant.credential.lookupKeyVersion === null ||
+      typeof grant.credential.lookupDigest !== "string"
+    )
+      return false;
+    if (
+      !sameSecret(
+        grant.credential.lookupDigest,
+        computeLookupDigest(token, options.keyRing, grant.credential.lookupKeyVersion),
+      )
+    )
+      return false;
+    return hasCurrentAdmissionEligibility(options, grant, snapshot);
   } catch {
     return false;
   }

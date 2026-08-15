@@ -276,6 +276,10 @@ export type TypedGrantAuthority = {
     transaction: FoundationStorageTransaction,
     input: { sessionBearer: string; readOnly?: boolean },
   ): TypedGrantAuthorization;
+  isGrantCurrentlyUsableInTransaction(
+    transaction: FoundationStorageTransaction,
+    grant: import("@/lib/grant-types").StoredGrant,
+  ): boolean;
   acceptControlGrantSessionSwitch(input: {
     sessionBearer: string;
   }): Promise<TypedControlGrantSwitch>;

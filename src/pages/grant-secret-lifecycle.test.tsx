@@ -689,6 +689,41 @@ describe("Grant secret UI lifecycle", () => {
     expect(container.textContent).not.toContain("stale reopening network");
   });
 
+  test("Event Admin fails closed when Hub health is absent or malformed", async () => {
+    let hubCalls = 0;
+    fetchHandler = async (input, init) => {
+      const url =
+        typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      const method = init?.method ?? "GET";
+      if (url.includes("/api/event-admin/hub")) {
+        hubCalls += 1;
+        return hubCalls === 1
+          ? json({ status: "accepted", value: eventHub })
+          : json({
+              status: "accepted",
+              value: {
+                ...eventHub,
+                health: {
+                  unresolvedTeamCount: "0",
+                  scheduleConflictCount: 0,
+                  teamScheduleConflictCount: 0,
+                  grantProblemCount: 0,
+                },
+              },
+            });
+      }
+      throw new Error(`Unexpected request: ${method} ${url}`);
+    };
+
+    await render(<EventAdminPage />);
+    expect(container.textContent).toContain("Operations health unavailable");
+    expect(container.textContent).not.toContain("Unresolved team assignments: 0");
+    await typeEventId("event-b");
+    await clickButton("Open as Technical Admin");
+    expect(container.textContent).toContain("Operations health unavailable");
+    expect(container.textContent).not.toContain("Grant problems: 0");
+  });
+
   afterEach(async () => {
     await act(async () => {
       root.unmount();

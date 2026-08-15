@@ -2937,13 +2937,13 @@ function isPublicEventPath(pathname: string): boolean {
 }
 
 function readPathSegment(url: string): string {
-  const segment = new URL(url).pathname.split("/").at(-1) ?? "";
-  return decodePathSegment(segment);
+  return decodePathSegment(new URL(url).pathname.split("/").at(-1));
 }
 
 function decodePathSegment(segment: string | undefined): string {
+  const value = segment ?? "";
   try {
-    return decodeURIComponent(segment ?? "");
+    return decodeURIComponent(value);
   } catch {
     return "";
   }

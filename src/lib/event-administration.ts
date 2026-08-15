@@ -71,6 +71,7 @@ import {
   type LockedGameCorrectionInput,
   type LockedGameCorrectionResult,
 } from "@/lib/locked-event-game-administration";
+import type { EventOperationsHealth } from "@/lib/event-operations-health";
 
 export const GENERIC_EVENT_HUB_AUTHORIZATION_FAILURE = Object.freeze({
   status: "rejected",
@@ -129,6 +130,7 @@ export type GrantCodeProjection = {
 
 export type EventHubProjection = {
   event: EventProjection;
+  health: EventOperationsHealth;
   selectedGameDayId: string | null;
   authority: "technical-admin" | "event-admin";
   grantSessionId: string | null;
@@ -1520,6 +1522,7 @@ export function createEventAdministration(
             return unauthorized();
           return accepted({
             event,
+            health: projectEventOperationsHealth(event, transaction, options),
             selectedGameDayId: gameDayId,
             authority: authorized.kind,
             grantSessionId: authorized.sessionId,
@@ -2408,6 +2411,45 @@ function authorizeControlManagementInTransaction(
   )
     return null;
   return { sessionExpiresAtMs: result.sessionExpiresAtMs ?? null };
+}
+
+function projectEventOperationsHealth(
+  event: EventProjection,
+  transaction: FoundationStorageTransaction,
+  options: EventAdministrationOptions,
+): EventOperationsHealth {
+  let unresolvedTeamCount = 0;
+  let scheduleConflictCount = 0;
+  let teamScheduleConflictCount = 0;
+  let grantProblemCount = 0;
+
+  for (const game of event.eventGames) {
+    if (game.sideA.eventTeamId === null || game.sideB.eventTeamId === null)
+      unresolvedTeamCount += 1;
+    if (game.scheduleConflict) scheduleConflictCount += 1;
+    if (game.teamScheduleConflict) teamScheduleConflictCount += 1;
+
+    const pitchSlot = transaction.findPitchSlot(game.pitchSlotId);
+    const pitch = pitchSlot === null ? null : transaction.findPitch(pitchSlot.pitchId);
+    const grant =
+      pitchSlot === null || pitch === null
+        ? null
+        : findControlGrantInTransaction(transaction, {
+            eventId: event.eventId,
+            gameDayId: game.gameDayId,
+            pitchId: pitch.pitchId,
+            pitchSlotId: pitchSlot.pitchSlotId,
+          });
+    if (grant === null || !options.grants.isGrantCurrentlyUsableInTransaction(transaction, grant))
+      grantProblemCount += 1;
+  }
+
+  return {
+    unresolvedTeamCount,
+    scheduleConflictCount,
+    teamScheduleConflictCount,
+    grantProblemCount,
+  };
 }
 
 function projectControlGrant(
