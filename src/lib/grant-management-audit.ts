@@ -15,7 +15,8 @@ export function auditInput(
   authority:
     | TrustedGrantAuthority
     | GrantAuthorityActor
-    | { kind: "session"; sessionId: string; pseudonymKeyVersion: string },
+    | { kind: "session"; sessionId: string; pseudonymKeyVersion: string }
+    | { kind: "external"; value: string },
   afterStatus: StoredGrant["status"],
   sessionId: string | null = null,
   replacedSessionId: string | null = null,
@@ -29,7 +30,8 @@ export function auditInput(
 ) {
   let actor:
     | { kind: "authority"; value: GrantAuthorityActor }
-    | { kind: "session"; sessionId: string; pseudonymKeyVersion: string };
+    | { kind: "session"; sessionId: string; pseudonymKeyVersion: string }
+    | { kind: "external"; value: string };
   if (authority.kind === "grant-session") {
     if (authority.sessionId === undefined || authority.pseudonymKeyVersion === undefined)
       throw new Error("Grant Session authority was not resolved.");
@@ -39,6 +41,8 @@ export function auditInput(
       pseudonymKeyVersion: authority.pseudonymKeyVersion,
     };
   } else if (authority.kind === "session") {
+    actor = authority;
+  } else if (authority.kind === "external") {
     actor = authority;
   } else {
     actor = { kind: "authority", value: authorityToActor(authority) as GrantAuthorityActor };

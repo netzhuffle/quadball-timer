@@ -220,6 +220,7 @@ export type GrantAuditAction =
   | "grant-expired"
   | "grant-disabled"
   | "grant-revoked"
+  | "grant-retired"
   | "grant-reactivated"
   | "grant-metadata-updated"
   | "session-revoked"
@@ -237,6 +238,7 @@ export type GrantAuditAction =
   | "grant-code-replaced"
   | "grant-code-disabled"
   | "grant-code-erased-expiry"
+  | "grant-code-erased-removal"
   | "grant-code-erased-game-lock"
   | "grant-code-admitted";
 

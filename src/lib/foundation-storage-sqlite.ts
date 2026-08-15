@@ -463,16 +463,21 @@ type RootStatements = {
   insertEventAudit: SqlStatement;
   insertEventTeam: SqlStatement;
   updateEventTeam: SqlStatement;
+  deleteEventTeam: SqlStatement;
   insertRosterEntry: SqlStatement;
   updateRosterEntry: SqlStatement;
   insertPitch: SqlStatement;
   updatePitch: SqlStatement;
+  deletePitch: SqlStatement;
   insertGameplaySlot: SqlStatement;
   insertPitchSlot: SqlStatement;
   updateGameplaySlot: SqlStatement;
   updatePitchSlot: SqlStatement;
+  deleteGameplaySlot: SqlStatement;
+  deletePitchSlot: SqlStatement;
   insertEventGame: SqlStatement;
   updateEventGame: SqlStatement;
+  deleteEventGame: SqlStatement;
 };
 
 function assertGameplaySlotMembership(statements: RootStatements, slot: StoredGameplaySlot): void {
@@ -947,8 +952,8 @@ export class SqliteFoundationStorage implements FoundationStorage {
   eventCatalogStorageCapability() {
     return {
       name: "event-catalog-storage",
-      version: 1,
-      implementation: "event-teams-rosters-pitches-transaction-v1",
+      version: 2,
+      implementation: "event-catalog-removal-transaction-v2",
       transaction: [
         "findEventTeam",
         "listEventTeams",
@@ -958,10 +963,12 @@ export class SqliteFoundationStorage implements FoundationStorage {
         "listPitches",
         "insertEventTeam",
         "updateEventTeam",
+        "deleteEventTeam",
         "insertRosterEntry",
         "updateRosterEntry",
         "insertPitch",
         "updatePitch",
+        "deletePitch",
         "findGameplaySlot",
         "listGameplaySlots",
         "findPitchSlot",
@@ -972,8 +979,11 @@ export class SqliteFoundationStorage implements FoundationStorage {
         "insertPitchSlot",
         "updateGameplaySlot",
         "updatePitchSlot",
+        "deleteGameplaySlot",
+        "deletePitchSlot",
         "insertEventGame",
         "updateEventGame",
+        "deleteEventGame",
       ],
     } as const;
   }
@@ -1457,6 +1467,7 @@ export class SqliteFoundationStorage implements FoundationStorage {
           team.updatedAtMs,
           team.eventTeamId,
         ),
+      deleteEventTeam: (eventTeamId) => statements.deleteEventTeam.run(eventTeamId),
       insertRosterEntry: (entry) =>
         statements.insertRosterEntry.run(
           entry.rosterEntryId,
@@ -1479,6 +1490,7 @@ export class SqliteFoundationStorage implements FoundationStorage {
         ),
       updatePitch: (pitch) =>
         statements.updatePitch.run(pitch.name, pitch.updatedAtMs, pitch.pitchId),
+      deletePitch: (pitchId) => statements.deletePitch.run(pitchId),
       insertGameplaySlot: (slot) => {
         assertGameplaySlotMembership(statements, slot);
         statements.insertGameplaySlot.run(
@@ -1516,6 +1528,8 @@ export class SqliteFoundationStorage implements FoundationStorage {
       updatePitchSlot: (slot) => {
         statements.updatePitchSlot.run(slot.expectedDelayMs, slot.updatedAtMs, slot.pitchSlotId);
       },
+      deleteGameplaySlot: (gameplaySlotId) => statements.deleteGameplaySlot.run(gameplaySlotId),
+      deletePitchSlot: (pitchSlotId) => statements.deletePitchSlot.run(pitchSlotId),
       insertEventGame: (game) => {
         assertEventGameMembership(statements, game);
         statements.insertEventGame.run(
@@ -1561,6 +1575,7 @@ export class SqliteFoundationStorage implements FoundationStorage {
           game.eventGameId,
         );
       },
+      deleteEventGame: (eventGameId) => statements.deleteEventGame.run(eventGameId),
       writeGrantAdmissionTelemetry: (value) => {
         this.getGrantStatements().upsertTelemetry.run(
           value.mode,
@@ -2029,6 +2044,9 @@ export class SqliteFoundationStorage implements FoundationStorage {
         SET name = ?, default_color = ?, updated_at_ms = ?
         WHERE event_team_id = ?
       `),
+      deleteEventTeam: this.database.query(
+        `DELETE FROM foundation_event_catalog_teams WHERE event_team_id = ?`,
+      ),
       insertRosterEntry: this.database.query(`
         INSERT INTO foundation_event_catalog_roster
           (roster_entry_id, event_id, event_team_id, player_number, public_name, created_at_ms, updated_at_ms)
@@ -2049,6 +2067,9 @@ export class SqliteFoundationStorage implements FoundationStorage {
         SET name = ?, updated_at_ms = ?
         WHERE pitch_id = ?
       `),
+      deletePitch: this.database.query(
+        `DELETE FROM foundation_event_catalog_pitches WHERE pitch_id = ?`,
+      ),
       insertGameplaySlot: this.database.query(`
         INSERT INTO foundation_event_catalog_gameplay_slots
           (gameplay_slot_id, event_id, game_day_id, sequence_number, scheduled_start_ms, expected_delay_ms, created_at_ms, updated_at_ms)
@@ -2067,6 +2088,12 @@ export class SqliteFoundationStorage implements FoundationStorage {
         UPDATE foundation_event_catalog_pitch_slots SET expected_delay_ms = ?, updated_at_ms = ?
         WHERE pitch_slot_id = ?
       `),
+      deleteGameplaySlot: this.database.query(
+        `DELETE FROM foundation_event_catalog_gameplay_slots WHERE gameplay_slot_id = ?`,
+      ),
+      deletePitchSlot: this.database.query(
+        `DELETE FROM foundation_event_catalog_pitch_slots WHERE pitch_slot_id = ?`,
+      ),
       insertEventGame: this.database.query(`
         INSERT INTO foundation_event_catalog_games
           (event_game_id, event_id, game_day_id, gameplay_slot_id, pitch_slot_id,
@@ -2082,6 +2109,9 @@ export class SqliteFoundationStorage implements FoundationStorage {
           side_b_event_team_id = ?, side_b_event_team_name = ?, side_b_source_label = ?, side_b_confirmed_at_ms = ?,
           updated_at_ms = ? WHERE event_game_id = ?
       `),
+      deleteEventGame: this.database.query(
+        `DELETE FROM foundation_event_catalog_games WHERE event_game_id = ?`,
+      ),
       budgetById: this.database.query(
         `SELECT * FROM foundation_acceptance_budgets WHERE bucket_id = ?`,
       ),

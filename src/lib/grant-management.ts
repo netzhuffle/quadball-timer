@@ -14,7 +14,7 @@ import {
   rotateGrantInTransaction,
   rotateGrantCredentialKeys,
 } from "@/lib/grant-management-credentials";
-import { recalculateExpiry } from "@/lib/grant-management-lifecycle";
+import { recalculateExpiry, retireGrantInTransaction } from "@/lib/grant-management-lifecycle";
 import { listAudit, listSessions, listSessionsInTransaction } from "@/lib/grant-management-queries";
 import { admitGrantCode, createGrantCode, disableGrantCode } from "@/lib/grant-management-code";
 import {
@@ -117,6 +117,8 @@ export function createTypedGrantAuthority(
       revokeGrantSession(storage, options, grantId, sessionReference, authority),
     revokeGrantSessionInTransaction: (transaction, grantId, sessionReference, authority) =>
       revokeGrantSessionInTransaction(transaction, options, grantId, sessionReference, authority),
+    retireGrantInTransaction: (transaction, input) =>
+      retireGrantInTransaction(transaction, options, input),
     leaveGrantSession: (sessionBearer) => leaveGrantSession(storage, options, sessionBearer),
     listGrantSessions: (grantId, authority) => listSessions(storage, options, grantId, authority),
     listGrantSessionsInTransaction: (transaction, grantId, authority) =>

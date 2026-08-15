@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { createAudienceProjection } from "@/lib/audience-projection";
 import { createEventAdministration } from "@/lib/event-administration";
 import { createEventCatalog, createFoundationEventCatalogStorage } from "@/lib/event-catalog";
 import type { FoundationStorage } from "@/lib/foundation-storage";
@@ -18,6 +19,815 @@ const keyRing: GrantKeyRing = {
 };
 
 describe("Event Administration handoff", () => {
+  test("previews and atomically removes an empty Event with its Event Admin authority", async () => {
+    const fixture = createFixture();
+    const event = await fixture.catalog.createEvent(
+      { name: "Remove Event", timeZone: "UTC" },
+      fixture.technical,
+    );
+    if (event.status !== "accepted") throw new Error("Expected Event.");
+    const day = await fixture.catalog.addGameDay(
+      event.value.eventId,
+      { date: "2026-08-14" },
+      fixture.technical,
+    );
+    if (day.status !== "accepted") throw new Error("Expected Game Day.");
+    const grant = await fixture.administration.createEventAdminGrant(
+      event.value.eventId,
+      fixture.technical,
+    );
+    if (grant.status !== "accepted") throw new Error("Expected Event Admin Grant.");
+    const revealed = await fixture.grants.revealGrant(grant.value.grantId, fixture.technical);
+    if (revealed.status !== "revealed") throw new Error("Expected Grant reveal.");
+    const admission = await fixture.administration.admitEventAdmin({
+      qrCredential: revealed.qrCredential,
+      browserContext: "removal-browser",
+    });
+    if (admission.status !== "admitted") throw new Error("Expected Grant Session.");
+    const eventAdmin = { kind: "grant-session" as const, sessionBearer: admission.sessionBearer };
+    const beforeAudit = await fixture.storage.transaction((transaction) =>
+      transaction.listEventAuditTrail(event.value.eventId),
+    );
+
+    const preview = await fixture.administration.previewEventCatalogRemoval(
+      { kind: "game-day", eventId: event.value.eventId, targetId: day.value.gameDayId },
+      eventAdmin,
+    );
+    expect(preview).toMatchObject({
+      status: "accepted",
+      value: {
+        eligible: true,
+        target: { kind: "game-day", targetId: day.value.gameDayId },
+        impact: { retiredAuthorityCount: 0 },
+      },
+    });
+    if (preview.status !== "accepted") throw new Error("Expected removal preview.");
+    const afterPreviewGrant = await fixture.storage.transaction((transaction) =>
+      transaction.findGrantById(grant.value.grantId),
+    );
+    expect(afterPreviewGrant?.status).toBe("active");
+    const sessionBeforeRemoval = await fixture.storage.transaction(
+      (transaction) => transaction.listGrantSessions(grant.value.grantId)[0],
+    );
+    if (sessionBeforeRemoval === undefined)
+      throw new Error("Expected persisted Event Admin session.");
+    const removedDay = await fixture.administration.removeEventCatalogEntry(
+      {
+        kind: "game-day",
+        eventId: event.value.eventId,
+        targetId: day.value.gameDayId,
+        previewFingerprint: preview.value.fingerprint,
+      },
+      eventAdmin,
+    );
+    expect(removedDay).toMatchObject({ status: "accepted", value: { removed: true } });
+    expect(removedDay.sessionExpiresAtMs).toBeTypeOf("number");
+    const sessionAfterRemoval = await fixture.storage.transaction(
+      (transaction) => transaction.listGrantSessions(grant.value.grantId)[0],
+    );
+    expect(sessionAfterRemoval?.lastActiveAtMs).toBeGreaterThanOrEqual(
+      sessionBeforeRemoval.lastActiveAtMs,
+    );
+    expect(removedDay.sessionExpiresAtMs).toBe(
+      Math.min(
+        afterPreviewGrant?.expiresAtMs ?? Number.MAX_SAFE_INTEGER,
+        (sessionAfterRemoval?.lastActiveAtMs ?? 0) + 30 * 24 * 60 * 60 * 1000,
+      ),
+    );
+
+    const eventRemovalPreview = await fixture.administration.previewEventCatalogRemoval(
+      {
+        kind: "event",
+        eventId: event.value.eventId,
+        targetId: event.value.eventId,
+      },
+      fixture.technical,
+    );
+    if (eventRemovalPreview.status !== "accepted") throw new Error("Expected Event preview.");
+    const removed = await fixture.administration.removeEventCatalogEntry(
+      {
+        kind: "event",
+        eventId: event.value.eventId,
+        targetId: event.value.eventId,
+        previewFingerprint: eventRemovalPreview.value.fingerprint,
+      },
+      fixture.technical,
+    );
+    expect(removed).toMatchObject({ status: "accepted", value: { removed: true } });
+    const retiredGrant = await fixture.storage.transaction((transaction) =>
+      transaction.findGrantById(grant.value.grantId),
+    );
+    expect(retiredGrant).toMatchObject({
+      status: "expired",
+      credential: { materialState: "erased", ciphertext: null, lookupDigest: null },
+    });
+    expect(
+      (
+        await fixture.storage.transaction((transaction) =>
+          transaction.listGrantSessions(grant.value.grantId),
+        )
+      )[0],
+    ).toMatchObject({ status: "expired", bearerMaterialState: "erased" });
+    const afterAudit = await fixture.storage.transaction((transaction) =>
+      transaction.listEventAuditTrail(event.value.eventId),
+    );
+    expect(afterAudit.length).toBeGreaterThan(beforeAudit.length);
+    const removalAudit = afterAudit.find(
+      (entry) =>
+        entry.action === "event-catalog-entry-removed" &&
+        entry.before !== null &&
+        typeof entry.before === "object" &&
+        "kind" in entry.before &&
+        entry.before.kind === "event",
+    );
+    expect(removalAudit).toMatchObject({
+      before: {
+        kind: "event",
+        eventId: event.value.eventId,
+        targetId: event.value.eventId,
+      },
+      after: null,
+    });
+    expect(JSON.stringify(removalAudit)).not.toMatch(
+      /credential|code|session|gameCode|gameDesignation|sideA|sideB/i,
+    );
+    expect(
+      await fixture.administration.openEventHub({
+        eventId: event.value.eventId,
+        authority: fixture.technical,
+      }),
+    ).toMatchObject({ status: "rejected", reason: "unauthorized" });
+  });
+
+  test("rejects a stale removal acceptance without changing the target", async () => {
+    const fixture = createFixture();
+    const event = await fixture.catalog.createEvent(
+      { name: "Stale Removal", timeZone: "UTC" },
+      fixture.technical,
+    );
+    if (event.status !== "accepted") throw new Error("Expected Event.");
+    const first = event;
+    const preview = await fixture.administration.previewEventCatalogRemoval(
+      { kind: "event", eventId: event.value.eventId, targetId: first.value.eventId },
+      fixture.technical,
+    );
+    if (preview.status !== "accepted") throw new Error("Expected preview.");
+    await fixture.catalog.updateEvent(
+      event.value.eventId,
+      { name: "Stale Removal Updated" },
+      fixture.technical,
+    );
+    expect(
+      await fixture.administration.removeEventCatalogEntry(
+        {
+          kind: "event",
+          eventId: event.value.eventId,
+          targetId: first.value.eventId,
+          previewFingerprint: preview.value.fingerprint,
+        },
+        fixture.technical,
+      ),
+    ).toMatchObject({ status: "rejected", reason: "invalid-input" });
+    expect(
+      await fixture.catalog.inspectEvent(event.value.eventId, fixture.technical),
+    ).toMatchObject({
+      status: "accepted",
+      value: { name: "Stale Removal Updated" },
+    });
+  });
+
+  test("requires an opaque nonempty fingerprint and binds acceptance to complete authority impact", async () => {
+    const fixture = createFixture();
+    const event = await fixture.catalog.createEvent(
+      { name: "Fingerprint Removal", timeZone: "UTC" },
+      fixture.technical,
+    );
+    if (event.status !== "accepted") throw new Error("Expected Event.");
+    const day = await fixture.catalog.addGameDay(
+      event.value.eventId,
+      { date: "2026-08-14" },
+      fixture.technical,
+    );
+    const pitch = await fixture.catalog.createPitch(
+      event.value.eventId,
+      { name: "Fingerprint Pitch" },
+      fixture.technical,
+    );
+    if (day.status !== "accepted" || pitch.status !== "accepted")
+      throw new Error("Expected catalog structure.");
+    const eventGrant = await fixture.administration.createEventAdminGrant(
+      event.value.eventId,
+      fixture.technical,
+    );
+    if (eventGrant.status !== "accepted") throw new Error("Expected Event Admin Grant.");
+    const revealed = await fixture.grants.revealGrant(eventGrant.value.grantId, fixture.technical);
+    if (revealed.status !== "revealed") throw new Error("Expected Event Admin credential.");
+    const admission = await fixture.administration.admitEventAdmin({
+      qrCredential: revealed.qrCredential,
+      browserContext: "fingerprint-removal-browser",
+    });
+    if (admission.status !== "admitted") throw new Error("Expected Event Admin session.");
+    const authority = { kind: "grant-session" as const, sessionBearer: admission.sessionBearer };
+    const preview = await fixture.administration.previewEventCatalogRemoval(
+      { kind: "pitch", eventId: event.value.eventId, targetId: pitch.value.pitchId },
+      authority,
+    );
+    if (preview.status !== "accepted") throw new Error("Expected removal preview.");
+    expect(preview.value.fingerprint).toMatch(/^event-catalog-removal-v1:[A-Za-z0-9_-]+$/u);
+    const beforeMissing = await fixture.storage.transaction((transaction) => ({
+      pitch: transaction.findPitch(pitch.value.pitchId),
+      grants: transaction.listGrants(),
+      grantAudit: transaction.listGrantAudit(eventGrant.value.grantId),
+      catalogAudit: transaction.listEventAuditTrail(event.value.eventId),
+    }));
+    for (const suppliedFingerprint of [undefined, "", "not-a-valid-removal-fingerprint"]) {
+      expect(
+        await fixture.administration.removeEventCatalogEntry(
+          {
+            kind: "pitch",
+            eventId: event.value.eventId,
+            targetId: pitch.value.pitchId,
+            ...(suppliedFingerprint === undefined
+              ? {}
+              : { previewFingerprint: suppliedFingerprint }),
+          },
+          authority,
+        ),
+      ).toMatchObject({ status: "rejected", reason: "invalid-input" });
+    }
+    const afterMissing = await fixture.storage.transaction((transaction) => ({
+      pitch: transaction.findPitch(pitch.value.pitchId),
+      grants: transaction.listGrants(),
+      grantAudit: transaction.listGrantAudit(eventGrant.value.grantId),
+      catalogAudit: transaction.listEventAuditTrail(event.value.eventId),
+    }));
+    expect(afterMissing).toEqual(beforeMissing);
+
+    const pitchGrant = await fixture.administration.createPitchManagerGrant(
+      event.value.eventId,
+      day.value.gameDayId,
+      pitch.value.pitchId,
+      authority,
+    );
+    if (pitchGrant.status !== "accepted") throw new Error("Expected Pitch Manager Grant.");
+    const beforeCreateRace = await fixture.storage.transaction((transaction) => ({
+      sessions: transaction.listGrantSessions(eventGrant.value.grantId),
+      grantAudit: transaction.listGrantAudit(eventGrant.value.grantId),
+      catalogAudit: transaction.listEventAuditTrail(event.value.eventId),
+    }));
+    expect(
+      await fixture.administration.removeEventCatalogEntry(
+        {
+          kind: "pitch",
+          eventId: event.value.eventId,
+          targetId: pitch.value.pitchId,
+          previewFingerprint: preview.value.fingerprint,
+        },
+        authority,
+      ),
+    ).toMatchObject({ status: "rejected", reason: "invalid-input" });
+    expect(
+      await fixture.storage.transaction((transaction) => ({
+        pitch: transaction.findPitch(pitch.value.pitchId),
+        grant: transaction.findGrantById(pitchGrant.value.grantId),
+      })),
+    ).toMatchObject({ pitch: { pitchId: pitch.value.pitchId }, grant: { status: "active" } });
+    const afterCreateRace = await fixture.storage.transaction((transaction) => ({
+      sessions: transaction.listGrantSessions(eventGrant.value.grantId),
+      grantAudit: transaction.listGrantAudit(eventGrant.value.grantId),
+      catalogAudit: transaction.listEventAuditTrail(event.value.eventId),
+    }));
+    expect(afterCreateRace).toEqual(beforeCreateRace);
+
+    const changedPitch = await fixture.catalog.createPitch(
+      event.value.eventId,
+      { name: "Changed Fingerprint Pitch" },
+      fixture.technical,
+    );
+    if (changedPitch.status !== "accepted") throw new Error("Expected changed Pitch.");
+    const changedGrant = await fixture.administration.createPitchManagerGrant(
+      event.value.eventId,
+      day.value.gameDayId,
+      changedPitch.value.pitchId,
+      authority,
+    );
+    if (changedGrant.status !== "accepted") throw new Error("Expected changed Pitch Grant.");
+    const changedPreview = await fixture.administration.previewEventCatalogRemoval(
+      { kind: "pitch", eventId: event.value.eventId, targetId: changedPitch.value.pitchId },
+      authority,
+    );
+    if (changedPreview.status !== "accepted") throw new Error("Expected changed Pitch preview.");
+    expect(
+      await fixture.administration.disablePitchManagerGrant(
+        event.value.eventId,
+        day.value.gameDayId,
+        changedPitch.value.pitchId,
+        authority,
+      ),
+    ).toMatchObject({ status: "accepted" });
+    expect(
+      await fixture.administration.removeEventCatalogEntry(
+        {
+          kind: "pitch",
+          eventId: event.value.eventId,
+          targetId: changedPitch.value.pitchId,
+          previewFingerprint: changedPreview.value.fingerprint,
+        },
+        authority,
+      ),
+    ).toMatchObject({ status: "rejected", reason: "invalid-input" });
+    expect(
+      await fixture.storage.transaction((transaction) => ({
+        pitch: transaction.findPitch(changedPitch.value.pitchId),
+        grant: transaction.findGrantById(changedGrant.value.grantId),
+      })),
+    ).toMatchObject({
+      pitch: { pitchId: changedPitch.value.pitchId },
+      grant: { status: "disabled" },
+    });
+  });
+
+  test("limits removal roles and retires only authority owned by the removed structure", async () => {
+    const fixture = createFixture();
+    const event = await fixture.catalog.createEvent(
+      { name: "Scoped Removal", timeZone: "UTC" },
+      fixture.technical,
+    );
+    if (event.status !== "accepted") throw new Error("Expected Event.");
+    const day = await fixture.catalog.addGameDay(
+      event.value.eventId,
+      { date: "2026-08-14" },
+      fixture.technical,
+    );
+    const pitch = await fixture.catalog.createPitch(
+      event.value.eventId,
+      { name: "Pitch A" },
+      fixture.technical,
+    );
+    if (day.status !== "accepted" || pitch.status !== "accepted")
+      throw new Error("Expected catalog structure.");
+    const eventGrant = await fixture.administration.createEventAdminGrant(
+      event.value.eventId,
+      fixture.technical,
+    );
+    if (eventGrant.status !== "accepted") throw new Error("Expected Event Admin Grant.");
+    const eventReveal = await fixture.grants.revealGrant(
+      eventGrant.value.grantId,
+      fixture.technical,
+    );
+    if (eventReveal.status !== "revealed") throw new Error("Expected Event Admin credential.");
+    const admission = await fixture.administration.admitEventAdmin({
+      qrCredential: eventReveal.qrCredential,
+      browserContext: "scoped-removal-browser",
+    });
+    if (admission.status !== "admitted") throw new Error("Expected Event Admin session.");
+    const authority = { kind: "grant-session" as const, sessionBearer: admission.sessionBearer };
+    expect(
+      await fixture.administration.previewEventCatalogRemoval(
+        { kind: "pitch", eventId: event.value.eventId, targetId: pitch.value.pitchId },
+        fixture.technical,
+      ),
+    ).toMatchObject({ status: "rejected", reason: "unauthorized" });
+    expect(
+      await fixture.administration.previewEventCatalogRemoval(
+        { kind: "event", eventId: event.value.eventId, targetId: event.value.eventId },
+        authority,
+      ),
+    ).toMatchObject({ status: "rejected", reason: "unauthorized" });
+    const pitchGrant = await fixture.administration.createPitchManagerGrant(
+      event.value.eventId,
+      day.value.gameDayId,
+      pitch.value.pitchId,
+      authority,
+    );
+    if (pitchGrant.status !== "accepted") throw new Error("Expected Pitch Manager Grant.");
+    const preview = await fixture.administration.previewEventCatalogRemoval(
+      { kind: "pitch", eventId: event.value.eventId, targetId: pitch.value.pitchId },
+      authority,
+    );
+    expect(preview).toMatchObject({
+      status: "accepted",
+      value: { eligible: true, impact: { retiredAuthorityCount: 1 } },
+    });
+    if (preview.status !== "accepted") throw new Error("Expected pitch preview.");
+    expect(
+      await fixture.administration.removeEventCatalogEntry(
+        {
+          kind: "pitch",
+          eventId: event.value.eventId,
+          targetId: pitch.value.pitchId,
+          previewFingerprint: preview.value.fingerprint,
+        },
+        authority,
+      ),
+    ).toMatchObject({ status: "accepted", value: { retiredAuthorityCount: 1 } });
+    expect(
+      await fixture.storage.transaction((transaction) => ({
+        eventGrant: transaction.findGrantById(eventGrant.value.grantId)?.status,
+        pitchGrant: transaction.findGrantById(pitchGrant.value.grantId)?.status,
+      })),
+    ).toEqual({ eventGrant: "active", pitchGrant: "expired" });
+  });
+
+  test("rejects removal after Grant Code or QR material changes without refreshing activity", async () => {
+    const fixture = createFixture();
+    const event = await fixture.catalog.createEvent(
+      { name: "Credential fingerprint removal", timeZone: "UTC" },
+      fixture.technical,
+    );
+    const day =
+      event.status === "accepted"
+        ? await fixture.catalog.addGameDay(
+            event.value.eventId,
+            { date: "2026-08-14" },
+            fixture.technical,
+          )
+        : null;
+    const pitch =
+      event.status === "accepted"
+        ? await fixture.catalog.createPitch(
+            event.value.eventId,
+            { name: "Fingerprint Pitch" },
+            fixture.technical,
+          )
+        : null;
+    if (event.status !== "accepted" || day?.status !== "accepted" || pitch?.status !== "accepted")
+      throw new Error("Expected removal structure.");
+    const eventGrant = await fixture.administration.createEventAdminGrant(
+      event.value.eventId,
+      fixture.technical,
+    );
+    if (eventGrant.status !== "accepted") throw new Error("Expected Event Admin Grant.");
+    const reveal = await fixture.grants.revealGrant(eventGrant.value.grantId, fixture.technical);
+    if (reveal.status !== "revealed") throw new Error("Expected Event Admin credential.");
+    const admission = await fixture.administration.admitEventAdmin({
+      qrCredential: reveal.qrCredential,
+      browserContext: "credential-fingerprint-browser",
+    });
+    if (admission.status !== "admitted") throw new Error("Expected Event Admin session.");
+    const eventAdmin = { kind: "grant-session" as const, sessionBearer: admission.sessionBearer };
+    const manager = await fixture.administration.createPitchManagerGrant(
+      event.value.eventId,
+      day.value.gameDayId,
+      pitch.value.pitchId,
+      eventAdmin,
+    );
+    if (manager.status !== "accepted") throw new Error("Expected Pitch Manager Grant.");
+    const code = await fixture.grants.createGrantCode(manager.value.grantId, eventAdmin);
+    if (code.status !== "created") throw new Error("Expected Grant Code.");
+
+    const codePreview = await fixture.administration.previewEventCatalogRemoval(
+      { kind: "pitch", eventId: event.value.eventId, targetId: pitch.value.pitchId },
+      eventAdmin,
+    );
+    if (codePreview.status !== "accepted") throw new Error("Expected code preview.");
+    const replace = await fixture.grants.replaceGrantCode(manager.value.grantId, eventAdmin);
+    expect(replace).toMatchObject({ status: "replaced" });
+    const afterCodeChange = await removalState(fixture, event.value.eventId, manager.value.grantId);
+    expect(
+      await fixture.administration.removeEventCatalogEntry(
+        {
+          kind: "pitch",
+          eventId: event.value.eventId,
+          targetId: pitch.value.pitchId,
+          previewFingerprint: codePreview.value.fingerprint,
+        },
+        eventAdmin,
+      ),
+    ).toMatchObject({ status: "rejected", reason: "invalid-input" });
+    expect(await removalState(fixture, event.value.eventId, manager.value.grantId)).toEqual(
+      afterCodeChange,
+    );
+
+    const qrPreview = await fixture.administration.previewEventCatalogRemoval(
+      { kind: "pitch", eventId: event.value.eventId, targetId: pitch.value.pitchId },
+      eventAdmin,
+    );
+    if (qrPreview.status !== "accepted") throw new Error("Expected QR preview.");
+    expect(await fixture.grants.rotateGrant(manager.value.grantId, eventAdmin)).toMatchObject({
+      status: "updated",
+    });
+    const afterQrChange = await removalState(fixture, event.value.eventId, manager.value.grantId);
+    expect(
+      await fixture.administration.removeEventCatalogEntry(
+        {
+          kind: "pitch",
+          eventId: event.value.eventId,
+          targetId: pitch.value.pitchId,
+          previewFingerprint: qrPreview.value.fingerprint,
+        },
+        eventAdmin,
+      ),
+    ).toMatchObject({ status: "rejected", reason: "invalid-input" });
+    expect(await removalState(fixture, event.value.eventId, manager.value.grantId)).toEqual(
+      afterQrChange,
+    );
+  });
+
+  test("rolls back typed retirement before catalog removal and allows a retry", async () => {
+    const fixture = createFixture();
+    const event = await fixture.catalog.createEvent(
+      { name: "Removal rollback", timeZone: "UTC" },
+      fixture.technical,
+    );
+    const day =
+      event.status === "accepted"
+        ? await fixture.catalog.addGameDay(
+            event.value.eventId,
+            { date: "2026-08-14" },
+            fixture.technical,
+          )
+        : null;
+    const pitch =
+      event.status === "accepted"
+        ? await fixture.catalog.createPitch(
+            event.value.eventId,
+            { name: "Rollback Pitch" },
+            fixture.technical,
+          )
+        : null;
+    if (event.status !== "accepted" || day?.status !== "accepted" || pitch?.status !== "accepted")
+      throw new Error("Expected removal structure.");
+    const eventGrant = await fixture.administration.createEventAdminGrant(
+      event.value.eventId,
+      fixture.technical,
+    );
+    if (eventGrant.status !== "accepted") throw new Error("Expected Event Admin Grant.");
+    const reveal = await fixture.grants.revealGrant(eventGrant.value.grantId, fixture.technical);
+    if (reveal.status !== "revealed") throw new Error("Expected Event Admin credential.");
+    const admission = await fixture.administration.admitEventAdmin({
+      qrCredential: reveal.qrCredential,
+      browserContext: "rollback-removal-browser",
+    });
+    if (admission.status !== "admitted") throw new Error("Expected Event Admin session.");
+    const eventAdmin = { kind: "grant-session" as const, sessionBearer: admission.sessionBearer };
+    const manager = await fixture.administration.createPitchManagerGrant(
+      event.value.eventId,
+      day.value.gameDayId,
+      pitch.value.pitchId,
+      eventAdmin,
+    );
+    if (manager.status !== "accepted") throw new Error("Expected Pitch Manager Grant.");
+    const code = await fixture.grants.createGrantCode(manager.value.grantId, eventAdmin);
+    if (code.status !== "created") throw new Error("Expected Grant Code.");
+    const preview = await fixture.administration.previewEventCatalogRemoval(
+      { kind: "pitch", eventId: event.value.eventId, targetId: pitch.value.pitchId },
+      eventAdmin,
+    );
+    if (preview.status !== "accepted") throw new Error("Expected removal preview.");
+    const before = await removalState(fixture, event.value.eventId, manager.value.grantId);
+    let inject = true;
+    const injectedAdministration = createEventAdministration({
+      storage: fixture.storage,
+      grants: fixture.grants,
+      nowMs: () => Date.parse("2026-08-14T12:00:00Z"),
+      removalFailureInjector: () => {
+        if (inject) {
+          inject = false;
+          throw new Error("injected removal failure after Grant retirement");
+        }
+      },
+    });
+    expect(
+      await injectedAdministration.removeEventCatalogEntry(
+        {
+          kind: "pitch",
+          eventId: event.value.eventId,
+          targetId: pitch.value.pitchId,
+          previewFingerprint: preview.value.fingerprint,
+        },
+        eventAdmin,
+      ),
+    ).toMatchObject({ status: "retryable-failure" });
+    expect(await removalState(fixture, event.value.eventId, manager.value.grantId)).toEqual(before);
+    expect(
+      await injectedAdministration.removeEventCatalogEntry(
+        {
+          kind: "pitch",
+          eventId: event.value.eventId,
+          targetId: pitch.value.pitchId,
+          previewFingerprint: preview.value.fingerprint,
+        },
+        eventAdmin,
+      ),
+    ).toMatchObject({ status: "accepted", value: { removed: true } });
+    expect(await removalState(fixture, event.value.eventId, manager.value.grantId)).toMatchObject({
+      event: { eventId: event.value.eventId },
+      grant: { status: "expired" },
+      pitches: [],
+    });
+  });
+
+  test("refreshes existing private and public readers after accepted removal", async () => {
+    const fixture = createFixture();
+    const event = await fixture.catalog.createEvent(
+      { name: "Projection removal", timeZone: "UTC" },
+      fixture.technical,
+    );
+    const day =
+      event.status === "accepted"
+        ? await fixture.catalog.addGameDay(
+            event.value.eventId,
+            { date: "2026-08-14" },
+            fixture.technical,
+          )
+        : null;
+    const pitch =
+      event.status === "accepted"
+        ? await fixture.catalog.createPitch(
+            event.value.eventId,
+            { name: "Projection Pitch" },
+            fixture.technical,
+          )
+        : null;
+    if (event.status !== "accepted" || day?.status !== "accepted" || pitch?.status !== "accepted")
+      throw new Error("Expected removal structure.");
+    expect(
+      await fixture.catalog.changePublicationStatus(
+        event.value.eventId,
+        { status: "published" },
+        fixture.technical,
+      ),
+    ).toMatchObject({ status: "accepted" });
+    const grant = await fixture.administration.createEventAdminGrant(
+      event.value.eventId,
+      fixture.technical,
+    );
+    if (grant.status !== "accepted") throw new Error("Expected Event Admin Grant.");
+    const reveal = await fixture.grants.revealGrant(grant.value.grantId, fixture.technical);
+    if (reveal.status !== "revealed") throw new Error("Expected Event Admin credential.");
+    const admission = await fixture.administration.admitEventAdmin({
+      qrCredential: reveal.qrCredential,
+      browserContext: "projection-removal-browser",
+    });
+    if (admission.status !== "admitted") throw new Error("Expected Event Admin session.");
+    const eventAdmin = { kind: "grant-session" as const, sessionBearer: admission.sessionBearer };
+    const preview = await fixture.administration.previewEventCatalogRemoval(
+      { kind: "pitch", eventId: event.value.eventId, targetId: pitch.value.pitchId },
+      eventAdmin,
+    );
+    if (preview.status !== "accepted") throw new Error("Expected removal preview.");
+    expect(
+      await fixture.administration.removeEventCatalogEntry(
+        {
+          kind: "pitch",
+          eventId: event.value.eventId,
+          targetId: pitch.value.pitchId,
+          previewFingerprint: preview.value.fingerprint,
+        },
+        eventAdmin,
+      ),
+    ).toMatchObject({ status: "accepted" });
+    expect(
+      await fixture.administration.openEventHub({
+        eventId: event.value.eventId,
+        gameDayId: day.value.gameDayId,
+        authority: eventAdmin,
+      }),
+    ).toMatchObject({ status: "accepted", value: { event: { pitches: [] } } });
+    expect(
+      await fixture.administration.openSlotSetup(
+        event.value.eventId,
+        day.value.gameDayId,
+        eventAdmin,
+      ),
+    ).toMatchObject({ status: "accepted", value: { pitches: [], eventGames: [] } });
+    expect(
+      await fixture.administration.openPitchView(
+        event.value.eventId,
+        day.value.gameDayId,
+        pitch.value.pitchId,
+        eventAdmin,
+      ),
+    ).toMatchObject({ status: "rejected", reason: "not-found" });
+    const audience = createAudienceProjection(
+      createFoundationEventCatalogStorage(fixture.storage),
+      {
+        now: () => Date.parse("2026-08-14T12:00:00Z"),
+      },
+    );
+    expect(await audience.read(event.value.eventId)).toMatchObject({
+      status: "accepted",
+      value: { publicationStatus: "published", pitches: [] },
+    });
+  });
+
+  test("fails closed when owned authority scope is malformed", async () => {
+    const fixture = createFixture();
+    const event = await fixture.catalog.createEvent(
+      { name: "Malformed authority removal", timeZone: "UTC" },
+      fixture.technical,
+    );
+    const day =
+      event.status === "accepted"
+        ? await fixture.catalog.addGameDay(
+            event.value.eventId,
+            { date: "2026-08-14" },
+            fixture.technical,
+          )
+        : null;
+    const pitch =
+      event.status === "accepted"
+        ? await fixture.catalog.createPitch(
+            event.value.eventId,
+            { name: "Malformed Pitch" },
+            fixture.technical,
+          )
+        : null;
+    if (event.status !== "accepted" || day?.status !== "accepted" || pitch?.status !== "accepted")
+      throw new Error("Expected removal structure.");
+    const eventGrant = await fixture.administration.createEventAdminGrant(
+      event.value.eventId,
+      fixture.technical,
+    );
+    if (eventGrant.status !== "accepted") throw new Error("Expected Event Admin Grant.");
+    const reveal = await fixture.grants.revealGrant(eventGrant.value.grantId, fixture.technical);
+    if (reveal.status !== "revealed") throw new Error("Expected Event Admin credential.");
+    const admission = await fixture.administration.admitEventAdmin({
+      qrCredential: reveal.qrCredential,
+      browserContext: "malformed-authority-browser",
+    });
+    if (admission.status !== "admitted") throw new Error("Expected Event Admin session.");
+    const eventAdmin = { kind: "grant-session" as const, sessionBearer: admission.sessionBearer };
+    const manager = await fixture.administration.createPitchManagerGrant(
+      event.value.eventId,
+      day.value.gameDayId,
+      pitch.value.pitchId,
+      eventAdmin,
+    );
+    if (manager.status !== "accepted") throw new Error("Expected Pitch Manager Grant.");
+    const malformedStorage = new Proxy(fixture.storage, {
+      get(target, property, receiver) {
+        if (property !== "transaction") return Reflect.get(target, property, receiver);
+        return (work: (transaction: unknown) => unknown) =>
+          target.transaction((transaction) => {
+            const wrapped = new Proxy(transaction, {
+              get(transactionTarget, transactionProperty, transactionReceiver) {
+                if (transactionProperty !== "listGrants")
+                  return Reflect.get(transactionTarget, transactionProperty, transactionReceiver);
+                return () => {
+                  const grants = transactionTarget.listGrants();
+                  const stored = grants.find((grant) => grant.grantId === manager.value.grantId);
+                  if (stored === undefined) return grants;
+                  return [
+                    ...grants.filter((grant) => grant.grantId !== manager.value.grantId),
+                    {
+                      ...stored,
+                      scope: { eventId: event.value.eventId, pitchId: pitch.value.pitchId },
+                    },
+                  ];
+                };
+              },
+            });
+            return work(wrapped);
+          });
+      },
+    }) as FoundationStorage;
+    const malformedAdministration = createEventAdministration({
+      storage: malformedStorage,
+      grants: fixture.grants,
+      nowMs: () => Date.parse("2026-08-14T12:00:00Z"),
+    });
+    const preview = await malformedAdministration.previewEventCatalogRemoval(
+      { kind: "pitch", eventId: event.value.eventId, targetId: pitch.value.pitchId },
+      eventAdmin,
+    );
+    expect(preview).toMatchObject({
+      status: "accepted",
+      value: {
+        eligible: false,
+        repairWorkflow: "Event Catalog removal is unavailable.",
+        impact: { retiredAuthorityCount: 0 },
+      },
+    });
+    if (preview.status !== "accepted") return;
+    const before = await fixture.storage.transaction((transaction) => ({
+      pitch: transaction.findPitch(pitch.value.pitchId),
+      grant: transaction.findGrantById(manager.value.grantId),
+      session: transaction.listGrantSessions(eventGrant.value.grantId),
+      audit: transaction.listEventAuditTrail(event.value.eventId),
+    }));
+    expect(
+      await malformedAdministration.removeEventCatalogEntry(
+        {
+          kind: "pitch",
+          eventId: event.value.eventId,
+          targetId: pitch.value.pitchId,
+          previewFingerprint: preview.value.fingerprint,
+        },
+        eventAdmin,
+      ),
+    ).toMatchObject({ status: "rejected", reason: "in-use" });
+    expect(
+      await fixture.storage.transaction((transaction) => ({
+        pitch: transaction.findPitch(pitch.value.pitchId),
+        grant: transaction.findGrantById(manager.value.grantId),
+        session: transaction.listGrantSessions(eventGrant.value.grantId),
+        audit: transaction.listEventAuditTrail(event.value.eventId),
+      })),
+    ).toEqual(before);
+  });
+
   test("creates a secret-free handoff, admits a pseudonymous session, and opens the same Hub", async () => {
     const fixture = createFixture();
     const event = await fixture.catalog.createEvent(
@@ -692,50 +1502,6 @@ describe("Event Administration handoff", () => {
     ).toMatchObject({ status: "rejected", reason: "unauthorized" });
   });
 
-  test("preserves empty Event removal while rejecting removal of an attached Grant", async () => {
-    const fixture = createFixture();
-    const event = await fixture.catalog.createEvent(
-      { name: "Attached Grant Event", timeZone: "UTC" },
-      fixture.technical,
-    );
-    if (event.status !== "accepted") throw new Error("Expected Event.");
-    const day = await fixture.catalog.addGameDay(
-      event.value.eventId,
-      { date: "2026-08-14" },
-      fixture.technical,
-    );
-    if (day.status !== "accepted") throw new Error("Expected Game Day.");
-    const grant = await fixture.administration.createEventAdminGrant(
-      event.value.eventId,
-      fixture.technical,
-    );
-    if (grant.status !== "accepted") throw new Error("Expected Grant.");
-    expect(
-      await fixture.catalog.removeGameDay(
-        event.value.eventId,
-        day.value.gameDayId,
-        fixture.technical,
-      ),
-    ).toMatchObject({ status: "accepted" });
-    expect(await fixture.catalog.removeEvent(event.value.eventId, fixture.technical)).toMatchObject(
-      {
-        status: "rejected",
-        reason: "in-use",
-        detail: "Event has an attached Event Admin Grant.",
-      },
-    );
-    const empty = await fixture.catalog.createEvent(
-      { name: "No Grant Event", timeZone: "UTC" },
-      fixture.technical,
-    );
-    if (empty.status !== "accepted") throw new Error("Expected empty Event.");
-    expect(await fixture.catalog.removeEvent(empty.value.eventId, fixture.technical)).toMatchObject(
-      {
-        status: "accepted",
-      },
-    );
-  });
-
   test("lets Event Administration configure Teams, public roster mappings, and Pitches", async () => {
     const fixture = createFixture();
     const event = await fixture.catalog.createEvent(
@@ -1273,6 +2039,23 @@ function createFixture(storage: FoundationStorage = createInMemoryFoundationStor
 
 function bytes(value: number): Uint8Array {
   return new Uint8Array(32).fill(value);
+}
+
+async function removalState(
+  fixture: ReturnType<typeof createFixture>,
+  eventId: string,
+  grantId: string,
+) {
+  return fixture.storage.transaction((transaction) => ({
+    event: transaction.findEvent(eventId),
+    grant: transaction.findGrantById(grantId),
+    grants: transaction.listGrants(),
+    sessions: transaction.listGrantSessions(grantId),
+    grantAudit: transaction.listGrantAudit(grantId),
+    eventAudit: transaction.listEventAuditTrail(eventId),
+    gameDays: transaction.listGameDays(eventId),
+    pitches: transaction.listPitches(eventId),
+  }));
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

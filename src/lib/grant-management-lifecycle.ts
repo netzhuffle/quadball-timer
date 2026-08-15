@@ -14,7 +14,7 @@ import {
   validateGrantScope,
 } from "@/lib/grant-types";
 import { eraseGrantCode } from "@/lib/grant-code";
-import { createAuditEntry, expireGrantIfDue } from "@/lib/grant-lifecycle";
+import { createAuditEntry, eraseGrantCredential, expireGrantIfDue } from "@/lib/grant-lifecycle";
 import { grantExpiryCap, resolveGrantExpiry } from "@/lib/grant-calendar";
 import {
   bindingFor,
@@ -33,6 +33,78 @@ export type GrantLifecycleMetadataCorrection = {
   gameDayDate?: string;
   finalGameDayDate?: string;
 };
+
+export function retireGrantInTransaction(
+  transaction: import("@/lib/foundation-storage").FoundationStorageTransaction,
+  options: GrantAuthorityOptions,
+  input: {
+    grantId: string;
+    actorReference: string;
+    reason: "event-catalog-removal";
+  },
+): TypedGrantMutation {
+  const stored = transaction.findGrantById(input.grantId);
+  if (stored === null) return { status: "rejected", reason: "not-found" };
+  const current = expireGrantIfDue(transaction, options, stored);
+  if (current.status === "expired")
+    return { status: "updated", grantId: current.grantId, grantVersion: current.grantVersion };
+  const nowMs = readNow(options);
+  const retired: StoredGrant = {
+    ...current,
+    status: "expired",
+    credential: eraseGrantCredential(current.credential),
+    code:
+      current.code === undefined || current.code === null
+        ? null
+        : eraseGrantCode(current.code, "erased"),
+  };
+  transaction.updateGrant(retired);
+  for (const session of transaction.listGrantSessions(current.grantId)) {
+    transaction.updateGrantSession({
+      ...session,
+      status: "expired",
+      bearerMaterialState: "erased",
+      bearerLookupVerifier: null,
+      bearerLookupKeyVersion: null,
+      revokedAtMs: session.revokedAtMs ?? nowMs,
+    });
+  }
+  transaction.appendGrantAudit(
+    createAuditEntry(options, {
+      action: "grant-retired",
+      actor: { kind: "external", value: input.actorReference },
+      grant: current,
+      sessionId: null,
+      replacedSessionId: null,
+      eventGameId: null,
+      beforeStatus: current.status,
+      afterStatus: "expired",
+    }),
+  );
+  if (current.code?.state === "present" || current.code?.state === "disabled") {
+    transaction.appendGrantAudit({
+      ...createAuditEntry(options, {
+        action: "grant-code-erased-removal",
+        actor: { kind: "external", value: input.actorReference },
+        grant: current,
+        sessionId: null,
+        replacedSessionId: null,
+        eventGameId: null,
+        beforeStatus: current.status,
+        afterStatus: "expired",
+        credentialKind: GRANT_CODE_KIND,
+        codeFormatVersion: current.code.formatVersion,
+        codeEncryptionKeyVersion: current.code.encryptionKeyVersion,
+        codeLookupKeyVersion: current.code.lookupKeyVersion,
+        codeStateBefore: current.code.state,
+        codeState: "erased",
+        previousCodeFingerprint: current.code.fingerprint,
+      }),
+      credentialFingerprint: current.code.fingerprint,
+    });
+  }
+  return { status: "updated", grantId: retired.grantId, grantVersion: retired.grantVersion };
+}
 
 /**
  * A Grant Code is bound to the Grant version and scope. The public reactivation
