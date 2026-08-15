@@ -81,6 +81,7 @@ verify_bundle() {
 if [[ -n "$staged_dir" ]]; then
   [[ ! -e "$release_dir" ]] || { echo "Test release identity already exists and cannot be overwritten." >&2; exit 1; }
   verify_bundle "$staged_dir"
+  chmod u+w -- "$staged_dir"
   mv -- "$staged_dir" "$release_dir"
   cleanup_staged=0
   chmod -R a-w -- "$release_dir"
