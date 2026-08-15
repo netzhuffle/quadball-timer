@@ -3,6 +3,7 @@ import { chmodSync, mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync }
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  assertEnvironmentStorageBoundary,
   assertProductionStateBoundary,
   readRuntimeStoragePaths,
 } from "@/lib/runtime-storage-config";
@@ -12,6 +13,7 @@ describe("runtime storage configuration", () => {
     expect(readRuntimeStoragePaths("production", {})).toEqual({
       technicalAdminDatabase: "/var/lib/quadball-timer/technical-admin.sqlite",
       foundationDatabase: "/var/lib/quadball-timer/foundation.sqlite",
+      eventGameDatabase: "/var/lib/quadball-timer/event-game.sqlite",
     });
   });
 
@@ -19,6 +21,7 @@ describe("runtime storage configuration", () => {
     expect(readRuntimeStoragePaths("test", {})).toEqual({
       technicalAdminDatabase: "data/test/technical-admin.sqlite",
       foundationDatabase: "data/test/foundation.sqlite",
+      eventGameDatabase: "data/test/event-game.sqlite",
     });
   });
 
@@ -27,6 +30,7 @@ describe("runtime storage configuration", () => {
       readRuntimeStoragePaths("production", {
         TECHNICAL_ADMIN_DATABASE: "/tmp/timer-test/technical-admin.sqlite",
         FOUNDATION_DATABASE: "/tmp/timer-test/foundation.sqlite",
+        EVENT_GAME_DATABASE: "/tmp/timer-test/event-game.sqlite",
       }),
     ).toThrow("canonical path");
   });
@@ -36,10 +40,12 @@ describe("runtime storage configuration", () => {
       readRuntimeStoragePaths("test", {
         TECHNICAL_ADMIN_DATABASE: "/tmp/timer-test/technical-admin.sqlite",
         FOUNDATION_DATABASE: "/tmp/timer-test/foundation.sqlite",
+        EVENT_GAME_DATABASE: "/tmp/timer-test/event-game.sqlite",
       }),
     ).toEqual({
       technicalAdminDatabase: "/tmp/timer-test/technical-admin.sqlite",
       foundationDatabase: "/tmp/timer-test/foundation.sqlite",
+      eventGameDatabase: "/tmp/timer-test/event-game.sqlite",
     });
   });
 
@@ -52,6 +58,7 @@ describe("runtime storage configuration", () => {
         assertProductionStateBoundary("production", {
           technicalAdminDatabase: join(directory, "technical-admin.sqlite"),
           foundationDatabase: join(directory, "foundation.sqlite"),
+          eventGameDatabase: join(directory, "event-game.sqlite"),
         }),
       ).not.toThrow();
     } finally {
@@ -76,6 +83,7 @@ describe("runtime storage configuration", () => {
           assertProductionStateBoundary("production", {
             technicalAdminDatabase: join(directory, "technical-admin.sqlite"),
             foundationDatabase: join(directory, "foundation.sqlite"),
+            eventGameDatabase: join(directory, "event-game.sqlite"),
           }),
         ).toThrow("Production state directory");
       }
@@ -89,6 +97,7 @@ describe("runtime storage configuration", () => {
       assertProductionStateBoundary("production", {
         technicalAdminDatabase: "/var/lib/quadball-timer/technical-admin.sqlite",
         foundationDatabase: "/srv/quadball-timer/foundation.sqlite",
+        eventGameDatabase: "/var/lib/quadball-timer/event-game.sqlite",
       }),
     ).toThrow("one state directory");
   });
@@ -111,11 +120,23 @@ describe("runtime storage configuration", () => {
           assertProductionStateBoundary("production", {
             technicalAdminDatabase,
             foundationDatabase: join(root, "foundation.sqlite"),
+            eventGameDatabase: join(root, "event-game.sqlite"),
           }),
         ).toThrow("Technical Admin database");
       }
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+
+  test("rejects Test paths inside Production state", () => {
+    expect(() => {
+      const paths = readRuntimeStoragePaths("test", {
+        TECHNICAL_ADMIN_DATABASE: "/var/lib/quadball-timer/technical-admin.sqlite",
+        FOUNDATION_DATABASE: "/var/lib/quadball-timer-test/foundation.sqlite",
+        EVENT_GAME_DATABASE: "/var/lib/quadball-timer-test/event-game.sqlite",
+      });
+      assertEnvironmentStorageBoundary("test", paths);
+    }).toThrow("Production state");
   });
 });

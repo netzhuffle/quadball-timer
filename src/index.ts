@@ -198,8 +198,7 @@ async function startServer() {
       }
     }
     let liveEventRuntime: LiveEventGameRuntime | null = null;
-    const liveEventDatabasePath =
-      process.env.EVENT_GAME_DATABASE ?? `data/${environment}/event-game.sqlite`;
+    const liveEventDatabasePath = storagePaths.eventGameDatabase;
     const liveEventKeyRing = readLiveEventGrantKeyRing();
     if (liveEventKeyRing !== null) {
       try {
@@ -242,6 +241,8 @@ async function startServer() {
     };
     process.once("SIGTERM", shutdown);
     process.once("SIGINT", shutdown);
+
+    const htmlRoute = environment === "test" ? await createTestHtmlRoute() : index;
 
     server = serve<SessionData>({
       hostname: process.env.HOST ?? "127.0.0.1",
@@ -761,10 +762,10 @@ async function startServer() {
             const gameId = new URL(req.url).pathname.split("/").at(-1) ?? "";
             const sessionId = readAdHocSession(req.headers.get("cookie"), gameId);
             const result = await adHocService.read({ gameId, sessionId });
-            return result.status === "accepted" ? index : adHocUnavailableResponse();
+            return result.status === "accepted" ? htmlRoute : adHocUnavailableResponse();
           },
         },
-        "/*": adHocFallbackRoute,
+        "/*": (req: Request) => adHocFallbackRouteFor(req, htmlRoute),
       },
       development: process.env.NODE_ENV !== "production" && {
         hmr: true,
@@ -907,6 +908,32 @@ async function startServer() {
     cleanup();
     throw error;
   }
+}
+
+async function createTestHtmlRoute() {
+  const html = await Bun.file(index.index)
+    .text()
+    .catch(() => null);
+  if (html === null) {
+    throw new Error("Test HTML presentation bundle is unavailable.");
+  }
+
+  const body = html
+    .replace(
+      "</head>",
+      '<meta name="robots" content="noindex, nofollow, noarchive, noimageindex" /></head>',
+    )
+    .replace(
+      "<body>",
+      '<body><div class="test-environment-banner">Test environment — not for live games</div>',
+    );
+  const headers = {
+    "cache-control": "no-store",
+    "content-type": "text/html; charset=utf-8",
+    "x-robots-tag": "noindex, nofollow, noarchive, noimageindex",
+  };
+
+  return () => new Response(body, { headers });
 }
 
 if (import.meta.main) void main();
@@ -1116,8 +1143,12 @@ function clearAdHocSessionCookie(gameId: string): string {
 }
 
 export function adHocFallbackRoute(req: Request) {
+  return adHocFallbackRouteFor(req, index);
+}
+
+function adHocFallbackRouteFor<HtmlRoute>(req: Request, htmlRoute: HtmlRoute) {
   const pathname = new URL(req.url).pathname;
-  return isAdHocPath(pathname) ? adHocUnavailableResponse() : index;
+  return isAdHocPath(pathname) ? adHocUnavailableResponse() : htmlRoute;
 }
 
 function isAdHocPath(pathname: string): boolean {

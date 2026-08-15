@@ -16,7 +16,7 @@ describe("server startup", () => {
       env: {
         NODE_ENV: "production",
         QUADBALL_ENVIRONMENT: "test",
-        PUBLIC_ORIGIN: "https://localhost.test",
+        PUBLIC_ORIGIN: "https://test.timer.quadball.app",
         TECHNICAL_ADMIN_DATABASE: join(stateDirectory, "technical-admin.sqlite"),
         FOUNDATION_DATABASE: join(stateDirectory, "foundation.sqlite"),
         HOST: "127.0.0.1",
@@ -54,7 +54,7 @@ describe("server startup", () => {
       env: {
         NODE_ENV: "production",
         QUADBALL_ENVIRONMENT: "test",
-        PUBLIC_ORIGIN: "https://localhost.test",
+        PUBLIC_ORIGIN: "https://test.timer.quadball.app",
         TECHNICAL_ADMIN_DATABASE: join(stateDirectory, "technical-admin.sqlite"),
         FOUNDATION_DATABASE: join(root, "absent", "foundation.sqlite"),
         HOST: "127.0.0.1",
