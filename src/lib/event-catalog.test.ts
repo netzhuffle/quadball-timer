@@ -716,8 +716,14 @@ describe("Event operations catalog", () => {
     const verifier: WebAuthnVerifier = {
       async verifyRegistration() {
         return {
-          credentialId: "credential-live",
-          publicKey: { kty: "OKP", crv: "Ed25519", x: "public-key" },
+          credentialId: "credential-1",
+          publicKey: {
+            kty: "OKP",
+            crv: "Ed25519",
+            x: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            alg: "EdDSA",
+            ext: true,
+          },
           signCount: 1,
         };
       },
@@ -727,7 +733,11 @@ describe("Event operations catalog", () => {
     };
     const auth = createTechnicalAdminAuth(
       { environment: "test", origin: binding.origin, rpId: "timer.example" },
-      new MemoryTechnicalAdminAuthRepository(),
+      new MemoryTechnicalAdminAuthRepository({
+        environment: "test",
+        origin: binding.origin,
+        rpId: "timer.example",
+      }),
       verifier,
       () => 1_000,
     );
@@ -742,7 +752,7 @@ describe("Event operations catalog", () => {
         value: undefined,
       },
     );
-    const authenticationOptions = auth.beginAuthentication(binding);
+    const authenticationOptions = await auth.beginAuthentication(binding);
     if (!authenticationOptions.ok) throw new Error("Expected authentication options.");
     const session = await auth.completeAuthentication(
       authenticationOptions.value.challengeId,

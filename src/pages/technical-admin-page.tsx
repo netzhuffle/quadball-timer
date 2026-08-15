@@ -6,6 +6,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { AdministrativeAuditBrowser } from "@/pages/administrative-audit-browser";
 import { createGrantSecretOwner, type GrantSecretToken } from "@/lib/grant-secret-owner";
+import { decodeTechnicalAdminCredentialId } from "@/lib/technical-admin-credential";
 
 export type GrantQrRenderer = (credential: string) => Promise<string>;
 
@@ -1089,7 +1090,10 @@ async function getCredential(options: AuthenticationOptionsResponse) {
     publicKey: {
       ...options,
       challenge: decode(options.challenge),
-      allowCredentials: options.allowCredentials.map((item) => ({ ...item, id: decode(item.id) })),
+      allowCredentials: options.allowCredentials.map((item) => ({
+        ...item,
+        id: decodeTechnicalAdminCredentialId(item.id) as BufferSource,
+      })),
     },
   });
   if (!(credential instanceof PublicKeyCredential)) throw new Error("No passkey returned.");

@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
+import { parseTechnicalAdminCredentialId } from "@/lib/technical-admin-credential";
 
 export type TechnicalAdminEnvironment = "production" | "test";
 
@@ -92,6 +93,24 @@ export type TechnicalAdminStorageStatus = {
   activeSessionCount: number;
   generation: number;
 };
+
+export type TechnicalAdminRestorePreparationRequest = {
+  mode: "preserve-compatible-credential" | "explicit-reset";
+};
+
+export type TechnicalAdminRestoreReEnrollmentReason =
+  | "missing"
+  | "invalid"
+  | "incompatible"
+  | "explicit-reset";
+
+export type TechnicalAdminRestorePreparationResult =
+  | { outcome: "preserved-transients-invalidated" }
+  | {
+      outcome: "re-enrollment-required";
+      reason: TechnicalAdminRestoreReEnrollmentReason;
+    }
+  | { outcome: "sanitation-failed" };
 
 export type TechnicalAdminOperationalLog = {
   atMs: number;
@@ -204,6 +223,12 @@ export interface TechnicalAdminAuthRepository {
   activeSessionCount(nowMs: number): number;
   getGeneration(): number;
   resetAuthority(nowMs: number, resetLog: TechnicalAdminOperationalLog): boolean;
+  prepareForFoundationRestore(
+    request: TechnicalAdminRestorePreparationRequest,
+    expectedIdentity: TechnicalAdminStorageIdentity,
+    _nowMs: number,
+  ): Promise<TechnicalAdminRestorePreparationResult>;
+  getStorageIdentity(): TechnicalAdminStorageIdentity | null;
   getStorageStatus(nowMs: number): TechnicalAdminStorageStatus;
   appendOperationalLog(log: TechnicalAdminOperationalLog): void;
   appendAlert(alert: TechnicalAdminAlert): void;
@@ -689,12 +714,12 @@ export function createTechnicalAdminAuth(
           rpId: config.rpId,
           requireUserVerification: true,
         });
-        if (
-          !repository.commitEnrollment(challengeId, {
-            ...credential,
-            createdAtMs: now(),
-          })
-        ) {
+        const storedCredential = { ...credential, createdAtMs: now() };
+        if (!(await isValidCredentialRecord(storedCredential))) {
+          noteFailure(sourceCorrelation, "enrollment-completed");
+          return { ok: false, error: "invalid-ceremony" };
+        }
+        if (!repository.commitEnrollment(challengeId, storedCredential)) {
           noteFailure(sourceCorrelation, "enrollment-completed");
           return { ok: false, error: "invalid-ceremony" };
         }
@@ -706,13 +731,27 @@ export function createTechnicalAdminAuth(
       }
     },
 
-    beginAuthentication(binding: CeremonyBinding): AuthResult<AuthenticationOptions> {
+    async beginAuthentication(
+      binding: CeremonyBinding,
+    ): Promise<AuthResult<AuthenticationOptions>> {
       if (!isExactBinding(binding, expectedOrigin, expectedHost)) {
         return { ok: false, error: "invalid-ceremony" };
       }
       try {
         const credential = repository.getCredential();
-        if (credential === null) return { ok: false, error: "invalid-credentials" };
+        if (credential === null || !(await isValidCredentialRecord(credential))) {
+          return { ok: false, error: "invalid-credentials" };
+        }
+        const storageIdentity = repository.getStorageIdentity();
+        if (
+          !isCompatibleStorageIdentity(storageIdentity, {
+            environment: config.environment,
+            origin: expectedOrigin,
+            rpId: config.rpId,
+          })
+        ) {
+          return { ok: false, error: "invalid-credentials" };
+        }
         const challenge = createChallenge("authentication", now());
         repository.createChallenge(challenge);
         return {
@@ -945,12 +984,17 @@ export function createTechnicalAdminAuth(
           rpId: config.rpId,
           requireUserVerification: true,
         });
+        const storedCredential = { ...replacement, createdAtMs: current };
+        if (!(await isValidCredentialRecord(storedCredential))) {
+          noteFailure(sourceCorrelation, "credential-replaced");
+          return { ok: false, error: "invalid-ceremony" };
+        }
         const created = createSession(current);
         if (
           !repository.commitReplacement(
             challengeId,
             credential.credentialId,
-            { ...replacement, createdAtMs: current },
+            storedCredential,
             created.session,
           )
         ) {
@@ -1095,6 +1139,24 @@ export function createTechnicalAdminAuth(
       }
     },
 
+    async prepareForFoundationRestore(
+      request: TechnicalAdminRestorePreparationRequest,
+    ): Promise<TechnicalAdminRestorePreparationResult> {
+      try {
+        return await repository.prepareForFoundationRestore(
+          request,
+          {
+            environment: config.environment,
+            origin: expectedOrigin,
+            rpId: config.rpId,
+          },
+          now(),
+        );
+      } catch {
+        return { outcome: "sanitation-failed" };
+      }
+    },
+
     revokeOtherSessions(token: string): AuthResult<{ revokedCount: number }> {
       try {
         const current = now();
@@ -1132,7 +1194,7 @@ export interface TechnicalAdminAuth {
     binding: CeremonyBinding,
     sourceCorrelation?: string,
   ): Promise<AuthResult<void>>;
-  beginAuthentication(binding: CeremonyBinding): AuthResult<AuthenticationOptions>;
+  beginAuthentication(binding: CeremonyBinding): Promise<AuthResult<AuthenticationOptions>>;
   completeAuthentication(
     challengeId: string,
     response: unknown,
@@ -1170,6 +1232,9 @@ export interface TechnicalAdminAuth {
   stopRetentionMaintenance(): void;
   close(): void;
   emergencyReset(): AuthResult<EnrollmentAuthorization>;
+  prepareForFoundationRestore(
+    request: TechnicalAdminRestorePreparationRequest,
+  ): Promise<TechnicalAdminRestorePreparationResult>;
   revokeOtherSessions(token: string): AuthResult<{ revokedCount: number }>;
   correlateSource(value: string): string;
   isExpectedBinding(binding: CeremonyBinding): boolean;
@@ -1252,6 +1317,8 @@ export class NativeWebAuthnVerifier implements WebAuthnVerifier {
 }
 
 export class MemoryTechnicalAdminAuthRepository implements TechnicalAdminAuthRepository {
+  storageIdentity: TechnicalAdminStorageIdentity | null;
+  failRestoreCommit = false;
   credential: CredentialRecord | null = null;
   enrollment: EnrollmentRecord | null = null;
   challenges = new Map<string, ChallengeRecord>();
@@ -1259,6 +1326,10 @@ export class MemoryTechnicalAdminAuthRepository implements TechnicalAdminAuthRep
   logs: TechnicalAdminOperationalLog[] = [];
   alerts: TechnicalAdminAlert[] = [];
   generation = 0;
+
+  constructor(storageIdentity: TechnicalAdminStorageIdentity | null = null) {
+    this.storageIdentity = storageIdentity;
+  }
 
   hasCredential() {
     return this.credential !== null;
@@ -1394,6 +1465,58 @@ export class MemoryTechnicalAdminAuthRepository implements TechnicalAdminAuthRep
   getGeneration() {
     return this.generation;
   }
+  getStorageIdentity() {
+    return this.storageIdentity;
+  }
+  async prepareForFoundationRestore(
+    request: TechnicalAdminRestorePreparationRequest,
+    expectedIdentity: TechnicalAdminStorageIdentity,
+    _nowMs: number,
+  ): Promise<TechnicalAdminRestorePreparationResult> {
+    const previousCredential = this.credential;
+    const previousEnrollment = this.enrollment;
+    const previousChallenges = new Map(this.challenges);
+    const previousSessions = new Map(
+      [...this.sessions].map(([id, session]) => [id, { ...session }] as const),
+    );
+    const previousGeneration = this.generation;
+    try {
+      if (request.mode === "explicit-reset") {
+        this.credential = null;
+        this.enrollment = null;
+        this.challenges.clear();
+        this.sessions.clear();
+        this.generation += 1;
+        if (this.failRestoreCommit) throw new Error("injected restore commit failure");
+        return { outcome: "re-enrollment-required", reason: "explicit-reset" };
+      }
+      const compatible = isCompatibleStorageIdentity(this.storageIdentity, expectedIdentity);
+      const credential = this.credential;
+      const credentialReason = !compatible
+        ? ("incompatible" as const)
+        : credential === null
+          ? ("missing" as const)
+          : !(await isValidCredentialRecord(credential))
+            ? ("invalid" as const)
+            : null;
+
+      this.enrollment = null;
+      this.challenges.clear();
+      this.sessions.clear();
+      this.generation += 1;
+      if (this.failRestoreCommit) throw new Error("injected restore commit failure");
+      return credentialReason === null
+        ? { outcome: "preserved-transients-invalidated" }
+        : { outcome: "re-enrollment-required", reason: credentialReason };
+    } catch {
+      this.credential = previousCredential;
+      this.enrollment = previousEnrollment;
+      this.challenges = previousChallenges;
+      this.sessions = previousSessions;
+      this.generation = previousGeneration;
+      return { outcome: "sanitation-failed" };
+    }
+  }
   resetAuthority(nowMs: number, resetLog: TechnicalAdminOperationalLog) {
     const previousCredential = this.credential;
     const previousEnrollment = this.enrollment;
@@ -1521,10 +1644,28 @@ export class SqliteTechnicalAdminAuthRepository implements TechnicalAdminAuthRep
       ) {
         throw new Error("Technical Admin storage identity does not match the environment.");
       }
-      if (!existing)
-        this.database
-          .query("INSERT INTO technical_admin_storage_identity VALUES (1, ?, ?, ?)")
-          .run(identity.environment, identity.origin, identity.rpId);
+      if (!existing) {
+        const hasAuthorityState =
+          Number(
+            (
+              this.database
+                .query(
+                  `SELECT COUNT(*) AS count FROM (
+                  SELECT credential_id AS value FROM technical_admin_credentials
+                  UNION ALL SELECT token_hash FROM technical_admin_enrollment
+                  UNION ALL SELECT challenge_id FROM technical_admin_challenges
+                  UNION ALL SELECT session_id FROM technical_admin_sessions
+                )`,
+                )
+                .get() as { count: number }
+            ).count,
+          ) > 0;
+        if (!hasAuthorityState) {
+          this.database
+            .query("INSERT INTO technical_admin_storage_identity VALUES (1, ?, ?, ?)")
+            .run(identity.environment, identity.origin, identity.rpId);
+        }
+      }
     }
   }
   private addColumnIfMissing(table: string, column: string, definition: string) {
@@ -1816,6 +1957,91 @@ export class SqliteTechnicalAdminAuthRepository implements TechnicalAdminAuthRep
       ).generation,
     );
   }
+  getStorageIdentity() {
+    const row = this.database
+      .query("SELECT environment, origin, rp_id FROM technical_admin_storage_identity WHERE id = 1")
+      .get() as { environment: string; origin: string; rp_id: string } | null;
+    return row === null
+      ? null
+      : {
+          environment: row.environment as TechnicalAdminEnvironment,
+          origin: row.origin,
+          rpId: row.rp_id,
+        };
+  }
+  async prepareForFoundationRestore(
+    request: TechnicalAdminRestorePreparationRequest,
+    expectedIdentity: TechnicalAdminStorageIdentity,
+    _nowMs: number,
+  ): Promise<TechnicalAdminRestorePreparationResult> {
+    let transactionOpen = false;
+    try {
+      this.database.exec("BEGIN IMMEDIATE");
+      transactionOpen = true;
+      const quickCheck = this.database.query("PRAGMA quick_check").get() as {
+        quick_check: string;
+      };
+      if (quickCheck.quick_check !== "ok") throw new Error("Technical Admin storage is corrupt.");
+
+      const storedIdentity = this.getStorageIdentity();
+      const credentialCount = Number(
+        (
+          this.database
+            .query("SELECT COUNT(*) AS count FROM technical_admin_credentials")
+            .get() as { count: number }
+        ).count,
+      );
+      const credential = credentialCount === 1 ? this.getCredential() : null;
+      if (credentialCount > 1 || (credentialCount === 1 && credential === null)) {
+        throw new Error("Technical Admin credential store is unclassifiable.");
+      }
+
+      if (request.mode === "explicit-reset") {
+        this.database.query("DELETE FROM technical_admin_credentials").run();
+        this.database.query("DELETE FROM technical_admin_enrollment").run();
+        this.database.query("DELETE FROM technical_admin_challenges").run();
+        this.database.query("DELETE FROM technical_admin_sessions").run();
+        const generationUpdate = this.database
+          .query("UPDATE technical_admin_state SET generation = generation + 1 WHERE id = 1")
+          .run();
+        if (generationUpdate.changes !== 1) throw new Error("Technical Admin state update failed.");
+        this.database.exec("COMMIT");
+        transactionOpen = false;
+        return { outcome: "re-enrollment-required", reason: "explicit-reset" };
+      }
+
+      const compatible = isCompatibleStorageIdentity(storedIdentity, expectedIdentity);
+      let credentialReason: Exclude<
+        TechnicalAdminRestoreReEnrollmentReason,
+        "explicit-reset"
+      > | null = null;
+      if (!compatible) credentialReason = "incompatible";
+      else if (credentialCount === 0) credentialReason = "missing";
+      else if (!(await isValidCredentialRecord(credential))) credentialReason = "invalid";
+
+      this.database.query("DELETE FROM technical_admin_enrollment").run();
+      this.database.query("DELETE FROM technical_admin_challenges").run();
+      this.database.query("DELETE FROM technical_admin_sessions").run();
+      const generationUpdate = this.database
+        .query("UPDATE technical_admin_state SET generation = generation + 1 WHERE id = 1")
+        .run();
+      if (generationUpdate.changes !== 1) throw new Error("Technical Admin state update failed.");
+      this.database.exec("COMMIT");
+      transactionOpen = false;
+      return credentialReason === null
+        ? { outcome: "preserved-transients-invalidated" }
+        : { outcome: "re-enrollment-required", reason: credentialReason };
+    } catch {
+      if (transactionOpen) {
+        try {
+          this.database.exec("ROLLBACK");
+        } catch {
+          // The public result remains the same fail-closed outcome.
+        }
+      }
+      return { outcome: "sanitation-failed" };
+    }
+  }
   resetAuthority(nowMs: number, resetLog: TechnicalAdminOperationalLog) {
     try {
       return this.database.transaction(() => {
@@ -2005,6 +2231,120 @@ function isExactBinding(binding: CeremonyBinding, origin: string, host: string) 
   return binding.origin === origin && binding.host === host;
 }
 
+function isCompatibleStorageIdentity(
+  actual: TechnicalAdminStorageIdentity | null,
+  expected: TechnicalAdminStorageIdentity,
+) {
+  return (
+    actual !== null &&
+    actual.environment === expected.environment &&
+    actual.origin === expected.origin &&
+    actual.rpId === expected.rpId
+  );
+}
+
+type SupportedPublicKey = {
+  key: CryptoKey;
+  algorithm: AlgorithmIdentifier;
+  kty: "EC" | "OKP";
+};
+
+const EC_PUBLIC_JWK_FIELDS = new Set(["kty", "crv", "x", "y", "alg", "ext", "use", "key_ops"]);
+const OKP_PUBLIC_JWK_FIELDS = new Set(["kty", "crv", "x", "alg", "ext", "use", "key_ops"]);
+
+function hasOnlyAllowedPublicJwkFields(publicKey: JsonWebKey, allowedFields: Set<string>) {
+  return Object.keys(publicKey).every((field) => allowedFields.has(field));
+}
+
+async function isValidCredentialRecord(credential: CredentialRecord | null) {
+  if (
+    credential === null ||
+    typeof credential.credentialId !== "string" ||
+    parseTechnicalAdminCredentialId(credential.credentialId) === null ||
+    !Number.isSafeInteger(credential.signCount) ||
+    credential.signCount < 0 ||
+    !Number.isFinite(credential.createdAtMs) ||
+    !isRecord(credential.publicKey)
+  ) {
+    return false;
+  }
+  return (await parseSupportedPublicKey(credential.publicKey)) !== null;
+}
+
+async function parseSupportedPublicKey(publicKey: JsonWebKey): Promise<SupportedPublicKey | null> {
+  if (publicKey.kty === "EC") {
+    if (
+      !hasOnlyAllowedPublicJwkFields(publicKey, EC_PUBLIC_JWK_FIELDS) ||
+      publicKey.crv !== "P-256" ||
+      typeof publicKey.x !== "string" ||
+      typeof publicKey.y !== "string" ||
+      publicKey.alg !== "ES256" ||
+      publicKey.ext !== true ||
+      (publicKey.use !== undefined && publicKey.use !== "sig") ||
+      (publicKey.key_ops !== undefined &&
+        (!Array.isArray(publicKey.key_ops) ||
+          publicKey.key_ops.length !== 1 ||
+          publicKey.key_ops[0] !== "verify"))
+    ) {
+      return null;
+    }
+    const x = decodeCanonicalBase64Url(publicKey.x, 32);
+    const y = decodeCanonicalBase64Url(publicKey.y, 32);
+    if (x === null || y === null) return null;
+    try {
+      return {
+        key: await crypto.subtle.importKey(
+          "jwk",
+          publicKey,
+          { name: "ECDSA", namedCurve: "P-256" },
+          false,
+          ["verify"],
+        ),
+        algorithm: { name: "ECDSA", hash: "SHA-256" } as AlgorithmIdentifier,
+        kty: "EC",
+      };
+    } catch {
+      return null;
+    }
+  }
+  if (publicKey.kty === "OKP") {
+    if (
+      !hasOnlyAllowedPublicJwkFields(publicKey, OKP_PUBLIC_JWK_FIELDS) ||
+      publicKey.crv !== "Ed25519" ||
+      typeof publicKey.x !== "string" ||
+      publicKey.y !== undefined ||
+      publicKey.alg !== "EdDSA" ||
+      publicKey.ext !== true ||
+      (publicKey.use !== undefined && publicKey.use !== "sig") ||
+      (publicKey.key_ops !== undefined &&
+        (!Array.isArray(publicKey.key_ops) ||
+          publicKey.key_ops.length !== 1 ||
+          publicKey.key_ops[0] !== "verify"))
+    ) {
+      return null;
+    }
+    if (decodeCanonicalBase64Url(publicKey.x, 32) === null) return null;
+    try {
+      return {
+        key: await crypto.subtle.importKey("jwk", publicKey, { name: "Ed25519" }, false, [
+          "verify",
+        ]),
+        algorithm: { name: "Ed25519" },
+        kty: "OKP",
+      };
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+function decodeCanonicalBase64Url(value: string, expectedLength: number) {
+  if (!/^[A-Za-z0-9_-]+$/u.test(value)) return null;
+  const bytes = new Uint8Array(Buffer.from(value, "base64url"));
+  return bytes.length === expectedLength && base64UrlEncode(bytes) === value ? bytes : null;
+}
+
 function randomToken() {
   return base64UrlEncode(crypto.getRandomValues(new Uint8Array(TOKEN_BYTES)));
 }
@@ -2110,13 +2450,12 @@ async function verifyWebAuthnSignature(
   signature: Uint8Array,
   data: Uint8Array,
 ) {
-  const algorithm =
-    publicKey.kty === "EC" ? { name: "ECDSA", namedCurve: "P-256" } : { name: "Ed25519" };
-  const key = await crypto.subtle.importKey("jwk", publicKey, algorithm, false, ["verify"]);
-  const normalizedSignature = publicKey.kty === "EC" ? derToP1363(signature) : signature;
+  const supported = await parseSupportedPublicKey(publicKey);
+  if (supported === null) throw new Error("Unsupported public key.");
+  const normalizedSignature = supported.kty === "EC" ? derToP1363(signature) : signature;
   return crypto.subtle.verify(
-    publicKey.kty === "EC" ? { name: "ECDSA", hash: "SHA-256" } : { name: "Ed25519" },
-    key,
+    supported.algorithm,
+    supported.key,
     normalizedSignature as BufferSource,
     data as BufferSource,
   );
