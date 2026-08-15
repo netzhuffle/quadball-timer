@@ -86,6 +86,8 @@ promote_verified_backup_as_root() {
   local previous_target=""
   local previous_path=""
   local previous_identity=""
+  local previous_fd_open=0
+  local previous_fd_identity=""
   local previous_cleanup_allowed=0
   local previous_cleanup_warning=""
 
@@ -182,18 +184,42 @@ promote_verified_backup_as_root() {
     rm -rf -- "$retained_version"
     return 1
   fi
+  if [[ "$focused_test_mode" != 1 && "$previous_cleanup_allowed" == 1 ]]; then
+    # Hold the validated directory open across pointer replacement. The
+    # orchestrator owns fd 9 for its activation lock; fd 8 is reserved here
+    # so inode reuse cannot make a replacement object look unchanged.
+    if ! exec 8<"$previous_path"; then
+      previous_cleanup_warning="previous retained backup cleanup skipped: target could not be held"
+      previous_cleanup_allowed=0
+    elif ! previous_fd_identity="$($stat_command -L -c '%d:%i' -- "/proc/self/fd/8")" ||
+      [[ "$previous_fd_identity" != "$previous_identity" ]]; then
+      exec 8<&-
+      previous_cleanup_warning="previous retained backup cleanup skipped: target identity changed"
+      previous_cleanup_allowed=0
+    else
+      previous_fd_open=1
+    fi
+  fi
   if [[ "$focused_test_mode" == 1 ]]; then
     # BSD mv follows a symlink destination.  Focused mode is disposable and
     # non-root, so remove only this validated pointer before the replacement;
     # Production runs on Linux and uses mv -T for a true no-dereference rename.
     if ! rm -f -- "$retained_pointer" || ! "$mv_command" -- "$temporary_pointer" "$retained_pointer"; then
       echo "Verified backup promotion failed before pointer replacement." >&2
+      if [[ "$previous_fd_open" == 1 ]]; then
+        exec 8<&-
+        previous_fd_open=0
+      fi
       rm -f -- "$temporary_pointer"
       rm -rf -- "$retained_version"
       return 1
     fi
   elif ! "$mv_command" -T -- "$temporary_pointer" "$retained_pointer"; then
     echo "Verified backup promotion failed before pointer replacement." >&2
+    if [[ "$previous_fd_open" == 1 ]]; then
+      exec 8<&-
+      previous_fd_open=0
+    fi
     rm -f -- "$temporary_pointer"
     rm -rf -- "$retained_version"
     return 1
@@ -201,20 +227,23 @@ promote_verified_backup_as_root() {
   local cleanup_warning="$previous_cleanup_warning"
   if [[ -n "$previous_target" && "$previous_cleanup_allowed" == 1 ]]; then
     local current_previous_target=""
-    if [[ -n "$before_previous_rm_command" ]]; then
-      "$before_previous_rm_command" "$previous_path"
-    fi
-    if ! current_previous_target="$(readlink -- "$retained_pointer")" ||
+    if [[ -n "$before_previous_rm_command" ]] && ! "$before_previous_rm_command" "$previous_path"; then
+      cleanup_warning="previous retained backup cleanup failed"
+    elif ! current_previous_target="$(readlink -- "$retained_pointer")" ||
       [[ "$current_previous_target" != "$(basename -- "$retained_version")" ]] ||
       [[ ! -d "$previous_path" || -L "$previous_path" ]] ||
       [[ "$($realpath_command -e -- "$previous_path")" != "$previous_path" ]] ||
-      [[ "$focused_test_mode" != 1 && "$($stat_command -c '%d:%i' -- "$previous_path")" != "$previous_identity" ]]; then
+      [[ "$focused_test_mode" != 1 && "$($stat_command -c '%d:%i' -- "$previous_path")" != "$previous_fd_identity" ]]; then
       cleanup_warning="previous retained backup cleanup failed"
     elif ! rm -rf -- "$previous_path"; then
       cleanup_warning="previous retained backup cleanup failed"
     else
       cleanup_warning=""
     fi
+  fi
+  if [[ "$previous_fd_open" == 1 ]]; then
+    exec 8<&-
+    previous_fd_open=0
   fi
   if [[ -n "$cleanup_warning" ]]; then
     printf '{"pointerCommitted":true,"retainedTarget":"%s","cleanupWarning":"%s"}\n' \
