@@ -61,6 +61,7 @@ export type StoredGamePresentationAuditEntry = {
   grant: GamePresentationGrantProvenance | null;
   /** Append-only revision linkage for repaired canonical snapshots. */
   supersedesAuditId?: string;
+  links?: { targetFactId?: string; grantAuditId?: string };
 };
 
 export type StoredGamePresentationAuditRevision = StoredGamePresentationAuditEntry & {

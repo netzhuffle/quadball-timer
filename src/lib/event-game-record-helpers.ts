@@ -66,7 +66,7 @@ export function validateAuditHistory(
   const contentFingerprintsByOperationId = new Map(
     actions.map((stored) => [stored.action.operationId, stored.contentFingerprint]),
   );
-  const actionOperationIds = new Set(actionsByOperationId.keys());
+  const submissionOperationIds = new Set(actionsByOperationId.keys());
   const acceptedOperationIds = new Set<string>();
   for (const entry of entries) {
     if (entry.recordId !== root.recordId || entry.eventGameId !== root.eventGameId) {
@@ -150,7 +150,7 @@ export function validateAuditHistory(
         entry.operationId === null ? undefined : actionsByOperationId.get(entry.operationId);
       if (
         entry.operationId === null ||
-        !actionOperationIds.has(entry.operationId) ||
+        !submissionOperationIds.has(entry.operationId) ||
         action === undefined ||
         entry.auditId !== acceptedAuditId(action) ||
         entry.createdAtMs !== action.acceptedAtMs ||

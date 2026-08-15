@@ -14,6 +14,13 @@ import {
   SYSTEM_TIMEOUT_COMPLETION_GRANT,
 } from "@/lib/event-game-actions";
 import { parseJsonValue, validateOverride } from "@/lib/event-game-action-codecs";
+import {
+  isValidHexColor,
+  type GamePresentation,
+  type GamePresentationGrantProvenance,
+  type PitchOrientation,
+} from "@/lib/game-presentation";
+import { createInitialGamePresentation } from "@/lib/game-presentation-projection";
 import { DEFAULT_IQA_SPORTING_RULES } from "@/lib/iqa-game-rules";
 import {
   CLOCK_AUTHORITY_VERSION,
@@ -102,6 +109,11 @@ type ControllerIntentBase = {
   override?: OfficialOverrideMetadata;
 };
 
+type ControllerPresentationIntentBase = Omit<ControllerIntentBase, "factId"> & {
+  factId: string;
+  presentationChangeId: string;
+};
+
 export type LiveEventControllerIntent =
   | (ControllerIntentBase & {
       type: "record-goal";
@@ -181,7 +193,34 @@ export type LiveEventControllerIntent =
     })
   | (ControllerIntentBase & {
       type: "reset" | "undo";
+    })
+  | (ControllerPresentationIntentBase & {
+      type: "set-pitch-orientation";
+      pitchOrientation: PitchOrientation;
+    })
+  | (ControllerPresentationIntentBase & {
+      type: "set-displayed-team-color";
+      gameSideId: string;
+      color: string;
     });
+
+export type LiveEventControllerSubmission = LiveEventControllerIntent;
+export type GamePresentationChangeIntent = Extract<
+  LiveEventControllerIntent,
+  { type: "set-pitch-orientation" | "set-displayed-team-color" }
+>;
+export type LiveEventControlActionIntent = Exclude<
+  LiveEventControllerIntent,
+  GamePresentationChangeIntent
+>;
+export type GamePresentationChangeResult =
+  | {
+      status: "accepted" | "duplicate-accepted";
+      operationId: string;
+      presentation: GamePresentation;
+      auditId: string;
+    }
+  | { status: "retryable" | "rejected"; operationId: string | null; message: string };
 
 export type ControllerCommencement = {
   status: "provisional" | "commenced";
@@ -194,6 +233,9 @@ export type ControllerSessionAttachment = {
   eventGameId: string;
   grantSessionId: string;
   grantVersion: string;
+};
+export type ControllerSessionWithReplayProof = ControllerSessionAttachment & {
+  replayProvenanceProof: string;
 };
 
 export type ControllerSwitchRequired = {
@@ -242,6 +284,7 @@ export type LiveEventGameDerivedState = {
   catch: LiveCatchState | null;
   gameFacts: readonly ControllerGameFact[];
   penalties: LivePenaltyProjection;
+  presentation?: GamePresentation;
 };
 
 /**
@@ -396,6 +439,7 @@ export type ControllerProjection = {
   guardrails?: readonly LiveEventGuardrailExplanation[];
   commencement: ControllerCommencement;
   clock: ClockProjection;
+  presentation?: GamePresentation;
 };
 
 type LiveMaterializationAuthority = {
@@ -582,7 +626,9 @@ export function parseLiveEventControllerIntent(
     value.type !== "set-game-clock" &&
     value.type !== "substantive" &&
     value.type !== "reset" &&
-    value.type !== "undo"
+    value.type !== "undo" &&
+    value.type !== "set-pitch-orientation" &&
+    value.type !== "set-displayed-team-color"
   )
     return invalid("Controller intent type is unsupported.");
   const normalizedType =
@@ -595,7 +641,6 @@ export function parseLiveEventControllerIntent(
           : value.type;
 
   const operationId = validateOpaqueIdentifier(value.operationId, "operationId");
-  const factId = validateOpaqueIdentifier(value.factId, "factId");
   const gameTimeMs = validateIntegerInRange(
     value.gameTimeMs,
     0,
@@ -603,8 +648,75 @@ export function parseLiveEventControllerIntent(
     "gameTimeMs",
   );
   if (!operationId.ok) return invalid(operationId.error);
-  if (!factId.ok) return invalid(factId.error);
   if (!gameTimeMs.ok) return invalid(gameTimeMs.error);
+
+  if (value.type === "set-pitch-orientation" || value.type === "set-displayed-team-color") {
+    const presentationChangeId = validateOpaqueIdentifier(
+      value.presentationChangeId,
+      "presentationChangeId",
+    );
+    if (!presentationChangeId.ok) return invalid(presentationChangeId.error);
+    if (!isRecord(value.occurrence)) return invalid("occurrence must be an object.");
+    const clientOrigin =
+      value.occurrence.clientOriginAtMs === null || value.occurrence.clientOriginAtMs === undefined
+        ? null
+        : validateIntegerInRange(
+            value.occurrence.clientOriginAtMs,
+            0,
+            Number.MAX_SAFE_INTEGER,
+            "occurrence.clientOriginAtMs",
+          );
+    if (clientOrigin !== null && !clientOrigin.ok) return invalid(clientOrigin.error);
+    const source = value.occurrence.source;
+    if (source !== undefined && source !== "online" && source !== "offline") {
+      return invalid("occurrence.source is unsupported.");
+    }
+    if (value.type === "set-pitch-orientation") {
+      if (value.pitchOrientation !== "side-a-left" && value.pitchOrientation !== "side-b-left") {
+        return invalid("pitchOrientation is unsupported.");
+      }
+      return {
+        ok: true,
+        value: {
+          version: LIVE_EVENT_CONTROL_INTENT_VERSION,
+          type: value.type,
+          operationId: operationId.value,
+          factId: presentationChangeId.value,
+          presentationChangeId: presentationChangeId.value,
+          gameTimeMs: gameTimeMs.value,
+          pitchOrientation: value.pitchOrientation,
+          occurrence: {
+            clientOriginAtMs: clientOrigin === null ? null : clientOrigin.value,
+            ...(source === undefined ? {} : { source }),
+          },
+        },
+      } as { ok: true; value: LiveEventControllerIntent };
+    }
+    const gameSideId = validateOpaqueIdentifier(value.gameSideId, "gameSideId");
+    if (!gameSideId.ok) return invalid(gameSideId.error);
+    if (!isValidHexColor(value.color)) return invalid("color is invalid.");
+    return {
+      ok: true,
+      value: {
+        version: LIVE_EVENT_CONTROL_INTENT_VERSION,
+        type: value.type,
+        operationId: operationId.value,
+        factId: presentationChangeId.value,
+        presentationChangeId: presentationChangeId.value,
+        gameTimeMs: gameTimeMs.value,
+        gameSideId: gameSideId.value,
+        color: value.color.trim().startsWith("#")
+          ? value.color.trim().toUpperCase()
+          : `#${value.color.trim().toUpperCase()}`,
+        occurrence: {
+          clientOriginAtMs: clientOrigin === null ? null : clientOrigin.value,
+          ...(source === undefined ? {} : { source }),
+        },
+      },
+    } as { ok: true; value: LiveEventControllerIntent };
+  }
+  const factId = validateOpaqueIdentifier(value.factId, "factId");
+  if (!factId.ok) return invalid(factId.error);
 
   let sportingOrder: number | undefined;
   if (value.sportingOrder !== undefined) {
@@ -967,6 +1079,8 @@ export function parseLiveEventControllerIntent(
     } as LiveEventControllerIntent,
   };
 }
+
+export const parseLiveEventControllerSubmission = parseLiveEventControllerIntent;
 
 export function explainLiveEventGuardrail(intent: {
   type: LiveEventControllerIntent["type"];
@@ -1792,6 +1906,8 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
       return null;
     const actions = parsed.map((candidate) => {
       if (!candidate.ok) throw new Error("Locked replay intent is invalid.");
+      if (!("factId" in candidate.value))
+        throw new Error("Presentation changes are not locked actions.");
       return {
         recordId: root.recordId,
         eventGameId: root.eventGameId,
@@ -1877,6 +1993,8 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
     const operationId = readOperationId(input.intent);
     const parsed = parseLiveEventControllerIntent(input.intent);
     if (!parsed.ok) return rejectedAction(operationId);
+    if (isGamePresentationIntentValue(parsed.value))
+      return rejectedAction(parsed.value.operationId);
 
     const owner = await options.resolveEventGameRecord(authorized.eventGameId);
     const root = owner === null ? null : await owner.record.readRoot(owner.recordId);
@@ -2323,6 +2441,7 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
         storedAction.interpretation.factType === "penalty-release-consequence" &&
         isRecord(storedAction.interpretation.payload) &&
         isRecord(storedAction.interpretation.payload.data) &&
+        "factId" in parsed.value &&
         storedAction.interpretation.payload.data.sourceFactId === parsed.value.factId,
     );
     const automaticPenaltyConsequence =
@@ -2923,6 +3042,7 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
           : projectedHeat.status === "started" || projectedHeat.status === "extended"
             ? { status: "heat-stoppage", factId: projectedHeat.factId }
             : { status: "none", factId: null };
+      const presentation = await record.readPresentation();
       const runningSinceMs =
         root.lifecycle.commencedAtMs === null ? latestRunningClockStart(derived.gameFacts) : null;
       const controllerProjection: ControllerProjection = {
@@ -2960,6 +3080,7 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
           provisionalRunningSinceMs: runningSinceMs,
           provisionalElapsedMs: runningSinceMs === null ? 0 : Math.max(0, clock() - runningSinceMs),
         },
+        presentation: structuredClone(presentation),
       };
       return controllerProjection;
     } catch {
@@ -3058,6 +3179,157 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
     );
   }
 
+  async function submitGamePresentationChange(input: {
+    sessionBearer: string;
+    eventGameId: string;
+    change: unknown;
+    causalPredecessorIds?: readonly string[];
+    originatingGrant?: GamePresentationGrantProvenance;
+  }): Promise<GamePresentationChangeResult> {
+    const authorized = await options.grantAuthority.authorizeGrant({
+      sessionBearer: input.sessionBearer,
+      eventGameId: input.eventGameId,
+      readOnly: true,
+    });
+    if (
+      authorized.status !== "authorized" ||
+      authorized.grantType !== "control" ||
+      authorized.eventGameId === null
+    ) {
+      return {
+        status: "rejected",
+        operationId: null,
+        message: "Unable to perform that Game Presentation Change.",
+      };
+    }
+    const parsed = parseLiveEventControllerIntent(input.change);
+    if (!parsed.ok || !isGamePresentationIntentValue(parsed.value)) {
+      return {
+        status: "rejected",
+        operationId: readOperationId(input.change),
+        message: "Unable to perform that Game Presentation Change.",
+      };
+    }
+    const owner = await options.resolveEventGameRecord(authorized.eventGameId);
+    const root = owner === null ? null : await owner.record.readRoot(owner.recordId);
+    if (owner === null || root === null) {
+      return {
+        status: "rejected",
+        operationId: parsed.value.operationId,
+        message: "Unable to perform that Game Presentation Change.",
+      };
+    }
+    const grant: GamePresentationGrantProvenance = input.originatingGrant ?? {
+      sessionId: authorized.grantSessionId,
+      versionId: authorized.grantVersion,
+    };
+    const outcome = await owner.record.acceptPresentationChange({
+      recordId: root.recordId,
+      eventGameId: root.eventGameId,
+      operationId: parsed.value.operationId,
+      presentationChangeId: parsed.value.presentationChangeId,
+      change:
+        parsed.value.type === "set-pitch-orientation"
+          ? { type: "pitch-orientation", pitchOrientation: parsed.value.pitchOrientation }
+          : {
+              type: "displayed-team-color",
+              gameSideId: parsed.value.gameSideId,
+              color: parsed.value.color,
+            },
+      causalPredecessorIds: [...(input.causalPredecessorIds ?? [])],
+      occurrence: {
+        trustedAtMs: clock(),
+        clientOriginAtMs: parsed.value.occurrence.clientOriginAtMs,
+        source: parsed.value.occurrence.source ?? "online",
+      },
+      grant,
+      acceptedAtMs: clock(),
+    });
+    if (outcome.status === "rejected") {
+      return {
+        status: outcome.reason === "storage-not-ready" ? "retryable" : "rejected",
+        operationId: parsed.value.operationId,
+        message: outcome.detail,
+      };
+    }
+    const projection = await readProjection(owner.record, root);
+    return {
+      status: outcome.status,
+      operationId: parsed.value.operationId,
+      presentation:
+        projection?.presentation ??
+        createInitialGamePresentation(root.gameSides.map((side) => side.id)),
+      auditId: outcome.auditId,
+    };
+  }
+
+  async function replayGamePresentationChanges(input: {
+    sessionBearer: string;
+    eventGameId: string;
+    batchId: string;
+    replicaGeneration: string;
+    expectedGrantSessionId: string;
+    expectedGrantVersion: string;
+    changes: readonly {
+      eventGameId: string;
+      change: unknown;
+      causalPredecessorIds?: readonly unknown[];
+      originatingGrant?: unknown;
+    }[];
+  }): Promise<ControllerReplayResult> {
+    const outcomes: ControllerReplayOutcome[] = [];
+    for (const candidate of input.changes) {
+      const parsed = parseLiveEventControllerIntent(candidate.change);
+      const operationId = parsed.ok
+        ? parsed.value.operationId
+        : (readOperationId(candidate.change) ?? "");
+      if (!parsed.ok || candidate.eventGameId !== input.eventGameId) {
+        outcomes.push({ operationId, status: "terminally-rejected" });
+        continue;
+      }
+      const result = await submitGamePresentationChange({
+        sessionBearer: input.sessionBearer,
+        eventGameId: input.eventGameId,
+        change: candidate.change,
+        causalPredecessorIds: Array.isArray(candidate.causalPredecessorIds)
+          ? candidate.causalPredecessorIds.filter(
+              (value): value is string => typeof value === "string",
+            )
+          : [],
+      });
+      outcomes.push({
+        operationId,
+        status:
+          result.status === "accepted"
+            ? "accepted"
+            : result.status === "duplicate-accepted"
+              ? "idempotent"
+              : result.status === "retryable"
+                ? "retryable"
+                : "terminally-rejected",
+      });
+    }
+    const owner = await options.resolveEventGameRecord(input.eventGameId);
+    const root = owner === null ? null : await owner.record.readRoot(owner.recordId);
+    const projection =
+      owner === null || root === null ? null : await readProjection(owner.record, root);
+    return {
+      batchId: input.batchId,
+      replicaGeneration: input.replicaGeneration,
+      session: {
+        eventGameId: input.eventGameId,
+        grantSessionId: input.expectedGrantSessionId,
+        grantVersion: input.expectedGrantVersion,
+      },
+      eventGameId: input.eventGameId,
+      status: outcomes.some((outcome) => outcome.status === "retryable")
+        ? "retryable"
+        : "synchronized",
+      outcomes,
+      projection,
+    };
+  }
+
   return {
     openController,
     refreshController,
@@ -3085,7 +3357,17 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
     },
     submitControllerIntent,
     replayControllerActions,
+    submitControlAction: submitControllerIntent,
+    replayControlActions: replayControllerActions,
+    submitGamePresentationChange,
+    replayGamePresentationChanges,
   };
+}
+
+function isGamePresentationIntentValue(
+  value: LiveEventControllerIntent,
+): value is GamePresentationChangeIntent {
+  return value.type === "set-pitch-orientation" || value.type === "set-displayed-team-color";
 }
 
 function projectLiveTimeout(timeout: LiveTimeoutState, nowMs: number): LiveTimeoutState {

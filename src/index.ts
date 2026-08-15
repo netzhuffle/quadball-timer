@@ -620,12 +620,22 @@ async function startServer() {
         },
         "/api/event-control/intent": {
           POST(req: Request) {
-            return liveEventControlTransport.submitControllerIntent(req);
+            return liveEventControlTransport.submitControlAction(req);
           },
         },
         "/api/event-control/replay": {
           POST(req: Request) {
-            return liveEventControlTransport.replayControllerActions(req);
+            return liveEventControlTransport.replayControlActions(req);
+          },
+        },
+        "/api/event-control/presentation-change": {
+          POST(req: Request) {
+            return liveEventControlTransport.submitGamePresentationChange(req);
+          },
+        },
+        "/api/event-control/presentation-replay": {
+          POST(req: Request) {
+            return liveEventControlTransport.replayGamePresentationChanges(req);
           },
         },
         "/api/event-control/refresh": {

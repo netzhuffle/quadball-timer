@@ -133,6 +133,15 @@ export function controllerIntentRetryKey(intent: LiveEventControllerIntent): str
     case "reset":
     case "undo":
       return JSON.stringify([intent.type, intent.gameTimeMs]);
+    case "set-pitch-orientation":
+      return JSON.stringify([intent.type, intent.pitchOrientation, intent.presentationChangeId]);
+    case "set-displayed-team-color":
+      return JSON.stringify([
+        intent.type,
+        intent.gameSideId,
+        intent.color,
+        intent.presentationChangeId,
+      ]);
   }
 }
 
