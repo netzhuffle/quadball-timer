@@ -19,6 +19,10 @@ describe("Production deployment contract", () => {
     expect(unit).toContain(
       "Environment=FOUNDATION_DATABASE=/var/lib/quadball-timer/foundation.sqlite",
     );
+    expect(unit).toContain(
+      "Environment=GRANT_KEY_RING_FILE=/etc/quadball-timer/production-grant-key-ring.json",
+    );
+    expect(unit).toContain("EnvironmentFile=-/etc/quadball-timer/production.env");
   });
 
   test("builds one shared immutable artifact for independent environment jobs", () => {
@@ -85,6 +89,9 @@ describe("Production deployment contract", () => {
     expect(activation).toContain("does not provide the required Production state contract");
     expect(activation).toContain(
       "Install ${release_dir}/deploy/systemd/quadball-timer.service and run systemctl daemon-reload before activation.",
+    );
+    expect(activation).toContain(
+      "GRANT_KEY_RING_FILE=/etc/quadball-timer/production-grant-key-ring.json",
     );
   });
 

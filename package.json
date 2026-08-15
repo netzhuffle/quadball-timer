@@ -8,6 +8,7 @@
     "start": "cd dist && NODE_ENV=production bun index.js",
     "admin:enroll": "bun scripts/enroll-technical-admin.ts",
     "admin:reset": "bun scripts/reset-technical-admin.ts",
+    "grant:key-ring": "bun scripts/grant-key-ring.ts",
     "event:catalog": "bun scripts/event-catalog.ts",
     "event:admin": "bun scripts/event-admin.ts",
     "test:focused:technical-admin-browser": "bun scripts/test-technical-admin-browser.ts",

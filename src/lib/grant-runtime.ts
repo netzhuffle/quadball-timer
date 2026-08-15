@@ -1,16 +1,21 @@
-import { createHash, randomBytes } from "node:crypto";
+import { randomBytes } from "node:crypto";
 import { createGrantAuthorityVerifier, type GrantAuthorityOptions } from "@/lib/grant-authority";
+import { loadGrantKeyRingFile } from "@/lib/grant-key-ring-custody";
 import { isTechnicalAdminAuthority } from "@/lib/technical-admin-auth";
-import type { GrantKeyRing } from "@/lib/grant-types";
-
-const KEY_BYTES = 32;
 
 /** Runtime-only wiring for the published Grant authority module. */
 export function readGrantAuthorityOptions(
   environment: "production" | "test",
   variables: Record<string, string | undefined> = process.env,
 ): GrantAuthorityOptions {
-  const keyRing = readKeyRing(environment, variables);
+  const keyRingPath = variables.GRANT_KEY_RING_FILE?.trim();
+  if (keyRingPath === undefined || keyRingPath.length === 0) {
+    throw new Error("Grant key ring file is required for the Environment.");
+  }
+  const keyRing = loadGrantKeyRingFile(keyRingPath, environment, {
+    requiredOwnerUid:
+      environment === "test" && variables.NODE_ENV !== "production" ? (process.getuid?.() ?? 0) : 0,
+  }).keyRing;
   return {
     environmentId: environment,
     clock: { nowMs: () => Date.now() },
@@ -35,47 +40,6 @@ export function readGrantAuthorityOptions(
       return null;
     }),
   };
-}
-
-function readKeyRing(
-  environment: "production" | "test",
-  variables: Record<string, string | undefined>,
-): GrantKeyRing {
-  const names = {
-    encryption: "GRANT_ENCRYPTION_KEY",
-    lookup: "GRANT_LOOKUP_KEY",
-    audit: "GRANT_AUDIT_KEY",
-  } as const;
-  const configured = Object.values(names).map((name) => variables[name]?.trim() ?? "");
-  if (configured.some(Boolean)) {
-    if (configured.some((value) => value.length === 0))
-      throw new Error("All Grant key environment variables must be configured together.");
-    return {
-      encryption: { currentVersion: "v1", keys: new Map([["v1", decodeKey(configured[0]!)]]) },
-      lookup: { currentVersion: "v1", keys: new Map([["v1", decodeKey(configured[1]!)]]) },
-      audit: { currentVersion: "v1", keys: new Map([["v1", decodeKey(configured[2]!)]]) },
-    };
-  }
-  if (environment === "production")
-    throw new Error("Grant keys are required in the Production Environment.");
-  return {
-    encryption: { currentVersion: "v1", keys: new Map([["v1", testKey("encryption")]]) },
-    lookup: { currentVersion: "v1", keys: new Map([["v1", testKey("lookup")]]) },
-    audit: { currentVersion: "v1", keys: new Map([["v1", testKey("audit")]]) },
-  };
-}
-
-function testKey(name: string): Uint8Array {
-  return new Uint8Array(createHash("sha256").update(`quadball-test-grant-v1:${name}`).digest());
-}
-
-function decodeKey(value: string): Uint8Array {
-  const decoded = /^[0-9a-f]{64}$/u.test(value)
-    ? Buffer.from(value, "hex")
-    : Buffer.from(value, "base64url");
-  if (decoded.byteLength !== KEY_BYTES)
-    throw new Error("Grant keys must contain exactly 32 bytes.");
-  return new Uint8Array(decoded);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
