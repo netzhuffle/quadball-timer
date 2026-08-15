@@ -239,7 +239,8 @@ export type EventCatalogAuditEntry = {
     | "event-game-created"
     | "event-game-teams-confirmed"
     | "event-publication-changed"
-    | "event-catalog-entry-removed";
+    | "event-catalog-entry-removed"
+    | "access-sheet-generated";
   eventId: string;
   gameDayId: string | null;
   actorReference: string;

@@ -10,6 +10,7 @@ import {
 import {
   revealGrant,
   revealGrantInTransaction,
+  resolveAccessSheetQrCredentialInTransaction,
   rotateGrant,
   rotateGrantInTransaction,
   rotateGrantCredentialKeys,
@@ -40,6 +41,7 @@ export type {
   TypedGrantReplayAuthorization,
   TypedGrantMutation,
   TypedGrantReveal,
+  TypedAccessSheetQrCredentialResolution,
   TypedGrantRotated,
   TypedGrantAdmissionThrottled,
   TypedGrantCodeCreated,
@@ -127,6 +129,8 @@ export function createTypedGrantAuthority(
     revealGrant: (grantId, authority) => revealGrant(storage, options, grantId, authority),
     revealGrantInTransaction: (transaction, grantId, authority) =>
       revealGrantInTransaction(transaction, options, grantId, authority),
+    resolveAccessSheetQrCredentialInTransaction: (transaction, input) =>
+      resolveAccessSheetQrCredentialInTransaction(transaction, options, input),
     disableGrant: (grantId, authority) =>
       notifyLifecycleChange(
         updateGrantStatus(storage, options, grantId, authority, "disabled", "grant-disabled"),
