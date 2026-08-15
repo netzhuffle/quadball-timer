@@ -219,6 +219,7 @@ describe("Docker SQLite qualification boundary", () => {
   });
 
   test("fails the start barrier before the artifact can run", async () => {
+    const artifactPath = await realpath("/bin/sh");
     const calls: string[][] = [];
     const responses = [
       { exitCode: 0, stdout: JSON.stringify({ OSType: "linux", Architecture: "x86_64" }) },
@@ -236,25 +237,35 @@ describe("Docker SQLite qualification boundary", () => {
       { exitCode: 0, stdout: "" },
       { exitCode: 0, stdout: "" },
     ];
-    await expect(
-      createDockerProbeExecution("/bin/sh", {
-        platform: "linux",
-        architecture: "x64",
-        invocationId: capability,
-        runCommand: async (arguments_) => {
-          calls.push([...arguments_]);
-          const response = responses.shift();
-          if (response === undefined) throw new Error("unexpected Docker command");
-          return {
-            ...response,
-            stderr: "",
-            stdoutBytes: response.stdout.length,
-            stderrBytes: 0,
-            outputExceeded: false,
-          };
-        },
-      }),
-    ).rejects.toBeInstanceOf(DockerAdmissionError);
+    const error = await createDockerProbeExecution(artifactPath, {
+      platform: "linux",
+      architecture: "x64",
+      invocationId: capability,
+      runCommand: async (arguments_) => {
+        calls.push([...arguments_]);
+        const response = responses.shift();
+        if (response === undefined) throw new Error("unexpected Docker command");
+        return {
+          ...response,
+          stderr: "",
+          stdoutBytes: response.stdout.length,
+          stderrBytes: 0,
+          outputExceeded: false,
+        };
+      },
+    }).catch((value) => value);
+    expect(error).toBeInstanceOf(DockerAdmissionError);
+    expect((error as DockerAdmissionError).disposition).toBe("removed");
+    expect(calls.map((value) => value[0])).toEqual([
+      "info",
+      "version",
+      "create",
+      "inspect",
+      "inspect",
+      "rm",
+      "ps",
+    ]);
+    expect(calls[2]).toContain(`type=bind,src=${artifactPath},dst=/opt/quadball-timer,readonly`);
     expect(calls.map((value) => value[0])).not.toContain("start");
   });
 
@@ -270,7 +281,7 @@ describe("Docker SQLite qualification boundary", () => {
       stderrBytes: 0,
       outputExceeded: false,
     });
-    const execution = await createDockerProbeExecution("/bin/sh", {
+    const execution = await createDockerProbeExecution(artifactPath, {
       platform: "linux",
       architecture: "x64",
       invocationId: capability,
@@ -317,7 +328,7 @@ describe("Docker SQLite qualification boundary", () => {
         stderrBytes: stderr.length,
         outputExceeded: false,
       });
-      const execution = await createDockerProbeExecution("/bin/sh", {
+      const execution = await createDockerProbeExecution(artifactPath, {
         platform: "linux",
         architecture: "x64",
         invocationId: capability,
@@ -581,6 +592,7 @@ describe("Docker SQLite qualification boundary", () => {
   });
 
   test("discovers and verifies cleanup after malformed Docker create output", async () => {
+    const artifactPath = await realpath("/bin/sh");
     const calls: string[][] = [];
     const executionId = containerId;
     const responses = [
@@ -599,7 +611,7 @@ describe("Docker SQLite qualification boundary", () => {
       { exitCode: 0, stdout: "" },
       { exitCode: 0, stdout: "" },
     ];
-    const error = await createDockerProbeExecution("/bin/sh", {
+    const error = await createDockerProbeExecution(artifactPath, {
       platform: "linux",
       architecture: "x64",
       invocationId: capability,
