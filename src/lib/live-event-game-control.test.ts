@@ -2,12 +2,14 @@ import { describe, expect, test } from "bun:test";
 import { applyGameCommand, createInitialGameState } from "@/lib/game-engine";
 import { createFoundationAcceptance, type AcceptanceLimits } from "@/lib/foundation-acceptance";
 import { createInMemoryFoundationStorage } from "@/lib/foundation-storage-memory";
+import { createEventCatalog, createFoundationEventCatalogStorage } from "@/lib/event-catalog";
 import { createEventGameRecord } from "@/lib/event-game-record";
 import { createGrantTestAuthorityVerifier } from "@/lib/grant-authority-test-support";
 import { createTypedGrantAuthority } from "@/lib/grant-management";
 import type { GrantAuthorityOptions } from "@/lib/grant-authority";
 import type { ControlGrantSessionResolution, GrantKeyRing } from "@/lib/grant-types";
 import type { EventGameRecordRoot } from "@/lib/foundation-record-types";
+import type { FoundationStorage } from "@/lib/foundation-storage";
 import {
   createLiveEventGameControl,
   createLiveEventGameIqaInterpreter,
@@ -24,6 +26,15 @@ import { createLiveEventGameControlTransport } from "@/lib/live-event-game-trans
 import { LIVE_SEEKER_RELEASE_MS } from "@/lib/live-event-penalties";
 import { createAdHocGamesService } from "@/lib/ad-hoc-games";
 import { createControlScopeResolver as createRuntimeControlScopeResolver } from "@/lib/live-event-game-runtime";
+import type {
+  HeatStoppageConfiguration,
+  HeatStoppageConfigurationScope,
+} from "@/lib/heat-stoppage-configuration";
+import { resolveHeatStoppageConfiguration } from "@/lib/heat-stoppage-configuration";
+import {
+  MemoryTechnicalAdminAuthRepository,
+  createTechnicalAdminAuth,
+} from "@/lib/technical-admin-auth";
 
 describe("Live Event Game control", () => {
   test("keeps Penalty Reason values fixed while skip remains a Controller-only absence", () => {
@@ -5026,9 +5037,11 @@ describe("Live Event Game control", () => {
   });
 
   test("atomically rolls back the action, mode snapshot, and commencement at the lifecycle boundary", async () => {
+    let configuration: HeatStoppageConfiguration = "enabled";
     const harness = await createHarness({
       failureBoundary: "after-lifecycle",
       heatStoppageConfiguration: true,
+      readHeatStoppageConfiguration: (_scope: HeatStoppageConfigurationScope) => configuration,
     });
     const opened = await harness.control.openController({
       qrCredential: harness.qrCredential,
@@ -5047,6 +5060,183 @@ describe("Live Event Game control", () => {
     expect((await harness.record.readRoot(harness.root.recordId))?.lifecycle).toMatchObject({
       phase: "scheduled",
       commencedAtMs: null,
+    });
+    harness.failureBoundary = undefined;
+    const committed = await harness.control.submitControllerIntent({
+      sessionBearer: opened.session.sessionBearer,
+      eventGameId: harness.root.eventGameId,
+      intent: substantiveIntent("atomic-card-retry", "card"),
+    });
+    expect(committed).toMatchObject({
+      status: "accepted",
+      projection: {
+        commencement: { status: "commenced" },
+        heat: { mode: "enabled" },
+      },
+    });
+    configuration = "disabled";
+    expect(
+      await harness.control.refreshController({
+        sessionBearer: opened.session.sessionBearer,
+        eventGameId: harness.root.eventGameId,
+      }),
+    ).toMatchObject({
+      status: "authorized",
+      projection: { commencement: { status: "commenced" }, heat: { mode: "enabled" } },
+    });
+  });
+
+  test("freezes one configuration when catalog mutation overlaps commencement", async () => {
+    const storage = createInMemoryFoundationStorage();
+    const root = createRoot("game-configuration-race");
+    await storage.transaction((transaction) => {
+      transaction.insertEvent({
+        eventId: root.eventId,
+        name: "Configuration Race Event",
+        timeZone: "UTC",
+        publicationStatus: "unpublished",
+        createdAtMs: 1,
+        updatedAtMs: 1,
+      });
+      transaction.insertGameDay({
+        gameDayId: root.externalScope.gameDayId,
+        eventId: root.eventId,
+        date: "2026-08-15",
+        heatStoppageConfiguration: "disabled",
+        createdAtMs: 1,
+        updatedAtMs: 1,
+      });
+      transaction.insertPitch({
+        pitchId: root.externalScope.pitchId,
+        eventId: root.eventId,
+        name: "Configuration Race Pitch",
+        createdAtMs: 1,
+        updatedAtMs: 1,
+      });
+      transaction.insertGameplaySlot({
+        gameplaySlotId: "gameplay-slot-configuration-race",
+        eventId: root.eventId,
+        gameDayId: root.externalScope.gameDayId,
+        sequence: 1,
+        scheduledStartMs: 1,
+        expectedDelayMs: 0,
+        createdAtMs: 1,
+        updatedAtMs: 1,
+      });
+      transaction.insertPitchSlot({
+        pitchSlotId: root.externalScope.pitchSlotId,
+        eventId: root.eventId,
+        gameDayId: root.externalScope.gameDayId,
+        pitchId: root.externalScope.pitchId,
+        gameplaySlotId: "gameplay-slot-configuration-race",
+        sequence: 1,
+        expectedDelayMs: 0,
+        createdAtMs: 1,
+        updatedAtMs: 1,
+      });
+      transaction.insertEventGame({
+        eventGameId: root.eventGameId,
+        eventId: root.eventId,
+        gameDayId: root.externalScope.gameDayId,
+        gameplaySlotId: "gameplay-slot-configuration-race",
+        pitchSlotId: root.externalScope.pitchSlotId,
+        gameCode: null,
+        gameDesignation: null,
+        sideA: {
+          sideId: "side-a",
+          eventTeamId: null,
+          eventTeamName: null,
+          sourceLabel: "A",
+          confirmedAtMs: null,
+        },
+        sideB: {
+          sideId: "side-b",
+          eventTeamId: null,
+          eventTeamName: null,
+          sourceLabel: "B",
+          confirmedAtMs: null,
+        },
+        createdAtMs: 1,
+        updatedAtMs: 1,
+      });
+    });
+
+    let nextCatalogId = 0;
+    const catalog = createEventCatalog(createFoundationEventCatalogStorage(storage), {
+      clock: { nowMs: () => 2 },
+      ids: { next: (kind) => `${kind}-configuration-race-${++nextCatalogId}` },
+    });
+    const technicalAdmin = createTechnicalAdminAuth(
+      { environment: "test", origin: "https://timer.example", rpId: "timer.example" },
+      new MemoryTechnicalAdminAuthRepository(),
+    ).resolveHostLocalAuthority();
+    let holdConfigurationRead = false;
+    const configurationReadStarted = Promise.withResolvers<void>();
+    const releaseConfigurationRead = Promise.withResolvers<void>();
+    const harness = await createHarness({
+      storage,
+      eventGameId: root.eventGameId,
+      readHeatStoppageConfiguration: async (scope) => {
+        if (holdConfigurationRead) {
+          configurationReadStarted.resolve();
+          await releaseConfigurationRead.promise;
+        }
+        return storage.transaction((transaction) =>
+          resolveHeatStoppageConfiguration(transaction, scope),
+        );
+      },
+    });
+    const opened = await harness.control.openController({
+      qrCredential: harness.qrCredential,
+      browserContext: "controller-configuration-race",
+    });
+    if (opened.status !== "opened") throw new Error("Expected the Controller to open.");
+    holdConfigurationRead = true;
+
+    const commencement = harness.control.submitControllerIntent({
+      sessionBearer: opened.session.sessionBearer,
+      eventGameId: root.eventGameId,
+      intent: substantiveIntent("configuration-race-commencement", "card"),
+    });
+    await configurationReadStarted.promise;
+
+    expect(
+      await catalog.setGameDayHeatStoppageConfiguration(
+        root.eventId,
+        root.externalScope.gameDayId,
+        { configuration: "enabled" },
+        technicalAdmin,
+      ),
+    ).toMatchObject({ status: "accepted", value: { heatStoppageConfiguration: "enabled" } });
+    releaseConfigurationRead.resolve();
+
+    const commencementResult = await commencement;
+    expect(commencementResult).toMatchObject({
+      status: "accepted",
+      projection: {
+        commencement: { status: "commenced" },
+        heat: { mode: "enabled" },
+      },
+    });
+    expect(
+      await catalog.setGameDayHeatStoppageConfiguration(
+        root.eventId,
+        root.externalScope.gameDayId,
+        { configuration: "disabled" },
+        technicalAdmin,
+      ),
+    ).toMatchObject({ status: "accepted", value: { heatStoppageConfiguration: "disabled" } });
+    expect(
+      await harness.control.refreshController({
+        sessionBearer: opened.session.sessionBearer,
+        eventGameId: root.eventGameId,
+      }),
+    ).toMatchObject({
+      status: "authorized",
+      projection: {
+        commencement: { status: "commenced" },
+        heat: { mode: "enabled" },
+      },
     });
   });
 
@@ -6456,14 +6646,18 @@ async function createHarness(
     scopeStatus?: "empty" | "conflict";
     controlClock?: () => number;
     knownDodgeballIds?: readonly string[];
+    storage?: FoundationStorage;
     sessionResolution?: ControlGrantSessionResolution;
     acceptanceLimits?: AcceptanceLimits;
     heatStoppageConfiguration?: boolean;
+    readHeatStoppageConfiguration?: (
+      scope: HeatStoppageConfigurationScope,
+    ) => HeatStoppageConfiguration | null | Promise<HeatStoppageConfiguration | null>;
   } = {},
 ) {
   const root = createRoot(overrides.eventGameId ?? "game-live-control");
   const reassignedRoot = createRoot("game-reassigned", "reassigned");
-  const storage = createInMemoryFoundationStorage();
+  const storage = overrides.storage ?? createInMemoryFoundationStorage();
   const grantOptions = createGrantOptions(overrides.grantEventGameId ?? root.eventGameId);
   const authority = createTypedGrantAuthority(storage, grantOptions);
   const created = await authority.createControlGrant({
@@ -6547,6 +6741,9 @@ async function createHarness(
     ...(overrides.heatStoppageConfiguration === undefined
       ? {}
       : { heatStoppageConfiguration: overrides.heatStoppageConfiguration }),
+    ...(overrides.readHeatStoppageConfiguration === undefined
+      ? {}
+      : { readHeatStoppageConfiguration: overrides.readHeatStoppageConfiguration }),
   });
   triggerLifecycleChange = () => {
     void control.reconcileActiveControllerSessions();

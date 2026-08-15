@@ -13,7 +13,7 @@ const migrations: readonly FoundationMigration[] = [
 ];
 
 describe("foundation migration ledger compatibility", () => {
-  test("keeps accepted migrations 001 through 029 byte-for-byte immutable and pins 030", () => {
+  test("keeps accepted migrations 001 through 030 byte-for-byte immutable and pins 031", () => {
     expect(FOUNDATION_MIGRATIONS.map(({ id, checksum }) => ({ id, checksum }))).toEqual([
       {
         id: "001-foundation-event-game-record-roots",
@@ -134,6 +134,10 @@ describe("foundation migration ledger compatibility", () => {
       {
         id: "030-heat-stoppage-configuration",
         checksum: "83f87206e902c3fd05a5d4f465b079d658ecd306d91254db6a676fe65206a789",
+      },
+      {
+        id: "031-heat-stoppage-audit-action",
+        checksum: "f11ca907b67bb8cefb1866314513166d0b993e44fa9ccd00bb146d76798d81c8",
       },
     ]);
   });

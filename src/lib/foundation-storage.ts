@@ -235,6 +235,7 @@ export type EventCatalogAuditEntry = {
     | "event-removed"
     | "game-day-added"
     | "game-day-updated"
+    | "game-day-heat-stoppage-configured"
     | "game-day-removed"
     | "event-team-created"
     | "event-team-updated"

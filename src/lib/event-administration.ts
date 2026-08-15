@@ -435,6 +435,12 @@ export type EventAdministration = {
     input: { name?: unknown; defaultColor?: unknown },
     authority: EventAdministrationAuthority,
   ): Promise<EventAdministrationMutationOutcome<EventTeamProjection>>;
+  setGameDayHeatStoppageConfiguration(
+    eventId: unknown,
+    gameDayId: unknown,
+    input: { configuration: unknown },
+    authority: EventAdministrationAuthority,
+  ): Promise<EventAdministrationMutationOutcome<import("@/lib/event-catalog").EventGameDay>>;
   upsertEventTeamRoster(
     eventId: unknown,
     eventTeamId: unknown,
@@ -1488,6 +1494,12 @@ export function createEventAdministration(
     async updateEventTeam(eventId, eventTeamId, input, authority) {
       return runCatalogMutation(catalog, options, eventId, authority, (operations) =>
         operations.updateEventTeam(eventId, eventTeamId, input),
+      );
+    },
+
+    async setGameDayHeatStoppageConfiguration(eventId, gameDayId, input, authority) {
+      return runCatalogMutation(catalog, options, eventId, authority, (operations) =>
+        operations.setGameDayHeatStoppageConfiguration(eventId, gameDayId, input),
       );
     },
 

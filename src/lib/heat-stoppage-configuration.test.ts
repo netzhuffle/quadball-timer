@@ -193,7 +193,7 @@ describe("Heat Stoppage Configuration SQLite persistence", () => {
     const directory = await mkdtemp(join(tmpdir(), "quadball-timer-heat-config-"));
     const databasePath = join(directory, "foundation.sqlite");
     const before = openSqliteFoundationStorage(databasePath, {
-      migrations: FOUNDATION_MIGRATIONS.slice(0, -1) as readonly FoundationMigration[],
+      migrations: FOUNDATION_MIGRATIONS.slice(0, -2) as readonly FoundationMigration[],
     });
     await before.applyMigrations();
     before.close();
@@ -217,7 +217,10 @@ describe("Heat Stoppage Configuration SQLite persistence", () => {
     const storage = openSqliteFoundationStorage(databasePath);
     try {
       const migration = await storage.applyMigrations();
-      expect(migration.appliedMigrationIds).toEqual(["030-heat-stoppage-configuration"]);
+      expect(migration.appliedMigrationIds).toEqual([
+        "030-heat-stoppage-configuration",
+        "031-heat-stoppage-audit-action",
+      ]);
       await storage.transaction((transaction) => {
         expect(transaction.listGameDays("legacy-event")).toMatchObject([
           { gameDayId: "legacy-day", heatStoppageConfiguration: "disabled" },
@@ -226,6 +229,22 @@ describe("Heat Stoppage Configuration SQLite persistence", () => {
       await seed(storage, "enabled");
       await storage.transaction((transaction) => {
         expect(resolveHeatStoppageConfiguration(transaction, scope)).toBe("enabled");
+        transaction.appendEventAudit({
+          auditId: "heat-audit-1",
+          operationId: "heat-operation-1",
+          action: "game-day-heat-stoppage-configured",
+          eventId: scope.eventId,
+          gameDayId: scope.gameDayId,
+          actorReference: "technical-admin:test",
+          occurredAtMs: 2,
+          before: { heatStoppageConfiguration: "disabled" },
+          after: { heatStoppageConfiguration: "enabled" },
+        });
+        expect(transaction.listEventAuditTrail(scope.eventId)).toContainEqual(
+          expect.objectContaining({
+            action: "game-day-heat-stoppage-configured",
+          }),
+        );
       });
       let failure: unknown;
       try {

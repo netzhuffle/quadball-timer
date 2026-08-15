@@ -33,7 +33,14 @@ const eventHub = {
     timeZone: "UTC",
     lifecycle: "active",
     publicationStatus: "unpublished",
-    gameDays: [{ gameDayId: "day", date: "2026-08-15", classification: "scheduled" }],
+    gameDays: [
+      {
+        gameDayId: "day",
+        date: "2026-08-15",
+        classification: "scheduled",
+        heatStoppageConfiguration: "disabled" as const,
+      },
+    ],
     teams: [],
     pitches: [{ pitchId: "pitch", name: "Pitch Main" }],
     gameplaySlots: [
@@ -68,7 +75,38 @@ const twoDayEventHub = {
     ...eventHub.event,
     gameDays: [
       ...eventHub.event.gameDays,
-      { gameDayId: "day-two", date: "2026-08-16", classification: "scheduled" },
+      {
+        gameDayId: "day-two",
+        date: "2026-08-16",
+        classification: "scheduled",
+        heatStoppageConfiguration: "enabled" as const,
+      },
+    ],
+  },
+};
+
+const dayBEventHub = {
+  ...twoDayEventHub,
+  selectedGameDayId: "day-two",
+  event: {
+    ...twoDayEventHub.event,
+    gameDays: twoDayEventHub.event.gameDays,
+    gameplaySlots: [
+      {
+        ...eventHub.event.gameplaySlots[0]!,
+        gameplaySlotId: "gameplay-day-two",
+        gameDayId: "day-two",
+        sequence: 2,
+      },
+    ],
+    pitchSlots: [
+      {
+        ...eventHub.event.pitchSlots[0]!,
+        pitchSlotId: "slot-day-two",
+        gameplaySlotId: "gameplay-day-two",
+        gameDayId: "day-two",
+        sequence: 2,
+      },
     ],
   },
 };
@@ -113,6 +151,175 @@ describe("Grant secret UI lifecycle", () => {
     container = document.createElement("div");
     document.body.appendChild(container);
     root = createRoot(container);
+  });
+
+  test("Event Admin configures the selected Game Day heat setting", async () => {
+    let configuration: "enabled" | "disabled" = "disabled";
+    let configurationUpdates = 0;
+    let hubCalls = 0;
+    fetchHandler = async (input, init) => {
+      const url =
+        typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      const method = init?.method ?? "GET";
+      if (url.endsWith("/api/event-admin/admit"))
+        return json({ status: "admitted", sessionExpiresAtMs: 123_000 });
+      if (url.includes("/api/event-admin/hub")) {
+        hubCalls += 1;
+        if (hubCalls === 1) return json({ status: "rejected" }, 401);
+        return json({
+          status: "accepted",
+          value: {
+            ...eventHub,
+            event: {
+              ...eventHub.event,
+              gameDays: [
+                { ...eventHub.event.gameDays[0]!, heatStoppageConfiguration: configuration },
+              ],
+            },
+          },
+        });
+      }
+      if (url.includes("/heat-stoppage-configuration") && method === "PATCH") {
+        configurationUpdates += 1;
+        const rawBody = typeof init?.body === "string" ? init.body : "";
+        const body = JSON.parse(rawBody) as { configuration: typeof configuration };
+        configuration = body.configuration;
+        return json({ status: "accepted", value: { heatStoppageConfiguration: configuration } });
+      }
+      throw new Error(`Unexpected request: ${method} ${url}`);
+    };
+
+    await render(<EventAdminPage />);
+    await admitEventAdmin();
+    expect(container.textContent).toContain("Currently disabled");
+    await clickButton("Enable");
+    expect(configurationUpdates).toBe(1);
+    expect(container.textContent).toContain("Currently enabled");
+  });
+
+  test("Event Admin ignores stale Day A heat success after selecting Day B", async () => {
+    const pendingMutation = deferred<Response>();
+    const hubGameDays: Array<string | null> = [];
+    fetchHandler = async (input, init) => {
+      const url =
+        typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      const method = init?.method ?? "GET";
+      if (url.includes("/api/event-admin/hub")) {
+        const parsed = new URL(url, "http://timer.quadball.app");
+        const gameDayId = parsed.searchParams.get("gameDayId");
+        hubGameDays.push(gameDayId);
+        return json({
+          status: "accepted",
+          value: gameDayId === "day-two" ? dayBEventHub : twoDayEventHub,
+        });
+      }
+      if (url.includes("/heat-stoppage-configuration") && method === "PATCH")
+        return pendingMutation.promise;
+      throw new Error(`Unexpected request: ${method} ${url}`);
+    };
+
+    await render(<EventAdminPage />);
+    await clickButton("Enable");
+    const gameDaySelector = container.querySelector(
+      "select#game-day-selector",
+    ) as HTMLSelectElement;
+    await act(async () => {
+      setSelectValue(gameDaySelector, "day-two");
+      await flush();
+    });
+    pendingMutation.resolve(
+      json({ status: "accepted", value: { heatStoppageConfiguration: "enabled" } }),
+    );
+    await flushAct();
+
+    expect(gameDaySelector.value).toBe("day-two");
+    expect(container.textContent).toContain("Currently enabled");
+    expect(container.textContent).toContain("Slot 2");
+    expect(container.textContent).not.toContain("Slot 1 ·");
+    expect(container.textContent).not.toContain("Heat Stoppage Configuration enabled.");
+    expect(hubGameDays).toEqual([null, "day-two"]);
+  });
+
+  test("Event Admin ignores stale Day A heat rejection after selecting Day B", async () => {
+    const pendingMutation = deferred<Response>();
+    const hubGameDays: Array<string | null> = [];
+    fetchHandler = async (input, init) => {
+      const url =
+        typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      const method = init?.method ?? "GET";
+      if (url.includes("/api/event-admin/hub")) {
+        const parsed = new URL(url, "http://timer.quadball.app");
+        const gameDayId = parsed.searchParams.get("gameDayId");
+        hubGameDays.push(gameDayId);
+        return json({
+          status: "accepted",
+          value: gameDayId === "day-two" ? dayBEventHub : twoDayEventHub,
+        });
+      }
+      if (url.includes("/heat-stoppage-configuration") && method === "PATCH")
+        return pendingMutation.promise;
+      throw new Error(`Unexpected request: ${method} ${url}`);
+    };
+
+    await render(<EventAdminPage />);
+    await clickButton("Enable");
+    const gameDaySelector = container.querySelector(
+      "select#game-day-selector",
+    ) as HTMLSelectElement;
+    await act(async () => {
+      setSelectValue(gameDaySelector, "day-two");
+      await flush();
+    });
+    pendingMutation.resolve(json({ status: "rejected", detail: "stale Day A rejection" }, 409));
+    await flushAct();
+
+    expect(gameDaySelector.value).toBe("day-two");
+    expect(container.textContent).toContain("Currently enabled");
+    expect(container.textContent).toContain("Slot 2");
+    expect(container.textContent).not.toContain("Slot 1 ·");
+    expect(container.textContent).not.toContain("stale Day A rejection");
+    expect(hubGameDays).toEqual([null, "day-two"]);
+  });
+
+  test("Event Admin ignores stale Day A heat network failure after selecting Day B", async () => {
+    const pendingMutation = deferred<Response>();
+    const hubGameDays: Array<string | null> = [];
+    fetchHandler = async (input, init) => {
+      const url =
+        typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      const method = init?.method ?? "GET";
+      if (url.includes("/api/event-admin/hub")) {
+        const parsed = new URL(url, "http://timer.quadball.app");
+        const gameDayId = parsed.searchParams.get("gameDayId");
+        hubGameDays.push(gameDayId);
+        return json({
+          status: "accepted",
+          value: gameDayId === "day-two" ? dayBEventHub : twoDayEventHub,
+        });
+      }
+      if (url.includes("/heat-stoppage-configuration") && method === "PATCH")
+        return pendingMutation.promise;
+      throw new Error(`Unexpected request: ${method} ${url}`);
+    };
+
+    await render(<EventAdminPage />);
+    await clickButton("Enable");
+    const gameDaySelector = container.querySelector(
+      "select#game-day-selector",
+    ) as HTMLSelectElement;
+    await act(async () => {
+      setSelectValue(gameDaySelector, "day-two");
+      await flush();
+    });
+    pendingMutation.reject(new Error("stale Day A network failure"));
+    await flushAct();
+
+    expect(gameDaySelector.value).toBe("day-two");
+    expect(container.textContent).toContain("Currently enabled");
+    expect(container.textContent).toContain("Slot 2");
+    expect(container.textContent).not.toContain("Slot 1 ·");
+    expect(container.textContent).not.toContain("stale Day A network failure");
+    expect(hubGameDays).toEqual([null, "day-two"]);
   });
 
   afterEach(async () => {

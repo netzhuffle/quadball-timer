@@ -16,7 +16,12 @@ type HubResponse = {
       timeZone: string;
       lifecycle: string;
       publicationStatus: "unpublished" | "published" | "cancelled";
-      gameDays: Array<{ gameDayId: string; date: string; classification: string }>;
+      gameDays: Array<{
+        gameDayId: string;
+        date: string;
+        classification: string;
+        heatStoppageConfiguration: "enabled" | "disabled";
+      }>;
       teams: Array<{
         eventTeamId: string;
         name: string;
@@ -328,6 +333,9 @@ export function EventAdminPage({
 
   const hubScopeKey = () => `event-admin-hub:${eventId}`;
 
+  const gameDayScopeKey = (nextEventId = eventId, nextGameDayId = selectedGameDayId) =>
+    `event-admin-game-day:${nextEventId}:${nextGameDayId ?? "none"}`;
+
   const clearGrantSecrets = () => {
     setCredential("");
     setGrantCode("");
@@ -346,6 +354,7 @@ export function EventAdminPage({
   const invalidateGrantSecrets = () => {
     accessSheetOwner.invalidate();
     secretOwner.invalidate(secretScopeKey());
+    secretOwner.invalidate(gameDayScopeKey());
     secretOwner.invalidate(hubScopeKey());
     clearGrantSecrets();
   };
@@ -973,6 +982,39 @@ export function EventAdminPage({
     await loadHub(selectedGameDayId);
   };
 
+  const setHeatStoppageConfiguration = async (configuration: "enabled" | "disabled") => {
+    const gameDayId = selectedGameDayId;
+    if (gameDayId === null) return;
+    const token = secretOwner.capture(gameDayScopeKey(eventId, gameDayId));
+    try {
+      const response = await fetch(
+        `/api/event-admin/events/${encodeURIComponent(eventId)}/game-days/${encodeURIComponent(gameDayId)}/heat-stoppage-configuration`,
+        {
+          method: "PATCH",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ configuration }),
+        },
+      );
+      const payload = (await response.json()) as {
+        status: "accepted" | "rejected" | "retryable-failure";
+        detail?: string;
+      };
+      if (!response.ok || payload.status !== "accepted")
+        throw new Error(payload.detail ?? "Heat Stoppage Configuration update failed.");
+      if (
+        !secretOwner.commit(token, () =>
+          setMessage(
+            `Heat Stoppage Configuration ${configuration === "enabled" ? "enabled" : "disabled"}.`,
+          ),
+        )
+      )
+        return;
+      await loadHub(gameDayId, token);
+    } catch (error) {
+      if (secretOwner.current(token)) throw error;
+    }
+  };
+
   const generateAccessSheet = async () => {
     const attempt = accessSheetOwner.begin();
     const gameDayId = selectedGameDayId ?? "";
@@ -1490,6 +1532,44 @@ export function EventAdminPage({
                   ))}
                 </select>
               </div>
+              {selectedGameDayId !== null ? (
+                <div className="space-y-3 rounded-lg border p-3">
+                  <div>
+                    <p className="font-semibold">Heat Stoppage Configuration</p>
+                    <p className="text-sm text-muted-foreground">
+                      New and uncommenced Event Games follow this Game Day setting. Commenced Games
+                      keep their effective mode.
+                    </p>
+                  </div>
+                  {(() => {
+                    const selectedDay = hub.event.gameDays.find(
+                      (day) => day.gameDayId === selectedGameDayId,
+                    );
+                    if (selectedDay === undefined) return null;
+                    return (
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="text-sm" role="status">
+                          Currently {selectedDay.heatStoppageConfiguration}
+                        </span>
+                        {(["enabled", "disabled"] as const).map((configuration) => (
+                          <Button
+                            key={configuration}
+                            disabled={
+                              busy || selectedDay.heatStoppageConfiguration === configuration
+                            }
+                            onClick={() =>
+                              void run(() => setHeatStoppageConfiguration(configuration))
+                            }
+                            variant={configuration === "enabled" ? "default" : "outline"}
+                          >
+                            {configuration === "enabled" ? "Enable" : "Disable"}
+                          </Button>
+                        ))}
+                      </div>
+                    );
+                  })()}
+                </div>
+              ) : null}
               <div className="space-y-3 rounded-lg border p-3">
                 <p className="font-semibold">Event Teams</p>
                 {hub.event.teams.map((team) =>
