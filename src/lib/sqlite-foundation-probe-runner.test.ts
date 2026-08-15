@@ -85,7 +85,7 @@ describe("Docker qualification orchestration", () => {
   test("never creates or starts a Docker workload when admission rejects", async () => {
     let created = false;
     const emitted: Array<{ outcome: string }> = [];
-    await expect(
+    expect(
       runCompiledSqliteFoundationProbe("/owned/artifact", {
         createExecution: async () => {
           created = true;
@@ -102,7 +102,7 @@ describe("Docker qualification orchestration", () => {
 
   test("awaits late admission cleanup before final evidence", async () => {
     const events: string[] = [];
-    await expect(
+    expect(
       runCompiledSqliteFoundationProbe("/owned/artifact", {
         timeoutMs: 160,
         createExecution: async (_path, { workSignal }) =>
@@ -154,7 +154,7 @@ describe("Docker qualification orchestration", () => {
         failures: string[];
       };
     }> = [];
-    await expect(
+    expect(
       runCompiledSqliteFoundationProbe("/owned/artifact", {
         timeoutMs: 160,
         createExecution: async (_path, { admissionSignal }) =>
@@ -181,7 +181,7 @@ describe("Docker qualification orchestration", () => {
   test("fails closed at the admission boundary without claiming removal", async () => {
     const events: string[] = [];
     const emitted: Array<{ cleanup: { status: string; containerRemoved: boolean | null } }> = [];
-    await expect(
+    expect(
       runCompiledSqliteFoundationProbe("/owned/artifact", {
         timeoutMs: 1_000,
         createExecution: async (_path, { cleanupSignal, admissionSignal }) =>
@@ -216,7 +216,7 @@ describe("Docker qualification orchestration", () => {
       cleanup: { status: string; temporaryDataRemoved: boolean };
       evidence: { emission: string };
     }> = [];
-    await expect(
+    expect(
       runCompiledSqliteFoundationProbe("/owned/artifact", {
         createExecution: async () =>
           (() => {
@@ -242,7 +242,7 @@ describe("Docker qualification orchestration", () => {
         failures: string[];
       };
     }> = [];
-    await expect(
+    expect(
       runCompiledSqliteFoundationProbe("/owned/artifact", {
         createExecution: async () => {
           throw new DockerAdmissionError("native platform unavailable");
@@ -264,7 +264,7 @@ describe("Docker qualification orchestration", () => {
   test("bounds a stalled evidence sink by the hard deadline", async () => {
     const fallback: Array<{ cleanup: { status: string } }> = [];
     const started = Date.now();
-    await expect(
+    expect(
       runCompiledSqliteFoundationProbe("/owned/artifact", {
         timeoutMs: 40,
         commit: "abcdef1",
@@ -298,7 +298,7 @@ describe("Docker qualification orchestration", () => {
   test("propagates interruption through bounded cleanup", async () => {
     const interruption = new AbortController();
     const emitted: Array<{ outcome: string }> = [];
-    await expect(
+    expect(
       runCompiledSqliteFoundationProbe("/owned/artifact", {
         commit: "abcdef1",
         signal: interruption.signal,

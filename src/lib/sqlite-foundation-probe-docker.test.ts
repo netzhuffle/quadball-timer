@@ -406,20 +406,20 @@ describe("Docker SQLite qualification boundary", () => {
     };
 
     const success = await makeExecution(0);
-    await expect(success.execution.run()).resolves.toMatchObject({ exitCode: 0 });
+    expect(success.execution.run()).resolves.toMatchObject({ exitCode: 0 });
     expect(success.commands.find((value) => value[0] === "logs")).toEqual(["logs", containerId]);
 
     const failure = await makeExecution(1);
-    await expect(failure.execution.run()).rejects.toMatchObject({ result: { exitCode: 1 } });
+    expect(failure.execution.run()).rejects.toMatchObject({ result: { exitCode: 1 } });
     expect(failure.commands.find((value) => value[0] === "logs")).toEqual(["logs", containerId]);
 
     const logFailure = await makeExecution(0, 1, "logs unavailable");
-    await expect(logFailure.execution.run()).rejects.toMatchObject({
+    expect(logFailure.execution.run()).rejects.toMatchObject({
       result: { stderr: "logs unavailable", stderrBytes: 16 },
     });
 
     const enospc = await makeExecution(0, 1, "ENOSPC");
-    await expect(enospc.execution.run()).rejects.toMatchObject({
+    expect(enospc.execution.run()).rejects.toMatchObject({
       measurement: { diskBytes: null, resourceViolations: ["disk-lower-bound"] },
       result: { stderr: "ENOSPC", stderrBytes: 6 },
     });
@@ -447,7 +447,7 @@ describe("Docker SQLite qualification boundary", () => {
     });
     expect(identity.serverArchitecture).toBe("amd64");
     expect(calls.map((value) => value[0])).toEqual(["info", "version"]);
-    await expect(
+    expect(
       admitDockerEngine({
         platform: "linux",
         architecture: "x64",
@@ -461,7 +461,7 @@ describe("Docker SQLite qualification boundary", () => {
         }),
       }),
     ).rejects.toBeInstanceOf(DockerAdmissionError);
-    await expect(
+    expect(
       admitDockerEngine({
         platform: "linux",
         architecture: "x64",
@@ -489,7 +489,7 @@ describe("Docker SQLite qualification boundary", () => {
     expect(new TextEncoder().encode(boundedInfo).byteLength).toBeLessThan(4 * 1024);
     expect(new TextEncoder().encode(boundedVersion).byteLength).toBeLessThan(4 * 1024);
 
-    await expect(
+    expect(
       admitDockerEngine({
         platform: "linux",
         architecture: "x64",
@@ -505,7 +505,7 @@ describe("Docker SQLite qualification boundary", () => {
     ).rejects.toBeInstanceOf(DockerAdmissionError);
 
     const calls: string[][] = [];
-    await expect(
+    expect(
       admitDockerEngine({
         platform: "linux",
         architecture: "x64",
