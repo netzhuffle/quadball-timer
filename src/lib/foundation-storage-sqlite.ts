@@ -83,6 +83,12 @@ import {
   type StoredEventGameRecordRoot,
   type StoredEventCatalogEvent,
   type StoredEventCatalogGameDay,
+  type StoredEventCatalogTeam,
+  type StoredEventCatalogRosterEntry,
+  type StoredEventCatalogPitch,
+  type StoredGameplaySlot,
+  type StoredPitchSlot,
+  type StoredEventCatalogGame,
   type EventCatalogAuditEntry,
 } from "@/lib/foundation-storage";
 import type {
@@ -267,7 +273,9 @@ function readEvent(value: unknown): StoredEventCatalogEvent | null {
     eventId: String(row.eventId),
     name: String(row.name),
     timeZone: String(row.timeZone),
-    publicationStatus: "unpublished",
+    publicationStatus: String(
+      row.publicationStatus,
+    ) as StoredEventCatalogEvent["publicationStatus"],
     createdAtMs: Number(row.createdAtMs),
     updatedAtMs: Number(row.updatedAtMs),
   };
@@ -279,6 +287,97 @@ function readGameDay(value: unknown): StoredEventCatalogGameDay {
     gameDayId: String(row.gameDayId),
     eventId: String(row.eventId),
     date: String(row.date),
+    createdAtMs: Number(row.createdAtMs),
+    updatedAtMs: Number(row.updatedAtMs),
+  };
+}
+
+function readEventTeam(value: unknown): StoredEventCatalogTeam {
+  const row = value as Record<string, unknown>;
+  return {
+    eventTeamId: String(row.eventTeamId),
+    eventId: String(row.eventId),
+    name: String(row.name),
+    defaultColor: String(row.defaultColor),
+    createdAtMs: Number(row.createdAtMs),
+    updatedAtMs: Number(row.updatedAtMs),
+  };
+}
+
+function readRosterEntry(value: unknown): StoredEventCatalogRosterEntry {
+  const row = value as Record<string, unknown>;
+  return {
+    rosterEntryId: String(row.rosterEntryId),
+    eventId: String(row.eventId),
+    eventTeamId: String(row.eventTeamId),
+    playerNumber: Number(row.playerNumber),
+    publicName: String(row.publicName),
+    createdAtMs: Number(row.createdAtMs),
+    updatedAtMs: Number(row.updatedAtMs),
+  };
+}
+
+function readPitch(value: unknown): StoredEventCatalogPitch {
+  const row = value as Record<string, unknown>;
+  return {
+    pitchId: String(row.pitchId),
+    eventId: String(row.eventId),
+    name: String(row.name),
+    createdAtMs: Number(row.createdAtMs),
+    updatedAtMs: Number(row.updatedAtMs),
+  };
+}
+
+function readGameplaySlot(value: unknown): StoredGameplaySlot {
+  const row = value as Record<string, unknown>;
+  return {
+    gameplaySlotId: String(row.gameplaySlotId),
+    eventId: String(row.eventId),
+    gameDayId: String(row.gameDayId),
+    sequence: Number(row.sequence),
+    scheduledStartMs: Number(row.scheduledStartMs),
+    expectedDelayMs: Number(row.expectedDelayMs ?? 0),
+    createdAtMs: Number(row.createdAtMs),
+    updatedAtMs: Number(row.updatedAtMs),
+  };
+}
+
+function readPitchSlot(value: unknown): StoredPitchSlot {
+  const row = value as Record<string, unknown>;
+  return {
+    pitchSlotId: String(row.pitchSlotId),
+    eventId: String(row.eventId),
+    gameDayId: String(row.gameDayId),
+    pitchId: String(row.pitchId),
+    gameplaySlotId: String(row.gameplaySlotId),
+    sequence: Number(row.sequence),
+    expectedDelayMs: Number(row.expectedDelayMs ?? 0),
+    createdAtMs: Number(row.createdAtMs),
+    updatedAtMs: Number(row.updatedAtMs),
+  };
+}
+
+function readEventGame(value: unknown): StoredEventCatalogGame {
+  const row = value as Record<string, unknown>;
+  const parseSide = (prefix: "a" | "b") => ({
+    sideId: String(row[`${prefix}SideId`]),
+    eventTeamId: row[`${prefix}EventTeamId`] === null ? null : String(row[`${prefix}EventTeamId`]),
+    eventTeamName:
+      row[`${prefix}EventTeamName`] === null ? null : String(row[`${prefix}EventTeamName`]),
+    sourceLabel: row[`${prefix}SourceLabel`] === null ? null : String(row[`${prefix}SourceLabel`]),
+    confirmedAtMs:
+      row[`${prefix}ConfirmedAtMs`] === null ? null : Number(row[`${prefix}ConfirmedAtMs`]),
+  });
+  return {
+    eventGameId: String(row.eventGameId),
+    eventId: String(row.eventId),
+    gameDayId: String(row.gameDayId),
+    gameplaySlotId: String(row.gameplaySlotId),
+    pitchSlotId: String(row.pitchSlotId),
+    gameCode: row.gameCode === null ? null : readText(row.gameCode),
+    gameDesignation: row.gameDesignation === null ? null : readText(row.gameDesignation),
+    sideA: parseSide("a"),
+    sideB: parseSide("b"),
     createdAtMs: Number(row.createdAtMs),
     updatedAtMs: Number(row.updatedAtMs),
   };
@@ -343,6 +442,18 @@ type RootStatements = {
   allEvents: SqlStatement;
   gameDaysByEventId: SqlStatement;
   eventAuditsByEventId: SqlStatement;
+  eventTeamById: SqlStatement;
+  eventTeamsByEventId: SqlStatement;
+  rosterByTeamId: SqlStatement;
+  rosterEntryByTeamAndNumber: SqlStatement;
+  pitchById: SqlStatement;
+  pitchesByEventId: SqlStatement;
+  gameplaySlotById: SqlStatement;
+  gameplaySlotsByGameDay: SqlStatement;
+  pitchSlotById: SqlStatement;
+  pitchSlotsByGameDay: SqlStatement;
+  eventGameById: SqlStatement;
+  eventGamesByGameDay: SqlStatement;
   insertEvent: SqlStatement;
   updateEvent: SqlStatement;
   deleteEvent: SqlStatement;
@@ -350,7 +461,112 @@ type RootStatements = {
   updateGameDay: SqlStatement;
   deleteGameDay: SqlStatement;
   insertEventAudit: SqlStatement;
+  insertEventTeam: SqlStatement;
+  updateEventTeam: SqlStatement;
+  insertRosterEntry: SqlStatement;
+  updateRosterEntry: SqlStatement;
+  insertPitch: SqlStatement;
+  updatePitch: SqlStatement;
+  insertGameplaySlot: SqlStatement;
+  insertPitchSlot: SqlStatement;
+  updateGameplaySlot: SqlStatement;
+  updatePitchSlot: SqlStatement;
+  insertEventGame: SqlStatement;
+  updateEventGame: SqlStatement;
 };
+
+function assertGameplaySlotMembership(statements: RootStatements, slot: StoredGameplaySlot): void {
+  assertGameDayMembership(statements, slot.eventId, slot.gameDayId);
+}
+
+function assertGameDayMembership(
+  statements: RootStatements,
+  eventId: string,
+  gameDayId: string,
+): void {
+  const day = statements.gameDaysByEventId
+    .all(eventId)
+    .map(readGameDay)
+    .find((candidate) => candidate.gameDayId === gameDayId);
+  if (day === undefined) throw new FoundationStorageConstraintError("game-day-id");
+}
+
+function assertPitchSlotMembership(statements: RootStatements, slot: StoredPitchSlot): void {
+  assertGameDayMembership(statements, slot.eventId, slot.gameDayId);
+  const pitch = statements.pitchesByEventId
+    .all(slot.eventId)
+    .map(readPitch)
+    .find((candidate) => candidate.pitchId === slot.pitchId);
+  const gameplaySlot = statements.gameplaySlotById.get(slot.gameplaySlotId);
+  if (pitch === undefined) throw new FoundationStorageConstraintError("pitch-id");
+  if (gameplaySlot === null) throw new FoundationStorageConstraintError("gameplay-slot-id");
+  const parsedGameplaySlot = readGameplaySlot(gameplaySlot);
+  if (
+    parsedGameplaySlot.eventId !== slot.eventId ||
+    parsedGameplaySlot.gameDayId !== slot.gameDayId
+  )
+    throw new FoundationStorageConstraintError("gameplay-slot-id");
+}
+
+function assertEventGameMembership(statements: RootStatements, game: StoredEventCatalogGame): void {
+  assertGameDayMembership(statements, game.eventId, game.gameDayId);
+  const gameplaySlot = statements.gameplaySlotById.get(game.gameplaySlotId);
+  const pitchSlot = statements.pitchSlotById.get(game.pitchSlotId);
+  if (gameplaySlot === null) throw new FoundationStorageConstraintError("gameplay-slot-id");
+  if (pitchSlot === null) throw new FoundationStorageConstraintError("pitch-slot-id");
+  const parsedGameplaySlot = readGameplaySlot(gameplaySlot);
+  const parsedPitchSlot = readPitchSlot(pitchSlot);
+  if (
+    parsedGameplaySlot.eventId !== game.eventId ||
+    parsedGameplaySlot.gameDayId !== game.gameDayId
+  )
+    throw new FoundationStorageConstraintError("gameplay-slot-id");
+  if (
+    parsedPitchSlot.eventId !== game.eventId ||
+    parsedPitchSlot.gameDayId !== game.gameDayId ||
+    parsedPitchSlot.gameplaySlotId !== game.gameplaySlotId
+  )
+    throw new FoundationStorageConstraintError("pitch-slot-id");
+  const teamIds = new Set(
+    statements.eventTeamsByEventId
+      .all(game.eventId)
+      .map(readEventTeam)
+      .map((team) => team.eventTeamId),
+  );
+  const teams = new Map(
+    statements.eventTeamsByEventId
+      .all(game.eventId)
+      .map(readEventTeam)
+      .map((team) => [team.eventTeamId, team]),
+  );
+  const existingRow = statements.eventGameById.get(game.eventGameId);
+  const existing = existingRow === null ? null : readEventGame(existingRow);
+  for (const side of [game.sideA, game.sideB]) {
+    if (side.eventTeamId !== null && !teamIds.has(side.eventTeamId))
+      throw new FoundationStorageConstraintError("event-team-id");
+    if (
+      (side.eventTeamId === null && side.eventTeamName !== null) ||
+      (side.eventTeamId !== null && side.eventTeamName === null)
+    )
+      throw new FoundationStorageConstraintError("event-team-name-snapshot");
+    if (side.eventTeamId !== null) {
+      const previousSide =
+        existing === null
+          ? null
+          : existing.sideA.sideId === side.sideId
+            ? existing.sideA
+            : existing.sideB.sideId === side.sideId
+              ? existing.sideB
+              : null;
+      const expectedName =
+        previousSide?.eventTeamId === side.eventTeamId
+          ? previousSide.eventTeamName
+          : teams.get(side.eventTeamId)?.name;
+      if (side.eventTeamName !== expectedName)
+        throw new FoundationStorageConstraintError("event-team-name-snapshot");
+    }
+  }
+}
 
 const ROOT_SELECT_COLUMNS = `
   roots.record_id AS record_id, roots.event_id AS event_id, roots.event_game_id AS event_game_id,
@@ -728,6 +944,40 @@ export class SqliteFoundationStorage implements FoundationStorage {
     } as const;
   }
 
+  eventCatalogStorageCapability() {
+    return {
+      name: "event-catalog-storage",
+      version: 1,
+      implementation: "event-teams-rosters-pitches-transaction-v1",
+      transaction: [
+        "findEventTeam",
+        "listEventTeams",
+        "listRoster",
+        "findRosterEntry",
+        "findPitch",
+        "listPitches",
+        "insertEventTeam",
+        "updateEventTeam",
+        "insertRosterEntry",
+        "updateRosterEntry",
+        "insertPitch",
+        "updatePitch",
+        "findGameplaySlot",
+        "listGameplaySlots",
+        "findPitchSlot",
+        "listPitchSlots",
+        "findEventGame",
+        "listEventGames",
+        "insertGameplaySlot",
+        "insertPitchSlot",
+        "updateGameplaySlot",
+        "updatePitchSlot",
+        "insertEventGame",
+        "updateEventGame",
+      ],
+    } as const;
+  }
+
   setGrantValidationContext(context: GrantStateValidationContext): void {
     this.grantValidationContext = { ...this.grantValidationContext, ...context };
   }
@@ -916,6 +1166,41 @@ export class SqliteFoundationStorage implements FoundationStorage {
           .map(readEvent)
           .filter((event): event is StoredEventCatalogEvent => event !== null),
       listGameDays: (eventId) => statements.gameDaysByEventId.all(eventId).map(readGameDay),
+      findEventTeam: (eventTeamId) => {
+        const row = statements.eventTeamById.get(eventTeamId);
+        return row === null ? null : readEventTeam(row);
+      },
+      listEventTeams: (eventId) => statements.eventTeamsByEventId.all(eventId).map(readEventTeam),
+      listRoster: (eventTeamId) => statements.rosterByTeamId.all(eventTeamId).map(readRosterEntry),
+      findRosterEntry: (eventTeamId, playerNumber) => {
+        const row = statements.rosterEntryByTeamAndNumber.get(eventTeamId, playerNumber);
+        return row === null ? null : readRosterEntry(row);
+      },
+      findPitch: (pitchId) => {
+        const row = statements.pitchById.get(pitchId);
+        return row === null ? null : readPitch(row);
+      },
+      listPitches: (eventId) => statements.pitchesByEventId.all(eventId).map(readPitch),
+      findGameplaySlot: (gameplaySlotId) => {
+        const row = statements.gameplaySlotById.get(gameplaySlotId);
+        return row === null ? null : readGameplaySlot(row);
+      },
+      listGameplaySlots: (gameDayId) =>
+        statements.gameplaySlotsByGameDay.all(gameDayId).map(readGameplaySlot),
+      findPitchSlot: (pitchSlotId) => {
+        const row = statements.pitchSlotById.get(pitchSlotId);
+        return row === null ? null : readPitchSlot(row);
+      },
+      listPitchSlots: (gameDayId, pitchId) =>
+        statements.pitchSlotsByGameDay
+          .all(gameDayId, pitchId ?? null, pitchId ?? null)
+          .map(readPitchSlot),
+      findEventGame: (eventGameId) => {
+        const row = statements.eventGameById.get(eventGameId);
+        return row === null ? null : readEventGame(row);
+      },
+      listEventGames: (gameDayId) =>
+        statements.eventGamesByGameDay.all(gameDayId).map(readEventGame),
       listEventAuditTrail: (eventId) =>
         statements.eventAuditsByEventId.all(eventId).map(readEventAudit),
       insertAction: (storedAction) => this.insertAction(statements, storedAction),
@@ -1156,6 +1441,126 @@ export class SqliteFoundationStorage implements FoundationStorage {
           entry.before === null ? null : JSON.stringify(entry.before),
           JSON.stringify(entry.after),
         ),
+      insertEventTeam: (team) =>
+        statements.insertEventTeam.run(
+          team.eventTeamId,
+          team.eventId,
+          team.name,
+          team.defaultColor,
+          team.createdAtMs,
+          team.updatedAtMs,
+        ),
+      updateEventTeam: (team) =>
+        statements.updateEventTeam.run(
+          team.name,
+          team.defaultColor,
+          team.updatedAtMs,
+          team.eventTeamId,
+        ),
+      insertRosterEntry: (entry) =>
+        statements.insertRosterEntry.run(
+          entry.rosterEntryId,
+          entry.eventId,
+          entry.eventTeamId,
+          entry.playerNumber,
+          entry.publicName,
+          entry.createdAtMs,
+          entry.updatedAtMs,
+        ),
+      updateRosterEntry: (entry) =>
+        statements.updateRosterEntry.run(entry.publicName, entry.updatedAtMs, entry.rosterEntryId),
+      insertPitch: (pitch) =>
+        statements.insertPitch.run(
+          pitch.pitchId,
+          pitch.eventId,
+          pitch.name,
+          pitch.createdAtMs,
+          pitch.updatedAtMs,
+        ),
+      updatePitch: (pitch) =>
+        statements.updatePitch.run(pitch.name, pitch.updatedAtMs, pitch.pitchId),
+      insertGameplaySlot: (slot) => {
+        assertGameplaySlotMembership(statements, slot);
+        statements.insertGameplaySlot.run(
+          slot.gameplaySlotId,
+          slot.eventId,
+          slot.gameDayId,
+          slot.sequence,
+          slot.scheduledStartMs,
+          slot.expectedDelayMs,
+          slot.createdAtMs,
+          slot.updatedAtMs,
+        );
+      },
+      insertPitchSlot: (slot) => {
+        assertPitchSlotMembership(statements, slot);
+        statements.insertPitchSlot.run(
+          slot.pitchSlotId,
+          slot.eventId,
+          slot.gameDayId,
+          slot.pitchId,
+          slot.gameplaySlotId,
+          slot.sequence,
+          slot.expectedDelayMs,
+          slot.createdAtMs,
+          slot.updatedAtMs,
+        );
+      },
+      updateGameplaySlot: (slot) => {
+        statements.updateGameplaySlot.run(
+          slot.expectedDelayMs,
+          slot.updatedAtMs,
+          slot.gameplaySlotId,
+        );
+      },
+      updatePitchSlot: (slot) => {
+        statements.updatePitchSlot.run(slot.expectedDelayMs, slot.updatedAtMs, slot.pitchSlotId);
+      },
+      insertEventGame: (game) => {
+        assertEventGameMembership(statements, game);
+        statements.insertEventGame.run(
+          game.eventGameId,
+          game.eventId,
+          game.gameDayId,
+          game.gameplaySlotId,
+          game.pitchSlotId,
+          game.gameCode,
+          game.gameDesignation,
+          game.sideA.sideId,
+          game.sideA.eventTeamId,
+          game.sideA.eventTeamName,
+          game.sideA.sourceLabel,
+          game.sideA.confirmedAtMs,
+          game.sideB.sideId,
+          game.sideB.eventTeamId,
+          game.sideB.eventTeamName,
+          game.sideB.sourceLabel,
+          game.sideB.confirmedAtMs,
+          game.createdAtMs,
+          game.updatedAtMs,
+        );
+      },
+      updateEventGame: (game) => {
+        assertEventGameMembership(statements, game);
+        statements.updateEventGame.run(
+          game.gameplaySlotId,
+          game.pitchSlotId,
+          game.gameCode,
+          game.gameDesignation,
+          game.sideA.sideId,
+          game.sideA.eventTeamId,
+          game.sideA.eventTeamName,
+          game.sideA.sourceLabel,
+          game.sideA.confirmedAtMs,
+          game.sideB.sideId,
+          game.sideB.eventTeamId,
+          game.sideB.eventTeamName,
+          game.sideB.sourceLabel,
+          game.sideB.confirmedAtMs,
+          game.updatedAtMs,
+          game.eventGameId,
+        );
+      },
       writeGrantAdmissionTelemetry: (value) => {
         this.getGrantStatements().upsertTelemetry.run(
           value.mode,
@@ -1476,6 +1881,104 @@ export class SqliteFoundationStorage implements FoundationStorage {
         FROM foundation_event_catalog_game_days
         WHERE event_id = ? ORDER BY game_day_date, game_day_id
       `),
+      eventTeamById: this.database.query(`
+        SELECT event_team_id AS eventTeamId, event_id AS eventId, name,
+               default_color AS defaultColor, created_at_ms AS createdAtMs,
+               updated_at_ms AS updatedAtMs
+        FROM foundation_event_catalog_teams WHERE event_team_id = ?
+      `),
+      eventTeamsByEventId: this.database.query(`
+        SELECT event_team_id AS eventTeamId, event_id AS eventId, name,
+               default_color AS defaultColor, created_at_ms AS createdAtMs,
+               updated_at_ms AS updatedAtMs
+        FROM foundation_event_catalog_teams WHERE event_id = ?
+        ORDER BY event_team_id
+      `),
+      rosterByTeamId: this.database.query(`
+        SELECT roster_entry_id AS rosterEntryId, event_id AS eventId,
+               event_team_id AS eventTeamId, player_number AS playerNumber,
+               public_name AS publicName, created_at_ms AS createdAtMs,
+               updated_at_ms AS updatedAtMs
+        FROM foundation_event_catalog_roster WHERE event_team_id = ?
+        ORDER BY player_number
+      `),
+      rosterEntryByTeamAndNumber: this.database.query(`
+        SELECT roster_entry_id AS rosterEntryId, event_id AS eventId,
+               event_team_id AS eventTeamId, player_number AS playerNumber,
+               public_name AS publicName, created_at_ms AS createdAtMs,
+               updated_at_ms AS updatedAtMs
+        FROM foundation_event_catalog_roster
+        WHERE event_team_id = ? AND player_number = ?
+      `),
+      pitchById: this.database.query(`
+        SELECT pitch_id AS pitchId, event_id AS eventId, name,
+               created_at_ms AS createdAtMs, updated_at_ms AS updatedAtMs
+        FROM foundation_event_catalog_pitches WHERE pitch_id = ?
+      `),
+      pitchesByEventId: this.database.query(`
+        SELECT pitch_id AS pitchId, event_id AS eventId, name,
+               created_at_ms AS createdAtMs, updated_at_ms AS updatedAtMs
+        FROM foundation_event_catalog_pitches WHERE event_id = ?
+        ORDER BY pitch_id
+      `),
+      gameplaySlotById: this.database.query(`
+        SELECT gameplay_slot_id AS gameplaySlotId, event_id AS eventId, game_day_id AS gameDayId,
+               sequence_number AS sequence, scheduled_start_ms AS scheduledStartMs,
+               expected_delay_ms AS expectedDelayMs,
+               created_at_ms AS createdAtMs, updated_at_ms AS updatedAtMs
+        FROM foundation_event_catalog_gameplay_slots WHERE gameplay_slot_id = ?
+      `),
+      gameplaySlotsByGameDay: this.database.query(`
+        SELECT gameplay_slot_id AS gameplaySlotId, event_id AS eventId, game_day_id AS gameDayId,
+               sequence_number AS sequence, scheduled_start_ms AS scheduledStartMs,
+               expected_delay_ms AS expectedDelayMs,
+               created_at_ms AS createdAtMs, updated_at_ms AS updatedAtMs
+        FROM foundation_event_catalog_gameplay_slots WHERE game_day_id = ?
+        ORDER BY sequence_number, gameplay_slot_id
+      `),
+      pitchSlotById: this.database.query(`
+        SELECT pitch_slot_id AS pitchSlotId, event_id AS eventId, game_day_id AS gameDayId,
+               pitch_id AS pitchId, gameplay_slot_id AS gameplaySlotId, sequence_number AS sequence,
+               expected_delay_ms AS expectedDelayMs,
+               created_at_ms AS createdAtMs, updated_at_ms AS updatedAtMs
+        FROM foundation_event_catalog_pitch_slots WHERE pitch_slot_id = ?
+      `),
+      pitchSlotsByGameDay: this.database.query(`
+        SELECT pitch_slot_id AS pitchSlotId, event_id AS eventId, game_day_id AS gameDayId,
+               pitch_id AS pitchId, gameplay_slot_id AS gameplaySlotId, sequence_number AS sequence,
+               expected_delay_ms AS expectedDelayMs,
+               created_at_ms AS createdAtMs, updated_at_ms AS updatedAtMs
+        FROM foundation_event_catalog_pitch_slots
+        WHERE game_day_id = ? AND (? IS NULL OR pitch_id = ?)
+        ORDER BY pitch_id, sequence_number, pitch_slot_id
+      `),
+      eventGameById: this.database.query(`
+        SELECT event_game_id AS eventGameId, event_id AS eventId, game_day_id AS gameDayId,
+               gameplay_slot_id AS gameplaySlotId, pitch_slot_id AS pitchSlotId,
+               game_code AS gameCode, game_designation AS gameDesignation,
+               side_a_id AS aSideId, side_a_event_team_id AS aEventTeamId,
+               side_a_event_team_name AS aEventTeamName, side_a_source_label AS aSourceLabel,
+               side_a_confirmed_at_ms AS aConfirmedAtMs,
+               side_b_id AS bSideId, side_b_event_team_id AS bEventTeamId,
+               side_b_event_team_name AS bEventTeamName, side_b_source_label AS bSourceLabel,
+               side_b_confirmed_at_ms AS bConfirmedAtMs,
+               created_at_ms AS createdAtMs, updated_at_ms AS updatedAtMs
+        FROM foundation_event_catalog_games WHERE event_game_id = ?
+      `),
+      eventGamesByGameDay: this.database.query(`
+        SELECT event_game_id AS eventGameId, event_id AS eventId, game_day_id AS gameDayId,
+               gameplay_slot_id AS gameplaySlotId, pitch_slot_id AS pitchSlotId,
+               game_code AS gameCode, game_designation AS gameDesignation,
+               side_a_id AS aSideId, side_a_event_team_id AS aEventTeamId,
+               side_a_event_team_name AS aEventTeamName, side_a_source_label AS aSourceLabel,
+               side_a_confirmed_at_ms AS aConfirmedAtMs,
+               side_b_id AS bSideId, side_b_event_team_id AS bEventTeamId,
+               side_b_event_team_name AS bEventTeamName, side_b_source_label AS bSourceLabel,
+               side_b_confirmed_at_ms AS bConfirmedAtMs,
+               created_at_ms AS createdAtMs, updated_at_ms AS updatedAtMs
+        FROM foundation_event_catalog_games WHERE game_day_id = ?
+        ORDER BY event_game_id
+      `),
       eventAuditsByEventId: this.database.query(`
         SELECT audit_id AS auditId, operation_id AS operationId, action,
                event_id AS eventId, game_day_id AS gameDayId,
@@ -1515,6 +2018,69 @@ export class SqliteFoundationStorage implements FoundationStorage {
           (audit_id, operation_id, action, event_id, game_day_id, actor_reference,
            occurred_at_ms, before_json, after_json)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `),
+      insertEventTeam: this.database.query(`
+        INSERT INTO foundation_event_catalog_teams
+          (event_team_id, event_id, name, default_color, created_at_ms, updated_at_ms)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `),
+      updateEventTeam: this.database.query(`
+        UPDATE foundation_event_catalog_teams
+        SET name = ?, default_color = ?, updated_at_ms = ?
+        WHERE event_team_id = ?
+      `),
+      insertRosterEntry: this.database.query(`
+        INSERT INTO foundation_event_catalog_roster
+          (roster_entry_id, event_id, event_team_id, player_number, public_name, created_at_ms, updated_at_ms)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `),
+      updateRosterEntry: this.database.query(`
+        UPDATE foundation_event_catalog_roster
+        SET public_name = ?, updated_at_ms = ?
+        WHERE roster_entry_id = ?
+      `),
+      insertPitch: this.database.query(`
+        INSERT INTO foundation_event_catalog_pitches
+          (pitch_id, event_id, name, created_at_ms, updated_at_ms)
+        VALUES (?, ?, ?, ?, ?)
+      `),
+      updatePitch: this.database.query(`
+        UPDATE foundation_event_catalog_pitches
+        SET name = ?, updated_at_ms = ?
+        WHERE pitch_id = ?
+      `),
+      insertGameplaySlot: this.database.query(`
+        INSERT INTO foundation_event_catalog_gameplay_slots
+          (gameplay_slot_id, event_id, game_day_id, sequence_number, scheduled_start_ms, expected_delay_ms, created_at_ms, updated_at_ms)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `),
+      insertPitchSlot: this.database.query(`
+        INSERT INTO foundation_event_catalog_pitch_slots
+          (pitch_slot_id, event_id, game_day_id, pitch_id, gameplay_slot_id, sequence_number, expected_delay_ms, created_at_ms, updated_at_ms)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `),
+      updateGameplaySlot: this.database.query(`
+        UPDATE foundation_event_catalog_gameplay_slots SET expected_delay_ms = ?, updated_at_ms = ?
+        WHERE gameplay_slot_id = ?
+      `),
+      updatePitchSlot: this.database.query(`
+        UPDATE foundation_event_catalog_pitch_slots SET expected_delay_ms = ?, updated_at_ms = ?
+        WHERE pitch_slot_id = ?
+      `),
+      insertEventGame: this.database.query(`
+        INSERT INTO foundation_event_catalog_games
+          (event_game_id, event_id, game_day_id, gameplay_slot_id, pitch_slot_id,
+           game_code, game_designation, side_a_id, side_a_event_team_id, side_a_event_team_name,
+           side_a_source_label, side_a_confirmed_at_ms, side_b_id, side_b_event_team_id,
+           side_b_event_team_name, side_b_source_label, side_b_confirmed_at_ms, created_at_ms, updated_at_ms)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `),
+      updateEventGame: this.database.query(`
+        UPDATE foundation_event_catalog_games SET
+          gameplay_slot_id = ?, pitch_slot_id = ?, game_code = ?, game_designation = ?, side_a_id = ?, side_a_event_team_id = ?,
+          side_a_event_team_name = ?, side_a_source_label = ?, side_a_confirmed_at_ms = ?, side_b_id = ?,
+          side_b_event_team_id = ?, side_b_event_team_name = ?, side_b_source_label = ?, side_b_confirmed_at_ms = ?,
+          updated_at_ms = ? WHERE event_game_id = ?
       `),
       budgetById: this.database.query(
         `SELECT * FROM foundation_acceptance_budgets WHERE bucket_id = ?`,
@@ -2277,6 +2843,24 @@ function translateSqliteConstraint(error: unknown): unknown {
   }
   if (message.includes("foundation_grant_audit.audit_id")) {
     return new FoundationStorageConstraintError("grant-audit-id");
+  }
+  if (message.includes("foundation_event_catalog_teams.event_team_id")) {
+    return new FoundationStorageConstraintError("event-team-id");
+  }
+  if (message.includes("foundation_event_catalog_teams.event_id") && message.includes("name")) {
+    return new FoundationStorageConstraintError("event-team-name");
+  }
+  if (message.includes("foundation_event_catalog_roster.roster_entry_id")) {
+    return new FoundationStorageConstraintError("roster-entry-id");
+  }
+  if (message.includes("foundation_event_catalog_roster.event_team_id")) {
+    return new FoundationStorageConstraintError("roster-player-number");
+  }
+  if (message.includes("foundation_event_catalog_pitches.pitch_id")) {
+    return new FoundationStorageConstraintError("pitch-id");
+  }
+  if (message.includes("foundation_event_catalog_pitches.event_id") && message.includes("name")) {
+    return new FoundationStorageConstraintError("pitch-name");
   }
   return translateControlSqliteConstraint(error);
 }

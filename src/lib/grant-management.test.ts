@@ -239,6 +239,59 @@ describe("typed Grant management", () => {
     expect(control).toMatchObject({ status: "created", grantType: GRANT_TYPE });
     if (control.status !== "created") throw new Error("Expected Control Grant.");
 
+    const eventSessionsBefore = await storage.transaction((transaction) =>
+      transaction.listGrantSessions(eventAdmin.grantId),
+    );
+    expect(
+      await authority.admitPitchManagerGrant({
+        qrCredential: eventAdmin.qrCredential,
+        browserContext: "wrong-event-admin",
+      }),
+    ).toMatchObject({ status: "rejected" });
+    expect(
+      await storage.transaction((transaction) => transaction.listGrantSessions(eventAdmin.grantId)),
+    ).toEqual(eventSessionsBefore);
+    const pitchManagerSessionsBeforeEventAdminAdmission = await storage.transaction((transaction) =>
+      transaction.listGrantSessions(pitchManager.grantId),
+    );
+    expect(
+      await authority.admitEventAdminGrant({
+        qrCredential: pitchManager.qrCredential,
+        browserContext: "wrong-pitch-manager-for-event-admin",
+      }),
+    ).toMatchObject({ status: "rejected" });
+    expect(
+      await storage.transaction((transaction) =>
+        transaction.listGrantSessions(pitchManager.grantId),
+      ),
+    ).toEqual(pitchManagerSessionsBeforeEventAdminAdmission);
+    const controlCredential = await authority.revealGrant(control.grantId, {
+      kind: "grant-session",
+      sessionBearer: eventSession.sessionBearer,
+    });
+    if (controlCredential.status !== "revealed") throw new Error("Expected Control QR.");
+    const controlSessionsBefore = await storage.transaction((transaction) =>
+      transaction.listGrantSessions(control.grantId),
+    );
+    expect(
+      await authority.admitEventAdminGrant({
+        qrCredential: controlCredential.qrCredential,
+        browserContext: "wrong-control-for-event-admin",
+      }),
+    ).toMatchObject({ status: "rejected" });
+    expect(
+      await storage.transaction((transaction) => transaction.listGrantSessions(control.grantId)),
+    ).toEqual(controlSessionsBefore);
+    expect(
+      await authority.admitPitchManagerGrant({
+        qrCredential: controlCredential.qrCredential,
+        browserContext: "wrong-control",
+      }),
+    ).toMatchObject({ status: "rejected" });
+    expect(
+      await storage.transaction((transaction) => transaction.listGrantSessions(control.grantId)),
+    ).toEqual(controlSessionsBefore);
+
     const pitchSession = await authority.admitGrant({
       qrCredential: pitchManager.qrCredential,
       browserContext: "manager",

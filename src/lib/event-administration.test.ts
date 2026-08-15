@@ -63,6 +63,56 @@ describe("Event Administration handoff", () => {
       status: "accepted",
       value: { authority: "event-admin", event: { eventId: event.value.eventId } },
     });
+    const sessionBefore = await fixture.storage.transaction(
+      (transaction) => transaction.listGrantSessions(created.value.grantId)[0],
+    );
+    expect(sessionBefore).not.toBeUndefined();
+    if (sessionBefore === undefined) throw new Error("Expected Event Admin session.");
+    const persistedExpiry = Math.min(
+      created.value.expiresAtMs ?? Number.MAX_SAFE_INTEGER,
+      sessionBefore.lastActiveAtMs + 30 * 24 * 60 * 60 * 1000,
+    );
+    fixture.setNow(sessionBefore.lastActiveAtMs + 60 * 60 * 1000);
+    const advancedHub = await fixture.administration.openEventHub({
+      eventId: event.value.eventId,
+      authority: { kind: "grant-session", sessionBearer: admission.sessionBearer },
+    });
+    expect(advancedHub).toMatchObject({
+      status: "accepted",
+      value: { grantSessionExpiresAtMs: persistedExpiry },
+    });
+    const slotProjection = await fixture.administration.openSlotSetup(
+      event.value.eventId,
+      (
+        await fixture.storage.transaction(
+          (transaction) => transaction.listGameDays(event.value.eventId)[0],
+        )
+      )?.gameDayId ?? "",
+      { kind: "grant-session", sessionBearer: admission.sessionBearer },
+    );
+    expect(slotProjection).toMatchObject({ status: "accepted" });
+    const sessionAfter = await fixture.storage.transaction(
+      (transaction) => transaction.listGrantSessions(created.value.grantId)[0],
+    );
+    expect(sessionAfter).toEqual(sessionBefore);
+    const mutationNow = sessionBefore.lastActiveAtMs + 2 * 60 * 60 * 1000;
+    fixture.setNow(mutationNow);
+    const mutation = await fixture.administration.createEventTeam(
+      event.value.eventId,
+      { name: "Renewed by Mutation" },
+      { kind: "grant-session", sessionBearer: admission.sessionBearer },
+    );
+    expect(mutation).toMatchObject({
+      status: "accepted",
+      sessionExpiresAtMs: Math.min(
+        created.value.expiresAtMs ?? Number.MAX_SAFE_INTEGER,
+        mutationNow + 30 * 24 * 60 * 60 * 1000,
+      ),
+    });
+    const sessionAfterMutation = await fixture.storage.transaction(
+      (transaction) => transaction.listGrantSessions(created.value.grantId)[0],
+    );
+    expect(sessionAfterMutation?.lastActiveAtMs).toBe(mutationNow);
     const technicalHub = await fixture.administration.openEventHub({
       eventId: event.value.eventId,
       authority: fixture.technical,
@@ -71,6 +121,108 @@ describe("Event Administration handoff", () => {
       status: "accepted",
       value: { authority: "technical-admin", event: { eventId: event.value.eventId } },
     });
+  });
+
+  test("keeps delay previews read-only while revalidating the persisted Event Admin session", async () => {
+    const fixture = createFixture();
+    const event = await fixture.catalog.createEvent(
+      { name: "Preview Event", timeZone: "UTC" },
+      fixture.technical,
+    );
+    if (event.status !== "accepted") throw new Error("Expected Event.");
+    const day = await fixture.catalog.addGameDay(
+      event.value.eventId,
+      { date: "2026-08-14" },
+      fixture.technical,
+    );
+    const pitch = await fixture.catalog.createPitch(
+      event.value.eventId,
+      { name: "Pitch A" },
+      fixture.technical,
+    );
+    if (day.status !== "accepted" || pitch.status !== "accepted")
+      throw new Error("Expected schedule setup.");
+    const slot = await fixture.catalog.createGameplaySlot(
+      event.value.eventId,
+      day.value.gameDayId,
+      { sequence: 1, scheduledStart: "2026-08-14T10:00" },
+      fixture.technical,
+    );
+    if (slot.status !== "accepted") throw new Error("Expected Gameplay Slot.");
+    const pitchSlot = await fixture.storage.transaction(
+      (transaction) => transaction.listPitchSlots(day.value.gameDayId, pitch.value.pitchId)[0],
+    );
+    if (pitchSlot === undefined) throw new Error("Expected Pitch Slot.");
+    const game = await fixture.catalog.createEventGame(
+      event.value.eventId,
+      day.value.gameDayId,
+      {
+        gameplaySlotId: slot.value.gameplaySlotId,
+        pitchSlotId: pitchSlot.pitchSlotId,
+        sideA: { sourceLabel: "A" },
+        sideB: { sourceLabel: "B" },
+      },
+      fixture.technical,
+    );
+    if (game.status !== "accepted") throw new Error("Expected Event Game.");
+    const created = await fixture.administration.createEventAdminGrant(
+      event.value.eventId,
+      fixture.technical,
+    );
+    if (created.status !== "accepted") throw new Error("Expected Grant.");
+    const revealed = await fixture.grants.revealGrant(created.value.grantId, fixture.technical);
+    if (revealed.status !== "revealed") throw new Error("Expected Grant reveal.");
+    const admitted = await fixture.administration.admitEventAdmin({
+      qrCredential: revealed.qrCredential,
+      browserContext: "preview-browser",
+      deviceClass: "desktop",
+      browserClass: "chromium",
+    });
+    if (admitted.status !== "admitted") throw new Error("Expected Event Admin admission.");
+    const authority = { kind: "grant-session" as const, sessionBearer: admitted.sessionBearer };
+    const beforeSession = await fixture.storage.transaction(
+      (transaction) => transaction.listGrantSessions(created.value.grantId)[0],
+    );
+    const beforeAudit = await fixture.catalog.listAuditTrail(
+      event.value.eventId,
+      fixture.technical,
+    );
+    expect(
+      await fixture.administration.previewGameplaySlotExpectedDelay(
+        event.value.eventId,
+        day.value.gameDayId,
+        slot.value.gameplaySlotId,
+        { expectedDelayMs: 5 * 60_000 },
+        authority,
+      ),
+    ).toMatchObject({
+      status: "accepted",
+      value: {
+        changes: [
+          {
+            eventGames: [
+              { eventGameId: game.value.eventGameId, beforeExpectedStartMs: expect.any(Number) },
+            ],
+          },
+        ],
+      },
+    });
+    const afterSession = await fixture.storage.transaction(
+      (transaction) => transaction.listGrantSessions(created.value.grantId)[0],
+    );
+    const afterAudit = await fixture.catalog.listAuditTrail(event.value.eventId, fixture.technical);
+    expect(afterSession).toEqual(beforeSession);
+    if (beforeAudit.status === "accepted" && afterAudit.status === "accepted")
+      expect(afterAudit.value.length).toBe(beforeAudit.value.length);
+    expect(
+      await fixture.administration.previewPitchSlotExpectedDelay(
+        event.value.eventId,
+        day.value.gameDayId,
+        pitchSlot.pitchSlotId,
+        { expectedDelayMs: 3 * 60_000 },
+        authority,
+      ),
+    ).toMatchObject({ status: "accepted", value: { changes: [{ afterDelayMs: 3 * 60_000 }] } });
   });
 
   test("rejects duplicate Event Admin creation without creating another authority", async () => {
@@ -332,17 +484,212 @@ describe("Event Administration handoff", () => {
         grantAudit: transaction.listGrantAudit(grant.value.grantId),
         event: transaction.findEvent(event.value.eventId),
         gameDays: transaction.listGameDays(event.value.eventId),
+        teams: transaction.listEventTeams(event.value.eventId),
+        roster: transaction
+          .listEventTeams(event.value.eventId)
+          .flatMap((team) => transaction.listRoster(team.eventTeamId)),
+        pitches: transaction.listPitches(event.value.eventId),
         eventAudit: transaction.listEventAuditTrail(event.value.eventId),
       }));
     const before = await readState();
     failNext = true;
     expect(
-      await fixture.administration.openEventHub({
-        eventId: event.value.eventId,
-        authority: { kind: "grant-session", sessionBearer: admission.sessionBearer },
-      }),
+      await fixture.administration.createEventTeam(
+        event.value.eventId,
+        { name: "Should Roll Back" },
+        { kind: "grant-session", sessionBearer: admission.sessionBearer },
+      ),
     ).toMatchObject({ status: "retryable-failure" });
     expect(await readState()).toEqual(before);
+  });
+
+  test("does not retain a Pitch Manager Grant after its atomic handoff fails", async () => {
+    const baseStorage = createInMemoryFoundationStorage();
+    let failNext = false;
+    const storage = new Proxy(baseStorage, {
+      get(target, property, receiver) {
+        if (property === "transaction") {
+          return (work: Parameters<FoundationStorage["transaction"]>[0]) =>
+            target.transaction((transaction) => {
+              const result = work(transaction);
+              if (failNext) {
+                failNext = false;
+                throw new Error("injected Pitch Manager handoff failure");
+              }
+              return result;
+            });
+        }
+        const value = Reflect.get(target, property, receiver);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    }) as FoundationStorage;
+    const fixture = createFixture(storage);
+    const event = await fixture.catalog.createEvent(
+      { name: "Pitch Manager Failure Event", timeZone: "UTC" },
+      fixture.technical,
+    );
+    if (event.status !== "accepted") throw new Error("Expected Event.");
+    const day = await fixture.catalog.addGameDay(
+      event.value.eventId,
+      { date: "2026-08-14" },
+      fixture.technical,
+    );
+    const pitch = await fixture.administration.createPitch(
+      event.value.eventId,
+      { name: "Pitch A" },
+      fixture.technical,
+    );
+    if (day.status !== "accepted" || pitch.status !== "accepted")
+      throw new Error("Expected schedule structure.");
+    const eventGrant = await fixture.administration.createEventAdminGrant(
+      event.value.eventId,
+      fixture.technical,
+    );
+    if (eventGrant.status !== "accepted") throw new Error("Expected Event Admin Grant.");
+    const eventQr = await fixture.grants.revealGrant(eventGrant.value.grantId, fixture.technical);
+    if (eventQr.status !== "revealed") throw new Error("Expected Event Admin QR.");
+    const eventSession = await fixture.administration.admitEventAdmin({
+      qrCredential: eventQr.qrCredential,
+      browserContext: "pitch-manager-failure-browser",
+    });
+    if (eventSession.status !== "admitted") throw new Error("Expected Event Admin session.");
+    const before = await baseStorage.transaction((transaction) => ({
+      grants: transaction.listGrants(),
+      sessions: transaction.listGrantSessions(eventGrant.value.grantId),
+      audit: transaction.listGrantAudit(eventGrant.value.grantId),
+    }));
+    failNext = true;
+    expect(
+      await fixture.administration.createPitchManagerGrant(
+        event.value.eventId,
+        day.value.gameDayId,
+        pitch.value.pitchId,
+        { kind: "grant-session", sessionBearer: eventSession.sessionBearer },
+      ),
+    ).toMatchObject({ status: "retryable-failure" });
+    expect(
+      await baseStorage.transaction((transaction) => ({
+        grants: transaction.listGrants(),
+        sessions: transaction.listGrantSessions(eventGrant.value.grantId),
+        audit: transaction.listGrantAudit(eventGrant.value.grantId),
+      })),
+    ).toEqual(before);
+  });
+
+  test("rejects forged Event Admin catalog authority and serializes revocation with mutation", async () => {
+    const fixture = createFixture();
+    const event = await fixture.catalog.createEvent(
+      { name: "Authority Event", timeZone: "UTC" },
+      fixture.technical,
+    );
+    if (event.status !== "accepted") throw new Error("Expected Event.");
+    await fixture.catalog.addGameDay(
+      event.value.eventId,
+      { date: "2026-08-14" },
+      fixture.technical,
+    );
+    const grant = await fixture.administration.createEventAdminGrant(
+      event.value.eventId,
+      fixture.technical,
+    );
+    if (grant.status !== "accepted") throw new Error("Expected Grant.");
+    const reveal = await fixture.grants.revealGrant(grant.value.grantId, fixture.technical);
+    if (reveal.status !== "revealed") throw new Error("Expected reveal.");
+    const admission = await fixture.administration.admitEventAdmin({
+      qrCredential: reveal.qrCredential,
+      browserContext: "authority-browser",
+    });
+    if (admission.status !== "admitted") throw new Error("Expected admission.");
+    const forged = {
+      kind: "event-admin",
+      eventId: event.value.eventId,
+      sessionId: "forged-session",
+    } as never;
+    expect(
+      await fixture.administration.createEventTeam(event.value.eventId, { name: "Forged" }, forged),
+    ).toMatchObject({ status: "rejected", reason: "unauthorized" });
+    const sessionAuthority = {
+      kind: "grant-session",
+      sessionBearer: admission.sessionBearer,
+    } as const;
+    const mutation = await fixture.administration.createEventTeam(
+      event.value.eventId,
+      { name: "Race Team" },
+      sessionAuthority,
+    );
+    const revoked = await fixture.administration.revokeEventAdminGrant(
+      event.value.eventId,
+      fixture.technical,
+    );
+    expect(revoked).toMatchObject({ status: "accepted" });
+    expect(mutation).toMatchObject({ status: "accepted" });
+    expect(
+      await fixture.catalog.inspectEvent(event.value.eventId, fixture.technical),
+    ).toMatchObject({
+      status: "accepted",
+      value: { teams: [{ name: "Race Team" }] },
+    });
+    expect(
+      await fixture.administration.createEventTeam(
+        event.value.eventId,
+        { name: "After Revoke" },
+        sessionAuthority,
+      ),
+    ).toMatchObject({ status: "rejected", reason: "unauthorized" });
+
+    const rotatedEvent = await fixture.catalog.createEvent(
+      { name: "Rotation Event", timeZone: "UTC" },
+      fixture.technical,
+    );
+    if (rotatedEvent.status !== "accepted") throw new Error("Expected rotation Event.");
+    await fixture.catalog.addGameDay(
+      rotatedEvent.value.eventId,
+      { date: "2026-08-14" },
+      fixture.technical,
+    );
+    const rotatedGrant = await fixture.administration.createEventAdminGrant(
+      rotatedEvent.value.eventId,
+      fixture.technical,
+    );
+    if (rotatedGrant.status !== "accepted") throw new Error("Expected rotation Grant.");
+    const rotatedReveal = await fixture.grants.revealGrant(
+      rotatedGrant.value.grantId,
+      fixture.technical,
+    );
+    if (rotatedReveal.status !== "revealed") throw new Error("Expected rotation reveal.");
+    const rotatedAdmission = await fixture.administration.admitEventAdmin({
+      qrCredential: rotatedReveal.qrCredential,
+      browserContext: "rotation-browser",
+    });
+    if (rotatedAdmission.status !== "admitted") throw new Error("Expected rotation admission.");
+    const rotationAuthority = {
+      kind: "grant-session",
+      sessionBearer: rotatedAdmission.sessionBearer,
+    } as const;
+    const rotated = await fixture.administration.rotateEventAdminGrant(
+      rotatedEvent.value.eventId,
+      fixture.technical,
+    );
+    const rotationMutation = await fixture.administration.createEventTeam(
+      rotatedEvent.value.eventId,
+      { name: "Rotation Race Team" },
+      rotationAuthority,
+    );
+    expect(rotated).toMatchObject({ status: "accepted" });
+    expect(rotationMutation).toMatchObject({ status: "rejected", reason: "unauthorized" });
+    expect(
+      await fixture.catalog.inspectEvent(rotatedEvent.value.eventId, fixture.technical),
+    ).toMatchObject({
+      status: "accepted",
+      value: { teams: [] },
+    });
+    expect(
+      await fixture.administration.createEventTeam(
+        rotatedEvent.value.eventId,
+        { name: "After Rotate" },
+        rotationAuthority,
+      ),
+    ).toMatchObject({ status: "rejected", reason: "unauthorized" });
   });
 
   test("preserves empty Event removal while rejecting removal of an attached Grant", async () => {
@@ -387,6 +734,492 @@ describe("Event Administration handoff", () => {
         status: "accepted",
       },
     );
+  });
+
+  test("lets Event Administration configure Teams, public roster mappings, and Pitches", async () => {
+    const fixture = createFixture();
+    const event = await fixture.catalog.createEvent(
+      { name: "Configured Event", timeZone: "UTC" },
+      fixture.technical,
+    );
+    if (event.status !== "accepted") throw new Error("Expected Event.");
+    const team = await fixture.administration.createEventTeam(
+      event.value.eventId,
+      { name: "Blue", defaultColor: "#123456" },
+      fixture.technical,
+    );
+    expect(team).toMatchObject({ status: "accepted", value: { name: "Blue", roster: [] } });
+    if (team.status !== "accepted") return;
+    expect(
+      await fixture.administration.upsertEventTeamRoster(
+        event.value.eventId,
+        team.value.eventTeamId,
+        { playerNumber: 4, publicName: "Public Player" },
+        fixture.technical,
+      ),
+    ).toMatchObject({
+      status: "accepted",
+      value: { playerNumber: 4, publicName: "Public Player" },
+    });
+    expect(
+      await fixture.administration.createPitch(
+        event.value.eventId,
+        { name: "Pitch 1" },
+        fixture.technical,
+      ),
+    ).toMatchObject({ status: "accepted", value: { name: "Pitch 1" } });
+    const hub = await fixture.administration.openEventHub({
+      eventId: event.value.eventId,
+      authority: fixture.technical,
+    });
+    expect(hub).toMatchObject({
+      status: "accepted",
+      value: {
+        event: {
+          teams: [{ name: "Blue", roster: [{ playerNumber: 4 }] }],
+          pitches: [{ name: "Pitch 1" }],
+        },
+      },
+    });
+  });
+
+  test("configures ordered schedule projections and confirms one Gameplay Slot", async () => {
+    const fixture = createFixture();
+    const event = await fixture.catalog.createEvent(
+      { name: "Scheduled Event", timeZone: "UTC" },
+      fixture.technical,
+    );
+    if (event.status !== "accepted") throw new Error("Expected Event.");
+    const day = await fixture.catalog.addGameDay(
+      event.value.eventId,
+      { date: "2026-08-14" },
+      fixture.technical,
+    );
+    if (day.status !== "accepted") throw new Error("Expected Game Day.");
+    const pitch = await fixture.administration.createPitch(
+      event.value.eventId,
+      { name: "Pitch A" },
+      fixture.technical,
+    );
+    if (pitch.status !== "accepted") throw new Error("Expected Pitch.");
+    const firstTeam = await fixture.administration.createEventTeam(
+      event.value.eventId,
+      { name: "First" },
+      fixture.technical,
+    );
+    const secondTeam = await fixture.administration.createEventTeam(
+      event.value.eventId,
+      { name: "Second" },
+      fixture.technical,
+    );
+    if (firstTeam.status !== "accepted" || secondTeam.status !== "accepted")
+      throw new Error("Expected Event Teams.");
+    const later = await fixture.administration.createGameplaySlot(
+      event.value.eventId,
+      day.value.gameDayId,
+      { sequence: 2, scheduledStart: "2026-08-14T10:30" },
+      fixture.technical,
+    );
+    const earlier = await fixture.administration.createGameplaySlot(
+      event.value.eventId,
+      day.value.gameDayId,
+      { sequence: 1, scheduledStart: "2026-08-14T10:00" },
+      fixture.technical,
+    );
+    expect(later).toMatchObject({ status: "accepted" });
+    expect(earlier).toMatchObject({ status: "accepted" });
+    if (later.status !== "accepted" || earlier.status !== "accepted")
+      throw new Error("Expected Gameplay Slots.");
+    const pitchSlots = await fixture.storage.transaction((transaction) =>
+      transaction.listPitchSlots(day.value.gameDayId, pitch.value.pitchId),
+    );
+    const earlierPitchSlot = pitchSlots.find(
+      (pitchSlot) => pitchSlot.gameplaySlotId === earlier.value.gameplaySlotId,
+    );
+    if (earlierPitchSlot === undefined) throw new Error("Expected Pitch Slot.");
+    const game = await fixture.administration.createEventGame(
+      event.value.eventId,
+      day.value.gameDayId,
+      {
+        gameplaySlotId: earlier.value.gameplaySlotId,
+        pitchSlotId: earlierPitchSlot.pitchSlotId,
+        gameCode: "G-01",
+        gameDesignation: "Opening",
+        sideA: { sourceLabel: "Winner of A" },
+        sideB: { sourceLabel: "Winner of B" },
+      },
+      fixture.technical,
+    );
+    expect(game).toMatchObject({
+      status: "accepted",
+      value: { sideA: { sourceLabel: "Winner of A" } },
+    });
+    if (game.status !== "accepted") throw new Error("Expected Event Game.");
+    const setup = await fixture.administration.openSlotSetup(
+      event.value.eventId,
+      day.value.gameDayId,
+      fixture.technical,
+    );
+    expect(setup).toMatchObject({
+      status: "accepted",
+      value: {
+        gameplaySlots: [{ sequence: 1 }, { sequence: 2 }],
+        eventGames: [{ gameCode: "G-01", sideA: { sourceLabel: "Winner of A" } }],
+        pitches: [{ pitchId: pitch.value.pitchId, name: "Pitch A" }],
+      },
+    });
+    expect(JSON.stringify(setup)).not.toContain("actorReference");
+    const pitchView = await fixture.administration.openPitchView(
+      event.value.eventId,
+      day.value.gameDayId,
+      pitch.value.pitchId,
+      fixture.technical,
+    );
+    expect(pitchView).toMatchObject({
+      status: "accepted",
+      value: {
+        pitchId: pitch.value.pitchId,
+        pitchSlots: [
+          { gameplaySlotId: earlier.value.gameplaySlotId },
+          { gameplaySlotId: later.value.gameplaySlotId },
+        ],
+        eventGames: [{ eventGameId: game.value.eventGameId }],
+      },
+    });
+    const confirmed = await fixture.administration.confirmGameplaySlotTeams(
+      event.value.eventId,
+      day.value.gameDayId,
+      earlier.value.gameplaySlotId,
+      {
+        games: [
+          {
+            eventGameId: game.value.eventGameId,
+            sideAEventTeamId: firstTeam.value.eventTeamId,
+            sideBEventTeamId: secondTeam.value.eventTeamId,
+          },
+        ],
+      },
+      fixture.technical,
+    );
+    expect(confirmed).toMatchObject({
+      status: "accepted",
+      value: [
+        {
+          sideA: { eventTeamId: firstTeam.value.eventTeamId },
+          sideB: { eventTeamId: secondTeam.value.eventTeamId },
+        },
+      ],
+    });
+  });
+
+  test("hands one Pitch and Game Day to a persistent, narrow Pitch Manager session", async () => {
+    const fixture = createFixture();
+    const event = await fixture.catalog.createEvent(
+      { name: "Pitch Handoff", timeZone: "Europe/Zurich" },
+      fixture.technical,
+    );
+    if (event.status !== "accepted") throw new Error("Expected Event.");
+    const firstDay = await fixture.catalog.addGameDay(
+      event.value.eventId,
+      { date: "2026-08-14" },
+      fixture.technical,
+    );
+    const secondDay = await fixture.catalog.addGameDay(
+      event.value.eventId,
+      { date: "2026-08-15" },
+      fixture.technical,
+    );
+    const pitch = await fixture.administration.createPitch(
+      event.value.eventId,
+      { name: "Pitch A" },
+      fixture.technical,
+    );
+    if (
+      firstDay.status !== "accepted" ||
+      secondDay.status !== "accepted" ||
+      pitch.status !== "accepted"
+    )
+      throw new Error("Expected schedule structure.");
+    const eventGrant = await fixture.administration.createEventAdminGrant(
+      event.value.eventId,
+      fixture.technical,
+    );
+    if (eventGrant.status !== "accepted") throw new Error("Expected Event Admin Grant.");
+    const eventCredential = await fixture.grants.revealGrant(
+      eventGrant.value.grantId,
+      fixture.technical,
+    );
+    if (eventCredential.status !== "revealed") throw new Error("Expected Event Admin QR.");
+    const eventAdmission = await fixture.administration.admitEventAdmin({
+      qrCredential: eventCredential.qrCredential,
+      browserContext: "event-admin-phone",
+    });
+    if (eventAdmission.status !== "admitted") throw new Error("Expected Event Admin session.");
+    const eventAuthority = {
+      kind: "grant-session",
+      sessionBearer: eventAdmission.sessionBearer,
+    } as const;
+
+    const created = await fixture.administration.createPitchManagerGrant(
+      event.value.eventId,
+      firstDay.value.gameDayId,
+      pitch.value.pitchId,
+      eventAuthority,
+    );
+    expect(created).toMatchObject({
+      status: "accepted",
+      value: {
+        gameDayId: firstDay.value.gameDayId,
+        pitchId: pitch.value.pitchId,
+        status: "active",
+      },
+    });
+    if (created.status !== "accepted") throw new Error("Expected Pitch Manager Grant.");
+    expect(
+      await fixture.administration.createPitchManagerGrant(
+        event.value.eventId,
+        firstDay.value.gameDayId,
+        pitch.value.pitchId,
+        eventAuthority,
+      ),
+    ).toMatchObject({ status: "rejected", reason: "invalid-input" });
+    const pitchCredential = await fixture.administration.revealPitchManagerGrant(
+      event.value.eventId,
+      firstDay.value.gameDayId,
+      pitch.value.pitchId,
+      eventAuthority,
+    );
+    if (pitchCredential.status !== "accepted" || pitchCredential.value.status !== "revealed")
+      throw new Error("Expected Pitch Manager QR.");
+    const managerAdmission = await fixture.administration.admitPitchManager({
+      qrCredential: pitchCredential.value.qrCredential,
+      browserContext: "manager-phone",
+    });
+    if (managerAdmission.status !== "admitted") throw new Error("Expected Pitch Manager session.");
+
+    const slot = await fixture.administration.createGameplaySlot(
+      event.value.eventId,
+      firstDay.value.gameDayId,
+      { sequence: 1, scheduledStart: "2026-08-14T10:00" },
+      fixture.technical,
+    );
+    if (slot.status !== "accepted") throw new Error("Expected Gameplay Slot.");
+    const pitchSlot = await fixture.storage.transaction(
+      (transaction) => transaction.listPitchSlots(firstDay.value.gameDayId, pitch.value.pitchId)[0],
+    );
+    if (pitchSlot === undefined) throw new Error("Expected Pitch Slot.");
+    const game = await fixture.administration.createEventGame(
+      event.value.eventId,
+      firstDay.value.gameDayId,
+      {
+        gameplaySlotId: slot.value.gameplaySlotId,
+        pitchSlotId: pitchSlot.pitchSlotId,
+        sideA: { sourceLabel: "A" },
+        sideB: { sourceLabel: "B" },
+      },
+      fixture.technical,
+    );
+    if (game.status !== "accepted") throw new Error("Expected Event Game.");
+    const control = await fixture.grants.createControlGrant({
+      authority: { kind: "grant-session", sessionBearer: managerAdmission.sessionBearer },
+      scope: {
+        eventId: event.value.eventId,
+        gameDayId: firstDay.value.gameDayId,
+        pitchId: pitch.value.pitchId,
+        pitchSlotId: pitchSlot.pitchSlotId,
+      },
+    });
+    expect(control).toMatchObject({ status: "created", grantType: "control" });
+
+    const view = await fixture.administration.openPitchManagerView({
+      eventId: event.value.eventId,
+      gameDayId: firstDay.value.gameDayId,
+      pitchId: pitch.value.pitchId,
+      authority: { kind: "grant-session", sessionBearer: managerAdmission.sessionBearer },
+    });
+    expect(view).toMatchObject({
+      status: "accepted",
+      value: {
+        eventId: event.value.eventId,
+        gameDayId: firstDay.value.gameDayId,
+        eventTimeZone: "Europe/Zurich",
+        pitch: { pitchId: pitch.value.pitchId },
+        schedule: [
+          {
+            expectedStart: "2026-08-14 10:00 Europe/Zurich",
+            eventGame: {
+              eventGameId: game.value.eventGameId,
+              sideA: { displayName: "A" },
+              sideB: { displayName: "B" },
+            },
+            conflictEventGameIds: [game.value.eventGameId],
+            controlGrantStatus: "active",
+          },
+        ],
+        grantSessionExpiresAt: "2026-08-15 04:30 Europe/Zurich",
+      },
+    });
+    if (view.status === "accepted") {
+      expect(view.value).not.toHaveProperty("eventGames");
+      expect(view.value).not.toHaveProperty("createdAtMs");
+      expect(view.value).not.toHaveProperty("updatedAtMs");
+    }
+    expect(
+      await fixture.administration.openPitchManagerCurrentView({
+        authority: { kind: "grant-session", sessionBearer: managerAdmission.sessionBearer },
+      }),
+    ).toMatchObject({
+      status: "accepted",
+      value: {
+        eventId: event.value.eventId,
+        gameDayId: firstDay.value.gameDayId,
+        pitch: { pitchId: pitch.value.pitchId },
+      },
+    });
+    expect(
+      await fixture.administration.openPitchManagerView({
+        eventId: event.value.eventId,
+        gameDayId: secondDay.value.gameDayId,
+        pitchId: pitch.value.pitchId,
+        authority: { kind: "grant-session", sessionBearer: managerAdmission.sessionBearer },
+      }),
+    ).toMatchObject({ status: "rejected", reason: "unauthorized" });
+
+    fixture.setNow(created.value.expiresAtMs ?? 0);
+    expect(
+      await fixture.administration.openPitchManagerView({
+        eventId: event.value.eventId,
+        gameDayId: firstDay.value.gameDayId,
+        pitchId: pitch.value.pitchId,
+        authority: { kind: "grant-session", sessionBearer: managerAdmission.sessionBearer },
+      }),
+    ).toMatchObject({ status: "rejected", reason: "unauthorized" });
+    expect(
+      await fixture.administration.reactivatePitchManagerGrant(
+        event.value.eventId,
+        firstDay.value.gameDayId,
+        pitch.value.pitchId,
+        fixture.technical,
+      ),
+    ).toMatchObject({ status: "rejected" });
+    const laterDayGrant = await fixture.administration.createPitchManagerGrant(
+      event.value.eventId,
+      secondDay.value.gameDayId,
+      pitch.value.pitchId,
+      eventAuthority,
+    );
+    expect(laterDayGrant).toMatchObject({
+      status: "accepted",
+      value: { gameDayId: secondDay.value.gameDayId, pitchId: pitch.value.pitchId },
+    });
+    if (laterDayGrant.status !== "accepted") throw new Error("Expected later-day Grant.");
+    const laterQr = await fixture.administration.revealPitchManagerGrant(
+      event.value.eventId,
+      secondDay.value.gameDayId,
+      pitch.value.pitchId,
+      eventAuthority,
+    );
+    if (laterQr.status !== "accepted" || laterQr.value.status !== "revealed")
+      throw new Error("Expected later-day QR.");
+    const oldLaterSession = await fixture.administration.admitPitchManager({
+      qrCredential: laterQr.value.qrCredential,
+      browserContext: "later-manager",
+    });
+    if (oldLaterSession.status !== "admitted") throw new Error("Expected later-day session.");
+    const rotated = await fixture.administration.rotatePitchManagerGrant(
+      event.value.eventId,
+      secondDay.value.gameDayId,
+      pitch.value.pitchId,
+      eventAuthority,
+    );
+    expect(rotated).toMatchObject({ status: "accepted", value: { status: "updated" } });
+    expect(
+      await fixture.administration.openPitchManagerView({
+        eventId: event.value.eventId,
+        gameDayId: secondDay.value.gameDayId,
+        pitchId: pitch.value.pitchId,
+        authority: { kind: "grant-session", sessionBearer: oldLaterSession.sessionBearer },
+      }),
+    ).toMatchObject({ status: "rejected", reason: "unauthorized" });
+    const revoked = await fixture.administration.revokePitchManagerGrant(
+      event.value.eventId,
+      secondDay.value.gameDayId,
+      pitch.value.pitchId,
+      eventAuthority,
+    );
+    expect(revoked).toMatchObject({ status: "accepted", value: { status: "updated" } });
+    const reactivated = await fixture.administration.reactivatePitchManagerGrant(
+      event.value.eventId,
+      secondDay.value.gameDayId,
+      pitch.value.pitchId,
+      eventAuthority,
+    );
+    expect(reactivated).toMatchObject({ status: "accepted", value: { status: "updated" } });
+    const reactivatedQr = await fixture.administration.revealPitchManagerGrant(
+      event.value.eventId,
+      secondDay.value.gameDayId,
+      pitch.value.pitchId,
+      eventAuthority,
+    );
+    expect(reactivatedQr).toMatchObject({ status: "accepted", value: { status: "revealed" } });
+  });
+
+  test("lets Technical and Event Admin authority publish and hide without revoking the Grant", async () => {
+    const fixture = createFixture();
+    const event = await fixture.catalog.createEvent(
+      { name: "Publication Event", timeZone: "UTC" },
+      fixture.technical,
+    );
+    if (event.status !== "accepted") throw new Error("Expected Event.");
+    await fixture.catalog.addGameDay(
+      event.value.eventId,
+      { date: "2026-08-14" },
+      fixture.technical,
+    );
+    const grant = await fixture.administration.createEventAdminGrant(
+      event.value.eventId,
+      fixture.technical,
+    );
+    if (grant.status !== "accepted") throw new Error("Expected Grant.");
+    const revealed = await fixture.grants.revealGrant(grant.value.grantId, fixture.technical);
+    if (revealed.status !== "revealed") throw new Error("Expected Grant reveal.");
+    const admission = await fixture.administration.admitEventAdmin({
+      qrCredential: revealed.qrCredential,
+      browserContext: "publication-browser",
+    });
+    if (admission.status !== "admitted") throw new Error("Expected Event Admin admission.");
+    const eventAdmin = { kind: "grant-session" as const, sessionBearer: admission.sessionBearer };
+
+    expect(
+      await fixture.administration.changePublicationStatus(
+        event.value.eventId,
+        { status: "published" },
+        eventAdmin,
+      ),
+    ).toMatchObject({ status: "accepted", value: { publicationStatus: "published" } });
+    expect(
+      await fixture.administration.changePublicationStatus(
+        event.value.eventId,
+        { status: "cancelled" },
+        eventAdmin,
+      ),
+    ).toMatchObject({ status: "rejected", reason: "invalid-input" });
+    expect(
+      await fixture.administration.changePublicationStatus(
+        event.value.eventId,
+        { status: "cancelled", impactConfirmed: true },
+        eventAdmin,
+      ),
+    ).toMatchObject({ status: "accepted", value: { publicationStatus: "cancelled" } });
+    expect(
+      await fixture.administration.openEventHub({
+        eventId: event.value.eventId,
+        authority: eventAdmin,
+      }),
+    ).toMatchObject({ status: "accepted", value: { event: { publicationStatus: "cancelled" } } });
+    expect(
+      await fixture.administration.inspectEventAdminGrant(event.value.eventId, fixture.technical),
+    ).toMatchObject({ status: "accepted", value: { status: "active" } });
   });
 });
 

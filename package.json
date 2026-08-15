@@ -23,6 +23,7 @@
     "test:focused:acceptance": "bun test --isolate ./src/lib/foundation-acceptance-sqlite.focused.ts",
     "test:focused:grant": "bun test ./src/lib/grant-authority.focused.ts",
     "test:focused:event-catalog": "bun test --isolate ./src/lib/event-catalog.focused.ts",
+    "test:focused:pitch-manager": "bun test --isolate ./src/lib/pitch-manager-administration-sqlite.focused.ts",
     "test:focused:event-catalog-cli": "bun test --isolate ./scripts/event-catalog-cli.focused.ts",
     "test:focused:grant-code": "bun test --isolate ./src/lib/grant-code.focused.ts",
     "test:focused:ad-hoc": "bun test --isolate ./src/lib/ad-hoc-games.focused.ts",

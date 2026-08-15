@@ -9,6 +9,10 @@ import {
   EVENT_ADMIN_GRANT_TYPE,
   GRANT_CODE_KIND,
   GRANT_TYPE,
+  PITCH_MANAGER_GRANT_TYPE,
+  type GrantType,
+  validateEventAdminGrantScope,
+  validatePitchManagerGrantScope,
   type ControlGrantScope,
   type ControlGrantScopeResolution,
   type ControlGrantSessionDecision,
@@ -70,6 +74,7 @@ export async function admitGrant(
     deviceClass?: string;
     browserClass?: string;
   },
+  expectedGrantType?: GrantType,
 ): Promise<TypedGrantAdmission | ReturnType<typeof grantAdmissionThrottled>> {
   const record: Record<string, unknown> = isGrantRecord(input) ? input : {};
   try {
@@ -97,6 +102,23 @@ export async function admitGrant(
       ) {
         recordAdmissionFailure(transaction, "qr", budget.sourceDigest, nowMs);
         return GENERIC_GRANT_ADMISSION_FAILURE;
+      }
+      if (expectedGrantType !== undefined && current.grantType !== expectedGrantType) {
+        recordAdmissionFailure(transaction, "qr", budget.sourceDigest, nowMs);
+        return GENERIC_GRANT_ADMISSION_FAILURE;
+      }
+      if (expectedGrantType === PITCH_MANAGER_GRANT_TYPE) {
+        const scope = validatePitchManagerGrantScope(current.scope);
+        if (!scope.ok || !isLivePitchManagerScope(transaction, scope.value)) {
+          recordAdmissionFailure(transaction, "qr", budget.sourceDigest, nowMs);
+          return GENERIC_GRANT_ADMISSION_FAILURE;
+        }
+      }
+      if (expectedGrantType === EVENT_ADMIN_GRANT_TYPE) {
+        if (!validateEventAdminGrantScope(current.scope).ok) {
+          recordAdmissionFailure(transaction, "qr", budget.sourceDigest, nowMs);
+          return GENERIC_GRANT_ADMISSION_FAILURE;
+        }
       }
       let eventGameId: string | null = null;
       if (current.grantType === GRANT_TYPE) {
@@ -173,12 +195,39 @@ export async function admitGrant(
         sessionExpiresAtMs:
           current.grantType === EVENT_ADMIN_GRANT_TYPE
             ? Math.min(current.expiresAtMs ?? Number.MAX_SAFE_INTEGER, nowMs + 30 * DAY_MS)
-            : null,
+            : current.grantType === "pitch-manager"
+              ? current.expiresAtMs
+              : null,
       };
     });
   } catch {
     return GENERIC_GRANT_ADMISSION_FAILURE;
   }
+}
+
+function isLivePitchManagerScope(
+  transaction: FoundationStorageTransaction,
+  scope: {
+    eventId: string;
+    gameDayId: string;
+    gameDayDate: string;
+    eventTimeZone: string;
+    pitchId: string;
+  },
+): boolean {
+  const event = transaction.findEvent(scope.eventId);
+  const gameDay = transaction
+    .listGameDays(scope.eventId)
+    .find((candidate) => candidate.gameDayId === scope.gameDayId);
+  const pitch = transaction.findPitch(scope.pitchId);
+  return (
+    event !== null &&
+    gameDay !== undefined &&
+    gameDay.date === scope.gameDayDate &&
+    event.timeZone === scope.eventTimeZone &&
+    pitch !== null &&
+    pitch.eventId === scope.eventId
+  );
 }
 
 export async function authorizeGrant(
@@ -309,6 +358,7 @@ export function authorizeGrantInTransaction(
       eventGameId = relationship.eventGameId;
     } else if (relationship.status !== "switchable") return GENERIC_GRANT_AUTHORIZATION_FAILURE;
   }
+  const effectiveActivityAtMs = input.readOnly ? session.lastActiveAtMs : nowMs;
   if (!input.readOnly) {
     transaction.updateGrantSession({ ...session, lastActiveAtMs: nowMs });
   }
@@ -322,8 +372,13 @@ export function authorizeGrantInTransaction(
     grantSessionId: session.sessionId,
     sessionExpiresAtMs:
       grant.grantType === EVENT_ADMIN_GRANT_TYPE
-        ? Math.min(grant.expiresAtMs ?? Number.MAX_SAFE_INTEGER, nowMs + 30 * DAY_MS)
-        : null,
+        ? Math.min(
+            grant.expiresAtMs ?? Number.MAX_SAFE_INTEGER,
+            effectiveActivityAtMs + 30 * DAY_MS,
+          )
+        : grant.grantType === "pitch-manager"
+          ? grant.expiresAtMs
+          : null,
   };
 }
 

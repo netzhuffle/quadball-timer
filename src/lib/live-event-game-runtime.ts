@@ -13,7 +13,7 @@ import {
 } from "@/lib/live-event-game-control";
 import { createTypedGrantAuthority } from "@/lib/grant-management";
 import type { GrantAuthorityOptions } from "@/lib/grant-authority";
-import type { GrantKeyRing } from "@/lib/grant-types";
+import type { ControlGrantScope, GrantKeyRing } from "@/lib/grant-types";
 import type { EventGameRecordRoot } from "@/lib/foundation-record-types";
 import {
   canonicalizeEventGameRecordRoot,
@@ -132,16 +132,10 @@ export function createControlScopeResolver(
   return {
     resolve(scope, snapshot) {
       if (snapshot === undefined) return { status: "unavailable" };
-      const storedRoot = snapshot.findRootByPitchSlotId(scope.pitchSlotId);
-      const root =
-        storedRoot === null ? null : materializeCommencement(storedRoot, snapshot, clock());
+      const current = resolveCurrentRootForSlot(scope, snapshot, clock());
+      if (current.status === "conflict") return current;
+      const root = current.root;
       if (root === null) return { status: "empty" };
-      if (
-        root.externalScope.eventId !== scope.eventId ||
-        root.externalScope.gameDayId !== scope.gameDayId ||
-        root.externalScope.pitchId !== scope.pitchId
-      )
-        return { status: "conflict" };
       if (root.lifecycle.lockedAtMs !== null) {
         return { status: "terminal", reason: "game-locked", eventGameId: root.eventGameId };
       }
@@ -149,16 +143,24 @@ export function createControlScopeResolver(
     },
     resolveSession(scope, sessionEventGameId, snapshot) {
       if (snapshot === undefined) return { status: "unavailable" };
-      const storedCurrent = snapshot.findRootByPitchSlotId(scope.pitchSlotId);
-      const current =
-        storedCurrent === null ? null : materializeCommencement(storedCurrent, snapshot, clock());
-      if (current === null) return { status: "empty" };
-      if (
-        current.externalScope.eventId !== scope.eventId ||
-        current.externalScope.gameDayId !== scope.gameDayId ||
-        current.externalScope.pitchId !== scope.pitchId
-      )
-        return { status: "conflict" };
+      const resolvedCurrent = resolveCurrentRootForSlot(scope, snapshot, clock());
+      if (resolvedCurrent.status === "conflict") return resolvedCurrent;
+      const current = resolvedCurrent.root;
+      if (current === null) {
+        const sessionRootValue = snapshot.findRootByEventGameId(sessionEventGameId);
+        const sessionRoot =
+          sessionRootValue === null
+            ? null
+            : materializeCommencement(sessionRootValue, snapshot, clock());
+        if (sessionRoot !== null && sessionRoot.lifecycle.commencedAtMs !== null) {
+          return {
+            status: "pinned",
+            sessionEventGameId,
+            currentEventGameId: sessionEventGameId,
+          };
+        }
+        return { status: "empty" };
+      }
       if (current.lifecycle.lockedAtMs !== null) {
         return { status: "game-locked", eventGameId: current.eventGameId };
       }
@@ -183,6 +185,53 @@ export function createControlScopeResolver(
           };
     },
   };
+}
+
+function resolveCurrentRootForSlot(
+  scope: ControlGrantScope,
+  snapshot: FoundationStorageSnapshot,
+  nowMs: number,
+): { status: "resolved"; root: EventGameRecordRoot | null } | { status: "conflict" } {
+  const catalogGames = snapshot
+    .listEventGames?.(scope.gameDayId)
+    ?.filter((game) => game.pitchSlotId === scope.pitchSlotId);
+  if (catalogGames !== undefined) {
+    if (catalogGames.length > 1) return { status: "conflict" };
+    const game = catalogGames[0];
+    if (game === undefined) {
+      const legacyRoot = snapshot.findRootByPitchSlotId(scope.pitchSlotId);
+      if (
+        legacyRoot === null ||
+        (snapshot.findEventGame !== undefined &&
+          snapshot.findEventGame(legacyRoot.eventGameId) !== null)
+      ) {
+        return { status: "resolved", root: null };
+      }
+      if (!sameScope(legacyRoot.externalScope, scope)) return { status: "conflict" };
+      return {
+        status: "resolved",
+        root: materializeCommencement(legacyRoot, snapshot, nowMs),
+      };
+    }
+    const pitch = snapshot.findPitchSlot?.(game.pitchSlotId);
+    if (
+      game.eventId !== scope.eventId ||
+      game.gameDayId !== scope.gameDayId ||
+      pitch === null ||
+      pitch === undefined ||
+      pitch.pitchId !== scope.pitchId
+    )
+      return { status: "conflict" };
+    const storedRoot = snapshot.findRootByEventGameId(game.eventGameId);
+    return {
+      status: "resolved",
+      root: storedRoot === null ? null : materializeCommencement(storedRoot, snapshot, nowMs),
+    };
+  }
+  const storedRoot = snapshot.findRootByPitchSlotId(scope.pitchSlotId);
+  if (storedRoot === null) return { status: "resolved", root: null };
+  if (!sameScope(storedRoot.externalScope, scope)) return { status: "conflict" };
+  return { status: "resolved", root: materializeCommencement(storedRoot, snapshot, nowMs) };
 }
 
 function materializeCommencement(

@@ -171,6 +171,10 @@ export type TypedGrantAuthority = {
   createPitchManagerGrant(
     input: Omit<CreateTypedGrantInput, "grantType"> & { scope: PitchManagerGrantScope },
   ): Promise<TypedGrantCreated | TypedGrantMutation>;
+  createPitchManagerGrantInTransaction(
+    transaction: FoundationStorageTransaction,
+    input: Omit<CreateTypedGrantInput, "grantType"> & { scope: PitchManagerGrantScope },
+  ): TypedGrantCreated | TypedGrantMutation;
   createControlGrant(
     input: Omit<CreateTypedGrantInput, "grantType"> & { scope: ControlGrantScope },
   ): Promise<TypedGrantCreated | TypedGrantMutation>;
@@ -198,6 +202,18 @@ export type TypedGrantAuthority = {
     deviceClass?: string;
     browserClass?: string;
   }): Promise<TypedGrantAdmission | TypedGrantAdmissionThrottled>;
+  admitPitchManagerGrant(input: {
+    qrCredential: string;
+    browserContext: string;
+    deviceClass?: string;
+    browserClass?: string;
+  }): Promise<TypedGrantAdmission | TypedGrantAdmissionThrottled>;
+  admitEventAdminGrant(input: {
+    qrCredential: string;
+    browserContext: string;
+    deviceClass?: string;
+    browserClass?: string;
+  }): Promise<TypedGrantAdmission | TypedGrantAdmissionThrottled>;
   authorizeGrant(input: {
     sessionBearer: string;
     eventGameId?: string;
@@ -207,7 +223,7 @@ export type TypedGrantAuthority = {
   /** Revalidates and refreshes a Grant Session on the caller's existing transaction. */
   authorizeGrantInTransaction(
     transaction: FoundationStorageTransaction,
-    input: { sessionBearer: string },
+    input: { sessionBearer: string; readOnly?: boolean },
   ): TypedGrantAuthorization;
   acceptControlGrantSessionSwitch(input: {
     sessionBearer: string;

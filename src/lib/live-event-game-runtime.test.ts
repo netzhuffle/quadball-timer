@@ -301,6 +301,42 @@ describe("Live Event Game SQLite runtime", () => {
     });
   });
 
+  test("keeps a commenced session pinned when its catalog placement leaves the scanned slot", () => {
+    const previous = createRoot();
+    const commenced: EventGameRecordRoot = {
+      ...previous,
+      recordId: "runtime-record-commenced-moved",
+      eventGameId: "runtime-game-commenced-moved",
+      ownership: { eventId: previous.eventId, eventGameId: "runtime-game-commenced-moved" },
+      lifecycle: { ...previous.lifecycle, phase: "in-progress", commencedAtMs: 10_000 },
+    };
+    const current: EventGameRecordRoot = {
+      ...previous,
+      recordId: "runtime-record-current-after-move",
+      eventGameId: "runtime-game-current-after-move",
+      ownership: { eventId: previous.eventId, eventGameId: "runtime-game-current-after-move" },
+    };
+    const snapshot = {
+      findRootByPitchSlotId: () => current,
+      findRootByEventGameId: (eventGameId: string) =>
+        eventGameId === commenced.eventGameId ? commenced : current,
+      listEventGames: () => [],
+      findEventGame: () => ({}) as never,
+    } as unknown as FoundationStorageSnapshot;
+
+    expect(
+      createControlScopeResolver().resolveSession?.(
+        current.externalScope,
+        commenced.eventGameId,
+        snapshot,
+      ),
+    ).toEqual({
+      status: "pinned",
+      sessionEventGameId: commenced.eventGameId,
+      currentEventGameId: commenced.eventGameId,
+    });
+  });
+
   test("production reassignment resolution persists passive commencement without refresh", async () => {
     const directory = await mkdtemp(join(tmpdir(), "quadball-event-game-runtime-"));
     const databasePath = join(directory, "event-game.sqlite");

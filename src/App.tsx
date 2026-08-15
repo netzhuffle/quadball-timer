@@ -8,6 +8,7 @@ import { DEFAULT_AWAY_TEAM_COLOR, DEFAULT_HOME_TEAM_COLOR } from "@/lib/team-col
 import { ColorTestPage } from "@/pages/color-test-page";
 import { EventOperationsPrototypePage } from "@/pages/event-operations-prototype-page";
 import { EventAdminPage } from "@/pages/event-admin-page";
+import { PitchManagerPage } from "@/pages/pitch-manager-page";
 import { EventGameControllerPage } from "@/pages/event-game-controller-page";
 import { GamePage } from "@/pages/game-page";
 import {
@@ -31,6 +32,9 @@ type Route =
     }
   | {
       type: "event-admin";
+    }
+  | {
+      type: "pitch-manager";
     }
   | {
       type: "event-game-controller";
@@ -75,6 +79,10 @@ export function App({
 
   if (route.type === "event-admin") {
     return <EventAdminPage />;
+  }
+
+  if (route.type === "pitch-manager") {
+    return <PitchManagerPage />;
   }
 
   if (route.type === "event-game-controller") {
@@ -318,6 +326,9 @@ export function parseRoute(pathname: string, _search: string, hash = ""): Route 
 
   if (pathname === "/event-admin" || pathname === "/event-admin/") {
     return { type: "event-admin" };
+  }
+  if (pathname === "/pitch-manager" || pathname === "/pitch-manager/") {
+    return { type: "pitch-manager" };
   }
 
   if (pathname === "/event-control" || pathname === "/event-control/") {

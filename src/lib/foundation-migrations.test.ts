@@ -13,7 +13,7 @@ const migrations: readonly FoundationMigration[] = [
 ];
 
 describe("foundation migration ledger compatibility", () => {
-  test("keeps accepted migrations 001 through 021 byte-for-byte immutable and pins 022", () => {
+  test("keeps accepted migrations 001 through 025 byte-for-byte immutable and pins 026", () => {
     expect(FOUNDATION_MIGRATIONS.map(({ id, checksum }) => ({ id, checksum }))).toEqual([
       {
         id: "001-foundation-event-game-record-roots",
@@ -102,6 +102,22 @@ describe("foundation migration ledger compatibility", () => {
       {
         id: "022-control-session-stay-binding",
         checksum: "88c2b77d65542cc3310c268389e9ad5693a7f87bc0815cb1209be7db49e2cf6e",
+      },
+      {
+        id: "023-event-teams-rosters-and-pitches",
+        checksum: "cba4dc52a3eff2bd982091112a65bafeb5bbc62965974d7eec4fdf869072042f",
+      },
+      {
+        id: "024-event-schedule-slots-and-games",
+        checksum: "aaf67baece0503c2c7ac91f3f26ca69b65e416e2514ef8a3889d7739679ae175",
+      },
+      {
+        id: "025-event-publication-status",
+        checksum: "c53a6d6d178217ed050086d40dad7a281f3ecd071ef6ab3e429fdef8787637ee",
+      },
+      {
+        id: "026-event-schedule-expected-delays-and-conflicts",
+        checksum: "c51d7eade99fe620ee2562013644ec4511ae106ae1b2525dfc3f8381da29f7ff",
       },
     ]);
   });
