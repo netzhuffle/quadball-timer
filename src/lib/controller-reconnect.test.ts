@@ -11,6 +11,8 @@ import {
   rebindControllerReplica,
   reconcileControllerReplay,
   serializeControllerReplica,
+  CONTROLLER_STALE_DISCONNECTED_AFTER_MS,
+  deriveControllerConnectionStatus,
   type ControllerReplicaStorage,
 } from "@/lib/controller-reconnect";
 import {
@@ -20,6 +22,38 @@ import {
 import { createInitialClockBaseline, projectClockBaseline } from "@/lib/clock-authority";
 
 describe("Controller reconnect replica", () => {
+  test("fails clear at the configured stale boundary with an injected clock", () => {
+    const lastSynchronizedAtMs = 10_000;
+    expect(
+      deriveControllerConnectionStatus({
+        lastSynchronizedAtMs,
+        nowMs: lastSynchronizedAtMs + CONTROLLER_STALE_DISCONNECTED_AFTER_MS - 1,
+        online: true,
+      }),
+    ).toBe("fresh");
+    expect(
+      deriveControllerConnectionStatus({
+        lastSynchronizedAtMs,
+        nowMs: lastSynchronizedAtMs + CONTROLLER_STALE_DISCONNECTED_AFTER_MS,
+        online: true,
+      }),
+    ).toBe("stale");
+    expect(
+      deriveControllerConnectionStatus({
+        lastSynchronizedAtMs,
+        nowMs: lastSynchronizedAtMs + CONTROLLER_STALE_DISCONNECTED_AFTER_MS + 1,
+        online: true,
+      }),
+    ).toBe("stale");
+    expect(
+      deriveControllerConnectionStatus({
+        lastSynchronizedAtMs,
+        nowMs: lastSynchronizedAtMs + 1,
+        online: false,
+      }),
+    ).toBe("disconnected");
+  });
+
   test("optimistically retains immutable identity, causal dependencies, and original occurrence evidence", () => {
     let state = createReplica();
     const first = dispatchControllerAction(state, goal("goal-1", "fact-1"), { nowMs: 100 });

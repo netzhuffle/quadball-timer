@@ -4,6 +4,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { Window } from "happy-dom";
 import { EventGameControllerPage } from "@/pages/event-game-controller-page";
 import {
+  CONTROLLER_STALE_DISCONNECTED_AFTER_MS,
   controllerReplicaStorageKey,
   createControllerReplica,
   dispatchControllerAction,
@@ -26,8 +27,12 @@ describe("Event Game Controller reconnect browser seam", () => {
   let container: HTMLDivElement;
   let root: Root;
   let replayMode: "lost" | "success" | "deferred" | "retryable";
+  let refreshMode: "immediate" | "deferred";
   let openBodies: Record<string, unknown>[];
   let replayCalls: number;
+  let refreshCalls: number;
+  let deferredRefresh: ((response: Response) => void) | null;
+  let deferredRefreshResponse: Response | null;
   let replayBodies: Record<string, any>[];
   let intentCalls: number;
   let intentBodies: Record<string, any>[];
@@ -45,8 +50,12 @@ describe("Event Game Controller reconnect browser seam", () => {
 
   beforeEach(() => {
     replayMode = "lost";
+    refreshMode = "immediate";
     openBodies = [];
     replayCalls = 0;
+    refreshCalls = 0;
+    deferredRefresh = null;
+    deferredRefreshResponse = null;
     replayBodies = [];
     intentCalls = 0;
     intentBodies = [];
@@ -132,6 +141,7 @@ describe("Event Game Controller reconnect browser seam", () => {
           return replayResponse;
         }
         if (url.endsWith("/api/event-control/refresh")) {
+          refreshCalls += 1;
           if (refreshRejected) return new Response("rejected", { status: 401 });
           if (switchRequested) {
             return new Response(
@@ -143,7 +153,7 @@ describe("Event Game Controller reconnect browser seam", () => {
               { status: 200, headers: { "content-type": "application/json" } },
             );
           }
-          return new Response(
+          const refreshResponse = new Response(
             JSON.stringify({
               status: "authorized",
               session: {
@@ -156,6 +166,13 @@ describe("Event Game Controller reconnect browser seam", () => {
             }),
             { status: 200, headers: { "content-type": "application/json" } },
           );
+          if (refreshMode === "deferred") {
+            deferredRefreshResponse = refreshResponse;
+            return await new Promise<Response>((resolve) => {
+              deferredRefresh = resolve;
+            });
+          }
+          return refreshResponse;
         }
         if (url.endsWith("/api/event-control/intent")) {
           intentCalls += 1;
@@ -247,6 +264,45 @@ describe("Event Game Controller reconnect browser seam", () => {
       await Promise.resolve();
       await Promise.resolve();
     });
+  }
+
+  function installControllerIntervalProbe() {
+    let tick: (() => void) | null = null;
+    const cleared: number[] = [];
+    const intervalId = 97;
+    const originalSetInterval = testWindow.setInterval;
+    const originalClearInterval = testWindow.clearInterval;
+    Object.defineProperty(testWindow, "setInterval", {
+      configurable: true,
+      value: (callback: TimerHandler, timeout?: number) => {
+        if (timeout === 250 && typeof callback === "function") {
+          tick = callback as () => void;
+          return intervalId;
+        }
+        throw new Error(`Unexpected interval: ${String(timeout)}`);
+      },
+    });
+    Object.defineProperty(testWindow, "clearInterval", {
+      configurable: true,
+      value: (id: number) => {
+        if (id === intervalId) cleared.push(id);
+        else throw new Error(`Unexpected interval clear: ${String(id)}`);
+      },
+    });
+    return {
+      tick: () => tick?.(),
+      wasCleared: () => cleared.includes(intervalId),
+      restore: () => {
+        Object.defineProperty(testWindow, "setInterval", {
+          configurable: true,
+          value: originalSetInterval,
+        });
+        Object.defineProperty(testWindow, "clearInterval", {
+          configurable: true,
+          value: originalClearInterval,
+        });
+      },
+    };
   }
 
   function setInputValue(input: HTMLInputElement, value: string) {
@@ -1356,6 +1412,71 @@ describe("Event Game Controller reconnect browser seam", () => {
     expect(replayCalls).toBe(2);
     expect(container.textContent).not.toContain("retained for reconnect replay");
     expect(container.textContent).toContain("Clock resynchronized.");
+  });
+
+  test("observes the literal 5,000 ms status boundary before foreground reconciliation", async () => {
+    const probe = installControllerIntervalProbe();
+    await enterAndOpen();
+    const status = container.querySelector<HTMLElement>("[data-controller-freshness]");
+    expect(status?.getAttribute("role")).toBe("status");
+    expect(status?.getAttribute("aria-live")).toBe("polite");
+    expect(CONTROLLER_STALE_DISCONNECTED_AFTER_MS).toBe(5_000);
+    monotonicNow = 4_999;
+    await act(async () => probe.tick());
+    expect(status?.textContent).toContain("fresh");
+    monotonicNow = 5_000;
+    await act(async () => probe.tick());
+    expect(status?.textContent).toContain("stale");
+    monotonicNow = 5_001;
+    await act(async () => probe.tick());
+    expect(status?.textContent).toContain("stale");
+    refreshMode = "deferred";
+    await act(async () => {
+      document.dispatchEvent(new testWindow.Event("visibilitychange") as unknown as Event);
+      await Promise.resolve();
+    });
+    expect(refreshCalls).toBe(1);
+    expect(status?.textContent).toContain("stale");
+    const pendingRefresh = deferredRefresh;
+    const pendingResponse = deferredRefreshResponse;
+    expect(pendingRefresh).not.toBeNull();
+    expect(pendingResponse).not.toBeNull();
+    await act(async () => {
+      pendingRefresh?.(pendingResponse as Response);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(status?.textContent).toContain("fresh");
+    await act(async () => {
+      root.unmount();
+      await Promise.resolve();
+    });
+    expect(probe.wasCleared()).toBe(true);
+    probe.restore();
+  });
+
+  test("local optimistic clock projection cannot renew freshness after lost transport", async () => {
+    const probe = installControllerIntervalProbe();
+    await enterAndOpen();
+    Object.defineProperty(testWindow.navigator, "onLine", { configurable: true, value: false });
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('button[aria-label="Start game clock"]')?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    Object.defineProperty(testWindow.navigator, "onLine", { configurable: true, value: true });
+    monotonicNow = 4_999;
+    await act(async () => probe.tick());
+    expect(container.querySelector("[data-controller-freshness]")?.textContent).toContain("fresh");
+    monotonicNow = 5_000;
+    await act(async () => probe.tick());
+    expect(container.querySelector("[data-controller-freshness]")?.textContent).toContain("stale");
+    await act(async () => {
+      root.unmount();
+      await Promise.resolve();
+    });
+    expect(probe.wasCleared()).toBe(true);
+    probe.restore();
   });
 
   test("unmount and remount restores persisted work before foreground replay", async () => {
