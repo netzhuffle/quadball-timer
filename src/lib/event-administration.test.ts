@@ -14,7 +14,7 @@ import {
 import type { FoundationStorage, FoundationStorageSnapshot } from "@/lib/foundation-storage";
 import { createInMemoryFoundationStorage } from "@/lib/foundation-storage-memory";
 import { createGrantAuthority, createGrantAuthorityVerifier } from "@/lib/grant-authority";
-import type { GrantKeyRing } from "@/lib/grant-types";
+import type { ControlGrantScopeResolution, GrantKeyRing } from "@/lib/grant-types";
 import {
   MemoryTechnicalAdminAuthRepository,
   createTechnicalAdminAuth,
@@ -28,6 +28,135 @@ const keyRing: GrantKeyRing = {
 };
 
 describe("Event Administration handoff", () => {
+  test("projects bounded operations health without exposing Grant details", async () => {
+    let resolution: ControlGrantScopeResolution = {
+      status: "eligible",
+      eventGameId: "pending",
+    };
+    const fixture = createFixture(undefined, { resolve: () => resolution });
+    const event = await fixture.catalog.createEvent(
+      { name: "Operations Health Event", timeZone: "UTC" },
+      fixture.technical,
+    );
+    if (event.status !== "accepted") throw new Error("Expected Event.");
+    const day = await fixture.catalog.addGameDay(
+      event.value.eventId,
+      { date: "2026-08-14" },
+      fixture.technical,
+    );
+    const pitch = await fixture.catalog.createPitch(
+      event.value.eventId,
+      { name: "Pitch A" },
+      fixture.technical,
+    );
+    if (day.status !== "accepted" || pitch.status !== "accepted")
+      throw new Error("Expected schedule setup.");
+    const slot = await fixture.catalog.createGameplaySlot(
+      event.value.eventId,
+      day.value.gameDayId,
+      { sequence: 1, scheduledStart: "2026-08-14T10:00" },
+      fixture.technical,
+    );
+    if (slot.status !== "accepted") throw new Error("Expected Gameplay Slot.");
+    const pitchSlot = await fixture.storage.transaction(
+      (transaction) => transaction.listPitchSlots(day.value.gameDayId, pitch.value.pitchId)[0],
+    );
+    if (pitchSlot === undefined) throw new Error("Expected Pitch Slot.");
+    const game = await fixture.catalog.createEventGame(
+      event.value.eventId,
+      day.value.gameDayId,
+      {
+        gameplaySlotId: slot.value.gameplaySlotId,
+        pitchSlotId: pitchSlot.pitchSlotId,
+        sideA: { sourceLabel: "Winner A" },
+        sideB: { sourceLabel: "Winner B" },
+      },
+      fixture.technical,
+    );
+    if (game.status !== "accepted") throw new Error("Expected Event Game.");
+
+    resolution = { status: "eligible", eventGameId: game.value.eventGameId };
+    const control = await fixture.grants.createControlGrant({
+      authority: fixture.technical,
+      expiresAtMs: Date.parse("2026-08-14T12:00:01Z"),
+      scope: {
+        eventId: event.value.eventId,
+        gameDayId: day.value.gameDayId,
+        pitchId: pitch.value.pitchId,
+        pitchSlotId: pitchSlot.pitchSlotId,
+      },
+    });
+    if (control.status !== "created") throw new Error("Expected Control Grant.");
+
+    resolution = { status: "unavailable" };
+
+    const hub = await fixture.administration.openEventHub({
+      eventId: event.value.eventId,
+      authority: fixture.technical,
+    });
+    expect(hub).toMatchObject({
+      status: "accepted",
+      value: {
+        health: {
+          unresolvedTeamCount: 1,
+          scheduleConflictCount: 0,
+          teamScheduleConflictCount: 0,
+          grantProblemCount: 1,
+        },
+      },
+    });
+    if (hub.status === "accepted") {
+      expect(JSON.stringify(hub.value.health)).not.toMatch(
+        /grantId|grantVersion|credential|session|secret/iu,
+      );
+    }
+
+    resolution = { status: "empty" };
+    expect(
+      await fixture.administration.openEventHub({
+        eventId: event.value.eventId,
+        authority: fixture.technical,
+      }),
+    ).toMatchObject({ value: { health: { grantProblemCount: 1 } } });
+
+    resolution = { status: "eligible", eventGameId: game.value.eventGameId };
+    expect(
+      await fixture.administration.openEventHub({
+        eventId: event.value.eventId,
+        authority: fixture.technical,
+      }),
+    ).toMatchObject({ value: { health: { grantProblemCount: 0 } } });
+
+    const malformedIsUsable = await fixture.storage.transaction((transaction) => {
+      const grant = transaction.findGrantById(control.grantId);
+      if (grant === null) throw new Error("Expected stored Control Grant.");
+      return fixture.grants.isGrantCurrentlyUsableInTransaction(transaction, {
+        ...grant,
+        credential: { ...grant.credential, ciphertext: "malformed" },
+      });
+    });
+    expect(malformedIsUsable).toBe(false);
+
+    const beforeExpiredHealth = await fixture.storage.transaction((transaction) => ({
+      grant: transaction.findGrantById(control.grantId),
+      sessions: transaction.listGrantSessions(control.grantId),
+      audit: transaction.listGrantAudit(control.grantId),
+    }));
+    fixture.setNow(control.expiresAtMs ?? 0);
+    expect(
+      await fixture.administration.openEventHub({
+        eventId: event.value.eventId,
+        authority: fixture.technical,
+      }),
+    ).toMatchObject({ value: { health: { grantProblemCount: 1 } } });
+    const afterExpiredHealth = await fixture.storage.transaction((transaction) => ({
+      grant: transaction.findGrantById(control.grantId),
+      sessions: transaction.listGrantSessions(control.grantId),
+      audit: transaction.listGrantAudit(control.grantId),
+    }));
+    expect(afterExpiredHealth).toEqual(beforeExpiredHealth);
+  });
+
   test("previews and atomically removes an empty Event with its Event Admin authority", async () => {
     const fixture = createFixture();
     const event = await fixture.catalog.createEvent(
@@ -2811,9 +2940,7 @@ describe("Event Administration handoff", () => {
 
 function createFixture(
   storage: FoundationStorage = createInMemoryFoundationStorage(),
-  controlScopeResolver: {
-    resolve: () => { status: "eligible"; eventGameId: string } | { status: "unavailable" };
-  } = {
+  controlScopeResolver: Pick<import("@/lib/grant-types").ControlGrantScopeResolver, "resolve"> = {
     resolve: () => ({ status: "unavailable" as const }),
   },
 ) {

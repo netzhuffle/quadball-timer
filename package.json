@@ -13,6 +13,7 @@
     "event:catalog": "bun scripts/event-catalog.ts",
     "event:admin": "bun scripts/event-admin.ts",
     "test:focused:technical-admin-browser": "bun scripts/test-technical-admin-browser.ts",
+    "test:focused:event-admin-browser-webkit": "bun scripts/test-event-admin-webkit.ts",
     "test:focused:public-event-browser": "bun scripts/test-public-event-browser.ts",
     "test:focused:event-game-controller-browser": "bun scripts/test-event-game-controller-browser.ts",
     "test:focused:event-game-routes": "bun test --isolate ./src/lib/live-event-game-transport.focused.ts",
