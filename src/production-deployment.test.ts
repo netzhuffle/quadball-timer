@@ -194,6 +194,9 @@ describe("Production deployment contract", () => {
     expect(wrapper).toContain("skip_chown=0");
     expect(wrapper).toContain('before_previous_rm_command=""');
     expect(wrapper).toContain('QBT_ROOT_PROMOTION="$root_promotion"');
+    expect(wrapper).toContain(
+      '"$release_dir/quadball-timer" --production-activation "$command" --root-promotion 2>&1',
+    );
     expect(wrapper).toContain("promote_verified_backup_as_root");
     expect(wrapper).toContain('chown -R root:root -- "$candidate_directory"');
     expect(wrapper).toContain('mv -- "$candidate_directory" "$retained_version"');
@@ -209,6 +212,31 @@ describe("Production deployment contract", () => {
     );
     expect(wrapper).toContain('[[ "$focused_test_mode" != 1 ]]');
     expect(wrapper).toContain('"${maintenance_output:0:4096}"');
+  });
+
+  test("keeps service cleanup out of the root-owned promotion handoff", () => {
+    const activationCli = readFileSync(
+      join(repositoryRoot, "src/lib/production-activation-cli.ts"),
+      "utf8",
+    );
+    const wrapper = readFileSync(
+      join(repositoryRoot, "deploy/activation-maintenance-root.sh"),
+      "utf8",
+    );
+    expect(activationCli).toContain(
+      'process.env.QBT_ROOT_PROMOTION === "1" || argv.includes("--root-promotion")',
+    );
+    expect(activationCli).toContain("if (rootPromotionRequested)");
+    expect(activationCli).toContain(
+      "console.log(JSON.stringify({ verified: true, snapshotId: manifest.snapshotId }));",
+    );
+    expect(activationCli).toContain("const promotion = await promoteVerifiedBackup({");
+    expect(wrapper).toContain("--root-promotion");
+    expect(wrapper).toContain("promote_verified_backup_as_root");
+    expect(wrapper).toContain("if (( rc != 0 )); then");
+    expect(wrapper).toContain(
+      'if (( rc != 0 )) && [[ "$command" == "backup" || "$command" == "verify-backup" || "$command" == "promote" ]]; then',
+    );
   });
 
   test("uses Linux mv -T to replace the retained pointer without following it", async () => {

@@ -382,7 +382,7 @@ if [[ "$command" == "promote" ]]; then
   AD_HOC_ENVIRONMENT_ID="$ad_hoc_environment_identity" \
   QBT_FOCUSED_FAILURE_PHASE="$focused_failure_phase" \
   QBT_ROOT_PROMOTION="$root_promotion" \
-  "$release_dir/quadball-timer" --production-activation "$command" 2>&1)"
+  "$release_dir/quadball-timer" --production-activation "$command" --root-promotion 2>&1)"
   rc=$?
 else
   "$runuser_command" -u "$service_user" -- env -i PATH=/usr/bin:/bin \
