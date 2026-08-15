@@ -180,6 +180,10 @@ _Avoid_: Scorekeeper app role, score-only Controller
 An optional broad classification of why a penalty card was issued in the app, supplementary to the exact foul recorded on the Official Score Sheet.
 _Avoid_: Foul text, official penalty record
 
+**Penalty Release Cause**:
+The sporting occurrence that ends penalty service early, such as an opposing score or a foul-before-score ruling; it is distinct from the optional Penalty Reason that classifies why the card was issued.
+_Avoid_: Penalty Reason, foul classification
+
 **Control Grant**:
 A Pitch Slot-scoped shared capability that admits Controllers to the one Event Game currently assigned to that slot. Its QR credential remains with the Pitch Slot when the schedule or Game assignment changes.
 _Avoid_: User account, controller account, controller role

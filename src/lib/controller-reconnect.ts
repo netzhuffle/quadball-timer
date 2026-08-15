@@ -9,6 +9,7 @@ import type {
   LiveStoppageState,
   LiveTimeoutState,
 } from "@/lib/live-event-game-control";
+import { deriveLivePenaltyProjection } from "@/lib/live-event-penalties";
 import { parseJsonValue } from "@/lib/event-game-action-codecs";
 import {
   applyClockProjectionAction,
@@ -655,6 +656,8 @@ function applyOptimisticAction(
   )
     return state;
   if (intent.type === "record-goal") {
+    const current = state.projection.scoreByGameSide[intent.gameSideId];
+    if (current === undefined) return state;
     const nextFacts = appendOptimisticFact(state.projection, {
       factId: intent.factId,
       factType: "goal",
@@ -673,6 +676,136 @@ function applyOptimisticAction(
       },
     });
     return rebuildOptimisticProjection(state, nextFacts, action.dispatchedAtMs);
+  }
+  if (intent.type === "record-card") {
+    const commencementAtDispatch = projectOptimisticCommencement(
+      state.projection.commencement,
+      state.projection.clock.running,
+      action.dispatchedAtMs,
+    );
+    const penaltyStart =
+      commencementAtDispatch.status === "provisional"
+        ? "sticks-up"
+        : intent.seekerPenalty === "head-referee-confirmed" &&
+            intent.gameTimeMs >= 19 * 60_000 &&
+            intent.gameTimeMs < 20 * 60_000
+          ? "seeker-release"
+          : "immediate";
+    const playerKey =
+      intent.playerNumber === null
+        ? `${intent.gameSideId}:unknown:${intent.factId}`
+        : `${intent.gameSideId}:${intent.playerNumber}`;
+    let nextFacts = appendOptimisticFact(state.projection, {
+      factId: intent.factId,
+      factType: "card",
+      gameSideId: intent.gameSideId,
+      gameTimeMs: intent.gameTimeMs,
+      sportingOrder: intent.sportingOrder ?? intent.gameTimeMs,
+      data: {
+        cardType: intent.cardType,
+        playerNumber: intent.playerNumber,
+        penaltyStart,
+        ...(intent.foulBeforeScore === undefined
+          ? {}
+          : { foulBeforeScore: intent.foulBeforeScore }),
+        ...(intent.seekerPenalty === undefined ? {} : { seekerPenalty: intent.seekerPenalty }),
+        sportingOrder: intent.sportingOrder ?? intent.gameTimeMs,
+      },
+    });
+    if (
+      intent.foulBeforeScore === true &&
+      (intent.cardType === "blue" || intent.cardType === "yellow")
+    ) {
+      nextFacts = appendOptimisticFact(
+        { ...state.projection, gameFacts: nextFacts },
+        {
+          factId: `${intent.factId}-penalty-release`,
+          factType: "penalty-release-consequence",
+          gameSideId: intent.gameSideId,
+          gameTimeMs: intent.gameTimeMs,
+          sportingOrder: intent.sportingOrder ?? intent.gameTimeMs,
+          data: {
+            sourceFactId: intent.factId,
+            playerKey,
+            releaseCause: "foul-before-score",
+            releasedMs: intent.gameTimeMs,
+            serviceDurationMs: 60_000,
+            sportingOrder: intent.sportingOrder ?? intent.gameTimeMs,
+          },
+        },
+      );
+    }
+    return {
+      ...state,
+      projection: {
+        ...state.projection,
+        phase:
+          state.projection.commencement.status === "provisional"
+            ? "in-progress"
+            : state.projection.phase,
+        commencement:
+          commencementAtDispatch.status === "provisional"
+            ? {
+                ...commencementAtDispatch,
+                status: "commenced",
+                commencedAtMs: action.dispatchedAtMs,
+                provisionalRunningSinceMs: null,
+              }
+            : commencementAtDispatch,
+        gameFacts: nextFacts,
+        penalties: deriveLivePenaltyProjection(nextFacts, state.projection.clock.gameTimeMs),
+      },
+    };
+  }
+  if (intent.type === "record-penalty-reason") {
+    const nextFacts = appendOptimisticFact(state.projection, {
+      factId: intent.factId,
+      factType: "penalty-reason",
+      gameSideId: null,
+      gameTimeMs: intent.gameTimeMs,
+      sportingOrder: intent.sportingOrder ?? intent.gameTimeMs,
+      data: {
+        targetCardFactId: intent.targetCardFactId,
+        reason: intent.reason,
+        sportingOrder: intent.sportingOrder ?? intent.gameTimeMs,
+      },
+    });
+    return {
+      ...state,
+      projection: {
+        ...state.projection,
+        gameFacts: nextFacts,
+        penalties: deriveLivePenaltyProjection(nextFacts, state.projection.clock.gameTimeMs),
+      },
+    };
+  }
+  if (intent.type === "resolve-penalty-expiration") {
+    const scoreFact = (state.projection.gameFacts ?? []).find(
+      (fact) => fact.factId === intent.scoreFactId && fact.factType === "goal",
+    );
+    const scoreGameTimeMs = scoreFact?.gameTimeMs ?? intent.gameTimeMs;
+    const scoreSportingOrder = scoreFact?.sportingOrder ?? scoreGameTimeMs;
+    const nextFacts = appendOptimisticFact(state.projection, {
+      factId: intent.factId,
+      factType: "penalty-release",
+      gameSideId: null,
+      gameTimeMs: scoreGameTimeMs,
+      sportingOrder: scoreSportingOrder,
+      data: {
+        pendingId: intent.pendingId,
+        scoreFactId: intent.scoreFactId,
+        playerKey: intent.playerKey,
+        sportingOrder: scoreSportingOrder,
+      },
+    });
+    return {
+      ...state,
+      projection: {
+        ...state.projection,
+        gameFacts: nextFacts,
+        penalties: deriveLivePenaltyProjection(nextFacts, state.projection.clock.gameTimeMs),
+      },
+    };
   }
   if (
     intent.type === "record-flag-catch" ||
@@ -733,32 +866,75 @@ function applyOptimisticAction(
     intent.type === "clock-correction" ||
     intent.type === "clock-takeover"
   ) {
+    const commencementAtDispatch = projectOptimisticCommencement(
+      state.projection.commencement,
+      state.projection.clock.running,
+      action.dispatchedAtMs,
+    );
+    const clock = applyClockProjectionAction(state.projection.clock, {
+      command:
+        intent.type === "clock" || intent.type === "set-running"
+          ? "set-running"
+          : intent.type === "clock-adjust"
+            ? "adjust"
+            : intent.type === "clock-correction"
+              ? "correct"
+              : "takeover",
+      running: "running" in intent ? intent.running : undefined,
+      gameTimeMs: "clockTimeMs" in intent ? intent.clockTimeMs : undefined,
+      adjustmentMs: "adjustmentMs" in intent ? intent.adjustmentMs : undefined,
+      authorityGeneration:
+        "authorityGeneration" in intent ? intent.authorityGeneration : intent.clockGeneration,
+      sessionId: state.session.grantSessionId,
+      operationId: intent.operationId,
+    });
     return {
       ...state,
       projection: {
         ...state.projection,
-        clock: applyClockProjectionAction(state.projection.clock, {
-          command:
-            intent.type === "clock" || intent.type === "set-running"
-              ? "set-running"
-              : intent.type === "clock-adjust"
-                ? "adjust"
-                : intent.type === "clock-correction"
-                  ? "correct"
-                  : "takeover",
-          running: "running" in intent ? intent.running : undefined,
-          gameTimeMs: "clockTimeMs" in intent ? intent.clockTimeMs : undefined,
-          adjustmentMs: "adjustmentMs" in intent ? intent.adjustmentMs : undefined,
-          authorityGeneration:
-            "authorityGeneration" in intent ? intent.authorityGeneration : intent.clockGeneration,
-          sessionId: state.session.grantSessionId,
-          operationId: intent.operationId,
-        }),
+        clock,
+        commencement:
+          commencementAtDispatch.status === "commenced"
+            ? commencementAtDispatch
+            : {
+                ...commencementAtDispatch,
+                provisionalRunningSinceMs: clock.running ? action.dispatchedAtMs : null,
+              },
       },
     };
   }
   return {
     ...state,
+  };
+}
+
+function projectOptimisticCommencement(
+  commencement: ControllerProjection["commencement"],
+  clockRunning: boolean,
+  nowMs: number,
+): ControllerProjection["commencement"] {
+  if (commencement.status === "commenced") return commencement;
+  const liveElapsedMs =
+    clockRunning && commencement.provisionalRunningSinceMs !== null
+      ? Math.max(0, nowMs - commencement.provisionalRunningSinceMs)
+      : 0;
+  const provisionalElapsedMs = commencement.provisionalElapsedMs + liveElapsedMs;
+  if (provisionalElapsedMs >= 10_000) {
+    return {
+      status: "commenced",
+      commencedAtMs:
+        commencement.provisionalRunningSinceMs === null
+          ? nowMs
+          : commencement.provisionalRunningSinceMs +
+            Math.max(0, 10_000 - commencement.provisionalElapsedMs),
+      provisionalRunningSinceMs: null,
+      provisionalElapsedMs,
+    };
+  }
+  return {
+    ...commencement,
+    provisionalElapsedMs,
+    provisionalRunningSinceMs: clockRunning ? nowMs : null,
   };
 }
 
@@ -1029,6 +1205,13 @@ function parseProjection(value: unknown): ControllerProjection {
   const overtimeTarget = parseOptionalScore(value.overtimeTarget ?? value.targetScore);
   const winnerGameSideId = parseOptionalIdentifier(value.winnerGameSideId, "winnerGameSideId");
   const catchState = parseOptionalCatch(value.catch);
+  const penalties =
+    value.penalties === undefined
+      ? undefined
+      : deriveLivePenaltyProjection(
+          gameFacts ?? [],
+          isRecord(clock) && typeof clock.gameTimeMs === "number" ? clock.gameTimeMs : 0,
+        );
   return {
     eventGameId,
     phase,
@@ -1043,6 +1226,7 @@ function parseProjection(value: unknown): ControllerProjection {
     ...(winnerGameSideId === undefined ? {} : { winnerGameSideId }),
     ...(catchState === undefined ? {} : { catch: catchState }),
     ...(value.gameFacts === undefined ? {} : { gameFacts }),
+    ...(penalties === undefined ? {} : { penalties }),
     ...(value.guardrails === undefined ? {} : { guardrails }),
     clock,
     commencement: {

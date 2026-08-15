@@ -20,6 +20,13 @@ describe("Controller tap retry identity", () => {
   test("uses one immutable pending seam for every controller intent", () => {
     const cases: LiveEventControllerIntent[] = [
       intent("record-goal", { gameSideId: "side-a" }),
+      intent("record-card", { gameSideId: "side-b", playerNumber: 7, cardType: "blue" }),
+      intent("record-penalty-reason", { targetCardFactId: "fact-card", reason: "conduct" }),
+      intent("resolve-penalty-expiration", {
+        pendingId: "pending",
+        scoreFactId: "score",
+        playerKey: "side-b:7",
+      }),
       intent("clock", { running: true }),
       intent("substantive", { trigger: "card" }),
       intent("substantive", { trigger: "timeout" }),
@@ -36,6 +43,7 @@ describe("Controller tap retry identity", () => {
       });
       expect(retry).toBe(first);
     }
+
     const scored = intent("record-flag-catch", {
       gameSideId: "side-a",
       sportingOrderAdjudication: { relatedFactId: "goal", relation: "before" },
@@ -55,6 +63,30 @@ describe("Controller tap retry identity", () => {
         },
       }),
     ).not.toBe(scored);
+
+    const card = intent("record-card", {
+      gameSideId: "side-b",
+      playerNumber: 7,
+      cardType: "blue",
+      sportingOrder: 100,
+    });
+    expect(retainControllerIntent(card, { ...card, sportingOrder: 101 })).not.toBe(card);
+    expect(
+      retainControllerIntent(card, {
+        ...card,
+        override: {
+          guardrail: "test-guardrail",
+          direction: "head-referee-direction",
+          confirmation: "head-referee-confirmed",
+          authorityReference: "head-referee",
+          gameTimeMs: 0,
+          beforeValue: null,
+          afterValue: null,
+          reason: "head-referee-direction",
+        },
+      }),
+    ).not.toBe(card);
+
     const forfeit = intent("substantive", {
       trigger: "forfeit",
       gameSideId: "side-a",

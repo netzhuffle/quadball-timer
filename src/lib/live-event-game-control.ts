@@ -29,6 +29,17 @@ import type { FoundationAcceptance } from "@/lib/foundation-acceptance";
 import type { ControlAction } from "@/lib/event-game-actions";
 import type { TypedGrantAuthority } from "@/lib/grant-management-types";
 import {
+  compareLivePenaltyFactOrder,
+  deriveLivePenaltyProjection,
+  LIVE_PENALTY_MINUTE_MS,
+  LIVE_PENALTY_REASONS,
+  LIVE_SEEKER_RELEASE_MS,
+  type LiveCardType,
+  type LivePenaltyProjection,
+  type LivePenaltyReason,
+  type LivePenaltyStart,
+} from "@/lib/live-event-penalties";
+import {
   SHARED_LIMITS,
   validateClockAdjustmentMs,
   validateGameClockMs,
@@ -72,6 +83,25 @@ export type LiveEventControllerIntent =
     })
   | (ControllerIntentBase & {
       type: "record-double-forfeit";
+    })
+  | (ControllerIntentBase & {
+      type: "record-card";
+      gameSideId: string;
+      playerNumber: number | null;
+      cardType: LiveCardType;
+      foulBeforeScore?: boolean;
+      seekerPenalty?: "head-referee-confirmed";
+    })
+  | (ControllerIntentBase & {
+      type: "record-penalty-reason";
+      targetCardFactId: string;
+      reason: LivePenaltyReason;
+    })
+  | (ControllerIntentBase & {
+      type: "resolve-penalty-expiration";
+      pendingId: string;
+      scoreFactId: string;
+      playerKey: string;
     })
   | (ControllerIntentBase & {
       type: "correct-fact";
@@ -173,6 +203,7 @@ export type LiveEventGameDerivedState = {
   winnerGameSideId: string | null;
   catch: LiveCatchState | null;
   gameFacts: readonly ControllerGameFact[];
+  penalties: LivePenaltyProjection;
 };
 
 export type LiveTimeoutState = {
@@ -239,6 +270,7 @@ export type ControllerProjection = {
   winnerGameSideId?: string | null;
   catch?: LiveCatchState | null;
   gameFacts?: readonly ControllerGameFact[];
+  penalties?: LivePenaltyProjection;
   guardrails?: readonly LiveEventGuardrailExplanation[];
   commencement: ControllerCommencement;
   clock: ClockProjection;
@@ -366,6 +398,9 @@ export function parseLiveEventControllerIntent(
     value.type !== "record-concession" &&
     value.type !== "record-forfeit" &&
     value.type !== "record-double-forfeit" &&
+    value.type !== "record-card" &&
+    value.type !== "record-penalty-reason" &&
+    value.type !== "resolve-penalty-expiration" &&
     value.type !== "correct-fact" &&
     value.type !== "correction" &&
     value.type !== "clock" &&
@@ -446,10 +481,47 @@ export function parseLiveEventControllerIntent(
       (value.trigger === "flag-catch" ||
         value.trigger === "concession" ||
         value.trigger === "forfeit"));
-  if (requiresGameSide) {
+  if (requiresGameSide || value.type === "record-card") {
     const parsedSide = validateOpaqueIdentifier(value.gameSideId, "gameSideId");
     if (!parsedSide.ok) return invalid(parsedSide.error);
     gameSideId = parsedSide.value;
+  }
+  let playerNumber: number | null | undefined;
+  let cardType: LiveCardType | undefined;
+  let foulBeforeScore: boolean | undefined;
+  let seekerPenalty: "head-referee-confirmed" | undefined;
+  if (value.type === "record-card") {
+    if (
+      value.cardType !== "blue" &&
+      value.cardType !== "yellow" &&
+      value.cardType !== "red" &&
+      value.cardType !== "ejection"
+    ) {
+      return invalid("cardType is unsupported.");
+    }
+    if (value.playerNumber !== null && value.playerNumber !== undefined) {
+      if (
+        typeof value.playerNumber !== "number" ||
+        !Number.isSafeInteger(value.playerNumber) ||
+        value.playerNumber < 0 ||
+        value.playerNumber > 99
+      ) {
+        return invalid("playerNumber is invalid.");
+      }
+      playerNumber = value.playerNumber;
+    } else {
+      playerNumber = null;
+    }
+    if (value.foulBeforeScore !== undefined && typeof value.foulBeforeScore !== "boolean") {
+      return invalid("foulBeforeScore must be a boolean.");
+    }
+    if (value.seekerPenalty !== undefined && value.seekerPenalty !== "head-referee-confirmed") {
+      return invalid("seekerPenalty requires Head Referee confirmation.");
+    }
+    cardType = value.cardType;
+    foulBeforeScore =
+      value.cardType === "blue" || value.cardType === "yellow" ? value.foulBeforeScore : undefined;
+    seekerPenalty = value.seekerPenalty;
   }
   let targetFactId: string | undefined;
   let effective: boolean | undefined;
@@ -459,6 +531,31 @@ export function parseLiveEventControllerIntent(
     if (typeof value.effective !== "boolean") return invalid("effective must be a boolean.");
     targetFactId = parsedTarget.value;
     effective = value.effective;
+  }
+  let targetCardFactId: string | undefined;
+  let reason: LivePenaltyReason | undefined;
+  if (value.type === "record-penalty-reason") {
+    const target = validateOpaqueIdentifier(value.targetCardFactId, "targetCardFactId");
+    if (!target.ok) return invalid(target.error);
+    if (!(LIVE_PENALTY_REASONS as readonly string[]).includes(value.reason as string)) {
+      return invalid("reason is unsupported.");
+    }
+    targetCardFactId = target.value;
+    reason = value.reason as LivePenaltyReason;
+  }
+  let pendingId: string | undefined;
+  let scoreFactId: string | undefined;
+  let playerKey: string | undefined;
+  if (value.type === "resolve-penalty-expiration") {
+    const pending = validateOpaqueIdentifier(value.pendingId, "pendingId");
+    const scoreFact = validateOpaqueIdentifier(value.scoreFactId, "scoreFactId");
+    const player = validateOpaqueIdentifier(value.playerKey, "playerKey");
+    if (!pending.ok) return invalid(pending.error);
+    if (!scoreFact.ok) return invalid(scoreFact.error);
+    if (!player.ok) return invalid(player.error);
+    pendingId = pending.value;
+    scoreFactId = scoreFact.value;
+    playerKey = player.value;
   }
   let running: boolean | undefined;
   if (value.type === "clock" || value.type === "set-running" || value.type === "clock-takeover") {
@@ -606,6 +703,15 @@ export function parseLiveEventControllerIntent(
       ...(targetFactId === undefined ? {} : { targetFactId }),
       ...(effective === undefined ? {} : { effective }),
       ...(gameSideId === undefined ? {} : { gameSideId }),
+      ...(playerNumber === undefined ? {} : { playerNumber }),
+      ...(cardType === undefined ? {} : { cardType }),
+      ...(foulBeforeScore === undefined ? {} : { foulBeforeScore }),
+      ...(seekerPenalty === undefined ? {} : { seekerPenalty }),
+      ...(targetCardFactId === undefined ? {} : { targetCardFactId }),
+      ...(reason === undefined ? {} : { reason }),
+      ...(pendingId === undefined ? {} : { pendingId }),
+      ...(scoreFactId === undefined ? {} : { scoreFactId }),
+      ...(playerKey === undefined ? {} : { playerKey }),
       ...(running === undefined ? {} : { running }),
       ...(adjustmentMs === undefined ? {} : { adjustmentMs }),
       ...(clockTimeMs === undefined ? {} : { clockTimeMs }),
@@ -1092,6 +1198,7 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
 
     if (
       parsed.value.type === "record-goal" ||
+      parsed.value.type === "record-card" ||
       parsed.value.type === "record-flag-catch" ||
       parsed.value.type === "record-concession" ||
       parsed.value.type === "record-forfeit" ||
@@ -1131,11 +1238,32 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
       return rejectedAction(parsed.value.operationId);
     }
     const nowMs = clock();
-    const previousClockStartMs = latestRunningClockStart(actionsBefore);
+    const previousClockStartMs = latestRunningClockStart(effectiveStateBefore.gameFacts);
+    const clockAuthorityActionsBefore = readClockAuthorityActions(actionsBefore);
     const clockBefore = projectClockBaseline(
-      deriveClockAuthority(readClockAuthorityActions(actionsBefore)),
+      deriveClockAuthority(clockAuthorityActionsBefore),
       nowMs,
     );
+    const releaseScoreFactId =
+      parsed.value.type === "resolve-penalty-expiration" ? parsed.value.scoreFactId : null;
+    const releaseSourceFact =
+      releaseScoreFactId === null
+        ? undefined
+        : effectiveStateBefore.gameFacts.find(
+            (fact) =>
+              fact.factId === releaseScoreFactId && fact.factType === "goal" && fact.effective,
+          );
+    const releaseSourceGameTimeMs =
+      releaseSourceFact?.gameTimeMs ?? releaseSourceFact?.sportingOrder;
+    const factGameTimeMs =
+      parsed.value.type === "resolve-penalty-expiration" && releaseSourceGameTimeMs !== undefined
+        ? releaseSourceGameTimeMs
+        : (parsed.value.type === "record-goal" || parsed.value.type === "record-card") &&
+            parsed.value.occurrence.source !== "offline" &&
+            parsed.value.gameTimeMs === 0 &&
+            clockAuthorityActionsBefore.length > 0
+          ? clockBefore.gameTimeMs
+          : parsed.value.gameTimeMs;
     const clockData = readClockIntentData(parsed.value, clockBefore, nowMs);
     if (clockData.status === "rejected") {
       return rejectedAction(parsed.value.operationId);
@@ -1165,7 +1293,14 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
           : previousClockStartMs
         : null;
     const factType = controllerFactType(parsed.value);
-    const gameSideId = controllerGameSideId(parsed.value);
+    const derivedPenaltyStart =
+      parsed.value.type === "record-card"
+        ? deriveControllerPenaltyStart(activeRoot, factGameTimeMs, parsed.value.seekerPenalty)
+        : undefined;
+    const gameSideId =
+      parsed.value.type === "record-card"
+        ? parsed.value.gameSideId
+        : controllerGameSideId(parsed.value);
     const isCorrection = parsed.value.type === "correct-fact";
     let override: OfficialOverrideMetadata | undefined;
     try {
@@ -1193,12 +1328,12 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
               factId: parsed.value.factId,
               factType,
               gameSideId,
-              gameTimeMs: parsed.value.gameTimeMs,
+              gameTimeMs: factGameTimeMs,
               data:
                 parsed.value.type === "record-goal"
                   ? {
                       points: 10,
-                      sportingOrder: parsed.value.sportingOrder ?? parsed.value.gameTimeMs,
+                      sportingOrder: parsed.value.sportingOrder ?? factGameTimeMs,
                       ...(parsed.value.sportingOrderAdjudication === undefined
                         ? {}
                         : { sportingOrderAdjudication: parsed.value.sportingOrderAdjudication }),
@@ -1206,48 +1341,41 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
                         ? {}
                         : { sportingOrderOverride: parsed.value.sportingOrderOverride }),
                     }
-                  : isScoringIntent(parsed.value)
+                  : parsed.value.type === "record-card"
                     ? {
-                        points:
-                          parsed.value.type === "record-flag-catch" ||
-                          (parsed.value.type === "substantive" &&
-                            parsed.value.trigger === "flag-catch")
-                            ? 30
-                            : 0,
-                        sportingOrder: parsed.value.sportingOrder ?? parsed.value.gameTimeMs,
-                        ...(parsed.value.sportingOrderAdjudication === undefined
+                        cardType: parsed.value.cardType,
+                        playerNumber: parsed.value.playerNumber,
+                        penaltyStart: derivedPenaltyStart,
+                        ...(parsed.value.foulBeforeScore === undefined
                           ? {}
-                          : { sportingOrderAdjudication: parsed.value.sportingOrderAdjudication }),
-                        ...(parsed.value.sportingOrderOverride === undefined
+                          : { foulBeforeScore: parsed.value.foulBeforeScore }),
+                        ...(parsed.value.seekerPenalty === undefined
                           ? {}
-                          : { sportingOrderOverride: parsed.value.sportingOrderOverride }),
-                        ...(parsed.value.type === "substantive"
-                          ? { trigger: parsed.value.trigger }
-                          : {}),
+                          : { seekerPenalty: parsed.value.seekerPenalty }),
+                        sportingOrder: parsed.value.sportingOrder ?? factGameTimeMs,
                       }
-                    : isResultIntent(parsed.value)
+                    : parsed.value.type === "record-penalty-reason"
                       ? {
-                          resultKind: controllerFactType(parsed.value),
+                          targetCardFactId: parsed.value.targetCardFactId,
+                          reason: parsed.value.reason,
                           sportingOrder: parsed.value.sportingOrder ?? parsed.value.gameTimeMs,
-                          ...(parsed.value.sportingOrderAdjudication === undefined
-                            ? {}
-                            : {
-                                sportingOrderAdjudication: parsed.value.sportingOrderAdjudication,
-                              }),
                         }
-                      : clockData.value !== null
+                      : parsed.value.type === "resolve-penalty-expiration"
                         ? {
-                            ...clockData.value,
-                            sportingOrder: parsed.value.sportingOrder ?? parsed.value.gameTimeMs,
-                            ...(parsed.value.sportingOrderAdjudication === undefined
-                              ? {}
-                              : {
-                                  sportingOrderAdjudication: parsed.value.sportingOrderAdjudication,
-                                }),
+                            pendingId: parsed.value.pendingId,
+                            scoreFactId: parsed.value.scoreFactId,
+                            playerKey: parsed.value.playerKey,
+                            sportingOrder:
+                              releaseSourceFact?.sportingOrder ?? parsed.value.gameTimeMs,
                           }
-                        : parsed.value.type === "substantive"
+                        : isScoringIntent(parsed.value)
                           ? {
-                              trigger: parsed.value.trigger,
+                              points:
+                                parsed.value.type === "record-flag-catch" ||
+                                (parsed.value.type === "substantive" &&
+                                  parsed.value.trigger === "flag-catch")
+                                  ? 30
+                                  : 0,
                               sportingOrder: parsed.value.sportingOrder ?? parsed.value.gameTimeMs,
                               ...(parsed.value.sportingOrderAdjudication === undefined
                                 ? {}
@@ -1255,11 +1383,53 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
                                     sportingOrderAdjudication:
                                       parsed.value.sportingOrderAdjudication,
                                   }),
-                              ...(parsed.value.heatAction === undefined
+                              ...(parsed.value.sportingOrderOverride === undefined
                                 ? {}
-                                : { heatAction: parsed.value.heatAction }),
+                                : { sportingOrderOverride: parsed.value.sportingOrderOverride }),
+                              ...(parsed.value.type === "substantive"
+                                ? { trigger: parsed.value.trigger }
+                                : {}),
                             }
-                          : null,
+                          : isResultIntent(parsed.value)
+                            ? {
+                                resultKind: controllerFactType(parsed.value),
+                                sportingOrder:
+                                  parsed.value.sportingOrder ?? parsed.value.gameTimeMs,
+                                ...(parsed.value.sportingOrderAdjudication === undefined
+                                  ? {}
+                                  : {
+                                      sportingOrderAdjudication:
+                                        parsed.value.sportingOrderAdjudication,
+                                    }),
+                              }
+                            : clockData.value !== null
+                              ? {
+                                  ...clockData.value,
+                                  sportingOrder:
+                                    parsed.value.sportingOrder ?? parsed.value.gameTimeMs,
+                                  ...(parsed.value.sportingOrderAdjudication === undefined
+                                    ? {}
+                                    : {
+                                        sportingOrderAdjudication:
+                                          parsed.value.sportingOrderAdjudication,
+                                      }),
+                                }
+                              : parsed.value.type === "substantive"
+                                ? {
+                                    trigger: parsed.value.trigger,
+                                    sportingOrder:
+                                      parsed.value.sportingOrder ?? parsed.value.gameTimeMs,
+                                    ...(parsed.value.sportingOrderAdjudication === undefined
+                                      ? {}
+                                      : {
+                                          sportingOrderAdjudication:
+                                            parsed.value.sportingOrderAdjudication,
+                                        }),
+                                    ...(parsed.value.heatAction === undefined
+                                      ? {}
+                                      : { heatAction: parsed.value.heatAction }),
+                                  }
+                                : null,
             },
       causalPredecessorIds: [...(input.causalPredecessorIds ?? [])],
       occurrence: {
@@ -1274,6 +1444,49 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
       lifecycle: structuredClone(existingAction?.action.lifecycle ?? activeRoot.lifecycle),
       ...(override === undefined ? {} : { override }),
     };
+    const hasDirectAutomaticPenaltyConsequence = actionsBefore.some(
+      ({ action: storedAction }) =>
+        storedAction.interpretation.type === "fact" &&
+        storedAction.interpretation.factType === "penalty-release-consequence" &&
+        isRecord(storedAction.interpretation.payload) &&
+        isRecord(storedAction.interpretation.payload.data) &&
+        storedAction.interpretation.payload.data.sourceFactId === parsed.value.factId,
+    );
+    const automaticPenaltyConsequence =
+      (hasDirectAutomaticPenaltyConsequence
+        ? null
+        : buildAutomaticPenaltyConsequence({
+            intent: parsed.value,
+            factGameTimeMs,
+            beforeFacts: effectiveStateBefore.gameFacts,
+          })) ?? buildMissingAutomaticPenaltyConsequence(activeRoot, actionsBefore, action);
+    const { override: sourceOverride, ...automaticConsequenceBase } = action;
+    void sourceOverride;
+    const actions =
+      automaticPenaltyConsequence === null
+        ? [action]
+        : [
+            action,
+            {
+              ...automaticConsequenceBase,
+              kind: { id: goalCodec.kind, version: goalCodec.version },
+              operationId: automaticPenaltyConsequence.operationId,
+              causalPredecessorIds: [
+                ...new Set([
+                  ...(input.causalPredecessorIds ?? []),
+                  action.operationId,
+                  automaticPenaltyConsequence.sourceOperationId,
+                ]),
+              ],
+              payload: {
+                factId: automaticPenaltyConsequence.factId,
+                factType: "penalty-release-consequence",
+                gameSideId: automaticPenaltyConsequence.gameSideId,
+                gameTimeMs: automaticPenaltyConsequence.gameTimeMs,
+                data: automaticPenaltyConsequence.data,
+              },
+            },
+          ];
 
     const derivedLifecycle =
       existingAction === undefined
@@ -1311,7 +1524,7 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
         eventGameId: activeRoot.eventGameId,
         sessionBearer: input.sessionBearer,
         lifecycleTransition,
-        actions: [action],
+        actions,
         reconcileDerivedLifecycle: derivedLifecycle !== undefined,
       });
     } catch {
@@ -1319,7 +1532,15 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
     }
 
     const result = accepted.results[0];
+    const consequenceResult = accepted.results[1];
     if (accepted.status === "partial" || result?.status === "retry-later") {
+      return retryableAction(parsed.value.operationId);
+    }
+    if (
+      consequenceResult !== undefined &&
+      consequenceResult.status !== "accepted" &&
+      consequenceResult.status !== "duplicate-accepted"
+    ) {
       return retryableAction(parsed.value.operationId);
     }
     if (result === undefined) return rejectedAction(parsed.value.operationId);
@@ -1585,9 +1806,13 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
       if (rebuild.status !== "ready") return null;
       const derived = readDerivedState(rebuild.derivedGameState);
       if (derived === null) return null;
-      const actions = await record.readActions();
+      const projectedClock = projectClockBaseline(derived.clock.baseline, clock());
+      const projectedFacts = derived.gameFacts.map((fact) => ({
+        ...fact,
+        data: structuredClone(fact.data),
+      }));
       const runningSinceMs =
-        root.lifecycle.commencedAtMs === null ? latestRunningClockStart(actions) : null;
+        root.lifecycle.commencedAtMs === null ? latestRunningClockStart(derived.gameFacts) : null;
       const controllerProjection: ControllerProjection = {
         eventGameId: root.eventGameId,
         phase: derived.phase,
@@ -1602,17 +1827,15 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
         targetScore: derived.overtimeTarget,
         winnerGameSideId: derived.winnerGameSideId,
         catch: structuredClone(derived.catch),
-        gameFacts: derived.gameFacts.map((fact) => ({
-          ...fact,
-          data: structuredClone(fact.data),
-        })),
+        gameFacts: projectedFacts,
+        penalties: deriveLivePenaltyProjection(projectedFacts, projectedClock.gameTimeMs),
         guardrails: [
           explainLiveEventGuardrail({ type: "substantive", trigger: "timeout" }),
           explainLiveEventGuardrail({ type: "substantive", trigger: "suspension" }),
           explainLiveEventGuardrail({ type: "substantive", trigger: "heat-stoppage" }),
           explainLiveEventGuardrail({ type: "record-goal", gameTimeMs: 1, sportingOrder: 0 }),
         ],
-        clock: projectClockBaseline(derived.clock.baseline, clock()),
+        clock: projectedClock,
         commencement: {
           status: root.lifecycle.commencedAtMs === null ? "provisional" : "commenced",
           commencedAtMs: root.lifecycle.commencedAtMs,
@@ -1876,6 +2099,12 @@ function deriveLiveEventGameState(
       : root.lifecycle.phase === "scheduled"
         ? "scheduled"
         : "in-progress";
+  const clock = projectClockBaseline(
+    deriveClockAuthority(
+      readClockAuthorityActions(effectiveFacts.map((fact) => ({ action: fact.action }))),
+    ),
+    0,
+  );
   return {
     interpreterVersion: version,
     phase,
@@ -1890,12 +2119,8 @@ function deriveLiveEventGameState(
     winnerGameSideId,
     catch: catchState,
     gameFacts,
-    clock: projectClockBaseline(
-      deriveClockAuthority(
-        readClockAuthorityActions(effectiveFacts.map((fact) => ({ action: fact.action }))),
-      ),
-      0,
-    ),
+    penalties: deriveLivePenaltyProjection(gameFacts, clock.gameTimeMs),
+    clock,
   };
 }
 
@@ -1905,6 +2130,9 @@ function controllerFactType(intent: LiveEventControllerIntent): string {
   if (intent.type === "record-concession") return "concession";
   if (intent.type === "record-forfeit") return "forfeit";
   if (intent.type === "record-double-forfeit") return "double-forfeit";
+  if (intent.type === "record-card") return "card";
+  if (intent.type === "record-penalty-reason") return "penalty-reason";
+  if (intent.type === "resolve-penalty-expiration") return "penalty-release";
   if (
     intent.type === "clock" ||
     intent.type === "set-running" ||
@@ -1918,6 +2146,182 @@ function controllerFactType(intent: LiveEventControllerIntent): string {
   return intent.type;
 }
 
+function buildAutomaticPenaltyConsequence(input: {
+  intent: LiveEventControllerIntent;
+  factGameTimeMs: number;
+  beforeFacts: readonly ControllerGameFact[];
+}): {
+  operationId: string;
+  sourceOperationId: string;
+  factId: string;
+  gameTimeMs: number;
+  gameSideId: string | null;
+  data: ActionJsonValue;
+} | null {
+  const { intent, factGameTimeMs, beforeFacts } = input;
+  if (
+    intent.type === "record-card" &&
+    intent.foulBeforeScore === true &&
+    (intent.cardType === "blue" || intent.cardType === "yellow")
+  ) {
+    const sourceFact = beforeFacts.find((fact) => fact.factId === intent.factId);
+    const sourceSportingOrder = sourceFact?.sportingOrder ?? intent.sportingOrder ?? factGameTimeMs;
+    const playerKey =
+      intent.playerNumber === null
+        ? `${intent.gameSideId}:unknown:${intent.factId}`
+        : `${intent.gameSideId}:${intent.playerNumber}`;
+    return {
+      operationId: `${intent.operationId}-penalty-release`,
+      sourceOperationId: intent.operationId,
+      factId: `${intent.factId}-penalty-release`,
+      gameTimeMs: factGameTimeMs,
+      gameSideId: intent.gameSideId,
+      data: {
+        sourceFactId: intent.factId,
+        playerKey,
+        releaseCause: "foul-before-score",
+        releasedMs: factGameTimeMs,
+        serviceDurationMs: LIVE_PENALTY_MINUTE_MS,
+        sportingOrder: sourceSportingOrder,
+      },
+    };
+  }
+  if (intent.type !== "record-goal") return null;
+  const sourceFact = beforeFacts.find((fact) => fact.factId === intent.factId);
+  const sourceSportingOrder = sourceFact?.sportingOrder ?? intent.sportingOrder ?? factGameTimeMs;
+  const prospectiveFact = {
+    factId: intent.factId,
+    factType: "goal",
+    gameSideId: intent.gameSideId,
+    gameTimeMs: factGameTimeMs,
+    sportingOrder: sourceSportingOrder,
+    synchronizationOrder:
+      beforeFacts.reduce((highest, fact) => Math.max(highest, fact.synchronizationOrder), 0) + 1,
+    effective: true,
+    data: {
+      points: 10,
+      sportingOrder: sourceSportingOrder,
+    },
+  } satisfies import("@/lib/live-event-penalties").LivePenaltyFact;
+  const projected = deriveLivePenaltyProjection(
+    beforeFacts.some((fact) => fact.factId === intent.factId)
+      ? beforeFacts
+      : [...beforeFacts, prospectiveFact],
+    factGameTimeMs,
+  );
+  const release = projected.releases.find(
+    (candidate) => candidate.scoreFactId === intent.factId && candidate.releaseCause === "score",
+  );
+  if (release === undefined) return null;
+  const beforeProjection = deriveLivePenaltyProjection(beforeFacts, factGameTimeMs);
+  const serviceDurationMs = Math.min(
+    ...(beforeProjection.players
+      .find((player) => player.playerKey === release.playerKey)
+      ?.segments.filter(
+        (segment) =>
+          segment.expirableByScore &&
+          segment.eligibleForScoreAtGameTimeMs <= factGameTimeMs &&
+          segment.startsAtGameTimeMs <= factGameTimeMs &&
+          segment.endsAtGameTimeMs > factGameTimeMs,
+      )
+      .map((segment) =>
+        Math.max(
+          0,
+          Math.min(segment.endsAtGameTimeMs, factGameTimeMs + LIVE_PENALTY_MINUTE_MS) -
+            factGameTimeMs,
+        ),
+      ) ?? [LIVE_PENALTY_MINUTE_MS]),
+  );
+  return {
+    operationId: `${intent.operationId}-penalty-release`,
+    sourceOperationId: intent.operationId,
+    factId: `${intent.factId}-penalty-release`,
+    gameTimeMs: factGameTimeMs,
+    gameSideId: release.gameSideId,
+    data: {
+      sourceFactId: intent.factId,
+      playerKey: release.playerKey,
+      releaseCause: "score",
+      releasedMs: factGameTimeMs,
+      serviceDurationMs,
+      sportingOrder: sourceSportingOrder,
+    },
+  };
+}
+
+function buildMissingAutomaticPenaltyConsequence(
+  root: EventGameRecordRoot,
+  actionsBefore: readonly {
+    action: ControlAction;
+    canonicalContent: string;
+    contentFingerprint: string;
+  }[],
+  candidate: unknown,
+): {
+  operationId: string;
+  sourceOperationId: string;
+  factId: string;
+  gameTimeMs: number;
+  gameSideId: string | null;
+  data: ActionJsonValue;
+} | null {
+  if (
+    !isRecord(candidate) ||
+    !isRecord(candidate.occurrence) ||
+    typeof candidate.occurrence.trustedAtMs !== "number"
+  ) {
+    return null;
+  }
+  const acceptedAtMs = candidate.occurrence.trustedAtMs;
+  const registry = createControlActionCodecRegistry(createDefaultControlActionCodecs());
+  const prepared = prepareControlAction(candidate, root, registry, acceptedAtMs);
+  if (!prepared.ok) return null;
+  const candidateStored = {
+    action: materializeControlAction(prepared.value, acceptedAtMs),
+    canonicalContent: prepared.value.canonicalContent,
+    contentFingerprint: prepared.value.contentFingerprint,
+  };
+  const prospectiveActions = [...actionsBefore, candidateStored];
+  const prospective = rebuildLiveDerivedState(root, prospectiveActions);
+  if (prospective?.penalties === undefined) return null;
+  const knownSources = new Set(
+    prospective.gameFacts.flatMap((fact) => {
+      if (fact.factType !== "penalty-release-consequence" || !isRecord(fact.data)) return [];
+      return typeof fact.data.sourceFactId === "string" ? [fact.data.sourceFactId] : [];
+    }),
+  );
+  const release = prospective.penalties.releases.find(
+    (candidateRelease) =>
+      candidateRelease.sourceFactId.length > 0 && !knownSources.has(candidateRelease.sourceFactId),
+  );
+  if (release === undefined) return null;
+  const sourceFact = prospective.gameFacts.find(
+    (fact) => fact.factId === release.sourceFactId && fact.effective,
+  );
+  const sourceAction = prospectiveActions.find(({ action }) => {
+    if (action.interpretation.type !== "fact" || !isRecord(action.interpretation.payload)) {
+      return false;
+    }
+    return action.interpretation.payload.factId === release.sourceFactId;
+  })?.action;
+  if (sourceAction === undefined) return null;
+  return {
+    operationId: `${sourceAction.operationId}-penalty-release`,
+    sourceOperationId: sourceAction.operationId,
+    factId: `${release.sourceFactId}-penalty-release`,
+    gameTimeMs: release.releasedMs,
+    gameSideId: release.gameSideId,
+    data: {
+      sourceFactId: release.sourceFactId,
+      playerKey: release.playerKey,
+      releaseCause: release.releaseCause,
+      releasedMs: release.releasedMs,
+      serviceDurationMs: release.serviceDurationMs,
+      sportingOrder: sourceFact?.sportingOrder ?? release.releasedMs,
+    },
+  };
+}
+
 async function ensureClockCommencement(
   owner: { recordId: string; record: EventGameRecord },
   root: EventGameRecordRoot,
@@ -1927,7 +2331,9 @@ async function ensureClockCommencement(
     return { status: "ready", root };
   }
   const actions = await owner.record.readActions();
-  const runningSinceMs = latestRunningClockStart(actions);
+  const rebuilt = rebuildLiveDerivedState(root, actions);
+  if (rebuilt === null) return { status: "rejected" };
+  const runningSinceMs = latestRunningClockStart(rebuilt.gameFacts);
   if (runningSinceMs === null || nowMs - runningSinceMs < 10_000) {
     return { status: "ready", root };
   }
@@ -1940,21 +2346,11 @@ async function ensureClockCommencement(
   return { status: "ready", root: transition.root };
 }
 
-function latestRunningClockStart(
-  actions: readonly { action: { interpretation: unknown } }[],
-): number | null {
-  for (const stored of [...actions].reverse()) {
-    const interpretation = stored.action.interpretation;
-    if (
-      !isRecord(interpretation) ||
-      interpretation.type !== "fact" ||
-      interpretation.factType !== "clock"
-    )
-      continue;
-    const payload = interpretation.payload;
-    if (!isRecord(payload) || !isRecord(payload.data)) return null;
-    if (payload.data.running !== true) return null;
-    return typeof payload.data.startedAtMs === "number" ? payload.data.startedAtMs : null;
+function latestRunningClockStart(facts: readonly ControllerGameFact[]): number | null {
+  for (const fact of [...facts].reverse()) {
+    if (!fact.effective || fact.factType !== "clock" || !isRecord(fact.data)) continue;
+    if (fact.data.running !== true) return null;
+    return typeof fact.data.startedAtMs === "number" ? fact.data.startedAtMs : null;
   }
   return null;
 }
@@ -1972,6 +2368,7 @@ function shouldRecordCommencement(
     intent.type === "record-concession" ||
     intent.type === "record-forfeit" ||
     intent.type === "record-double-forfeit" ||
+    intent.type === "record-card" ||
     intent.type === "substantive"
   ) {
     return { atMs: nowMs };
@@ -2152,6 +2549,19 @@ function currentSideIds(state: LiveEventGameDerivedState): string[] {
   return Object.keys(state.scoreByGameSide);
 }
 
+function deriveControllerPenaltyStart(
+  root: EventGameRecordRoot,
+  gameTimeMs: number,
+  seekerPenalty: "head-referee-confirmed" | undefined,
+): LivePenaltyStart {
+  if (root.lifecycle.commencedAtMs === null) return "sticks-up";
+  return seekerPenalty === "head-referee-confirmed" &&
+    gameTimeMs >= 19 * LIVE_PENALTY_MINUTE_MS &&
+    gameTimeMs < LIVE_SEEKER_RELEASE_MS
+    ? "seeker-release"
+    : "immediate";
+}
+
 function readDerivedState(value: unknown): LiveEventGameDerivedState | null {
   if (!isRecord(value) || typeof value.interpreterVersion !== "string") return null;
   if (
@@ -2210,6 +2620,7 @@ function readDerivedState(value: unknown): LiveEventGameDerivedState | null {
     winnerGameSideId: winnerGameSideId.status === "value" ? winnerGameSideId.value : null,
     catch: catchState === "missing" ? null : catchState,
     gameFacts,
+    penalties: deriveLivePenaltyProjection(gameFacts, clock.gameTimeMs),
     clock,
   };
 }
@@ -2651,6 +3062,95 @@ export function validateLiveEventGameActionInTransaction(
   if (!isRecord(payload)) return rejectedLiveAction("The live Game Fact payload is invalid.");
   const gameTimeMs = typeof payload.gameTimeMs === "number" ? payload.gameTimeMs : null;
   const data = isRecord(payload.data) ? payload.data : null;
+  if (candidate.interpretation.factType === "penalty-reason") {
+    const targetCardFactId = data?.targetCardFactId;
+    if (
+      typeof targetCardFactId !== "string" ||
+      !actions.some(
+        ({ action }) =>
+          action.interpretation.type === "fact" &&
+          action.interpretation.factId === targetCardFactId &&
+          action.interpretation.factType === "card",
+      )
+    ) {
+      return rejectedLiveAction("A Penalty Reason must refer to an accepted card fact.");
+    }
+  }
+  if (candidate.interpretation.factType === "penalty-release-consequence") {
+    const sourceFactId = data?.sourceFactId;
+    const playerKey = data?.playerKey;
+    const releaseCause = data?.releaseCause;
+    const source =
+      typeof sourceFactId === "string"
+        ? actions.find(
+            ({ action }) =>
+              action.interpretation.type === "fact" &&
+              action.interpretation.factId === sourceFactId,
+          )
+        : undefined;
+    if (
+      source === undefined ||
+      typeof playerKey !== "string" ||
+      (releaseCause !== "score" && releaseCause !== "foul-before-score") ||
+      (releaseCause === "score" &&
+        source.action.interpretation.type === "fact" &&
+        source.action.interpretation.factType !== "goal") ||
+      (releaseCause === "foul-before-score" &&
+        (source.action.interpretation.type !== "fact" ||
+          source.action.interpretation.factType !== "card"))
+    ) {
+      return rejectedLiveAction("The automatic Penalty Release consequence is invalid.");
+    }
+  }
+  if (candidate.interpretation.factType === "penalty-release") {
+    const pendingId = data?.pendingId;
+    const scoreFactId = data?.scoreFactId;
+    const playerKey = data?.playerKey;
+    const scoreFact =
+      typeof scoreFactId === "string"
+        ? current.gameFacts.find(
+            (fact) => fact.factId === scoreFactId && fact.factType === "goal" && fact.effective,
+          )
+        : undefined;
+    const scoreGameTimeMs = scoreFact?.gameTimeMs ?? scoreFact?.sportingOrder;
+    const releaseSportingOrder =
+      data !== null && typeof data.sportingOrder === "number" ? data.sportingOrder : null;
+    const factsThroughScore =
+      scoreFact === undefined
+        ? []
+        : current.gameFacts.filter((fact) => compareLivePenaltyFactOrder(fact, scoreFact) <= 0);
+    const scoreProjection =
+      scoreGameTimeMs === undefined
+        ? null
+        : deriveLivePenaltyProjection(factsThroughScore, scoreGameTimeMs);
+    const existingEffectiveChoice =
+      typeof scoreFactId === "string"
+        ? current.gameFacts.find(
+            (fact) =>
+              fact.factType === "penalty-release" &&
+              fact.effective &&
+              isRecord(fact.data) &&
+              fact.data.scoreFactId === scoreFactId,
+          )
+        : undefined;
+    const pending =
+      typeof pendingId === "string" && typeof scoreFactId === "string"
+        ? scoreProjection?.pendingExpirations.find(
+            (expiration) => expiration.id === pendingId && expiration.scoreFactId === scoreFactId,
+          )
+        : undefined;
+    if (
+      pending === undefined ||
+      typeof playerKey !== "string" ||
+      !pending.candidatePlayerKeys.includes(playerKey) ||
+      gameTimeMs !== scoreGameTimeMs ||
+      releaseSportingOrder !== scoreFact?.sportingOrder ||
+      (existingEffectiveChoice !== undefined &&
+        existingEffectiveChoice.factId !== candidate.interpretation.factId)
+    ) {
+      return rejectedLiveAction("The Penalty Release choice is no longer valid.");
+    }
+  }
   const sportingOrder =
     data !== null && typeof data.sportingOrder === "number" ? data.sportingOrder : gameTimeMs;
   const sportingOrderDiffers =
@@ -2734,9 +3234,11 @@ export function validateLiveEventGameActionInTransaction(
     }
   }
   const expected =
-    closePair.fact !== null && sportingOrderAdjudication !== null
-      ? expectedClosePlayOverride(closePair.fact, gameTimeMs, sportingOrderAdjudication)
-      : expectedLiveOverride(candidate, current, sportingOrderDiffers, gameTimeMs, data);
+    candidate.interpretation.factType === "penalty-release-consequence"
+      ? null
+      : closePair.fact !== null && sportingOrderAdjudication !== null
+        ? expectedClosePlayOverride(closePair.fact, gameTimeMs, sportingOrderAdjudication)
+        : expectedLiveOverride(candidate, current, sportingOrderDiffers, gameTimeMs, data);
   if (sportingOrderOverride !== undefined) {
     return rejectedLiveAction(
       "A separate Sporting Order override is only valid with a flag-catch boundary override.",
@@ -3228,6 +3730,12 @@ function readClockAuthorityActions(
     const data = interpretation.payload.data;
     if (!isRecord(data)) continue;
     if (interpretation.factType === "card") {
+      if (isRecord(data) && typeof data.cardType === "string") {
+        // Live penalty timing is rebuilt from the sporting Game Clock. The
+        // legacy trigger-only card fact retains the clock-authority signal
+        // used by the earlier live-control slice.
+        continue;
+      }
       clockActions.push({
         operationId: storedAction.operationId,
         trustedAtMs: storedAction.occurrence.trustedAtMs,

@@ -17,10 +17,687 @@ import {
   validateLiveEventGameActionInTransaction,
 } from "@/lib/live-event-game-control";
 import { createLiveEventGameControlTransport } from "@/lib/live-event-game-transport";
+import { LIVE_SEEKER_RELEASE_MS } from "@/lib/live-event-penalties";
 import { createAdHocGamesService } from "@/lib/ad-hoc-games";
 import { createControlScopeResolver as createRuntimeControlScopeResolver } from "@/lib/live-event-game-runtime";
 
 describe("Live Event Game control", () => {
+  test("keeps Penalty Reason values fixed while skip remains a Controller-only absence", () => {
+    expect(
+      parseLiveEventControllerIntent({
+        ...reasonIntent(),
+        reason: "skip",
+      }),
+    ).toMatchObject({ ok: false });
+    expect(
+      parseLiveEventControllerIntent({
+        ...reasonIntent(),
+        reason: "free text",
+      }),
+    ).toMatchObject({ ok: false });
+    expect(
+      parseLiveEventControllerIntent({
+        ...cardIntent(),
+        seekerPenalty: "controller-guessed",
+      }),
+    ).toMatchObject({ ok: false });
+  });
+
+  test("derives sticks-up and seeker-floor timing from the real Controller seam", async () => {
+    const pregame = await createHarness();
+    const pregameOpened = await pregame.control.openController({
+      qrCredential: pregame.qrCredential,
+      browserContext: "pregame-card-controller",
+    });
+    if (pregameOpened.status !== "opened") throw new Error("Expected the Controller to open.");
+    await pregame.control.submitControllerIntent({
+      sessionBearer: pregameOpened.session.sessionBearer,
+      eventGameId: pregame.root.eventGameId,
+      intent: clockCorrectionIntent("pregame-clock", 90_000),
+    });
+    const pregameCard = await pregame.control.submitControllerIntent({
+      sessionBearer: pregameOpened.session.sessionBearer,
+      eventGameId: pregame.root.eventGameId,
+      intent: cardIntent(),
+    });
+    expect(pregameCard).toMatchObject({
+      status: "accepted",
+      projection: { phase: "in-progress" },
+    });
+    expect((await pregame.record.readActions()).at(-1)?.action.interpretation).toMatchObject({
+      type: "fact",
+      factType: "card",
+      payload: { gameTimeMs: 90_000, data: { penaltyStart: "sticks-up" } },
+    });
+
+    const inGame = await createHarness();
+    const opened = await inGame.control.openController({
+      qrCredential: inGame.qrCredential,
+      browserContext: "seeker-floor-controller",
+    });
+    if (opened.status !== "opened") throw new Error("Expected the Controller to open.");
+    await inGame.control.submitControllerIntent({
+      sessionBearer: opened.session.sessionBearer,
+      eventGameId: inGame.root.eventGameId,
+      intent: goalIntent({ operationId: "commence-game", factId: "commence-game" }),
+    });
+    const seekerGameTime = 19 * 60_000 + 30_000;
+    await inGame.control.submitControllerIntent({
+      sessionBearer: opened.session.sessionBearer,
+      eventGameId: inGame.root.eventGameId,
+      intent: clockCorrectionIntent("seeker-clock", seekerGameTime),
+    });
+    const ordinaryCard = await inGame.control.submitControllerIntent({
+      sessionBearer: opened.session.sessionBearer,
+      eventGameId: inGame.root.eventGameId,
+      intent: cardIntent({
+        operationId: "ordinary-floor-card",
+        factId: "ordinary-floor-card",
+        playerNumber: 8,
+      }),
+    });
+    expect(ordinaryCard).toMatchObject({ status: "accepted" });
+    const seekerCard = await inGame.control.submitControllerIntent({
+      sessionBearer: opened.session.sessionBearer,
+      eventGameId: inGame.root.eventGameId,
+      intent: cardIntent({
+        operationId: "seeker-card",
+        factId: "seeker-card",
+        seekerPenalty: "head-referee-confirmed",
+      }),
+    });
+    expect(seekerCard).toMatchObject({ status: "accepted" });
+    expect((await inGame.record.readActions()).at(-1)?.action.interpretation).toMatchObject({
+      type: "fact",
+      factType: "card",
+      payload: {
+        gameTimeMs: seekerGameTime,
+        data: {
+          penaltyStart: "seeker-release",
+          seekerPenalty: "head-referee-confirmed",
+        },
+      },
+    });
+    expect(
+      (await inGame.record.readActions()).find(
+        ({ action }) => action.operationId === "ordinary-floor-card",
+      )?.action.interpretation,
+    ).toMatchObject({
+      type: "fact",
+      payload: { data: { penaltyStart: "immediate" } },
+    });
+
+    const earlierGoal = await inGame.control.submitControllerIntent({
+      sessionBearer: opened.session.sessionBearer,
+      eventGameId: inGame.root.eventGameId,
+      intent: {
+        ...goalIntent({
+          operationId: "before-seeker-floor",
+          factId: "before-seeker-floor",
+          gameTimeMs: seekerGameTime + 1,
+        }),
+        occurrence: { clientOriginAtMs: 10_000, source: "offline" as const },
+      },
+    });
+    expect(earlierGoal).toMatchObject({
+      status: "accepted",
+      projection: {
+        penalties: {
+          pendingExpirations: [],
+          releases: [{ playerKey: "side-b:8", releasedMs: seekerGameTime + 1 }],
+        },
+      },
+    });
+    if (earlierGoal.status !== "accepted" || earlierGoal.projection?.penalties === undefined) {
+      throw new Error("Expected the pre-floor score projection.");
+    }
+    expect(
+      earlierGoal.projection.penalties.players.some((player) => player.playerNumber === 7),
+    ).toBe(true);
+    expect(
+      earlierGoal.projection.penalties.releases.some((release) => release.playerKey === "side-b:7"),
+    ).toBe(false);
+    await inGame.control.submitControllerIntent({
+      sessionBearer: opened.session.sessionBearer,
+      eventGameId: inGame.root.eventGameId,
+      intent: clockCorrectionIntent("seeker-release-clock", 20 * 60_000),
+    });
+    const releasedAtFloor = await inGame.control.submitControllerIntent({
+      sessionBearer: opened.session.sessionBearer,
+      eventGameId: inGame.root.eventGameId,
+      intent: goalIntent({
+        operationId: "at-seeker-floor",
+        factId: "at-seeker-floor",
+        gameTimeMs: 0,
+      }),
+    });
+    expect(releasedAtFloor).toMatchObject({ status: "accepted" });
+    if (
+      releasedAtFloor.status !== "accepted" ||
+      releasedAtFloor.projection?.penalties === undefined
+    ) {
+      throw new Error("Expected the seeker-floor score projection.");
+    }
+    expect(
+      releasedAtFloor.projection.penalties.releases.some(
+        (release) =>
+          release.scoreFactId === "at-seeker-floor" &&
+          release.playerKey === "side-b:7" &&
+          release.releasedMs === LIVE_SEEKER_RELEASE_MS,
+      ),
+    ).toBe(true);
+  });
+
+  test("uses every queued penalty minute including red for Controller score priority", async () => {
+    const harness = await createHarness();
+    const opened = await harness.control.openController({
+      qrCredential: harness.qrCredential,
+      browserContext: "queued-priority-controller",
+    });
+    if (opened.status !== "opened") throw new Error("Expected the Controller to open.");
+    const submit = (intent: unknown) =>
+      harness.control.submitControllerIntent({
+        sessionBearer: opened.session.sessionBearer,
+        eventGameId: harness.root.eventGameId,
+        intent,
+      });
+
+    await submit(substantiveIntent("commence-priority", "card"));
+    await submit(
+      cardIntent({
+        operationId: "two-first-controller",
+        factId: "two-first-controller",
+        playerNumber: 7,
+      }),
+    );
+    await submit(
+      cardIntent({
+        operationId: "queued-red-controller",
+        factId: "queued-red-controller",
+        playerNumber: 7,
+        cardType: "red",
+      }),
+    );
+    await submit(
+      cardIntent({ operationId: "one-controller", factId: "one-controller", playerNumber: 8 }),
+    );
+    const scored = await submit(
+      goalIntent({ operationId: "queued-priority-goal", factId: "queued-priority-goal" }),
+    );
+
+    expect(scored).toMatchObject({
+      status: "accepted",
+      projection: {
+        penalties: {
+          releases: [{ playerKey: "side-b:8", releaseCause: "score" }],
+          pendingExpirations: [],
+        },
+      },
+    });
+  });
+
+  test("keeps tie choice, red-to-blue gating, foul expiry, and reason follow-up on the Controller seam", async () => {
+    const tieHarness = await createHarness();
+    const tieOpened = await tieHarness.control.openController({
+      qrCredential: tieHarness.qrCredential,
+      browserContext: "tie-controller",
+    });
+    if (tieOpened.status !== "opened") throw new Error("Expected the Controller to open.");
+    const tieSubmit = (intent: unknown) =>
+      tieHarness.control.submitControllerIntent({
+        sessionBearer: tieOpened.session.sessionBearer,
+        eventGameId: tieHarness.root.eventGameId,
+        intent,
+      });
+    await tieSubmit(substantiveIntent("tie-commence", "card"));
+    await tieSubmit(
+      cardIntent({ operationId: "tie-card-a", factId: "tie-card-a", playerNumber: 7 }),
+    );
+    await tieSubmit(
+      cardIntent({ operationId: "tie-card-b", factId: "tie-card-b", playerNumber: 8 }),
+    );
+    const tie = await tieSubmit(
+      goalIntent({ operationId: "tie-goal", factId: "tie-goal", gameTimeMs: 0 }),
+    );
+    expect(tie).toMatchObject({
+      status: "accepted",
+      projection: {
+        penalties: {
+          pendingExpirations: [
+            {
+              candidatePlayerKeys: ["side-b:7", "side-b:8"],
+              requiresOfficialChoice: true,
+            },
+          ],
+        },
+      },
+    });
+    const selected = await tieSubmit({
+      ...releaseIntent("penalty-expiration:tie-goal", "tie-goal", "side-b:8"),
+    });
+    expect(selected).toMatchObject({
+      status: "accepted",
+      projection: { penalties: { pendingExpirations: [], players: [{ playerNumber: 7 }] } },
+    });
+
+    const redBlueHarness = await createHarness();
+    const redBlueOpened = await redBlueHarness.control.openController({
+      qrCredential: redBlueHarness.qrCredential,
+      browserContext: "red-blue-controller",
+    });
+    if (redBlueOpened.status !== "opened") throw new Error("Expected the Controller to open.");
+    const redBlueSubmit = (intent: unknown) =>
+      redBlueHarness.control.submitControllerIntent({
+        sessionBearer: redBlueOpened.session.sessionBearer,
+        eventGameId: redBlueHarness.root.eventGameId,
+        intent,
+      });
+    await redBlueSubmit(substantiveIntent("red-blue-commence", "card"));
+    await redBlueSubmit(
+      cardIntent({
+        operationId: "a-red-controller",
+        factId: "a-red-controller",
+        playerNumber: 7,
+        cardType: "red",
+      }),
+    );
+    await redBlueSubmit(
+      cardIntent({
+        operationId: "b-blue-controller",
+        factId: "b-blue-controller",
+        playerNumber: 7,
+      }),
+    );
+    await redBlueSubmit(
+      cardIntent({
+        operationId: "c-blue-controller",
+        factId: "c-blue-controller",
+        playerNumber: 7,
+      }),
+    );
+    await redBlueSubmit(clockCorrectionIntent("a-red-blue-clock-30", 30_000));
+    const beforeBlue = await redBlueSubmit(
+      goalIntent({
+        operationId: "red-blue-early-goal",
+        factId: "red-blue-early-goal",
+        gameTimeMs: 0,
+      }),
+    );
+    expect(beforeBlue).toMatchObject({
+      status: "accepted",
+      projection: { penalties: { releases: [], pendingExpirations: [] } },
+    });
+    await redBlueSubmit(clockCorrectionIntent("b-red-blue-clock-120", 120_000));
+    const afterBlue = await redBlueSubmit(
+      goalIntent({
+        operationId: "red-blue-late-goal",
+        factId: "red-blue-late-goal",
+        gameTimeMs: 0,
+      }),
+    );
+    expect(afterBlue).toMatchObject({
+      status: "accepted",
+      projection: { penalties: { releases: [{ playerKey: "side-b:7", releaseCause: "score" }] } },
+    });
+    const afterFirstRelease = await redBlueSubmit(
+      goalIntent({
+        operationId: "red-blue-repeated-goal",
+        factId: "red-blue-repeated-goal",
+        gameTimeMs: 0,
+      }),
+    );
+    if (
+      afterFirstRelease.status !== "accepted" &&
+      afterFirstRelease.status !== "duplicate-accepted"
+    ) {
+      throw new Error("Expected the repeated score to be accepted.");
+    }
+    if (
+      afterFirstRelease.projection === null ||
+      afterFirstRelease.projection.penalties === undefined
+    ) {
+      throw new Error("Expected the repeated score projection.");
+    }
+    expect(
+      afterFirstRelease.projection.penalties.releases.some(
+        (release) =>
+          release.scoreFactId === "red-blue-repeated-goal" &&
+          release.playerKey === "side-b:7" &&
+          release.releaseCause === "score",
+      ),
+    ).toBe(true);
+
+    const foulHarness = await createHarness();
+    const foulOpened = await foulHarness.control.openController({
+      qrCredential: foulHarness.qrCredential,
+      browserContext: "foul-controller",
+    });
+    if (foulOpened.status !== "opened") throw new Error("Expected the Controller to open.");
+    const foulSubmit = (intent: unknown) =>
+      foulHarness.control.submitControllerIntent({
+        sessionBearer: foulOpened.session.sessionBearer,
+        eventGameId: foulHarness.root.eventGameId,
+        intent,
+      });
+    await foulSubmit(goalIntent({ operationId: "foul-commence", factId: "foul-commence" }));
+    const foul = await foulSubmit(
+      cardIntent({
+        operationId: "foul-card-controller",
+        factId: "foul-card-controller",
+        playerNumber: 9,
+        foulBeforeScore: true,
+      }),
+    );
+    expect(foul).toMatchObject({
+      status: "accepted",
+      projection: {
+        penalties: {
+          players: [],
+          releases: [{ playerKey: "side-b:9", releaseCause: "foul-before-score" }],
+        },
+      },
+    });
+    const foulRelease = (await foulHarness.record.readActions()).find(
+      ({ action }) =>
+        action.interpretation.type === "fact" &&
+        action.interpretation.factType === "penalty-release-consequence",
+    );
+    expect(foulRelease?.action.interpretation).toMatchObject({
+      type: "fact",
+      factType: "penalty-release-consequence",
+      payload: {
+        data: { releaseCause: "foul-before-score", sourceFactId: "foul-card-controller" },
+      },
+    });
+    const foulCorrection = await foulSubmit(
+      correctionIntent(
+        "correct-foul-release",
+        "correct-foul-release-fact",
+        false,
+        "foul-card-controller-penalty-release",
+      ),
+    );
+    expect(foulCorrection).toMatchObject({
+      status: "accepted",
+      projection: {
+        penalties: {
+          releases: [{ scoreFactId: "foul-commence", releaseCause: "score" }],
+          players: [{ playerNumber: 9 }],
+        },
+      },
+    });
+
+    const reasonHarness = await createHarness();
+    const reasonOpened = await reasonHarness.control.openController({
+      qrCredential: reasonHarness.qrCredential,
+      browserContext: "reason-controller",
+    });
+    if (reasonOpened.status !== "opened") throw new Error("Expected the Controller to open.");
+    const reasonSubmit = (intent: unknown) =>
+      reasonHarness.control.submitControllerIntent({
+        sessionBearer: reasonOpened.session.sessionBearer,
+        eventGameId: reasonHarness.root.eventGameId,
+        intent,
+      });
+    await reasonSubmit(cardIntent());
+    const laterReason = await reasonSubmit(
+      reasonIntent({
+        operationId: "zz-later-reason",
+        factId: "zz-later-reason",
+        reason: "conduct",
+      }),
+    );
+    expect(laterReason).toMatchObject({
+      status: "accepted",
+      projection: { penalties: { cards: [{ factId: "fact-card", reason: "conduct" }] } },
+    });
+  });
+
+  test("strips foul-before-score from ejection cards at the Controller boundary", async () => {
+    const harness = await createHarness();
+    const opened = await harness.control.openController({
+      qrCredential: harness.qrCredential,
+      browserContext: "ejection-foul-boundary",
+    });
+    if (opened.status !== "opened") throw new Error("Expected the Controller to open.");
+    const result = await harness.control.submitControllerIntent({
+      sessionBearer: opened.session.sessionBearer,
+      eventGameId: harness.root.eventGameId,
+      intent: cardIntent({
+        operationId: "ejection-foul-card",
+        factId: "ejection-foul-card",
+        cardType: "ejection",
+        foulBeforeScore: true,
+      }),
+    });
+    expect(result).toMatchObject({
+      status: "accepted",
+      projection: { penalties: { releases: [] } },
+    });
+    const actions = await harness.record.readActions();
+    expect(actions).toHaveLength(1);
+    const interpretation = actions[0]?.action.interpretation;
+    expect(interpretation).toMatchObject({ factType: "card" });
+    if (
+      interpretation?.type !== "fact" ||
+      typeof interpretation.payload !== "object" ||
+      interpretation.payload === null
+    ) {
+      throw new Error("Expected a durable ejection card fact.");
+    }
+    if (Array.isArray(interpretation.payload) || !("data" in interpretation.payload)) {
+      throw new Error("Expected card payload data.");
+    }
+    expect(interpretation.payload.data).not.toHaveProperty("foulBeforeScore");
+  });
+
+  test("accepts a delayed tie choice after natural expiry and anchors it to the score fact", async () => {
+    const harness = await createHarness();
+    const opened = await harness.control.openController({
+      qrCredential: harness.qrCredential,
+      browserContext: "delayed-tie-controller",
+    });
+    if (opened.status !== "opened") throw new Error("Expected the Controller to open.");
+    const submit = (intent: unknown) =>
+      harness.control.submitControllerIntent({
+        sessionBearer: opened.session.sessionBearer,
+        eventGameId: harness.root.eventGameId,
+        intent,
+      });
+
+    await submit(substantiveIntent("delayed-tie-commence", "card"));
+    await submit(cardIntent({ operationId: "delayed-tie-card-7", factId: "delayed-tie-card-7" }));
+    await submit(
+      cardIntent({
+        operationId: "delayed-tie-card-8",
+        factId: "delayed-tie-card-8",
+        playerNumber: 8,
+      }),
+    );
+    await submit(clockCorrectionIntent("delayed-tie-score-clock", 10_000));
+    const score = await submit(
+      goalIntent({
+        operationId: "delayed-tie-score",
+        factId: "delayed-tie-score",
+        gameTimeMs: 10_000,
+      }),
+    );
+    expect(score).toMatchObject({
+      status: "accepted",
+      projection: {
+        penalties: {
+          pendingExpirations: [{ scoreFactId: "delayed-tie-score", requiresOfficialChoice: true }],
+        },
+      },
+    });
+
+    await submit(clockCorrectionIntent("delayed-tie-clock-after-expiry", 90_000));
+    const selected = await submit(
+      releaseIntent(
+        "penalty-expiration:delayed-tie-score",
+        "delayed-tie-score",
+        "side-b:8",
+        90_000,
+      ),
+    );
+    expect(selected).toMatchObject({
+      status: "accepted",
+      projection: {
+        penalties: {
+          releases: [
+            {
+              scoreFactId: "delayed-tie-score",
+              playerKey: "side-b:8",
+              releasedMs: 10_000,
+            },
+          ],
+        },
+      },
+    });
+    const release = (await harness.record.readActions()).find(
+      ({ action }) => action.operationId === "zz-release-side-b:8",
+    );
+    expect(release?.action.interpretation).toMatchObject({
+      type: "fact",
+      factType: "penalty-release",
+      payload: {
+        gameTimeMs: 10_000,
+        data: {
+          pendingId: "penalty-expiration:delayed-tie-score",
+          scoreFactId: "delayed-tie-score",
+        },
+      },
+    });
+    expect(
+      await submit(
+        releaseIntent(
+          "penalty-expiration:delayed-tie-score",
+          "delayed-tie-score",
+          "side-b:8",
+          90_000,
+        ),
+      ),
+    ).toMatchObject({ status: "duplicate-accepted" });
+    expect(
+      await submit({
+        ...releaseIntent(
+          "penalty-expiration:delayed-tie-score",
+          "delayed-tie-score",
+          "side-b:7",
+          90_000,
+        ),
+        operationId: "competing-delayed-release",
+        factId: "competing-delayed-release",
+      }),
+    ).toMatchObject({ status: "rejected" });
+  });
+
+  test("accepts cards before optional fixed reasons, applies score release choice, and rebuilds corrections", async () => {
+    const harness = await createHarness();
+    const opened = await harness.control.openController({
+      qrCredential: harness.qrCredential,
+      browserContext: "penalty-control",
+    });
+    if (opened.status !== "opened") throw new Error("Expected the Controller to open.");
+    const submit = (intent: unknown) =>
+      harness.control.submitControllerIntent({
+        sessionBearer: opened.session.sessionBearer,
+        eventGameId: harness.root.eventGameId,
+        intent,
+      });
+
+    expect(
+      await submit({
+        ...reasonIntent(),
+        operationId: "orphan-reason",
+        factId: "orphan-reason-fact",
+      }),
+    ).toMatchObject({ status: "rejected" });
+    const acceptedCard = await submit(cardIntent());
+    expect(acceptedCard).toMatchObject({
+      status: "accepted",
+      projection: {
+        penalties: {
+          cards: [{ factId: "fact-card", reason: null }],
+          pendingExpirations: [],
+        },
+      },
+    });
+    const reason = await submit(reasonIntent());
+    expect(reason).toMatchObject({
+      status: "accepted",
+      projection: { penalties: { cards: [{ reason: "contact-safety" }] } },
+    });
+
+    const goal = await submit(goalIntent({ gameSideId: "side-a", gameTimeMs: 0 }));
+    expect(goal).toMatchObject({
+      status: "accepted",
+      projection: {
+        penalties: {
+          pendingExpirations: [],
+          players: [],
+          releases: [
+            {
+              id: "fact-goal-penalty-release",
+              scoreFactId: "fact-goal",
+              playerKey: "side-b:7",
+            },
+          ],
+        },
+      },
+    });
+    expect(await submit(goalIntent({ gameSideId: "side-a", gameTimeMs: 0 }))).toMatchObject({
+      status: "duplicate-accepted",
+      projection: { penalties: { releases: [{ id: "fact-goal-penalty-release" }] } },
+    });
+    expect(
+      (await harness.record.readActions()).some(
+        ({ action }) =>
+          action.interpretation.type === "fact" &&
+          action.interpretation.factType === "penalty-release-consequence" &&
+          action.interpretation.factId === "fact-goal-penalty-release",
+      ),
+    ).toBe(true);
+    const correctedRelease = await submit(
+      correctionIntent(
+        "correct-release-consequence",
+        "correction-release-consequence",
+        false,
+        "fact-goal-penalty-release",
+      ),
+    );
+    expect(correctedRelease).toMatchObject({
+      status: "accepted",
+      projection: {
+        scoreByGameSide: { "side-a": 10 },
+        penalties: { players: [{ playerNumber: 7 }], releases: [] },
+      },
+    });
+    const reinstatedRelease = await submit(
+      correctionIntent(
+        "reinstate-release-consequence",
+        "reinstate-release-consequence",
+        true,
+        "fact-goal-penalty-release",
+      ),
+    );
+    expect(reinstatedRelease).toMatchObject({
+      status: "accepted",
+      projection: {
+        scoreByGameSide: { "side-a": 10 },
+        penalties: { releases: [{ id: "fact-goal-penalty-release" }] },
+      },
+    });
+
+    const corrected = await submit(
+      correctionIntent("correct-card", "correction-card", false, "fact-card"),
+    );
+    expect(corrected).toMatchObject({
+      status: "accepted",
+      projection: { penalties: { cards: [], players: [], pendingExpirations: [] } },
+    });
+  });
+
   test("Event authority, storage, and control remain accepted after Ad Hoc pressure", async () => {
     const adHoc = createAdHocGamesService({
       now: () => 1_000,
@@ -4278,6 +4955,431 @@ describe("Live Event Game control", () => {
       }),
     ).toMatchObject({ status: "ok", value: [] });
   });
+  test("keeps a retryable card ahead of its reason while unrelated replay work progresses", async () => {
+    const harness = await createHarness({ failureAfterActionNumber: 1 });
+    const opened = await harness.control.openController({
+      qrCredential: harness.qrCredential,
+      browserContext: "card-reason-causal-replay",
+    });
+    if (opened.status !== "opened") throw new Error("Expected the Controller to open.");
+    const card = cardIntent({
+      operationId: "retryable-card",
+      factId: "retryable-card-fact",
+      cardType: "ejection",
+    });
+    const reason = reasonIntent({
+      operationId: "card-dependent-reason",
+      factId: "card-dependent-reason-fact",
+      targetCardFactId: "retryable-card-fact",
+    });
+    const replayInput = {
+      sessionBearer: opened.session.sessionBearer,
+      eventGameId: harness.root.eventGameId,
+      batchId: "card-reason-causal-batch",
+      replicaGeneration: "card-reason-causal-generation",
+      expectedGrantSessionId: opened.session.grantSessionId,
+      expectedGrantVersion: opened.session.grantVersion,
+      actions: [
+        { eventGameId: harness.root.eventGameId, intent: card, causalPredecessorIds: [] },
+        {
+          eventGameId: harness.root.eventGameId,
+          intent: reason,
+          causalPredecessorIds: ["retryable-card"],
+        },
+        {
+          eventGameId: harness.root.eventGameId,
+          intent: goalIntent({
+            operationId: "unrelated-replay-goal",
+            factId: "unrelated-replay-goal-fact",
+          }),
+          causalPredecessorIds: [],
+        },
+      ],
+    };
+    const first = await harness.control.replayControllerActions(replayInput);
+    expect(
+      Object.fromEntries(first.outcomes.map((outcome) => [outcome.operationId, outcome.status])),
+    ).toEqual({
+      "retryable-card": "retryable",
+      "unrelated-replay-goal": "accepted",
+      "card-dependent-reason": "causally-blocked",
+    });
+
+    harness.failureAfterActionNumber = undefined;
+    const converged = await harness.control.replayControllerActions({
+      ...replayInput,
+      batchId: "card-reason-causal-retry",
+      actions: replayInput.actions.slice(0, 2),
+    });
+    expect(converged.outcomes).toEqual([
+      { operationId: "retryable-card", status: "accepted" },
+      { operationId: "card-dependent-reason", status: "accepted" },
+    ]);
+    expect(converged.projection).toMatchObject({
+      penalties: { cards: [{ factId: "retryable-card-fact", reason: "contact-safety" }] },
+    });
+  });
+
+  test("retains a complete-tie choice behind a retryable score during replay", async () => {
+    const harness = await createHarness();
+    const opened = await harness.control.openController({
+      qrCredential: harness.qrCredential,
+      browserContext: "score-choice-causal-replay",
+    });
+    if (opened.status !== "opened") throw new Error("Expected the Controller to open.");
+    const submit = (intent: unknown) =>
+      harness.control.submitControllerIntent({
+        sessionBearer: opened.session.sessionBearer,
+        eventGameId: harness.root.eventGameId,
+        intent,
+      });
+    await submit(
+      cardIntent({ operationId: "choice-card-7", factId: "choice-card-7", playerNumber: 7 }),
+    );
+    await submit(
+      cardIntent({ operationId: "choice-card-8", factId: "choice-card-8", playerNumber: 8 }),
+    );
+    harness.failureAfterActionNumber = 3;
+    const score = goalIntent({
+      operationId: "choice-score",
+      factId: "choice-score",
+      gameTimeMs: 12_000,
+    });
+    const choice = releaseIntent(
+      "penalty-expiration:choice-score",
+      "choice-score",
+      "side-b:8",
+      12_000,
+    );
+    const replayInput = {
+      sessionBearer: opened.session.sessionBearer,
+      eventGameId: harness.root.eventGameId,
+      batchId: "score-choice-causal-batch",
+      replicaGeneration: "score-choice-causal-generation",
+      expectedGrantSessionId: opened.session.grantSessionId,
+      expectedGrantVersion: opened.session.grantVersion,
+      actions: [
+        { eventGameId: harness.root.eventGameId, intent: score, causalPredecessorIds: [] },
+        {
+          eventGameId: harness.root.eventGameId,
+          intent: choice,
+          causalPredecessorIds: ["choice-score"],
+        },
+      ],
+    };
+    const first = await harness.control.replayControllerActions(replayInput);
+    expect(first.outcomes).toEqual([
+      { operationId: "choice-score", status: "retryable", detail: "retryable server outcome" },
+      { operationId: choice.operationId, status: "causally-blocked" },
+    ]);
+    expect(await harness.record.readActions()).toHaveLength(2);
+
+    harness.failureAfterActionNumber = undefined;
+    const second = await harness.control.replayControllerActions({
+      ...replayInput,
+      batchId: "score-choice-causal-retry",
+    });
+    expect(second.outcomes).toEqual([
+      { operationId: "choice-score", status: "accepted" },
+      { operationId: choice.operationId, status: "accepted" },
+    ]);
+    expect(second.projection).toMatchObject({
+      penalties: { releases: [{ scoreFactId: "choice-score", playerKey: "side-b:8" }] },
+    });
+  });
+
+  test("repairs a missing automatic release consequence after a source-only batch commit", async () => {
+    const harness = await createHarness({ failureAfterActionNumber: 3 });
+    const opened = await harness.control.openController({
+      qrCredential: harness.qrCredential,
+      browserContext: "automatic-release-repair",
+    });
+    if (opened.status !== "opened") throw new Error("Expected the Controller to open.");
+    const submit = (intent: unknown) =>
+      harness.control.submitControllerIntent({
+        sessionBearer: opened.session.sessionBearer,
+        eventGameId: harness.root.eventGameId,
+        intent,
+      });
+    await submit(cardIntent({ operationId: "repair-card", factId: "repair-card" }));
+    const firstGoal = await submit(
+      goalIntent({
+        operationId: "repair-goal",
+        factId: "repair-goal",
+        sportingOrder: 7_000,
+        override: {
+          guardrail: "sporting-order-adjudication",
+          direction: "head-referee-adjudicated-sporting-order",
+          confirmation: "head-referee-confirmed",
+          authorityReference: "head-referee",
+          gameTimeMs: 12_000,
+          beforeValue: { sportingOrder: 12_000 },
+          afterValue: { sportingOrder: 7_000 },
+          reason: "head-referee-direction",
+        },
+      }),
+    );
+    expect(firstGoal).toMatchObject({ status: "retryable", operationId: "repair-goal" });
+    expect(await harness.record.readActions()).toHaveLength(2);
+
+    harness.failureAfterActionNumber = undefined;
+    const repaired = await submit(
+      goalIntent({
+        operationId: "repair-goal",
+        factId: "repair-goal",
+        sportingOrder: 7_000,
+        override: {
+          guardrail: "sporting-order-adjudication",
+          direction: "head-referee-adjudicated-sporting-order",
+          confirmation: "head-referee-confirmed",
+          authorityReference: "head-referee",
+          gameTimeMs: 12_000,
+          beforeValue: { sportingOrder: 12_000 },
+          afterValue: { sportingOrder: 7_000 },
+          reason: "head-referee-direction",
+        },
+      }),
+    );
+    expect(repaired).toMatchObject({
+      status: "duplicate-accepted",
+      projection: { penalties: { releases: [{ releaseCause: "score" }] } },
+    });
+    expect(await harness.record.readActions()).toHaveLength(3);
+    const releaseConsequences = (await harness.record.readActions()).filter(
+      ({ action }) =>
+        action.interpretation.type === "fact" &&
+        action.interpretation.factType === "penalty-release-consequence",
+    );
+    expect(releaseConsequences).toHaveLength(1);
+    expect(releaseConsequences[0]?.action.causalPredecessorIds).toContain("repair-goal");
+    expect(releaseConsequences[0]?.action.interpretation).toMatchObject({
+      payload: { data: { sportingOrder: 7_000 } },
+    });
+    expect(
+      (await harness.record.readActions()).find(
+        ({ action }) => action.operationId === "repair-goal",
+      )?.action.interpretation,
+    ).toMatchObject({ payload: { data: { sportingOrder: 7_000 } } });
+
+    const duplicate = await submit(
+      goalIntent({
+        operationId: "repair-goal",
+        factId: "repair-goal",
+        sportingOrder: 7_000,
+        override: {
+          guardrail: "sporting-order-adjudication",
+          direction: "head-referee-adjudicated-sporting-order",
+          confirmation: "head-referee-confirmed",
+          authorityReference: "head-referee",
+          gameTimeMs: 12_000,
+          beforeValue: { sportingOrder: 12_000 },
+          afterValue: { sportingOrder: 7_000 },
+          reason: "head-referee-direction",
+        },
+      }),
+    );
+    expect(duplicate).toMatchObject({ status: "duplicate-accepted" });
+    expect(await harness.record.readActions()).toHaveLength(3);
+  });
+
+  test("keeps direct and repaired release consequences on the source sporting order", async () => {
+    const harness = await createHarness();
+    const opened = await harness.control.openController({
+      qrCredential: harness.qrCredential,
+      browserContext: "direct-sporting-order-release",
+    });
+    if (opened.status !== "opened") throw new Error("Expected the Controller to open.");
+    const submit = (intent: unknown) =>
+      harness.control.submitControllerIntent({
+        sessionBearer: opened.session.sessionBearer,
+        eventGameId: harness.root.eventGameId,
+        intent,
+      });
+    await submit(cardIntent({ operationId: "direct-order-card", factId: "direct-order-card" }));
+    await submit(
+      goalIntent({
+        operationId: "direct-order-goal",
+        factId: "direct-order-goal",
+        sportingOrder: 7_000,
+        override: {
+          guardrail: "sporting-order-adjudication",
+          direction: "head-referee-adjudicated-sporting-order",
+          confirmation: "head-referee-confirmed",
+          authorityReference: "head-referee",
+          gameTimeMs: 12_000,
+          beforeValue: { sportingOrder: 12_000 },
+          afterValue: { sportingOrder: 7_000 },
+          reason: "head-referee-direction",
+        },
+      }),
+    );
+    const consequence = (await harness.record.readActions()).find(
+      ({ action }) =>
+        action.interpretation.type === "fact" &&
+        action.interpretation.factType === "penalty-release-consequence",
+    );
+    expect(consequence?.action.interpretation).toMatchObject({
+      payload: { data: { sourceFactId: "direct-order-goal", sportingOrder: 7_000 } },
+    });
+  });
+
+  test("materializes an automatic consequence when a late card precedes an accepted score", async () => {
+    const harness = await createHarness();
+    const opened = await harness.control.openController({
+      qrCredential: harness.qrCredential,
+      browserContext: "late-card-consequence",
+    });
+    if (opened.status !== "opened") throw new Error("Expected the Controller to open.");
+    const submit = (intent: unknown) =>
+      harness.control.submitControllerIntent({
+        sessionBearer: opened.session.sessionBearer,
+        eventGameId: harness.root.eventGameId,
+        intent,
+      });
+    expect(
+      await submit(
+        goalIntent({
+          operationId: "late-card-score",
+          factId: "late-card-score",
+          gameTimeMs: 10_000,
+          sportingOrder: 7_000,
+          override: {
+            guardrail: "sporting-order-adjudication",
+            direction: "head-referee-adjudicated-sporting-order",
+            confirmation: "head-referee-confirmed",
+            authorityReference: "head-referee",
+            gameTimeMs: 10_000,
+            beforeValue: { sportingOrder: 10_000 },
+            afterValue: { sportingOrder: 7_000 },
+            reason: "head-referee-direction",
+          },
+        }),
+      ),
+    ).toMatchObject({ status: "accepted" });
+    expect(
+      await submit({
+        ...cardIntent({
+          operationId: "late-card",
+          factId: "late-card",
+          gameTimeMs: 0,
+        }),
+        occurrence: { clientOriginAtMs: 0, source: "offline" as const },
+      }),
+    ).toMatchObject({
+      status: "accepted",
+      projection: {
+        penalties: {
+          players: [{ playerNumber: 7 }],
+          releases: [{ sourceFactId: "late-card-score" }],
+        },
+      },
+    });
+    const consequence = (await harness.record.readActions()).find(
+      ({ action }) =>
+        action.interpretation.type === "fact" &&
+        action.interpretation.factType === "penalty-release-consequence",
+    );
+    expect(consequence?.action.interpretation).toMatchObject({
+      payload: { data: { sourceFactId: "late-card-score", sportingOrder: 7_000 } },
+    });
+    expect(consequence?.action.causalPredecessorIds).toEqual(
+      expect.arrayContaining(["late-card-score", "late-card"]),
+    );
+  });
+
+  test("preserves offline sporting time while delayed replay records current acceptance evidence", async () => {
+    const harness = await createHarness();
+    const opened = await harness.control.openController({
+      qrCredential: harness.qrCredential,
+      browserContext: "delayed-offline-device",
+    });
+    if (opened.status !== "opened") throw new Error("Expected the Controller to open.");
+    const serverClock = await harness.control.submitControllerIntent({
+      sessionBearer: opened.session.sessionBearer,
+      eventGameId: harness.root.eventGameId,
+      intent: {
+        ...clockCorrectionIntent("delayed-server-clock", 60_000),
+        occurrence: { clientOriginAtMs: 60_000, source: "online" as const },
+      },
+    });
+    expect(serverClock).toMatchObject({ status: "accepted" });
+    const offlineCard = {
+      ...cardIntent({
+        operationId: "delayed-offline-card",
+        factId: "delayed-offline-card",
+        gameTimeMs: 0,
+      }),
+      occurrence: { clientOriginAtMs: 1_000, source: "offline" as const },
+    };
+    const offlineGoal = {
+      ...goalIntent({
+        operationId: "delayed-offline-goal",
+        factId: "delayed-offline-goal",
+        gameTimeMs: 15_000,
+      }),
+      occurrence: { clientOriginAtMs: 2_000, source: "offline" as const },
+    };
+    const replay = await harness.control.replayControllerActions({
+      sessionBearer: opened.session.sessionBearer,
+      eventGameId: harness.root.eventGameId,
+      batchId: "delayed-offline-batch",
+      replicaGeneration: "delayed-offline-generation",
+      expectedGrantSessionId: opened.session.grantSessionId,
+      expectedGrantVersion: opened.session.grantVersion,
+      actions: [
+        { eventGameId: harness.root.eventGameId, intent: offlineCard, causalPredecessorIds: [] },
+        {
+          eventGameId: harness.root.eventGameId,
+          intent: offlineGoal,
+          causalPredecessorIds: ["delayed-offline-card"],
+        },
+      ],
+    });
+    expect(replay.outcomes).toEqual([
+      { operationId: "delayed-offline-card", status: "accepted" },
+      { operationId: "delayed-offline-goal", status: "accepted" },
+    ]);
+    const stored = await harness.record.readActions();
+    expect(
+      stored
+        .filter(({ action }) =>
+          ["delayed-offline-card", "delayed-offline-goal"].includes(action.operationId),
+        )
+        .map(({ action }) => {
+          const payload =
+            action.interpretation.type === "fact" ? action.interpretation.payload : null;
+          const gameTimeMs =
+            payload !== null &&
+            typeof payload === "object" &&
+            !Array.isArray(payload) &&
+            "gameTimeMs" in payload
+              ? payload.gameTimeMs
+              : null;
+          return {
+            operationId: action.operationId,
+            gameTimeMs,
+            source: action.occurrence.source,
+            trustedAtMs: action.occurrence.trustedAtMs,
+          };
+        }),
+    ).toEqual([
+      {
+        operationId: "delayed-offline-card",
+        gameTimeMs: 0,
+        source: "offline",
+        trustedAtMs: 10_000,
+      },
+      {
+        operationId: "delayed-offline-goal",
+        gameTimeMs: 15_000,
+        source: "offline",
+        trustedAtMs: 10_000,
+      },
+    ]);
+    expect(
+      stored.some(({ action }) => action.operationId === "delayed-offline-goal-penalty-release"),
+    ).toBe(true);
+  });
 });
 
 async function createHarness(
@@ -4286,6 +5388,7 @@ async function createHarness(
     grantEventGameId?: string;
     grantExpiresAtMs?: number | null;
     failureBoundary?: "after-action" | "after-lifecycle";
+    failureAfterActionNumber?: number;
     projectionFailure?: () => boolean;
     scopeStatus?: "empty" | "conflict";
     controlClock?: () => number;
@@ -4320,6 +5423,8 @@ async function createHarness(
   };
 
   let failureBoundary = overrides.failureBoundary;
+  let failureAfterActionNumber = overrides.failureAfterActionNumber;
+  let afterActionCount = 0;
   const record = createEventGameRecord(storage, {
     externalScopeResolver: createScopeResolver(root),
     interpreter: createLiveEventGameIqaInterpreter(),
@@ -4344,7 +5449,12 @@ async function createHarness(
     clock: () => grantOptions.clock.nowMs(),
     interpreter: createLiveEventGameIqaInterpreter(),
     failureInjector: (boundary) => {
-      if (boundary === failureBoundary) throw new Error("simulated durable failure");
+      if (boundary === "after-action") afterActionCount += 1;
+      if (
+        boundary === failureBoundary ||
+        (boundary === "after-action" && afterActionCount === failureAfterActionNumber)
+      )
+        throw new Error("simulated durable failure");
     },
     validateActionInTransaction: ({ transaction, root, action }) =>
       validateLiveEventGameActionInTransaction(
@@ -4388,6 +5498,9 @@ async function createHarness(
     set failureBoundary(value: typeof failureBoundary) {
       failureBoundary = value;
     },
+    set failureAfterActionNumber(value: number | undefined) {
+      failureAfterActionNumber = value;
+    },
     setNow(value: number) {
       grantOptions.setNow(value);
     },
@@ -4409,6 +5522,8 @@ function goalIntent(
     operationId?: string;
     factId?: string;
     gameTimeMs?: number;
+    sportingOrder?: number;
+    override?: Record<string, unknown>;
   } = {},
 ) {
   return {
@@ -4418,6 +5533,76 @@ function goalIntent(
     factId: overrides.factId ?? "fact-goal",
     gameSideId: overrides.gameSideId ?? "side-a",
     gameTimeMs: overrides.gameTimeMs ?? 12_000,
+    ...(overrides.sportingOrder === undefined ? {} : { sportingOrder: overrides.sportingOrder }),
+    ...(overrides.override === undefined ? {} : { override: overrides.override }),
+    occurrence: { clientOriginAtMs: 10_000 },
+  };
+}
+
+function cardIntent(
+  overrides: {
+    operationId?: string;
+    factId?: string;
+    gameSideId?: string;
+    playerNumber?: number | null;
+    cardType?: "blue" | "yellow" | "red" | "ejection";
+    foulBeforeScore?: boolean;
+    seekerPenalty?: "head-referee-confirmed";
+    gameTimeMs?: number;
+  } = {},
+) {
+  return {
+    version: LIVE_EVENT_CONTROL_INTENT_VERSION,
+    type: "record-card" as const,
+    operationId: overrides.operationId ?? "operation-card",
+    factId: overrides.factId ?? "fact-card",
+    gameSideId: overrides.gameSideId ?? "side-b",
+    playerNumber: overrides.playerNumber ?? 7,
+    cardType: overrides.cardType ?? ("blue" as const),
+    ...(overrides.foulBeforeScore === undefined
+      ? {}
+      : { foulBeforeScore: overrides.foulBeforeScore }),
+    ...(overrides.seekerPenalty === undefined ? {} : { seekerPenalty: overrides.seekerPenalty }),
+    gameTimeMs: overrides.gameTimeMs ?? 0,
+    occurrence: { clientOriginAtMs: 10_000 },
+  };
+}
+
+function reasonIntent(
+  overrides: {
+    operationId?: string;
+    factId?: string;
+    targetCardFactId?: string;
+    reason?:
+      | "contact-safety"
+      | "ball-interaction"
+      | "position-boundary"
+      | "procedure-substitution"
+      | "conduct";
+  } = {},
+) {
+  return {
+    version: LIVE_EVENT_CONTROL_INTENT_VERSION,
+    type: "record-penalty-reason" as const,
+    operationId: overrides.operationId ?? "operation-reason",
+    factId: overrides.factId ?? "fact-reason",
+    targetCardFactId: overrides.targetCardFactId ?? "fact-card",
+    reason: overrides.reason ?? ("contact-safety" as const),
+    gameTimeMs: 0,
+    occurrence: { clientOriginAtMs: 10_000 },
+  };
+}
+
+function releaseIntent(pendingId: string, scoreFactId: string, playerKey: string, gameTimeMs = 0) {
+  return {
+    version: LIVE_EVENT_CONTROL_INTENT_VERSION,
+    type: "resolve-penalty-expiration" as const,
+    operationId: `zz-release-${playerKey}`,
+    factId: `zz-release-${playerKey}`,
+    pendingId,
+    scoreFactId,
+    playerKey,
+    gameTimeMs,
     occurrence: { clientOriginAtMs: 10_000 },
   };
 }
@@ -4507,13 +5692,13 @@ function correctionIntent(
   };
 }
 
-function clockCorrectionIntent(operationId: string) {
+function clockCorrectionIntent(operationId: string, clockTimeMs = 1_000) {
   return {
     version: LIVE_EVENT_CONTROL_INTENT_VERSION,
     type: "clock-correction" as const,
     operationId,
     factId: `fact-${operationId}`,
-    clockTimeMs: 1_000,
+    clockTimeMs,
     gameTimeMs: 0,
     occurrence: { clientOriginAtMs: null },
   };

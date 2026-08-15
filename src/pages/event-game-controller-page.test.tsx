@@ -10,6 +10,7 @@ import {
 } from "@/lib/controller-reconnect";
 import type { ControllerProjection } from "@/lib/live-event-game-control";
 import { createInitialClockBaseline, projectClockBaseline } from "@/lib/clock-authority";
+import { deriveLivePenaltyProjection } from "@/lib/live-event-penalties";
 
 describe("Event Game Controller reconnect browser seam", () => {
   const originalWindow = globalThis.window;
@@ -18,6 +19,7 @@ describe("Event Game Controller reconnect browser seam", () => {
   const originalSessionStorage = globalThis.sessionStorage;
   const originalLocalStorage = globalThis.localStorage;
   const originalFetch = globalThis.fetch;
+  const originalPerformance = globalThis.performance;
   const originalActEnvironment = (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean })
     .IS_REACT_ACT_ENVIRONMENT;
   let testWindow: Window;
@@ -32,12 +34,14 @@ describe("Event Game Controller reconnect browser seam", () => {
   let openGrantSessionId: string;
   let openGrantVersion: string;
   let openBearer: string;
-  let openProjection: ControllerProjection;
+  let openProjection: ControllerProjection | null;
   let refreshProjection: ControllerProjection | null;
   let refreshRejected: boolean;
   let switchRequested: boolean;
   let deferredReplay: ((response: Response) => void) | null;
   let deferredReplayResponse: Response | null;
+  let replayProjection: ControllerProjection | null;
+  let monotonicNow: number;
 
   beforeEach(() => {
     replayMode = "lost";
@@ -55,6 +59,8 @@ describe("Event Game Controller reconnect browser seam", () => {
     switchRequested = false;
     deferredReplay = null;
     deferredReplayResponse = null;
+    replayProjection = null;
+    monotonicNow = 0;
     testWindow = new Window({ url: "http://timer.quadball.app/event-control" });
     Object.assign(globalThis, {
       window: testWindow,
@@ -76,7 +82,7 @@ describe("Event Game Controller reconnect browser seam", () => {
                 grantSessionId: openGrantSessionId,
                 grantVersion: openGrantVersion,
               },
-              projection: openProjection,
+              projection: openProjection ?? projection(),
               projectionStatus: "available",
             }),
             { status: 200, headers: { "content-type": "application/json" } },
@@ -110,7 +116,10 @@ describe("Event Game Controller reconnect browser seam", () => {
                 operationId: action.intent.operationId,
                 status: replayMode === "retryable" ? "retryable" : "accepted",
               })),
-              projection: replayMode === "retryable" ? openProjection : projection(),
+              projection:
+                replayMode === "retryable"
+                  ? (openProjection ?? projection())
+                  : (replayProjection ?? projection()),
             }),
             { status: 200, headers: { "content-type": "application/json" } },
           );
@@ -191,6 +200,16 @@ describe("Event Game Controller reconnect browser seam", () => {
         return new Response("Not found", { status: 404 });
       },
     });
+    Object.defineProperty(globalThis, "performance", {
+      configurable: true,
+      value: new Proxy(originalPerformance, {
+        get(target, property) {
+          if (property === "now") return () => monotonicNow;
+          const value = Reflect.get(target, property, target);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      }),
+    });
     (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
     container = document.createElement("div");
     document.body.appendChild(container);
@@ -248,6 +267,10 @@ describe("Event Game Controller reconnect browser seam", () => {
       sessionStorage: originalSessionStorage,
       localStorage: originalLocalStorage,
       fetch: originalFetch,
+    });
+    Object.defineProperty(globalThis, "performance", {
+      configurable: true,
+      value: originalPerformance,
     });
     (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT =
       originalActEnvironment;
@@ -356,6 +379,372 @@ describe("Event Game Controller reconnect browser seam", () => {
     ]);
     expect(qrInput.value).toBe("");
     expect(codeInput.value).toBe("");
+  });
+
+  test("uses the injected live Clock for a goal tap and penalty countdown through seeker release", async () => {
+    const gameTimeBeforeRelease = 20 * 60 * 1000 - 1_000;
+    const gameFacts: ControllerProjection["gameFacts"] = [
+      {
+        factId: "seeker-card-ui",
+        factType: "card",
+        gameSideId: "side-b",
+        gameTimeMs: gameTimeBeforeRelease,
+        sportingOrder: gameTimeBeforeRelease,
+        synchronizationOrder: 1,
+        effective: true,
+        data: {
+          cardType: "blue",
+          playerNumber: 7,
+          penaltyStart: "seeker-release",
+          foulBeforeScore: false,
+        },
+      },
+    ];
+    openProjection = projection("game-browser", {
+      gameTimeMs: gameTimeBeforeRelease,
+      running: true,
+      gameFacts,
+    });
+    Object.defineProperty(testWindow.navigator, "onLine", { configurable: true, value: true });
+    await enterAndOpen();
+    expect(container.textContent).toContain("19:59");
+
+    monotonicNow = 1_000;
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 300));
+    });
+    expect(container.textContent).toContain("SEEKER RELEASED at 20:00");
+
+    const goalButton = Array.from(container.getElementsByTagName("button")).find((button) =>
+      button.textContent?.includes("Record 10-point goal"),
+    );
+    await act(async () => {
+      goalButton?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const sentIntent =
+      intentBodies.at(-1)?.intent ??
+      replayBodies.flatMap((body) => body.actions ?? []).at(-1)?.intent;
+    expect(sentIntent).toMatchObject({
+      type: "record-goal",
+      gameTimeMs: 20 * 60 * 1000,
+    });
+  });
+
+  test("marks only a Head Referee-confirmed seeker card for the 20:00 floor", async () => {
+    const seekerFloorTime = 19 * 60 * 1000 + 30_000;
+    openProjection = projection("game-browser", {
+      gameTimeMs: seekerFloorTime,
+      gameFacts: [],
+      commenced: true,
+    });
+    replayMode = "lost";
+    await enterAndOpen();
+    Object.defineProperty(testWindow.navigator, "onLine", { configurable: true, value: false });
+    const sideSelect = container.querySelector("select#penalty-game-side") as HTMLSelectElement;
+    await act(async () => {
+      sideSelect.value = "side-b";
+      sideSelect.dispatchEvent(
+        new testWindow.Event("change", { bubbles: true }) as unknown as Event,
+      );
+      await Promise.resolve();
+    });
+    const acceptCard = () =>
+      Array.from(container.getElementsByTagName("button")).find((button) =>
+        button.textContent?.includes("Accept card"),
+      );
+    await act(async () => {
+      acceptCard()?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const seekerLabel = Array.from(container.getElementsByTagName("label")).find((label) =>
+      label.textContent?.includes("Penalized player is the seeker"),
+    );
+    const seekerCheckbox = seekerLabel?.querySelector("input") as HTMLInputElement;
+    await act(async () => {
+      seekerCheckbox.click();
+      await Promise.resolve();
+    });
+    await act(async () => {
+      acceptCard()?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const retained = JSON.parse(
+      testWindow.localStorage.getItem(controllerReplicaStorageKey("game-browser")) ?? "null",
+    ) as {
+      pendingActions: { intent: any }[];
+      projection: ControllerProjection;
+    };
+    const cards = retained.pendingActions.filter((action) => action.intent.type === "record-card");
+    expect(cards).toHaveLength(2);
+    expect(cards[0]?.intent.seekerPenalty).toBeUndefined();
+    expect(cards[1]?.intent.seekerPenalty).toBe("head-referee-confirmed");
+    expect(retained.projection.penalties?.cards).toMatchObject([
+      { penaltyStart: "immediate" },
+      { penaltyStart: "seeker-release" },
+    ]);
+  });
+
+  test("disables foul-before-score for ejection cards and omits it from offline intent", async () => {
+    replayMode = "lost";
+    await enterAndOpen();
+    Object.defineProperty(testWindow.navigator, "onLine", { configurable: true, value: false });
+    const sideSelect = container.querySelector("select#penalty-game-side") as HTMLSelectElement;
+    const cardTypeSelect = container.querySelector("select#penalty-card-type") as HTMLSelectElement;
+    await act(async () => {
+      sideSelect.value = "side-b";
+      sideSelect.dispatchEvent(
+        new testWindow.Event("change", { bubbles: true }) as unknown as Event,
+      );
+      cardTypeSelect.value = "ejection";
+      cardTypeSelect.dispatchEvent(
+        new testWindow.Event("change", { bubbles: true }) as unknown as Event,
+      );
+      await Promise.resolve();
+    });
+    const foulCheckbox = container.querySelector('input[type="checkbox"]') as HTMLInputElement;
+    expect(foulCheckbox.disabled).toBe(true);
+    const acceptCard = Array.from(container.getElementsByTagName("button")).find((button) =>
+      button.textContent?.includes("Accept card"),
+    );
+    await act(async () => {
+      acceptCard?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const retained = JSON.parse(
+      testWindow.localStorage.getItem(controllerReplicaStorageKey("game-browser")) ?? "null",
+    ) as { pendingActions: { intent: any }[] };
+    const card = retained.pendingActions.find((action) => action.intent.type === "record-card");
+    expect(card?.intent.cardType).toBe("ejection");
+    expect(card?.intent).not.toHaveProperty("foulBeforeScore");
+  });
+
+  test("projects offline card and reason taps, then converges after reconnect", async () => {
+    replayMode = "lost";
+    await enterAndOpen();
+    Object.defineProperty(testWindow.navigator, "onLine", { configurable: true, value: false });
+
+    const sideSelect = container.querySelector("select#penalty-game-side") as HTMLSelectElement;
+    const playerInput = container.querySelector("input#penalty-player-number") as HTMLInputElement;
+    await act(async () => {
+      sideSelect.value = "side-b";
+      sideSelect.dispatchEvent(
+        new testWindow.Event("change", { bubbles: true }) as unknown as Event,
+      );
+      playerInput.value = "7";
+      playerInput.dispatchEvent(
+        new testWindow.Event("input", { bubbles: true }) as unknown as Event,
+      );
+      playerInput.dispatchEvent(
+        new testWindow.Event("change", { bubbles: true }) as unknown as Event,
+      );
+      await Promise.resolve();
+    });
+    await act(async () => {
+      Array.from(container.getElementsByTagName("button"))
+        .find((button) => button.textContent?.includes("Accept card"))
+        ?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(container.textContent).toContain("Game Side side-b · Player unknown");
+
+    await act(async () => {
+      Array.from(container.getElementsByTagName("button"))
+        .find((button) => button.textContent?.includes("Skip"))
+        ?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(container.textContent).toContain("reason skipped; add later");
+    const afterSkip = JSON.parse(
+      testWindow.localStorage.getItem(controllerReplicaStorageKey("game-browser")) ?? "null",
+    ) as { pendingActions: { intent: any }[]; projection: ControllerProjection };
+    expect(afterSkip.pendingActions).toHaveLength(1);
+    expect(afterSkip.projection.gameFacts?.some((fact) => fact.factType.includes("absence"))).toBe(
+      false,
+    );
+
+    await act(async () => {
+      Array.from(container.getElementsByTagName("button"))
+        .find((button) => button.textContent?.includes("Contact/Safety"))
+        ?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(container.textContent).toContain("reason: contact-safety");
+    const retained = JSON.parse(
+      testWindow.localStorage.getItem(controllerReplicaStorageKey("game-browser")) ?? "null",
+    ) as { pendingActions: { intent: any; causalPredecessorIds: string[] }[] };
+    expect(retained.pendingActions).toHaveLength(2);
+    const cardIntent = retained.pendingActions.find(
+      (action) => action.intent.type === "record-card",
+    )?.intent;
+    const reasonIntent = retained.pendingActions.find(
+      (action) => action.intent.type === "record-penalty-reason",
+    );
+    if (cardIntent === undefined || reasonIntent === undefined) {
+      throw new Error("Expected retained card and Penalty Reason actions.");
+    }
+    expect(reasonIntent?.causalPredecessorIds).toEqual([cardIntent.operationId]);
+    replayProjection = projection("game-browser", {
+      gameFacts: [
+        {
+          factId: cardIntent.factId,
+          factType: "card",
+          gameSideId: "side-b",
+          gameTimeMs: 0,
+          sportingOrder: 0,
+          synchronizationOrder: 1,
+          effective: true,
+          data: {
+            cardType: "blue",
+            playerNumber: 7,
+            penaltyStart: "sticks-up",
+            foulBeforeScore: false,
+          },
+        },
+        {
+          factId: reasonIntent.intent.factId,
+          factType: "penalty-reason",
+          gameSideId: null,
+          gameTimeMs: 0,
+          sportingOrder: 0,
+          synchronizationOrder: 2,
+          effective: true,
+          data: { targetCardFactId: cardIntent.factId, reason: "contact-safety" },
+        },
+      ],
+    });
+    replayMode = "success";
+    Object.defineProperty(testWindow.navigator, "onLine", { configurable: true, value: true });
+    await act(async () => {
+      document.dispatchEvent(new testWindow.Event("visibilitychange") as unknown as Event);
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const after = JSON.parse(
+      testWindow.localStorage.getItem(controllerReplicaStorageKey("game-browser")) ?? "null",
+    ) as { pendingActions: unknown[] };
+    expect(after.pendingActions).toHaveLength(0);
+    const replayedTypes = replayBodies
+      .flatMap((body) => body.actions ?? [])
+      .map((action) => action.intent.type);
+    expect(replayedTypes).toContain("record-card");
+    expect(replayedTypes).toContain("record-penalty-reason");
+    expect(container.textContent).toContain("reason: contact-safety");
+  });
+
+  test("projects an offline complete-tie choice and converges its release fact", async () => {
+    const gameFacts: ControllerProjection["gameFacts"] = [
+      {
+        factId: "tie-card-7",
+        factType: "card",
+        gameSideId: "side-b",
+        gameTimeMs: 0,
+        sportingOrder: 0,
+        synchronizationOrder: 1,
+        effective: true,
+        data: { cardType: "blue", playerNumber: 7, penaltyStart: "immediate" },
+      },
+      {
+        factId: "tie-card-8",
+        factType: "card",
+        gameSideId: "side-b",
+        gameTimeMs: 0,
+        sportingOrder: 0,
+        synchronizationOrder: 2,
+        effective: true,
+        data: { cardType: "blue", playerNumber: 8, penaltyStart: "immediate" },
+      },
+    ];
+    openProjection = projection("game-browser", { gameFacts, gameTimeMs: 0 });
+    replayMode = "lost";
+    await enterAndOpen();
+    Object.defineProperty(testWindow.navigator, "onLine", { configurable: true, value: false });
+    const goalButton = Array.from(container.getElementsByTagName("button")).find((button) =>
+      button.textContent?.includes("Record 10-point goal"),
+    );
+    await act(async () => {
+      goalButton?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(container.textContent).toContain("Complete tie requires official choice.");
+    await act(async () => {
+      Array.from(container.getElementsByTagName("button"))
+        .find((button) => button.textContent?.includes("Player #8"))
+        ?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(container.textContent).not.toContain("Complete tie requires official choice.");
+    const retained = JSON.parse(
+      testWindow.localStorage.getItem(controllerReplicaStorageKey("game-browser")) ?? "null",
+    ) as { pendingActions: { intent: any; causalPredecessorIds: string[] }[] };
+    expect(retained.pendingActions).toHaveLength(2);
+    const scoreAction = retained.pendingActions.find(
+      (action) => action.intent.type === "record-goal",
+    );
+    const choiceAction = retained.pendingActions.find(
+      (action) => action.intent.type === "resolve-penalty-expiration",
+    );
+    if (scoreAction === undefined || choiceAction === undefined) {
+      throw new Error("Expected retained score and complete-tie choice actions.");
+    }
+    expect(choiceAction.causalPredecessorIds).toEqual([scoreAction.intent.operationId]);
+    expect(choiceAction.intent.scoreFactId).toBe(scoreAction.intent.factId);
+    replayProjection = projection("game-browser", {
+      gameFacts: [
+        ...gameFacts,
+        {
+          factId: scoreAction.intent.factId,
+          factType: "goal",
+          gameSideId: "side-a",
+          gameTimeMs: scoreAction.intent.gameTimeMs,
+          sportingOrder: scoreAction.intent.gameTimeMs,
+          synchronizationOrder: 3,
+          effective: true,
+          data: { points: 10 },
+        },
+        {
+          factId: choiceAction.intent.factId,
+          factType: "penalty-release",
+          gameSideId: null,
+          gameTimeMs: 0,
+          sportingOrder: 0,
+          synchronizationOrder: 4,
+          effective: true,
+          data: {
+            pendingId: choiceAction.intent.pendingId,
+            scoreFactId: scoreAction.intent.factId,
+            playerKey: "side-b:8",
+          },
+        },
+      ],
+    });
+    replayMode = "success";
+    Object.defineProperty(testWindow.navigator, "onLine", { configurable: true, value: true });
+    await act(async () => {
+      document.dispatchEvent(new testWindow.Event("visibilitychange") as unknown as Event);
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const after = JSON.parse(
+      testWindow.localStorage.getItem(controllerReplicaStorageKey("game-browser")) ?? "null",
+    ) as { pendingActions: unknown[] };
+    expect(after.pendingActions).toHaveLength(0);
+    expect(replayBodies.at(-1)?.actions[0]?.intent).toMatchObject({
+      type: "resolve-penalty-expiration",
+      scoreFactId: scoreAction.intent.factId,
+    });
   });
 
   test("renders stable fact identity and sends a contextual Correction from the browser seam", async () => {
@@ -1162,18 +1551,32 @@ describe("Event Game Controller reconnect browser seam", () => {
   });
 });
 
-function projection(eventGameId = "game-browser"): ControllerProjection {
+function projection(
+  eventGameId = "game-browser",
+  options: {
+    gameTimeMs?: number;
+    running?: boolean;
+    gameFacts?: ControllerProjection["gameFacts"];
+    commenced?: boolean;
+  } = {},
+): ControllerProjection {
   const baseline = createInitialClockBaseline();
   baseline.holderGrantSessionId = "session";
   baseline.holderGeneration = 1;
   baseline.authorityGeneration = 1;
-  baseline.gameTimeMs = 12_000;
+  baseline.gameTimeMs = options.gameTimeMs ?? 0;
+  baseline.running = options.running ?? false;
+  baseline.runningSinceMs = baseline.running ? 0 : null;
+  const defaultProjection = Object.keys(options).length === 0;
+  if (defaultProjection) baseline.gameTimeMs = 12_000;
   return {
     eventGameId,
-    phase: "in-progress",
-    scoreByGameSide: { "side-a": 10, "side-b": 0 },
-    goalCount: 1,
-    gameFacts: [
+    phase: defaultProjection || options.commenced !== false ? "in-progress" : "scheduled",
+    scoreByGameSide: defaultProjection
+      ? { "side-a": 10, "side-b": 0 }
+      : { "side-a": 0, "side-b": 0 },
+    goalCount: defaultProjection ? 1 : 0,
+    gameFacts: options.gameFacts ?? [
       {
         factId: "fact-goal",
         factType: "goal",
@@ -1185,10 +1588,11 @@ function projection(eventGameId = "game-browser"): ControllerProjection {
         data: { points: 10 },
       },
     ],
+    penalties: deriveLivePenaltyProjection(options.gameFacts ?? [], baseline.gameTimeMs),
     clock: projectClockBaseline(baseline, 0),
     commencement: {
-      status: "commenced",
-      commencedAtMs: 10_000,
+      status: defaultProjection || options.commenced === true ? "commenced" : "provisional",
+      commencedAtMs: defaultProjection ? 10_000 : options.commenced === true ? 0 : null,
       provisionalRunningSinceMs: null,
       provisionalElapsedMs: 0,
     },

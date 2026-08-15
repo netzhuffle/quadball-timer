@@ -51,6 +51,33 @@ export function controllerIntentRetryKey(intent: LiveEventControllerIntent): str
         intent.sportingOrder ?? null,
         intent.override ?? null,
       ]);
+    case "record-card":
+      return JSON.stringify([
+        intent.type,
+        intent.gameSideId,
+        intent.playerNumber,
+        intent.cardType,
+        intent.foulBeforeScore ?? false,
+        intent.seekerPenalty ?? null,
+        intent.gameTimeMs,
+        intent.sportingOrder ?? null,
+        intent.override ?? null,
+      ]);
+    case "record-penalty-reason":
+      return JSON.stringify([
+        intent.type,
+        intent.targetCardFactId,
+        intent.reason,
+        intent.gameTimeMs,
+      ]);
+    case "resolve-penalty-expiration":
+      return JSON.stringify([
+        intent.type,
+        intent.pendingId,
+        intent.scoreFactId,
+        intent.playerKey,
+        intent.gameTimeMs,
+      ]);
     case "correct-fact":
       return JSON.stringify([
         intent.type,

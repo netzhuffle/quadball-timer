@@ -147,6 +147,50 @@ describe("Controller reconnect replica", () => {
     expect(undoState.projection.phase).toBe("scheduled");
   });
 
+  test("materializes passive commencement before classifying an offline card", () => {
+    let state = dispatchControllerClockAction(createReplica(), clock("start-clock", true), {
+      nowMs: 100,
+    }).state;
+    state = dispatchControllerAction(state, card("card-after-passive-boundary"), {
+      nowMs: 10_200,
+    }).state;
+    expect(state.projection.commencement).toMatchObject({
+      status: "commenced",
+      commencedAtMs: 10_100,
+    });
+    expect(state.projection.gameFacts?.at(-1)?.data).toMatchObject({
+      penaltyStart: "immediate",
+    });
+  });
+
+  test("anchors an optimistic delayed tie choice to its score fact", () => {
+    let state = dispatchControllerAction(createReplica(), goal("tie-score", "tie-score-fact"), {
+      nowMs: 100,
+    }).state;
+    state = dispatchControllerAction(
+      state,
+      {
+        version: LIVE_EVENT_CONTROL_INTENT_VERSION,
+        type: "resolve-penalty-expiration",
+        operationId: "delayed-choice",
+        factId: "delayed-choice-fact",
+        pendingId: "penalty-expiration:tie-score-fact",
+        scoreFactId: "tie-score-fact",
+        playerKey: "side-b:7",
+        gameTimeMs: 90_000,
+        sportingOrder: 90_000,
+        occurrence: { clientOriginAtMs: 90_000, source: "offline" as const },
+      },
+      { nowMs: 90_000 },
+    ).state;
+    expect(state.projection.gameFacts?.at(-1)).toMatchObject({
+      factType: "penalty-release",
+      gameTimeMs: 42,
+      sportingOrder: 42,
+      data: { scoreFactId: "tie-score-fact", sportingOrder: 42 },
+    });
+  });
+
   test("keeps mixed causal optimistic effects while unrelated actions progress", () => {
     let state = createReplica();
     const card = dispatchControllerAction(state, substantive("card", "card"), { nowMs: 100 });
@@ -616,6 +660,20 @@ function correction(operationId: string, factId: string, effective: boolean, tar
     effective,
     gameTimeMs: 1_300_000,
     occurrence: { clientOriginAtMs: 1_300_000, source: "offline" as const },
+  };
+}
+
+function card(operationId: string) {
+  return {
+    version: LIVE_EVENT_CONTROL_INTENT_VERSION,
+    type: "record-card" as const,
+    operationId,
+    factId: `fact-${operationId}`,
+    gameSideId: "side-b",
+    playerNumber: 7,
+    cardType: "blue" as const,
+    gameTimeMs: 10_000,
+    occurrence: { clientOriginAtMs: 10_000, source: "offline" as const },
   };
 }
 
