@@ -253,6 +253,15 @@ export async function runProductionActivationCli(argv: readonly string[]): Promi
       return { manifest, metadata };
     };
     if (command === "promote") {
+      // The root maintenance wrapper owns the backup parent and performs the
+      // final pointer swap.  The service user still performs the complete
+      // candidate re-verification here, but must not attempt to rename the
+      // candidate into the root-controlled retained area.
+      if (process.env.QBT_ROOT_PROMOTION === "1") {
+        const { manifest } = await verifyCandidate();
+        console.log(JSON.stringify({ verified: true, snapshotId: manifest.snapshotId }));
+        return 0;
+      }
       const promotion = await promoteVerifiedBackup({
         backupDirectory,
         candidateDirectory,

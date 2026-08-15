@@ -1,10 +1,31 @@
 import { describe, expect, test } from "bun:test";
 import { Buffer } from "node:buffer";
 import { readFileSync } from "node:fs";
+import {
+  chmod,
+  lstat,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readlink,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { resolveAdHocEnvironmentIdentity } from "@/lib/ad-hoc-games";
 
 const repositoryRoot = process.cwd();
+
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    await lstat(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 describe("Production deployment contract", () => {
   test("gives the service one private persistent state directory", () => {
@@ -159,6 +180,201 @@ describe("Production deployment contract", () => {
     expect(wrapper).toContain('PUBLIC_ORIGIN="$public_origin"');
     expect(wrapper).toContain("backup|verify-backup|promote");
     expect(wrapper).not.toContain("eval ");
+  });
+
+  test("keeps verified backup promotion in the root ownership boundary", () => {
+    const wrapper = readFileSync(
+      join(repositoryRoot, "deploy/activation-maintenance-root.sh"),
+      "utf8",
+    );
+
+    expect(wrapper).toContain("configure_promotion_test_hooks()");
+    expect(wrapper).toContain('mv_command="mv"');
+    expect(wrapper).toContain('stat_command="stat"');
+    expect(wrapper).toContain("skip_chown=0");
+    expect(wrapper).toContain('before_previous_rm_command=""');
+    expect(wrapper).toContain('QBT_ROOT_PROMOTION="$root_promotion"');
+    expect(wrapper).toContain("promote_verified_backup_as_root");
+    expect(wrapper).toContain('chown -R root:root -- "$candidate_directory"');
+    expect(wrapper).toContain('mv -- "$candidate_directory" "$retained_version"');
+    expect(wrapper).toContain('"$mv_command" -T -- "$temporary_pointer" "$retained_pointer"');
+    expect(wrapper).toContain("local previous_cleanup_allowed=0");
+    expect(wrapper).toContain('stat_command="${QBT_FOCUSED_TEST_STAT:-stat}"');
+    expect(wrapper).toContain('[[ -n "$previous_target" && "$previous_cleanup_allowed" == 1 ]]');
+    expect(wrapper).toContain(
+      '[[ "$command" == "promote" ]] && foundation_backup_directory="$backup_directory"',
+    );
+    expect(wrapper).toContain('[[ "$focused_test_mode" != 1 ]]');
+    expect(wrapper).toContain('"${maintenance_output:0:4096}"');
+  });
+
+  test("uses Linux mv -T to replace the retained pointer without following it", async () => {
+    if (process.platform !== "linux") return;
+
+    const wrapper = readFileSync(
+      join(repositoryRoot, "deploy/activation-maintenance-root.sh"),
+      "utf8",
+    );
+    const functionStart = wrapper.indexOf("configure_promotion_test_hooks() {");
+    const functionEnd = wrapper.indexOf('\n}\n\nif [[ "$focused_test_mode" == 1 ]]', functionStart);
+    expect(functionStart).toBeGreaterThanOrEqual(0);
+    expect(functionEnd).toBeGreaterThan(functionStart);
+    const functionSource = wrapper.slice(functionStart, functionEnd + 2);
+    const root = await mkdtemp(join(tmpdir(), "quadball-backup-promotion-contract-"));
+    const harness = join(root, "promote.sh");
+    const ambientHarness = join(root, "ambient-hooks.sh");
+    const run = async (
+      backupDirectory: string,
+      releaseAttemptId: string,
+      mvOverride?: string,
+      beforePreviousRmOverride?: string,
+    ) => {
+      const child = Bun.spawn(["bash", harness, backupDirectory, releaseAttemptId], {
+        cwd: root,
+        env: {
+          ...process.env,
+          QBT_FOCUSED_TEST_SKIP_CHOWN: "1",
+          ...(mvOverride === undefined ? {} : { QBT_FOCUSED_TEST_MV: mvOverride }),
+          ...(beforePreviousRmOverride === undefined
+            ? {}
+            : { QBT_FOCUSED_TEST_BEFORE_PREVIOUS_RM: beforePreviousRmOverride }),
+        },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      return {
+        code: await child.exited,
+        output: `${await new Response(child.stdout).text()}${await new Response(child.stderr).text()}`,
+      };
+    };
+    try {
+      await writeFile(
+        ambientHarness,
+        `#!/usr/bin/env bash
+set -euo pipefail
+${functionSource}
+focused_test_root="$PWD"
+test_harness_mode=0
+mv_command=mv
+stat_command=stat
+skip_chown=0
+before_previous_rm_command=""
+configure_promotion_test_hooks
+printf '%s|%s|%s|%s\\n' "$mv_command" "$stat_command" "$skip_chown" "$before_previous_rm_command"
+`,
+      );
+      await chmod(ambientHarness, 0o755);
+      const ambient = Bun.spawn(["bash", ambientHarness], {
+        cwd: root,
+        env: {
+          ...process.env,
+          QBT_FOCUSED_TEST_MV: "/bin/false",
+          QBT_FOCUSED_TEST_STAT: "/bin/false",
+          QBT_FOCUSED_TEST_SKIP_CHOWN: "1",
+          QBT_FOCUSED_TEST_BEFORE_PREVIOUS_RM: "/bin/false",
+        },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const ambientOutput = await new Response(ambient.stdout).text();
+      const ambientError = await new Response(ambient.stderr).text();
+      expect(await ambient.exited, ambientError).toBe(0);
+      expect(ambientOutput).toBe("mv|stat|0|\n");
+
+      await writeFile(
+        harness,
+        `#!/usr/bin/env bash
+set -euo pipefail
+${functionSource}
+backup_directory="$1"
+focused_test_mode=""
+focused_test_root="$PWD"
+test_harness_mode=1
+mv_command=mv
+stat_command=stat
+skip_chown=0
+before_previous_rm_command=""
+realpath_command=realpath
+configure_promotion_test_hooks
+release_attempt_id="$2"
+promote_verified_backup_as_root "$backup_directory/.candidate-$release_attempt_id" "$backup_directory/.candidate-$release_attempt_id/manifest.json" "$release_attempt_id"
+`,
+      );
+      await chmod(harness, 0o755);
+
+      const successRoot = join(root, "success");
+      const successCandidate = join(successRoot, ".candidate-new");
+      const successOld = join(successRoot, "verified-old");
+      await mkdir(successCandidate, { recursive: true });
+      await mkdir(successOld, { recursive: true });
+      await writeFile(join(successCandidate, "manifest.json"), "candidate\n");
+      await writeFile(join(successOld, "marker"), "old\n");
+      await symlink("verified-old", join(successRoot, "retained"));
+      const success = await run(successRoot, "new");
+      expect(success.code, success.output).toBe(0);
+      expect(await readlink(join(successRoot, "retained"))).toBe("verified-new");
+      expect(await pathExists(join(successRoot, "verified-new"))).toBe(true);
+      expect(await pathExists(successOld)).toBe(false);
+      expect(await pathExists(successCandidate)).toBe(false);
+
+      const invalidNamespaceRoot = join(root, "invalid-namespace");
+      const invalidNamespaceCandidate = join(invalidNamespaceRoot, ".candidate-new");
+      const invalidNamespaceOld = join(invalidNamespaceRoot, "unexpected-target");
+      await mkdir(invalidNamespaceCandidate, { recursive: true });
+      await mkdir(invalidNamespaceOld, { recursive: true });
+      await writeFile(join(invalidNamespaceCandidate, "manifest.json"), "candidate\n");
+      await writeFile(join(invalidNamespaceOld, "marker"), "must-retain\n");
+      await symlink("unexpected-target", join(invalidNamespaceRoot, "retained"));
+      const invalidNamespace = await run(invalidNamespaceRoot, "new");
+      expect(invalidNamespace.code, invalidNamespace.output).toBe(0);
+      expect(await readlink(join(invalidNamespaceRoot, "retained"))).toBe("verified-new");
+      expect(await readFile(join(invalidNamespaceOld, "marker"), "utf8")).toBe("must-retain\n");
+
+      const replacementRoot = join(root, "replacement-object");
+      const replacementCandidate = join(replacementRoot, ".candidate-new");
+      const replacementOld = join(replacementRoot, "verified-old");
+      const replacementScript = join(root, "replace-old.sh");
+      await mkdir(replacementCandidate, { recursive: true });
+      await mkdir(replacementOld, { recursive: true });
+      await writeFile(join(replacementCandidate, "manifest.json"), "candidate\n");
+      await writeFile(join(replacementOld, "marker"), "old\n");
+      await symlink("verified-old", join(replacementRoot, "retained"));
+      await writeFile(
+        replacementScript,
+        '#!/usr/bin/env bash\nset -euo pipefail\nrm -rf -- "$1"\nmkdir -p -- "$1"\nprintf \'replacement\\n\' > "$1/marker"\n',
+      );
+      await chmod(replacementScript, 0o755);
+      const replacement = await run(replacementRoot, "new", undefined, replacementScript);
+      expect(replacement.code, replacement.output).toBe(0);
+      expect(await readlink(join(replacementRoot, "retained"))).toBe("verified-new");
+      expect(await readFile(join(replacementOld, "marker"), "utf8")).toBe("replacement\n");
+      expect(replacement.output).toContain("cleanupWarning");
+
+      const failureRoot = join(root, "failure");
+      const failureCandidate = join(failureRoot, ".candidate-fail");
+      const failureOld = join(failureRoot, "verified-old");
+      const failureMv = join(root, "mv-fails.sh");
+      await mkdir(failureCandidate, { recursive: true });
+      await mkdir(failureOld, { recursive: true });
+      await writeFile(join(failureCandidate, "manifest.json"), "candidate\n");
+      await writeFile(join(failureOld, "marker"), "old\n");
+      await symlink("verified-old", join(failureRoot, "retained"));
+      await writeFile(
+        failureMv,
+        '#!/usr/bin/env bash\nif [[ "$1" == "-T" ]]; then exit 73; fi\nexec /bin/mv "$@"\n',
+      );
+      await chmod(failureMv, 0o755);
+      const failure = await run(failureRoot, "fail", failureMv);
+      expect(failure.code).not.toBe(0);
+      expect(failure.output.length).toBeLessThan(4096);
+      expect(await readlink(join(failureRoot, "retained"))).toBe("verified-old");
+      expect(await readFile(join(failureOld, "marker"), "utf8")).toBe("old\n");
+      expect(await pathExists(join(failureRoot, "verified-fail"))).toBe(false);
+      expect(await pathExists(failureCandidate)).toBe(false);
+      expect(await pathExists(join(failureRoot, ".retained-fail.tmp"))).toBe(false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   test("documents the host-observed Production sudoers command path", () => {
