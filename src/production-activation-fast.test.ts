@@ -13,7 +13,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 
 const repositoryRoot = process.cwd();
 const roots: string[] = [];
@@ -461,8 +461,13 @@ describe("Production activation Fast phase matrix", () => {
       });
       expect(failedPrune.exitCode, failedPrune.output).not.toBe(0);
       expect(await pathExists(fixture.stale), failedPrune.output).toBe(false);
-      const trashEntries = await readdir(join(fixture.base, ".staging"));
-      expect(trashEntries.some((entry) => entry.startsWith(".prune-"))).toBe(true);
+      const quarantineEntries = await readdir(fixture.releaseRoot);
+      expect(quarantineEntries).toContain(`.prune-${basename(fixture.stale)}`);
+      const selectable = runPruneList(script, fixture);
+      expect(selectable.exitCode, selectable.output).toBe(0);
+      expect(selectable.output).not.toContain(`.prune-${basename(fixture.stale)}`);
+      expect(selectable.output).toContain(fixture.current);
+      expect(selectable.output).toContain(fixture.rollback);
       expect((await lstat(fixture.current)).mode & 0o200).toBe(0);
       expect((await lstat(fixture.rollback)).mode & 0o200).toBe(0);
 
@@ -480,7 +485,7 @@ describe("Production activation Fast phase matrix", () => {
         valid.noncanonical,
       ]) {
         const invalidRun = runPruneProbe(script, valid, invalidTarget);
-        expect(invalidRun.exitCode).not.toBe(0);
+        expect(invalidRun.exitCode, `${invalidTarget}\n${invalidRun.output}`).not.toBe(0);
       }
       expect(await pathExists(valid.symlink)).toBe(true);
       expect(await pathExists(valid.nested)).toBe(true);
@@ -712,9 +717,7 @@ async function createPruneHarness(): Promise<{
   await chmod(join(outside, "marker"), 0o444);
   await chmod(current, 0o555);
   await chmod(rollback, 0o555);
-  // macOS rejects renaming a non-writable directory; keep its payload immutable
-  // while allowing the cross-directory rename that the Linux deployment uses.
-  await chmod(stale, process.platform === "darwin" ? 0o755 : 0o555);
+  await chmod(stale, 0o555);
   await chmod(nested, 0o555);
   await chmod(outside, 0o555);
   await symlink(outside, symlinkPath);
@@ -731,7 +734,7 @@ exec /bin/realpath "$@"
     base,
     current,
     nested,
-    noncanonical: join(releaseRoot, "..", "releases", "current-release"),
+    noncanonical: `${releaseRoot}/../releases/current-release`,
     outside,
     releaseRoot,
     rollback,
@@ -765,6 +768,26 @@ function runPruneProbe(
   return {
     exitCode: result.exitCode,
     output: `${new TextDecoder().decode(result.stdout)}${new TextDecoder().decode(result.stderr)}`,
+  };
+}
+
+function runPruneList(script: string, fixture: Awaited<ReturnType<typeof createPruneHarness>>) {
+  const result = Bun.spawnSync({
+    cmd: ["bash", script, "--base-dir", fixture.base, "--release", releaseId],
+    env: {
+      ...process.env,
+      QBT_FOCUSED_TEST_MAINTENANCE_WRAPPER: join(fixture.root, "maintenance"),
+      QBT_FOCUSED_TEST_MODE: "1",
+      QBT_FOCUSED_TEST_PRUNE_LIST: "1",
+      QBT_FOCUSED_TEST_REALPATH: join(fixture.root, "bin", "realpath"),
+      QBT_FOCUSED_TEST_ROOT: fixture.root,
+    },
+    stderr: "pipe",
+    stdout: "pipe",
+  });
+  return {
+    exitCode: result.exitCode,
+    output: `${result.stdout.toString()}${result.stderr.toString()}`,
   };
 }
 
