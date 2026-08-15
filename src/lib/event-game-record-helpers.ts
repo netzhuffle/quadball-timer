@@ -543,6 +543,7 @@ function actionProvenance(action: ControlAction): Record<string, unknown> {
   return {
     occurrence: action.occurrence,
     grant: action.grant,
+    ...(action.origin === undefined ? {} : { origin: action.origin }),
     lifecycle: action.lifecycle,
     override: action.override ?? null,
     recoveryProvenance: action.recoveryProvenance ?? null,
@@ -713,6 +714,7 @@ export function createAuditEntry(
     provenance: {
       occurrence: structuredClone(provenanceAction.occurrence),
       grant: structuredClone(provenanceAction.grant),
+      ...(provenanceAction.origin === undefined ? {} : { origin: provenanceAction.origin }),
       lifecycle: structuredClone(provenanceAction.lifecycle),
       override:
         provenanceAction.override === undefined ? null : structuredClone(provenanceAction.override),

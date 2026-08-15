@@ -15,7 +15,9 @@ import {
   LIVE_SUSPENSION_SNAPSHOT_VERSION,
   parseLiveEventControllerIntent,
   suspensionPenaltyStateFromProjection,
+  projectLiveHeatState,
   type LiveEventControllerIntent,
+  type ControllerGameFact,
   validateLiveEventGameActionInTransaction,
 } from "@/lib/live-event-game-control";
 import { createLiveEventGameControlTransport } from "@/lib/live-event-game-transport";
@@ -1949,6 +1951,76 @@ describe("Live Event Game control", () => {
     });
     expect(await harness.record.readActions()).toHaveLength(before.length);
   });
+  test("projects natural trigger crossing and a locally advancing active timer", () => {
+    const pending = projectLiveHeatState([], "enabled", 15 * 60 * 1000, 1_000);
+    expect(pending).toMatchObject({
+      status: "inactive",
+      pendingTriggerId: "heat-trigger-900000",
+      pendingTriggerGameTimeMs: 900_000,
+    });
+
+    const start: ControllerGameFact = {
+      factId: "local-heat-start",
+      factType: "heat-stoppage",
+      gameSideId: null,
+      gameTimeMs: 900_000,
+      sportingOrder: 900_000,
+      synchronizationOrder: 1,
+      trustedAtMs: 10_000,
+      effective: true,
+      data: {
+        heatAction: "start",
+        heatTriggerId: "heat-trigger-900000",
+        triggerGameTimeMs: 900_000,
+        heatSequence: 1,
+      },
+    };
+    const atStart = projectLiveHeatState([start], "enabled", 900_000, 10_000);
+    const afterLocalAdvance = projectLiveHeatState([start], "enabled", 900_000, 12_500);
+    expect(atStart).toMatchObject({ status: "started", actualDurationMs: 0 });
+    expect(afterLocalAdvance).toMatchObject({ status: "started", actualDurationMs: 2_500 });
+  });
+
+  test("requires a validated Heat Stoppage action before admission", async () => {
+    const malformed = parseLiveEventControllerIntent({
+      version: LIVE_EVENT_CONTROL_INTENT_VERSION,
+      type: "substantive",
+      trigger: "heat-stoppage",
+      operationId: "missing-heat-action",
+      factId: "missing-heat-action-fact",
+      gameTimeMs: 0,
+      occurrence: { clientOriginAtMs: 1_000 },
+    });
+    expect(malformed).toMatchObject({
+      ok: false,
+      error: "heatAction is required for Heat Stoppage operations.",
+    });
+
+    const harness = await createHarness({ heatStoppageConfiguration: true });
+    const opened = await harness.control.openController({
+      qrCredential: harness.qrCredential,
+      browserContext: "missing-heat-action",
+    });
+    if (opened.status !== "opened") throw new Error("Expected the Controller to open.");
+    const rejected = await harness.control.submitControllerIntent({
+      sessionBearer: opened.session.sessionBearer,
+      eventGameId: harness.root.eventGameId,
+      intent: {
+        version: LIVE_EVENT_CONTROL_INTENT_VERSION,
+        type: "substantive",
+        trigger: "heat-stoppage",
+        operationId: "missing-heat-action",
+        factId: "missing-heat-action-fact",
+        gameTimeMs: 0,
+        occurrence: { clientOriginAtMs: 1_000 },
+      },
+    });
+    expect(rejected).toMatchObject({ status: "rejected" });
+    expect(
+      (await harness.record.readRoot(harness.root.recordId))?.lifecycle.commencedAtMs,
+    ).toBeNull();
+    expect(await harness.record.readActions()).toHaveLength(0);
+  });
 
   test("exposes stable Game Facts and rebuilds score through contextual correction and reinstatement", async () => {
     const harness = await createHarness();
@@ -3028,8 +3100,25 @@ describe("Live Event Game control", () => {
       },
     });
     await submit({
+      ...clockCorrectionIntent("dependent-heat-clock-15"),
+      clockTimeMs: 15 * 60 * 1000,
+      gameTimeMs: 15 * 60 * 1000,
+    });
+    await submit({
       ...substantiveIntent("heat-state", "heat-stoppage"),
+      gameTimeMs: 15 * 60 * 1000,
       heatAction: "start",
+      heatTriggerId: "heat-trigger-900000",
+      override: {
+        guardrail: "heat-stoppage-rule-deviation",
+        direction: "head-referee-directed-heat-stoppage",
+        confirmation: "head-referee-confirmed",
+        authorityReference: "head-referee",
+        gameTimeMs: 15 * 60 * 1000,
+        beforeValue: { heat: "pending", requiredDecision: "skip" },
+        afterValue: { heat: "start" },
+        reason: "head-referee-direction",
+      },
     });
     await submit(substantiveIntent("result-state", "result"));
 
@@ -3182,7 +3271,7 @@ describe("Live Event Game control", () => {
       beforeValue: { running: true },
       afterValue: { timeout: "stoppage" },
     });
-    expect(acceptedAction?.grant.sessionId).toBe(opened.session.grantSessionId);
+    expect(acceptedAction?.grant?.sessionId).toBe(opened.session.grantSessionId);
 
     const invalidEvidence = await harness.control.submitControllerIntent({
       sessionBearer: opened.session.sessionBearer,
@@ -3203,7 +3292,7 @@ describe("Live Event Game control", () => {
     });
     expect(invalidEvidence).toMatchObject({ status: "rejected" });
 
-    const validHeat = await harness.control.submitControllerIntent({
+    const preTriggerHeat = await harness.control.submitControllerIntent({
       sessionBearer: opened.session.sessionBearer,
       eventGameId: harness.root.eventGameId,
       intent: {
@@ -3212,8 +3301,7 @@ describe("Live Event Game control", () => {
         heatAction: "skip-required",
       },
     });
-    expect(validHeat).toMatchObject({ status: "accepted" });
-    expect((await harness.record.readActions())[2]?.action.override).toBeUndefined();
+    expect(preTriggerHeat).toMatchObject({ status: "rejected" });
 
     const fabricatedHeatOverride = await harness.control.submitControllerIntent({
       sessionBearer: opened.session.sessionBearer,
@@ -3277,7 +3365,787 @@ describe("Live Event Game control", () => {
       },
     });
     expect(clockWithOverride).toMatchObject({ status: "rejected" });
-    expect(await harness.record.readActions()).toHaveLength(4);
+    expect(await harness.record.readActions()).toHaveLength(3);
+  });
+
+  test("freezes Game Day heat mode at commencement and carries durable trigger obligations", async () => {
+    const harness = await createHarness({ heatStoppageConfiguration: true });
+    const opened = await harness.control.openController({
+      qrCredential: harness.qrCredential,
+      browserContext: "heat-trigger-boundaries",
+    });
+    if (opened.status !== "opened" || opened.projection === null) {
+      throw new Error("Expected the Controller to open with a projection.");
+    }
+    expect(opened.projection.heat).toMatchObject({
+      mode: "enabled",
+      pendingTriggerGameTimeMs: null,
+      nextTriggerGameTimeMs: 15 * 60 * 1000,
+    });
+
+    const submit = (intent: unknown) =>
+      harness.control.submitControllerIntent({
+        sessionBearer: opened.session.sessionBearer,
+        eventGameId: harness.root.eventGameId,
+        intent,
+      });
+    await submit(clockIntent("heat-commencement-start", true));
+    harness.setNow(20_000);
+    await submit(clockIntent("heat-commencement-pause", false));
+    await submit({
+      ...clockCorrectionIntent("heat-clock-15"),
+      clockTimeMs: 15 * 60 * 1000,
+      gameTimeMs: 15 * 60 * 1000,
+    });
+    const pending = await harness.control.refreshController({
+      sessionBearer: opened.session.sessionBearer,
+      eventGameId: harness.root.eventGameId,
+    });
+    expect(pending).toMatchObject({
+      projection: {
+        clock: { gameTimeMs: 15 * 60 * 1000 },
+        heat: {
+          mode: "enabled",
+          pendingTriggerGameTimeMs: 15 * 60 * 1000,
+        },
+      },
+    });
+
+    const first = await submit({
+      ...substantiveIntent("heat-required-skip", "heat-stoppage"),
+      gameTimeMs: 15 * 60 * 1000,
+      heatAction: "skip-required",
+      heatTriggerId: "heat-trigger-900000",
+    });
+    expect(first).toMatchObject({
+      status: "accepted",
+      projection: {
+        commencement: { status: "commenced" },
+        heat: {
+          status: "required-skip",
+          pendingTriggerGameTimeMs: null,
+        },
+      },
+    });
+
+    await submit({
+      ...clockCorrectionIntent("heat-clock-25"),
+      clockTimeMs: 25 * 60 * 1000,
+      gameTimeMs: 25 * 60 * 1000,
+    });
+    const secondPending = await harness.control.refreshController({
+      sessionBearer: opened.session.sessionBearer,
+      eventGameId: harness.root.eventGameId,
+    });
+    expect(secondPending).toMatchObject({
+      projection: { heat: { pendingTriggerGameTimeMs: 25 * 60 * 1000 } },
+    });
+    const skipped = await submit({
+      ...substantiveIntent("heat-within-one-goal-skip", "heat-stoppage"),
+      gameTimeMs: 25 * 60 * 1000,
+      heatAction: "skip-required",
+    });
+    expect(skipped).toMatchObject({
+      status: "accepted",
+      projection: { heat: { status: "required-skip", pendingTriggerGameTimeMs: null } },
+    });
+    const retainedActions = await harness.record.readActions();
+    expect(retainedActions.map(({ action }) => action.interpretation)).toEqual(
+      expect.arrayContaining([expect.objectContaining({ type: "fact", factType: "heat-mode" })]),
+    );
+    expect(
+      retainedActions.find(
+        ({ action }) =>
+          action.interpretation.type === "fact" && action.interpretation.factType === "heat-mode",
+      )?.action,
+    ).toMatchObject({ origin: "system-heat-stoppage" });
+    expect(
+      retainedActions.find(
+        ({ action }) =>
+          action.interpretation.type === "fact" &&
+          action.interpretation.factType === "heat-trigger",
+      )?.action,
+    ).toMatchObject({ origin: "system-heat-stoppage" });
+  });
+
+  test("starts enabled intervals at the next future trigger and never recreates disabled triggers", async () => {
+    const harness = await createHarness({ heatStoppageConfiguration: false });
+    const opened = await harness.control.openController({
+      qrCredential: harness.qrCredential,
+      browserContext: "heat-enabled-intervals",
+    });
+    if (opened.status !== "opened") throw new Error("Expected the Controller to open.");
+    const submit = (intent: unknown) =>
+      harness.control.submitControllerIntent({
+        sessionBearer: opened.session.sessionBearer,
+        eventGameId: harness.root.eventGameId,
+        intent,
+      });
+    await submit(goalIntent({ operationId: "interval-commence", factId: "interval-commence" }));
+    await submit({
+      ...clockCorrectionIntent("interval-clock-20"),
+      clockTimeMs: 20 * 60 * 1000,
+      gameTimeMs: 20 * 60 * 1000,
+    });
+    const enabledAtTwenty = await submit({
+      ...substantiveIntent("interval-enable-20", "heat-stoppage"),
+      gameTimeMs: 20 * 60 * 1000,
+      heatAction: "enable",
+      override: heatModeOverride(20 * 60 * 1000, false, true),
+    });
+    expect(enabledAtTwenty).toMatchObject({
+      status: "accepted",
+      projection: {
+        heat: {
+          mode: "enabled",
+          pendingTriggerId: null,
+          nextTriggerGameTimeMs: 25 * 60 * 1000,
+        },
+      },
+    });
+    await submit({
+      ...clockCorrectionIntent("interval-clock-24"),
+      clockTimeMs: 24 * 60 * 1000,
+      gameTimeMs: 24 * 60 * 1000,
+    });
+    const disabledAtTwentyFour = await submit({
+      ...substantiveIntent("interval-disable-24", "heat-stoppage"),
+      gameTimeMs: 24 * 60 * 1000,
+      heatAction: "disable",
+      override: heatModeOverride(24 * 60 * 1000, true, false),
+    });
+    expect(disabledAtTwentyFour).toMatchObject({
+      status: "accepted",
+      projection: { heat: { mode: "disabled" } },
+    });
+    await submit({
+      ...clockCorrectionIntent("interval-clock-26"),
+      clockTimeMs: 26 * 60 * 1000,
+      gameTimeMs: 26 * 60 * 1000,
+    });
+    const reenabledAtTwentySix = await submit({
+      ...substantiveIntent("interval-enable-26", "heat-stoppage"),
+      gameTimeMs: 26 * 60 * 1000,
+      heatAction: "enable",
+      override: heatModeOverride(26 * 60 * 1000, false, true),
+    });
+    expect(reenabledAtTwentySix).toMatchObject({
+      status: "accepted",
+      projection: {
+        heat: {
+          mode: "enabled",
+          pendingTriggerId: null,
+          nextTriggerGameTimeMs: 30 * 60 * 1000,
+        },
+      },
+    });
+    await submit({
+      ...clockCorrectionIntent("interval-clock-30"),
+      clockTimeMs: 30 * 60 * 1000,
+      gameTimeMs: 30 * 60 * 1000,
+    });
+    const reached = await harness.control.refreshController({
+      sessionBearer: opened.session.sessionBearer,
+      eventGameId: harness.root.eventGameId,
+    });
+    expect(reached).toMatchObject({
+      projection: {
+        heat: {
+          pendingTriggerId: "heat-trigger-1800000",
+          pendingTriggerGameTimeMs: 30 * 60 * 1000,
+        },
+      },
+    });
+    const triggerIds = (await harness.record.readActions()).flatMap(({ action }) =>
+      action.interpretation.type === "fact" && action.interpretation.factType === "heat-trigger"
+        ? [action.operationId]
+        : [],
+    );
+    expect(triggerIds).toEqual(["materialize-heat-trigger-1800000"]);
+  });
+
+  test("covers enable, end-of-drive, dead-volleyball, other-stoppage, and suppression branches", async () => {
+    const harness = await createHarness({ heatStoppageConfiguration: false });
+    const opened = await harness.control.openController({
+      qrCredential: harness.qrCredential,
+      browserContext: "heat-decision-branches",
+    });
+    if (opened.status !== "opened") throw new Error("Expected the Controller to open.");
+    const submit = (intent: unknown) =>
+      harness.control.submitControllerIntent({
+        sessionBearer: opened.session.sessionBearer,
+        eventGameId: harness.root.eventGameId,
+        intent,
+      });
+    await submit(goalIntent({ operationId: "branch-commencement", factId: "branch-commencement" }));
+    const enabled = await submit({
+      ...substantiveIntent("branch-enable", "heat-stoppage"),
+      gameTimeMs: 12_000,
+      heatAction: "enable",
+      override: {
+        guardrail: "heat-stoppage-mode-change",
+        direction: "head-referee-directed-heat-mode-change",
+        confirmation: "head-referee-confirmed",
+        authorityReference: "head-referee",
+        gameTimeMs: 12_000,
+        beforeValue: { heatMode: false },
+        afterValue: { heatMode: true },
+        reason: "head-referee-direction",
+      },
+    });
+    expect(enabled).toMatchObject({ projection: { heat: { mode: "enabled" } } });
+    await submit(clockIntent("branch-clock-start", true));
+    harness.setNow(20_000);
+    await submit(clockIntent("branch-clock-pause", false));
+    await submit({
+      ...clockCorrectionIntent("branch-clock-15"),
+      clockTimeMs: 15 * 60 * 1000,
+      gameTimeMs: 15 * 60 * 1000,
+    });
+    await submit(goalIntent({ operationId: "branch-score-a", factId: "branch-score-a" }));
+    await submit(goalIntent({ operationId: "branch-score-b", factId: "branch-score-b" }));
+    const endOfDrive = await submit({
+      ...substantiveIntent("branch-end-of-drive", "heat-stoppage"),
+      gameTimeMs: 15 * 60 * 1000,
+      heatAction: "end-of-drive",
+      heatTriggerId: "heat-trigger-900000",
+    });
+    expect(endOfDrive).toMatchObject({ projection: { heat: { status: "started" } } });
+    await submit({
+      ...clockCorrectionIntent("branch-clock-25"),
+      clockTimeMs: 25 * 60 * 1000,
+      gameTimeMs: 25 * 60 * 1000,
+    });
+    const deadVolleyball = await submit({
+      ...substantiveIntent("branch-dead-volleyball", "heat-stoppage"),
+      gameTimeMs: 25 * 60 * 1000,
+      heatAction: "dead-volleyball",
+      heatTriggerId: "heat-trigger-1500000",
+    });
+    expect(deadVolleyball).toMatchObject({ status: "accepted" });
+    await submit({
+      ...clockCorrectionIntent("branch-clock-30"),
+      clockTimeMs: 30 * 60 * 1000,
+      gameTimeMs: 30 * 60 * 1000,
+    });
+    const otherStoppage = await submit({
+      ...substantiveIntent("branch-other-stoppage", "heat-stoppage"),
+      gameTimeMs: 30 * 60 * 1000,
+      heatAction: "other-stoppage",
+      heatTriggerId: "heat-trigger-1800000",
+    });
+    expect(otherStoppage).toMatchObject({ status: "accepted" });
+    await submit({
+      ...clockCorrectionIntent("branch-clock-35"),
+      clockTimeMs: 35 * 60 * 1000,
+      gameTimeMs: 35 * 60 * 1000,
+    });
+    const suppressed = await submit({
+      ...substantiveIntent("branch-suppress", "heat-stoppage"),
+      gameTimeMs: 35 * 60 * 1000,
+      heatAction: "suppress",
+      heatTriggerId: "heat-trigger-2100000",
+      override: {
+        guardrail: "heat-stoppage-rule-deviation",
+        direction: "head-referee-directed-heat-stoppage",
+        confirmation: "head-referee-confirmed",
+        authorityReference: "head-referee",
+        gameTimeMs: 35 * 60 * 1000,
+        beforeValue: { pendingTriggerGameTimeMs: 35 * 60 * 1000 },
+        afterValue: { trigger: "suppressed" },
+        reason: "head-referee-direction",
+      },
+    });
+    expect(suppressed).toMatchObject({ projection: { heat: { status: "suppressed" } } });
+  });
+
+  test("completes at the allowance after a delayed tap while keeping early end and overrun overrides", async () => {
+    const harness = await createHarness({ heatStoppageConfiguration: true });
+    const opened = await harness.control.openController({
+      qrCredential: harness.qrCredential,
+      browserContext: "heat-overrides",
+    });
+    if (opened.status !== "opened") throw new Error("Expected the Controller to open.");
+    const submit = (intent: unknown) =>
+      harness.control.submitControllerIntent({
+        sessionBearer: opened.session.sessionBearer,
+        eventGameId: harness.root.eventGameId,
+        intent,
+      });
+    await submit(goalIntent({ operationId: "override-score-a", factId: "override-score-a" }));
+    await submit(goalIntent({ operationId: "override-score-b", factId: "override-score-b" }));
+    await submit(clockIntent("heat-mode-commencement-start", true));
+    harness.setNow(20_000);
+    await submit(clockIntent("heat-mode-commencement-pause", false));
+    await submit({
+      ...clockCorrectionIntent("heat-clock-start"),
+      clockTimeMs: 15 * 60 * 1000,
+      gameTimeMs: 15 * 60 * 1000,
+    });
+    await submit({
+      ...substantiveIntent("heat-start-override-test", "heat-stoppage"),
+      gameTimeMs: 15 * 60 * 1000,
+      heatAction: "start",
+      heatTriggerId: "heat-trigger-900000",
+    });
+    const modeRejected = await submit({
+      ...substantiveIntent("heat-disable-without-override", "heat-stoppage"),
+      heatAction: "disable",
+    });
+    expect(modeRejected).toMatchObject({ status: "rejected" });
+    const modeChanged = await submit({
+      ...substantiveIntent("heat-disable-with-override", "heat-stoppage"),
+      heatAction: "disable",
+      override: {
+        guardrail: "heat-stoppage-mode-change",
+        direction: "head-referee-directed-heat-mode-change",
+        confirmation: "head-referee-confirmed",
+        authorityReference: "head-referee",
+        gameTimeMs: 15 * 60 * 1000,
+        beforeValue: { heatMode: true },
+        afterValue: { heatMode: false },
+        reason: "head-referee-direction",
+      },
+    });
+    expect(modeChanged).toMatchObject({
+      status: "accepted",
+      projection: { heat: { mode: "disabled", status: "ended" }, stoppage: { status: "none" } },
+    });
+
+    const fresh = await createHarness({ heatStoppageConfiguration: true });
+    const freshOpened = await fresh.control.openController({
+      qrCredential: fresh.qrCredential,
+      browserContext: "heat-early-end",
+    });
+    if (freshOpened.status !== "opened") throw new Error("Expected the Controller to open.");
+    const freshSubmit = (intent: unknown) =>
+      fresh.control.submitControllerIntent({
+        sessionBearer: freshOpened.session.sessionBearer,
+        eventGameId: fresh.root.eventGameId,
+        intent,
+      });
+    await freshSubmit(
+      goalIntent({ operationId: "early-end-score-a", factId: "early-end-score-a" }),
+    );
+    await freshSubmit(
+      goalIntent({ operationId: "early-end-score-b", factId: "early-end-score-b" }),
+    );
+    await freshSubmit(clockIntent("early-end-commencement-start", true));
+    fresh.setNow(20_000);
+    await freshSubmit(clockIntent("early-end-commencement-pause", false));
+    await freshSubmit({
+      ...clockCorrectionIntent("early-end-clock-start"),
+      clockTimeMs: 15 * 60 * 1000,
+      gameTimeMs: 15 * 60 * 1000,
+    });
+    await freshSubmit({
+      ...substantiveIntent("early-end-start", "heat-stoppage"),
+      gameTimeMs: 15 * 60 * 1000,
+      heatAction: "start",
+      heatTriggerId: "heat-trigger-900000",
+    });
+    fresh.setNow(140_000);
+    const earlyEnd = await freshSubmit({
+      ...substantiveIntent("early-end", "heat-stoppage"),
+      gameTimeMs: 17 * 60 * 1000,
+      heatAction: "end",
+      override: {
+        guardrail: "heat-stoppage-rule-deviation",
+        direction: "head-referee-directed-heat-stoppage",
+        confirmation: "head-referee-confirmed",
+        authorityReference: "head-referee",
+        gameTimeMs: 17 * 60 * 1000,
+        beforeValue: { heat: "started" },
+        afterValue: { heat: "ended" },
+        reason: "head-referee-direction",
+      },
+    });
+    expect(earlyEnd).toMatchObject({
+      status: "accepted",
+      projection: {
+        heat: {
+          status: "ended",
+          nominalDurationMs: 4 * 60 * 1000,
+          actualDurationMs: 2 * 60 * 1000,
+        },
+      },
+    });
+
+    const nominal = await createHarness({ heatStoppageConfiguration: true });
+    const nominalOpened = await nominal.control.openController({
+      qrCredential: nominal.qrCredential,
+      browserContext: "heat-nominal-end",
+    });
+    if (nominalOpened.status !== "opened") throw new Error("Expected the Controller to open.");
+    const nominalSubmit = (intent: unknown) =>
+      nominal.control.submitControllerIntent({
+        sessionBearer: nominalOpened.session.sessionBearer,
+        eventGameId: nominal.root.eventGameId,
+        intent,
+      });
+    await nominalSubmit(goalIntent({ operationId: "nominal-score-a", factId: "nominal-score-a" }));
+    await nominalSubmit(goalIntent({ operationId: "nominal-score-b", factId: "nominal-score-b" }));
+    await nominalSubmit({
+      ...clockCorrectionIntent("nominal-clock-15"),
+      clockTimeMs: 15 * 60 * 1000,
+      gameTimeMs: 15 * 60 * 1000,
+    });
+    await nominalSubmit({
+      ...substantiveIntent("nominal-start", "heat-stoppage"),
+      gameTimeMs: 15 * 60 * 1000,
+      heatAction: "start",
+      heatTriggerId: "heat-trigger-900000",
+    });
+    nominal.setNow(250_000 + 2_000);
+    const delayedObservation = await nominal.control.refreshController({
+      sessionBearer: nominalOpened.session.sessionBearer,
+      eventGameId: nominal.root.eventGameId,
+    });
+    expect(delayedObservation).toMatchObject({
+      projection: {
+        clock: { running: false },
+        heat: {
+          status: "ended",
+          allowedDurationMs: 240_000,
+          actualDurationMs: 240_000,
+          completedAtAllowed: true,
+        },
+      },
+    });
+    const nominalEnd = await nominalSubmit({
+      ...substantiveIntent("nominal-end", "heat-stoppage"),
+      gameTimeMs: 15 * 60 * 1000,
+      heatAction: "end",
+    });
+    expect(nominalEnd).toMatchObject({
+      status: "accepted",
+      projection: {
+        heat: {
+          status: "ended",
+          nominalDurationMs: 240_000,
+          allowedDurationMs: 240_000,
+          actualDurationMs: 240_000,
+          completedAtAllowed: true,
+        },
+      },
+    });
+    const deliberateExtension = await nominalSubmit({
+      ...substantiveIntent("delayed-extension", "heat-stoppage"),
+      gameTimeMs: 15 * 60 * 1000,
+      heatAction: "extend",
+      heatTriggerId: "heat-trigger-900000",
+    });
+    expect(deliberateExtension).toMatchObject({ status: "rejected" });
+    const extended = await nominalSubmit({
+      ...substantiveIntent("delayed-extension-override", "heat-stoppage"),
+      gameTimeMs: 15 * 60 * 1000,
+      heatAction: "extend",
+      heatTriggerId: "heat-trigger-900000",
+      override: {
+        guardrail: "heat-stoppage-rule-deviation",
+        direction: "head-referee-directed-heat-stoppage",
+        confirmation: "head-referee-confirmed",
+        authorityReference: "head-referee",
+        gameTimeMs: 15 * 60 * 1000,
+        beforeValue: { heat: "ended", nominalDurationMs: 240_000, actualDurationMs: 240_000 },
+        afterValue: { heat: "extended" },
+        reason: "head-referee-direction",
+      },
+    });
+    expect(extended).toMatchObject({
+      status: "accepted",
+      projection: { heat: { status: "extended" } },
+    });
+  });
+
+  test("keeps durable trigger identity and reached obligations across correction and replay", async () => {
+    const harness = await createHarness({ heatStoppageConfiguration: true });
+    const opened = await harness.control.openController({
+      qrCredential: harness.qrCredential,
+      browserContext: "heat-trigger-identity",
+    });
+    if (opened.status !== "opened") throw new Error("Expected the Controller to open.");
+    const submit = (intent: unknown) =>
+      harness.control.submitControllerIntent({
+        sessionBearer: opened.session.sessionBearer,
+        eventGameId: harness.root.eventGameId,
+        intent,
+      });
+    await submit(clockIntent("identity-clock-start", true));
+    harness.setNow(20_000);
+    await submit(clockIntent("identity-clock-pause", false));
+    await submit({
+      ...clockCorrectionIntent("identity-clock-15"),
+      clockTimeMs: 15 * 60 * 1000,
+      gameTimeMs: 15 * 60 * 1000,
+    });
+    const firstPending = await harness.control.refreshController({
+      sessionBearer: opened.session.sessionBearer,
+      eventGameId: harness.root.eventGameId,
+    });
+    expect(firstPending).toMatchObject({
+      projection: {
+        heat: {
+          pendingTriggerId: "heat-trigger-900000",
+          pendingTriggerGameTimeMs: 900000,
+        },
+      },
+    });
+    await submit({
+      ...clockCorrectionIntent("identity-clock-backward"),
+      clockTimeMs: 0,
+      gameTimeMs: 0,
+    });
+    const retainedPending = await harness.control.refreshController({
+      sessionBearer: opened.session.sessionBearer,
+      eventGameId: harness.root.eventGameId,
+    });
+    expect(retainedPending).toMatchObject({
+      projection: { heat: { pendingTriggerId: "heat-trigger-900000" } },
+    });
+
+    const started = await submit({
+      ...substantiveIntent("identity-start", "heat-stoppage"),
+      gameTimeMs: 15 * 60 * 1000,
+      heatAction: "skip-required",
+      heatTriggerId: "heat-trigger-900000",
+    });
+    expect(started).toMatchObject({
+      status: "accepted",
+      projection: { heat: { status: "required-skip" } },
+    });
+    await submit({
+      ...clockCorrectionIntent("identity-clock-25"),
+      clockTimeMs: 25 * 60 * 1000,
+      gameTimeMs: 25 * 60 * 1000,
+    });
+    const stale = await submit({
+      ...substantiveIntent("identity-stale", "heat-stoppage"),
+      gameTimeMs: 25 * 60 * 1000,
+      heatAction: "start",
+      heatTriggerId: "heat-trigger-900000",
+    });
+    expect(stale).toMatchObject({ status: "rejected" });
+    expect(
+      (await harness.record.readActions()).some(
+        ({ action }) => action.operationId === "identity-stale",
+      ),
+    ).toBe(false);
+  });
+
+  test("rejects ended-state extension even when the active trigger identity is retained", async () => {
+    const harness = await createHarness({ heatStoppageConfiguration: true });
+    const opened = await harness.control.openController({
+      qrCredential: harness.qrCredential,
+      browserContext: "heat-ended-extension",
+    });
+    if (opened.status !== "opened") throw new Error("Expected the Controller to open.");
+    const submit = (intent: unknown) =>
+      harness.control.submitControllerIntent({
+        sessionBearer: opened.session.sessionBearer,
+        eventGameId: harness.root.eventGameId,
+        intent,
+      });
+    await submit({
+      ...clockCorrectionIntent("ended-extension-clock-15"),
+      clockTimeMs: 15 * 60 * 1000,
+      gameTimeMs: 15 * 60 * 1000,
+    });
+    await submit({
+      ...substantiveIntent("ended-extension-start", "heat-stoppage"),
+      gameTimeMs: 15 * 60 * 1000,
+      heatAction: "start",
+      heatTriggerId: "heat-trigger-900000",
+      override: {
+        guardrail: "heat-stoppage-rule-deviation",
+        direction: "head-referee-directed-heat-stoppage",
+        confirmation: "head-referee-confirmed",
+        authorityReference: "head-referee",
+        gameTimeMs: 15 * 60 * 1000,
+        beforeValue: { heat: "pending", requiredDecision: "skip" },
+        afterValue: { heat: "start" },
+        reason: "head-referee-direction",
+      },
+    });
+    harness.setNow(250_000);
+    const ended = await submit({
+      ...substantiveIntent("ended-extension-end", "heat-stoppage"),
+      gameTimeMs: 15 * 60 * 1000,
+      heatAction: "end",
+      heatTriggerId: "heat-trigger-900000",
+    });
+    expect(ended).toMatchObject({ status: "accepted", projection: { heat: { status: "ended" } } });
+
+    const reopened = await submit({
+      ...substantiveIntent("ended-extension-rejected", "heat-stoppage"),
+      gameTimeMs: 15 * 60 * 1000,
+      heatAction: "extend",
+      heatTriggerId: "heat-trigger-900000",
+    });
+    expect(reopened).toMatchObject({ status: "rejected" });
+    expect(
+      (await harness.record.readActions()).some(
+        ({ action }) => action.operationId === "ended-extension-rejected",
+      ),
+    ).toBe(false);
+  });
+
+  test("keeps ordinary required skip and permitted extension distinct from overridden skip", async () => {
+    const ordinary = await createHarness({ heatStoppageConfiguration: true });
+    const opened = await ordinary.control.openController({
+      qrCredential: ordinary.qrCredential,
+      browserContext: "heat-skip-linkage",
+    });
+    if (opened.status !== "opened") throw new Error("Expected the Controller to open.");
+    const submit = (intent: unknown) =>
+      ordinary.control.submitControllerIntent({
+        sessionBearer: opened.session.sessionBearer,
+        eventGameId: ordinary.root.eventGameId,
+        intent,
+      });
+    await submit(clockIntent("skip-clock-start", true));
+    ordinary.setNow(20_000);
+    await submit(clockIntent("skip-clock-pause", false));
+    await submit({
+      ...clockCorrectionIntent("skip-clock-15"),
+      clockTimeMs: 15 * 60 * 1000,
+      gameTimeMs: 15 * 60 * 1000,
+    });
+    const started = await submit({
+      ...substantiveIntent("skip-start", "heat-stoppage"),
+      gameTimeMs: 15 * 60 * 1000,
+      heatAction: "start",
+      heatTriggerId: "heat-trigger-900000",
+      override: {
+        guardrail: "heat-stoppage-rule-deviation",
+        direction: "head-referee-directed-heat-stoppage",
+        confirmation: "head-referee-confirmed",
+        authorityReference: "head-referee",
+        gameTimeMs: 15 * 60 * 1000,
+        beforeValue: { heat: "pending", requiredDecision: "skip" },
+        afterValue: { heat: "start" },
+        reason: "head-referee-direction",
+      },
+    });
+    expect(started).toMatchObject({ projection: { heat: { status: "started" } } });
+    await submit({
+      ...clockCorrectionIntent("skip-clock-25"),
+      clockTimeMs: 25 * 60 * 1000,
+      gameTimeMs: 25 * 60 * 1000,
+    });
+    const skipped = await submit({
+      ...substantiveIntent("skip-required", "heat-stoppage"),
+      gameTimeMs: 25 * 60 * 1000,
+      heatAction: "skip-required",
+      heatTriggerId: "heat-trigger-1500000",
+    });
+    expect(skipped).toMatchObject({ projection: { heat: { status: "required-skip" } } });
+    await submit({
+      ...clockCorrectionIntent("skip-clock-30"),
+      clockTimeMs: 30 * 60 * 1000,
+      gameTimeMs: 30 * 60 * 1000,
+    });
+    const followingStart = await submit({
+      ...substantiveIntent("skip-following-start", "heat-stoppage"),
+      gameTimeMs: 30 * 60 * 1000,
+      heatAction: "start",
+      heatTriggerId: "heat-trigger-1800000",
+      override: {
+        guardrail: "heat-stoppage-rule-deviation",
+        direction: "head-referee-directed-heat-stoppage",
+        confirmation: "head-referee-confirmed",
+        authorityReference: "head-referee",
+        gameTimeMs: 30 * 60 * 1000,
+        beforeValue: { heat: "pending", requiredDecision: "skip" },
+        afterValue: { heat: "start" },
+        reason: "head-referee-direction",
+      },
+    });
+    expect(followingStart).toMatchObject({ projection: { heat: { status: "started" } } });
+    const extended = await submit({
+      ...substantiveIntent("skip-extension", "heat-stoppage"),
+      gameTimeMs: 30 * 60 * 1000,
+      heatAction: "extend-permitted",
+      heatTriggerId: "heat-trigger-1800000",
+    });
+    expect(extended).toMatchObject({ projection: { heat: { status: "extended" } } });
+    ordinary.setNow(300_000);
+    const overrunRejected = await submit({
+      ...substantiveIntent("skip-overrun", "heat-stoppage"),
+      gameTimeMs: 30 * 60 * 1000,
+      heatAction: "extend",
+    });
+    expect(overrunRejected).toMatchObject({ status: "rejected" });
+    const overrunOverride = await submit({
+      ...substantiveIntent("skip-overrun-override", "heat-stoppage"),
+      gameTimeMs: 30 * 60 * 1000,
+      heatAction: "extend",
+      override: {
+        guardrail: "heat-stoppage-rule-deviation",
+        direction: "head-referee-directed-heat-stoppage",
+        confirmation: "head-referee-confirmed",
+        authorityReference: "head-referee",
+        gameTimeMs: 30 * 60 * 1000,
+        beforeValue: { heat: "ended", nominalDurationMs: 120_000, actualDurationMs: 240_000 },
+        afterValue: { heat: "extended" },
+        reason: "head-referee-direction",
+      },
+    });
+    expect(overrunOverride).toMatchObject({ status: "accepted" });
+
+    const ineligible = await createHarness({ heatStoppageConfiguration: true });
+    const ineligibleOpened = await ineligible.control.openController({
+      qrCredential: ineligible.qrCredential,
+      browserContext: "heat-skip-override",
+    });
+    if (ineligibleOpened.status !== "opened") throw new Error("Expected the Controller to open.");
+    const ineligibleSubmit = (intent: unknown) =>
+      ineligible.control.submitControllerIntent({
+        sessionBearer: ineligibleOpened.session.sessionBearer,
+        eventGameId: ineligible.root.eventGameId,
+        intent,
+      });
+    await ineligibleSubmit({
+      ...goalIntent({ operationId: "skip-goal-a", factId: "skip-goal-a", gameTimeMs: 1_000 }),
+    });
+    await ineligibleSubmit({
+      ...goalIntent({ operationId: "skip-goal-b", factId: "skip-goal-b", gameTimeMs: 2_000 }),
+    });
+    await ineligibleSubmit({
+      ...goalIntent({ operationId: "skip-goal-c", factId: "skip-goal-c", gameTimeMs: 3_000 }),
+    });
+    await ineligibleSubmit(clockIntent("skip-override-clock-start", true));
+    ineligible.setNow(20_000);
+    await ineligibleSubmit(clockIntent("skip-override-clock-pause", false));
+    await ineligibleSubmit({
+      ...clockCorrectionIntent("skip-override-clock-15"),
+      clockTimeMs: 15 * 60 * 1000,
+      gameTimeMs: 15 * 60 * 1000,
+    });
+    const rejected = await ineligibleSubmit({
+      ...substantiveIntent("skip-impermissible", "heat-stoppage"),
+      gameTimeMs: 15 * 60 * 1000,
+      heatAction: "skip",
+      heatTriggerId: "heat-trigger-900000",
+    });
+    expect(rejected).toMatchObject({ status: "rejected" });
+    const overridden = await ineligibleSubmit({
+      ...substantiveIntent("skip-impermissible-override", "heat-stoppage"),
+      gameTimeMs: 15 * 60 * 1000,
+      heatAction: "skip",
+      heatTriggerId: "heat-trigger-900000",
+      override: {
+        guardrail: "heat-stoppage-rule-deviation",
+        direction: "head-referee-directed-heat-stoppage",
+        confirmation: "head-referee-confirmed",
+        authorityReference: "head-referee",
+        gameTimeMs: 15 * 60 * 1000,
+        beforeValue: { scoreDifference: 30 },
+        afterValue: { heat: "skipped" },
+        reason: "head-referee-direction",
+      },
+    });
+    expect(overridden).toMatchObject({ projection: { heat: { status: "skipped" } } });
   });
 
   test("keeps a failed live Correction atomic and safely retryable", async () => {
@@ -4157,8 +5025,11 @@ describe("Live Event Game control", () => {
     });
   });
 
-  test("atomically rolls back the action and commencement at the lifecycle boundary", async () => {
-    const harness = await createHarness({ failureBoundary: "after-lifecycle" });
+  test("atomically rolls back the action, mode snapshot, and commencement at the lifecycle boundary", async () => {
+    const harness = await createHarness({
+      failureBoundary: "after-lifecycle",
+      heatStoppageConfiguration: true,
+    });
     const opened = await harness.control.openController({
       qrCredential: harness.qrCredential,
       browserContext: "controller-phone",
@@ -4261,11 +5132,164 @@ describe("Live Event Game control", () => {
       actions.map((stored) => ({
         operationId: stored.action.operationId,
         clientOriginAtMs: stored.action.occurrence.clientOriginAtMs,
+        trustedAtMs: stored.action.occurrence.trustedAtMs,
+        acceptedAtMs: stored.action.acceptedAtMs,
         source: stored.action.occurrence.source,
       })),
     ).toEqual([
-      { operationId: "online-provenance", clientOriginAtMs: 1_000, source: "online" },
-      { operationId: "offline-provenance", clientOriginAtMs: 2_000, source: "offline" },
+      {
+        operationId: "online-provenance",
+        clientOriginAtMs: 1_000,
+        trustedAtMs: 10_000,
+        acceptedAtMs: 10_000,
+        source: "online",
+      },
+      {
+        operationId: "offline-provenance",
+        clientOriginAtMs: 2_000,
+        trustedAtMs: 2_000,
+        acceptedAtMs: 10_000,
+        source: "offline",
+      },
+    ]);
+  });
+
+  test("preserves offline Heat Stoppage occurrence timing across reordered replay acceptance", async () => {
+    const harness = await createHarness({ heatStoppageConfiguration: true });
+    const opened = await harness.control.openController({
+      qrCredential: harness.qrCredential,
+      browserContext: "offline-heat-replay-device",
+    });
+    if (opened.status !== "opened") throw new Error("Expected the Controller to open.");
+    const submit = (intent: unknown) =>
+      harness.control.submitControllerIntent({
+        sessionBearer: opened.session.sessionBearer,
+        eventGameId: harness.root.eventGameId,
+        intent,
+      });
+    await submit(
+      goalIntent({ operationId: "offline-heat-score-a", factId: "offline-heat-score-a" }),
+    );
+    await submit(
+      goalIntent({ operationId: "offline-heat-score-b", factId: "offline-heat-score-b" }),
+    );
+    await submit({
+      ...clockCorrectionIntent("offline-heat-clock-15"),
+      clockTimeMs: 15 * 60 * 1000,
+      gameTimeMs: 15 * 60 * 1000,
+    });
+
+    const start = await harness.control.replayControllerActions({
+      sessionBearer: opened.session.sessionBearer,
+      eventGameId: harness.root.eventGameId,
+      batchId: "offline-heat-start-batch",
+      replicaGeneration: "offline-heat-start-generation",
+      expectedGrantSessionId: opened.session.grantSessionId,
+      expectedGrantVersion: opened.session.grantVersion,
+      actions: [
+        {
+          eventGameId: harness.root.eventGameId,
+          intent: {
+            ...substantiveIntent("offline-heat-start", "heat-stoppage"),
+            gameTimeMs: 15 * 60 * 1000,
+            heatAction: "start",
+            heatTriggerId: "heat-trigger-900000",
+            occurrence: { clientOriginAtMs: 100_000, source: "offline" as const },
+          },
+          causalPredecessorIds: [],
+        },
+      ],
+    });
+    expect(start.outcomes).toEqual([{ operationId: "offline-heat-start", status: "accepted" }]);
+
+    harness.setNow(500_000);
+    await submit({
+      ...clockCorrectionIntent("offline-heat-clock-25"),
+      clockTimeMs: 25 * 60 * 1000,
+      gameTimeMs: 25 * 60 * 1000,
+    });
+    const lateWithoutOverride = await harness.control.replayControllerActions({
+      sessionBearer: opened.session.sessionBearer,
+      eventGameId: harness.root.eventGameId,
+      batchId: "offline-heat-late-without-override-batch",
+      replicaGeneration: "offline-heat-late-without-override-generation",
+      expectedGrantSessionId: opened.session.grantSessionId,
+      expectedGrantVersion: opened.session.grantVersion,
+      actions: [
+        {
+          eventGameId: harness.root.eventGameId,
+          intent: {
+            ...substantiveIntent("offline-heat-late-without-override", "heat-stoppage"),
+            gameTimeMs: 25 * 60 * 1000,
+            heatAction: "end",
+            heatTriggerId: "heat-trigger-900000",
+            occurrence: { clientOriginAtMs: 400_000, source: "offline" as const },
+          },
+          causalPredecessorIds: ["offline-heat-start"],
+        },
+      ],
+    });
+    expect(lateWithoutOverride.outcomes).toEqual([
+      {
+        operationId: "offline-heat-late-without-override",
+        status: "terminally-rejected",
+        detail: "terminal server rejection",
+      },
+    ]);
+    const end = await harness.control.replayControllerActions({
+      sessionBearer: opened.session.sessionBearer,
+      eventGameId: harness.root.eventGameId,
+      batchId: "offline-heat-end-batch",
+      replicaGeneration: "offline-heat-end-generation",
+      expectedGrantSessionId: opened.session.grantSessionId,
+      expectedGrantVersion: opened.session.grantVersion,
+      actions: [
+        {
+          eventGameId: harness.root.eventGameId,
+          intent: {
+            ...substantiveIntent("offline-heat-end", "heat-stoppage"),
+            gameTimeMs: 25 * 60 * 1000,
+            heatAction: "end",
+            heatTriggerId: "heat-trigger-900000",
+            occurrence: { clientOriginAtMs: 400_000, source: "offline" as const },
+            override: {
+              guardrail: "heat-stoppage-rule-deviation",
+              direction: "head-referee-directed-heat-stoppage",
+              confirmation: "head-referee-confirmed",
+              authorityReference: "head-referee",
+              gameTimeMs: 25 * 60 * 1000,
+              beforeValue: {
+                heat: "ended",
+                nominalDurationMs: 240_000,
+                actualDurationMs: 300_000,
+              },
+              afterValue: { heat: "ended" },
+              reason: "head-referee-direction",
+            },
+          },
+          causalPredecessorIds: ["offline-heat-start"],
+        },
+      ],
+    });
+    expect(end.outcomes).toEqual([{ operationId: "offline-heat-end", status: "accepted" }]);
+    expect(end.projection).toMatchObject({
+      heat: { status: "ended", nominalDurationMs: 240_000, actualDurationMs: 300_000 },
+    });
+    expect(
+      (await harness.record.readActions())
+        .filter(
+          ({ action }) =>
+            action.operationId === "offline-heat-start" ||
+            action.operationId === "offline-heat-end",
+        )
+        .map(({ action }) => ({
+          operationId: action.operationId,
+          trustedAtMs: action.occurrence.trustedAtMs,
+          acceptedAtMs: action.acceptedAtMs,
+        })),
+    ).toEqual([
+      { operationId: "offline-heat-start", trustedAtMs: 100_000, acceptedAtMs: 10_000 },
+      { operationId: "offline-heat-end", trustedAtMs: 400_000, acceptedAtMs: 500_000 },
     ]);
   });
 
@@ -5406,13 +6430,13 @@ describe("Live Event Game control", () => {
         operationId: "delayed-offline-card",
         gameTimeMs: 0,
         source: "offline",
-        trustedAtMs: 10_000,
+        trustedAtMs: 1_000,
       },
       {
         operationId: "delayed-offline-goal",
         gameTimeMs: 15_000,
         source: "offline",
-        trustedAtMs: 10_000,
+        trustedAtMs: 2_000,
       },
     ]);
     expect(
@@ -5434,6 +6458,7 @@ async function createHarness(
     knownDodgeballIds?: readonly string[];
     sessionResolution?: ControlGrantSessionResolution;
     acceptanceLimits?: AcceptanceLimits;
+    heatStoppageConfiguration?: boolean;
   } = {},
 ) {
   const root = createRoot(overrides.eventGameId ?? "game-live-control");
@@ -5519,6 +6544,9 @@ async function createHarness(
     knownDodgeballIdsForEventGame:
       overrides.knownDodgeballIds === undefined ? undefined : () => overrides.knownDodgeballIds!,
     projectionFailure: overrides.projectionFailure,
+    ...(overrides.heatStoppageConfiguration === undefined
+      ? {}
+      : { heatStoppageConfiguration: overrides.heatStoppageConfiguration }),
   });
   triggerLifecycleChange = () => {
     void control.reconcileActiveControllerSessions();
@@ -5806,6 +6834,19 @@ function substantiveIntent(
       : {}),
     occurrence: { clientOriginAtMs: null },
   };
+}
+
+function heatModeOverride(gameTimeMs: number, before: boolean, after: boolean) {
+  return {
+    guardrail: "heat-stoppage-mode-change",
+    direction: "head-referee-directed-heat-mode-change",
+    confirmation: "head-referee-confirmed",
+    authorityReference: "head-referee",
+    gameTimeMs,
+    beforeValue: { heatMode: before },
+    afterValue: { heatMode: after },
+    reason: "head-referee-direction",
+  } as const;
 }
 
 function simpleIntent(operationId: string, type: "reset" | "undo") {

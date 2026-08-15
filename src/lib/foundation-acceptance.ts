@@ -80,6 +80,8 @@ export type ControlActionBatchInput = {
   recordId: string;
   eventGameId: string;
   actions: readonly unknown[];
+  /** Commit all accepted actions and the lifecycle transition in one storage transaction. */
+  atomic?: boolean;
   sessionBearer?: string;
   controlSessionDecision?: ControlGrantSessionDecision;
   mode?: "online" | "replay";
@@ -100,7 +102,7 @@ export type FoundationActionResult =
       status: "accepted" | "duplicate-accepted";
       action?: ControlAction;
       auditId: string;
-      grantAuditId: string;
+      grantAuditId?: string;
     }
   | {
       status: "rejected" | "dependency-blocked" | "authority-expired" | "retry-later";
@@ -207,6 +209,12 @@ function isSystemTimeoutCompletionBatch(batch: PreparedBatch): boolean {
   return batch.input.systemOperation === "timeout-completion";
 }
 type OneOutcome = { result: FoundationActionResult; reservationId?: string; receipt?: string };
+
+class AtomicBatchAbort extends Error {
+  constructor(readonly outcome: FoundationBatchOutcome) {
+    super("Atomic Control Action batch was rolled back.");
+  }
+}
 type AuthorizedControl = {
   grant: StoredGrant;
   session: StoredGrantSession;
@@ -277,6 +285,7 @@ export function createFoundationAcceptance(
           detail: "The Event Game Record is unavailable.",
         })),
       };
+    if (batch.input.atomic === true) return submitAtomicBatch(batch, preflight);
     const results: FoundationActionResult[] = Array.from({ length: batch.actions.length });
     let reservationId: string | undefined;
     let receipt: string | undefined;
@@ -311,6 +320,69 @@ export function createFoundationAcceptance(
       results,
       ...(reservationId === undefined ? {} : { reservationId }),
     };
+  }
+
+  async function submitAtomicBatch(
+    batch: PreparedBatch,
+    preflight: BatchPreflight,
+  ): Promise<FoundationBatchOutcome> {
+    try {
+      return await storage.transaction((transaction) => {
+        const results: FoundationActionResult[] = Array.from({ length: batch.actions.length });
+        for (const index of batch.order) {
+          const action = batch.actions[index];
+          if (action === undefined) throw new Error("Missing structural action.");
+          const predecessors = predecessorResultsFor(batch, results, index);
+          const one = acceptOne(
+            transaction,
+            batch,
+            index,
+            predecessors,
+            preflight.actions[index],
+            true,
+          );
+          results[index] = one.result;
+          if (one.result.status !== "accepted" && one.result.status !== "duplicate-accepted") {
+            const retry = one.result.status === "retry-later";
+            throw new AtomicBatchAbort({
+              status: retry ? "partial" : "rejected",
+              results: batch.actions.map((_, resultIndex) =>
+                resultIndex === index
+                  ? one.result
+                  : retry
+                    ? {
+                        status: "retry-later",
+                        reason: "causal-predecessor-retry",
+                        detail: "Retry the complete atomic Control Action batch.",
+                      }
+                    : {
+                        status: "dependency-blocked",
+                        reason: "causal-dependency-rejected",
+                        detail: "The complete atomic Control Action batch was rejected.",
+                      },
+              ),
+            });
+          }
+        }
+        applyLifecycleTransition(
+          transaction,
+          batch.input.recordId,
+          batch.input.lifecycleTransition,
+          batch.input.reconcileDerivedLifecycle === true,
+        );
+        return { status: "committed", results };
+      });
+    } catch (error) {
+      if (error instanceof AtomicBatchAbort) return error.outcome;
+      return {
+        status: "partial",
+        results: batch.actions.map(() => ({
+          status: "retry-later",
+          reason: "storage-unavailable",
+          detail: "Retry this atomic batch after authoritative storage recovers.",
+        })),
+      };
+    }
   }
 
   async function acknowledgeReplay(
@@ -414,23 +486,31 @@ export function createFoundationAcceptance(
       authorization.grantType !== "control" ||
       authorization.eventGameId !== batch.input.eventGameId ||
       (!isSystemTimeoutCompletionBatch(batch) &&
-        (authorization.grantSessionId !== first.envelope.grant.sessionId ||
+        !isTrustedSystemAction(first.envelope) &&
+        (first.envelope.grant === null ||
+          authorization.grantSessionId !== first.envelope.grant.sessionId ||
           authorization.grantVersion !== first.envelope.grant.versionId)) ||
       (isSystemTimeoutCompletionBatch(batch) &&
-        (first.envelope.grant.sessionId !== SYSTEM_TIMEOUT_COMPLETION_GRANT.sessionId ||
+        (first.envelope.grant === null ||
+          first.envelope.grant.sessionId !== SYSTEM_TIMEOUT_COMPLETION_GRANT.sessionId ||
           first.envelope.grant.versionId !== SYSTEM_TIMEOUT_COMPLETION_GRANT.versionId))
-    )
+    ) {
       return { authorized: false, root: null, trustedLockedReplay: false, actions: [] };
+    }
     if (
       batch.actions.some(({ envelope }) =>
         isSystemTimeoutCompletionBatch(batch)
-          ? envelope.grant.sessionId !== SYSTEM_TIMEOUT_COMPLETION_GRANT.sessionId ||
+          ? envelope.grant === null ||
+            envelope.grant.sessionId !== SYSTEM_TIMEOUT_COMPLETION_GRANT.sessionId ||
             envelope.grant.versionId !== SYSTEM_TIMEOUT_COMPLETION_GRANT.versionId
-          : envelope.grant.sessionId !== authorization.grantSessionId ||
-            envelope.grant.versionId !== authorization.grantVersion,
+          : envelope.origin !== "system-heat-stoppage" &&
+            (envelope.grant === null ||
+              envelope.grant.sessionId !== authorization.grantSessionId ||
+              envelope.grant.versionId !== authorization.grantVersion),
       )
-    )
+    ) {
       return { authorized: false, root: null, trustedLockedReplay: false, actions: [] };
+    }
     const root = transaction.findRootByRecordId(batch.input.recordId);
     if (root === null || root.eventGameId !== batch.input.eventGameId)
       return {
@@ -503,6 +583,7 @@ export function createFoundationAcceptance(
     const replay = batch.input.replay;
     const first = batch.actions[0];
     if (replay === undefined || first === undefined) return false;
+    if (first.envelope.grant === null) return false;
     if (options.authorizeLockedReplay !== undefined)
       return options.authorizeLockedReplay({
         transaction,
@@ -526,6 +607,7 @@ export function createFoundationAcceptance(
       authorization.grantVersion === first.envelope.grant.versionId &&
       batch.actions.every(
         ({ envelope }) =>
+          envelope.grant !== null &&
           envelope.grant.sessionId === authorization.grantSessionId &&
           envelope.grant.versionId === authorization.grantVersion,
       )
@@ -559,6 +641,7 @@ export function createFoundationAcceptance(
     index: number,
     predecessorResults: readonly FoundationActionResult[],
     preflightAction: { prepared: PreparedControlAction | null; error: string | null } | undefined,
+    deferLifecycleTransition = false,
   ): OneOutcome {
     const structural = batch.actions[index];
     if (structural === undefined) throw new Error("Missing structural action.");
@@ -605,7 +688,8 @@ export function createFoundationAcceptance(
         (exactReservation.recordId !== root.recordId ||
           exactReservation.eventGameId !== root.eventGameId ||
           exactReservation.originatingSessionId !== replay.originatingSessionId ||
-          exactReservation.actionCount !== batch.actions.length)
+          ((trustedReservationId === null || trustedReservationId === undefined) &&
+            exactReservation.actionCount !== batch.actions.length))
       )
         return authorityFailure();
       const originReservation =
@@ -684,10 +768,13 @@ export function createFoundationAcceptance(
       authorization.grantType !== "control" ||
       authorization.eventGameId !== batch.input.eventGameId ||
       (!isSystemTimeoutCompletionBatch(batch) &&
-        (authorization.grantSessionId !== structural.envelope.grant.sessionId ||
+        !isTrustedSystemAction(structural.envelope) &&
+        (structural.envelope.grant === null ||
+          authorization.grantSessionId !== structural.envelope.grant.sessionId ||
           authorization.grantVersion !== structural.envelope.grant.versionId)) ||
       (isSystemTimeoutCompletionBatch(batch) &&
-        (structural.envelope.grant.sessionId !== SYSTEM_TIMEOUT_COMPLETION_GRANT.sessionId ||
+        (structural.envelope.grant === null ||
+          structural.envelope.grant.sessionId !== SYSTEM_TIMEOUT_COMPLETION_GRANT.sessionId ||
           structural.envelope.grant.versionId !== SYSTEM_TIMEOUT_COMPLETION_GRANT.versionId))
     )
       return authorityFailure();
@@ -767,10 +854,13 @@ export function createFoundationAcceptance(
       currentAuthorization.grantType !== "control" ||
       currentAuthorization.eventGameId !== batch.input.eventGameId ||
       (!isSystemTimeoutCompletionBatch(batch) &&
-        (currentAuthorization.grantSessionId !== structural.envelope.grant.sessionId ||
+        !isTrustedSystemAction(structural.envelope) &&
+        (structural.envelope.grant === null ||
+          currentAuthorization.grantSessionId !== structural.envelope.grant.sessionId ||
           currentAuthorization.grantVersion !== structural.envelope.grant.versionId)) ||
       (isSystemTimeoutCompletionBatch(batch) &&
-        (structural.envelope.grant.sessionId !== SYSTEM_TIMEOUT_COMPLETION_GRANT.sessionId ||
+        (structural.envelope.grant === null ||
+          structural.envelope.grant.sessionId !== SYSTEM_TIMEOUT_COMPLETION_GRANT.sessionId ||
           structural.envelope.grant.versionId !== SYSTEM_TIMEOUT_COMPLETION_GRANT.versionId))
     )
       return authorityFailure();
@@ -999,7 +1089,7 @@ export function createFoundationAcceptance(
         mode,
         replayState,
         existing.action,
-        batch.input.lifecycleTransition,
+        deferLifecycleTransition ? undefined : batch.input.lifecycleTransition,
         batch.input.reconcileDerivedLifecycle === true,
         batch.input.systemOperation,
       );
@@ -1089,7 +1179,7 @@ export function createFoundationAcceptance(
       current,
       mode,
       replayState,
-      batch.input.lifecycleTransition,
+      deferLifecycleTransition ? undefined : batch.input.lifecycleTransition,
       batch.input.reconcileDerivedLifecycle === true,
       batch.input.systemOperation,
     );
@@ -1108,6 +1198,27 @@ export function createFoundationAcceptance(
     reconcileDerivedLifecycle: boolean,
     systemOperation?: ControlActionBatchInput["systemOperation"],
   ): OneOutcome {
+    if (action.grant === null) {
+      controlAudit.links = {
+        ...controlAudit.links!,
+        contentFingerprint: fingerprint,
+      };
+      transaction.appendAuditEntry(controlAudit);
+      options.failureInjector?.("after-control-audit");
+      applyLifecycleTransition(
+        transaction,
+        root.recordId,
+        lifecycleTransition,
+        reconcileDerivedLifecycle,
+      );
+      return {
+        result: {
+          status: "accepted",
+          action,
+          auditId: controlAudit.auditId,
+        },
+      };
+    }
     const acceptanceId = `accept-${sha256(`${root.recordId}:${action.operationId}:${action.grant.sessionId}`)}`;
     const grantAudit = linkedGrantAudit(
       options.grant,
@@ -1158,6 +1269,10 @@ export function createFoundationAcceptance(
       controlAudit.auditId,
       grantAudit.auditId,
     );
+  }
+
+  function isTrustedSystemAction(input: ControlActionInput): boolean {
+    return input.origin === "system-heat-stoppage" && input.grant === null;
   }
 
   function recoverExistingOutcome(
@@ -1279,6 +1394,38 @@ export function createFoundationAcceptance(
     systemOperation?: ControlActionBatchInput["systemOperation"],
   ): OneOutcome {
     const nowMs = readNow(clock);
+    if (prepared.input.grant === null) {
+      const controlAudit = createControlAudit(
+        prepared.input,
+        "action-duplicate",
+        "The trusted system obligation was already committed.",
+        nowMs,
+        {
+          interpretation: existing.interpretation,
+          relatedOperationIds: relatedFactOperationIds(transaction, root, existing.interpretation),
+        },
+      );
+      controlAudit.outcome = "accepted";
+      controlAudit.links = {
+        ...controlAudit.links!,
+        contentFingerprint: prepared.contentFingerprint,
+      };
+      transaction.appendAuditEntry(controlAudit);
+      options.failureInjector?.("after-control-audit");
+      applyLifecycleTransition(
+        transaction,
+        root.recordId,
+        lifecycleTransition,
+        reconcileDerivedLifecycle,
+      );
+      return {
+        result: {
+          status: "duplicate-accepted",
+          action: existing,
+          auditId: controlAudit.auditId,
+        },
+      };
+    }
     const controlAudit = createControlAudit(
       prepared.input,
       "action-duplicate",
@@ -1571,7 +1718,7 @@ export function createFoundationAcceptance(
     return {
       result: {
         status: "locked-discarded",
-        count: reservation?.actionCount ?? batch.actions.length,
+        count: batch.actions.length,
         eventGameId: root.eventGameId,
         rejectedAtMs,
       },
@@ -1594,6 +1741,8 @@ export function createFoundationAcceptance(
     )
       return null;
     const mode = raw.mode === "replay" ? "replay" : raw.mode === "online" ? "online" : undefined;
+    if (raw.atomic !== undefined && typeof raw.atomic !== "boolean") return null;
+    const atomic = raw.atomic === true;
     const replay =
       isRecord(raw.replay) &&
       typeof raw.replay.sessionBearer === "string" &&
@@ -1609,6 +1758,7 @@ export function createFoundationAcceptance(
     if ((mode === "online" && replay !== undefined) || (mode === "replay" && replay === undefined))
       return null;
     const effectiveMode = mode ?? (replay === undefined ? "online" : "replay");
+    if (atomic && effectiveMode === "replay") return null;
     let size: number;
     try {
       size = Buffer.byteLength(JSON.stringify(raw), "utf8");
@@ -1631,12 +1781,14 @@ export function createFoundationAcceptance(
         return null;
       const grant = canonicalizeJson(envelope.value.grant);
       const lifecycle = canonicalizeJson(envelope.value.lifecycle);
+      const trustedSystem = isTrustedSystemAction(envelope.value);
+      if (envelope.value.origin === "system-heat-stoppage" && !trustedSystem) return null;
       if (
-        (grantEnvelope !== undefined && grantEnvelope !== grant) ||
+        (!trustedSystem && grantEnvelope !== undefined && grantEnvelope !== grant) ||
         (lifecycleEnvelope !== undefined && lifecycleEnvelope !== lifecycle)
       )
         return null;
-      grantEnvelope ??= grant;
+      if (!trustedSystem) grantEnvelope ??= grant;
       lifecycleEnvelope ??= lifecycle;
       if (
         envelope.value.recoveryProvenance !== undefined &&
@@ -1659,6 +1811,7 @@ export function createFoundationAcceptance(
       recordId,
       eventGameId,
       mode: effectiveMode,
+      ...(atomic ? { atomic: true } : {}),
       replay: replay
         ? {
             originatingSessionId: replay.originatingSessionId,
@@ -1679,6 +1832,7 @@ export function createFoundationAcceptance(
         actions: raw.actions,
         sessionBearer: typeof raw.sessionBearer === "string" ? raw.sessionBearer : undefined,
         mode: effectiveMode,
+        atomic,
         replay,
         reconcileDerivedLifecycle: raw.reconcileDerivedLifecycle === true,
         lifecycleTransition: isRecord(raw.lifecycleTransition)
@@ -1839,436 +1993,441 @@ export function createFoundationAcceptance(
     );
     return { value: created, mismatch: false };
   }
-}
 
-function recoverCommittedReplay(
-  transaction: FoundationStorageTransaction,
-  reservation: StoredReplayReservation,
-  attempt: StoredReplayAttempt,
-  keyRing: GrantAuthorityOptions["keyRing"],
-): OneOutcome {
-  const expectedAction = transaction.findActionByOperationId(
-    reservation.recordId,
-    attempt.operationId,
-  )?.action;
-  const controlAudit = transaction
-    .listAuditEntries(reservation.recordId)
-    .find((entry) => entry.auditId === attempt.controlAuditId);
-  const result = readAttemptResult(attempt, expectedAction, controlAudit?.links?.reason);
-  const receipt = transaction.findReplayReceiptByReservationId(reservation.reservationId);
-  if (receipt === null) throw new Error("Committed replay receipt is missing.");
-  return {
-    result,
-    reservationId: reservation.reservationId,
-    receipt: encodeReceipt(reservation.reservationId, keyRing, receipt.receiptKeyVersion),
-  };
-}
-
-function authorityFailure(): OneOutcome {
-  return {
-    result: {
-      status: "authority-expired",
-      reason: "grant-session",
-      detail: "The Grant Session is no longer current.",
-    },
-  };
-}
-
-function samePreparedAction(
-  left: PreparedControlAction,
-  right: PreparedControlAction | null | undefined,
-): boolean {
-  return (
-    right !== null &&
-    right !== undefined &&
-    left.codecIdentity === right.codecIdentity &&
-    left.canonicalContent === right.canonicalContent &&
-    left.contentFingerprint === right.contentFingerprint &&
-    canonicalizeJson(left.interpretation) === canonicalizeJson(right.interpretation) &&
-    canonicalizeJson(left.input.lifecycle) === canonicalizeJson(right.input.lifecycle)
-  );
-}
-
-function samePreparationResultIgnoringTrustedOccurrence(
-  left: PreparedControlAction | null,
-  right: PreparedControlAction | null,
-): boolean {
-  if (left === null || right === null) return left === right;
-  return (
-    left.codecIdentity === right.codecIdentity &&
-    canonicalizeJson(actionContentWithoutTrustedOccurrence(left.input)) ===
-      canonicalizeJson(actionContentWithoutTrustedOccurrence(right.input)) &&
-    canonicalizeJson(left.interpretation) === canonicalizeJson(right.interpretation) &&
-    canonicalizeJson(left.input.lifecycle) === canonicalizeJson(right.input.lifecycle)
-  );
-}
-
-function sameImmutableActionContent(
-  existing: ControlAction,
-  candidate: ControlActionInput,
-): boolean {
-  return (
-    canonicalizeJson(actionContentWithoutTrustedOccurrence(existing)) ===
-    canonicalizeJson(actionContentWithoutTrustedOccurrence(candidate))
-  );
-}
-
-function actionContentWithoutTrustedOccurrence(
-  action: ControlActionInput,
-): Record<string, unknown> {
-  return {
-    recordId: action.recordId,
-    eventGameId: action.eventGameId,
-    operationId: action.operationId,
-    kind: action.kind,
-    payload: action.payload,
-    causalPredecessorIds: action.causalPredecessorIds,
-    occurrence: {
-      clientOriginAtMs: action.occurrence.clientOriginAtMs,
-      source: action.occurrence.source,
-    },
-    grant: action.grant,
-    lifecycle: action.lifecycle,
-    override: action.override ?? null,
-    recoveryProvenance: action.recoveryProvenance ?? null,
-  };
-}
-
-function withTrustedOccurrence(raw: unknown, trustedAtMs: number): unknown {
-  if (!isRecord(raw) || !isRecord(raw.occurrence)) return raw;
-  return {
-    ...structuredClone(raw),
-    occurrence: {
-      ...structuredClone(raw.occurrence),
-      trustedAtMs,
-    },
-  };
-}
-
-function one(result: FoundationActionResult): OneOutcome {
-  return { result };
-}
-
-function validateCurrentAction(
-  transaction: FoundationStorageTransaction,
-  root: EventGameRecordRoot,
-  prepared: PreparedControlAction,
-  options: FoundationAcceptanceOptions,
-): { reason: string; detail: string } | null {
-  const dependency = validateDependencies(transaction, prepared.input);
-  if (dependency !== null) return dependency;
-  if (
-    prepared.interpretation.type === "correction" &&
-    findFactById(transaction.listActions(root.recordId), prepared.interpretation.targetFactId) ===
-      null
-  )
-    return { reason: "fact-target-missing", detail: "The Correction target is not retained." };
-  if (
-    prepared.interpretation.type === "team-assignment-correction" &&
-    options.externalScopeResolver.resolveEventTeam(
-      root.eventId,
-      prepared.interpretation.eventTeamId,
-      transaction,
-    ).status !== "resolved"
-  )
-    return { reason: "invalid-action", detail: "The Event Team is unavailable." };
-  return null;
-}
-
-function dependencyOutcome(
-  predecessorResults: readonly FoundationActionResult[],
-): { status: "dependency-blocked" | "retry-later"; reason: string; detail: string } | undefined {
-  if (
-    predecessorResults.some(
-      (result) => result.status === "retry-later" || result.status === "authority-expired",
-    )
-  )
+  function recoverCommittedReplay(
+    transaction: FoundationStorageTransaction,
+    reservation: StoredReplayReservation,
+    attempt: StoredReplayAttempt,
+    keyRing: GrantAuthorityOptions["keyRing"],
+  ): OneOutcome {
+    const expectedAction = transaction.findActionByOperationId(
+      reservation.recordId,
+      attempt.operationId,
+    )?.action;
+    const controlAudit = transaction
+      .listAuditEntries(reservation.recordId)
+      .find((entry) => entry.auditId === attempt.controlAuditId);
+    const result = readAttemptResult(attempt, expectedAction, controlAudit?.links?.reason);
+    const receipt = transaction.findReplayReceiptByReservationId(reservation.reservationId);
+    if (receipt === null) throw new Error("Committed replay receipt is missing.");
     return {
-      status: "retry-later",
-      reason: "causal-predecessor-retry",
-      detail: "Retry after the causal predecessor reaches a definitive outcome.",
-    };
-  if (
-    predecessorResults.some(
-      (result) => result.status !== "accepted" && result.status !== "duplicate-accepted",
-    )
-  )
-    return {
-      status: "dependency-blocked",
-      reason: "causal-dependency-rejected",
-      detail: "A causal predecessor did not commit.",
-    };
-  return undefined;
-}
-
-function readAttemptResult(
-  attempt: StoredReplayAttempt,
-  expectedAction?: ControlAction,
-  expectedReason?: string,
-): FoundationActionResult {
-  const failure = replayAttemptResultFailure(attempt, expectedAction, expectedReason);
-  if (failure !== null) throw new Error(failure);
-  return JSON.parse(attempt.resultJson!) as FoundationActionResult;
-}
-function reservationIdFor(batch: PreparedBatch, sessionId: string): string {
-  // The reservation identifies the authenticated replay slot, not its
-  // contents. The batch digest remains authenticated mutable evidence and is
-  // checked by ensureReservation, while a locked delivery can still find and
-  // discard an existing reserved/partial slot without retaining content-derived
-  // identifiers.
-  return `reservation-${sha256(`${batch.input.recordId}:${batch.input.eventGameId}:${batch.input.replay?.originatingSessionId ?? ""}:${sessionId}`)}`;
-}
-
-function rejectionCandidate(
-  prepared: PreparedControlAction | undefined,
-  input: ControlActionEnvelope | ControlActionInput,
-  registry: ControlActionCodecRegistry,
-): {
-  codecIdentity: string;
-  codecFingerprint: string;
-  canonicalContent: string;
-  contentFingerprint: string;
-} {
-  if (prepared !== undefined) {
-    return {
-      codecIdentity: prepared.codecIdentity,
-      codecFingerprint: prepared.codecFingerprint,
-      canonicalContent: prepared.canonicalContent,
-      contentFingerprint: prepared.contentFingerprint,
+      result,
+      reservationId: reservation.reservationId,
+      receipt: encodeReceipt(reservation.reservationId, keyRing, receipt.receiptKeyVersion),
     };
   }
-  const codecIdentity = controlActionCodecIdentity(input.kind, registry);
-  const canonicalContent = canonicalizeJson(input);
-  return {
-    codecIdentity,
-    codecFingerprint: codecIdentity,
-    canonicalContent,
-    contentFingerprint: sha256(`${codecIdentity}:${canonicalContent}`),
-  };
-}
 
-function sameRejectedCandidate(
-  links: NonNullable<ControlAuditEntry["links"]>,
-  candidate: ReturnType<typeof rejectionCandidate>,
-): boolean {
-  const rejected = links.rejectedCandidate;
-  if (
-    rejected === undefined ||
-    rejected.codecIdentity !== candidate.codecIdentity ||
-    rejected.codecFingerprint !== candidate.codecFingerprint ||
-    rejected.canonicalContent !== candidate.canonicalContent ||
-    rejected.contentFingerprint !== candidate.contentFingerprint
-  )
-    return false;
-  const collision = links.collision?.rejectedAttempt;
-  return (
-    collision === undefined ||
-    (collision.codecIdentity === candidate.codecIdentity &&
-      collision.codecFingerprint === candidate.codecFingerprint &&
-      collision.canonicalContent === candidate.canonicalContent &&
-      collision.contentFingerprint === candidate.contentFingerprint)
-  );
-}
-
-function parseGrantOutcomeDetail(value: string | null | undefined): {
-  status: FoundationActionResult["status"];
-  reason: FoundationRejectionReason | null;
-} | null {
-  if (value === null || value === undefined) return null;
-  try {
-    const parsed = JSON.parse(value) as Record<string, unknown>;
-    if (
-      typeof parsed.status !== "string" ||
-      ![
-        "accepted",
-        "duplicate-accepted",
-        "rejected",
-        "dependency-blocked",
-        "authority-expired",
-        "retry-later",
-      ].includes(parsed.status) ||
-      (parsed.reason !== null && typeof parsed.reason !== "string")
-    )
-      return null;
+  function authorityFailure(): OneOutcome {
     return {
-      status: parsed.status as FoundationActionResult["status"],
-      reason: parsed.reason === null ? null : normalizeFoundationRejectionReason(parsed.reason),
+      result: {
+        status: "authority-expired",
+        reason: "grant-session",
+        detail: "The Grant Session is no longer current.",
+      },
     };
-  } catch {
+  }
+
+  function samePreparedAction(
+    left: PreparedControlAction,
+    right: PreparedControlAction | null | undefined,
+  ): boolean {
+    return (
+      right !== null &&
+      right !== undefined &&
+      left.codecIdentity === right.codecIdentity &&
+      left.canonicalContent === right.canonicalContent &&
+      left.contentFingerprint === right.contentFingerprint &&
+      canonicalizeJson(left.interpretation) === canonicalizeJson(right.interpretation) &&
+      canonicalizeJson(left.input.lifecycle) === canonicalizeJson(right.input.lifecycle)
+    );
+  }
+
+  function samePreparationResultIgnoringTrustedOccurrence(
+    left: PreparedControlAction | null,
+    right: PreparedControlAction | null,
+  ): boolean {
+    if (left === null || right === null) return left === right;
+    return (
+      left.codecIdentity === right.codecIdentity &&
+      canonicalizeJson(actionContentWithoutTrustedOccurrence(left.input)) ===
+        canonicalizeJson(actionContentWithoutTrustedOccurrence(right.input)) &&
+      canonicalizeJson(left.interpretation) === canonicalizeJson(right.interpretation) &&
+      canonicalizeJson(left.input.lifecycle) === canonicalizeJson(right.input.lifecycle)
+    );
+  }
+
+  function sameImmutableActionContent(
+    existing: ControlAction,
+    candidate: ControlActionInput,
+  ): boolean {
+    return (
+      canonicalizeJson(actionContentWithoutTrustedOccurrence(existing)) ===
+      canonicalizeJson(actionContentWithoutTrustedOccurrence(candidate))
+    );
+  }
+
+  function actionContentWithoutTrustedOccurrence(
+    action: ControlActionInput,
+  ): Record<string, unknown> {
+    return {
+      recordId: action.recordId,
+      eventGameId: action.eventGameId,
+      operationId: action.operationId,
+      kind: action.kind,
+      payload: action.payload,
+      causalPredecessorIds: action.causalPredecessorIds,
+      occurrence: {
+        clientOriginAtMs: action.occurrence.clientOriginAtMs,
+        source: action.occurrence.source,
+      },
+      grant: action.grant,
+      origin: action.origin ?? null,
+      lifecycle: action.lifecycle,
+      override: action.override ?? null,
+      recoveryProvenance: action.recoveryProvenance ?? null,
+    };
+  }
+
+  function withTrustedOccurrence(raw: unknown, trustedAtMs: number): unknown {
+    if (!isRecord(raw) || !isRecord(raw.occurrence)) return raw;
+    return {
+      ...structuredClone(raw),
+      occurrence: {
+        ...structuredClone(raw.occurrence),
+        trustedAtMs,
+      },
+    };
+  }
+
+  function one(result: FoundationActionResult): OneOutcome {
+    return { result };
+  }
+
+  function validateCurrentAction(
+    transaction: FoundationStorageTransaction,
+    root: EventGameRecordRoot,
+    prepared: PreparedControlAction,
+    options: FoundationAcceptanceOptions,
+  ): { reason: string; detail: string } | null {
+    const dependency = validateDependencies(transaction, prepared.input);
+    if (dependency !== null) return dependency;
+    if (
+      prepared.interpretation.type === "correction" &&
+      findFactById(transaction.listActions(root.recordId), prepared.interpretation.targetFactId) ===
+        null
+    )
+      return { reason: "fact-target-missing", detail: "The Correction target is not retained." };
+    if (
+      prepared.interpretation.type === "team-assignment-correction" &&
+      options.externalScopeResolver.resolveEventTeam(
+        root.eventId,
+        prepared.interpretation.eventTeamId,
+        transaction,
+      ).status !== "resolved"
+    )
+      return { reason: "invalid-action", detail: "The Event Team is unavailable." };
     return null;
   }
-}
 
-function linkedGrantAudit(
-  options: GrantAuthorityOptions,
-  grant: StoredGrant,
-  session: StoredGrantSession,
-  acceptanceId: string,
-  controlAuditId: string,
-  controlActionId: string,
-  outcome: string,
-  contentFingerprint: string,
-  createdAtMs: number,
-  reason: FoundationRejectionReason | null,
-  detail: string | null = null,
-  systemOperation?: ControlActionBatchInput["systemOperation"],
-) {
-  const action =
-    outcome === "accepted"
-      ? "control-action-accepted"
-      : outcome === "duplicate-accepted"
-        ? "control-action-duplicate"
-        : outcome === "retry-later"
-          ? "control-action-retry-later"
-          : outcome === "dependency-blocked"
-            ? "control-action-dependency-blocked"
-            : "control-action-rejected";
-  return {
-    ...createGrantAudit(
-      options,
-      auditInput(
-        action,
-        grant,
-        systemOperation === "timeout-completion"
-          ? { kind: "system", value: "timeout-completion" as const }
-          : {
-              kind: "session",
-              sessionId: session.sessionId,
-              pseudonymKeyVersion: session.browserContextKeyVersion,
-            },
-        grant.status,
-        systemOperation === "timeout-completion" ? null : session.sessionId,
-        null,
-        session.eventGameId,
-        grant.status,
-        null,
-        null,
-        null,
-        null,
-        null,
-      ),
-    ),
-    acceptanceId,
-    controlAuditId,
-    controlActionId,
-    contentFingerprint,
-    outcomeDetail: canonicalizeJson({
-      status: outcome,
-      reason,
-      detail: detail ?? "",
-      ...(systemOperation === "timeout-completion"
-        ? { provenance: "system-timeout-completion" }
-        : {}),
-    }),
-    createdAtMs,
-  };
-}
-
-function takeBudget(
-  transaction: FoundationStorageTransaction,
-  kind: StoredAcceptanceBudget["bucketKind"],
-  subjectId: string,
-  capacity: number,
-  refillPerSecond: number,
-  nowMs: number,
-  keyRing: GrantAuthorityOptions["keyRing"],
-): boolean {
-  const bucketId = `budget-${kind}:${subjectId}`;
-  const previous = transaction.findAcceptanceBudget(bucketId);
-  const elapsed = previous === null ? 0 : Math.max(0, nowMs - previous.updatedAtMs) / 1000;
-  const tokens = Math.min(capacity, (previous?.tokens ?? capacity) + elapsed * refillPerSecond);
-  const allowed = tokens >= 1;
-  transaction.upsertAcceptanceBudget({
-    bucketId,
-    bucketKind: kind,
-    subjectId,
-    capacity,
-    refillPerSecond,
-    tokens: allowed ? tokens - 1 : tokens,
-    updatedAtMs: nowMs,
-    stateRevision: (previous?.stateRevision ?? 0) + 1,
-  });
-  transaction.insertAcceptanceIntegrityAnchor(
-    anchorFor(
-      "budget",
-      {
-        bucketId,
-        bucketKind: kind,
-        subjectId,
-        capacity,
-        refillPerSecond,
-        tokens: allowed ? tokens - 1 : tokens,
-        updatedAtMs: nowMs,
-        stateRevision: (previous?.stateRevision ?? 0) + 1,
-      },
-      keyRing,
-    ),
-  );
-  return allowed;
-}
-
-function topologicalOrder(
-  actions: readonly { operationId: string; predecessors: readonly string[] }[],
-): number[] | null {
-  const byOperation = new Map(actions.map((item, index) => [item.operationId, index]));
-  const indegree = actions.map(
-    (item) => item.predecessors.filter((id) => byOperation.has(id)).length,
-  );
-  const order: number[] = [];
-  while (order.length < actions.length) {
-    const next = actions.findIndex((_, index) => indegree[index] === 0 && !order.includes(index));
-    if (next < 0) return null;
-    order.push(next);
-    const operation = actions[next]?.operationId;
-    for (const [index, item] of actions.entries())
-      if (item.predecessors.includes(operation ?? "")) indegree[index] = (indegree[index] ?? 0) - 1;
-    indegree[next] = -1;
+  function dependencyOutcome(
+    predecessorResults: readonly FoundationActionResult[],
+  ): { status: "dependency-blocked" | "retry-later"; reason: string; detail: string } | undefined {
+    if (
+      predecessorResults.some(
+        (result) => result.status === "retry-later" || result.status === "authority-expired",
+      )
+    )
+      return {
+        status: "retry-later",
+        reason: "causal-predecessor-retry",
+        detail: "Retry after the causal predecessor reaches a definitive outcome.",
+      };
+    if (
+      predecessorResults.some(
+        (result) => result.status !== "accepted" && result.status !== "duplicate-accepted",
+      )
+    )
+      return {
+        status: "dependency-blocked",
+        reason: "causal-dependency-rejected",
+        detail: "A causal predecessor did not commit.",
+      };
+    return undefined;
   }
-  return order;
-}
-function predecessorResultsFor(
-  batch: PreparedBatch,
-  results: readonly FoundationActionResult[],
-  index: number,
-): FoundationActionResult[] {
-  const predecessorResults: FoundationActionResult[] = [];
-  for (const predecessor of batch.actions[index]?.envelope.causalPredecessorIds ?? []) {
-    const predecessorIndex = batch.actions.findIndex(
-      (candidate) => candidate.envelope.operationId === predecessor,
+
+  function readAttemptResult(
+    attempt: StoredReplayAttempt,
+    expectedAction?: ControlAction,
+    expectedReason?: string,
+  ): FoundationActionResult {
+    const failure = replayAttemptResultFailure(attempt, expectedAction, expectedReason);
+    if (failure !== null) throw new Error(failure);
+    return JSON.parse(attempt.resultJson!) as FoundationActionResult;
+  }
+  function reservationIdFor(batch: PreparedBatch, sessionId: string): string {
+    // The reservation identifies the authenticated replay slot, not its
+    // contents. The batch digest remains authenticated mutable evidence and is
+    // checked by ensureReservation, while a locked delivery can still find and
+    // discard an existing reserved/partial slot without retaining content-derived
+    // identifiers.
+    return `reservation-${sha256(`${batch.input.recordId}:${batch.input.eventGameId}:${batch.input.replay?.originatingSessionId ?? ""}:${sessionId}`)}`;
+  }
+
+  function rejectionCandidate(
+    prepared: PreparedControlAction | undefined,
+    input: ControlActionEnvelope | ControlActionInput,
+    registry: ControlActionCodecRegistry,
+  ): {
+    codecIdentity: string;
+    codecFingerprint: string;
+    canonicalContent: string;
+    contentFingerprint: string;
+  } {
+    if (prepared !== undefined) {
+      return {
+        codecIdentity: prepared.codecIdentity,
+        codecFingerprint: prepared.codecFingerprint,
+        canonicalContent: prepared.canonicalContent,
+        contentFingerprint: prepared.contentFingerprint,
+      };
+    }
+    const codecIdentity = controlActionCodecIdentity(input.kind, registry);
+    const canonicalContent = canonicalizeJson(input);
+    return {
+      codecIdentity,
+      codecFingerprint: codecIdentity,
+      canonicalContent,
+      contentFingerprint: sha256(`${codecIdentity}:${canonicalContent}`),
+    };
+  }
+
+  function sameRejectedCandidate(
+    links: NonNullable<ControlAuditEntry["links"]>,
+    candidate: ReturnType<typeof rejectionCandidate>,
+  ): boolean {
+    const rejected = links.rejectedCandidate;
+    if (
+      rejected === undefined ||
+      rejected.codecIdentity !== candidate.codecIdentity ||
+      rejected.codecFingerprint !== candidate.codecFingerprint ||
+      rejected.canonicalContent !== candidate.canonicalContent ||
+      rejected.contentFingerprint !== candidate.contentFingerprint
+    )
+      return false;
+    const collision = links.collision?.rejectedAttempt;
+    return (
+      collision === undefined ||
+      (collision.codecIdentity === candidate.codecIdentity &&
+        collision.codecFingerprint === candidate.codecFingerprint &&
+        collision.canonicalContent === candidate.canonicalContent &&
+        collision.contentFingerprint === candidate.contentFingerprint)
     );
-    if (predecessorIndex >= 0 && results[predecessorIndex] !== undefined)
-      predecessorResults.push(results[predecessorIndex]);
   }
-  return predecessorResults;
-}
-function encodeReceipt(
-  reservationId: string,
-  keyRing: GrantAuthorityOptions["keyRing"],
-  keyVersion = keyRing.lookup.currentVersion,
-): string {
-  return `${reservationId}.${computeLookupDigest(
-    `acceptance-receipt:${reservationId}`,
-    keyRing,
-    keyVersion,
-  )}`;
-}
-function readNow(clock: () => number): number {
-  const nowMs = clock();
-  if (!Number.isSafeInteger(nowMs) || nowMs < 0)
-    throw new Error("Acceptance clock returned an invalid timestamp.");
-  return nowMs;
-}
 
-function relatedFactOperationIds(
-  transaction: FoundationStorageSnapshot,
-  root: EventGameRecordRoot,
-  interpretation: ControlAction["interpretation"],
-): readonly string[] {
-  if (interpretation.type !== "correction") return [];
-  const target = findFactById(transaction.listActions(root.recordId), interpretation.targetFactId);
-  return target === null ? [] : [target.action.operationId];
-}
+  function parseGrantOutcomeDetail(value: string | null | undefined): {
+    status: FoundationActionResult["status"];
+    reason: FoundationRejectionReason | null;
+  } | null {
+    if (value === null || value === undefined) return null;
+    try {
+      const parsed = JSON.parse(value) as Record<string, unknown>;
+      if (
+        typeof parsed.status !== "string" ||
+        ![
+          "accepted",
+          "duplicate-accepted",
+          "rejected",
+          "dependency-blocked",
+          "authority-expired",
+          "retry-later",
+        ].includes(parsed.status) ||
+        (parsed.reason !== null && typeof parsed.reason !== "string")
+      )
+        return null;
+      return {
+        status: parsed.status as FoundationActionResult["status"],
+        reason: parsed.reason === null ? null : normalizeFoundationRejectionReason(parsed.reason),
+      };
+    } catch {
+      return null;
+    }
+  }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
+  function linkedGrantAudit(
+    options: GrantAuthorityOptions,
+    grant: StoredGrant,
+    session: StoredGrantSession,
+    acceptanceId: string,
+    controlAuditId: string,
+    controlActionId: string,
+    outcome: string,
+    contentFingerprint: string,
+    createdAtMs: number,
+    reason: FoundationRejectionReason | null,
+    detail: string | null = null,
+    systemOperation?: ControlActionBatchInput["systemOperation"],
+  ) {
+    const action =
+      outcome === "accepted"
+        ? "control-action-accepted"
+        : outcome === "duplicate-accepted"
+          ? "control-action-duplicate"
+          : outcome === "retry-later"
+            ? "control-action-retry-later"
+            : outcome === "dependency-blocked"
+              ? "control-action-dependency-blocked"
+              : "control-action-rejected";
+    return {
+      ...createGrantAudit(
+        options,
+        auditInput(
+          action,
+          grant,
+          systemOperation === "timeout-completion"
+            ? { kind: "system", value: "timeout-completion" as const }
+            : {
+                kind: "session",
+                sessionId: session.sessionId,
+                pseudonymKeyVersion: session.browserContextKeyVersion,
+              },
+          grant.status,
+          systemOperation === "timeout-completion" ? null : session.sessionId,
+          null,
+          session.eventGameId,
+          grant.status,
+          null,
+          null,
+          null,
+          null,
+          null,
+        ),
+      ),
+      acceptanceId,
+      controlAuditId,
+      controlActionId,
+      contentFingerprint,
+      outcomeDetail: canonicalizeJson({
+        status: outcome,
+        reason,
+        detail: detail ?? "",
+        ...(systemOperation === "timeout-completion"
+          ? { provenance: "system-timeout-completion" }
+          : {}),
+      }),
+      createdAtMs,
+    };
+  }
+
+  function takeBudget(
+    transaction: FoundationStorageTransaction,
+    kind: StoredAcceptanceBudget["bucketKind"],
+    subjectId: string,
+    capacity: number,
+    refillPerSecond: number,
+    nowMs: number,
+    keyRing: GrantAuthorityOptions["keyRing"],
+  ): boolean {
+    const bucketId = `budget-${kind}:${subjectId}`;
+    const previous = transaction.findAcceptanceBudget(bucketId);
+    const elapsed = previous === null ? 0 : Math.max(0, nowMs - previous.updatedAtMs) / 1000;
+    const tokens = Math.min(capacity, (previous?.tokens ?? capacity) + elapsed * refillPerSecond);
+    const allowed = tokens >= 1;
+    transaction.upsertAcceptanceBudget({
+      bucketId,
+      bucketKind: kind,
+      subjectId,
+      capacity,
+      refillPerSecond,
+      tokens: allowed ? tokens - 1 : tokens,
+      updatedAtMs: nowMs,
+      stateRevision: (previous?.stateRevision ?? 0) + 1,
+    });
+    transaction.insertAcceptanceIntegrityAnchor(
+      anchorFor(
+        "budget",
+        {
+          bucketId,
+          bucketKind: kind,
+          subjectId,
+          capacity,
+          refillPerSecond,
+          tokens: allowed ? tokens - 1 : tokens,
+          updatedAtMs: nowMs,
+          stateRevision: (previous?.stateRevision ?? 0) + 1,
+        },
+        keyRing,
+      ),
+    );
+    return allowed;
+  }
+
+  function topologicalOrder(
+    actions: readonly { operationId: string; predecessors: readonly string[] }[],
+  ): number[] | null {
+    const byOperation = new Map(actions.map((item, index) => [item.operationId, index]));
+    const indegree = actions.map(
+      (item) => item.predecessors.filter((id) => byOperation.has(id)).length,
+    );
+    const order: number[] = [];
+    while (order.length < actions.length) {
+      const next = actions.findIndex((_, index) => indegree[index] === 0 && !order.includes(index));
+      if (next < 0) return null;
+      order.push(next);
+      const operation = actions[next]?.operationId;
+      for (const [index, item] of actions.entries())
+        if (item.predecessors.includes(operation ?? ""))
+          indegree[index] = (indegree[index] ?? 0) - 1;
+      indegree[next] = -1;
+    }
+    return order;
+  }
+  function predecessorResultsFor(
+    batch: PreparedBatch,
+    results: readonly FoundationActionResult[],
+    index: number,
+  ): FoundationActionResult[] {
+    const predecessorResults: FoundationActionResult[] = [];
+    for (const predecessor of batch.actions[index]?.envelope.causalPredecessorIds ?? []) {
+      const predecessorIndex = batch.actions.findIndex(
+        (candidate) => candidate.envelope.operationId === predecessor,
+      );
+      if (predecessorIndex >= 0 && results[predecessorIndex] !== undefined)
+        predecessorResults.push(results[predecessorIndex]);
+    }
+    return predecessorResults;
+  }
+  function encodeReceipt(
+    reservationId: string,
+    keyRing: GrantAuthorityOptions["keyRing"],
+    keyVersion = keyRing.lookup.currentVersion,
+  ): string {
+    return `${reservationId}.${computeLookupDigest(
+      `acceptance-receipt:${reservationId}`,
+      keyRing,
+      keyVersion,
+    )}`;
+  }
+  function readNow(clock: () => number): number {
+    const nowMs = clock();
+    if (!Number.isSafeInteger(nowMs) || nowMs < 0)
+      throw new Error("Acceptance clock returned an invalid timestamp.");
+    return nowMs;
+  }
+
+  function relatedFactOperationIds(
+    transaction: FoundationStorageSnapshot,
+    root: EventGameRecordRoot,
+    interpretation: ControlAction["interpretation"],
+  ): readonly string[] {
+    if (interpretation.type !== "correction") return [];
+    const target = findFactById(
+      transaction.listActions(root.recordId),
+      interpretation.targetFactId,
+    );
+    return target === null ? [] : [target.action.operationId];
+  }
+
+  function isRecord(value: unknown): value is Record<string, unknown> {
+    return typeof value === "object" && value !== null && !Array.isArray(value);
+  }
 }

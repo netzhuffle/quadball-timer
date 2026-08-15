@@ -780,6 +780,7 @@ describe("SQLite foundation storage", () => {
       const controlSessionStayMigration = FOUNDATION_MIGRATIONS[21];
       const eventTeamsMigration = FOUNDATION_MIGRATIONS[22];
       const removalAuditMigration = FOUNDATION_MIGRATIONS[27];
+      const heatStoppageConfigurationMigration = FOUNDATION_MIGRATIONS[29];
       if (
         initialMigration === undefined ||
         repairMigration === undefined ||
@@ -804,7 +805,8 @@ describe("SQLite foundation storage", () => {
         grantCodeLockMigration === undefined ||
         controlSessionStayMigration === undefined ||
         eventTeamsMigration === undefined ||
-        removalAuditMigration === undefined
+        removalAuditMigration === undefined ||
+        heatStoppageConfigurationMigration === undefined
       ) {
         throw new Error("Expected the foundation migrations.");
       }
@@ -846,7 +848,7 @@ describe("SQLite foundation storage", () => {
         "027-event-game-presentation-integrity",
         removalAuditMigration.id,
         "029-access-sheet-generated-audit-action",
-        "030-heat-stoppage-configuration",
+        heatStoppageConfigurationMigration.id,
       ]);
       expect(await current.readiness()).toMatchObject({ ok: true, schemaVersion: "30" });
       current.close();

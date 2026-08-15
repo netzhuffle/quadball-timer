@@ -167,6 +167,77 @@ describe("Live Event Game SQLite runtime", () => {
     let qrCredential: string;
     try {
       await setupStorage.applyMigrations({ requireCandidate: false });
+      await setupStorage.transaction((transaction) => {
+        transaction.insertEvent({
+          eventId: root.eventId,
+          name: "Runtime Event",
+          timeZone: "UTC",
+          publicationStatus: "unpublished",
+          createdAtMs: 1,
+          updatedAtMs: 1,
+        });
+        transaction.insertGameDay({
+          gameDayId: root.externalScope.gameDayId,
+          eventId: root.eventId,
+          date: "2026-08-15",
+          heatStoppageConfiguration: "enabled",
+          createdAtMs: 1,
+          updatedAtMs: 1,
+        });
+        transaction.insertPitch({
+          pitchId: root.externalScope.pitchId,
+          eventId: root.eventId,
+          name: "Runtime Pitch",
+          createdAtMs: 1,
+          updatedAtMs: 1,
+        });
+        transaction.insertGameplaySlot({
+          gameplaySlotId: "runtime-gameplay-slot-1",
+          eventId: root.eventId,
+          gameDayId: root.externalScope.gameDayId,
+          sequence: 1,
+          scheduledStartMs: 1,
+          expectedDelayMs: 0,
+          createdAtMs: 1,
+          updatedAtMs: 1,
+        });
+        transaction.insertPitchSlot({
+          pitchSlotId: root.externalScope.pitchSlotId,
+          eventId: root.eventId,
+          gameDayId: root.externalScope.gameDayId,
+          pitchId: root.externalScope.pitchId,
+          gameplaySlotId: "runtime-gameplay-slot-1",
+          sequence: 1,
+          expectedDelayMs: 0,
+          createdAtMs: 1,
+          updatedAtMs: 1,
+        });
+        transaction.insertEventGame({
+          eventGameId: root.eventGameId,
+          eventId: root.eventId,
+          gameDayId: root.externalScope.gameDayId,
+          gameplaySlotId: "runtime-gameplay-slot-1",
+          pitchSlotId: root.externalScope.pitchSlotId,
+          gameCode: null,
+          gameDesignation: null,
+          sideA: {
+            sideId: "side-a",
+            eventTeamId: null,
+            eventTeamName: null,
+            sourceLabel: "A",
+            confirmedAtMs: null,
+          },
+          sideB: {
+            sideId: "side-b",
+            eventTeamId: null,
+            eventTeamName: null,
+            sourceLabel: "B",
+            confirmedAtMs: null,
+          },
+          createdAtMs: 1,
+          updatedAtMs: 1,
+        });
+      });
       const setupRecord = createEventGameRecord(setupStorage, {
         externalScopeResolver: createExternalScopeResolver(root),
         interpreter: createLiveEventGameIqaInterpreter(),
@@ -202,7 +273,10 @@ describe("Live Event Game SQLite runtime", () => {
         status: "opened",
         eventGameId: root.eventGameId,
         projectionStatus: "available",
-        projection: { scoreByGameSide: { "side-a": 0, "side-b": 0 } },
+        projection: {
+          scoreByGameSide: { "side-a": 0, "side-b": 0 },
+          heat: { mode: "enabled", nextTriggerGameTimeMs: 900_000 },
+        },
       });
       if (opened.status !== "opened") throw new Error("Expected the runtime Controller to open.");
 
@@ -227,6 +301,20 @@ describe("Live Event Game SQLite runtime", () => {
           goalCount: 1,
           commencement: { status: "commenced", commencedAtMs: 10_000 },
         },
+      });
+      const catalogDatabase = new Database(databasePath);
+      catalogDatabase
+        .query(
+          "UPDATE foundation_event_catalog_game_days SET heat_stoppage_configuration = ? WHERE game_day_id = ?",
+        )
+        .run("disabled", root.externalScope.gameDayId);
+      catalogDatabase.close();
+      const afterConfigurationChange = await runtime.control.refreshController({
+        sessionBearer: opened.session.sessionBearer,
+        eventGameId: opened.eventGameId,
+      });
+      expect(afterConfigurationChange).toMatchObject({
+        projection: { heat: { mode: "enabled" } },
       });
 
       const duplicate = await runtime.control.submitControllerIntent({
@@ -552,6 +640,77 @@ describe("Live Event Game SQLite runtime", () => {
     let qrCredential: string;
     try {
       await setupStorage.applyMigrations({ requireCandidate: false });
+      await setupStorage.transaction((transaction) => {
+        transaction.insertEvent({
+          eventId: previous.eventId,
+          name: "Runtime Reassignment Event",
+          timeZone: "UTC",
+          publicationStatus: "unpublished",
+          createdAtMs: 1,
+          updatedAtMs: 1,
+        });
+        transaction.insertGameDay({
+          gameDayId: previous.externalScope.gameDayId,
+          eventId: previous.eventId,
+          date: "2026-08-15",
+          heatStoppageConfiguration: "disabled",
+          createdAtMs: 1,
+          updatedAtMs: 1,
+        });
+        transaction.insertPitch({
+          pitchId: previous.externalScope.pitchId,
+          eventId: previous.eventId,
+          name: "Runtime Reassignment Pitch",
+          createdAtMs: 1,
+          updatedAtMs: 1,
+        });
+        transaction.insertGameplaySlot({
+          gameplaySlotId: "runtime-reassignment-gameplay-slot",
+          eventId: previous.eventId,
+          gameDayId: previous.externalScope.gameDayId,
+          sequence: 1,
+          scheduledStartMs: 1,
+          expectedDelayMs: 0,
+          createdAtMs: 1,
+          updatedAtMs: 1,
+        });
+        transaction.insertPitchSlot({
+          pitchSlotId: previous.externalScope.pitchSlotId,
+          eventId: previous.eventId,
+          gameDayId: previous.externalScope.gameDayId,
+          pitchId: previous.externalScope.pitchId,
+          gameplaySlotId: "runtime-reassignment-gameplay-slot",
+          sequence: 1,
+          expectedDelayMs: 0,
+          createdAtMs: 1,
+          updatedAtMs: 1,
+        });
+        transaction.insertEventGame({
+          eventGameId: previous.eventGameId,
+          eventId: previous.eventId,
+          gameDayId: previous.externalScope.gameDayId,
+          gameplaySlotId: "runtime-reassignment-gameplay-slot",
+          pitchSlotId: previous.externalScope.pitchSlotId,
+          gameCode: null,
+          gameDesignation: null,
+          sideA: {
+            sideId: "side-a",
+            eventTeamId: null,
+            eventTeamName: null,
+            sourceLabel: "A",
+            confirmedAtMs: null,
+          },
+          sideB: {
+            sideId: "side-b",
+            eventTeamId: null,
+            eventTeamName: null,
+            sourceLabel: "B",
+            confirmedAtMs: null,
+          },
+          createdAtMs: 1,
+          updatedAtMs: 1,
+        });
+      });
       for (const root of [previous, current]) {
         const record = createEventGameRecord(setupStorage, {
           externalScopeResolver: createExternalScopeResolver(root),
