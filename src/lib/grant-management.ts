@@ -66,6 +66,11 @@ export function createTypedGrantAuthority(
       }),
     createPitchManagerGrant: (input) =>
       createGrant(storage, options, { ...input, grantType: PITCH_MANAGER_GRANT_TYPE }),
+    createPitchManagerGrantInTransaction: (transaction, input) =>
+      createGrantInTransaction(transaction, options, {
+        ...input,
+        grantType: PITCH_MANAGER_GRANT_TYPE,
+      }),
     createControlGrant: (input) =>
       createGrant(storage, options, { ...input, grantType: GRANT_TYPE }),
     createGrantCode: (grantId, authority) =>
@@ -76,6 +81,9 @@ export function createTypedGrantAuthority(
       disableGrantCode(storage, options, grantId, authority),
     admitGrantCode: (input) => admitGrantCode(storage, options, input),
     admitGrant: (input) => admitGrant(storage, options, input),
+    admitPitchManagerGrant: (input) =>
+      admitGrant(storage, options, input, PITCH_MANAGER_GRANT_TYPE),
+    admitEventAdminGrant: (input) => admitGrant(storage, options, input, EVENT_ADMIN_GRANT_TYPE),
     authorizeGrant: (input) => authorizeGrant(storage, options, input),
     authorizeGrantInTransaction: (transaction, input) =>
       authorizeGrantInTransaction(transaction, options, input),

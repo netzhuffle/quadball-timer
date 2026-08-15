@@ -173,6 +173,8 @@ export type StoredGameplaySlot = {
   gameDayId: string;
   sequence: number;
   scheduledStartMs: number;
+  /** Optional until the schedule-delay projection is persisted by the catalog. */
+  expectedDelayMs?: number;
   createdAtMs: number;
   updatedAtMs: number;
 };
@@ -184,6 +186,8 @@ export type StoredPitchSlot = {
   pitchId: string;
   gameplaySlotId: string;
   sequence: number;
+  /** Optional until the schedule-delay projection is persisted by the catalog. */
+  expectedDelayMs?: number;
   createdAtMs: number;
   updatedAtMs: number;
 };

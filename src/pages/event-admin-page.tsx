@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import QRCode from "qrcode/lib/browser";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -61,6 +62,18 @@ type ScheduleResponse = {
     eventGames: HubResponse["value"]["event"]["eventGames"];
   };
 };
+type PitchManagerGrantResponse = {
+  status: "accepted";
+  value: {
+    grantId: string;
+    grantVersion: string;
+    gameDayId: string;
+    gameDayDate: string;
+    pitchId: string;
+    status: string;
+    expiresAtMs: number | null;
+  };
+};
 
 class EventPublicationValidationError extends Error {}
 
@@ -108,6 +121,11 @@ export function EventAdminPage() {
     pitchSlots: HubResponse["value"]["event"]["pitchSlots"];
     eventGames: HubResponse["value"]["event"]["eventGames"];
   } | null>(null);
+  const [pitchManagerPitchId, setPitchManagerPitchId] = useState("");
+  const [pitchManagerGrant, setPitchManagerGrant] = useState<
+    PitchManagerGrantResponse["value"] | null
+  >(null);
+  const [pitchManagerQrDataUrl, setPitchManagerQrDataUrl] = useState<string | null>(null);
   const [publicationImpactConfirmed, setPublicationImpactConfirmed] = useState(false);
 
   const loadHub = async (nextGameDayId = selectedGameDayId) => {
@@ -186,6 +204,17 @@ export function EventAdminPage() {
     setPitchView(payload.value);
   };
 
+  const loadPitchManagerGrant = async () => {
+    if (selectedGameDayId === null || pitchManagerPitchId.length === 0) return;
+    const response = await fetch(
+      `/api/event-admin/events/${eventId}/game-days/${selectedGameDayId}/pitches/${pitchManagerPitchId}/pitch-manager-grant`,
+    );
+    const payload = (await response.json()) as PitchManagerGrantResponse | { status: string };
+    if (!response.ok || payload.status !== "accepted") throw new Error("Grant lookup failed.");
+    setPitchManagerGrant((payload as PitchManagerGrantResponse).value ?? null);
+    setPitchManagerQrDataUrl(null);
+  };
+
   const changePublicationStatus = async (status: "unpublished" | "published" | "cancelled") => {
     if (hub === null) return;
     const leavingPublished = hub.event.publicationStatus === "published" && status !== "published";
@@ -222,6 +251,18 @@ export function EventAdminPage() {
         : "Publication Status updated.",
     );
     await loadHub(selectedGameDayId);
+  };
+
+  const managePitchManagerGrant = async (
+    operation: "rotate" | "disable" | "revoke" | "reactivate",
+  ) => {
+    if (selectedGameDayId === null || pitchManagerPitchId.length === 0) return;
+    const response = await fetch(
+      `/api/event-admin/events/${eventId}/game-days/${selectedGameDayId}/pitches/${pitchManagerPitchId}/pitch-manager-grant/${operation}`,
+      { method: "POST" },
+    );
+    if (!response.ok) throw new Error("Pitch Manager Grant lifecycle change failed.");
+    await loadPitchManagerGrant();
   };
 
   const confirmGameplaySlot = async (
@@ -928,6 +969,153 @@ export function EventAdminPage() {
                       );
                     })}
                   </div>
+                ) : null}
+              </div>
+              <div className="space-y-3 rounded-lg border p-3">
+                <div>
+                  <p className="font-semibold">Pitch Manager handoff</p>
+                  <p className="text-xs text-muted-foreground">
+                    One Grant covers exactly one Pitch and Game Day. The QR is revealed only on
+                    demand.
+                  </p>
+                </div>
+                <div className="grid gap-2 sm:grid-cols-2">
+                  <select
+                    aria-label="Pitch Manager Game Day"
+                    className="h-10 rounded-md border bg-background px-3 text-sm"
+                    value={selectedGameDayId ?? ""}
+                    onChange={(event) => {
+                      setSelectedGameDayId(event.target.value);
+                      setPitchManagerGrant(null);
+                      setPitchManagerQrDataUrl(null);
+                    }}
+                  >
+                    <option value="">Game Day</option>
+                    {hub.event.gameDays.map((day) => (
+                      <option key={day.gameDayId} value={day.gameDayId}>
+                        {day.date}
+                      </option>
+                    ))}
+                  </select>
+                  <select
+                    aria-label="Pitch Manager Pitch"
+                    className="h-10 rounded-md border bg-background px-3 text-sm"
+                    value={pitchManagerPitchId}
+                    onChange={(event) => {
+                      setPitchManagerPitchId(event.target.value);
+                      setPitchManagerGrant(null);
+                      setPitchManagerQrDataUrl(null);
+                    }}
+                  >
+                    <option value="">Pitch</option>
+                    {hub.event.pitches.map((pitch) => (
+                      <option key={pitch.pitchId} value={pitch.pitchId}>
+                        {pitch.name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  <Button
+                    variant="outline"
+                    disabled={
+                      busy || selectedGameDayId === null || pitchManagerPitchId.length === 0
+                    }
+                    onClick={() => void run(loadPitchManagerGrant)}
+                  >
+                    Inspect Grant
+                  </Button>
+                  <Button
+                    disabled={
+                      busy || selectedGameDayId === null || pitchManagerPitchId.length === 0
+                    }
+                    onClick={() =>
+                      void run(async () => {
+                        const response = await fetch(
+                          `/api/event-admin/events/${eventId}/game-days/${selectedGameDayId}/pitches/${pitchManagerPitchId}/pitch-manager-grant`,
+                          { method: "POST" },
+                        );
+                        if (!response.ok) throw new Error("Pitch Manager Grant creation failed.");
+                        await loadPitchManagerGrant();
+                      })
+                    }
+                  >
+                    Create Grant
+                  </Button>
+                  <Button
+                    variant="outline"
+                    disabled={busy || pitchManagerGrant === null}
+                    onClick={() =>
+                      void run(async () => {
+                        const response = await fetch(
+                          `/api/event-admin/events/${eventId}/game-days/${selectedGameDayId}/pitches/${pitchManagerPitchId}/pitch-manager-grant/reveal`,
+                          { method: "POST" },
+                        );
+                        const payload = (await response.json()) as {
+                          status: string;
+                          value?: { qrCredential?: string };
+                        };
+                        if (
+                          !response.ok ||
+                          payload.status !== "accepted" ||
+                          payload.value?.qrCredential === undefined
+                        )
+                          throw new Error("Pitch Manager QR reveal failed.");
+                        setPitchManagerQrDataUrl(
+                          await QRCode.toDataURL(payload.value.qrCredential),
+                        );
+                      })
+                    }
+                  >
+                    Reveal QR
+                  </Button>
+                  <Button
+                    variant="outline"
+                    aria-label="Rotate Pitch Manager Grant"
+                    disabled={busy || pitchManagerGrant === null}
+                    onClick={() => void run(() => managePitchManagerGrant("rotate"))}
+                  >
+                    Rotate Grant
+                  </Button>
+                  <Button
+                    variant="outline"
+                    aria-label="Disable Pitch Manager Grant"
+                    disabled={busy || pitchManagerGrant === null}
+                    onClick={() => void run(() => managePitchManagerGrant("disable"))}
+                  >
+                    Disable Grant
+                  </Button>
+                  <Button
+                    variant="outline"
+                    aria-label="Revoke Pitch Manager Grant"
+                    disabled={busy || pitchManagerGrant === null}
+                    onClick={() => void run(() => managePitchManagerGrant("revoke"))}
+                  >
+                    Revoke Grant
+                  </Button>
+                  <Button
+                    variant="outline"
+                    aria-label="Reactivate Pitch Manager Grant"
+                    disabled={busy || pitchManagerGrant === null}
+                    onClick={() => void run(() => managePitchManagerGrant("reactivate"))}
+                  >
+                    Reactivate Grant
+                  </Button>
+                </div>
+                {pitchManagerGrant ? (
+                  <p className="text-sm">
+                    {pitchManagerGrant.status} · expires{" "}
+                    {pitchManagerGrant.expiresAtMs === null
+                      ? "never"
+                      : new Date(pitchManagerGrant.expiresAtMs).toLocaleString()}
+                  </p>
+                ) : null}
+                {pitchManagerQrDataUrl ? (
+                  <img
+                    alt="Pitch Manager Grant QR code"
+                    className="h-48 w-48 rounded border bg-white p-2"
+                    src={pitchManagerQrDataUrl}
+                  />
                 ) : null}
               </div>
               <Button variant="outline" onClick={() => setHub(null)}>
