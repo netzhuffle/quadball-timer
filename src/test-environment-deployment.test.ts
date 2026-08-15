@@ -16,6 +16,9 @@ describe("Test Environment deployment contract", () => {
     expect(unit).toContain("Environment=PORT=3001");
     expect(unit).toContain("Environment=PUBLIC_ORIGIN=https://test.timer.quadball.app");
     expect(unit).toContain("StateDirectory=quadball-timer-test");
+    expect(unit).toContain(
+      "Environment=GRANT_KEY_RING_FILE=/etc/quadball-timer/test-grant-key-ring.json",
+    );
     expect(unit).toContain("EnvironmentFile=/etc/quadball-timer/test.env");
     expect(unit).not.toContain("/var/lib/quadball-timer/");
     expect(unit).not.toContain("quadball-timer.service");
@@ -80,6 +83,9 @@ describe("Test Environment deployment contract", () => {
     );
     expect(activation).toContain("${release_dir}/deploy/systemd/quadball-timer-test.service");
     expect(activation).not.toContain("${release_dir}/deploy/quadball-timer.service");
+    expect(activation).toContain(
+      "GRANT_KEY_RING_FILE=/etc/quadball-timer/test-grant-key-ring.json",
+    );
     expect(activation).not.toContain("/srv/quadball-timer/current");
   });
 
@@ -129,5 +135,8 @@ describe("Test Environment deployment contract", () => {
     );
     expect(provisioning).toContain("NOPASSWD: /usr/bin/systemctl restart quadball-timer-test");
     expect(provisioning).not.toContain("NOPASSWD: /bin/systemctl");
+    expect(provisioning).toContain("Test Grant Key Ring Recovery");
+    expect(provisioning).toContain("test-grant-key-ring.json");
+    expect(provisioning).toContain("The server never installs or invokes 1Password.");
   });
 });

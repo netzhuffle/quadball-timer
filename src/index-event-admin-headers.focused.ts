@@ -2,6 +2,8 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { writeFileSync } from "node:fs";
+import { createGrantKeyRingDocument, writeGrantKeyRingFile } from "@/lib/grant-key-ring-custody";
 
 describe("Event Hub early response headers", () => {
   test("marks unauthenticated and unavailable early responses as sensitive", async () => {
@@ -13,13 +15,7 @@ describe("Event Hub early response headers", () => {
       expect(await response.json()).toEqual({ error: "Authentication failed." });
     });
 
-    await withServer({ incompleteGrantKeys: true }, async (serverUrl) => {
-      const response = await fetch(new URL("/api/event-admin/hub?eventId=event", serverUrl));
-      expect(response.status).toBe(503);
-      expect(response.headers.get("cache-control")).toBe("no-store");
-      expect(response.headers.get("referrer-policy")).toBe("no-referrer");
-      expect(await response.json()).toEqual({ error: "Authentication failed." });
-    });
+    await withServer({ incompleteGrantKeys: true }, async () => {});
   });
 });
 
@@ -128,7 +124,14 @@ async function withServer(
     WEBAUTHN_RP_ID: "localhost",
     PORT: "0",
     TECHNICAL_ADMIN_DATABASE: join(directory, "technical-admin.sqlite"),
+    GRANT_KEY_RING_FILE: join(directory, "grant-key-ring.json"),
   });
+  const grantKeyRingPath = environment.GRANT_KEY_RING_FILE!;
+  if (options.incompleteGrantKeys) {
+    writeFileSync(grantKeyRingPath, "{}\n", { mode: 0o600 });
+  } else {
+    writeGrantKeyRingFile(grantKeyRingPath, createGrantKeyRingDocument("test"));
+  }
   delete environment.FOUNDATION_DATABASE;
   delete environment.GRANT_LOOKUP_KEY;
   delete environment.GRANT_AUDIT_KEY;
@@ -142,6 +145,13 @@ async function withServer(
     stderr: "pipe",
   });
   try {
+    if (options.incompleteGrantKeys) {
+      const exitCode = await Promise.race([server.exited, Bun.sleep(2_500).then(() => null)]);
+      if (exitCode === null) server.kill();
+      expect(exitCode).not.toBe(null);
+      expect(exitCode).not.toBe(0);
+      return;
+    }
     const serverUrl = await readServerUrl(server.stdout);
     await work(serverUrl);
   } finally {

@@ -14,6 +14,7 @@ set deploy_user deploy-quadball-timer-test
 set base_dir /srv/quadball-timer-test
 set env_dir /etc/quadball-timer
 set env_file $env_dir/test.env
+set grant_ring_file $env_dir/test-grant-key-ring.json
 set group $app
 
 getent group $group >/dev/null 2>&1; or sudo groupadd --system $group
@@ -51,7 +52,7 @@ sudo install -d -o root -g $app -m 0750 $env_dir
 sudo test -s $env_file; or begin
     set secret_dir (mktemp -d /tmp/quadball-timer-test-keys.XXXXXX)
     set generated_env $secret_dir/test.env
-    for name in GRANT_ENCRYPTION_KEY GRANT_LOOKUP_KEY GRANT_AUDIT_KEY EVENT_GAME_ENCRYPTION_KEY EVENT_GAME_LOOKUP_KEY EVENT_GAME_AUDIT_KEY
+    for name in EVENT_GAME_ENCRYPTION_KEY EVENT_GAME_LOOKUP_KEY EVENT_GAME_AUDIT_KEY
         openssl rand -hex 32 > $secret_dir/$name
         printf '%s=' $name >> $generated_env
         cat $secret_dir/$name >> $generated_env
@@ -63,9 +64,47 @@ sudo test -s $env_file; or begin
 end
 ```
 
-The block generates six distinct Test-only 32-byte keys into a private
+The block generates three distinct Test-only Event Game keys into a private
 temporary directory and installs them without printing their values. It does
 not overwrite an existing non-empty key file. Never reuse a Production key.
+
+The Grant key ring is generated off-host so the same values can be stored in
+the separate human recovery item before the active copy reaches the server.
+Run this locally in fish once for Test and once for Production, using separate
+temporary directories and separate 1Password items:
+
+```fish
+set key_dir (mktemp -d /tmp/quadball-grant-ring-test.XXXXXX)
+chmod 700 $key_dir
+bun run grant:key-ring create --environment test --active-file $key_dir/test-grant-key-ring.json --handoff-file $key_dir/test-grant-key-ring-1password.json
+```
+
+Copy the non-secret metadata into the 1Password item named Quadball Timer
+Test Grant Key Ring Recovery; store the generated keyRing object as the
+item's protected recovery fields. Keep the handoff file private and remove it
+after the item is verified. Transfer only the active ring file to the host,
+then install it as root; never put it in the release, repository, database, or
+workflow artifact:
+
+```fish
+scp $key_dir/test-grant-key-ring.json jannis@jannis.rocks:/tmp/quadball-timer-test-grant-key-ring.json
+```
+
+On jannis.rocks, as jannis, install the transferred copy and remove the
+temporary server copy:
+
+```fish
+sudo install -o root -g quadball-timer-test -m 0640 /tmp/quadball-timer-test-grant-key-ring.json $grant_ring_file
+sudo rm -f /tmp/quadball-timer-test-grant-key-ring.json
+sudo stat -c '%U:%G %a' $grant_ring_file
+```
+
+The Production procedure uses --environment production, a different private
+directory, the Production item named Quadball Timer Production Grant Key Ring
+Recovery, the canonical legacy EnvironmentFile
+/etc/quadball-timer/production.env, and
+/etc/quadball-timer/production-grant-key-ring.json. Never reuse a ring
+between environments. The server never installs or invokes 1Password.
 
 Create a dedicated Test-only Ed25519 deploy key in 1Password. Use no
 passphrase because this workflow reads the key from the GitHub encrypted

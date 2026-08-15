@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { chmod, mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createGrantKeyRingDocument, writeGrantKeyRingFile } from "@/lib/grant-key-ring-custody";
 
 describe("server startup", () => {
   test("starts from a read-only release while an unready Foundation leaves health available", async () => {
@@ -11,14 +12,17 @@ describe("server startup", () => {
     await mkdir(releaseDirectory, { mode: 0o750 });
     await mkdir(stateDirectory, { mode: 0o750 });
     await chmod(releaseDirectory, 0o550);
+    const grantKeyRingPath = join(stateDirectory, "grant-key-ring.json");
+    writeGrantKeyRingFile(grantKeyRingPath, createGrantKeyRingDocument("test"));
     const server = Bun.spawn([process.execPath, "run", join(process.cwd(), "src/index.ts")], {
       cwd: releaseDirectory,
       env: {
-        NODE_ENV: "production",
+        NODE_ENV: "test",
         QUADBALL_ENVIRONMENT: "test",
         PUBLIC_ORIGIN: "https://test.timer.quadball.app",
         TECHNICAL_ADMIN_DATABASE: join(stateDirectory, "technical-admin.sqlite"),
         FOUNDATION_DATABASE: join(stateDirectory, "foundation.sqlite"),
+        GRANT_KEY_RING_FILE: grantKeyRingPath,
         HOST: "127.0.0.1",
         PORT: "0",
       },
@@ -49,14 +53,17 @@ describe("server startup", () => {
     const root = await mkdtemp(join(tmpdir(), "quadball-timer-startup-"));
     const stateDirectory = join(root, "state");
     await mkdir(stateDirectory, { mode: 0o750 });
+    const grantKeyRingPath = join(stateDirectory, "grant-key-ring.json");
+    writeGrantKeyRingFile(grantKeyRingPath, createGrantKeyRingDocument("test"));
     const server = Bun.spawn([process.execPath, "run", join(process.cwd(), "src/index.ts")], {
       cwd: root,
       env: {
-        NODE_ENV: "production",
+        NODE_ENV: "test",
         QUADBALL_ENVIRONMENT: "test",
         PUBLIC_ORIGIN: "https://test.timer.quadball.app",
         TECHNICAL_ADMIN_DATABASE: join(stateDirectory, "technical-admin.sqlite"),
         FOUNDATION_DATABASE: join(root, "absent", "foundation.sqlite"),
+        GRANT_KEY_RING_FILE: grantKeyRingPath,
         HOST: "127.0.0.1",
         PORT: "0",
       },
@@ -71,7 +78,7 @@ describe("server startup", () => {
       });
       const games = await fetch(new URL("/api/games", serverUrl));
       expect(health.status).toBe(200);
-      expect(games.status).toBe(200);
+      expect(games.status).toBe(404);
     } finally {
       server.kill();
       await server.exited;

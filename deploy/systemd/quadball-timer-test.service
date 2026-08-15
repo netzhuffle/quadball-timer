@@ -15,6 +15,7 @@ Environment=PORT=3001
 Environment=TECHNICAL_ADMIN_DATABASE=/var/lib/quadball-timer-test/technical-admin.sqlite
 Environment=FOUNDATION_DATABASE=/var/lib/quadball-timer-test/foundation.sqlite
 Environment=EVENT_GAME_DATABASE=/var/lib/quadball-timer-test/event-game.sqlite
+Environment=GRANT_KEY_RING_FILE=/etc/quadball-timer/test-grant-key-ring.json
 EnvironmentFile=/etc/quadball-timer/test.env
 StateDirectory=quadball-timer-test
 StateDirectoryMode=0750

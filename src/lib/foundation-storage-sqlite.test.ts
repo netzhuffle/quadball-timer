@@ -262,6 +262,24 @@ describe("SQLite foundation storage", () => {
       );
       expect(missingAuditReadiness.evidence?.keys.availableCategories.lookup).toBeGreaterThan(0);
       missingAudit.close();
+
+      const missingEncryptionRing = {
+        ...keyRing,
+        encryption: {
+          currentVersion: "v2",
+          keys: new Map([["v2", keyRing.encryption.keys.get(keyRing.encryption.currentVersion)!]]),
+        },
+      };
+      const missingEncryption = openSqliteFoundationStorage(databasePath, {
+        grantKeyRing: missingEncryptionRing,
+      });
+      const missingEncryptionReadiness = await missingEncryption.readiness();
+      expect(missingEncryptionReadiness.ok).toBe(false);
+      expect(missingEncryptionReadiness.evidence?.keys.missingCount).toBeGreaterThan(0);
+      expect(
+        missingEncryptionReadiness.evidence?.keys.missingCategories.encryption,
+      ).toBeGreaterThan(0);
+      missingEncryption.close();
     });
   });
 

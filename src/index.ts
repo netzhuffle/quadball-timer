@@ -71,6 +71,8 @@ import { openSqliteFoundationStorage } from "@/lib/foundation-storage-sqlite";
 import type { FoundationStorage } from "@/lib/foundation-storage";
 import { assertProductionStateBoundary } from "@/lib/runtime-storage-config";
 import { createStartupCleanup } from "@/lib/startup-resources";
+import { parseGrantKeyRingCli, runGrantKeyRingCli } from "@/lib/grant-key-ring-cli";
+import { GrantKeyRingCustodyError } from "@/lib/grant-key-ring-custody";
 import {
   createAdHocLiveSessionTracker,
   createAdHocGamesService,
@@ -113,6 +115,7 @@ const defaultAdHocService = createAdHocGamesService();
 const pendingSocketReservations = new Map<string, ReturnType<typeof setTimeout>>();
 
 const probeInvocation = parseSqliteProbeInvocation(process.argv.slice(1));
+const grantKeyRingInvocation = parseGrantKeyRingCli(process.argv.slice(1));
 
 async function main() {
   if (process.argv.includes("--release-runtime-identity")) {
@@ -120,6 +123,15 @@ async function main() {
     return;
   }
 
+  if (grantKeyRingInvocation.kind === "invalid") {
+    console.error(grantKeyRingInvocation.error);
+    process.exitCode = 1;
+    return;
+  }
+  if (grantKeyRingInvocation.kind === "operation") {
+    process.exitCode = runGrantKeyRingCli(grantKeyRingInvocation, 0);
+    return;
+  }
   if (probeInvocation.kind === "invalid") {
     console.error(probeInvocation.error);
     process.exitCode = 1;
@@ -140,6 +152,7 @@ async function startServer() {
     | undefined;
   let technicalAdminAuth!: ReturnType<typeof createTechnicalAdminAuth>;
   let foundationStorage: FoundationStorage | undefined;
+  let grantAuthorityOptions: ReturnType<typeof readGrantAuthorityOptions>;
   let server: Bun.Server<SessionData> | undefined;
   let shutdown: (() => void) | undefined;
   const startupCleanup = createStartupCleanup();
@@ -150,6 +163,7 @@ async function startServer() {
     const { technicalAdmin: technicalAdminConfig, storagePaths } = readRuntimeConfig();
     const { environment } = technicalAdminConfig;
     assertProductionStateBoundary(environment, storagePaths);
+    grantAuthorityOptions = readGrantAuthorityOptions(environment);
     const adHocDatabasePath =
       process.env.AD_HOC_DATABASE?.trim() ||
       (environment === "production"
@@ -197,12 +211,6 @@ async function startServer() {
       }),
     );
     startupCleanup.add(() => adHocService.close());
-    let runtimeGrantOptions: ReturnType<typeof readGrantAuthorityOptions> | null = null;
-    try {
-      runtimeGrantOptions = readGrantAuthorityOptions(environment);
-    } catch {
-      // Grant configuration remains an Event Administration dependency.
-    }
     const databasePath = storagePaths.technicalAdminDatabase;
     technicalAdminRepository = createSqliteTechnicalAdminAuthRepository(databasePath, {
       environment: technicalAdminConfig.environment,
@@ -226,9 +234,12 @@ async function startServer() {
         environment === "test" && !process.env.FOUNDATION_DATABASE?.trim()
           ? createInMemoryFoundationStorage()
           : openSqliteFoundationStorage(foundationDatabasePath, {
-              grantKeyRing: runtimeGrantOptions?.keyRing,
+              grantKeyRing: grantAuthorityOptions.keyRing,
             });
       const readiness = await candidateFoundation.readiness();
+      if ((readiness.evidence?.keys?.missingCount ?? 0) > 0) {
+        throw new GrantKeyRingCustodyError("missing-key-version");
+      }
       if (readiness.ok) {
         const readyFoundation = candidateFoundation;
         foundationStorage = readyFoundation;
@@ -246,6 +257,7 @@ async function startServer() {
       candidateFoundation?.close();
       foundationStorage?.close();
       foundationStorage = undefined;
+      if (error instanceof GrantKeyRingCustodyError) throw error;
       eventCatalogStorage = createUnavailableEventCatalogStorage(
         error instanceof Error
           ? `Event catalog foundation storage is unavailable: ${error.message}`
@@ -260,7 +272,7 @@ async function startServer() {
     if (foundationStorage !== undefined) {
       try {
         const grantOptions = {
-          ...(runtimeGrantOptions ?? readGrantAuthorityOptions(environment)),
+          ...grantAuthorityOptions,
           controlScopeResolver: createControlScopeResolver(),
         };
         const grantAuthority = createGrantAuthority(foundationStorage, grantOptions);

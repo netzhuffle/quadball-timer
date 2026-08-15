@@ -12,6 +12,8 @@ Environment=HOST=127.0.0.1
 Environment=PORT=3000
 Environment=TECHNICAL_ADMIN_DATABASE=/var/lib/quadball-timer/technical-admin.sqlite
 Environment=FOUNDATION_DATABASE=/var/lib/quadball-timer/foundation.sqlite
+Environment=GRANT_KEY_RING_FILE=/etc/quadball-timer/production-grant-key-ring.json
+EnvironmentFile=-/etc/quadball-timer/production.env
 StateDirectory=quadball-timer
 StateDirectoryMode=0750
 ExecStart=/srv/quadball-timer/current/quadball-timer

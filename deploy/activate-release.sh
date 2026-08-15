@@ -163,7 +163,8 @@ check_service_state_contract() {
   if [[ "$effective_state_directory" != "quadball-timer" ]] ||
     [[ "$effective_state_directory_mode" != "0750" ]] ||
     [[ " $effective_environment " != *" TECHNICAL_ADMIN_DATABASE=/var/lib/quadball-timer/technical-admin.sqlite "* ]] ||
-    [[ " $effective_environment " != *" FOUNDATION_DATABASE=/var/lib/quadball-timer/foundation.sqlite "* ]]
+    [[ " $effective_environment " != *" FOUNDATION_DATABASE=/var/lib/quadball-timer/foundation.sqlite "* ]] ||
+    [[ " $effective_environment " != *" GRANT_KEY_RING_FILE=/etc/quadball-timer/production-grant-key-ring.json "* ]]
   then
     echo "Systemd service ${service_name} does not provide the required Production state contract." >&2
     echo "Install ${release_dir}/deploy/systemd/quadball-timer.service and run systemctl daemon-reload before activation." >&2

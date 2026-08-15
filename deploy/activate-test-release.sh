@@ -106,7 +106,8 @@ check_service_contract() {
     [[ " $effective_environment " != *" PUBLIC_ORIGIN=https://test.timer.quadball.app "* ]] ||
     [[ " $effective_environment " != *" TECHNICAL_ADMIN_DATABASE=/var/lib/quadball-timer-test/technical-admin.sqlite "* ]] ||
     [[ " $effective_environment " != *" FOUNDATION_DATABASE=/var/lib/quadball-timer-test/foundation.sqlite "* ]] ||
-    [[ " $effective_environment " != *" EVENT_GAME_DATABASE=/var/lib/quadball-timer-test/event-game.sqlite "* ]]; then
+    [[ " $effective_environment " != *" EVENT_GAME_DATABASE=/var/lib/quadball-timer-test/event-game.sqlite "* ]] ||
+    [[ " $effective_environment " != *" GRANT_KEY_RING_FILE=/etc/quadball-timer/test-grant-key-ring.json "* ]]; then
     echo "Test service does not provide the required isolated state contract." >&2
     echo "Install ${release_dir}/deploy/systemd/quadball-timer-test.service and run systemctl daemon-reload." >&2
     return 1
