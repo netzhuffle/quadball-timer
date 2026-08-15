@@ -940,6 +940,24 @@ describe("game-engine", () => {
     expect(state.score.away).toBe(0);
   });
 
+  test("Correction can make a finished Ad Hoc Game unfinished without changing its facts", () => {
+    let state = createInitialGameState({ id: "game-correction", nowMs: 0 });
+    state = applyGameCommand({
+      state,
+      command: { type: "record-double-forfeit" },
+      nowMs: 1,
+    });
+    state = applyGameCommand({
+      state,
+      command: { type: "correct-to-unfinished" },
+      nowMs: 2,
+    });
+
+    expect(state.isFinished).toBe(false);
+    expect(state.finishReason).toBeNull();
+    expect(state.winner).toBeNull();
+  });
+
   test("flag catch that does not create a lead enters overtime instead of ending game", () => {
     const makeId = createIdGenerator();
     let state = createInitialGameState({ id: "game-22", nowMs: 0 });

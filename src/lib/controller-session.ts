@@ -16,6 +16,14 @@ export function getControllerSessionStorageKey(gameId: string) {
   return `quadball:controller-session:${gameId}`;
 }
 
+export function clearPersistedControllerSession(gameId: string) {
+  try {
+    window.localStorage.removeItem(getControllerSessionStorageKey(gameId));
+  } catch {
+    // Best-effort cleanup; the server-side leave remains authoritative.
+  }
+}
+
 export function createPersistedControllerSession({
   gameId,
   state,

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+import QRCode from "qrcode/lib/browser";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { CloudOff, Eye, OctagonX, Shield, TriangleAlert, UserX, Wifi, WifiOff } from "lucide-react";
@@ -32,6 +33,8 @@ import {
   useNow,
   willFlagCatchWin,
 } from "@/lib/game-page-support";
+import { buildAdHocControlQrPayload } from "@/lib/ad-hoc-handoff";
+import { clearPersistedControllerSession } from "@/lib/controller-session";
 import {
   DEFAULT_AWAY_TEAM_COLOR,
   DEFAULT_HOME_TEAM_COLOR,
@@ -104,15 +107,30 @@ export function GamePage({ gameId, role }: { gameId: string; role: ControllerRol
 
   const {
     baseState,
+    controlQr,
     clockOffsetMs,
     dispatchCommand,
     connectionState,
+    error,
     pendingCommands,
     localOnlyMode,
   } = useGameConnection({
     gameId,
     role,
   });
+  const [leaveMessage, setLeaveMessage] = useState<string | null>(null);
+
+  const leaveAdHocGame = useCallback(async () => {
+    setLeaveMessage(null);
+    try {
+      const response = await fetch(`/api/games/${gameId}/leave`, { method: "POST" });
+      if (!response.ok) throw new Error("leave failed");
+      clearPersistedControllerSession(gameId);
+      navigateTo("/");
+    } catch {
+      setLeaveMessage("Ad Hoc Game unavailable.");
+    }
+  }, [gameId]);
 
   useEffect(() => {
     if (baseState !== null) {
@@ -496,8 +514,10 @@ export function GamePage({ gameId, role }: { gameId: string; role: ControllerRol
       <div className="mx-auto flex min-h-screen w-full max-w-3xl items-center justify-center p-6">
         <Card className="w-full">
           <CardHeader>
-            <CardTitle>Loading game</CardTitle>
-            <CardDescription>Waiting for snapshot from server.</CardDescription>
+            <CardTitle>{error ?? "Loading game"}</CardTitle>
+            <CardDescription>
+              {error === null ? "Waiting for snapshot from server." : "Return to the Games page."}
+            </CardDescription>
           </CardHeader>
           <CardContent>
             <Button variant="outline" onClick={() => navigateTo("/")}>
@@ -816,8 +836,21 @@ export function GamePage({ gameId, role }: { gameId: string; role: ControllerRol
               >
                 Games
               </Button>
+              {controller ? (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-7 border-slate-300 bg-white px-2 text-[11px] text-slate-800 hover:bg-slate-100"
+                  onClick={() => void leaveAdHocGame()}
+                >
+                  Leave
+                </Button>
+              ) : null}
             </div>
           </div>
+          {leaveMessage ? (
+            <p className="mt-1 text-[10px] font-medium text-rose-700">{leaveMessage}</p>
+          ) : null}
           {controller ? (
             localOnlyMode ? (
               <p className="mt-1 text-[10px] font-medium text-amber-700">{LOCAL_ONLY_MESSAGE}</p>
@@ -828,6 +861,14 @@ export function GamePage({ gameId, role }: { gameId: string; role: ControllerRol
             ) : null
           ) : null}
         </section>
+
+        {controller ? (
+          <AdHocControlHandoff
+            gameId={gameId}
+            controlQr={controlQr}
+            isFinished={state.isFinished}
+          />
+        ) : null}
 
         <ControllerTopSection
           controller={controller}
@@ -986,6 +1027,7 @@ export function GamePage({ gameId, role }: { gameId: string; role: ControllerRol
             });
           }}
           recordDoubleForfeit={() => dispatchCommand({ type: "record-double-forfeit" })}
+          correctBackToUnfinished={() => dispatchCommand({ type: "correct-to-unfinished" })}
           requestTargetScoreWin={(team) =>
             requestWinConfirmation(`${displayTeamName(team)} reached target score and wins.`, {
               type: "record-target-score",
@@ -1016,6 +1058,149 @@ export function GamePage({ gameId, role }: { gameId: string; role: ControllerRol
         />
       </div>
     </div>
+  );
+}
+
+function AdHocControlHandoff({
+  gameId,
+  controlQr,
+  isFinished,
+}: {
+  gameId: string;
+  controlQr: string | null;
+  isFinished: boolean;
+}) {
+  const [qrDataUrl, setQrDataUrl] = useState<string | null>(null);
+  const [qrError, setQrError] = useState(false);
+  const [qrOpen, setQrOpen] = useState(false);
+  const dialogRef = useRef<HTMLDivElement | null>(null);
+  const closeQrButtonRef = useRef<HTMLButtonElement | null>(null);
+  const showQrButtonRef = useRef<HTMLButtonElement | null>(null);
+  const payload = controlQr === null ? null : buildAdHocControlQrPayload(gameId, controlQr);
+
+  const closeQr = useCallback(() => {
+    setQrOpen(false);
+    window.setTimeout(() => showQrButtonRef.current?.focus(), 0);
+  }, []);
+
+  useEffect(() => {
+    if (!qrOpen) return;
+    closeQrButtonRef.current?.focus();
+    const dialog = dialogRef.current;
+    if (dialog === null) return;
+
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeQr();
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const focusable = Array.from(
+        dialog.querySelectorAll<HTMLElement>(
+          'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
+        ),
+      ).filter((element) => !element.hasAttribute("disabled"));
+      if (focusable.length === 0) {
+        event.preventDefault();
+        return;
+      }
+      const first = focusable[0];
+      const last = focusable.at(-1);
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last?.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first?.focus();
+      }
+    };
+
+    dialog.addEventListener("keydown", onKeyDown);
+    return () => dialog.removeEventListener("keydown", onKeyDown);
+  }, [closeQr, qrOpen]);
+
+  useEffect(() => {
+    if (payload === null) {
+      setQrDataUrl(null);
+      setQrError(false);
+      return;
+    }
+
+    let cancelled = false;
+    setQrError(false);
+    void QRCode.toDataURL(payload, {
+      errorCorrectionLevel: "M",
+      margin: 2,
+      width: 320,
+    })
+      .then((dataUrl) => {
+        if (!cancelled) setQrDataUrl(dataUrl);
+      })
+      .catch(() => {
+        if (!cancelled) setQrError(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [payload]);
+
+  return (
+    <section
+      aria-label="Ad Hoc Controller handoff"
+      className="rounded-2xl border border-slate-300 bg-white p-3 shadow-[0_8px_18px_rgba(15,23,42,0.08)]"
+    >
+      <p className="text-xs font-semibold tracking-wide text-slate-900">Share Ad Hoc Control</p>
+      {isFinished ? (
+        <p className="mt-1 text-[11px] text-slate-600">
+          This Game is finished. Existing Controllers can still make Corrections; new admission is
+          paused.
+        </p>
+      ) : qrOpen ? (
+        <div
+          aria-label="Ad Hoc Control QR dialog"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/50 p-4"
+          aria-modal="true"
+          ref={dialogRef}
+          role="dialog"
+        >
+          <div className="w-full max-w-sm space-y-3 rounded-2xl bg-white p-4 shadow-xl">
+            <div className="flex items-center justify-between gap-2">
+              <p className="text-sm font-semibold text-slate-900">Ad Hoc Control QR</p>
+              <Button ref={closeQrButtonRef} size="sm" variant="outline" onClick={closeQr}>
+                Close Control QR
+              </Button>
+            </div>
+            {qrError ? (
+              <p className="text-[11px] text-rose-700">Unable to display the Control QR.</p>
+            ) : qrDataUrl !== null ? (
+              <>
+                <img
+                  alt="Ad Hoc Control QR code"
+                  className="mx-auto size-64 max-w-full rounded border border-slate-200"
+                  src={qrDataUrl}
+                />
+                <p className="text-center text-[11px] text-slate-600">
+                  Scan this QR on another device to join directly as an equal Controller.
+                </p>
+              </>
+            ) : (
+              <p className="text-[11px] text-slate-600">Preparing the reusable Control QR…</p>
+            )}
+          </div>
+        </div>
+      ) : (
+        <Button
+          ref={showQrButtonRef}
+          size="sm"
+          variant="outline"
+          className="mt-2"
+          onClick={() => setQrOpen(true)}
+        >
+          Show Ad Hoc Control QR
+        </Button>
+      )}
+    </section>
   );
 }
 

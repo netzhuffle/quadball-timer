@@ -3,6 +3,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { Window } from "happy-dom";
 import { App, parseRoute } from "./App";
+import { captureAdHocHandoffFromLocation } from "@/lib/ad-hoc-handoff";
 import { createInitialGameState, projectGameView } from "@/lib/game-engine";
 import { DEFAULT_AWAY_TEAM_COLOR, DEFAULT_HOME_TEAM_COLOR } from "@/lib/team-colors";
 import { createInitialClockBaseline, projectClockBaseline } from "@/lib/clock-authority";
@@ -72,6 +73,69 @@ describe("App", () => {
       type: "game",
       gameId: "adhoc-id_with_underscore",
       role: "controller",
+    });
+  });
+
+  test("parses a QR handoff from the URL fragment without putting the credential in the path", () => {
+    expect(
+      parseRoute(
+        "/",
+        "",
+        "#adhoc-game=adhoc-game-123&adhoc-control=secret-token-abcdefghijklmnopqrstuvwxyz",
+      ),
+    ).toEqual({
+      type: "ad-hoc-handoff",
+      handoff: {
+        gameId: "adhoc-game-123",
+        controlQr: "secret-token-abcdefghijklmnopqrstuvwxyz",
+      },
+    });
+  });
+
+  test("captures and scrubs a QR handoff before the first render", () => {
+    const handoffWindow = new Window({
+      url: "http://localhost:3000/#adhoc-game=adhoc-game-123&adhoc-control=secret-token-abcdefghijklmnopqrstuvwxyz",
+    });
+    const handoff = captureAdHocHandoffFromLocation(handoffWindow.location, handoffWindow.history);
+
+    expect(handoff).toEqual({
+      attempted: true,
+      handoff: {
+        gameId: "adhoc-game-123",
+        controlQr: "secret-token-abcdefghijklmnopqrstuvwxyz",
+      },
+    });
+    expect(handoffWindow.location.hash).toBe("");
+    expect(handoffWindow.location.pathname).toBe("/");
+    expect(handoffWindow.history.state).toBeNull();
+  });
+
+  test("scrubs malformed Ad Hoc attempts and preserves unrelated hashes", () => {
+    const malformedWindow = new Window({
+      url: "http://localhost:3000/#adhoc-game=partial",
+    });
+    expect(
+      captureAdHocHandoffFromLocation(malformedWindow.location, malformedWindow.history),
+    ).toEqual({
+      attempted: true,
+      handoff: null,
+    });
+    expect(malformedWindow.location.hash).toBe("");
+    expect(malformedWindow.history.state).toBeNull();
+
+    const unrelatedWindow = new Window({ url: "http://localhost:3000/#scoreboard" });
+    expect(
+      captureAdHocHandoffFromLocation(unrelatedWindow.location, unrelatedWindow.history),
+    ).toEqual({
+      attempted: false,
+      handoff: null,
+    });
+    expect(unrelatedWindow.location.hash).toBe("#scoreboard");
+  });
+
+  test("routes malformed Ad Hoc attempts to the generic unavailable result", () => {
+    expect(parseRoute("/", "", "#adhoc-control=partial")).toEqual({
+      type: "ad-hoc-unavailable",
     });
   });
 

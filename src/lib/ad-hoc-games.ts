@@ -19,7 +19,7 @@ export const AD_HOC_CREATION_GLOBAL_WINDOW_MS = 60 * 60_000;
 export const AD_HOC_MAX_CREATIONS_PER_SOURCE = 5;
 export const AD_HOC_MAX_CREATIONS_PER_HOUR = 30;
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 const GENERIC_UNAVAILABLE = "Ad Hoc Game unavailable.";
 
 export type AdHocGameView = GameView & {
@@ -33,6 +33,7 @@ export type AdHocCreationInput = {
   awayName: unknown;
   homeColor?: unknown;
   awayColor?: unknown;
+  browserId?: unknown;
   sourceKey?: string;
   nowMs?: number;
 };
@@ -72,7 +73,7 @@ export type AdHocAccessResult =
 
 type StoredSession = {
   sessionHash: string;
-  browserId: string;
+  browserId: string | null;
   connected: boolean;
   lastConnectedAtMs: number;
   lastDisconnectedAtMs: number | null;
@@ -86,6 +87,7 @@ type StoredOperation = {
 
 export type StoredAdHocGame = {
   gameId: string;
+  environmentIdentity: string;
   createdAtMs: number;
   state: GameState;
   controlQr: string;
@@ -116,6 +118,7 @@ export type AdHocGamesServiceOptions = {
   store?: AdHocStore;
   now?: () => number;
   random?: () => string;
+  environmentIdentity?: string;
 };
 
 export type AdHocGamesService = ReturnType<typeof createAdHocGamesService>;
@@ -124,6 +127,7 @@ export function createAdHocGamesService(options: AdHocGamesServiceOptions = {}) 
   const store = options.store ?? createInMemoryAdHocStore();
   const now = options.now ?? (() => Date.now());
   const random = options.random ?? (() => randomBytes(32).toString("base64url"));
+  const environmentIdentity = options.environmentIdentity?.trim() || "test";
 
   return {
     async create(input: AdHocCreationInput): Promise<AdHocCreateResult> {
@@ -150,6 +154,7 @@ export function createAdHocGamesService(options: AdHocGamesServiceOptions = {}) 
 
       const sourceKey =
         typeof input.sourceKey === "string" ? input.sourceKey.trim() : "anonymous-browser";
+      const browserId = validateBrowserId(input.browserId);
       const sourceHash = digest(sourceKey || "anonymous-browser");
       const gameId = `adhoc-${random()}`;
       const sessionId = random();
@@ -164,6 +169,7 @@ export function createAdHocGamesService(options: AdHocGamesServiceOptions = {}) 
       });
       const game: StoredAdHocGame = {
         gameId,
+        environmentIdentity,
         createdAtMs: nowMs,
         state,
         controlQr,
@@ -171,7 +177,7 @@ export function createAdHocGamesService(options: AdHocGamesServiceOptions = {}) 
         sessions: [
           {
             sessionHash: digest(sessionId),
-            browserId: sourceKey || "anonymous-browser",
+            browserId,
             connected: false,
             lastConnectedAtMs: nowMs,
             lastDisconnectedAtMs: null,
@@ -221,7 +227,12 @@ export function createAdHocGamesService(options: AdHocGamesServiceOptions = {}) 
       } catch {
         return unavailable();
       }
-      if (game === null || !hasSession(game, sessionId)) return unavailable();
+      if (
+        game === null ||
+        game.environmentIdentity !== environmentIdentity ||
+        !hasSession(game, sessionId)
+      )
+        return unavailable();
       return {
         status: "accepted",
         game: projectAuthorizedGame(game, sessionId, null, input.nowMs ?? now()),
@@ -231,7 +242,8 @@ export function createAdHocGamesService(options: AdHocGamesServiceOptions = {}) 
     async admit(input: {
       gameId: unknown;
       controlQr: unknown;
-      browserId?: string;
+      browserId?: unknown;
+      priorSessionId?: unknown;
       nowMs?: number;
     }): Promise<AdHocAccessResult> {
       const gameId = validateGameId(input.gameId);
@@ -239,14 +251,26 @@ export function createAdHocGamesService(options: AdHocGamesServiceOptions = {}) 
       if (gameId === null || qr === null) return unavailable();
       const nowMs = input.nowMs ?? now();
       if (!isSafeTimestamp(nowMs)) return unavailable();
+      const browserId = validateBrowserId(input.browserId);
+      const priorSessionId = validateBearer(input.priorSessionId);
       const sessionId = random();
       let outcome: boolean | null;
       try {
         outcome = store.mutateGame(gameId, (game) => {
-          if (game.state.isFinished || digest(qr) !== game.controlQrHash) return false;
+          if (
+            game.environmentIdentity !== environmentIdentity ||
+            game.state.isFinished ||
+            digest(qr) !== game.controlQrHash
+          )
+            return false;
+          game.sessions = game.sessions.filter(
+            (session) =>
+              (priorSessionId === null || session.sessionHash !== digest(priorSessionId)) &&
+              (browserId === null || session.browserId !== browserId),
+          );
           game.sessions.push({
             sessionHash: digest(sessionId),
-            browserId: input.browserId?.trim() || "anonymous-browser",
+            browserId,
             connected: false,
             lastConnectedAtMs: nowMs,
             lastDisconnectedAtMs: null,
@@ -289,7 +313,8 @@ export function createAdHocGamesService(options: AdHocGamesServiceOptions = {}) 
       let outcome: AdHocApplyMutationResult | null;
       try {
         outcome = store.mutateGame<AdHocApplyMutationResult>(gameId, (game) => {
-          if (!hasSession(game, sessionId)) return false;
+          if (game.environmentIdentity !== environmentIdentity || !hasSession(game, sessionId))
+            return false;
           const next = structuredClone(game) as StoredAdHocGame;
           const acknowledged: string[] = [];
           let duplicate = false;
@@ -369,6 +394,7 @@ export function createAdHocGamesService(options: AdHocGamesServiceOptions = {}) 
       try {
         return (
           store.mutateGame(gameId, (game) => {
+            if (game.environmentIdentity !== environmentIdentity) return false;
             const session = game.sessions.find(
               (candidate) => candidate.sessionHash === digest(sessionId),
             );
@@ -391,6 +417,7 @@ export function createAdHocGamesService(options: AdHocGamesServiceOptions = {}) 
       try {
         return (
           store.mutateGame(gameId, (game) => {
+            if (game.environmentIdentity !== environmentIdentity) return false;
             const before = game.sessions.length;
             game.sessions = game.sessions.filter(
               (session) => session.sessionHash !== digest(sessionId),
@@ -471,7 +498,10 @@ export function createInMemoryAdHocStore(): AdHocStore {
   };
 }
 
-export function openSqliteAdHocStore(databasePath: string): AdHocStore {
+export function openSqliteAdHocStore(
+  databasePath: string,
+  environmentIdentity = "test",
+): AdHocStore {
   mkdirSync(dirname(databasePath), { recursive: true });
   const db = new Database(databasePath, { create: true, strict: true });
   db.run("PRAGMA journal_mode = WAL");
@@ -480,9 +510,14 @@ export function openSqliteAdHocStore(databasePath: string): AdHocStore {
   db.run(
     "CREATE TABLE IF NOT EXISTS adhoc_schema (id INTEGER PRIMARY KEY CHECK (id = 1), version INTEGER NOT NULL)",
   );
+  const schemaRow = db.query("SELECT version FROM adhoc_schema WHERE id = 1").get() as {
+    version?: number | string;
+  } | null;
+  const previousSchemaVersion = Number(schemaRow?.version ?? SCHEMA_VERSION);
   db.run("INSERT OR IGNORE INTO adhoc_schema (id, version) VALUES (1, ?)", [SCHEMA_VERSION]);
   db.run(`CREATE TABLE IF NOT EXISTS adhoc_games (
     game_id TEXT PRIMARY KEY,
+    environment_identity TEXT NOT NULL DEFAULT '',
     created_at_ms INTEGER NOT NULL,
     state_json TEXT NOT NULL,
     control_qr TEXT NOT NULL,
@@ -490,6 +525,19 @@ export function openSqliteAdHocStore(databasePath: string): AdHocStore {
     sessions_json TEXT NOT NULL,
     operations_json TEXT NOT NULL
   )`);
+  const columns = db.query("PRAGMA table_info(adhoc_games)").all() as { name?: string }[];
+  if (!columns.some((column) => column.name === "environment_identity")) {
+    db.run("ALTER TABLE adhoc_games ADD COLUMN environment_identity TEXT NOT NULL DEFAULT ''");
+  }
+  if (previousSchemaVersion < SCHEMA_VERSION) {
+    const migrate = db.transaction(() => {
+      db.run("UPDATE adhoc_games SET environment_identity = ? WHERE environment_identity = ''", [
+        environmentIdentity.trim() || "test",
+      ]);
+      db.run("UPDATE adhoc_schema SET version = ? WHERE id = 1", [SCHEMA_VERSION]);
+    });
+    migrate();
+  }
   db.run(
     "CREATE TABLE IF NOT EXISTS adhoc_creation_events (source_hash TEXT NOT NULL, successful INTEGER NOT NULL, occurred_at_ms INTEGER NOT NULL)",
   );
@@ -551,9 +599,10 @@ export function openSqliteAdHocStore(databasePath: string): AdHocStore {
           db.run("DELETE FROM adhoc_games WHERE game_id = ?", [victim.game_id]);
         }
         db.run(
-          "INSERT INTO adhoc_games (game_id, created_at_ms, state_json, control_qr, control_qr_hash, sessions_json, operations_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
+          "INSERT INTO adhoc_games (game_id, environment_identity, created_at_ms, state_json, control_qr, control_qr_hash, sessions_json, operations_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
           [
             game.gameId,
+            game.environmentIdentity,
             game.createdAtMs,
             JSON.stringify(game.state),
             game.controlQr,
@@ -602,6 +651,7 @@ export function openSqliteAdHocStore(databasePath: string): AdHocStore {
 function parseStoredRow(row: Record<string, string | number>): StoredAdHocGame {
   return {
     gameId: String(row.game_id),
+    environmentIdentity: String(row.environment_identity ?? ""),
     createdAtMs: Number(row.created_at_ms),
     state: JSON.parse(String(row.state_json)) as GameState,
     controlQr: String(row.control_qr),
@@ -637,6 +687,12 @@ function validateGameId(value: unknown): string | null {
 
 function validateBearer(value: unknown): string | null {
   return typeof value === "string" && value.length >= 32 && value.length <= 256 ? value : null;
+}
+
+function validateBrowserId(value: unknown): string | null {
+  if (value === undefined || value === null) return null;
+  const result = validateOpaqueIdentifier(value, "browserId");
+  return result.ok ? result.value : null;
 }
 
 function isSafeTimestamp(value: number): boolean {

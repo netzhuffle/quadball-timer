@@ -1,8 +1,15 @@
 import { createRoot } from "react-dom/client";
 import { App } from "./App";
+import { captureAdHocHandoffFromLocation } from "@/lib/ad-hoc-handoff";
 
 const elem = document.getElementById("root")!;
-const app = <App />;
+const initialAdHocHandoff = captureAdHocHandoffFromLocation(window.location, window.history);
+const app = (
+  <App
+    initialAdHocHandoff={initialAdHocHandoff.handoff}
+    initialAdHocHandoffAttempted={initialAdHocHandoff.attempted}
+  />
+);
 
 if (import.meta.hot) {
   // With hot module reloading, `import.meta.hot.data` is persisted.
