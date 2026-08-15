@@ -10,7 +10,9 @@ import {
   isOwnedDockerContainerInspection,
   isDockerResourceViolation,
   isDockerContainerConfigurationAdmitted,
+  SQLITE_FOUNDATION_PROBE_DOCKER_CONTAINER_CONFIGURATION_FORMAT,
   SQLITE_FOUNDATION_PROBE_DOCKER_INFO_IDENTITY_FORMAT,
+  SQLITE_FOUNDATION_PROBE_DOCKER_OWNED_CONTAINER_FORMAT,
   SQLITE_FOUNDATION_PROBE_DOCKER_VERSION_IDENTITY_FORMAT,
   parseDockerEngineIdentity,
   parseDockerArtifactIdentity,
@@ -76,7 +78,6 @@ function admittedContainerInspection(artifactPath: string): string {
       Tmpfs: { "/tmp": "rw,size=16777216,mode=1777" },
     },
     Mounts: [
-      { Type: "tmpfs", Destination: "/tmp", RW: true },
       {
         Type: "bind",
         Source: artifactPath,
@@ -96,6 +97,15 @@ function ownedContainerInspection(): string {
 }
 
 describe("Docker SQLite qualification boundary", () => {
+  test("requests bounded container inspection projections", () => {
+    expect(SQLITE_FOUNDATION_PROBE_DOCKER_CONTAINER_CONFIGURATION_FORMAT).not.toBe("{{json .}}");
+    expect(SQLITE_FOUNDATION_PROBE_DOCKER_OWNED_CONTAINER_FORMAT).not.toBe("{{json .}}");
+    expect(SQLITE_FOUNDATION_PROBE_DOCKER_CONTAINER_CONFIGURATION_FORMAT).toContain('"HostConfig"');
+    expect(SQLITE_FOUNDATION_PROBE_DOCKER_OWNED_CONTAINER_FORMAT).toContain(
+      "com.quadball-timer.sqlite-probe",
+    );
+  });
+
   test("constructs one non-privileged, no-network, bounded container", () => {
     const command = buildDockerContainerArguments({
       name: "quadball-timer-sqlite-test",
@@ -184,7 +194,6 @@ describe("Docker SQLite qualification boundary", () => {
         Tmpfs: { "/tmp": "rw,size=16777216,mode=1777" },
       },
       Mounts: [
-        { Type: "tmpfs", Destination: "/tmp", RW: true },
         {
           Type: "bind",
           Source: "/release/quadball-timer",
@@ -205,6 +214,18 @@ describe("Docker SQLite qualification boundary", () => {
     expect(
       isDockerContainerConfigurationAdmitted(
         inspection.replace('"ReadonlyRootfs":true', '"ReadonlyRootfs":false'),
+        containerId,
+        "owned",
+        capability,
+        "/release/quadball-timer",
+      ),
+    ).toBe(false);
+    expect(
+      isDockerContainerConfigurationAdmitted(
+        inspection.replace(
+          '"/tmp":"rw,size=16777216,mode=1777"',
+          '"/tmp":"rw,size=16777216,mode=1777","/extra":"rw,size=1024"',
+        ),
         containerId,
         "owned",
         capability,

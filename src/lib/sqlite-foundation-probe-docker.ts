@@ -27,6 +27,18 @@ export const SQLITE_FOUNDATION_PROBE_DOCKER_INFO_IDENTITY_FORMAT =
   '{"OSType":{{json .OSType}},"Architecture":{{json .Architecture}}}';
 export const SQLITE_FOUNDATION_PROBE_DOCKER_VERSION_IDENTITY_FORMAT =
   '{"Os":{{json .Server.Os}},"Arch":{{json .Server.Arch}}}';
+export const SQLITE_FOUNDATION_PROBE_DOCKER_OWNED_CONTAINER_FORMAT = `{"Id":{{json .Id}},"Name":{{json .Name}},"Config":{"Labels":{"${SQLITE_FOUNDATION_PROBE_DOCKER_LABEL}":{{json (index .Config.Labels "${SQLITE_FOUNDATION_PROBE_DOCKER_LABEL}")}}}}}`;
+export const SQLITE_FOUNDATION_PROBE_DOCKER_CONTAINER_CONFIGURATION_FORMAT = [
+  `{"Id":{{json .Id}},"Name":{{json .Name}},"Config":{"Labels":{"${SQLITE_FOUNDATION_PROBE_DOCKER_LABEL}":{{json (index .Config.Labels "${SQLITE_FOUNDATION_PROBE_DOCKER_LABEL}")}}},`,
+  '"Env":{{json .Config.Env}},"User":{{json .Config.User}},"WorkingDir":{{json .Config.WorkingDir}}},',
+  '"HostConfig":{"NetworkMode":{{json .HostConfig.NetworkMode}},"Privileged":{{json .HostConfig.Privileged}},',
+  '"PidMode":{{json .HostConfig.PidMode}},"IpcMode":{{json .HostConfig.IpcMode}},"UsernsMode":{{json .HostConfig.UsernsMode}},',
+  '"CgroupnsMode":{{json .HostConfig.CgroupnsMode}},"CgroupParent":{{json .HostConfig.CgroupParent}},',
+  '"ReadonlyRootfs":{{json .HostConfig.ReadonlyRootfs}},"Memory":{{json .HostConfig.Memory}},"PidsLimit":{{json .HostConfig.PidsLimit}},',
+  '"CapDrop":{{json .HostConfig.CapDrop}},"CapAdd":{{json .HostConfig.CapAdd}},"SecurityOpt":{{json .HostConfig.SecurityOpt}},',
+  '"Tmpfs":{{json .HostConfig.Tmpfs}},"Devices":{{json .HostConfig.Devices}},"DeviceRequests":{{json .HostConfig.DeviceRequests}},',
+  '"LogConfig":{{json .HostConfig.LogConfig}}},"Mounts":{{json .Mounts}}}',
+].join("");
 
 export type DockerCommandResult = {
   exitCode: number;
@@ -565,9 +577,10 @@ async function verifyOwnedContainer(
   container: Pick<DockerProbeContainer, "id" | "name" | "capability">,
   signal?: AbortSignal,
 ): Promise<boolean> {
-  const inspected = await runCommand(["inspect", "--format", "{{json .}}", container.id], {
-    signal,
-  });
+  const inspected = await runCommand(
+    ["inspect", "--format", SQLITE_FOUNDATION_PROBE_DOCKER_OWNED_CONTAINER_FORMAT, container.id],
+    { signal },
+  );
   if (inspected.exitCode !== 0 || inspected.outputExceeded) return false;
   return isOwnedDockerContainerInspection(
     inspected.stdout,
@@ -583,9 +596,15 @@ export async function verifyDockerContainerConfiguration(
   signal: AbortSignal | undefined,
   artifactPath: string | null,
 ): Promise<boolean> {
-  const inspected = await runCommand(["inspect", "--format", "{{json .}}", container.id], {
-    signal,
-  }).catch(() => null);
+  const inspected = await runCommand(
+    [
+      "inspect",
+      "--format",
+      SQLITE_FOUNDATION_PROBE_DOCKER_CONTAINER_CONFIGURATION_FORMAT,
+      container.id,
+    ],
+    { signal },
+  ).catch(() => null);
   if (inspected === null || inspected.exitCode !== 0 || inspected.outputExceeded) return false;
   return isDockerContainerConfigurationAdmitted(
     inspected.stdout,
@@ -609,7 +628,11 @@ export function isDockerContainerConfigurationAdmitted(
     const hostConfig = inspected.HostConfig as Record<string, unknown> | undefined;
     const labels = config?.Labels as Record<string, unknown> | undefined;
     const mounts = Array.isArray(inspected.Mounts) ? inspected.Mounts : [];
-    const tmpfs = hostConfig?.Tmpfs as Record<string, unknown> | undefined;
+    const tmpfsValue = hostConfig?.Tmpfs;
+    const tmpfs =
+      typeof tmpfsValue === "object" && tmpfsValue !== null && !Array.isArray(tmpfsValue)
+        ? (tmpfsValue as Record<string, unknown>)
+        : undefined;
     const capDrop = Array.isArray(hostConfig?.CapDrop) ? hostConfig.CapDrop : [];
     const capAdd = Array.isArray(hostConfig?.CapAdd) ? hostConfig.CapAdd : [];
     const securityOptions = Array.isArray(hostConfig?.SecurityOpt) ? hostConfig.SecurityOpt : [];
@@ -623,13 +646,6 @@ export function isDockerContainerConfigurationAdmitted(
         typeof mount === "object" &&
         mount !== null &&
         (mount as Record<string, unknown>).Destination === "/opt/quadball-timer",
-    );
-    const tmpfsMounts = mounts.filter(
-      (mount) =>
-        typeof mount === "object" &&
-        mount !== null &&
-        (mount as Record<string, unknown>).Type === "tmpfs" &&
-        (mount as Record<string, unknown>).Destination === "/tmp",
     );
     return (
       inspected.Id === id &&
@@ -653,20 +669,19 @@ export function isDockerContainerConfigurationAdmitted(
       logOptions?.["max-size"] === SQLITE_FOUNDATION_PROBE_DOCKER_LOG_MAX_SIZE &&
       logOptions?.["max-file"] === SQLITE_FOUNDATION_PROBE_DOCKER_LOG_MAX_FILE &&
       tmpfs?.["/tmp"] === `rw,size=${SQLITE_FOUNDATION_PROBE_MAX_DISK_BYTES},mode=1777` &&
+      Object.keys(tmpfs).length === 1 &&
       capAdd.length === 0 &&
       config?.User === "65532:65532" &&
       config.WorkingDir === "/tmp" &&
       environment.every(isAllowlistedDockerEnvironment) &&
       hasRequiredDockerEnvironment(environment) &&
-      tmpfsMounts.length === 1 &&
-      (tmpfsMounts[0] as Record<string, unknown>).RW === true &&
       (artifactPath === null
-        ? artifactMount === undefined && mounts.length === 1
+        ? artifactMount === undefined && mounts.length === 0
         : artifactMount?.Type === "bind" &&
           artifactMount.Source === artifactPath &&
           artifactMount.Destination === "/opt/quadball-timer" &&
           artifactMount.RW === false &&
-          mounts.length === 2)
+          mounts.length === 1)
     );
   } catch {
     return false;
