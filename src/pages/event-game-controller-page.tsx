@@ -132,6 +132,9 @@ export function EventGameControllerPage() {
   const [qrDialogOpen, setQrDialogOpen] = useState(false);
   const [switchTarget, setSwitchTarget] = useState<string | null>(null);
   const [stayedOnAssignment, setStayedOnAssignment] = useState<string | null>(null);
+  const [acknowledgedTeamCorrections, setAcknowledgedTeamCorrections] = useState<
+    Readonly<Record<string, string>>
+  >({});
   const [clockRunning, setClockRunning] = useState(false);
   const [clockReceiptAnchor, setClockReceiptAnchor] = useState<ClockReceiptAnchor | null>(null);
   const [localMonotonicMs, setLocalMonotonicMs] = useState(readMonotonicNow);
@@ -972,8 +975,9 @@ export function EventGameControllerPage() {
       const relatedPendingOperationId =
         relatedFactId === undefined
           ? undefined
-          : current.pendingActions.find((action) => action.intent.factId === relatedFactId)?.intent
-              .operationId;
+          : current.pendingActions.find(
+              (action) => "factId" in action.intent && action.intent.factId === relatedFactId,
+            )?.intent.operationId;
       const dispatched = dispatchControllerAction(
         current,
         {
@@ -1000,6 +1004,21 @@ export function EventGameControllerPage() {
     } catch {
       setMessage("The Controller action could not be retained safely.");
     }
+  }
+
+  function acknowledgeTeamAssignment(
+    correction: NonNullable<ControllerProjection["teamAssignmentCorrections"]>[number],
+  ) {
+    queueIntent({
+      version: LIVE_EVENT_CONTROL_INTENT_VERSION,
+      type: "acknowledge-team-assignment",
+      operationId: crypto.randomUUID(),
+      factId: crypto.randomUUID(),
+      gameSideId: correction.gameSideId,
+      correctionOperationId: correction.operationId,
+      gameTimeMs: 0,
+      occurrence: { clientOriginAtMs: Date.now() },
+    });
   }
 
   function currentSportingTimeMs(): number | null {
@@ -1375,6 +1394,12 @@ export function EventGameControllerPage() {
         if (intent.type === "clock" || intent.type === "set-running") {
           setClockRunning(intent.running);
         }
+      }
+      if (intent.type === "acknowledge-team-assignment") {
+        setAcknowledgedTeamCorrections((current) => ({
+          ...current,
+          [intent.gameSideId]: intent.correctionOperationId,
+        }));
       }
     } catch {
       setMessage("The online Controller action could not be submitted.");
@@ -1794,6 +1819,28 @@ export function EventGameControllerPage() {
                     </label>
                   ))}
                 </div>
+              )}
+              {projection?.teamAssignmentCorrections?.map((correction) =>
+                acknowledgedTeamCorrections[correction.gameSideId] ===
+                correction.operationId ? null : (
+                  <div
+                    key={correction.operationId}
+                    className="flex items-center justify-between gap-3 rounded border border-amber-300 bg-amber-50 p-2 text-sm"
+                  >
+                    <span>
+                      Game Side {correction.gameSideId} now uses {correction.eventTeamName} (Event
+                      Team {correction.eventTeamId}). Acknowledge the corrected identity before
+                      recording another team action.
+                    </span>
+                    <Button
+                      variant="outline"
+                      onClick={() => acknowledgeTeamAssignment(correction)}
+                      disabled={busy}
+                    >
+                      Acknowledge identity
+                    </Button>
+                  </div>
+                ),
               )}
               <div className="flex flex-wrap gap-2">
                 {[-60_000, -10_000, 10_000, 60_000].map((adjustmentMs) => (

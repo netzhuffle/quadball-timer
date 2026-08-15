@@ -68,6 +68,43 @@ const eventHub = {
   authority: "event-admin",
 };
 
+const identityEventHub = {
+  ...eventHub,
+  event: {
+    ...eventHub.event,
+    teams: [
+      { eventTeamId: "team-a", name: "Original Team", defaultColor: "#112233", roster: [] },
+      { eventTeamId: "team-b", name: "Corrected Team", defaultColor: "#445566", roster: [] },
+    ],
+    eventGames: [
+      {
+        eventGameId: "game-identity",
+        gameDayId: "day",
+        gameplaySlotId: "gameplay",
+        pitchSlotId: "slot",
+        gameCode: "G-1",
+        gameDesignation: "Pool A",
+        sideA: {
+          sideId: "side-a",
+          eventTeamId: "team-a",
+          eventTeamName: "Original Team",
+          sourceLabel: null,
+        },
+        sideB: {
+          sideId: "side-b",
+          eventTeamId: "team-b",
+          eventTeamName: "Corrected Team",
+          sourceLabel: null,
+        },
+        expectedStartMs: Date.UTC(2026, 7, 15, 10),
+        expectedPlayingPeriod: { startMs: 0, endMs: 1 },
+        scheduleConflict: false,
+        teamScheduleConflict: false,
+      },
+    ],
+  },
+};
+
 const twoDayEventHub = {
   ...eventHub,
   selectedGameDayId: "day",
@@ -195,6 +232,93 @@ describe("Grant secret UI lifecycle", () => {
     await clickButton("Enable");
     expect(configurationUpdates).toBe(1);
     expect(container.textContent).toContain("Currently enabled");
+  });
+
+  test("Event Admin operates public identity and presentation controls", async () => {
+    const requests: { url: string; body: Record<string, unknown> }[] = [];
+    let hubCalls = 0;
+    fetchHandler = async (input, init) => {
+      const url =
+        typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      const method = init?.method ?? "GET";
+      if (url.endsWith("/api/event-admin/admit"))
+        return json({ status: "admitted", sessionExpiresAtMs: 123_000 });
+      if (url.includes("/api/event-admin/hub")) {
+        hubCalls += 1;
+        if (hubCalls === 1) return json({ status: "rejected" }, 401);
+        return json({ status: "accepted", value: identityEventHub });
+      }
+      if (method === "POST" && (url.endsWith("/identity") || url.endsWith("/presentation"))) {
+        requests.push({
+          url,
+          body: JSON.parse(typeof init?.body === "string" ? init.body : "{}") as Record<
+            string,
+            unknown
+          >,
+        });
+        return json({ status: "accepted", value: identityEventHub });
+      }
+      throw new Error(`Unexpected request: ${method} ${url}`);
+    };
+
+    await render(<EventAdminPage />);
+    await admitEventAdmin();
+    const identitySelect = container.querySelector(
+      'select[aria-label="Correct game-identity sideA Event Team"]',
+    ) as HTMLSelectElement | null;
+    expect(identitySelect).not.toBeNull();
+    await act(async () => {
+      setSelectValue(identitySelect as HTMLSelectElement, "team-b");
+      await flush();
+    });
+    const identityButton = Array.from(container.querySelectorAll("button")).find(
+      (button) =>
+        button.textContent?.trim() === "Correct identity" &&
+        button.parentElement?.querySelector(
+          'select[aria-label="Correct game-identity sideA Event Team"]',
+        ) !== null,
+    );
+    expect(identityButton).not.toBeNull();
+    await act(async () => {
+      identityButton?.click();
+      await flush();
+    });
+    expect(requests[0]).toMatchObject({
+      url: "/api/event-admin/events/event/game-days/day/event-games/game-identity/identity",
+      body: { gameSideId: "side-a", eventTeamId: "team-b", confirmation: false },
+    });
+
+    const orientation = container.querySelector(
+      'select[aria-label="game-identity pitch orientation"]',
+    ) as HTMLSelectElement;
+    await act(async () => {
+      setSelectValue(orientation, "side-b-left");
+      await flush();
+    });
+    expect(requests.at(-1)).toMatchObject({
+      url: "/api/event-admin/events/event/event-games/game-identity/presentation",
+      body: { change: { type: "pitch-orientation", pitchOrientation: "side-b-left" } },
+    });
+
+    const color = container.querySelector(
+      'input[aria-label="game-identity sideA displayed color"]',
+    ) as HTMLInputElement;
+    await act(async () => {
+      setInputValue(color, "#abcdef");
+      await flush();
+    });
+    const colorButton = color.parentElement?.querySelector("button") as HTMLButtonElement | null;
+    expect(colorButton).not.toBeNull();
+    await act(async () => {
+      colorButton?.click();
+      await flush();
+    });
+    expect(requests.at(-1)).toMatchObject({
+      url: "/api/event-admin/events/event/event-games/game-identity/presentation",
+      body: {
+        change: { type: "displayed-team-color", gameSideId: "side-a", color: "#abcdef" },
+      },
+    });
   });
 
   test("Event Admin ignores stale Day A heat success after selecting Day B", async () => {

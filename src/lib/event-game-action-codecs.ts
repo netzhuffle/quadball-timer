@@ -85,6 +85,7 @@ type TeamAssignmentCorrectionPayload = {
   gameSideId: string;
   eventTeamId: string;
   teamInterpretationRef: string;
+  eventTeamName?: string;
 };
 
 function createGameFactCodec(): ControlActionCodec<GameFactPayload> {
@@ -202,11 +203,17 @@ function createTeamAssignmentCorrectionCodec(): ControlActionCodec<TeamAssignmen
       if (!gameSideId.ok) return gameSideId;
       if (!eventTeamId.ok) return eventTeamId;
       if (!teamInterpretationRef.ok) return teamInterpretationRef;
+      const eventTeamName =
+        payload.eventTeamName === undefined
+          ? valid(undefined)
+          : validateId(payload.eventTeamName, "payload.eventTeamName");
+      if (!eventTeamName.ok) return eventTeamName;
       return valid({
         correctionId: correctionId.value,
         gameSideId: gameSideId.value,
         eventTeamId: eventTeamId.value,
         teamInterpretationRef: teamInterpretationRef.value,
+        ...(eventTeamName.value === undefined ? {} : { eventTeamName: eventTeamName.value }),
       });
     },
     canonicalize(payload) {
@@ -222,6 +229,7 @@ function createTeamAssignmentCorrectionCodec(): ControlActionCodec<TeamAssignmen
         gameSideId: payload.gameSideId,
         eventTeamId: payload.eventTeamId,
         teamInterpretationRef: payload.teamInterpretationRef,
+        ...(payload.eventTeamName === undefined ? {} : { eventTeamName: payload.eventTeamName }),
       };
     },
   };
@@ -505,16 +513,22 @@ export function validateInterpretation(
       value.teamInterpretationRef,
       "interpretation.teamInterpretationRef",
     );
+    const eventTeamName =
+      value.eventTeamName === undefined
+        ? valid(undefined)
+        : validateId(value.eventTeamName, "interpretation.eventTeamName");
     if (!correctionId.ok) return correctionId;
     if (!gameSideId.ok) return gameSideId;
     if (!eventTeamId.ok) return eventTeamId;
     if (!teamInterpretationRef.ok) return teamInterpretationRef;
+    if (!eventTeamName.ok) return eventTeamName;
     return valid({
       type: "team-assignment-correction",
       correctionId: correctionId.value,
       gameSideId: gameSideId.value,
       eventTeamId: eventTeamId.value,
       teamInterpretationRef: teamInterpretationRef.value,
+      ...(eventTeamName.value === undefined ? {} : { eventTeamName: eventTeamName.value }),
     });
   }
   if (value.type === "non-fact") {

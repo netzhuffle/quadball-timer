@@ -25,6 +25,14 @@ export type PublicAudiencePitch = {
   name: string;
 };
 
+export type PublicAudienceEventGameInput = {
+  eventGameId: string;
+  sides: readonly [
+    { gameSideId: string; eventTeamId: string | null; eventTeamName: string | null },
+    { gameSideId: string; eventTeamId: string | null; eventTeamName: string | null },
+  ];
+};
+
 export type PublicAudienceGameScheduleStatus = "past" | "running" | "awaiting-start" | "future";
 
 export type PublicAudienceGamePhase = "seeker-floor" | "seekers-released" | "overtime";
@@ -164,6 +172,10 @@ export type PublicAudienceEventProjection = {
   canonicalPath: string;
   teams: readonly PublicAudienceEventTeam[];
   pitches: readonly PublicAudiencePitch[];
+  /** Neutral public state; correction reasons, audit rows, and provenance stay private. */
+  identityNotice?: "event-team-identities-current";
+  /** Allowlisted identity input for downstream roster and public Timeline composition. */
+  eventGames?: readonly PublicAudienceEventGameInput[];
   schedule: PublicAudienceScheduleProjection;
 };
 
@@ -298,6 +310,25 @@ function projectPublicEvent(
       color: defaultColor,
     })),
     pitches: snapshot.listPitches(event.eventId).map(({ name }) => ({ name })),
+    identityNotice: "event-team-identities-current",
+    eventGames: snapshot
+      .listGameDays(event.eventId)
+      .flatMap((day) => snapshot.listEventGames(day.gameDayId))
+      .map((game) => ({
+        eventGameId: game.eventGameId,
+        sides: [
+          {
+            gameSideId: game.sideA.sideId,
+            eventTeamId: game.sideA.eventTeamId,
+            eventTeamName: game.sideA.eventTeamName,
+          },
+          {
+            gameSideId: game.sideB.sideId,
+            eventTeamId: game.sideB.eventTeamId,
+            eventTeamName: game.sideB.eventTeamName,
+          },
+        ],
+      })) as PublicAudienceEventGameInput[],
     schedule: projectSchedule(snapshot, event, nowMs),
   };
 }

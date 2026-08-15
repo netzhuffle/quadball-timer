@@ -32,6 +32,8 @@ export function controllerIntentRetryKey(intent: LiveEventControllerIntent): str
         intent.sportingOrderOverride ?? null,
         intent.override ?? null,
       ]);
+    case "acknowledge-team-assignment":
+      return JSON.stringify([intent.type, intent.gameSideId, intent.correctionOperationId]);
     case "record-flag-catch":
     case "record-concession":
     case "record-forfeit":

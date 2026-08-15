@@ -393,7 +393,7 @@ export function reconcileControllerReplay(
             action.status === "causally-blocked" ||
             action.status === "held-for-correction",
         )
-        .map((action) => action.intent.factId),
+        .flatMap((action) => ("factId" in action.intent ? [action.intent.factId] : [])),
     );
     authoritativeProjection.gameFacts = authoritativeProjection.gameFacts.filter(
       (fact) => !retainedPendingFactIds.has(fact.factId),

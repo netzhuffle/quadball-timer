@@ -259,6 +259,11 @@ export async function openLiveEventGameRuntime(input: {
     };
     const control = createLiveEventGameControl({
       resolveEventGameRecord,
+      resolveEventTeamName: async (eventId, eventTeamId) =>
+        storage.transaction((transaction) => {
+          const team = transaction.findEventTeam(eventTeamId);
+          return team?.eventId === eventId ? team.name : null;
+        }),
       acceptance,
       grantAuthority: authority,
       clock,
@@ -625,7 +630,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function createExternalScopeResolver(): ExternalScopeResolver {
+export function createExternalScopeResolver(): ExternalScopeResolver {
   return {
     resolve(scope, snapshot) {
       const root = snapshot.findRootByPitchSlotId(scope.pitchSlotId);
@@ -633,10 +638,15 @@ function createExternalScopeResolver(): ExternalScopeResolver {
         ? { status: "resolved", scope: structuredClone(scope) }
         : { status: "mismatch", detail: "Event Game Pitch Slot is unavailable." };
     },
-    resolveEventTeam(eventId, eventTeamId, _snapshot) {
-      return eventId.length > 0 && eventTeamId.length > 0
+    resolveEventTeam(eventId, eventTeamId, snapshot) {
+      const team = snapshot.findEventTeam(eventTeamId);
+      return eventId.length > 0 && team !== null && team.eventId === eventId
         ? { status: "resolved" }
         : { status: "missing", detail: "Event Team is unavailable." };
+    },
+    resolveEventTeamDefaultColor(eventId, eventTeamId, snapshot) {
+      const team = snapshot.findEventTeam(eventTeamId);
+      return team?.eventId === eventId ? team.defaultColor : null;
     },
   };
 }

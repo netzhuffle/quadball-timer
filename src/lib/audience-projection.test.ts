@@ -41,6 +41,76 @@ const authority = createTechnicalAdminAuth(
 ).resolveHostLocalAuthority();
 
 describe("Audience Publication Projection", () => {
+  test("keeps correction-time Event Game identity names while exposing neutral allowlisted state", async () => {
+    const event: StoredEvent = {
+      eventId: "event-identity",
+      name: "Identity Event",
+      timeZone: "UTC",
+      publicationStatus: "published",
+      createdAtMs: 1,
+      updatedAtMs: 1,
+    };
+    const game = createScheduleGame("identity-game", "2026-08-14T10:00:00.000Z", "Pitch 1");
+    game.sideA = {
+      ...game.sideA,
+      eventTeamId: "team-correction",
+      eventTeamName: "Correction-time Team",
+    };
+    game.sideB = { ...game.sideB, eventTeamId: "team-other", eventTeamName: "Other Team" };
+    const snapshot = {
+      listEvents: () => [event],
+      findEvent: () => event,
+      listGameDays: () => [
+        { gameDayId: "day-identity", eventId: event.eventId, date: "2026-08-14" },
+      ],
+      listEventGames: () => [game],
+      listEventTeams: () => [
+        {
+          eventTeamId: "team-correction",
+          eventId: event.eventId,
+          name: "Renamed Later",
+          defaultColor: "#123456",
+        },
+        {
+          eventTeamId: "team-other",
+          eventId: event.eventId,
+          name: "Other Team",
+          defaultColor: "#654321",
+        },
+      ],
+      listPitches: () => [{ pitchId: "pitch-identity", eventId: event.eventId, name: "Pitch 1" }],
+      listPitchSlots: () => [],
+      listGameplaySlots: () => [],
+      findEventGame: () => game,
+      findEventTeam: () => null,
+      listEventAuditTrail: () => [],
+    } as unknown as EventCatalogStorageSnapshot;
+    const audience = createAudienceProjection(
+      { snapshot: async () => snapshot } as unknown as EventCatalogFoundationStorage,
+      { now: () => Date.parse("2026-08-14T10:00:00.000Z") },
+    );
+
+    const result = await audience.read(event.eventId);
+    expect(result).toMatchObject({
+      status: "accepted",
+      value: {
+        identityNotice: "event-team-identities-current",
+        eventGames: [
+          {
+            eventGameId: game.eventGameId,
+            sides: [
+              { eventTeamId: "team-correction", eventTeamName: "Correction-time Team" },
+              { eventTeamId: "team-other", eventTeamName: "Other Team" },
+            ],
+          },
+        ],
+      },
+    });
+    if (result.status !== "accepted") return;
+    expect(result.value).not.toHaveProperty("auditTrail");
+    expect(result.value).not.toHaveProperty("reason");
+  });
+
   test("groups every running Game, uses a half-open one-hour horizon, and orders the schedule", async () => {
     const now = Date.parse("2026-08-14T10:00:00.000Z");
     const snapshot = createScheduleSnapshot({

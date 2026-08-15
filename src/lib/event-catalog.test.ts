@@ -2141,4 +2141,244 @@ describe("Event operations catalog", () => {
         auditBeforeFailedReassignment.value.length,
       );
   });
+  test("corrects one stable Game Side before commencement and preserves its stable identity", async () => {
+    const fixture = createFixture();
+    const event = await fixture.catalog.createEvent(
+      { name: "Identity", timeZone: "UTC" },
+      authority,
+    );
+    if (event.status !== "accepted") throw new Error("Expected Event.");
+    const day = await fixture.catalog.addGameDay(
+      event.value.eventId,
+      { date: "2026-08-14" },
+      authority,
+    );
+    const home = await fixture.catalog.createEventTeam(
+      event.value.eventId,
+      { name: "Old" },
+      authority,
+    );
+    const replacement = await fixture.catalog.createEventTeam(
+      event.value.eventId,
+      { name: "Replacement" },
+      authority,
+    );
+    const other = await fixture.catalog.createEventTeam(
+      event.value.eventId,
+      { name: "Other" },
+      authority,
+    );
+    const later = await fixture.catalog.createEventTeam(
+      event.value.eventId,
+      { name: "Later" },
+      authority,
+    );
+    const pitch = await fixture.catalog.createPitch(
+      event.value.eventId,
+      { name: "Pitch A" },
+      authority,
+    );
+    if (
+      day.status !== "accepted" ||
+      home.status !== "accepted" ||
+      replacement.status !== "accepted" ||
+      other.status !== "accepted" ||
+      later.status !== "accepted" ||
+      pitch.status !== "accepted"
+    )
+      throw new Error("Expected setup.");
+    const slot = await fixture.catalog.createGameplaySlot(
+      event.value.eventId,
+      day.value.gameDayId,
+      { sequence: 1, scheduledStart: "2026-08-14T10:00" },
+      authority,
+    );
+    if (slot.status !== "accepted") throw new Error("Expected slot.");
+    const pitchSlot = (await fixture.storage.snapshot()).listPitchSlots(
+      day.value.gameDayId,
+      pitch.value.pitchId,
+    )[0];
+    if (pitchSlot === undefined) throw new Error("Expected Pitch Slot.");
+    const game = await fixture.catalog.createEventGame(
+      event.value.eventId,
+      day.value.gameDayId,
+      {
+        gameplaySlotId: slot.value.gameplaySlotId,
+        pitchSlotId: pitchSlot.pitchSlotId,
+        sideA: { sourceLabel: "Old" },
+        sideB: { sourceLabel: "Other" },
+      },
+      authority,
+    );
+    if (game.status !== "accepted") throw new Error(`Expected Game: ${JSON.stringify(game)}`);
+    const confirmed = await fixture.catalog.confirmGameplaySlotTeams(
+      event.value.eventId,
+      day.value.gameDayId,
+      slot.value.gameplaySlotId,
+      {
+        games: [
+          {
+            eventGameId: game.value.eventGameId,
+            sideAEventTeamId: home.value.eventTeamId,
+            sideBEventTeamId: other.value.eventTeamId,
+          },
+        ],
+      },
+      authority,
+    );
+    if (confirmed.status !== "accepted")
+      throw new Error(`Expected confirmed Game: ${JSON.stringify(confirmed)}`);
+    const assignedGame = confirmed.value[0];
+    if (assignedGame === undefined) throw new Error("Expected assigned Game.");
+
+    expect(
+      await fixture.catalog.correctEventGameIdentity(
+        event.value.eventId,
+        day.value.gameDayId,
+        game.value.eventGameId,
+        {
+          gameSideId: assignedGame.sideA.sideId,
+          eventTeamId: replacement.value.eventTeamId,
+          operationId: "identity-op-a",
+        },
+        authority,
+      ),
+    ).toMatchObject({
+      status: "accepted",
+      value: {
+        gameSideId: assignedGame.sideA.sideId,
+        eventTeamName: "Replacement",
+        commenced: false,
+      },
+    });
+    const changed = await fixture.catalog.inspectEvent(event.value.eventId, authority);
+    expect(changed).toMatchObject({
+      value: {
+        eventGames: [
+          { sideA: { eventTeamId: replacement.value.eventTeamId, eventTeamName: "Replacement" } },
+        ],
+      },
+    });
+
+    expect(
+      await fixture.catalog.updateEventTeam(
+        event.value.eventId,
+        replacement.value.eventTeamId,
+        { name: "Replacement Renamed Later" },
+        authority,
+      ),
+    ).toMatchObject({ status: "accepted" });
+    expect(await fixture.catalog.inspectEvent(event.value.eventId, authority)).toMatchObject({
+      value: {
+        eventGames: [
+          { sideA: { eventTeamId: replacement.value.eventTeamId, eventTeamName: "Replacement" } },
+        ],
+      },
+    });
+
+    const beforeRetryAudit = await fixture.catalog.listAuditTrail(event.value.eventId, authority);
+    expect(
+      await fixture.catalog.correctEventGameIdentity(
+        event.value.eventId,
+        day.value.gameDayId,
+        game.value.eventGameId,
+        {
+          gameSideId: assignedGame.sideA.sideId,
+          eventTeamId: later.value.eventTeamId,
+          operationId: "identity-op-b",
+        },
+        authority,
+      ),
+    ).toMatchObject({ status: "accepted", value: { eventTeamId: later.value.eventTeamId } });
+    const afterLaterCorrectionAudit = await fixture.catalog.listAuditTrail(
+      event.value.eventId,
+      authority,
+    );
+    if (afterLaterCorrectionAudit.status !== "accepted")
+      throw new Error("Expected the later correction audit.");
+    const retried = await fixture.catalog.correctEventGameIdentity(
+      event.value.eventId,
+      day.value.gameDayId,
+      game.value.eventGameId,
+      {
+        gameSideId: assignedGame.sideA.sideId,
+        eventTeamId: replacement.value.eventTeamId,
+        operationId: "identity-op-a",
+      },
+      authority,
+    );
+    expect(retried).toMatchObject({
+      status: "accepted",
+      value: {
+        operationId: "identity-op-a",
+        eventTeamId: replacement.value.eventTeamId,
+        eventTeamName: "Replacement",
+      },
+    });
+    const retryAudit = await fixture.catalog.listAuditTrail(event.value.eventId, authority);
+    if (retryAudit.status !== "accepted") throw new Error("Expected the retry audit.");
+    expect(retryAudit.value).toHaveLength(afterLaterCorrectionAudit.value.length);
+    expect(await fixture.catalog.inspectEvent(event.value.eventId, authority)).toMatchObject({
+      value: {
+        eventGames: [{ sideA: { eventTeamId: later.value.eventTeamId, eventTeamName: "Later" } }],
+      },
+    });
+    const concurrentRetries = await Promise.all([
+      fixture.catalog.correctEventGameIdentity(
+        event.value.eventId,
+        day.value.gameDayId,
+        game.value.eventGameId,
+        {
+          gameSideId: assignedGame.sideA.sideId,
+          eventTeamId: replacement.value.eventTeamId,
+          operationId: "identity-op-a",
+        },
+        authority,
+      ),
+      fixture.catalog.correctEventGameIdentity(
+        event.value.eventId,
+        day.value.gameDayId,
+        game.value.eventGameId,
+        {
+          gameSideId: assignedGame.sideA.sideId,
+          eventTeamId: replacement.value.eventTeamId,
+          operationId: "identity-op-a",
+        },
+        authority,
+      ),
+    ]);
+    expect(concurrentRetries).toHaveLength(2);
+    expect(concurrentRetries[0]).toMatchObject({
+      status: "accepted",
+      value: { eventTeamId: replacement.value.eventTeamId, eventTeamName: "Replacement" },
+    });
+    expect(concurrentRetries[1]).toMatchObject({
+      status: "accepted",
+      value: { eventTeamId: replacement.value.eventTeamId, eventTeamName: "Replacement" },
+    });
+    const afterConcurrentRetriesAudit = await fixture.catalog.listAuditTrail(
+      event.value.eventId,
+      authority,
+    );
+    if (afterConcurrentRetriesAudit.status !== "accepted")
+      throw new Error("Expected the concurrent retry audit.");
+    expect(afterConcurrentRetriesAudit.value).toHaveLength(afterLaterCorrectionAudit.value.length);
+    expect(
+      await fixture.catalog.correctEventGameIdentity(
+        event.value.eventId,
+        day.value.gameDayId,
+        game.value.eventGameId,
+        {
+          gameSideId: assignedGame.sideA.sideId,
+          eventTeamId: home.value.eventTeamId,
+          operationId: "identity-op-a",
+        },
+        authority,
+      ),
+    ).toMatchObject({ status: "rejected", reason: "duplicate" });
+    expect(beforeRetryAudit.status).toBe("accepted");
+
+    const root = (await fixture.storage.snapshot()).findRootByEventGameId(game.value.eventGameId);
+    if (root !== null) throw new Error("This catalog fixture has no commenced root.");
+  });
 });

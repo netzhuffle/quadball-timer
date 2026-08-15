@@ -1,4 +1,6 @@
 import type { FoundationStorage, FoundationStorageTransaction } from "@/lib/foundation-storage";
+import type { EventGameRecordTransactionSeam } from "@/lib/event-game-record";
+import type { GamePresentation } from "@/lib/game-presentation";
 import {
   createEventCatalog,
   createFoundationEventCatalogStorage,
@@ -21,6 +23,10 @@ import {
   type ProjectedEventGame,
   type ScheduleDelayPreview,
   type PitchReassignmentResult,
+  type EventGameIdentityCorrection,
+  type EventGameIdentityCorrectionInput,
+  correctEventGameIdentityInTransaction,
+  reconcileEventGameIdentityInTransaction,
   projectScheduleGames,
 } from "@/lib/event-catalog";
 import type { TechnicalAdminAuthority } from "@/lib/technical-admin-auth";
@@ -171,6 +177,13 @@ export type EventAdministrationOutcome<T> =
     }
   | { status: "retryable-failure"; detail: string };
 
+export type EventGamePresentationChangeInput = {
+  operationId?: unknown;
+  presentationChangeId?: unknown;
+  causalPredecessorIds?: unknown;
+  change: unknown;
+};
+
 export type EventAdministrationMutationOutcome<T> = EventAdministrationOutcome<T> & {
   sessionExpiresAtMs?: number | null;
 };
@@ -186,7 +199,24 @@ export type EventAdministrationOptions = {
   environmentId?: string;
   accessSheetRenderer?: AccessSheetRenderer;
   accessSheetIds?: AccessSheetIds;
+  eventGameRecordTransaction?: (
+    transaction: FoundationStorageTransaction,
+  ) => EventGameRecordTransactionSeam;
 };
+
+class EventAdministrationTransactionRejection extends Error {
+  constructor(
+    readonly outcome:
+      | {
+          status: "rejected";
+          reason: "invalid-input" | "unauthorized" | "not-found";
+          detail: string;
+        }
+      | { status: "retryable-failure"; detail: string },
+  ) {
+    super(outcome.detail);
+  }
+}
 
 export type EventAdministration = {
   previewEventCatalogRemoval(
@@ -519,6 +549,19 @@ export type EventAdministration = {
     input: { targetPitchSlotId: unknown; mode?: unknown },
     authority: EventAdministrationAuthority,
   ): Promise<EventAdministrationMutationOutcome<PitchReassignmentResult>>;
+  correctEventGameIdentity(
+    eventId: unknown,
+    gameDayId: unknown,
+    eventGameId: unknown,
+    input: EventGameIdentityCorrectionInput,
+    authority: EventAdministrationAuthority,
+  ): Promise<EventAdministrationMutationOutcome<EventGameIdentityCorrection>>;
+  changeEventGamePresentation(
+    eventId: unknown,
+    eventGameId: unknown,
+    input: EventGamePresentationChangeInput,
+    authority: EventAdministrationAuthority,
+  ): Promise<EventAdministrationMutationOutcome<GamePresentation>>;
   openSlotSetup(
     eventId: unknown,
     gameDayId: unknown,
@@ -1567,6 +1610,174 @@ export function createEventAdministration(
       return runCatalogMutation(catalog, options, eventId, authority, (operations) =>
         operations.reassignEventGame(eventId, gameDayId, eventGameId, input),
       );
+    },
+
+    async correctEventGameIdentity(eventId, gameDayId, eventGameId, input, authority) {
+      if (options.eventGameRecordTransaction === undefined) return unavailable();
+      const eventIdResult = validateEventId(eventId);
+      const gameDayIdResult = validateEventId(gameDayId);
+      const eventGameIdResult = validateEventId(eventGameId);
+      if (!eventIdResult.ok || !gameDayIdResult.ok || !eventGameIdResult.ok)
+        return invalid("Event Game identity correction identifier is invalid.");
+      try {
+        return await options.storage.transaction((transaction) => {
+          const authorized = authorizeEventScopeInTransaction(
+            options,
+            transaction,
+            eventIdResult.value,
+            authority,
+          );
+          if (authorized === null) return unauthorized();
+          const event = transaction.findEvent(eventIdResult.value);
+          const game = transaction.findEventGame(eventGameIdResult.value);
+          const root = transaction.findRootByEventGameId(eventGameIdResult.value);
+          if (event === null || game === null || root === null)
+            return notFound("Event Game was not found.");
+          if (root.eventId !== event.eventId || game.eventId !== event.eventId)
+            return unauthorized();
+          const catalogResult = correctEventGameIdentityInTransaction(
+            transaction,
+            { nowMs },
+            { next: (kind) => `${kind}-${crypto.randomUUID()}` },
+            eventIdResult.value,
+            gameDayIdResult.value,
+            eventGameIdResult.value,
+            input,
+            authorized.actorReference,
+          );
+          if (catalogResult.status !== "accepted") return mapCatalogOutcome(catalogResult);
+          const record = options.eventGameRecordTransaction!(transaction);
+          const correction = record.correctTeamAssignment({
+            recordId: root.recordId,
+            eventGameId: root.eventGameId,
+            operationId: catalogResult.value.operationId,
+            gameSideId: catalogResult.value.gameSideId,
+            eventTeamId: catalogResult.value.eventTeamId,
+            teamInterpretationRef: `event-team:${catalogResult.value.eventTeamId}`,
+            eventTeamName: catalogResult.value.eventTeamName,
+            trustedAtMs: nowMs(),
+            grant: {
+              sessionId: authorized.sessionId ?? authorized.actorReference,
+              versionId: "event-admin",
+            },
+          });
+          if (correction.status === "rejected")
+            throw new EventAdministrationTransactionRejection({
+              status: "rejected",
+              reason: "invalid-input",
+              detail: correction.detail,
+            });
+          const duplicate = correction.status === "duplicate-accepted";
+          const effective = correction.effectiveTeamAssignments?.find(
+            (assignment) => assignment.gameSideId === catalogResult.value.gameSideId,
+          );
+          if (effective === undefined)
+            throw new EventAdministrationTransactionRejection({
+              status: "retryable-failure",
+              detail: "The Event Game Record did not return the corrected Game Side.",
+            });
+          const reconciled = reconcileEventGameIdentityInTransaction(
+            transaction,
+            { next: (kind) => `${kind}-${crypto.randomUUID()}` },
+            eventIdResult.value,
+            gameDayIdResult.value,
+            eventGameIdResult.value,
+            effective.gameSideId,
+            effective.eventTeamId,
+            authorized.actorReference,
+          );
+          if (reconciled.status !== "accepted")
+            throw new EventAdministrationTransactionRejection(
+              reconciled.status === "retryable-failure"
+                ? reconciled
+                : {
+                    status: "rejected",
+                    reason: reconciled.reason === "cross-event" ? "unauthorized" : "invalid-input",
+                    detail: reconciled.detail,
+                  },
+            );
+          const currentSide =
+            reconciled.value.sideA.sideId === catalogResult.value.gameSideId
+              ? reconciled.value.sideA
+              : reconciled.value.sideB;
+          return {
+            ...accepted({
+              ...catalogResult.value,
+              ...(duplicate
+                ? {}
+                : {
+                    eventTeamId: currentSide.eventTeamId ?? catalogResult.value.eventTeamId,
+                    eventTeamName: currentSide.eventTeamName ?? catalogResult.value.eventTeamName,
+                  }),
+              commenced: root.lifecycle.commencedAtMs !== null,
+              controllerAcknowledgementRequired: root.lifecycle.commencedAtMs !== null,
+            }),
+            sessionExpiresAtMs: authorized.sessionExpiresAtMs,
+          };
+        });
+      } catch (error) {
+        if (error instanceof EventAdministrationTransactionRejection) return error.outcome;
+        return unavailable();
+      }
+    },
+
+    async changeEventGamePresentation(eventIdInput, eventGameIdInput, input, authority) {
+      if (options.eventGameRecordTransaction === undefined) return unavailable();
+      const eventId = validateEventId(eventIdInput);
+      const eventGameId = validateEventId(eventGameIdInput);
+      if (!eventId.ok || !eventGameId.ok)
+        return invalid("Event Game presentation identifier is invalid.");
+      try {
+        return await options.storage.transaction((transaction) => {
+          const authorized = authorizeEventScopeInTransaction(
+            options,
+            transaction,
+            eventId.value,
+            authority,
+          );
+          if (authorized === null) return unauthorized();
+          const event = transaction.findEvent(eventId.value);
+          const game = transaction.findEventGame(eventGameId.value);
+          const root = transaction.findRootByEventGameId(eventGameId.value);
+          if (event === null || game === null || root === null)
+            return notFound("Event Game was not found.");
+          if (game.eventId !== event.eventId || root.eventId !== event.eventId)
+            return unauthorized();
+          const operationId = validateEventId(
+            input.operationId ?? `event-admin-presentation-${crypto.randomUUID()}`,
+          );
+          const presentationChangeId = validateEventId(
+            input.presentationChangeId ?? `presentation-${crypto.randomUUID()}`,
+          );
+          if (!operationId.ok || !presentationChangeId.ok)
+            return invalid("Presentation identity is invalid.");
+          const record = options.eventGameRecordTransaction!(transaction);
+          const result = record.acceptPresentationChange({
+            recordId: root.recordId,
+            eventGameId: root.eventGameId,
+            operationId: operationId.value,
+            presentationChangeId: presentationChangeId.value,
+            change: input.change,
+            causalPredecessorIds: Array.isArray(input.causalPredecessorIds)
+              ? input.causalPredecessorIds
+              : [],
+            occurrence: { trustedAtMs: nowMs(), clientOriginAtMs: null, source: "online" },
+            grant: {
+              sessionId: authorized.sessionId ?? authorized.actorReference,
+              versionId: "event-admin",
+            },
+            acceptedAtMs: nowMs(),
+          });
+          if (result.status === "rejected")
+            return result.reason === "storage-not-ready" ? unavailable() : invalid(result.detail);
+          return {
+            ...accepted(record.readPresentation(root.recordId)),
+            sessionExpiresAtMs: authorized.sessionExpiresAtMs,
+          };
+        });
+      } catch {
+        return unavailable();
+      }
     },
 
     async openSlotSetup(eventIdInput, gameDayIdInput, authority) {
@@ -2762,6 +2973,16 @@ function accepted<T>(value: T): EventAdministrationOutcome<T> {
 
 function invalid(detail: string): EventAdministrationOutcome<never> {
   return { status: "rejected", reason: "invalid-input", detail };
+}
+
+function mapCatalogOutcome<T>(result: CatalogOutcome<T>): EventAdministrationOutcome<T> {
+  if (result.status === "accepted") return result;
+  if (result.status === "retryable-failure") return result;
+  return {
+    status: "rejected",
+    reason: result.reason === "not-found" ? "not-found" : "invalid-input",
+    detail: result.detail,
+  };
 }
 
 function unauthorized(): EventAdministrationOutcome<never> {
