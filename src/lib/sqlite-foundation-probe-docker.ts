@@ -20,6 +20,10 @@ export const SQLITE_FOUNDATION_PROBE_DOCKER_PROCESS_LIMIT =
 export const SQLITE_FOUNDATION_PROBE_DOCKER_TMPFS = `/tmp:rw,size=${SQLITE_FOUNDATION_PROBE_MAX_DISK_BYTES},mode=1777`;
 export const SQLITE_FOUNDATION_PROBE_DOCKER_LOG_MAX_SIZE = "4k";
 export const SQLITE_FOUNDATION_PROBE_DOCKER_LOG_MAX_FILE = "1";
+export const SQLITE_FOUNDATION_PROBE_DOCKER_INFO_IDENTITY_FORMAT =
+  '{"OSType":{{json .OSType}},"Architecture":{{json .Architecture}}}';
+export const SQLITE_FOUNDATION_PROBE_DOCKER_VERSION_IDENTITY_FORMAT =
+  '{"Os":{{json .Server.Os}},"Arch":{{json .Server.Arch}}}';
 
 export type DockerCommandResult = {
   exitCode: number;
@@ -182,8 +186,12 @@ export async function admitDockerEngine(
   }
   const runCommand = dependencies.runCommand ?? runDockerCommand;
   const [info, version] = await Promise.all([
-    runCommand(["info", "--format", "{{json .}}"], { signal: dependencies.signal }),
-    runCommand(["version", "--format", "{{json .Server}}"], { signal: dependencies.signal }),
+    runCommand(["info", "--format", SQLITE_FOUNDATION_PROBE_DOCKER_INFO_IDENTITY_FORMAT], {
+      signal: dependencies.signal,
+    }),
+    runCommand(["version", "--format", SQLITE_FOUNDATION_PROBE_DOCKER_VERSION_IDENTITY_FORMAT], {
+      signal: dependencies.signal,
+    }),
   ]);
   if (
     info.exitCode !== 0 ||

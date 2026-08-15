@@ -10,6 +10,8 @@ import {
   isOwnedDockerContainerInspection,
   isDockerResourceViolation,
   isDockerContainerConfigurationAdmitted,
+  SQLITE_FOUNDATION_PROBE_DOCKER_INFO_IDENTITY_FORMAT,
+  SQLITE_FOUNDATION_PROBE_DOCKER_VERSION_IDENTITY_FORMAT,
   parseDockerEngineIdentity,
   parseDockerArtifactIdentity,
   parseDockerResourceMeasurement,
@@ -428,6 +430,69 @@ describe("Docker SQLite qualification boundary", () => {
         }),
       }),
     ).rejects.toBeInstanceOf(DockerAdmissionError);
+  });
+
+  test("keeps oversized full info outside the reader while accepting bounded identity output", async () => {
+    const oversizedInfo = JSON.stringify({
+      OSType: "linux",
+      Architecture: "x86_64",
+      diagnostics: "x".repeat(10_422),
+    });
+    const boundedInfo = JSON.stringify({ OSType: "linux", Architecture: "x86_64" });
+    const boundedVersion = JSON.stringify({ Os: "linux", Arch: "amd64" });
+    expect(new TextEncoder().encode(oversizedInfo).byteLength).toBeGreaterThan(4 * 1024);
+    expect(new TextEncoder().encode(boundedInfo).byteLength).toBeLessThan(4 * 1024);
+    expect(new TextEncoder().encode(boundedVersion).byteLength).toBeLessThan(4 * 1024);
+
+    await expect(
+      admitDockerEngine({
+        platform: "linux",
+        architecture: "x64",
+        runCommand: async (arguments_) => ({
+          exitCode: 0,
+          stdout: arguments_[0] === "info" ? oversizedInfo : boundedVersion,
+          stderr: "",
+          stdoutBytes: arguments_[0] === "info" ? oversizedInfo.length : boundedVersion.length,
+          stderrBytes: 0,
+          outputExceeded: arguments_[0] === "info",
+        }),
+      }),
+    ).rejects.toBeInstanceOf(DockerAdmissionError);
+
+    const calls: string[][] = [];
+    await expect(
+      admitDockerEngine({
+        platform: "linux",
+        architecture: "x64",
+        runCommand: async (arguments_) => {
+          calls.push([...arguments_]);
+          const stdout = arguments_[0] === "info" ? boundedInfo : boundedVersion;
+          return {
+            exitCode: 0,
+            stdout,
+            stderr: "",
+            stdoutBytes: stdout.length,
+            stderrBytes: 0,
+            outputExceeded: false,
+          };
+        },
+      }),
+    ).resolves.toEqual({
+      os: "linux",
+      serverArchitecture: "amd64",
+      hostArchitecture: "x86_64",
+    });
+    expect(calls).toEqual([
+      ["info", "--format", SQLITE_FOUNDATION_PROBE_DOCKER_INFO_IDENTITY_FORMAT],
+      ["version", "--format", SQLITE_FOUNDATION_PROBE_DOCKER_VERSION_IDENTITY_FORMAT],
+    ]);
+    expect(parseDockerEngineIdentity(boundedInfo, boundedVersion)).not.toBeNull();
+    expect(
+      parseDockerEngineIdentity(JSON.stringify({ OSType: "linux" }), boundedVersion),
+    ).toBeNull();
+    expect(
+      parseDockerEngineIdentity(boundedInfo, JSON.stringify({ Os: "linux", Arch: "arm64" })),
+    ).toBeNull();
   });
 
   test("keeps the focused command harmless and separate from the SQLite workload", () => {
