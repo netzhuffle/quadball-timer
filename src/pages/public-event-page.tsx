@@ -167,6 +167,309 @@ export function PublicEventPage({ eventId }: { eventId: string }) {
   );
 }
 
+export function PublicEventGamePage({
+  eventId,
+  eventGameId,
+}: {
+  eventId: string;
+  eventGameId: string;
+}) {
+  const [game, setGame] = useState<PublicAudienceGameProjection | null>(null);
+  const [unavailable, setUnavailable] = useState(false);
+  const [compactScoreboard, setCompactScoreboard] = useState(false);
+  const scoreboardSentinelRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    let active = true;
+    setGame(null);
+    setUnavailable(false);
+    void fetch(
+      `/api/audience/events/${encodeURIComponent(eventId)}/games/${encodeURIComponent(eventGameId)}`,
+    )
+      .then(async (response) => {
+        if (!response.ok) throw new Error("Game unavailable");
+        const payload = (await response.json()) as AudienceGameResponse;
+        if (payload.status !== "accepted") throw new Error("Game unavailable");
+        return payload.value;
+      })
+      .then((nextGame) => {
+        if (active) setGame(nextGame);
+      })
+      .catch(() => {
+        if (active) setUnavailable(true);
+      });
+    return () => {
+      active = false;
+    };
+  }, [eventGameId, eventId]);
+
+  useEffect(() => {
+    const sentinel = scoreboardSentinelRef.current;
+    if (sentinel === null) return;
+    if (typeof IntersectionObserver === "function") {
+      const observer = new IntersectionObserver(([entry]) => {
+        setCompactScoreboard(entry?.isIntersecting === false);
+      });
+      observer.observe(sentinel);
+      return () => observer.disconnect();
+    }
+    const update = () => setCompactScoreboard(window.scrollY > 120);
+    update();
+    window.addEventListener("scroll", update, { passive: true });
+    return () => window.removeEventListener("scroll", update);
+  }, [game]);
+
+  if (unavailable) return <GameUnavailablePanel eventId={eventId} />;
+  if (game === null) {
+    return (
+      <PublicShell title="Live spectator Game" description="Loading public Game information…">
+        <p className="rounded-2xl border bg-card/80 p-5 text-sm text-muted-foreground">Loading…</p>
+      </PublicShell>
+    );
+  }
+
+  const sides =
+    game.presentation.pitchOrientation === "side-b-left"
+      ? [
+          { sideId: "side-b" as const, side: game.sideB, label: "Side B" },
+          { sideId: "side-a" as const, side: game.sideA, label: "Side A" },
+        ]
+      : [
+          { sideId: "side-a" as const, side: game.sideA, label: "Side A" },
+          { sideId: "side-b" as const, side: game.sideB, label: "Side B" },
+        ];
+  const title = game.gameDesignation ?? game.gameCode ?? "Live spectator Game";
+
+  return (
+    <PublicShell title={title} description="Public Audience Projection · no sign-in required">
+      <div className="space-y-4">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <Button
+            variant="outline"
+            onClick={() => navigateTo(`/events/${encodeURIComponent(eventId)}`)}
+          >
+            Back to Event
+          </Button>
+          <p className="text-sm text-muted-foreground">{game.pitch ?? "Event Game"}</p>
+        </div>
+        <div
+          ref={scoreboardSentinelRef}
+          aria-hidden="true"
+          className="h-px"
+          data-scoreboard-sentinel
+        />
+        {compactScoreboard ? (
+          <section
+            aria-label="Compact live scoreboard"
+            className="sticky top-2 z-10 rounded-2xl border bg-background/95 p-2 shadow-lg backdrop-blur"
+            data-scoreboard-compact
+          >
+            <div className="mb-1 flex flex-wrap items-center justify-center gap-x-2 gap-y-0.5 text-[0.65rem] text-muted-foreground">
+              <span>Game Phase: {gamePhaseLabel(game.phase)}</span>
+              <span>Operational status: {operationalStatusLabel(game.operationalStatus)}</span>
+              <span>Schedule: {scheduleStatusLabel(game.scheduleStatus)}</span>
+            </div>
+            <div className="grid grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-2">
+              <CompactScoreSide
+                side={sides[0]!.side}
+                label={sides[0]!.label}
+                sideId={sides[0]!.sideId}
+                isCatching={game.flagState.catchingSide === sides[0]!.sideId}
+              />
+              <div className="flex flex-col items-center">
+                <span className="font-mono text-lg font-bold tabular-nums">
+                  {formatClock(game.clock?.gameTimeMs ?? 0)}
+                </span>
+                <span className="text-[0.65rem] text-muted-foreground">
+                  {clockFreshnessLabel(game.clock?.synchronization ?? "unavailable")}
+                </span>
+              </div>
+              <CompactScoreSide
+                side={sides[1]!.side}
+                label={sides[1]!.label}
+                align="right"
+                sideId={sides[1]!.sideId}
+                isCatching={game.flagState.catchingSide === sides[1]!.sideId}
+              />
+            </div>
+          </section>
+        ) : null}
+        <section
+          aria-label="Live scoreboard"
+          className="rounded-3xl border bg-background/95 p-3 shadow-lg sm:p-5"
+          data-scoreboard-expanded
+        >
+          <div className="mb-3 flex flex-wrap items-center justify-between gap-2 text-sm">
+            <span className="font-semibold">{scheduleStatusLabel(game.scheduleStatus)}</span>
+            <span className="text-muted-foreground">
+              Game Phase: {gamePhaseLabel(game.phase)} · Operational status:{" "}
+              {operationalStatusLabel(game.operationalStatus)}
+            </span>
+          </div>
+          <div className="grid grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-stretch gap-2 sm:gap-4">
+            <PublicScoreSide
+              side={sides[0]!.side}
+              label={sides[0]!.label}
+              sideId={sides[0]!.sideId}
+              isCatching={game.flagState.catchingSide === sides[0]!.sideId}
+            />
+            <div className="flex min-w-20 flex-col items-center justify-center rounded-2xl bg-muted/60 px-2 py-3">
+              <span className="font-mono text-3xl font-bold tabular-nums sm:text-4xl">
+                {formatClock(game.clock?.gameTimeMs ?? 0)}
+              </span>
+              <span className="mt-1 text-center text-xs text-muted-foreground">
+                {clockFreshnessLabel(game.clock?.synchronization ?? "unavailable")}
+              </span>
+            </div>
+            <PublicScoreSide
+              side={sides[1]!.side}
+              label={sides[1]!.label}
+              align="right"
+              sideId={sides[1]!.sideId}
+              isCatching={game.flagState.catchingSide === sides[1]!.sideId}
+            />
+          </div>
+          <div className="mt-3 flex flex-wrap justify-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
+            <span>
+              Last synchronized:{" "}
+              {formatLastSynchronization(game.clock?.lastSynchronizedAtMs ?? null)}
+            </span>
+            <span>Expected start: {formatDateTime(game.expectedStartMs)}</span>
+          </div>
+        </section>
+        <Card>
+          <CardHeader>
+            <CardTitle>Game Phase and operational status</CardTitle>
+            <CardDescription>
+              Committed public information from the Event Game&apos;s Audience Projection.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-3 text-sm">
+            <dl className="grid gap-3 sm:grid-cols-2">
+              <StatusValue label="Game Phase" value={gamePhaseLabel(game.phase)} />
+              <StatusValue
+                label="Operational status"
+                value={operationalStatusLabel(game.operationalStatus)}
+              />
+              <StatusValue
+                label="Overtime target"
+                value={game.phase === "overtime" ? `Target ${game.overtimeTarget ?? "—"}` : "No"}
+              />
+              <StatusValue
+                label="Flag"
+                value={
+                  game.flagState.catchingSide !== null
+                    ? `Caught by ${game.flagState.catchingSide}`
+                    : "Not caught"
+                }
+              />
+              <StatusValue label="Team Timeout" value={timeoutLabel(game.teamTimeout)} />
+              <StatusValue
+                label="Game Suspension"
+                value={game.gameSuspension === "suspended" ? "Suspended" : "None"}
+              />
+              <StatusValue label="Heat Stoppage" value={heatLabel(game.heatStoppage)} />
+              <StatusValue label="Result" value={resultLabel(game.result)} />
+            </dl>
+            <p className="rounded-xl border border-dashed p-3 text-muted-foreground">
+              Public play history will be added by the Timeline work; this page shows the committed
+              scoreboard projection.
+            </p>
+          </CardContent>
+        </Card>
+      </div>
+    </PublicShell>
+  );
+}
+
+function PublicScoreSide({
+  side,
+  label,
+  sideId,
+  isCatching,
+  align = "left",
+}: {
+  side: PublicAudienceGameProjection["sideA"];
+  label: string;
+  sideId: "side-a" | "side-b";
+  isCatching: boolean;
+  align?: "left" | "right";
+}) {
+  return (
+    <div
+      className={`min-w-0 rounded-2xl border-2 bg-card p-3 ${align === "right" ? "text-right" : "text-left"}`}
+      style={{ borderColor: side.color ?? "hsl(var(--border))" }}
+      data-side-id={sideId}
+    >
+      <p className="text-xs font-semibold tracking-wide text-muted-foreground uppercase">{label}</p>
+      <p className="mt-1 break-words text-base font-semibold leading-tight sm:text-xl">
+        {side.name ?? "Unassigned Team"}
+      </p>
+      <p className="mt-2 text-4xl font-bold tabular-nums sm:text-5xl">
+        {side.score ?? "—"}
+        {isCatching ? (
+          <span className="mt-1 block text-xs font-semibold tracking-wide text-foreground uppercase">
+            Flag catch
+          </span>
+        ) : null}
+      </p>
+    </div>
+  );
+}
+
+function CompactScoreSide({
+  side,
+  label,
+  sideId,
+  isCatching,
+  align = "left",
+}: {
+  side: PublicAudienceGameProjection["sideA"];
+  label: string;
+  sideId: "side-a" | "side-b";
+  isCatching: boolean;
+  align?: "left" | "right";
+}) {
+  return (
+    <div
+      className={`min-w-0 ${align === "right" ? "text-right" : "text-left"}`}
+      data-side-id={sideId}
+    >
+      <p className="truncate text-xs font-semibold">{side.name ?? "Unassigned Team"}</p>
+      <p className="truncate text-sm font-semibold">
+        <span aria-label={`${label} score`}>{side.score ?? "—"}</span>
+        {isCatching ? <span className="ml-1 text-[0.65rem] uppercase">Flag catch</span> : null}
+      </p>
+    </div>
+  );
+}
+
+function StatusValue({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="rounded-xl border p-3">
+      <dt className="text-muted-foreground">{label}</dt>
+      <dd className="mt-1 font-medium">{value}</dd>
+    </div>
+  );
+}
+
+function GameUnavailablePanel({ eventId }: { eventId: string }) {
+  return (
+    <PublicShell title="Game unavailable" description="This public Game is not available.">
+      <Card>
+        <CardContent className="space-y-4 pt-6">
+          <p className="text-sm text-muted-foreground">
+            The Game may be hidden, unknown, or temporarily unavailable.
+          </p>
+          <Button onClick={() => navigateTo(`/events/${encodeURIComponent(eventId)}`)}>
+            Back to Event
+          </Button>
+        </CardContent>
+      </Card>
+    </PublicShell>
+  );
+}
+
 function ScheduleBoard({
   schedule,
   timeZone,
@@ -326,7 +629,11 @@ function GameCard({
   compact?: boolean;
 }) {
   const winnerName =
-    game.winner === "side-a" ? game.sideA.name : game.winner === "side-b" ? game.sideB.name : null;
+    game.result.winner === "side-a"
+      ? game.sideA.name
+      : game.result.winner === "side-b"
+        ? game.sideB.name
+        : null;
   return (
     <Card className={compact ? "bg-card/70" : "border-primary/40 bg-card shadow-md"}>
       <CardHeader className={compact ? "pb-3" : undefined}>
@@ -348,8 +655,16 @@ function GameCard({
       </CardHeader>
       <CardContent className="space-y-3">
         <div className="grid grid-cols-[1fr_auto] items-center gap-x-3 gap-y-2">
-          <GameSideRow side={game.sideA} label="Side A" />
-          <GameSideRow side={game.sideB} label="Side B" />
+          <GameSideRow
+            side={game.sideA}
+            label="Side A"
+            isCatching={game.flagState.catchingSide === "side-a"}
+          />
+          <GameSideRow
+            side={game.sideB}
+            label="Side B"
+            isCatching={game.flagState.catchingSide === "side-b"}
+          />
         </div>
         <div className="flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
           <span>Scheduled Start {formatScheduleTime(game.scheduledStartMs, timeZone)}</span>
@@ -384,9 +699,11 @@ function GameCard({
 function GameSideRow({
   side,
   label,
+  isCatching,
 }: {
   side: PublicAudienceGameProjection["sideA"];
   label: string;
+  isCatching: boolean;
 }) {
   return (
     <>
@@ -400,7 +717,7 @@ function GameSideRow({
       >
         <span className="sr-only">{label}: </span>
         {side.name ?? "TBD"}
-        {side.flagCatch ? <span className="ml-2 text-xs font-semibold">Flag catch</span> : null}
+        {isCatching ? <span className="ml-2 text-xs font-semibold">Flag catch</span> : null}
       </span>
       <span
         className="text-right text-2xl font-semibold tabular-nums"
@@ -482,6 +799,53 @@ function formatClock(milliseconds: number) {
   const minutes = Math.floor(milliseconds / 60_000);
   const seconds = Math.floor((milliseconds % 60_000) / 1_000);
   return `${minutes}:${String(seconds).padStart(2, "0")}`;
+}
+
+function formatDateTime(milliseconds: number) {
+  return new Intl.DateTimeFormat(undefined, {
+    dateStyle: "medium",
+    timeStyle: "short",
+  }).format(new Date(milliseconds));
+}
+
+function clockFreshnessLabel(
+  status: NonNullable<PublicAudienceGameProjection["clock"]>["synchronization"],
+) {
+  return status === "synchronized"
+    ? "Synchronized clock"
+    : status === "estimated"
+      ? "Estimated clock"
+      : status === "stale"
+        ? "Stale clock"
+        : "Clock unavailable";
+}
+
+function formatLastSynchronization(milliseconds: number | null) {
+  return milliseconds === null ? "unavailable" : formatDateTime(milliseconds);
+}
+
+function timeoutLabel(timeout: PublicAudienceGameProjection["teamTimeout"]) {
+  return timeout.status === "inactive"
+    ? "None"
+    : timeout.status === "started"
+      ? `Started${timeout.remainingMs === null ? "" : ` · ${Math.ceil(timeout.remainingMs / 1_000)}s`}`
+      : timeout.status[0]!.toUpperCase() + timeout.status.slice(1);
+}
+
+function heatLabel(heat: PublicAudienceGameProjection["heatStoppage"]) {
+  return heat.status === "inactive"
+    ? "Inactive"
+    : `${heat.status}${heat.remainingMs === null ? "" : ` · ${formatDuration(heat.remainingMs)} remaining`}${heat.pending ? " · decision pending" : ""}`;
+}
+
+function formatDuration(milliseconds: number) {
+  const seconds = Math.ceil(Math.max(0, milliseconds) / 1_000);
+  return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
+}
+
+function resultLabel(result: PublicAudienceGameProjection["result"]) {
+  if (result.status === "unfinished") return "In progress";
+  return `${result.winner === null ? "Finished" : `Winner ${result.winner === "side-a" ? "Side A" : "Side B"}`}${result.locked ? " · Locked" : ""}`;
 }
 
 function clockStatusLabel(
@@ -788,6 +1152,9 @@ function lifecycleLabel(lifecycle: PublicAudienceEventProjection["lifecycle"]): 
 
 type AudienceEventResponse =
   | { status: "accepted"; value: PublicAudienceEventProjection }
+  | { status: "unavailable" };
+type AudienceGameResponse =
+  | { status: "accepted"; value: PublicAudienceGameProjection }
   | { status: "unavailable" };
 type AudienceEventsResponse =
   | { status: "accepted"; value: { events: readonly PublicAudienceEventProjection[] } }

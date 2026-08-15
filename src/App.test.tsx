@@ -145,6 +145,11 @@ describe("App", () => {
       eventId: "event-123",
     });
     expect(parseRoute("/events", "?view=all")).toEqual({ type: "home", showAll: true });
+    expect(parseRoute("/events/event-123/games/game-456", "")).toEqual({
+      type: "event-game",
+      eventId: "event-123",
+      eventGameId: "game-456",
+    });
   });
 
   beforeEach(() => {

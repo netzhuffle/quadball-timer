@@ -310,7 +310,16 @@ async function startServer() {
     }
 
     const eventCatalog = createEventCatalog(eventCatalogStorage, {});
-    const audienceProjection = createAudienceProjection(eventCatalogStorage);
+    let liveEventRuntime: LiveEventGameRuntime | null = null;
+    const audienceProjection = createAudienceProjection(eventCatalogStorage, {
+      gameInput: {
+        async read(eventGameId) {
+          return liveEventRuntime === null
+            ? { status: "unavailable" as const }
+            : await liveEventRuntime.readAudienceProjectionGameInput(eventGameId);
+        },
+      },
+    });
     let eventAdministration: EventAdministration | null = null;
     let administrativeAuditProjection: AdministrativeAuditProjection | null = null;
     if (foundationStorage !== undefined) {
@@ -336,7 +345,6 @@ async function startServer() {
         eventAdministration = null;
       }
     }
-    let liveEventRuntime: LiveEventGameRuntime | null = null;
     const liveEventDatabasePath = storagePaths.eventGameDatabase;
     const liveEventKeyRing = readLiveEventGrantKeyRing();
     if (liveEventKeyRing !== null) {
@@ -648,6 +656,11 @@ async function startServer() {
         "/api/audience/events/:eventId": {
           GET(req: Request) {
             return readAudienceEvent(req, audienceProjection);
+          },
+        },
+        "/api/audience/events/:eventId/games/:eventGameId": {
+          GET(req: Request) {
+            return readAudienceGame(req, audienceProjection);
           },
         },
         "/api/audience/events": {
@@ -2527,6 +2540,18 @@ export async function readAudienceEvent(
   return publicAudienceUnavailableResponse();
 }
 
+export async function readAudienceGame(
+  req: Request,
+  projection: Pick<AudienceProjectionReader, "readGame">,
+): Promise<Response> {
+  const segments = new URL(req.url).pathname.split("/");
+  const eventId = decodePathSegment(segments.at(-3));
+  const eventGameId = decodePathSegment(segments.at(-1));
+  const result = await projection.readGame(eventId, eventGameId);
+  if (result.status === "accepted") return sensitiveJson(result);
+  return publicAudienceUnavailableResponse();
+}
+
 export async function readPublicAudienceEventPage(
   req: Request,
   projection: Pick<AudienceProjectionReader, "read">,
@@ -2758,8 +2783,12 @@ function isPublicEventPath(pathname: string): boolean {
 
 function readPathSegment(url: string): string {
   const segment = new URL(url).pathname.split("/").at(-1) ?? "";
+  return decodePathSegment(segment);
+}
+
+function decodePathSegment(segment: string | undefined): string {
   try {
-    return decodeURIComponent(segment);
+    return decodeURIComponent(segment ?? "");
   } catch {
     return "";
   }

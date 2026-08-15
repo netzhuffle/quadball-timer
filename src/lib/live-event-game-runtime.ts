@@ -1,4 +1,10 @@
 import { randomBytes } from "node:crypto";
+import type {
+  AudienceProjectionGameInput,
+  AudienceProjectionGameInputOutcome,
+  PublicAudienceGamePhase,
+  PublicAudienceGameOperationalStatus,
+} from "@/lib/audience-projection";
 import { createFoundationAcceptance } from "@/lib/foundation-acceptance";
 import { createEventGameRecord, type ExternalScopeResolver } from "@/lib/event-game-record";
 import type { EventGameRecord } from "@/lib/event-game-record";
@@ -9,6 +15,7 @@ import {
 import {
   createLiveEventGameControl,
   createLiveEventGameIqaInterpreter,
+  type ControllerProjection,
   validateLiveEventGameActionInTransaction,
 } from "@/lib/live-event-game-control";
 import { createTypedGrantAuthority } from "@/lib/grant-management";
@@ -29,8 +36,83 @@ import type { FoundationStorage } from "@/lib/foundation-storage";
 
 export type LiveEventGameRuntime = {
   control: ReturnType<typeof createLiveEventGameControl>;
+  readAudienceProjectionGameInput(eventGameId: string): Promise<AudienceProjectionGameInputOutcome>;
   close(): void;
 };
+
+export function readAudienceProjectionGameInput(
+  root: EventGameRecordRoot | null,
+  projection: ControllerProjection | null,
+): AudienceProjectionGameInputOutcome {
+  if (root === null || projection === null || projection.presentation === undefined) {
+    return { status: "unavailable" };
+  }
+  const gameSideIds = root.gameSides.map((side) => side.id);
+  if (gameSideIds.length !== 2) return { status: "unavailable" };
+  const phase: PublicAudienceGamePhase =
+    projection.overtime === true
+      ? "overtime"
+      : projection.clock.cues.seekerRelease === "released"
+        ? "seekers-released"
+        : "seeker-floor";
+  const operationalStatus: PublicAudienceGameOperationalStatus =
+    projection.phase === "finished"
+      ? "finished"
+      : projection.phase === "suspended"
+        ? "suspended"
+        : projection.phase === "scheduled"
+          ? "scheduled"
+          : projection.clock.running
+            ? "running"
+            : "paused";
+  const timeout = projection.timeout ?? {
+    status: "inactive" as const,
+    gameSideId: null,
+    remainingMs: null,
+  };
+  const heat = projection.heat ?? {
+    status: "inactive" as const,
+    mode: null,
+    pendingTriggerGameTimeMs: null,
+    allowedDurationMs: null,
+    actualDurationMs: null,
+    completionAtTrustedAtMs: null,
+  };
+  const allowedDurationMs = heat.allowedDurationMs ?? null;
+  const actualDurationMs = heat.actualDurationMs ?? null;
+  const remainingMs =
+    allowedDurationMs !== null && actualDurationMs !== null
+      ? Math.max(0, allowedDurationMs - actualDurationMs)
+      : heat.completionAtTrustedAtMs === null || heat.completionAtTrustedAtMs === undefined
+        ? null
+        : Math.max(0, heat.completionAtTrustedAtMs - projection.clock.projectedAtMs);
+  const value: AudienceProjectionGameInput = {
+    gameSideIds: [gameSideIds[0]!, gameSideIds[1]!] as const,
+    phase,
+    operationalStatus,
+    scoreByGameSide: structuredClone(projection.scoreByGameSide),
+    clock: structuredClone(projection.clock),
+    presentation: structuredClone(projection.presentation),
+    overtimeTarget: projection.overtimeTarget ?? null,
+    teamTimeout: {
+      status: timeout.status,
+      gameSideId: timeout.gameSideId ?? null,
+      remainingMs: timeout.remainingMs ?? null,
+    },
+    heatStoppage: {
+      status: heat.status,
+      mode: heat.mode ?? null,
+      pending: (heat.pendingTriggerGameTimeMs ?? null) !== null,
+      allowedDurationMs,
+      actualDurationMs,
+      remainingMs,
+    },
+    winnerGameSideId: projection.winnerGameSideId ?? null,
+    catchingGameSideId: projection.catch?.catchingGameSideId ?? null,
+    locked: root.lifecycle.lockedAtMs !== null,
+  };
+  return { status: "accepted", value };
+}
 
 export async function openLiveEventGameRuntime(input: {
   databasePath: string;
@@ -232,6 +314,13 @@ export async function openLiveEventGameRuntime(input: {
     };
     return {
       control,
+      async readAudienceProjectionGameInput(eventGameId) {
+        const root = await storage.transaction((transaction) =>
+          transaction.findRootByEventGameId(eventGameId),
+        );
+        const projection = await control.readControllerProjection(eventGameId);
+        return readAudienceProjectionGameInput(root, projection);
+      },
       close() {
         clearInterval(lockTimer);
         control.close();
