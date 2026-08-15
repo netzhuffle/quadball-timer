@@ -35,6 +35,24 @@ function createFixture(storage: InMemoryEventCatalogStorage = createInMemoryEven
 }
 
 describe("Event operations catalog", () => {
+  test("defaults each new Game Day to disabled Heat Stoppage Configuration", async () => {
+    const fixture = createFixture();
+    const event = await fixture.catalog.createEvent(
+      { name: "Heat default Event", timeZone: "UTC" },
+      authority,
+    );
+    if (event.status !== "accepted") return;
+    const day = await fixture.catalog.addGameDay(
+      event.value.eventId,
+      { date: "2026-08-15" },
+      authority,
+    );
+    expect(day).toMatchObject({
+      status: "accepted",
+      value: { heatStoppageConfiguration: "disabled" },
+    });
+  });
+
   test("projects Expected Start from the greater Gameplay and Pitch Slot delay", () => {
     expect(
       projectExpectedStartMs(
@@ -698,8 +716,14 @@ describe("Event operations catalog", () => {
     const verifier: WebAuthnVerifier = {
       async verifyRegistration() {
         return {
-          credentialId: "credential-live",
-          publicKey: { kty: "OKP", crv: "Ed25519", x: "public-key" },
+          credentialId: "credential-1",
+          publicKey: {
+            kty: "OKP",
+            crv: "Ed25519",
+            x: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            alg: "EdDSA",
+            ext: true,
+          },
           signCount: 1,
         };
       },
@@ -709,7 +733,11 @@ describe("Event operations catalog", () => {
     };
     const auth = createTechnicalAdminAuth(
       { environment: "test", origin: binding.origin, rpId: "timer.example" },
-      new MemoryTechnicalAdminAuthRepository(),
+      new MemoryTechnicalAdminAuthRepository({
+        environment: "test",
+        origin: binding.origin,
+        rpId: "timer.example",
+      }),
       verifier,
       () => 1_000,
     );
@@ -724,7 +752,7 @@ describe("Event operations catalog", () => {
         value: undefined,
       },
     );
-    const authenticationOptions = auth.beginAuthentication(binding);
+    const authenticationOptions = await auth.beginAuthentication(binding);
     if (!authenticationOptions.ok) throw new Error("Expected authentication options.");
     const session = await auth.completeAuthentication(
       authenticationOptions.value.challengeId,

@@ -13,17 +13,36 @@ import {
 } from "@/lib/technical-admin-auth";
 
 const binding = { origin: "https://timer.example", host: "timer.example" };
+const validEd25519PublicKey: JsonWebKey = {
+  kty: "OKP",
+  crv: "Ed25519",
+  x: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+  alg: "EdDSA",
+  ext: true,
+};
+const validP256PublicKey: JsonWebKey = {
+  kty: "EC",
+  crv: "P-256",
+  x: "axfR8uEsQkf4vOblY6RA8ncDfYEt6zOg9KE5RdiYwpY",
+  y: "T-NC4v4af5uO5-tKfA-eFivOM1drMV7Oy7ZAaDe_UfU",
+  alg: "ES256",
+  ext: true,
+};
 
 function createFixture() {
   let nowMs = 1_000;
   let registrationCredentialId = "credential-1";
   let authenticationSignCount = 2;
-  const repository = new MemoryTechnicalAdminAuthRepository();
+  const repository = new MemoryTechnicalAdminAuthRepository({
+    environment: "production",
+    origin: binding.origin,
+    rpId: "timer.example",
+  });
   const verifier: WebAuthnVerifier = {
     async verifyRegistration() {
       return {
         credentialId: registrationCredentialId,
-        publicKey: { kty: "OKP", crv: "Ed25519", x: "public-key" },
+        publicKey: { ...validEd25519PublicKey },
         signCount: 1,
       };
     },
@@ -175,7 +194,7 @@ describe("Technical Admin authentication", () => {
     const token = decodeURIComponent(issued.value.url.split("token=")[1] ?? "");
     const enrollment = fixture.auth.beginEnrollment(token, binding);
     if (!enrollment.ok) throw new Error("Expected enrollment options.");
-    expect(fixture.auth.beginAuthentication(binding)).toEqual({
+    expect(await fixture.auth.beginAuthentication(binding)).toEqual({
       ok: false,
       error: "invalid-credentials",
     });
@@ -196,7 +215,7 @@ describe("Technical Admin authentication", () => {
     if (!enrollment.ok) throw new Error("Expected enrollment options.");
     await fixture.auth.completeEnrollment(enrollment.value.challengeId, {}, binding);
 
-    const authentication = fixture.auth.beginAuthentication(binding);
+    const authentication = await fixture.auth.beginAuthentication(binding);
     if (!authentication.ok) throw new Error("Expected authentication options.");
     const session = await fixture.auth.completeAuthentication(
       authentication.value.challengeId,
@@ -220,7 +239,7 @@ describe("Technical Admin authentication", () => {
   test("rejects authentication replay and enforces the absolute deadline despite activity", async () => {
     const fixture = createFixture();
     await enroll(fixture);
-    const options = fixture.auth.beginAuthentication(binding);
+    const options = await fixture.auth.beginAuthentication(binding);
     if (!options.ok) throw new Error("Expected authentication options.");
     const first = await fixture.auth.completeAuthentication(options.value.challengeId, {}, binding);
     expect(first.ok).toBe(true);
@@ -396,7 +415,7 @@ describe("Technical Admin authentication", () => {
       );
     }
     fixture.advance(1_000);
-    const options = fixture.auth.beginAuthentication(binding);
+    const options = await fixture.auth.beginAuthentication(binding);
     if (!options.ok) throw new Error("Expected authentication options.");
     expect(
       await fixture.auth.completeAuthentication(options.value.challengeId, {}, binding, "source-a"),
@@ -654,6 +673,344 @@ describe("Technical Admin authentication", () => {
     expect(fixture.repository.alerts.some((alert) => alert.event === "reset-failure")).toBe(true);
   });
 
+  test("preserves the exact credential and invalidates every transient authority", async () => {
+    const fixture = createFixture();
+    const artifacts = await createRestoreArtifacts(fixture);
+    const credentialBefore = structuredClone(fixture.repository.getCredential());
+
+    expect(
+      await fixture.auth.prepareForFoundationRestore({ mode: "preserve-compatible-credential" }),
+    ).toEqual({ outcome: "preserved-transients-invalidated" });
+    expect(fixture.repository.getCredential()).toEqual(credentialBefore);
+    expect(fixture.repository.enrollment).toBeNull();
+    expect(fixture.repository.challenges.size).toBe(0);
+    expect(fixture.auth.authenticateSession(artifacts.session.token)).toBe(false);
+    expect(fixture.auth.verifyCsrf(artifacts.session.token, artifacts.session.csrfToken)).toBe(
+      false,
+    );
+    expect(fixture.auth.resolveCurrentAuthority(artifacts.session.token)).toBeNull();
+    expect(
+      fixture.auth.beginFreshVerification(artifacts.session.token, "replace-credential", binding),
+    ).toEqual({ ok: false, error: "not-authenticated" });
+    expect(await fixture.auth.completeAuthentication(artifacts.challengeId, {}, binding)).toEqual({
+      ok: false,
+      error: "invalid-ceremony",
+    });
+    expect(fixture.auth.beginEnrollment(artifacts.enrollmentToken, binding)).toEqual({
+      ok: false,
+      error: "invalid-enrollment",
+    });
+
+    const freshSignIn = await authenticate(fixture);
+    expect(freshSignIn.token).not.toBe(artifacts.session.token);
+    expect(fixture.repository.getCredential()).toMatchObject({
+      credentialId: credentialBefore?.credentialId,
+      publicKey: credentialBefore?.publicKey,
+    });
+  });
+
+  test("sanitizes readable missing credential state before requiring re-enrollment", async () => {
+    const fixture = createFixture();
+    const artifacts = await createRestoreArtifacts(fixture);
+    fixture.repository.credential = null;
+
+    expect(
+      await fixture.auth.prepareForFoundationRestore({ mode: "preserve-compatible-credential" }),
+    ).toEqual({ outcome: "re-enrollment-required", reason: "missing" });
+    expect(fixture.repository.enrollment).toBeNull();
+    expect(fixture.repository.challenges.size).toBe(0);
+    await expectRestoreArtifactsRejected(fixture, artifacts);
+  });
+
+  test("sanitizes readable invalid credential state before requiring re-enrollment", async () => {
+    const fixture = createFixture();
+    const artifacts = await createRestoreArtifacts(fixture);
+    fixture.repository.credential = {
+      credentialId: "",
+      publicKey: { kty: "unsupported" },
+      signCount: -1,
+      createdAtMs: Number.NaN,
+    };
+
+    expect(
+      await fixture.auth.prepareForFoundationRestore({ mode: "preserve-compatible-credential" }),
+    ).toEqual({ outcome: "re-enrollment-required", reason: "invalid" });
+    expect(fixture.repository.enrollment).toBeNull();
+    expect(fixture.repository.challenges.size).toBe(0);
+    await expectRestoreArtifactsRejected(fixture, artifacts);
+  });
+
+  test("sanitizes readable incompatible storage before requiring re-enrollment", async () => {
+    const fixture = createFixture();
+    const artifacts = await createRestoreArtifacts(fixture);
+    fixture.repository.storageIdentity = {
+      environment: "test",
+      origin: "https://other.example",
+      rpId: "other.example",
+    };
+
+    expect(
+      await fixture.auth.prepareForFoundationRestore({ mode: "preserve-compatible-credential" }),
+    ).toEqual({ outcome: "re-enrollment-required", reason: "incompatible" });
+    expect(fixture.repository.enrollment).toBeNull();
+    expect(fixture.repository.challenges.size).toBe(0);
+    await expectRestoreArtifactsRejected(fixture, artifacts);
+  });
+
+  test("explicit reset removes the credential even when storage identity is incompatible", async () => {
+    const fixture = createFixture();
+    const artifacts = await createRestoreArtifacts(fixture);
+    fixture.repository.storageIdentity = {
+      environment: "test",
+      origin: "https://other.example",
+      rpId: "other.example",
+    };
+
+    expect(await fixture.auth.prepareForFoundationRestore({ mode: "explicit-reset" })).toEqual({
+      outcome: "re-enrollment-required",
+      reason: "explicit-reset",
+    });
+    expect(fixture.repository.getCredential()).toBeNull();
+    expect(fixture.repository.generation).toBe(1);
+    await expectRestoreArtifactsRejected(fixture, artifacts);
+    expect(fixture.auth.issueEnrollmentAuthorization().ok).toBe(true);
+  });
+
+  test("rolls back an incompatible explicit reset when its commit fails", async () => {
+    const fixture = createFixture();
+    const artifacts = await createRestoreArtifacts(fixture);
+    const before = {
+      credential: structuredClone(fixture.repository.credential),
+      enrollment: structuredClone(fixture.repository.enrollment),
+      challenges: structuredClone([...fixture.repository.challenges]),
+      sessions: structuredClone([...fixture.repository.sessions]),
+      generation: fixture.repository.generation,
+    };
+    fixture.repository.storageIdentity = {
+      environment: "test",
+      origin: "https://other.example",
+      rpId: "other.example",
+    };
+    fixture.repository.failRestoreCommit = true;
+
+    expect(await fixture.auth.prepareForFoundationRestore({ mode: "explicit-reset" })).toEqual({
+      outcome: "sanitation-failed",
+    });
+    expect(fixture.repository.credential).toEqual(before.credential);
+    expect(fixture.repository.enrollment).toEqual(before.enrollment);
+    expect([...fixture.repository.challenges]).toEqual(before.challenges);
+    expect([...fixture.repository.sessions]).toEqual(before.sessions);
+    expect(fixture.repository.generation).toBe(before.generation);
+    expect(fixture.auth.authenticateSession(artifacts.session.token)).toBe(true);
+  });
+
+  test("accepts only canonical supported credential key records before issuing a challenge", async () => {
+    const supported = [
+      validEd25519PublicKey,
+      { ...validEd25519PublicKey, use: "sig", key_ops: ["verify"] },
+      validP256PublicKey,
+      { ...validP256PublicKey, use: "sig", key_ops: ["verify"] },
+    ];
+    for (const publicKey of supported) {
+      const fixture = createFixture();
+      fixture.repository.credential = {
+        credentialId: "credential-1",
+        publicKey: { ...publicKey },
+        signCount: 1,
+        createdAtMs: fixture.now(),
+      };
+      const authentication = await fixture.auth.beginAuthentication(binding);
+      expect(authentication.ok).toBe(true);
+      expect(fixture.repository.challenges.size).toBe(1);
+    }
+
+    const invalidKeys: JsonWebKey[] = [
+      { kty: "EC", crv: "P-256", x: "AA", y: validP256PublicKey.y },
+      { kty: "EC", crv: "P-256", x: validP256PublicKey.x, y: "AA" },
+      {
+        kty: "EC",
+        crv: "P-256",
+        x: `${validP256PublicKey.x}=`,
+        y: validP256PublicKey.y,
+      },
+      { kty: "EC", crv: "Ed25519", x: validP256PublicKey.x, y: validP256PublicKey.y },
+      {
+        kty: "EC",
+        crv: "P-256",
+        x: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        y: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      },
+      { kty: "OKP", crv: "Ed25519", x: "AA", y: validEd25519PublicKey.x },
+      { kty: "OKP", crv: "P-256", x: validEd25519PublicKey.x },
+      { kty: "OKP", crv: "Ed25519", x: `${validEd25519PublicKey.x}=`, alg: "ES256" },
+      { kty: "RSA", n: validEd25519PublicKey.x, e: "AQAB", alg: "RS256" },
+      { kty: "unsupported", x: validEd25519PublicKey.x },
+    ];
+    for (const publicKey of invalidKeys) {
+      const fixture = createFixture();
+      fixture.repository.credential = {
+        credentialId: "credential-1",
+        publicKey,
+        signCount: 1,
+        createdAtMs: fixture.now(),
+      };
+      expect(await fixture.auth.beginAuthentication(binding)).toEqual({
+        ok: false,
+        error: "invalid-credentials",
+      });
+      expect(fixture.repository.challenges.size).toBe(0);
+      expect(
+        await fixture.auth.prepareForFoundationRestore({ mode: "preserve-compatible-credential" }),
+      ).toEqual({ outcome: "re-enrollment-required", reason: "invalid" });
+    }
+  });
+
+  test("rejects invalid credential IDs before challenge creation and classifies them during restore", async () => {
+    for (const credentialId of ["", "AA=", "credential-live", "!"]) {
+      const fixture = createFixture();
+      fixture.repository.credential = {
+        credentialId,
+        publicKey: { ...validEd25519PublicKey },
+        signCount: 1,
+        createdAtMs: fixture.now(),
+      };
+
+      expect(await fixture.auth.beginAuthentication(binding)).toEqual({
+        ok: false,
+        error: "invalid-credentials",
+      });
+      expect(fixture.repository.challenges.size).toBe(0);
+      expect(
+        await fixture.auth.prepareForFoundationRestore({ mode: "preserve-compatible-credential" }),
+      ).toEqual({ outcome: "re-enrollment-required", reason: "invalid" });
+    }
+  });
+
+  test("rejects private, symmetric, cross-family, and unknown JWK fields", async () => {
+    const forbiddenFields = ["d", "n", "e", "p", "q", "dp", "dq", "qi", "oth", "k", "unexpected"];
+    for (const publicKey of [validP256PublicKey, validEd25519PublicKey]) {
+      for (const field of forbiddenFields) {
+        const fixture = createFixture();
+        fixture.repository.credential = {
+          credentialId: "credential-1",
+          publicKey: { ...publicKey, [field]: "forbidden" } as JsonWebKey,
+          signCount: 1,
+          createdAtMs: fixture.now(),
+        };
+
+        expect(await fixture.auth.beginAuthentication(binding)).toEqual({
+          ok: false,
+          error: "invalid-credentials",
+        });
+        expect(fixture.repository.challenges.size).toBe(0);
+        expect(
+          await fixture.auth.prepareForFoundationRestore({
+            mode: "preserve-compatible-credential",
+          }),
+        ).toEqual({ outcome: "re-enrollment-required", reason: "invalid" });
+        expect(fixture.repository.enrollment).toBeNull();
+        expect(fixture.repository.sessions.size).toBe(0);
+      }
+    }
+  });
+
+  test("rejects WebCrypto-incompatible JWK metadata before challenge creation", async () => {
+    const invalidMetadata: JsonWebKey[] = [
+      { ...validEd25519PublicKey, alg: undefined },
+      { ...validEd25519PublicKey, ext: undefined },
+      { ...validEd25519PublicKey, alg: "ES256" },
+      { ...validEd25519PublicKey, ext: false },
+      { ...validEd25519PublicKey, use: "enc" },
+      { ...validEd25519PublicKey, key_ops: ["sign"] },
+      { ...validEd25519PublicKey, key_ops: ["verify", "sign"] },
+    ];
+    for (const publicKey of invalidMetadata) {
+      const fixture = createFixture();
+      fixture.repository.credential = {
+        credentialId: "credential-1",
+        publicKey,
+        signCount: 1,
+        createdAtMs: fixture.now(),
+      };
+
+      expect(await fixture.auth.beginAuthentication(binding)).toEqual({
+        ok: false,
+        error: "invalid-credentials",
+      });
+      expect(fixture.repository.challenges.size).toBe(0);
+      expect(
+        await fixture.auth.prepareForFoundationRestore({ mode: "preserve-compatible-credential" }),
+      ).toEqual({ outcome: "re-enrollment-required", reason: "invalid" });
+    }
+  });
+
+  test("performs explicit reset atomically and returns the deliberate reset classification", async () => {
+    const fixture = createFixture();
+    const artifacts = await createRestoreArtifacts(fixture);
+
+    expect(await fixture.auth.prepareForFoundationRestore({ mode: "explicit-reset" })).toEqual({
+      outcome: "re-enrollment-required",
+      reason: "explicit-reset",
+    });
+    expect(fixture.repository.getCredential()).toBeNull();
+    expect(fixture.repository.enrollment).toBeNull();
+    expect(fixture.repository.challenges.size).toBe(0);
+    await expectRestoreArtifactsRejected(fixture, artifacts);
+  });
+
+  test("rolls back the credential and every transient collection when sanitation cannot commit", async () => {
+    const fixture = createFixture();
+    await createRestoreArtifacts(fixture);
+    const before = {
+      credential: structuredClone(fixture.repository.credential),
+      enrollment: structuredClone(fixture.repository.enrollment),
+      challenges: structuredClone([...fixture.repository.challenges]),
+      sessions: structuredClone([...fixture.repository.sessions]),
+      generation: fixture.repository.generation,
+    };
+    fixture.repository.failRestoreCommit = true;
+
+    expect(
+      await fixture.auth.prepareForFoundationRestore({ mode: "preserve-compatible-credential" }),
+    ).toEqual({ outcome: "sanitation-failed" });
+    expect(fixture.repository.credential).toEqual(before.credential);
+    expect(fixture.repository.enrollment).toEqual(before.enrollment);
+    expect([...fixture.repository.challenges]).toEqual(before.challenges);
+    expect([...fixture.repository.sessions]).toEqual(before.sessions);
+    expect(fixture.repository.generation).toBe(before.generation);
+  });
+
+  test("rolls back an explicit reset when credential removal cannot commit", async () => {
+    const fixture = createFixture();
+    await createRestoreArtifacts(fixture);
+    const credentialBefore = structuredClone(fixture.repository.credential);
+    const sessionsBefore = structuredClone([...fixture.repository.sessions]);
+    fixture.repository.failRestoreCommit = true;
+
+    expect(await fixture.auth.prepareForFoundationRestore({ mode: "explicit-reset" })).toEqual({
+      outcome: "sanitation-failed",
+    });
+    expect(fixture.repository.credential).toEqual(credentialBefore);
+    expect([...fixture.repository.sessions]).toEqual(sessionsBefore);
+    expect(fixture.repository.enrollment).not.toBeNull();
+    expect(fixture.repository.challenges.size).toBeGreaterThan(0);
+  });
+
+  test("does not expose storage details when the sanitation operation is unreadable", async () => {
+    const fixture = createFixture();
+    const auth = createTechnicalAdminAuth(
+      { environment: "production", origin: binding.origin, rpId: "timer.example" },
+      throwingRepository("prepareForFoundationRestore", fixture.repository),
+    );
+
+    const result = await auth.prepareForFoundationRestore({
+      mode: "preserve-compatible-credential",
+    });
+    expect(result).toEqual({ outcome: "sanitation-failed" });
+    expect(JSON.stringify(result)).not.toMatch(/credential|sqlite|path|schema|injected/u);
+    expect(Object.keys(result)).toEqual(["outcome"]);
+  });
+
   test("does not issue enrollment when reset evidence cannot be recorded", async () => {
     const fixture = createFixture();
     await enroll(fixture);
@@ -784,6 +1141,42 @@ describe("Technical Admin authentication", () => {
     expect(String(wrongRpError)).toContain("Invalid RP ID");
   });
 
+  test("native verification explicitly rejects unsupported RSA dispatch", async () => {
+    const verifier = new NativeWebAuthnVerifier();
+    const challenge = "Y2hhbGxlbmdl";
+    const clientDataJSON = encodeBase64Url(
+      JSON.stringify({ type: "webauthn.get", challenge, origin: binding.origin }),
+    );
+    const authData = new Uint8Array(37);
+    authData.set(new Uint8Array(new Bun.CryptoHasher("sha256").update("timer.example").digest()));
+    authData[32] = 0x05;
+
+    await expect(
+      verifier.verifyAuthentication(
+        {
+          id: "credential-1",
+          response: {
+            clientDataJSON,
+            authenticatorData: encodeBase64Url(authData),
+            signature: encodeBase64Url(new Uint8Array()),
+          },
+        },
+        {
+          challenge,
+          origin: binding.origin,
+          rpId: "timer.example",
+          credential: {
+            credentialId: "credential-1",
+            publicKey: { kty: "RSA", n: "AA", e: "AQAB", alg: "RS256" },
+            signCount: 0,
+            createdAtMs: 0,
+          },
+          requireUserVerification: true,
+        },
+      ),
+    ).rejects.toThrow("Unsupported public key.");
+  });
+
   test("contains storage and commit failures without acknowledging state", async () => {
     const issueFailure = createTechnicalAdminAuth(
       { environment: "test", origin: binding.origin, rpId: "timer.example" },
@@ -796,7 +1189,7 @@ describe("Technical Admin authentication", () => {
 
     const fixture = createFixture();
     await enroll(fixture);
-    const enrolledOptions = fixture.auth.beginAuthentication(binding);
+    const enrolledOptions = await fixture.auth.beginAuthentication(binding);
     if (!enrolledOptions.ok) throw new Error("Expected authentication options.");
     const enrolledSession = await fixture.auth.completeAuthentication(
       enrolledOptions.value.challengeId,
@@ -809,16 +1202,16 @@ describe("Technical Admin authentication", () => {
       throwingRepository("getCredential", fixture.repository),
       fixture.verifier,
     );
-    expect(credentialReadFailure.beginAuthentication(binding)).toEqual({
+    expect(await credentialReadFailure.beginAuthentication(binding)).toEqual({
       ok: false,
       error: "storage-failure",
     });
     const commitFailure = createTechnicalAdminAuth(
-      { environment: "test", origin: binding.origin, rpId: "timer.example" },
+      { environment: "production", origin: binding.origin, rpId: "timer.example" },
       throwingRepository("commitAuthentication", fixture.repository),
       fixture.verifier,
     );
-    const authentication = commitFailure.beginAuthentication(binding);
+    const authentication = await commitFailure.beginAuthentication(binding);
     if (!authentication.ok) throw new Error("Expected authentication options.");
     expect(
       await commitFailure.completeAuthentication(authentication.value.challengeId, {}, binding),
@@ -857,11 +1250,55 @@ async function enroll(fixture: ReturnType<typeof createFixture>) {
 }
 
 async function authenticate(fixture: ReturnType<typeof createFixture>) {
-  const options = fixture.auth.beginAuthentication(binding);
+  const options = await fixture.auth.beginAuthentication(binding);
   if (!options.ok) throw new Error("Expected authentication options.");
   const session = await fixture.auth.completeAuthentication(options.value.challengeId, {}, binding);
   if (!session.ok) throw new Error("Expected authenticated session.");
   return session.value;
+}
+
+async function createRestoreArtifacts(fixture: ReturnType<typeof createFixture>) {
+  await enroll(fixture);
+  const session = await authenticate(fixture);
+  await authenticate(fixture);
+  const fresh = fixture.auth.beginFreshVerification(session.token, "replace-credential", binding);
+  if (!fresh.ok) throw new Error("Expected fresh verification options.");
+  expect(
+    await fixture.auth.completeFreshVerification(
+      session.token,
+      fresh.value.challengeId,
+      {},
+      binding,
+    ),
+  ).toEqual({ ok: true, value: undefined });
+  const pendingAuthentication = await fixture.auth.beginAuthentication(binding);
+  if (!pendingAuthentication.ok) throw new Error("Expected pending authentication challenge.");
+  fixture.repository.issueEnrollment("pending-enrollment", fixture.now() + 60_000);
+  return {
+    session,
+    challengeId: pendingAuthentication.value.challengeId,
+    enrollmentToken: "pending-enrollment",
+  };
+}
+
+async function expectRestoreArtifactsRejected(
+  fixture: ReturnType<typeof createFixture>,
+  artifacts: Awaited<ReturnType<typeof createRestoreArtifacts>>,
+) {
+  expect(fixture.auth.authenticateSession(artifacts.session.token)).toBe(false);
+  expect(fixture.auth.verifyCsrf(artifacts.session.token, artifacts.session.csrfToken)).toBe(false);
+  expect(fixture.auth.resolveCurrentAuthority(artifacts.session.token)).toBeNull();
+  expect(
+    fixture.auth.beginFreshVerification(artifacts.session.token, "replace-credential", binding),
+  ).toEqual({ ok: false, error: "not-authenticated" });
+  expect(await fixture.auth.completeAuthentication(artifacts.challengeId, {}, binding)).toEqual({
+    ok: false,
+    error: "invalid-ceremony",
+  });
+  expect(fixture.auth.beginEnrollment(artifacts.enrollmentToken, binding)).toEqual({
+    ok: false,
+    error: "invalid-enrollment",
+  });
 }
 
 function encodeBase64Url(value: string | Uint8Array) {
@@ -909,6 +1346,11 @@ function throwingRepository(
       failure === "resetAuthority" || failure === "appendOperationalLog"
         ? fail
         : (...args) => base.resetAuthority(...args),
+    prepareForFoundationRestore:
+      failure === "prepareForFoundationRestore"
+        ? fail
+        : (...args) => base.prepareForFoundationRestore(...args),
+    getStorageIdentity: () => base.getStorageIdentity(),
     getStorageStatus:
       failure === "getStorageStatus" ? fail : (...args) => base.getStorageStatus(...args),
     appendOperationalLog:

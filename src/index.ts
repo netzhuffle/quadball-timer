@@ -682,8 +682,8 @@ async function startServer() {
           },
         },
         "/api/admin/authentication/options": {
-          POST(req: Request) {
-            const result = technicalAdminAuth.beginAuthentication(requestBinding(req));
+          async POST(req: Request) {
+            const result = await technicalAdminAuth.beginAuthentication(requestBinding(req));
             return result.ok ? sensitiveJson(result.value) : genericAuthFailure(401);
           },
         },

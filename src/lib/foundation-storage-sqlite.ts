@@ -327,6 +327,9 @@ function readGameDay(value: unknown): StoredEventCatalogGameDay {
     gameDayId: String(row.gameDayId),
     eventId: String(row.eventId),
     date: String(row.date),
+    heatStoppageConfiguration: String(
+      row.heatStoppageConfiguration,
+    ) as StoredEventCatalogGameDay["heatStoppageConfiguration"],
     createdAtMs: Number(row.createdAtMs),
     updatedAtMs: Number(row.updatedAtMs),
   };
@@ -1501,6 +1504,7 @@ export class SqliteFoundationStorage implements FoundationStorage {
           gameDay.gameDayId,
           gameDay.eventId,
           gameDay.date,
+          gameDay.heatStoppageConfiguration,
           gameDay.createdAtMs,
           gameDay.updatedAtMs,
         ),
@@ -1508,6 +1512,7 @@ export class SqliteFoundationStorage implements FoundationStorage {
         statements.updateGameDay.run(
           gameDay.eventId,
           gameDay.date,
+          gameDay.heatStoppageConfiguration,
           gameDay.updatedAtMs,
           gameDay.gameDayId,
         ),
@@ -2080,6 +2085,7 @@ export class SqliteFoundationStorage implements FoundationStorage {
       `),
       gameDaysByEventId: this.database.query(`
         SELECT game_day_id AS gameDayId, event_id AS eventId, game_day_date AS date,
+               heat_stoppage_configuration AS heatStoppageConfiguration,
                created_at_ms AS createdAtMs, updated_at_ms AS updatedAtMs
         FROM foundation_event_catalog_game_days
         WHERE event_id = ? ORDER BY game_day_date, game_day_id
@@ -2205,12 +2211,12 @@ export class SqliteFoundationStorage implements FoundationStorage {
       ),
       insertGameDay: this.database.query(`
         INSERT INTO foundation_event_catalog_game_days
-          (game_day_id, event_id, game_day_date, created_at_ms, updated_at_ms)
-        VALUES (?, ?, ?, ?, ?)
+          (game_day_id, event_id, game_day_date, heat_stoppage_configuration, created_at_ms, updated_at_ms)
+        VALUES (?, ?, ?, ?, ?, ?)
       `),
       updateGameDay: this.database.query(`
         UPDATE foundation_event_catalog_game_days
-        SET event_id = ?, game_day_date = ?, updated_at_ms = ?
+        SET event_id = ?, game_day_date = ?, heat_stoppage_configuration = ?, updated_at_ms = ?
         WHERE game_day_id = ?
       `),
       deleteGameDay: this.database.query(

@@ -13,6 +13,13 @@ import {
 
 const binding = { origin: "https://localhost:39421", host: "localhost:39421" };
 const identity = { environment: "test" as const, origin: binding.origin, rpId: "localhost" };
+const validEd25519PublicKey: JsonWebKey = {
+  kty: "OKP",
+  crv: "Ed25519",
+  x: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+  alg: "EdDSA",
+  ext: true,
+};
 
 function createVerifier(): WebAuthnVerifier {
   let signCount = 1;
@@ -20,7 +27,7 @@ function createVerifier(): WebAuthnVerifier {
     async verifyRegistration() {
       return {
         credentialId: "credential-1",
-        publicKey: { kty: "OKP", crv: "Ed25519", x: "focused-key" },
+        publicKey: { ...validEd25519PublicKey },
         signCount: signCount++,
       };
     },
@@ -42,7 +49,7 @@ async function enrollAndAuthenticate(
   if (!enrollment.ok) throw new Error("Expected enrollment options.");
   const completed = await auth.completeEnrollment(enrollment.value.challengeId, {}, binding);
   if (!completed.ok) throw new Error("Expected enrollment completion.");
-  const options = auth.beginAuthentication(binding);
+  const options = await auth.beginAuthentication(binding);
   if (!options.ok) throw new Error("Expected authentication options.");
   const session = await auth.completeAuthentication(options.value.challengeId, {}, binding);
   if (!session.ok) throw new Error("Expected authenticated session.");
@@ -54,12 +61,7 @@ function insertCredential(databasePath: string, count = 1) {
   for (let index = 0; index < count; index++) {
     database
       .query("INSERT INTO technical_admin_credentials VALUES (?, ?, ?, ?)")
-      .run(
-        `credential-${index}`,
-        JSON.stringify({ kty: "OKP", crv: "Ed25519", x: `key-${index}` }),
-        1,
-        0,
-      );
+      .run(`credential-${index}`, JSON.stringify({ ...validEd25519PublicKey }), 1, 0);
   }
   database.close();
 }
@@ -135,6 +137,351 @@ async function withTempDirectory<T>(
 }
 
 describe("focused Technical Admin SQLite boundary", () => {
+  test("preserves the credential across sanitation and restart while requiring fresh sign-in", async () => {
+    await withTempDirectory("technical-admin-restore-focused-", async (directory) => {
+      const databasePath = join(directory, "auth.sqlite");
+      let repository: SqliteTechnicalAdminAuthRepository | undefined;
+      let restarted: SqliteTechnicalAdminAuthRepository | undefined;
+      try {
+        repository = new SqliteTechnicalAdminAuthRepository(databasePath, identity);
+        const { auth, session } = await enrollAndAuthenticate(repository, () => 1_000);
+        const pending = await auth.beginAuthentication(binding);
+        if (!pending.ok) throw new Error("Expected a pending authentication challenge.");
+        repository.issueEnrollment("pending-enrollment", 61_000);
+        const credentialBefore = structuredClone(repository.getCredential());
+
+        expect(
+          await auth.prepareForFoundationRestore({ mode: "preserve-compatible-credential" }),
+        ).toEqual({ outcome: "preserved-transients-invalidated" });
+        expect(repository.getCredential()).toEqual(credentialBefore);
+        expect(auth.authenticateSession(session.token)).toBe(false);
+        expect(auth.verifyCsrf(session.token, session.csrfToken)).toBe(false);
+        expect(auth.resolveCurrentAuthority(session.token)).toBeNull();
+        expect(await auth.beginAuthentication(binding)).toMatchObject({ ok: true });
+
+        repository.close();
+        repository = undefined;
+        restarted = new SqliteTechnicalAdminAuthRepository(databasePath, identity);
+        const restartedAuth = createTechnicalAdminAuth(
+          identity,
+          restarted,
+          createVerifier(),
+          () => 2_000,
+        );
+        expect(restarted.getCredential()).toMatchObject({
+          credentialId: credentialBefore?.credentialId,
+          publicKey: credentialBefore?.publicKey,
+          createdAtMs: credentialBefore?.createdAtMs,
+        });
+        const freshOptions = await restartedAuth.beginAuthentication(binding);
+        if (!freshOptions.ok) throw new Error("Expected fresh authentication options.");
+        expect(
+          await restartedAuth.completeAuthentication(freshOptions.value.challengeId, {}, binding),
+        ).toMatchObject({ ok: true });
+      } finally {
+        repository?.close();
+        restarted?.close();
+      }
+    });
+  });
+
+  test("classifies readable invalid state while sanitizing its old authority", async () => {
+    await withTempDirectory("technical-admin-restore-invalid-focused-", async (directory) => {
+      const databasePath = join(directory, "auth.sqlite");
+      let repository: SqliteTechnicalAdminAuthRepository | undefined;
+      let reopened: SqliteTechnicalAdminAuthRepository | undefined;
+      try {
+        repository = new SqliteTechnicalAdminAuthRepository(databasePath, identity);
+        const { auth, session } = await enrollAndAuthenticate(repository, () => 1_000);
+        const pending = await auth.beginAuthentication(binding);
+        if (!pending.ok) throw new Error("Expected a pending authentication challenge.");
+        repository.issueEnrollment("pending-enrollment", 61_000);
+        repository.close();
+        repository = undefined;
+
+        const database = new Database(databasePath);
+        database
+          .query("UPDATE technical_admin_credentials SET public_key_json = ?, credential_id = ?")
+          .run(JSON.stringify({ ...validEd25519PublicKey, key_ops: ["sign"] }), "credential-live");
+        database.close();
+
+        reopened = new SqliteTechnicalAdminAuthRepository(databasePath);
+        const reopenedAuth = createTechnicalAdminAuth(
+          identity,
+          reopened,
+          createVerifier(),
+          () => 2_000,
+        );
+        const challengeCountBefore = Number(
+          (
+            reopened.database
+              .query("SELECT COUNT(*) AS count FROM technical_admin_challenges")
+              .get() as { count: number }
+          ).count,
+        );
+        expect(await reopenedAuth.beginAuthentication(binding)).toEqual({
+          ok: false,
+          error: "invalid-credentials",
+        });
+        expect(
+          Number(
+            (
+              reopened.database
+                .query("SELECT COUNT(*) AS count FROM technical_admin_challenges")
+                .get() as { count: number }
+            ).count,
+          ),
+        ).toBe(challengeCountBefore);
+        expect(
+          await reopenedAuth.prepareForFoundationRestore({
+            mode: "preserve-compatible-credential",
+          }),
+        ).toEqual({ outcome: "re-enrollment-required", reason: "invalid" });
+        expect(reopenedAuth.authenticateSession(session.token)).toBe(false);
+        expect(await reopenedAuth.beginAuthentication(binding)).toEqual({
+          ok: false,
+          error: "invalid-credentials",
+        });
+      } finally {
+        repository?.close();
+        reopened?.close();
+      }
+    });
+  });
+
+  test("classifies compatible explicit reset atomically and removes the credential", async () => {
+    await withTempDirectory("technical-admin-restore-reset-focused-", async (directory) => {
+      const databasePath = join(directory, "auth.sqlite");
+      let repository: SqliteTechnicalAdminAuthRepository | undefined;
+      try {
+        repository = new SqliteTechnicalAdminAuthRepository(databasePath, identity);
+        const { auth, session } = await enrollAndAuthenticate(repository, () => 1_000);
+        const pending = await auth.beginAuthentication(binding);
+        if (!pending.ok) throw new Error("Expected a pending authentication challenge.");
+        repository.issueEnrollment("pending-enrollment", 61_000);
+
+        expect(await auth.prepareForFoundationRestore({ mode: "explicit-reset" })).toEqual({
+          outcome: "re-enrollment-required",
+          reason: "explicit-reset",
+        });
+        expect(repository.getCredential()).toBeNull();
+        expect(auth.authenticateSession(session.token)).toBe(false);
+        expect(await auth.beginAuthentication(binding)).toEqual({
+          ok: false,
+          error: "invalid-credentials",
+        });
+      } finally {
+        repository?.close();
+      }
+    });
+  });
+
+  test("explicit reset removes the credential when storage identity is incompatible", async () => {
+    await withTempDirectory(
+      "technical-admin-restore-reset-incompatible-focused-",
+      async (directory) => {
+        const databasePath = join(directory, "auth.sqlite");
+        let repository: SqliteTechnicalAdminAuthRepository | undefined;
+        try {
+          repository = new SqliteTechnicalAdminAuthRepository(databasePath, identity);
+          const { auth, session } = await enrollAndAuthenticate(repository, () => 1_000);
+          repository.issueEnrollment("pending-enrollment", 61_000);
+          const pending = await auth.beginAuthentication(binding);
+          if (!pending.ok) throw new Error("Expected pending authentication challenge.");
+          repository.close();
+          repository = new SqliteTechnicalAdminAuthRepository(databasePath);
+          const incompatibleAuth = createTechnicalAdminAuth(
+            { environment: "test", origin: "https://localhost:49421", rpId: "localhost" },
+            repository,
+            createVerifier(),
+            () => 2_000,
+          );
+
+          expect(
+            await incompatibleAuth.prepareForFoundationRestore({ mode: "explicit-reset" }),
+          ).toEqual({
+            outcome: "re-enrollment-required",
+            reason: "explicit-reset",
+          });
+          expect(repository.getCredential()).toBeNull();
+          expect(incompatibleAuth.authenticateSession(session.token)).toBe(false);
+          expect(incompatibleAuth.issueEnrollmentAuthorization().ok).toBe(true);
+        } finally {
+          repository?.close();
+        }
+      },
+    );
+  });
+
+  test("rolls back an incompatible explicit reset when credential deletion fails", async () => {
+    await withTempDirectory(
+      "technical-admin-restore-reset-rollback-focused-",
+      async (directory) => {
+        const databasePath = join(directory, "auth.sqlite");
+        let repository: SqliteTechnicalAdminAuthRepository | undefined;
+        try {
+          repository = new SqliteTechnicalAdminAuthRepository(databasePath, identity);
+          const { auth, session } = await enrollAndAuthenticate(repository, () => 1_000);
+          repository.issueEnrollment("pending-enrollment", 61_000);
+          const pending = await auth.beginAuthentication(binding);
+          if (!pending.ok) throw new Error("Expected pending authentication challenge.");
+          repository.close();
+          repository = new SqliteTechnicalAdminAuthRepository(databasePath);
+          const incompatibleAuth = createTechnicalAdminAuth(
+            { environment: "test", origin: "https://localhost:49421", rpId: "localhost" },
+            repository,
+            createVerifier(),
+            () => 2_000,
+          );
+          repository.database.exec(
+            "CREATE TRIGGER fail_restore_credential_delete BEFORE DELETE ON technical_admin_credentials BEGIN SELECT RAISE(ABORT, 'injected restore delete failure'); END",
+          );
+
+          expect(
+            await incompatibleAuth.prepareForFoundationRestore({ mode: "explicit-reset" }),
+          ).toEqual({
+            outcome: "sanitation-failed",
+          });
+          expect(repository.getCredential()).not.toBeNull();
+          expect(incompatibleAuth.authenticateSession(session.token)).toBe(true);
+          expect(
+            Number(
+              (
+                repository.database
+                  .query("SELECT COUNT(*) AS count FROM technical_admin_challenges")
+                  .get() as { count: number }
+              ).count,
+            ),
+          ).toBeGreaterThan(0);
+          expect(
+            Number(
+              (
+                repository.database
+                  .query("SELECT COUNT(*) AS count FROM technical_admin_enrollment")
+                  .get() as { count: number }
+              ).count,
+            ),
+          ).toBeGreaterThan(0);
+        } finally {
+          repository?.close();
+        }
+      },
+    );
+  });
+
+  test("classifies readable incompatible storage without preserving authority", async () => {
+    await withTempDirectory("technical-admin-restore-incompatible-focused-", async (directory) => {
+      const databasePath = join(directory, "auth.sqlite");
+      let repository: SqliteTechnicalAdminAuthRepository | undefined;
+      try {
+        repository = new SqliteTechnicalAdminAuthRepository(databasePath, identity);
+        const { session } = await enrollAndAuthenticate(repository, () => 1_000);
+        repository.close();
+        repository = new SqliteTechnicalAdminAuthRepository(databasePath);
+        const incompatibleAuth = createTechnicalAdminAuth(
+          { environment: "test", origin: "https://localhost:49421", rpId: "localhost" },
+          repository,
+          createVerifier(),
+          () => 2_000,
+        );
+
+        expect(
+          await incompatibleAuth.prepareForFoundationRestore({
+            mode: "preserve-compatible-credential",
+          }),
+        ).toEqual({ outcome: "re-enrollment-required", reason: "incompatible" });
+        expect(incompatibleAuth.authenticateSession(session.token)).toBe(false);
+      } finally {
+        repository?.close();
+      }
+    });
+  });
+
+  test("does not adopt a missing storage identity for an existing credential store", async () => {
+    await withTempDirectory(
+      "technical-admin-restore-missing-identity-focused-",
+      async (directory) => {
+        const databasePath = join(directory, "auth.sqlite");
+        let repository: SqliteTechnicalAdminAuthRepository | undefined;
+        try {
+          repository = new SqliteTechnicalAdminAuthRepository(databasePath, identity);
+          await enrollAndAuthenticate(repository, () => 1_000);
+          repository.close();
+          const database = new Database(databasePath);
+          database.query("DELETE FROM technical_admin_storage_identity").run();
+          database.close();
+
+          repository = new SqliteTechnicalAdminAuthRepository(databasePath, identity);
+          const auth = createTechnicalAdminAuth(
+            identity,
+            repository,
+            createVerifier(),
+            () => 2_000,
+          );
+          expect(
+            await auth.prepareForFoundationRestore({ mode: "preserve-compatible-credential" }),
+          ).toEqual({ outcome: "re-enrollment-required", reason: "incompatible" });
+        } finally {
+          repository?.close();
+        }
+      },
+    );
+  });
+
+  test("fails closed without mutation for read-only and unreadable stores", async () => {
+    await withTempDirectory("technical-admin-restore-failure-focused-", async (directory) => {
+      const readOnlyPath = join(directory, "readonly.sqlite");
+      let writable: SqliteTechnicalAdminAuthRepository | undefined;
+      let readOnly: SqliteTechnicalAdminAuthRepository | undefined;
+      let unreadable: SqliteTechnicalAdminAuthRepository | undefined;
+      try {
+        writable = new SqliteTechnicalAdminAuthRepository(readOnlyPath, identity);
+        await enrollAndAuthenticate(writable, () => 1_000);
+        writable.close();
+        writable = undefined;
+        readOnly = new SqliteTechnicalAdminAuthRepository(readOnlyPath, undefined, {
+          readwrite: false,
+        });
+        const readOnlyAuth = createTechnicalAdminAuth(
+          identity,
+          readOnly,
+          createVerifier(),
+          () => 2_000,
+        );
+        expect(
+          await readOnlyAuth.prepareForFoundationRestore({
+            mode: "preserve-compatible-credential",
+          }),
+        ).toEqual({ outcome: "sanitation-failed" });
+
+        const unreadablePath = join(directory, "unreadable.sqlite");
+        const initialized = new SqliteTechnicalAdminAuthRepository(unreadablePath, identity);
+        initialized.close();
+        const database = new Database(unreadablePath);
+        database.exec("DROP TABLE technical_admin_credentials");
+        database.close();
+        unreadable = new SqliteTechnicalAdminAuthRepository(unreadablePath, undefined, {
+          readwrite: false,
+        });
+        const unreadableAuth = createTechnicalAdminAuth(
+          identity,
+          unreadable,
+          createVerifier(),
+          () => 2_000,
+        );
+        expect(
+          await unreadableAuth.prepareForFoundationRestore({
+            mode: "preserve-compatible-credential",
+          }),
+        ).toEqual({ outcome: "sanitation-failed" });
+      } finally {
+        writable?.close();
+        readOnly?.close();
+        unreadable?.close();
+      }
+    });
+  });
+
   test("persists purpose-bound step-up and its authenticator counter across restart", async () => {
     await withTempDirectory("technical-admin-focused-", async (directory) => {
       const databasePath = join(directory, "auth.sqlite");

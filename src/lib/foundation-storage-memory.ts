@@ -1316,6 +1316,9 @@ function createTransaction(
       if (!state.events.has(gameDay.eventId)) {
         throw new FoundationStorageConstraintError("event-id");
       }
+      if (!isHeatStoppageConfiguration(gameDay.heatStoppageConfiguration)) {
+        throw new FoundationStorageConstraintError("heat-stoppage-configuration");
+      }
       if (state.gameDays.has(gameDay.gameDayId)) {
         throw new FoundationStorageConstraintError("game-day-id");
       }
@@ -1332,6 +1335,9 @@ function createTransaction(
     updateGameDay(gameDay) {
       const previous = state.gameDays.get(gameDay.gameDayId);
       if (previous === undefined) throw new FoundationStorageConstraintError("game-day-id");
+      if (!isHeatStoppageConfiguration(gameDay.heatStoppageConfiguration)) {
+        throw new FoundationStorageConstraintError("heat-stoppage-configuration");
+      }
       if (
         [...state.gameDays.values()].some(
           (candidate) =>
@@ -2336,6 +2342,10 @@ function createTransaction(
       });
     },
   };
+}
+
+function isHeatStoppageConfiguration(value: unknown): value is "enabled" | "disabled" {
+  return value === "enabled" || value === "disabled";
 }
 
 function findRoot(

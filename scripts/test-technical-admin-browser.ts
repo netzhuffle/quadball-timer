@@ -6,6 +6,11 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { openSqliteFoundationStorage } from "@/lib/foundation-storage-sqlite";
 import { readGrantAuthorityOptions } from "@/lib/grant-runtime";
+import {
+  createSqliteTechnicalAdminAuthRepository,
+  createTechnicalAdminAuth,
+} from "@/lib/technical-admin-auth";
+import { readTechnicalAdminConfig } from "@/lib/technical-admin-config";
 
 const directory = mkdtempSync(join(tmpdir(), "quadball-timer-admin-browser-"));
 const certificatePath = join(directory, "localhost.crt");
@@ -132,6 +137,11 @@ try {
   }, enrollmentToken);
   assert(replayStatus === 401 || replayStatus === 409, "enrollment replay was rejected");
 
+  await page.getByRole("button", { name: "Sign in with passkey" }).click();
+  await page.getByText("Technical Admin administration").waitFor();
+  await prepareTechnicalAdminRestore();
+  await page.reload();
+  await page.getByRole("button", { name: "Sign in with passkey" }).waitFor();
   await page.getByRole("button", { name: "Sign in with passkey" }).click();
   await page.getByText("Technical Admin administration").waitFor();
   const csrfFailureStatus = await page.evaluate(async () => {
@@ -2273,11 +2283,41 @@ async function waitForServer(url: string) {
 }
 
 async function restartServerProcess(serverOrigin: string, serverEnvironment: NodeJS.ProcessEnv) {
+  await stopServerProcess();
+  await Bun.sleep(250);
+  await startServerProcess(serverOrigin, serverEnvironment);
+}
+
+async function prepareTechnicalAdminRestore() {
+  await stopServerProcess();
+  const config = readTechnicalAdminConfig(environment);
+  const repository = createSqliteTechnicalAdminAuthRepository(databasePath, {
+    environment: config.environment,
+    origin: config.origin,
+    rpId: config.rpId,
+  });
+  try {
+    const auth = createTechnicalAdminAuth(config, repository);
+    assert(
+      (await auth.prepareForFoundationRestore({ mode: "preserve-compatible-credential" }))
+        .outcome === "preserved-transients-invalidated",
+      "Technical Admin restore preparation did not preserve the compatible credential",
+    );
+  } finally {
+    repository.close();
+  }
+  await startServerProcess(origin, environment);
+}
+
+async function stopServerProcess() {
   if (server !== null) {
     server.kill();
     await server.exited;
-    await Bun.sleep(250);
+    server = null;
   }
+}
+
+async function startServerProcess(serverOrigin: string, serverEnvironment: NodeJS.ProcessEnv) {
   server = Bun.spawn(["bun", "run", "src/index.ts"], {
     cwd: process.cwd(),
     env: serverEnvironment,
