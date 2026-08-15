@@ -3,6 +3,7 @@ import type {
   ControllerLeaveResult,
   ControllerQrResult,
   ControllerRefreshResult,
+  ControllerReplayResult,
   LiveEventGameControlResult,
   OpenControllerResult,
 } from "@/lib/live-event-game-control";
@@ -16,6 +17,7 @@ export type LiveEventGameControlTransport = {
   revealControllerQr(request: Request): Promise<Response>;
   leaveController(request: Request): Promise<Response>;
   submitControllerIntent(request: Request): Promise<Response>;
+  replayControllerActions(request: Request): Promise<Response>;
 };
 
 export type LiveEventGameControlTransportTarget = {
@@ -42,6 +44,19 @@ export type LiveEventGameControlTransportTarget = {
     eventGameId: string;
     intent: unknown;
   }): Promise<LiveEventGameControlResult>;
+  replayControllerActions(input: {
+    sessionBearer: string;
+    eventGameId: string;
+    batchId: string;
+    replicaGeneration: string;
+    expectedGrantSessionId: string;
+    expectedGrantVersion: string;
+    actions: readonly {
+      eventGameId: string;
+      intent: unknown;
+      causalPredecessorIds?: readonly unknown[];
+    }[];
+  }): Promise<ControllerReplayResult>;
 };
 
 export function createLiveEventGameControlTransport(
@@ -91,6 +106,53 @@ export function createLiveEventGameControlTransport(
         sessionBearer: body.body.sessionBearer,
         eventGameId: body.body.eventGameId,
         intent: body.body.intent,
+      });
+      return noStoreJson(result, resultStatus(result));
+    },
+    async replayControllerActions(request) {
+      if (!isAllowedRequest(request)) return unavailable();
+      const control = resolve();
+      if (control === null) return unavailable();
+      const body = await readJsonBodyWithinLimit(
+        request,
+        SHARED_LIMITS.transport.httpJsonBodyBytes,
+      );
+      if (
+        !body.ok ||
+        !isRecord(body.body) ||
+        typeof body.body.sessionBearer !== "string" ||
+        typeof body.body.eventGameId !== "string" ||
+        typeof body.body.batchId !== "string" ||
+        typeof body.body.replicaGeneration !== "string" ||
+        typeof body.body.grantSessionId !== "string" ||
+        typeof body.body.grantVersion !== "string" ||
+        !Array.isArray(body.body.actions)
+      )
+        return unavailable();
+      if (
+        body.body.actions.length === 0 ||
+        body.body.actions.length > SHARED_LIMITS.replay.maxControlActions
+      ) {
+        return unavailable();
+      }
+      const result = await control.replayControllerActions({
+        sessionBearer: body.body.sessionBearer,
+        eventGameId: body.body.eventGameId,
+        batchId: body.body.batchId,
+        replicaGeneration: body.body.replicaGeneration,
+        expectedGrantSessionId: body.body.grantSessionId,
+        expectedGrantVersion: body.body.grantVersion,
+        actions: body.body.actions.map((action) => {
+          if (!isRecord(action))
+            return { eventGameId: "", intent: null, causalPredecessorIds: [null] };
+          return {
+            eventGameId: typeof action.eventGameId === "string" ? action.eventGameId : "",
+            intent: action.intent,
+            causalPredecessorIds: Array.isArray(action.causalPredecessorIds)
+              ? action.causalPredecessorIds
+              : [null],
+          };
+        }),
       });
       return noStoreJson(result, resultStatus(result));
     },
@@ -165,7 +227,7 @@ async function readSessionInput(
   return { sessionBearer: body.body.sessionBearer };
 }
 
-function resultStatus(result: LiveEventGameControlResult): number {
+function resultStatus(result: LiveEventGameControlResult | ControllerReplayResult): number {
   if (result.status === "retryable") return 503;
   if (result.status === "rejected") return 403;
   return 200;

@@ -5,6 +5,7 @@ import { Window } from "happy-dom";
 import { App } from "./App";
 import { createInitialGameState, projectGameView } from "@/lib/game-engine";
 import { DEFAULT_AWAY_TEAM_COLOR, DEFAULT_HOME_TEAM_COLOR } from "@/lib/team-colors";
+import { createInitialClockBaseline, projectClockBaseline } from "@/lib/clock-authority";
 
 class MockWebSocket {
   static CONNECTING = 0;
@@ -153,6 +154,166 @@ describe("App", () => {
     } finally {
       console.error = originalConsoleError;
     }
+  });
+
+  test("online Event Game Controller keeps Game Clock and play/pause visible", async () => {
+    testWindow.history.pushState({}, "", "/event-control");
+    const originalDateNow = Date.now;
+    Date.now = () => 9_000_000_000_000;
+    try {
+      const baseline = { ...createInitialClockBaseline(), gameTimeMs: 5_000 };
+      const projection = {
+        eventGameId: "event-game-1",
+        phase: "scheduled" as const,
+        scoreByGameSide: { "side-a": 0, "side-b": 0 },
+        goalCount: 0,
+        commencement: {
+          status: "provisional" as const,
+          commencedAtMs: null,
+          provisionalRunningSinceMs: null,
+          provisionalElapsedMs: 0,
+        },
+        // The server sample is deliberately from a wall clock far from this phone.
+        clock: projectClockBaseline(baseline, 4_000),
+      };
+      Object.assign(globalThis, {
+        fetch: async (input: string | URL | Request) => {
+          const url =
+            typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+          if (url.endsWith("/api/event-control/open")) {
+            return new Response(
+              JSON.stringify({
+                status: "opened",
+                eventGameId: "event-game-1",
+                session: {
+                  sessionBearer: "session-bearer",
+                  grantSessionId: "grant-session",
+                  grantVersion: "grant-version",
+                },
+                projection,
+                projectionStatus: "available",
+              }),
+              { status: 200, headers: { "content-type": "application/json" } },
+            );
+          }
+          return new Response("Not found", { status: 404 });
+        },
+      });
+
+      await act(async () => {
+        root.render(<App />);
+        await Promise.resolve();
+      });
+
+      const openButton = Array.from(container.getElementsByTagName("button")).find((button) =>
+        button.textContent?.includes("Open Controller Device"),
+      );
+      expect(openButton).not.toBeNull();
+      await act(async () => {
+        openButton?.click();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      expect(container.textContent).toContain("Game Clock");
+      expect(container.textContent).toContain("00:05");
+      expect(container.textContent).toContain("Start clock");
+      expect(container.textContent).toContain("Controller projection");
+    } finally {
+      Date.now = originalDateNow;
+    }
+  });
+
+  test("online Controller renders every clock cue phase and rejects fractional correction", async () => {
+    testWindow.history.pushState({}, "", "/event-control");
+    let phaseMs = 0;
+    const makeProjection = () => ({
+      eventGameId: "event-game-1",
+      phase: "scheduled" as const,
+      scoreByGameSide: { "side-a": 0, "side-b": 0 },
+      goalCount: 0,
+      commencement: {
+        status: "provisional" as const,
+        commencedAtMs: null,
+        provisionalRunningSinceMs: null,
+        provisionalElapsedMs: 0,
+      },
+      clock: projectClockBaseline({ ...createInitialClockBaseline(), gameTimeMs: phaseMs }, 0),
+    });
+    Object.assign(globalThis, {
+      fetch: async (input: string | URL | Request) => {
+        const url =
+          typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+        if (url.endsWith("/api/event-control/open") || url.endsWith("/api/event-control/refresh")) {
+          return new Response(
+            JSON.stringify({
+              status: url.endsWith("/open") ? "opened" : "authorized",
+              eventGameId: "event-game-1",
+              session: {
+                sessionBearer: "session-bearer",
+                eventGameId: "event-game-1",
+                grantSessionId: "grant-session",
+                grantVersion: "grant-version",
+              },
+              projection: makeProjection(),
+              projectionStatus: "available",
+            }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          );
+        }
+        return new Response("Not found", { status: 404 });
+      },
+    });
+
+    await act(async () => {
+      root.render(<App />);
+      await Promise.resolve();
+    });
+    const openButton = Array.from(container.getElementsByTagName("button")).find((button) =>
+      button.textContent?.includes("Open Controller Device"),
+    );
+    await act(async () => {
+      openButton?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(container.textContent).toContain("Flag-runner entry pending at 19:00");
+    expect(container.textContent).toContain("Seeker warning pending");
+    expect(container.textContent).toContain("Seeker release pending at 20:00");
+
+    phaseMs = 19 * 60 * 1000;
+    const refreshButton = Array.from(container.getElementsByTagName("button")).find((button) =>
+      button.textContent?.includes("Refresh assignment"),
+    );
+    await act(async () => {
+      refreshButton?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(container.textContent).toContain("FLAG-RUNNER ENTRY NOW");
+    expect(container.textContent).toContain("SEEKER WARNING: release countdown active");
+    expect(container.textContent).toContain("SEEKER COUNTDOWN: 01:00");
+
+    phaseMs = 20 * 60 * 1000;
+    await act(async () => {
+      refreshButton?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(container.textContent).toContain("SEEKER RELEASED at 20:00");
+
+    const correctionInput = container.querySelector<HTMLInputElement>("#clock-correction");
+    const correctionButton = container.querySelector<HTMLButtonElement>(
+      '[data-clock-correction="true"]',
+    );
+    if (correctionInput === null || correctionButton === null) {
+      throw new Error("Expected the bounded clock correction controls.");
+    }
+    await act(async () => {
+      correctionButton.click();
+      await Promise.resolve();
+    });
+    expect(container.textContent).toContain("Enter a whole number of milliseconds");
   });
 
   test("clock adjust controls replace helper text and can be closed from the clock toggle", async () => {

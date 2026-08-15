@@ -9,6 +9,7 @@ import {
 import {
   createLiveEventGameControl,
   createLiveEventGameIqaInterpreter,
+  validateLiveEventClockActionInTransaction,
 } from "@/lib/live-event-game-control";
 import { createTypedGrantAuthority } from "@/lib/grant-management";
 import type { GrantAuthorityOptions } from "@/lib/grant-authority";
@@ -52,6 +53,8 @@ export async function openLiveEventGameRuntime(input: {
       externalScopeResolver: scopeResolver,
       interpreter: createLiveEventGameIqaInterpreter(),
       clock,
+      validateActionInTransaction: ({ transaction, root, action }) =>
+        validateLiveEventClockActionInTransaction(transaction.listActions(root.recordId), action),
     });
     const records = new Map<string, EventGameRecord>();
     const resolveEventGameRecord = async (eventGameId: string) => {

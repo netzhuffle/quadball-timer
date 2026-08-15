@@ -1,11 +1,22 @@
 import type { EffectiveGameFact, IqaGameRulesInterpreter } from "@/lib/event-game-actions";
 import { createDefaultControlActionCodecs } from "@/lib/event-game-actions";
+import {
+  CLOCK_AUTHORITY_VERSION,
+  deriveClockAuthority,
+  projectClockBaseline,
+  validateClockAuthorityAction,
+  type ClockAuthorityAction,
+  type ClockProjection,
+} from "@/lib/clock-authority";
 import type { EventGameLifecyclePhase, EventGameRecordRoot } from "@/lib/foundation-record-types";
 import type { EventGameRecord } from "@/lib/event-game-record";
 import type { FoundationAcceptance } from "@/lib/foundation-acceptance";
+import type { ControlAction } from "@/lib/event-game-actions";
 import type { TypedGrantAuthority } from "@/lib/grant-management-types";
 import {
   SHARED_LIMITS,
+  validateClockAdjustmentMs,
+  validateGameClockMs,
   validateIntegerInRange,
   validateOpaqueIdentifier,
 } from "@/lib/validation-policy";
@@ -20,6 +31,7 @@ type ControllerIntentBase = {
   gameTimeMs: number;
   occurrence: {
     clientOriginAtMs: number | null;
+    source?: "online" | "offline";
   };
 };
 
@@ -31,6 +43,14 @@ export type LiveEventControllerIntent =
   | (ControllerIntentBase & {
       type: "clock" | "set-running";
       running: boolean;
+    })
+  | (ControllerIntentBase & {
+      type: "clock-adjust";
+      adjustmentMs: number;
+    })
+  | (ControllerIntentBase & {
+      type: "clock-correction";
+      clockTimeMs: number;
     })
   | (ControllerIntentBase & {
       type: "substantive";
@@ -87,6 +107,7 @@ export type LiveEventGameDerivedState = {
   phase: EventGameLifecyclePhase;
   scoreByGameSide: Readonly<Record<string, number>>;
   goalCount: number;
+  clock: ClockProjection;
 };
 
 export type ControllerProjection = {
@@ -95,6 +116,7 @@ export type ControllerProjection = {
   scoreByGameSide: Readonly<Record<string, number>>;
   goalCount: number;
   commencement: ControllerCommencement;
+  clock: ClockProjection;
 };
 
 export type ControllerSynchronization = {
@@ -164,13 +186,40 @@ export type LiveEventGameControlOptions = {
   projectionFailure?: () => boolean;
 };
 
+export type ControllerReplayOutcome = {
+  operationId: string;
+  status:
+    | "accepted"
+    | "idempotent"
+    | "retryable"
+    | "causally-blocked"
+    | "held-for-correction"
+    | "terminally-rejected";
+  detail?: string;
+};
+
+export type ControllerReplayResult = {
+  batchId: string;
+  replicaGeneration: string;
+  session: ControllerSessionAttachment;
+  eventGameId: string;
+  status: "synchronized" | "retryable" | "rejected";
+  outcomes: readonly ControllerReplayOutcome[];
+  projection: ControllerProjection | null;
+};
+
 export function createLiveEventGameIqaInterpreter(
   version = LIVE_EVENT_IQA_INTERPRETER_VERSION,
 ): IqaGameRulesInterpreter {
   return {
     version,
-    rebuild({ root, effectiveFacts }) {
-      return deriveLiveEventGameState(root, effectiveFacts, version);
+    rebuild({ root, canonicalActions, effectiveFacts }) {
+      return deriveLiveEventGameState(
+        root,
+        canonicalActions.map((action) => ({ action })),
+        effectiveFacts,
+        version,
+      );
     },
   };
 }
@@ -186,11 +235,23 @@ export function parseLiveEventControllerIntent(
     value.type !== "record-goal" &&
     value.type !== "clock" &&
     value.type !== "set-running" &&
+    value.type !== "clock-adjust" &&
+    value.type !== "adjust-clock" &&
+    value.type !== "adjust-game-clock" &&
+    value.type !== "clock-correction" &&
+    value.type !== "correct-clock" &&
+    value.type !== "set-game-clock" &&
     value.type !== "substantive" &&
     value.type !== "reset" &&
     value.type !== "undo"
   )
     return invalid("Controller intent type is unsupported.");
+  const normalizedType =
+    value.type === "adjust-clock" || value.type === "adjust-game-clock"
+      ? "clock-adjust"
+      : value.type === "correct-clock" || value.type === "set-game-clock"
+        ? "clock-correction"
+        : value.type;
 
   const operationId = validateOpaqueIdentifier(value.operationId, "operationId");
   const factId = validateOpaqueIdentifier(value.factId, "factId");
@@ -214,6 +275,20 @@ export function parseLiveEventControllerIntent(
   if (value.type === "clock" || value.type === "set-running") {
     if (typeof value.running !== "boolean") return invalid("running must be a boolean.");
     running = value.running;
+  }
+  let adjustmentMs: number | undefined;
+  if (normalizedType === "clock-adjust") {
+    const adjustment = validateClockAdjustment(value.adjustmentMs ?? value.deltaMs);
+    if (!adjustment.ok) return invalid(adjustment.error);
+    adjustmentMs = adjustment.value;
+  }
+  let clockTimeMs: number | undefined;
+  if (normalizedType === "clock-correction") {
+    const clockTime = validateGameClock(
+      value.clockTimeMs ?? value.targetGameTimeMs ?? value.gameTimeMs,
+    );
+    if (!clockTime.ok) return invalid(clockTime.error);
+    clockTimeMs = clockTime.value;
   }
   let trigger: "card" | "timeout" | "suspension" | "result" | undefined;
   if (value.type === "substantive") {
@@ -242,17 +317,26 @@ export function parseLiveEventControllerIntent(
     if (!clientOrigin.ok) return invalid(clientOrigin.error);
     clientOriginAtMs = clientOrigin.value;
   }
+  let source: "online" | "offline" | undefined;
+  if (value.occurrence.source !== undefined) {
+    if (value.occurrence.source !== "online" && value.occurrence.source !== "offline") {
+      return invalid("occurrence.source is unsupported.");
+    }
+    source = value.occurrence.source;
+  }
   return {
     ok: true,
     value: {
       version: LIVE_EVENT_CONTROL_INTENT_VERSION,
-      type: value.type,
+      type: normalizedType,
       operationId: operationId.value,
       factId: factId.value,
       gameTimeMs: gameTimeMs.value,
-      occurrence: { clientOriginAtMs },
+      occurrence: { clientOriginAtMs, ...(source === undefined ? {} : { source }) },
       ...(gameSideId === undefined ? {} : { gameSideId }),
       ...(running === undefined ? {} : { running }),
+      ...(adjustmentMs === undefined ? {} : { adjustmentMs }),
+      ...(clockTimeMs === undefined ? {} : { clockTimeMs }),
       ...(trigger === undefined ? {} : { trigger }),
     } as LiveEventControllerIntent,
   };
@@ -267,6 +351,7 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
     throw new Error("The game-fact runtime codec is unavailable.");
   }
   const goalCodec = gameFactCodec;
+  const replayingSessions = new Set<string>();
 
   async function openController(input: {
     qrCredential: string;
@@ -516,6 +601,7 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
     sessionBearer: string;
     eventGameId: string;
     intent: unknown;
+    causalPredecessorIds?: readonly string[];
   }): Promise<LiveEventGameControlResult> {
     const authorized = await options.grantAuthority.authorizeGrant({
       sessionBearer: input.sessionBearer,
@@ -559,6 +645,14 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
     }
     const nowMs = clock();
     const previousClockStartMs = latestRunningClockStart(actionsBefore);
+    const clockBefore = projectClockBaseline(
+      deriveClockAuthority(readClockAuthorityActions(actionsBefore)),
+      nowMs,
+    );
+    const clockData = readClockIntentData(parsed.value, clockBefore, nowMs);
+    if (clockData.status === "rejected") {
+      return rejectedAction(parsed.value.operationId);
+    }
     const clockStartMs =
       parsed.value.type === "clock" || parsed.value.type === "set-running"
         ? parsed.value.running
@@ -581,17 +675,17 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
         data:
           parsed.value.type === "record-goal"
             ? { points: 10 }
-            : parsed.value.type === "clock" || parsed.value.type === "set-running"
-              ? { running: parsed.value.running, startedAtMs: clockStartMs }
+            : clockData.value !== null
+              ? clockData.value
               : parsed.value.type === "substantive"
                 ? { trigger: parsed.value.trigger }
                 : null,
       },
-      causalPredecessorIds: [],
+      causalPredecessorIds: [...(input.causalPredecessorIds ?? [])],
       occurrence: {
         trustedAtMs: nowMs,
         clientOriginAtMs: parsed.value.occurrence.clientOriginAtMs,
-        source: "online",
+        source: parsed.value.occurrence.source ?? "online",
       },
       grant: {
         sessionId: authorized.grantSessionId,
@@ -662,6 +756,229 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
     };
   }
 
+  async function replayControllerActions(input: {
+    sessionBearer: string;
+    eventGameId: string;
+    batchId: string;
+    replicaGeneration: string;
+    expectedGrantSessionId: string;
+    expectedGrantVersion: string;
+    actions: readonly {
+      eventGameId: string;
+      intent: unknown;
+      causalPredecessorIds?: readonly unknown[];
+    }[];
+  }): Promise<ControllerReplayResult> {
+    const requestedSession: ControllerSessionAttachment = {
+      eventGameId: input.eventGameId,
+      grantSessionId: input.expectedGrantSessionId,
+      grantVersion: input.expectedGrantVersion,
+    };
+    const replayContext = {
+      batchId: input.batchId,
+      replicaGeneration: input.replicaGeneration,
+      session: requestedSession,
+      eventGameId: input.eventGameId,
+    };
+    if (
+      !validateOpaqueIdentifier(input.batchId, "batchId").ok ||
+      !validateOpaqueIdentifier(input.replicaGeneration, "replicaGeneration").ok ||
+      !validateOpaqueIdentifier(input.expectedGrantSessionId, "grantSessionId").ok ||
+      !validateOpaqueIdentifier(input.expectedGrantVersion, "grantVersion").ok
+    ) {
+      return replayRejected(input.actions, replayContext);
+    }
+    const authorized = await options.grantAuthority.authorizeGrant({
+      sessionBearer: input.sessionBearer,
+      eventGameId: input.eventGameId,
+      readOnly: true,
+    });
+    if (
+      authorized.status !== "authorized" ||
+      authorized.grantType !== "control" ||
+      authorized.eventGameId === null
+    ) {
+      return replayRejected(input.actions, replayContext);
+    }
+    if (
+      authorized.grantSessionId !== input.expectedGrantSessionId ||
+      authorized.grantVersion !== input.expectedGrantVersion
+    ) {
+      return replayRejected(input.actions, replayContext);
+    }
+    if (
+      input.actions.length === 0 ||
+      input.actions.length > SHARED_LIMITS.replay.maxControlActions ||
+      replayingSessions.has(authorized.grantSessionId)
+    ) {
+      return replayRetryable(input.actions, replayContext);
+    }
+    replayingSessions.add(authorized.grantSessionId);
+    try {
+      const replayOwner = await options.resolveEventGameRecord(authorized.eventGameId);
+      if (replayOwner === null) return replayRetryable(input.actions, replayContext);
+      const persistedActions = await replayOwner.record.readActions();
+      const persistedOperationIds = new Set(
+        persistedActions.map((stored) => stored.action.operationId),
+      );
+      const replayRoot = await replayOwner.record.readRoot(replayOwner.recordId);
+      if (replayRoot === null) return replayRetryable(input.actions, replayContext);
+      let finishedUnlocked =
+        replayRoot.lifecycle.phase === "finished" && replayRoot.lifecycle.lockedAtMs === null;
+      const outcomes: ControllerReplayOutcome[] = [];
+      const completed = new Set<string>();
+      const blocked = new Set<string>();
+      const held = new Set<string>();
+      const operationCounts = new Map<string, number>();
+      for (const candidate of input.actions) {
+        const operationId = readOperationId(candidate.intent);
+        if (operationId !== null)
+          operationCounts.set(operationId, (operationCounts.get(operationId) ?? 0) + 1);
+      }
+      const batchOperationIds = new Set(
+        input.actions.flatMap((candidate) => {
+          const operationId = readOperationId(candidate.intent);
+          return operationId === null ? [] : [operationId];
+        }),
+      );
+      let remaining = [...input.actions];
+      while (remaining.length > 0) {
+        let progressed = false;
+        const deferred: typeof remaining = [];
+        for (const candidate of remaining) {
+          const operationId = readOperationId(candidate.intent);
+          const predecessors = candidate.causalPredecessorIds ?? [];
+          if (operationId === null) continue;
+          const parsedIntent = parseLiveEventControllerIntent(candidate.intent);
+          if (
+            !parsedIntent.ok ||
+            parsedIntent.value.type === "clock" ||
+            parsedIntent.value.type === "set-running" ||
+            (operationCounts.get(operationId) ?? 0) > 1
+          ) {
+            outcomes.push({ operationId, status: "terminally-rejected" });
+            blocked.add(operationId);
+            progressed = true;
+            continue;
+          }
+          if (
+            candidate.eventGameId !== authorized.eventGameId ||
+            !Array.isArray(predecessors) ||
+            predecessors.some(
+              (predecessor) => !validateOpaqueIdentifier(predecessor, "causalPredecessorId").ok,
+            ) ||
+            new Set(predecessors).size !== predecessors.length ||
+            predecessors.some((predecessor) => predecessor === operationId)
+          ) {
+            outcomes.push({ operationId, status: "terminally-rejected" });
+            blocked.add(operationId);
+            progressed = true;
+            continue;
+          }
+          if (predecessors.some((predecessor) => blocked.has(predecessor))) {
+            outcomes.push({ operationId, status: "causally-blocked" });
+            blocked.add(operationId);
+            progressed = true;
+            continue;
+          }
+          if (
+            predecessors.some(
+              (predecessor) =>
+                !batchOperationIds.has(predecessor) && !persistedOperationIds.has(predecessor),
+            )
+          ) {
+            outcomes.push({ operationId, status: "terminally-rejected" });
+            blocked.add(operationId);
+            progressed = true;
+            continue;
+          }
+          if (predecessors.some((predecessor) => held.has(predecessor))) {
+            outcomes.push({ operationId, status: "held-for-correction" });
+            held.add(operationId);
+            progressed = true;
+            continue;
+          }
+          if (finishedUnlocked && !persistedOperationIds.has(operationId)) {
+            outcomes.push({ operationId, status: "held-for-correction" });
+            held.add(operationId);
+            progressed = true;
+            continue;
+          }
+          if (
+            predecessors.some(
+              (predecessor) => batchOperationIds.has(predecessor) && !completed.has(predecessor),
+            )
+          ) {
+            deferred.push(candidate);
+            continue;
+          }
+          const result = await submitControllerIntent({
+            sessionBearer: input.sessionBearer,
+            eventGameId: authorized.eventGameId,
+            intent: candidate.intent,
+            causalPredecessorIds: predecessors,
+          });
+          if (result.status === "accepted") {
+            outcomes.push({ operationId, status: "accepted" });
+            completed.add(operationId);
+            if (
+              parsedIntent.value.type === "substantive" &&
+              parsedIntent.value.trigger === "result"
+            ) {
+              finishedUnlocked = true;
+            }
+          } else if (result.status === "duplicate-accepted") {
+            outcomes.push({ operationId, status: "idempotent" });
+            completed.add(operationId);
+          } else if (result.status === "retryable") {
+            outcomes.push({ operationId, status: "retryable", detail: "retryable server outcome" });
+          } else if (finishedUnlocked && !persistedOperationIds.has(operationId)) {
+            outcomes.push({ operationId, status: "held-for-correction" });
+            held.add(operationId);
+          } else {
+            outcomes.push({
+              operationId,
+              status: "terminally-rejected",
+              detail: "terminal server rejection",
+            });
+            blocked.add(operationId);
+          }
+          progressed = true;
+        }
+        if (!progressed) {
+          for (const candidate of deferred) {
+            const operationId = readOperationId(candidate.intent);
+            if (operationId !== null) {
+              outcomes.push({ operationId, status: "causally-blocked" });
+              blocked.add(operationId);
+            }
+          }
+          break;
+        }
+        remaining = deferred;
+      }
+      const owner = await options.resolveEventGameRecord(authorized.eventGameId);
+      const root = owner === null ? null : await owner.record.readRoot(owner.recordId);
+      const projection =
+        owner === null || root === null ? null : await readProjection(owner.record, root);
+      return {
+        ...replayContext,
+        session: {
+          eventGameId: authorized.eventGameId,
+          grantSessionId: authorized.grantSessionId,
+          grantVersion: authorized.grantVersion,
+        },
+        status: outcomes.some((outcome) => outcome.status === "retryable")
+          ? "retryable"
+          : "synchronized",
+        outcomes,
+        projection,
+      };
+    } finally {
+      replayingSessions.delete(authorized.grantSessionId);
+    }
+  }
+
   async function readProjection(
     record: EventGameRecord,
     root: EventGameRecordRoot,
@@ -680,6 +997,7 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
         phase: derived.phase,
         scoreByGameSide: structuredClone(derived.scoreByGameSide),
         goalCount: derived.goalCount,
+        clock: projectClockBaseline(derived.clock.baseline, clock()),
         commencement: {
           status: root.lifecycle.commencedAtMs === null ? "provisional" : "commenced",
           commencedAtMs: root.lifecycle.commencedAtMs,
@@ -700,11 +1018,13 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
     revealControllerQr,
     leaveController,
     submitControllerIntent,
+    replayControllerActions,
   };
 }
 
 function deriveLiveEventGameState(
   root: EventGameRecordRoot,
+  canonicalActions: readonly { action: import("@/lib/event-game-actions").ControlAction }[],
   effectiveFacts: readonly EffectiveGameFact[],
   version: string,
 ): LiveEventGameDerivedState {
@@ -725,12 +1045,22 @@ function deriveLiveEventGameState(
     phase: root.lifecycle.phase,
     scoreByGameSide,
     goalCount,
+    clock: projectClockBaseline(
+      deriveClockAuthority(readClockAuthorityActions(canonicalActions)),
+      0,
+    ),
   };
 }
 
 function controllerFactType(intent: LiveEventControllerIntent): string {
   if (intent.type === "record-goal") return "goal";
-  if (intent.type === "clock" || intent.type === "set-running") return "clock";
+  if (
+    intent.type === "clock" ||
+    intent.type === "set-running" ||
+    intent.type === "clock-adjust" ||
+    intent.type === "clock-correction"
+  )
+    return "clock";
   if (intent.type === "substantive") return intent.trigger;
   return intent.type;
 }
@@ -823,12 +1153,150 @@ function readDerivedState(value: unknown): LiveEventGameDerivedState | null {
     value.goalCount < 0
   )
     return null;
+  const clock = readClockProjection(value.clock);
+  if (clock === null) return null;
   return {
     interpreterVersion: value.interpreterVersion,
     phase: value.phase,
     scoreByGameSide,
     goalCount: value.goalCount,
+    clock,
   };
+}
+
+export function validateLiveEventClockActionInTransaction(
+  actions: readonly { action: ControlAction }[],
+  candidate: ControlAction,
+): { status: "accepted" } | { status: "rejected"; reason: "invalid-action"; detail: string } {
+  const candidateClock = readClockAuthorityActions([{ action: candidate }])[0];
+  if (candidateClock === undefined || candidateClock.command === "penalty-start") {
+    return { status: "accepted" };
+  }
+  const validation = validateClockAuthorityAction(
+    readClockAuthorityActions(actions),
+    candidateClock,
+  );
+  return validation.ok
+    ? { status: "accepted" }
+    : { status: "rejected", reason: "invalid-action", detail: validation.error };
+}
+
+function readClockAuthorityActions(
+  actions: readonly {
+    action?: {
+      operationId: string;
+      occurrence: { trustedAtMs: number };
+      acceptedAtMs: number;
+      grant: { sessionId: string };
+      interpretation: unknown;
+    };
+    operationId?: string;
+    occurrence?: { trustedAtMs: number };
+    acceptedAtMs?: number;
+    grant?: { sessionId: string };
+    interpretation?: unknown;
+  }[],
+): ClockAuthorityAction[] {
+  const clockActions: ClockAuthorityAction[] = [];
+  for (const stored of actions) {
+    const storedAction = stored.action ?? stored;
+    if (
+      storedAction.operationId === undefined ||
+      storedAction.occurrence === undefined ||
+      storedAction.acceptedAtMs === undefined ||
+      storedAction.grant === undefined ||
+      storedAction.interpretation === undefined
+    )
+      continue;
+    const interpretation = storedAction.interpretation;
+    if (!isRecord(interpretation) || interpretation.type !== "fact") continue;
+    if (interpretation.factType !== "clock" && interpretation.factType !== "card") continue;
+    if (!isRecord(interpretation.payload)) continue;
+    const data = interpretation.payload.data;
+    if (!isRecord(data)) continue;
+    if (interpretation.factType === "card") {
+      clockActions.push({
+        operationId: storedAction.operationId,
+        trustedAtMs: storedAction.occurrence.trustedAtMs,
+        acceptedAtMs: storedAction.acceptedAtMs,
+        sessionId: storedAction.grant.sessionId,
+        command: "penalty-start",
+      });
+      continue;
+    }
+    const command =
+      data.command === "adjust" || data.command === "correct" || data.command === "set-running"
+        ? data.command
+        : typeof data.running === "boolean"
+          ? "set-running"
+          : null;
+    if (command === null) continue;
+    const clockAction: ClockAuthorityAction = {
+      operationId: storedAction.operationId,
+      trustedAtMs: storedAction.occurrence.trustedAtMs,
+      acceptedAtMs: storedAction.acceptedAtMs,
+      sessionId: storedAction.grant.sessionId,
+      command,
+      ...(typeof data.running === "boolean" ? { running: data.running } : {}),
+      ...(typeof data.gameTimeMs === "number" ? { gameTimeMs: data.gameTimeMs } : {}),
+      ...(typeof data.adjustmentMs === "number" ? { adjustmentMs: data.adjustmentMs } : {}),
+    };
+    clockActions.push(clockAction);
+  }
+  return clockActions;
+}
+
+function readClockIntentData(
+  intent: LiveEventControllerIntent,
+  current: ClockProjection,
+  nowMs: number,
+): { status: "ready"; value: Record<string, unknown> | null } | { status: "rejected" } {
+  if (intent.type === "clock" || intent.type === "set-running") {
+    return {
+      status: "ready",
+      value: {
+        command: "set-running",
+        running: intent.running,
+        startedAtMs: intent.running
+          ? (current.baseline.runningSinceMs ?? nowMs)
+          : current.baseline.runningSinceMs,
+      },
+    };
+  }
+  if (intent.type === "clock-adjust") {
+    return {
+      status: "ready",
+      value: {
+        command: "adjust",
+        adjustmentMs: intent.adjustmentMs,
+      },
+    };
+  }
+  if (intent.type === "clock-correction") {
+    return {
+      status: "ready",
+      value: {
+        command: "correct",
+        gameTimeMs: intent.clockTimeMs,
+      },
+    };
+  }
+  return { status: "ready", value: null };
+}
+
+function readClockProjection(value: unknown): ClockProjection | null {
+  if (!isRecord(value) || value.version !== CLOCK_AUTHORITY_VERSION) return null;
+  if (!isRecord(value.baseline)) return null;
+  if (
+    !validateGameClockMs(value.gameTimeMs).ok ||
+    !validateGameClockMs(value.activePenaltyTimeMs).ok ||
+    typeof value.running !== "boolean" ||
+    typeof value.projectedAtMs !== "number" ||
+    !Number.isSafeInteger(value.projectedAtMs) ||
+    value.synchronization !== "synchronized"
+  )
+    return null;
+  return value as unknown as ClockProjection;
 }
 
 function synchronized(): ControllerSynchronization {
@@ -855,6 +1323,43 @@ function retryableAction(operationId: string | null): LiveEventGameControlResult
   };
 }
 
+type ReplayContext = {
+  batchId: string;
+  replicaGeneration: string;
+  session: ControllerSessionAttachment;
+  eventGameId: string;
+};
+
+function replayRejected(
+  actions: readonly { intent: unknown }[],
+  context: ReplayContext,
+): ControllerReplayResult {
+  return {
+    ...context,
+    status: "rejected",
+    outcomes: actions.flatMap((action) => {
+      const operationId = readOperationId(action.intent);
+      return operationId === null ? [] : [{ operationId, status: "retryable" as const }];
+    }),
+    projection: null,
+  };
+}
+
+function replayRetryable(
+  actions: readonly { intent: unknown }[],
+  context: ReplayContext,
+): ControllerReplayResult {
+  return {
+    ...context,
+    status: "retryable",
+    outcomes: actions.flatMap((action) => {
+      const operationId = readOperationId(action.intent);
+      return operationId === null ? [] : [{ operationId, status: "retryable" as const }];
+    }),
+    projection: null,
+  };
+}
+
 function readOperationId(value: unknown): string | null {
   return isRecord(value) && typeof value.operationId === "string" ? value.operationId : null;
 }
@@ -865,4 +1370,12 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function invalid(error: string): { ok: false; error: string } {
   return { ok: false, error };
+}
+
+function validateClockAdjustment(value: unknown) {
+  return validateClockAdjustmentMs(value);
+}
+
+function validateGameClock(value: unknown) {
+  return validateGameClockMs(value);
 }
