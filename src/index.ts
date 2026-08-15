@@ -41,6 +41,7 @@ import {
 import {
   createAudienceProjection,
   PUBLIC_AUDIENCE_ABSENCE,
+  type AudienceProjectionListOutcome,
   type AudienceProjectionReader,
 } from "@/lib/audience-projection";
 import {
@@ -382,6 +383,11 @@ async function startServer() {
         "/api/audience/events/:eventId": {
           GET(req: Request) {
             return readAudienceEvent(req, audienceProjection);
+          },
+        },
+        "/api/audience/events": {
+          GET(req: Request) {
+            return readAudienceEvents(req, audienceProjection);
           },
         },
         "/api/games/:gameId": {
@@ -1314,6 +1320,23 @@ async function startServer() {
         },
         "/game/:gameId": htmlRoute,
         "/": htmlRoute,
+        "/events/:eventId": {
+          async GET(req: Request, routeServer: Bun.Server<SessionData>) {
+            return readPublicAudienceEventPage(req, audienceProjection, () =>
+              fetch(new URL("/", routeServer.url)),
+            );
+          },
+        },
+        "/sitemap.xml": {
+          GET(req: Request) {
+            return readAudienceSitemap(req, audienceProjection);
+          },
+        },
+        "/robots.txt": {
+          GET(req: Request) {
+            return audienceRobotsResponse(req);
+          },
+        },
         "/events": htmlRoute,
         "/events/": htmlRoute,
         "/admin": htmlRoute,
@@ -1640,12 +1663,47 @@ export async function readGame(req: Request, service: AdHocGamesService = defaul
 
 export async function readAudienceEvent(
   req: Request,
-  projection: AudienceProjectionReader,
+  projection: Pick<AudienceProjectionReader, "read">,
 ): Promise<Response> {
-  const eventId = new URL(req.url).pathname.split("/").at(-1) ?? "";
+  const eventId = readPathSegment(req.url);
   const result = await projection.read(eventId);
   if (result.status === "accepted") return sensitiveJson(result);
-  return sensitiveJson(PUBLIC_AUDIENCE_ABSENCE, 404);
+  return publicAudienceUnavailableResponse();
+}
+
+export async function readPublicAudienceEventPage(
+  req: Request,
+  projection: Pick<AudienceProjectionReader, "read">,
+  readIndex: () => Response | Promise<Response>,
+): Promise<Response> {
+  const result = await projection.read(readPathSegment(req.url));
+  const response = await readIndex();
+  if (result.status !== "accepted") response.headers.set("x-robots-tag", "noindex");
+  return response;
+}
+
+export async function readAudienceEvents(
+  _req: Request,
+  projection: Pick<AudienceProjectionReader, "list">,
+): Promise<Response> {
+  const result = await projection.list();
+  if (result.status === "accepted") return sensitiveJson(result);
+  return publicAudienceUnavailableResponse();
+}
+
+export async function readAudienceSitemap(
+  req: Request,
+  projection: Pick<AudienceProjectionReader, "list">,
+): Promise<Response> {
+  const result = await projection.list();
+  if (result.status !== "accepted") return publicAudienceUnavailableResponse();
+  return new Response(renderAudienceSitemap(new URL(req.url), result), {
+    headers: {
+      "cache-control": "no-store",
+      "content-type": "application/xml; charset=utf-8",
+      "referrer-policy": "no-referrer",
+    },
+  });
 }
 
 export async function leaveGame(req: Request, service: AdHocGamesService = defaultAdHocService) {
@@ -1777,7 +1835,9 @@ type HtmlRoute = typeof index | ((req: Request) => Response);
 
 function adHocFallbackRouteFor(req: Request, htmlRoute: HtmlRoute) {
   const pathname = new URL(req.url).pathname;
-  return isAdHocPath(pathname) ? adHocUnavailableResponse() : resolveHtmlRoute(req, htmlRoute);
+  if (isAdHocPath(pathname)) return adHocUnavailableResponse();
+  if (isPublicEventPath(pathname)) return publicAudienceUnavailableResponse();
+  return resolveHtmlRoute(req, htmlRoute);
 }
 
 function resolveHtmlRoute(req: Request, htmlRoute: HtmlRoute) {
@@ -1791,6 +1851,79 @@ function isAdHocPath(pathname: string): boolean {
     pathname === "/api/games" ||
     pathname.startsWith("/api/games/")
   );
+}
+
+function isPublicEventPath(pathname: string): boolean {
+  return pathname === "/events/" || pathname.startsWith("/events/");
+}
+
+function readPathSegment(url: string): string {
+  const segment = new URL(url).pathname.split("/").at(-1) ?? "";
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    return "";
+  }
+}
+
+function publicAudienceUnavailableResponse() {
+  return sensitiveJson(PUBLIC_AUDIENCE_ABSENCE, 404);
+}
+
+function audienceRobotsResponse(req: Request): Response {
+  const origin = new URL(req.url).origin;
+  return new Response(
+    [
+      "User-agent: *",
+      "Allow: /",
+      "Disallow: /admin",
+      "Disallow: /event-admin",
+      "Disallow: /event-control",
+      "Disallow: /api/",
+      `Sitemap: ${origin}/sitemap.xml`,
+      "",
+    ].join("\n"),
+    {
+      headers: {
+        "content-type": "text/plain; charset=utf-8",
+        "referrer-policy": "no-referrer",
+      },
+    },
+  );
+}
+
+function renderAudienceSitemap(
+  origin: URL,
+  result: AudienceProjectionListOutcome & { status: "accepted" },
+): string {
+  const locations = [
+    new URL("/", origin).toString(),
+    ...result.value.events.map((event) => new URL(event.canonicalPath, origin).toString()),
+  ];
+  return [
+    '<?xml version="1.0" encoding="UTF-8"?>',
+    '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">',
+    ...locations.map((location) => `  <url><loc>${escapeXml(location)}</loc></url>`),
+    "</urlset>",
+    "",
+  ].join("\n");
+}
+
+function escapeXml(value: string): string {
+  return value.replace(/[&<>'"]/g, (character) => {
+    switch (character) {
+      case "&":
+        return "&amp;";
+      case "<":
+        return "&lt;";
+      case ">":
+        return "&gt;";
+      case "'":
+        return "&apos;";
+      default:
+        return "&quot;";
+    }
+  });
 }
 
 function json(payload: unknown, status = 200, extraHeaders: Iterable<[string, string]> = []) {
