@@ -71,7 +71,17 @@ export type PublicAudienceTimelineProjectionInput = {
   sideA: PublicAudienceTimelineSide;
   sideB: PublicAudienceTimelineSide;
   lookupRosterName: (eventTeamId: string, playerNumber: number) => string | null;
-  derived: Pick<LiveEventGameDerivedState, "catch" | "overtime" | "overtimeTarget" | "result">;
+  derived: PublicAudienceTimelineDerivedState;
+};
+
+export type PublicAudienceTimelineDerivedState = {
+  catch: null | Pick<
+    NonNullable<LiveEventGameDerivedState["catch"]>,
+    "factId" | "gameTimeMs" | "catchingGameSideId"
+  >;
+  overtime: boolean;
+  overtimeTarget: number | null;
+  result: null | Pick<NonNullable<LiveEventGameDerivedState["result"]>, "factId">;
 };
 
 const PUBLIC_FACT_TYPES = new Set([

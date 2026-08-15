@@ -21,7 +21,7 @@ import {
 } from "@/lib/event-catalog";
 import type { EventGameRecordRoot } from "@/lib/foundation-record-types";
 import { createInMemoryFoundationStorage } from "@/lib/foundation-storage-memory";
-import type { ControllerProjection } from "@/lib/live-event-game-control";
+import type { ControllerGameFact, ControllerProjection } from "@/lib/live-event-game-control";
 import { readAudienceProjectionGameInput } from "@/lib/live-event-game-runtime";
 import {
   MemoryTechnicalAdminAuthRepository,
@@ -96,7 +96,6 @@ describe("Audience Publication Projection", () => {
     expect(result).toMatchObject({
       status: "accepted",
       value: {
-        identityNotice: "event-team-identities-current",
         eventGames: [
           {
             eventGameId: game.eventGameId,
@@ -111,6 +110,128 @@ describe("Audience Publication Projection", () => {
     if (result.status !== "accepted") return;
     expect(result.value).not.toHaveProperty("auditTrail");
     expect(result.value).not.toHaveProperty("reason");
+  });
+
+  test("fails closed on an injected live reader failure while preserving catalog-only projection", async () => {
+    const game = createScheduleGame("live-failure", "2026-08-14T10:00:00.000Z", "Pitch 1");
+    const root = createScheduleRoot("live-failure", "in-progress");
+    const snapshot = createScheduleSnapshot({
+      pitches: ["Pitch 1"],
+      games: [game],
+      roots: new Map([[game.eventGameId, root]]),
+      actions: () => [createGoalAction(root)],
+    });
+    const storage = {
+      snapshot: async () => snapshot,
+    } as unknown as EventCatalogFoundationStorage;
+
+    expect((await createAudienceProjection(storage).read("event-schedule")).status).toBe(
+      "accepted",
+    );
+    for (const status of ["unavailable", "retryable-failure"] as const) {
+      const audience = createAudienceProjection(storage, {
+        gameInput: { read: async () => ({ status }) },
+      });
+      expect((await audience.read("event-schedule")).status).toBe(status);
+    }
+  });
+
+  test("uses one runtime snapshot for Timeline semantics and scopes the neutral correction notice", async () => {
+    const correctedGame = createScheduleGame(
+      "runtime-corrected",
+      "2026-08-14T10:00:00.000Z",
+      "Pitch 1",
+    );
+    const ordinaryGame = createScheduleGame(
+      "runtime-ordinary",
+      "2026-08-14T11:00:00.000Z",
+      "Pitch 1",
+    );
+    const correctedRoot = createScheduleRoot("runtime-corrected", "in-progress");
+    const ordinaryRoot = createScheduleRoot("runtime-ordinary", "scheduled");
+    const snapshot = createScheduleSnapshot({
+      pitches: ["Pitch 1"],
+      games: [correctedGame, ordinaryGame],
+      roots: new Map([
+        [correctedGame.eventGameId, correctedRoot],
+        [ordinaryGame.eventGameId, ordinaryRoot],
+      ]),
+    });
+    const runtimeProjection = createAudienceControllerProjection({
+      overtime: true,
+      overtimeTarget: 70,
+      catch: {
+        factId: "runtime-catch",
+        catchingGameSideId: correctedRoot.gameSides[0]!.id,
+        nonCatchingGameSideId: correctedRoot.gameSides[1]!.id,
+        gameTimeMs: 1_000,
+        targetScore: 70,
+      },
+      presentation: createInitialGamePresentation(
+        [correctedRoot.gameSides[0]!.id, correctedRoot.gameSides[1]!.id],
+        {
+          [correctedRoot.gameSides[0]!.id]: "#123abc",
+          [correctedRoot.gameSides[1]!.id]: "#456def",
+        },
+      ),
+      gameFacts: [
+        {
+          factId: "runtime-catch",
+          factType: "flag-catch",
+          gameSideId: correctedRoot.gameSides[0]!.id,
+          gameTimeMs: 1_000,
+          sportingOrder: 1,
+          synchronizationOrder: 1,
+          effective: true,
+          data: { points: 30 },
+        },
+      ],
+      teamAssignmentCorrections: [
+        {
+          operationId: "private-correction-operation",
+          gameSideId: correctedRoot.gameSides[0]!.id,
+          eventTeamId: "team-current",
+          eventTeamName: "Current Team",
+          teamInterpretationRef: "private-interpretation",
+        },
+      ],
+    });
+    const correctedInput = readAudienceProjectionGameInput(correctedRoot, runtimeProjection);
+    const ordinaryInput = readAudienceProjectionGameInput(
+      ordinaryRoot,
+      createAudienceControllerProjection({ phase: "scheduled" }),
+    );
+    const audience = createAudienceProjection(
+      { snapshot: async () => snapshot } as unknown as EventCatalogFoundationStorage,
+      {
+        now: () => Date.parse("2026-08-14T10:00:00.000Z"),
+        gameInput: {
+          read: async (eventGameId) =>
+            eventGameId === correctedGame.eventGameId ? correctedInput : ordinaryInput,
+        },
+      },
+    );
+
+    const result = await audience.read("event-schedule");
+    expect(result.status).toBe("accepted");
+    if (result.status !== "accepted") return;
+    expect(result.value.teamAssignmentNotice).toBe("event-team-assignment-corrected");
+    const corrected = result.value.schedule.scheduleGames.find(
+      (game) => game.eventGameId === correctedGame.eventGameId,
+    );
+    const ordinary = result.value.schedule.scheduleGames.find(
+      (game) => game.eventGameId === ordinaryGame.eventGameId,
+    );
+    expect(corrected).toMatchObject({
+      teamAssignmentNotice: "event-team-assignment-corrected",
+      phase: "overtime",
+      overtimeTarget: 70,
+      presentation: { displayedTeamColors: { sideA: "#123abc", sideB: "#456def" } },
+    });
+    expect(corrected?.timeline.map((entry) => entry.kind)).toEqual(["overtime", "flag-catch"]);
+    expect(ordinary).not.toHaveProperty("teamAssignmentNotice");
+    expect(JSON.stringify(result.value)).not.toContain("private-correction-operation");
+    expect(JSON.stringify(result.value)).not.toContain("private-interpretation");
   });
 
   test("embeds a roster-resolved Timeline and isolates roster reads by Event", async () => {
@@ -176,6 +297,25 @@ describe("Audience Publication Projection", () => {
               winnerGameSideId: null,
               catchingGameSideId: null,
               locked: true,
+              gameFacts: [
+                {
+                  factId: `goal-fact-${root.eventGameId}`,
+                  factType: "goal",
+                  gameSideId: root.gameSides[0]!.id,
+                  gameTimeMs: 1,
+                  sportingOrder: 1,
+                  synchronizationOrder: 1,
+                  effective: true,
+                  data: { points: 10, playerNumber: 3 },
+                },
+              ],
+              timelineState: {
+                catch: null,
+                overtime: false,
+                overtimeTarget: null,
+                result: null,
+              },
+              teamAssignmentCorrected: false,
             },
           }),
         },
@@ -205,6 +345,123 @@ describe("Audience Publication Projection", () => {
         player: { number: 3, name: "Current Goal Player" },
       }),
     );
+  });
+
+  test("keeps effective locked-correction history across reopening without public provenance", async () => {
+    const game = createScheduleGame("locked-reopen", "2026-08-14T08:00:00.000Z", "Pitch 1");
+    const root = createScheduleRoot("locked-reopen", "finished");
+    const snapshot = createScheduleSnapshot({
+      pitches: ["Pitch 1"],
+      games: [game],
+      roots: new Map([[game.eventGameId, root]]),
+    });
+    const publicFacts: readonly ControllerGameFact[] = [
+      {
+        factId: "corrected-goal",
+        factType: "goal",
+        gameSideId: root.gameSides[0]!.id,
+        gameTimeMs: 1_000,
+        sportingOrder: 1,
+        synchronizationOrder: 1,
+        effective: true,
+        data: { points: 30, playerNumber: 3 },
+      },
+      {
+        factId: "corrected-result",
+        factType: "result",
+        gameSideId: root.gameSides[0]!.id,
+        gameTimeMs: 2_000,
+        sportingOrder: 2,
+        synchronizationOrder: 2,
+        effective: true,
+        data: { resultKind: "corrected-result" },
+      },
+      {
+        factId: "private-locked-correction",
+        factType: "locked-game-correction",
+        gameSideId: null,
+        gameTimeMs: null,
+        sportingOrder: 3,
+        synchronizationOrder: 3,
+        effective: true,
+        data: { reason: "PRIVATE_LOCKED_CORRECTION_REASON" },
+      },
+      {
+        factId: "private-game-reopening",
+        factType: "game-reopening",
+        gameSideId: null,
+        gameTimeMs: null,
+        sportingOrder: 4,
+        synchronizationOrder: 4,
+        effective: true,
+        data: { operationId: "PRIVATE_REOPEN_OPERATION" },
+      },
+    ];
+    let locked = true;
+    const audience = createAudienceProjection(
+      { snapshot: async () => snapshot } as unknown as EventCatalogFoundationStorage,
+      {
+        now: () => Date.parse("2026-08-14T10:00:00.000Z"),
+        gameInput: {
+          read: async () => ({
+            status: "accepted" as const,
+            value: {
+              gameSideIds: [root.gameSides[0]!.id, root.gameSides[1]!.id] as const,
+              phase: "seeker-floor" as const,
+              operationalStatus: "finished" as const,
+              scoreByGameSide: { [root.gameSides[0]!.id]: 30, [root.gameSides[1]!.id]: 20 },
+              clock: null,
+              presentation: null,
+              overtimeTarget: null,
+              teamTimeout: { status: "inactive" as const, gameSideId: null, remainingMs: null },
+              heatStoppage: {
+                status: "inactive" as const,
+                mode: null,
+                pending: false,
+                allowedDurationMs: null,
+                actualDurationMs: null,
+                remainingMs: null,
+              },
+              winnerGameSideId: root.gameSides[0]!.id,
+              catchingGameSideId: root.gameSides[0]!.id,
+              locked,
+              gameFacts: publicFacts,
+              timelineState: {
+                catch: null,
+                overtime: false,
+                overtimeTarget: null,
+                result: { factId: "corrected-result" },
+              },
+              teamAssignmentCorrected: false,
+            },
+          }),
+        },
+      },
+    );
+
+    const beforeReopen = await audience.readGame("event-schedule", game.eventGameId);
+    expect(beforeReopen).toMatchObject({
+      status: "accepted",
+      value: {
+        result: { status: "finished", winner: "side-a", locked: true },
+        flagState: { catchingSide: "side-a" },
+      },
+    });
+    if (beforeReopen.status !== "accepted") return;
+    locked = false;
+    const afterReopen = await audience.readGame("event-schedule", game.eventGameId);
+    expect(afterReopen).toMatchObject({
+      status: "accepted",
+      value: { result: { status: "finished", winner: "side-a", locked: false } },
+    });
+    if (afterReopen.status !== "accepted") return;
+    expect(afterReopen.value.timeline).toEqual(beforeReopen.value.timeline);
+    expect(afterReopen.value.timeline.map((entry) => entry.kind)).toEqual(["finish", "goal"]);
+    const serialized = JSON.stringify(afterReopen.value);
+    expect(serialized).not.toContain("locked-game-correction");
+    expect(serialized).not.toContain("game-reopening");
+    expect(serialized).not.toContain("PRIVATE_LOCKED_CORRECTION_REASON");
+    expect(serialized).not.toContain("PRIVATE_REOPEN_OPERATION");
   });
 
   test("projects concession, forfeit, and double-forfeit outcomes", async () => {
@@ -854,6 +1111,14 @@ describe("Audience Publication Projection", () => {
               winnerGameSideId: null,
               catchingGameSideId: null,
               locked: false,
+              gameFacts: [],
+              timelineState: {
+                catch: null,
+                overtime: false,
+                overtimeTarget: null,
+                result: null,
+              },
+              teamAssignmentCorrected: false,
             },
           }),
         },
@@ -906,14 +1171,18 @@ describe("Audience Publication Projection", () => {
     expect(serialized).not.toContain("correction");
     expect(serialized).not.toContain("provenance");
     expect(serialized).not.toContain("authority");
-    const httpResponse = await readAudienceGame(
-      new Request(
-        `https://timer.example/api/audience/events/${event.eventId}/games/${game.eventGameId}`,
-      ),
+    const gameUrl = `https://timer.example/api/audience/events/${event.eventId}/games/${game.eventGameId}`;
+    const httpResponse = await readAudienceGame(new Request(gameUrl), audience);
+    expect(httpResponse.status).toBe(200);
+    expect(httpResponse.headers.get("cache-control")).toBe("no-cache");
+    const etag = httpResponse.headers.get("etag");
+    expect(etag).not.toBeNull();
+    const revalidated = await readAudienceGame(
+      new Request(gameUrl, { headers: { "if-none-match": etag ?? "" } }),
       audience,
     );
-    expect(httpResponse.status).toBe(200);
-    expect(httpResponse.headers.get("cache-control")).toBe("no-store");
+    expect(revalidated.status).toBe(304);
+    expect(await revalidated.text()).toBe("");
     expect(await httpResponse.text()).toContain('"status":"accepted"');
   });
 
@@ -933,6 +1202,8 @@ describe("Audience Publication Projection", () => {
     const bodies = await Promise.all(responses.map((response) => response.text()));
     expect(bodies[0]).toBe(bodies[1]);
     expect(bodies[0]).toBe('{"status":"unavailable"}');
+    expect(responses[0]?.headers.get("cache-control")).toBe("no-store");
+    expect(responses[0]?.headers.get("x-robots-tag")).toBe("noindex");
   });
 
   test("table-drives the runtime adapter through the one public projector", async () => {

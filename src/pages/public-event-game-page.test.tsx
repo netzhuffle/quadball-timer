@@ -11,6 +11,7 @@ describe("public spectator Game page", () => {
   const originalNavigator = globalThis.navigator;
   const originalLocation = globalThis.location;
   const originalHistory = globalThis.history;
+  const originalWebSocket = globalThis.WebSocket;
   const originalFetch = globalThis.fetch;
   const originalActEnvironment = (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean })
     .IS_REACT_ACT_ENVIRONMENT;
@@ -26,8 +27,20 @@ describe("public spectator Game page", () => {
       navigator: testWindow.navigator,
       location: testWindow.location,
       history: testWindow.history,
+      WebSocket: class {
+        onopen: (() => void) | null = null;
+        onmessage: ((event: MessageEvent) => void) | null = null;
+        onclose: (() => void) | null = null;
+        send() {}
+        close() {
+          this.onclose?.();
+        }
+        constructor() {
+          queueMicrotask(() => this.onopen?.());
+        }
+      },
       fetch: async () =>
-        new Response(JSON.stringify({ status: "accepted", value: projection() }), {
+        new Response(JSON.stringify({ status: "accepted", value: eventProjection() }), {
           status: 200,
           headers: { "content-type": "application/json" },
         }),
@@ -51,6 +64,7 @@ describe("public spectator Game page", () => {
       navigator: originalNavigator,
       location: originalLocation,
       history: originalHistory,
+      WebSocket: originalWebSocket,
       fetch: originalFetch,
     });
     (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT =
@@ -82,6 +96,9 @@ describe("public spectator Game page", () => {
     expect(container.textContent).toContain("A Very Long Team Name That Must Wrap");
     expect(container.textContent).toContain("Another Long Team Name For A Narrow Screen");
     expect(container.textContent).toContain("2:05");
+    expect(container.textContent).toContain(
+      "An Event Team assignment was corrected. Current team identities are shown.",
+    );
     expect(container.querySelectorAll(".break-words").length).toBe(2);
     const expandedSides = Array.from(
       container.querySelectorAll("[data-scoreboard-expanded] [data-side-id]"),
@@ -116,11 +133,23 @@ describe("public spectator Game page", () => {
     expect(compactSides[0]?.textContent).toContain("Flag catch");
     expect(compactSides[1]?.textContent).not.toContain("Flag catch");
   });
+
+  test("renders Game unavailable after the Event loads without the requested Game identity", async () => {
+    await act(async () => {
+      root.render(<PublicEventGamePage eventId="event-1" eventGameId="unknown-game" />);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(container.textContent).toContain("Game unavailable");
+    expect(container.textContent).not.toContain("Loading public Game information");
+  });
 });
 
 function projection(): PublicAudienceGameProjection {
   return {
     eventId: "event-1",
+    eventGameId: "game-1",
     gameCode: "A1",
     gameDesignation: "Final",
     scheduledStartMs: 1_000,
@@ -172,5 +201,28 @@ function projection(): PublicAudienceGameProjection {
     result: { status: "finished", winner: "side-a", locked: true },
     canonicalPath: "/events/event-1/games/game-1",
     timeline: [],
+    teamAssignmentNotice: "event-team-assignment-corrected",
+  };
+}
+
+function eventProjection() {
+  const game = projection();
+  return {
+    eventId: "event-1",
+    name: "Published Event",
+    timeZone: "UTC",
+    publicationStatus: "published" as const,
+    gameDays: ["2026-08-15"],
+    lifecycle: "current" as const,
+    canonicalPath: "/events/event-1",
+    teams: [],
+    pitches: [{ name: "Pitch A" }],
+    schedule: {
+      asOfMs: 0,
+      runningGames: [],
+      upcomingGames: [],
+      scheduleGames: [game],
+      focusIndex: null,
+    },
   };
 }

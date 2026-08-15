@@ -1,20 +1,13 @@
 import {
   availableNonControllerCapacity,
   type ControllerCapacityInput,
+  type ControllerCapacitySignal,
 } from "@/lib/controller-capacity";
 import { SHARED_LIMITS } from "@/lib/validation-policy";
 
-/**
- * The spectator path deliberately owns delivery pressure only. Controller
- * admission and authority remain owned by the live-control runtime; this
- * source is the read-only capacity signal supplied by that runtime.
- */
-export type ControllerCapacitySignal = {
-  totalConnections: number;
-  reservedConnections: number;
-  /** Number of currently active authoritative Controller Grant Sessions. */
-  activeControllerSessions: () => number;
-};
+const CAPACITY_NOTICE = "Spectator capacity is currently full; try again later." as const;
+const GENERIC_UNAVAILABLE_MESSAGE = "Spectator experience is currently unavailable." as const;
+const OUTPUT_LIMIT_MESSAGE = "Spectator output is currently unavailable." as const;
 
 export type SpectatorCurrentVersion<TPayload> = {
   version: string;
@@ -33,8 +26,16 @@ export type SpectatorCurrentVersionResult<TPayload> =
 export type SpectatorStreamAdapter<TPayload> = {
   readCurrentVersion(input: { eventId: string }): Promise<SpectatorCurrentVersionResult<TPayload>>;
   /** Exact bytes of the serialized transport envelope, supplied by the transport seam. */
-  measureQueuedOutputBytes(update: SpectatorQueuedUpdate<TPayload>): number;
-  write(clientId: string, update: SpectatorQueuedUpdate<TPayload>): boolean | Promise<boolean>;
+  measureQueuedOutputBytes?(update: SpectatorQueuedUpdate<TPayload>): number;
+  serializeQueuedOutput?(update: SpectatorQueuedUpdate<TPayload>): {
+    serialized: string;
+    bytes: number;
+  };
+  write(
+    clientId: string,
+    update: SpectatorQueuedUpdate<TPayload>,
+    serialized?: string,
+  ): boolean | Promise<boolean>;
   close(clientId: string, reason: SpectatorDisconnectReason): void;
 };
 
@@ -72,16 +73,16 @@ export type SpectatorAdmissionResult =
   | {
       status: "rejected";
       reason: "capacity";
-      message: "Spectator capacity is currently full; try again later.";
+      message: typeof CAPACITY_NOTICE;
     }
   | {
       status: "rejected";
       reason: "output-limit";
-      message: "Spectator output is currently unavailable.";
+      message: typeof OUTPUT_LIMIT_MESSAGE;
     }
   | {
       status: "unavailable";
-      message: "Spectator experience is currently unavailable.";
+      message: typeof GENERIC_UNAVAILABLE_MESSAGE;
     };
 
 export type SpectatorPublishInput<TPayload> = SpectatorCurrentVersion<TPayload> & {
@@ -130,8 +131,6 @@ const DEFAULT_MAX_SPECTATORS = SHARED_LIMITS.load.maxConnectedSpectators;
 const DEFAULT_PER_CLIENT_QUEUE_LIMIT = 8;
 const DEFAULT_GLOBAL_QUEUE_LIMIT = 2_000;
 const DEFAULT_PER_CLIENT_QUEUED_OUTPUT_BYTES = SHARED_LIMITS.transport.websocketTextFrameBytes;
-const GENERIC_UNAVAILABLE_MESSAGE = "Spectator experience is currently unavailable." as const;
-const OUTPUT_LIMIT_MESSAGE = "Spectator output is currently unavailable." as const;
 
 export function createSpectatorCapacity<TPayload>(
   options: SpectatorCapacityOptions<TPayload>,
@@ -156,6 +155,7 @@ export function createSpectatorCapacity<TPayload>(
   let reserveBreachesObserved = 0;
   let admissionSequence = 0;
   const provisionalAdmissions = new Set<string>();
+  const serializedOutputCache = new WeakMap<object, { serialized?: string; bytes: number }>();
 
   function controllerSignal() {
     const totalConnections = positiveLimit(options.controllerCapacity.totalConnections, 1);
@@ -233,8 +233,39 @@ export function createSpectatorCapacity<TPayload>(
   }
 
   function measureUpdateBytes(update: SpectatorQueuedUpdate<TPayload>): number {
+    return readSerializedOutput(update).bytes;
+  }
+
+  function readSerializedOutput(update: SpectatorQueuedUpdate<TPayload>) {
+    const cached = serializedOutputCache.get(update);
+    if (cached !== undefined) return cached;
+    let output: { serialized?: string; bytes: number };
+    if (options.adapter.serializeQueuedOutput !== undefined) {
+      try {
+        const serialized = options.adapter.serializeQueuedOutput(update);
+        output = {
+          serialized: serialized.serialized,
+          bytes:
+            typeof serialized.serialized === "string" &&
+            Number.isFinite(serialized.bytes) &&
+            serialized.bytes >= 0
+              ? serialized.bytes
+              : Number.POSITIVE_INFINITY,
+        };
+      } catch {
+        output = { bytes: Number.POSITIVE_INFINITY };
+      }
+    } else {
+      output = { bytes: measureAdapterOutputBytes(update) };
+    }
+    serializedOutputCache.set(update, output);
+    return output;
+  }
+
+  function measureAdapterOutputBytes(update: SpectatorQueuedUpdate<TPayload>): number {
     try {
-      const measured = options.adapter.measureQueuedOutputBytes(update);
+      const measured = options.adapter.measureQueuedOutputBytes?.(update);
+      if (measured === undefined) return Number.POSITIVE_INFINITY;
       return Number.isFinite(measured) && measured >= 0 ? measured : Number.POSITIVE_INFINITY;
     } catch {
       return Number.POSITIVE_INFINITY;
@@ -314,7 +345,11 @@ export function createSpectatorCapacity<TPayload>(
       if (update === undefined) break;
       let accepted = false;
       try {
-        accepted = await options.adapter.write(clientId, update);
+        accepted = await options.adapter.write(
+          clientId,
+          update,
+          readSerializedOutput(update).serialized,
+        );
       } catch {
         accepted = false;
       }
@@ -344,7 +379,7 @@ export function createSpectatorCapacity<TPayload>(
         return {
           status: "rejected",
           reason: "capacity",
-          message: "Spectator capacity is currently full; try again later.",
+          message: CAPACITY_NOTICE,
         };
       }
 
@@ -353,7 +388,7 @@ export function createSpectatorCapacity<TPayload>(
         return {
           status: "rejected",
           reason: "capacity",
-          message: "Spectator capacity is currently full; try again later.",
+          message: CAPACITY_NOTICE,
         };
       }
       const provisional = !clients.has(input.clientId);
@@ -375,7 +410,7 @@ export function createSpectatorCapacity<TPayload>(
             return {
               status: "rejected",
               reason: "capacity",
-              message: "Spectator capacity is currently full; try again later.",
+              message: CAPACITY_NOTICE,
             };
           }
           provisionalAdmissions.add(input.clientId);
@@ -385,7 +420,7 @@ export function createSpectatorCapacity<TPayload>(
           return {
             status: "rejected",
             reason: "capacity",
-            message: "Spectator capacity is currently full; try again later.",
+            message: CAPACITY_NOTICE,
           };
         }
 
@@ -465,6 +500,18 @@ export function createSpectatorCapacity<TPayload>(
     disconnect(clientId, reason = "client-closed") {
       return disconnect(clientId, reason);
     },
+    clearQueuedUpdates(eventId: string) {
+      let cleared = 0;
+      for (const client of clients.values()) {
+        if (client.eventId !== eventId || client.queue.length === 0) continue;
+        cleared += client.queue.length;
+        queuedUpdates -= client.queue.length;
+        queuedBytes -= client.queuedBytes;
+        client.queue.length = 0;
+        client.queuedBytes = 0;
+      }
+      return cleared;
+    },
     getQueueState(clientId): SpectatorQueueState | null {
       const client = clients.get(clientId);
       if (client === undefined) return null;
@@ -514,9 +561,10 @@ export type SpectatorCapacity<TPayload> = {
         availableForSpectators: number;
         disconnected: number;
       }
-    | { status: "unavailable"; message: "Spectator experience is currently unavailable." };
+    | { status: "unavailable"; message: typeof GENERIC_UNAVAILABLE_MESSAGE };
   drain(clientId: string, limit?: number): Promise<number>;
   disconnect(clientId: string, reason?: SpectatorDisconnectReason): boolean;
+  clearQueuedUpdates(eventId: string): number;
   getQueueState(clientId: string): SpectatorQueueState | null;
   getMetrics(): SpectatorCapacityMetrics;
 };

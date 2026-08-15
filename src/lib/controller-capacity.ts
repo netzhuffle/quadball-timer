@@ -4,6 +4,13 @@ export type ControllerCapacityInput = {
   activeControllerSessions: number;
 };
 
+/** Read-only Controller capacity signal shared by non-Controller admission paths. */
+export type ControllerCapacitySignal = {
+  totalConnections: number;
+  reservedConnections: number;
+  activeControllerSessions: () => number;
+};
+
 /**
  * Return non-Controller capacity after honoring the configured reserve,
  * active authoritative Controller Sessions, and an optional workflow cap.

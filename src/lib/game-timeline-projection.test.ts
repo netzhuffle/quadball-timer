@@ -57,10 +57,8 @@ describe("public Game Timeline projection", () => {
       derived: {
         catch: {
           factId: "catch-fact",
-          catchingGameSideId: "side-a",
-          nonCatchingGameSideId: "side-b",
           gameTimeMs: 6_000,
-          targetScore: 60,
+          catchingGameSideId: "side-a",
         },
         overtime: true,
         overtimeTarget: 60,
@@ -214,13 +212,11 @@ describe("public Game Timeline projection", () => {
         catch: {
           factId: "locked-correction",
           catchingGameSideId: "side-a",
-          nonCatchingGameSideId: "side-b",
           gameTimeMs: 1_500,
-          targetScore: null,
         },
         overtime: false,
         overtimeTarget: null,
-        result: { factId: "locked-correction", data: { resultKind: "result" } },
+        result: { factId: "locked-correction" },
       },
     });
 

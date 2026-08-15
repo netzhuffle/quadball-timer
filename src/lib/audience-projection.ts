@@ -10,6 +10,7 @@ import { projectClockBaseline } from "@/lib/clock-authority";
 import {
   projectPublicGameTimeline,
   type PublicAudienceTimelineEntry,
+  type PublicAudienceTimelineDerivedState,
 } from "@/lib/game-timeline-projection";
 import {
   projectLiveEventGameDerivedState,
@@ -106,6 +107,7 @@ export type PublicAudienceClockProjection = {
 
 export type PublicAudienceGameProjection = PublicAudienceGameOperationalProjection & {
   eventId: string;
+  eventGameId: string;
   gameCode: string | null;
   gameDesignation: string | null;
   scheduledStartMs: number;
@@ -127,6 +129,8 @@ export type PublicAudienceGameProjection = PublicAudienceGameOperationalProjecti
   };
   canonicalPath: string;
   timeline: readonly PublicAudienceTimelineEntry[];
+  /** Temporary neutral notice; correction evidence and provenance stay private. */
+  teamAssignmentNotice?: "event-team-assignment-corrected";
 };
 
 /** Allowlisted, server-side input for one public Audience Projection. */
@@ -147,6 +151,9 @@ export type AudienceProjectionGameInput = {
   winnerGameSideId: string | null;
   catchingGameSideId: string | null;
   locked: boolean;
+  gameFacts: LiveEventGameDerivedState["gameFacts"];
+  timelineState: PublicAudienceTimelineDerivedState;
+  teamAssignmentCorrected: boolean;
 };
 
 export type AudienceProjectionGameInputOutcome =
@@ -177,8 +184,8 @@ export type PublicAudienceEventProjection = {
   canonicalPath: string;
   teams: readonly PublicAudienceEventTeam[];
   pitches: readonly PublicAudiencePitch[];
-  /** Neutral public state; correction reasons, audit rows, and provenance stay private. */
-  identityNotice?: "event-team-identities-current";
+  /** Temporary neutral notice; correction evidence and provenance stay private. */
+  teamAssignmentNotice?: "event-team-assignment-corrected";
   /** Allowlisted identity input for downstream roster and public Timeline composition. */
   eventGames?: readonly PublicAudienceEventGameInput[];
   schedule: PublicAudienceScheduleProjection;
@@ -237,8 +244,12 @@ export function createAudienceProjection(
         const event = snapshot.findEvent(eventId);
         if (event === null || event.publicationStatus !== "published")
           return { status: "unavailable" };
-        return { status: "accepted", value: projectPublicEvent(snapshot, event, now()) };
-      } catch {
+        return {
+          status: "accepted",
+          value: await projectPublicEvent(snapshot, event, now(), options.gameInput),
+        };
+      } catch (error) {
+        if (error instanceof GameInputReadError) return { status: error.status };
         return { status: "retryable-failure" };
       }
     },
@@ -247,8 +258,7 @@ export function createAudienceProjection(
         typeof eventId !== "string" ||
         eventId.trim().length === 0 ||
         typeof eventGameId !== "string" ||
-        eventGameId.trim().length === 0 ||
-        options.gameInput === undefined
+        eventGameId.trim().length === 0
       )
         return { status: "unavailable" };
       try {
@@ -262,13 +272,19 @@ export function createAudienceProjection(
           game.eventId !== eventId
         )
           return { status: "unavailable" };
-        const input = await options.gameInput.read(eventGameId);
-        if (input.status !== "accepted") return input;
         const projected = projectScheduleGames(snapshot, [game]).at(0);
         if (projected === undefined) return { status: "unavailable" };
+        const input = await options.gameInput?.read(eventGameId);
+        if (input !== undefined && input.status !== "accepted") return input;
         return {
           status: "accepted",
-          value: projectAudienceGameFromInput(snapshot, event, projected, input.value, now()),
+          value: projectAudienceGameFromInput(
+            snapshot,
+            event,
+            projected,
+            input?.value ?? readAudienceProjectionGameInputFromCatalog(snapshot, projected, now()),
+            now(),
+          ),
         };
       } catch {
         return { status: "retryable-failure" };
@@ -278,10 +294,12 @@ export function createAudienceProjection(
       try {
         const snapshot = await storage.snapshot();
         const nowMs = now();
-        const events = snapshot
-          .listEvents()
-          .filter((event) => event.publicationStatus === "published")
-          .map((event) => projectPublicEvent(snapshot, event, nowMs));
+        const events = await Promise.all(
+          snapshot
+            .listEvents()
+            .filter((event) => event.publicationStatus === "published")
+            .map((event) => projectPublicEvent(snapshot, event, nowMs, options.gameInput)),
+        );
         return {
           status: "accepted",
           value: { events: sortPublicEvents(events) },
@@ -293,15 +311,20 @@ export function createAudienceProjection(
   };
 }
 
-function projectPublicEvent(
+async function projectPublicEvent(
   snapshot: EventCatalogStorageSnapshot,
   event: StoredEvent,
   nowMs: number,
-): PublicAudienceEventProjection {
+  gameInput?: AudienceProjectionGameInputReader,
+): Promise<PublicAudienceEventProjection> {
   const gameDays = snapshot
     .listGameDays(event.eventId)
     .map(({ date }) => date)
     .sort();
+  const schedule = await projectSchedule(snapshot, event, nowMs, gameInput);
+  const teamAssignmentCorrected = schedule.scheduleGames.some(
+    (game) => game.teamAssignmentNotice !== undefined,
+  );
   return {
     eventId: event.eventId,
     name: event.name,
@@ -315,7 +338,9 @@ function projectPublicEvent(
       color: defaultColor,
     })),
     pitches: snapshot.listPitches(event.eventId).map(({ name }) => ({ name })),
-    identityNotice: "event-team-identities-current",
+    ...(teamAssignmentCorrected
+      ? { teamAssignmentNotice: "event-team-assignment-corrected" as const }
+      : {}),
     eventGames: snapshot
       .listGameDays(event.eventId)
       .flatMap((day) => snapshot.listEventGames(day.gameDayId))
@@ -334,7 +359,7 @@ function projectPublicEvent(
           },
         ],
       })) as PublicAudienceEventGameInput[],
-    schedule: projectSchedule(snapshot, event, nowMs),
+    schedule,
   };
 }
 
@@ -353,6 +378,7 @@ function projectAudienceGameFromInput(
   const multiplePitches = snapshot.listPitches(event.eventId).length > 1;
   return {
     eventId: event.eventId,
+    eventGameId: game.eventGameId,
     gameCode: game.gameCode,
     gameDesignation: game.gameDesignation,
     scheduledStartMs: scheduledStartForGame(snapshot, game),
@@ -397,7 +423,10 @@ function projectAudienceGameFromInput(
       },
     },
     canonicalPath: `/events/${encodeURIComponent(event.eventId)}/games/${encodeURIComponent(game.eventGameId)}`,
-    timeline: projectAudienceGameTimeline(snapshot, game),
+    timeline: projectAudienceGameTimeline(snapshot, game, input.gameFacts, input.timelineState),
+    ...(input.teamAssignmentCorrected
+      ? { teamAssignmentNotice: "event-team-assignment-corrected" as const }
+      : {}),
   };
 }
 
@@ -427,11 +456,12 @@ function sideForGameSideId(
   return gameSideId === gameSideIds[0] ? "side-a" : gameSideId === gameSideIds[1] ? "side-b" : null;
 }
 
-function projectSchedule(
+async function projectSchedule(
   snapshot: EventCatalogStorageSnapshot,
   event: StoredEvent,
   nowMs: number,
-): PublicAudienceScheduleProjection {
+  gameInput?: AudienceProjectionGameInputReader,
+): Promise<PublicAudienceScheduleProjection> {
   const eventId = event.eventId;
   const gamesById = new Map<string, EventGame>();
   for (const gameDay of snapshot.listGameDays(eventId)) {
@@ -441,17 +471,23 @@ function projectSchedule(
     }
   }
 
-  const projected = projectScheduleGames(snapshot, [...gamesById.values()])
-    .map((game) =>
-      projectAudienceGameFromInput(
-        snapshot,
-        event,
-        game,
-        readAudienceProjectionGameInputFromCatalog(snapshot, game, nowMs),
-        nowMs,
-      ),
+  const projected = (
+    await Promise.all(
+      projectScheduleGames(snapshot, [...gamesById.values()]).map(async (game) => {
+        const current = await gameInput?.read(game.eventGameId);
+        if (current !== undefined && current.status !== "accepted") {
+          throw new GameInputReadError(current.status);
+        }
+        return projectAudienceGameFromInput(
+          snapshot,
+          event,
+          game,
+          current?.value ?? readAudienceProjectionGameInputFromCatalog(snapshot, game, nowMs),
+          nowMs,
+        );
+      }),
     )
-    .sort(compareAudienceGames);
+  ).sort(compareAudienceGames);
   const runningGames = projected.filter((game) => game.scheduleStatus === "running");
   const upcomingGames = projected.filter(
     (game) =>
@@ -508,19 +544,38 @@ function readAudienceProjectionGameInputFromCatalog(
     winnerGameSideId: derived?.winnerGameSideId ?? null,
     catchingGameSideId: derived?.catch?.catchingGameSideId ?? null,
     locked: root?.lifecycle.lockedAtMs !== null && root?.lifecycle.lockedAtMs !== undefined,
+    gameFacts: structuredClone(derived?.gameFacts ?? []),
+    timelineState: {
+      catch:
+        derived?.catch === null || derived?.catch === undefined
+          ? null
+          : {
+              factId: derived.catch.factId,
+              gameTimeMs: derived.catch.gameTimeMs,
+              catchingGameSideId: derived.catch.catchingGameSideId,
+            },
+      overtime: derived?.overtime ?? false,
+      overtimeTarget: derived?.overtimeTarget ?? null,
+      result:
+        derived?.result === null || derived?.result === undefined
+          ? null
+          : { factId: derived.result.factId },
+    },
+    teamAssignmentCorrected: false,
   };
 }
 
 function projectAudienceGameTimeline(
   snapshot: EventCatalogStorageSnapshot,
   game: ProjectedEventGame,
+  gameFacts: LiveEventGameDerivedState["gameFacts"],
+  timelineState: PublicAudienceTimelineDerivedState,
 ): readonly PublicAudienceTimelineEntry[] {
   const root = snapshot.findRootByEventGameId(game.eventGameId);
   if (root === null) return [];
-  const derived = readDerivedState(snapshot, root);
   const sideAssignments = publicTimelineSideAssignments(snapshot, game, root);
   return projectPublicGameTimeline({
-    facts: derived.gameFacts,
+    facts: gameFacts,
     sideA: sideAssignments.sideA,
     sideB: sideAssignments.sideB,
     lookupRosterName: (eventTeamId, playerNumber) => {
@@ -529,8 +584,14 @@ function projectAudienceGameTimeline(
       const entry = snapshot.findRosterEntry(eventTeamId, playerNumber);
       return entry?.eventId === game.eventId ? entry.publicName : null;
     },
-    derived,
+    derived: timelineState,
   });
+}
+
+class GameInputReadError extends Error {
+  constructor(readonly status: Exclude<AudienceProjectionGameInputOutcome["status"], "accepted">) {
+    super("Authoritative Event Game input is unavailable.");
+  }
 }
 
 function publicTimelineSideAssignments(

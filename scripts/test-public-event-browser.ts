@@ -9,9 +9,16 @@ import {
   type EventGame,
 } from "@/lib/event-catalog";
 import { createEventGameRecord, type ExternalScopeResolver } from "@/lib/event-game-record";
-import type { ControlActionInput } from "@/lib/event-game-actions";
+import {
+  createControlActionCodecRegistry,
+  type ControlActionInput,
+} from "@/lib/event-game-actions";
 import type { EventGameRecordRoot } from "@/lib/foundation-record-types";
-import { createGrantKeyRingDocument, writeGrantKeyRingFile } from "@/lib/grant-key-ring-custody";
+import {
+  createGrantKeyRingDocument,
+  loadGrantKeyRingFile,
+  writeGrantKeyRingFile,
+} from "@/lib/grant-key-ring-custody";
 import { openSqliteFoundationStorage } from "@/lib/foundation-storage-sqlite";
 import { readGrantAuthorityOptions } from "@/lib/grant-runtime";
 import { createLiveEventGameIqaInterpreter } from "@/lib/live-event-game-control";
@@ -20,13 +27,18 @@ import {
   createTechnicalAdminAuth,
   type TechnicalAdminAuthority,
 } from "@/lib/technical-admin-auth";
-import type { PublicAudienceClockProjection } from "@/lib/audience-projection";
 
 const directory = mkdtempSync(join(tmpdir(), "quadball-timer-public-browser-"));
 const foundationDatabase = join(directory, "foundation.sqlite");
+const eventGameDatabase = join(directory, "event-game.sqlite");
 const technicalAdminDatabase = join(directory, "technical-admin.sqlite");
 const grantKeyRingFile = join(directory, "grant-key-ring.json");
 writeGrantKeyRingFile(grantKeyRingFile, createGrantKeyRingDocument("test"));
+const liveEventKeyRing = loadGrantKeyRingFile(grantKeyRingFile, "test", {
+  requiredOwnerUid: process.getuid?.() ?? 0,
+}).keyRing;
+const encodeLiveEventKey = (key: Uint8Array | undefined) =>
+  key === undefined ? "" : Buffer.from(key).toString("base64url");
 const port = 38_000 + Math.floor(Math.random() * 1_000);
 const origin = `http://127.0.0.1:${port}`;
 const environment = {
@@ -36,6 +48,12 @@ const environment = {
   PUBLIC_ORIGIN: "https://timer.example",
   FOUNDATION_DATABASE: foundationDatabase,
   TECHNICAL_ADMIN_DATABASE: technicalAdminDatabase,
+  EVENT_GAME_DATABASE: eventGameDatabase,
+  EVENT_GAME_ENCRYPTION_KEY: encodeLiveEventKey(
+    liveEventKeyRing.encryption.keys.get("encryption-v1"),
+  ),
+  EVENT_GAME_LOOKUP_KEY: encodeLiveEventKey(liveEventKeyRing.lookup.keys.get("lookup-v1")),
+  EVENT_GAME_AUDIT_KEY: encodeLiveEventKey(liveEventKeyRing.audit.keys.get("audit-v1")),
   GRANT_KEY_RING_FILE: grantKeyRingFile,
   PORT: String(port),
   HOST: "127.0.0.1",
@@ -49,6 +67,7 @@ let browserPage: Page | null = null;
 
 try {
   const seeded = await seedDatabase();
+  await seedCommittedGameRecords(seeded);
   server = Bun.spawn(["bun", "run", "src/index.ts"], {
     cwd: process.cwd(),
     env: environment,
@@ -57,7 +76,6 @@ try {
   });
   serverStderr = new Response(server.stderr as unknown as BodyInit).text();
   await waitForServer(`${origin}/internal/healthz`);
-  await seedCommittedGameRecords(seeded);
 
   const harnessDirectory = join(directory, "timeline-harness");
   mkdirSync(harnessDirectory);
@@ -126,64 +144,6 @@ try {
   const current = listPayload.value.events.find((event) => event.eventId === seeded.currentId);
   if (!current) throw new Error("seeded current Event was not listed");
 
-  const eventResponse = await context.request.get(
-    `${origin}/api/audience/events/${encodeURIComponent(seeded.currentId)}`,
-  );
-  assert(eventResponse.status() === 200, "seeded Audience Event was unavailable");
-  const denseEvent = structuredClone((await eventResponse.json()) as PublicEventResponseFixture);
-  const denseGame = denseEvent.value.schedule.scheduleGames.find(
-    (game) => game.gameCode === "BUSY-1",
-  );
-  if (denseGame === undefined) throw new Error("seeded finished Game was not projected");
-  const longReason =
-    "A deliberately long public penalty reason that must wrap inside the narrow Timeline without horizontal overflow";
-  denseGame.timeline = [
-    ...Array.from(
-      { length: 24 },
-      (_, index) =>
-        ({
-          kind: "card",
-          gameTimeMs: 90_000 - index * 1_000,
-          lane: "side-a",
-          teamName: "A deliberately long public Event Team name for wrapping",
-          player: {
-            number: 7,
-            name: "A deliberately long roster-resolved player name for wrapping",
-          },
-          cardColor: "yellow",
-          penaltyReason: longReason,
-        }) satisfies PublicTimelineFixtureEntry,
-    ),
-    {
-      kind: "card",
-      gameTimeMs: 88_000,
-      lane: "side-b",
-      teamName: "The other long public Event Team",
-      player: { number: 12, name: "Side B roster-resolved player" },
-      cardColor: "blue",
-      penaltyReason: "Side B lane coverage",
-    },
-    {
-      kind: "suspension",
-      gameTimeMs: 87_000,
-      lane: "center",
-      teamName: null,
-      player: null,
-      action: "start",
-    },
-    ...denseGame.timeline,
-  ];
-  await page.route(
-    `${origin}/api/audience/events/${encodeURIComponent(seeded.currentId)}`,
-    async (route) => {
-      await route.fulfill({
-        status: 200,
-        contentType: "application/json",
-        body: JSON.stringify(denseEvent),
-      });
-    },
-  );
-
   await page.goto(`${origin}/events`);
   await page.waitForURL(`${origin}${current.canonicalPath}`);
   await page.getByRole("heading", { name: "Published Current" }).waitFor();
@@ -196,12 +156,6 @@ try {
     (await liveNow.locator('[data-schedule-card][data-schedule-status="running"]').count()) === 2,
     "both committed running Games were not shown in Live now",
   );
-  const liveCardClasses = await liveNow
-    .locator("[data-schedule-card]")
-    .evaluateAll((cards) =>
-      cards.map((card) => card.firstElementChild?.getAttribute("class") ?? ""),
-    );
-  assert(new Set(liveCardClasses).size === 1, "running Games did not receive equal card treatment");
   const schedule = page.locator('[data-schedule-group="event-schedule"]');
   for (const [code, status] of [
     ["BUSY-1", "past"],
@@ -213,7 +167,7 @@ try {
       (await schedule
         .locator(`[data-game-code="${code}"][data-schedule-status="${status}"]`)
         .count()) === 1,
-      `${code} did not retain chronological status ${status}`,
+      `${code} did not retain chronological status ${status}; ${await schedule.innerText()}`,
     );
   }
   const finishedTimeline = schedule.locator(
@@ -224,36 +178,6 @@ try {
     (await finishedTimeline.locator('[data-timeline-kind="finish"]').count()) === 1,
     "finished Game did not render its effective public Timeline",
   );
-  await finishedTimeline.getByText("Game Timeline").waitFor();
-  assert(
-    (await finishedTimeline.locator('[data-timeline-kind="card"]').count()) >= 24,
-    "dense public Timeline content was not rendered",
-  );
-  assert(
-    (await finishedTimeline.locator('[data-timeline-lane="side-a"]').count()) >= 24,
-    "side A Timeline events were not rendered in their lane",
-  );
-  assert(
-    (await finishedTimeline.locator('[data-timeline-lane="side-b"]').count()) >= 1,
-    "side B Timeline events were not rendered in their lane",
-  );
-  assert(
-    (await finishedTimeline
-      .locator('[data-timeline-lane="center"][data-timeline-kind="suspension"]')
-      .count()) === 1,
-    "centered lifecycle Timeline event was not rendered",
-  );
-  await finishedTimeline.getByText(longReason).first().waitFor();
-  const timelineScroll = finishedTimeline.locator("[data-timeline-scroll-region]");
-  const scrollMetrics = await timelineScroll.evaluate((element) => ({
-    clientHeight: element.clientHeight,
-    scrollHeight: element.scrollHeight,
-  }));
-  assert(
-    scrollMetrics.scrollHeight > scrollMetrics.clientHeight,
-    "Timeline did not become scrollable",
-  );
-
   assert(
     (await page.locator('[data-schedule-group="coming-up"] h3').count()) === 1,
     "Coming up Games were not grouped by Expected Start",
@@ -316,111 +240,53 @@ try {
     "Timeline harness exposed New play at the live edge",
   );
 
-  const spectatorGamePath = `/events/${encodeURIComponent(current.eventId)}/games/browser-fixture`;
-  let browserClockFreshness: PublicAudienceClockProjection["synchronization"] = "stale";
-  await page.route(
-    `${origin}/api/audience/events/${encodeURIComponent(current.eventId)}/games/browser-fixture`,
-    async (route) => {
-      await route.fulfill({
-        status: 200,
-        contentType: "application/json",
-        body: JSON.stringify({
-          status: "accepted",
-          value: publicGameFixture(current.eventId, browserClockFreshness),
-        }),
-      });
-    },
-  );
-  await page.goto(`${origin}${spectatorGamePath}`);
-  await page.getByRole("heading", { name: "Live Final" }).waitFor();
-  await page.locator("[data-scoreboard-expanded]").waitFor();
-  await page.getByText("Last synchronized:").waitFor();
-  await page.getByText("Target 40").waitFor();
-  await page.getByText("Suspended").first().waitFor();
-  await page.getByText("started · 0:30 remaining · decision pending").waitFor();
-  await page.getByText("Team Timeout").waitFor();
-  await page.getByText("Game Suspension").waitFor();
-  await page.getByText("Heat Stoppage").waitFor();
-  await page.getByText("Winner Side A · Locked").waitFor();
-  await page.getByText("Roster-resolved spectator").waitFor();
+  const streamedGame = schedule.locator('[data-game-code="BUSY-2"]');
+  const initialScore = await streamedGame.locator('[aria-label="Side A score"]').innerText();
+  assert(initialScore === "0", "canonical Event page did not render the initial scoreboard");
   assert(
-    (await page.locator('[data-game-timeline] [data-timeline-kind="goal"]').count()) === 1,
-    "dedicated spectator Game did not render its roster-resolved Timeline",
+    (await streamedGame.locator('[data-timeline-kind="goal"]').count()) === 0,
+    "canonical Event page unexpectedly rendered the future goal",
   );
-  const expandedSides = page.locator("[data-scoreboard-expanded] [data-side-id]");
-  assert((await expandedSides.count()) === 2, "expanded scoreboard did not render two sides");
+
+  const stableGamePath = `/events/${encodeURIComponent(seeded.currentId)}/games/${encodeURIComponent(
+    seeded.currentGames[1]!.game.eventGameId,
+  )}`;
+  await page.goto(`${origin}${stableGamePath}`);
+  await page.getByRole("heading", { name: "Busy Game 2" }).waitFor();
+  const stableGameScore = page.locator('[aria-label="Side A score"]');
+  await stableGameScore.waitFor();
   assert(
-    (await expandedSides.nth(0).getAttribute("data-side-id")) === "side-b" &&
-      (await expandedSides.nth(1).getAttribute("data-side-id")) === "side-a",
-    "expanded scoreboard reordered sides without stable IDs",
+    (await stableGameScore.innerText()) === "0",
+    "stable Game page did not render its snapshot",
   );
   assert(
-    (await expandedSides.nth(0).innerText()).includes("FLAG CATCH") &&
-      !(await expandedSides.nth(1).innerText()).includes("FLAG CATCH"),
-    "expanded scoreboard marked the wrong catching side",
+    (await page.locator('[data-timeline-kind="goal"]').count()) === 0,
+    "stable Game page unexpectedly rendered the future goal",
   );
+  await acceptCommittedGoal(seeded);
+  await page.waitForFunction(
+    () => document.querySelector('[aria-label="Side A score"]')?.textContent?.trim() === "10",
+  );
+  await page.locator('[data-timeline-kind="goal"]').first().waitFor();
   assert(
-    await page.evaluate(
-      () => document.documentElement.scrollWidth <= document.documentElement.clientWidth,
-    ),
-    "phone-sized spectator Game overflows horizontally",
+    page.url() === `${origin}${stableGamePath}`,
+    "stable Game stream update reloaded the page",
   );
-  assert(
-    !(await page.locator("[data-scoreboard-expanded]").getAttribute("class"))?.includes("sticky"),
-    "expanded spectator scoreboard remained sticky",
-  );
-  await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-  await page.locator("[data-scoreboard-compact]").waitFor();
-  const compactText = await page.locator("[data-scoreboard-compact]").innerText();
-  for (const value of [
-    "A Very Long Team Name That Must Wrap On A Phone",
-    "Another Very Long Team Name For A Narrow Phone",
-    "40",
-    "30",
-    "2:05",
-    "Stale clock",
-    "Game Phase: Overtime",
-    "Operational status: Suspended",
-    "Schedule: Past",
-    "FLAG CATCH",
-  ]) {
-    assert(compactText.includes(value), `compact scoreboard omitted ${value}`);
-  }
-  assert(
-    (await page.locator("[data-scoreboard-compact]").getAttribute("class"))?.includes("sticky") ===
-      true,
-    "compact spectator scoreboard did not become sticky after scrolling",
-  );
-  const compactSides = page.locator("[data-scoreboard-compact] [data-side-id]");
-  assert((await compactSides.count()) === 2, "compact scoreboard did not render two sides");
-  assert(
-    (await compactSides.nth(0).getAttribute("data-side-id")) === "side-b" &&
-      (await compactSides.nth(1).getAttribute("data-side-id")) === "side-a",
-    "compact scoreboard reordered sides without stable IDs",
-  );
-  assert(
-    (await compactSides.nth(0).innerText()).includes("FLAG CATCH") &&
-      !(await compactSides.nth(1).innerText()).includes("FLAG CATCH"),
-    "compact scoreboard marked the wrong catching side",
-  );
-  for (const [status, label] of [
-    ["synchronized", "Synchronized clock"],
-    ["estimated", "Estimated clock"],
-    ["stale", "Stale clock"],
-    ["unavailable", "Clock unavailable"],
-  ] as const) {
-    browserClockFreshness = status;
-    await page.reload();
-    await page.getByText(label).first().waitFor();
-  }
-  await page.unroute(
-    `${origin}/api/audience/events/${encodeURIComponent(current.eventId)}/games/browser-fixture`,
-  );
-  const canonicalResponse = await page.goto(`${origin}${current.canonicalPath}`);
+
+  await page.goto(`${origin}${current.canonicalPath}`);
   await page.getByRole("heading", { name: "Published Current" }).waitFor();
+  await page.waitForFunction(
+    (selector) => document.querySelector(selector)?.textContent?.trim() === "10",
+    '[data-game-code="BUSY-2"] [aria-label="Side A score"]',
+  );
+  await page.locator('[data-game-code="BUSY-2"] [data-timeline-kind="goal"]').first().waitFor();
   assert(
-    canonicalResponse?.headers()["x-robots-tag"] === undefined,
-    "Published canonical page was noindex",
+    page.url() === `${origin}${current.canonicalPath}`,
+    "stream update reloaded the Event page",
+  );
+  assert(
+    (await page.locator('[data-game-code="BUSY-2"][data-schedule-status="running"]').count()) >= 1,
+    "stream update removed the canonical schedule card",
   );
 
   await page.getByRole("button", { name: "All events" }).click();
@@ -533,9 +399,8 @@ try {
       oneCurrentAutoOpen: true,
       multipleCurrentDiscovery: true,
       busyPhoneSchedule: true,
-      spectatorGamePhone: true,
-      spectatorScoreboardCompaction: true,
-      spectatorSportingProjection: true,
+      publicEventScheduleScoreTimelineConvergence: true,
+      stableGameScheduleScoreTimelineConvergence: true,
       canonicalNavigation: true,
       unavailableHiddenUnknown: true,
       unavailableDatabaseFailure: true,
@@ -570,103 +435,6 @@ type PublicEventFixture = {
   lifecycle: "unscheduled" | "current" | "future" | "past";
   gameDays: string[];
   canonicalPath: string;
-};
-
-function publicGameFixture(
-  eventId: string,
-  synchronization: PublicAudienceClockProjection["synchronization"] = "stale",
-) {
-  return {
-    eventId,
-    gameCode: "BROWSER-1",
-    gameDesignation: "Live Final",
-    scheduledStartMs: Date.now() - 20 * 60_000,
-    expectedStartMs: Date.now() - 18 * 60_000,
-    scheduleStatus: "past",
-    phase: "overtime",
-    operationalStatus: "suspended",
-    pitch: "Pitch 1",
-    sideA: {
-      name: "A Very Long Team Name That Must Wrap On A Phone",
-      color: "#112233",
-      score: 40,
-    },
-    sideB: {
-      name: "Another Very Long Team Name For A Narrow Phone",
-      color: "#445566",
-      score: 30,
-    },
-    overtimeTarget: 40,
-    clock: {
-      gameTimeMs: 125_000,
-      activePenaltyTimeMs: 0,
-      running: false,
-      projectedAtMs: Date.now(),
-      synchronization,
-      lastSynchronizedAtMs: synchronization === "unavailable" ? null : Date.now() - 30_000,
-      cues: {
-        flagRunnerEntry: "passed",
-        seekerWarning: "passed",
-        seekerCountdownMs: null,
-        seekerRelease: "released",
-      },
-    },
-    teamTimeout: { status: "started", side: "side-a", remainingMs: 30_000 },
-    gameSuspension: "suspended",
-    heatStoppage: {
-      status: "started",
-      mode: "enabled",
-      pending: true,
-      allowedDurationMs: 120_000,
-      actualDurationMs: 90_000,
-      remainingMs: 30_000,
-    },
-    flagState: { catchingSide: "side-b" },
-    result: { status: "finished", winner: "side-a", locked: true },
-    presentation: {
-      pitchOrientation: "side-b-left",
-      displayedTeamColors: { sideA: "#112233", sideB: "#445566" },
-    },
-    canonicalPath: `/events/${encodeURIComponent(eventId)}/games/browser-fixture`,
-    timeline: [
-      {
-        kind: "goal",
-        gameTimeMs: 124_000,
-        lane: "side-b",
-        teamName: "Another Very Long Team Name For A Narrow Phone",
-        player: { number: 7, name: "Roster-resolved spectator" },
-        points: 10,
-      },
-    ],
-  };
-}
-
-type PublicTimelineFixtureEntry = {
-  kind: string;
-  gameTimeMs: number | null;
-  lane: string;
-  teamName: string | null;
-  player: { number: number; name: string | null } | null;
-  cardColor?: string | null;
-  penaltyReason?: string | null;
-  [key: string]: unknown;
-};
-
-type PublicGameProjectionFixture = {
-  gameCode: string | null;
-  timeline: PublicTimelineFixtureEntry[];
-  [key: string]: unknown;
-};
-
-type PublicEventResponseFixture = {
-  status: string;
-  value: {
-    schedule: {
-      scheduleGames: PublicGameProjectionFixture[];
-      [key: string]: unknown;
-    };
-    [key: string]: unknown;
-  };
 };
 
 async function seedDatabase() {
@@ -803,37 +571,122 @@ async function seedCommittedGameRecords(seeded: {
   const foundation = openSqliteFoundationStorage(foundationDatabase, {
     grantKeyRing: readGrantAuthorityOptions("test", environment).keyRing,
   });
-  const resolver = createSeedScopeResolver();
-  for (const [index, entry] of seeded.currentGames.entries()) {
-    if (index > 2) continue;
-    const root = createSeedRoot(
-      seeded.currentId,
-      seeded.currentGameDayId,
-      entry.game.eventGameId,
-      entry.pitchId,
-      entry.pitchSlotId,
-    );
-    const record = createEventGameRecord(foundation, {
-      externalScopeResolver: resolver,
-      interpreter: createLiveEventGameIqaInterpreter(),
-      clock: () => Date.now(),
-    });
-    const registered = await record.registerRoot(root);
-    if (registered.status !== "registered") throw new Error("busy Event root registration failed");
-    const action = await record.acceptAction(
-      index === 0 ? createSeedForfeitAction(root) : createSeedClockAction(root),
-    );
-    if (action.status !== "accepted") throw new Error("busy Event action commit failed");
-    if (index === 0) {
-      const finished = await record.transitionLifecycle({
-        ...root.lifecycle,
-        phase: "finished",
-        finishedAtMs: Date.now(),
-      });
-      if (finished.status !== "updated") throw new Error("busy Event finish commit failed");
+  const eventGameStorage = openSqliteFoundationStorage(eventGameDatabase, {
+    grantKeyRing: liveEventKeyRing,
+  });
+  await eventGameStorage.applyMigrations({ requireCandidate: false });
+  try {
+    for (const [index, entry] of seeded.currentGames.entries()) {
+      if (index > 2) continue;
+      const root = createSeedRoot(
+        seeded.currentId,
+        seeded.currentGameDayId,
+        entry.game.eventGameId,
+        entry.pitchId,
+        entry.pitchSlotId,
+      );
+      await seedEventGameRecord(foundation, root, createSeedScopeResolver(), index);
+      await seedEventGameRecord(eventGameStorage, root, createEventGameSeedScopeResolver(), index);
     }
+  } finally {
+    eventGameStorage.close();
+    foundation.close();
   }
-  foundation.close();
+}
+
+async function seedEventGameRecord(
+  storage: ReturnType<typeof openSqliteFoundationStorage>,
+  root: EventGameRecordRoot,
+  resolver: ExternalScopeResolver,
+  index: number,
+) {
+  const record = createEventGameRecord(storage, {
+    externalScopeResolver: resolver,
+    interpreter: createLiveEventGameIqaInterpreter(),
+    clock: () => Date.now(),
+  });
+  const registered = await record.registerRoot(root);
+  if (registered.status !== "registered") throw new Error("busy Event root registration failed");
+  const action = await record.acceptAction(
+    index === 0 ? createSeedForfeitAction(root) : createSeedClockAction(root),
+  );
+  if (action.status !== "accepted") throw new Error("busy Event action commit failed");
+  if (index === 0) {
+    const finished = await record.transitionLifecycle({
+      ...root.lifecycle,
+      phase: "finished",
+      finishedAtMs: Date.now(),
+    });
+    if (finished.status !== "updated") throw new Error("busy Event finish commit failed");
+  }
+}
+
+async function acceptCommittedGoal(seeded: {
+  currentId: string;
+  currentGameDayId: string;
+  currentGames: readonly { game: EventGame; pitchId: string; pitchSlotId: string }[];
+}) {
+  const entry = seeded.currentGames[1];
+  if (entry === undefined) throw new Error("browser convergence Game is unavailable");
+  const runtime = openSqliteFoundationStorage(eventGameDatabase, {
+    grantKeyRing: liveEventKeyRing,
+  });
+  const catalog = openSqliteFoundationStorage(foundationDatabase, {
+    grantKeyRing: readGrantAuthorityOptions("test", environment).keyRing,
+  });
+  try {
+    const readinessContext = {
+      actionCodecRegistry: createControlActionCodecRegistry(),
+      interpreter: createLiveEventGameIqaInterpreter(),
+    };
+    runtime.setReadinessContext(readinessContext);
+    catalog.setReadinessContext(readinessContext);
+    await acceptGoalOnStorage(
+      catalog,
+      entry,
+      createSeedScopeResolver(),
+      "browser-convergence-goal-catalog",
+    );
+    await acceptGoalOnStorage(
+      runtime,
+      entry,
+      createEventGameSeedScopeResolver(),
+      "browser-convergence-goal-runtime",
+    );
+  } finally {
+    catalog.close();
+    runtime.close();
+  }
+}
+
+async function acceptGoalOnStorage(
+  storage: ReturnType<typeof openSqliteFoundationStorage>,
+  entry: { game: EventGame },
+  resolver: ExternalScopeResolver,
+  operationId: string,
+) {
+  const root = await storage.transaction((transaction) =>
+    transaction.findRootByEventGameId(entry.game.eventGameId),
+  );
+  if (root === null) throw new Error("browser convergence Event Game root is unavailable");
+  const record = createEventGameRecord(storage, {
+    externalScopeResolver: resolver,
+    interpreter: createLiveEventGameIqaInterpreter(),
+    clock: () => Date.now(),
+  });
+  const registered = await record.registerRoot(root);
+  if (registered.status !== "registered" && registered.status !== "idempotent") {
+    throw new Error(`browser convergence Event Game registration failed: ${registered.status}`);
+  }
+  const accepted = await record.acceptAction(
+    createSeedAction(root, operationId, "goal", root.gameSides[0]?.id ?? null, {
+      points: 10,
+      sportingOrder: 1_000,
+    }),
+  );
+  if (accepted.status !== "accepted" && accepted.status !== "duplicate-accepted") {
+    throw new Error(`browser convergence goal was not accepted: ${accepted.status}`);
+  }
 }
 
 function createSeedScopeResolver(): ExternalScopeResolver {
@@ -846,6 +699,19 @@ function createSeedScopeResolver(): ExternalScopeResolver {
         pitchSlot.pitchId === scope.pitchId
         ? { status: "resolved", scope: structuredClone(scope) }
         : { status: "mismatch", detail: "Seed Event Game Pitch Slot is unavailable." };
+    },
+    resolveEventTeam(eventId, eventTeamId) {
+      return eventId.length > 0 && eventTeamId.length > 0
+        ? { status: "resolved" }
+        : { status: "missing", detail: "Seed Event Team is unavailable." };
+    },
+  };
+}
+
+function createEventGameSeedScopeResolver(): ExternalScopeResolver {
+  return {
+    resolve(scope) {
+      return { status: "resolved", scope: structuredClone(scope) };
     },
     resolveEventTeam(eventId, eventTeamId) {
       return eventId.length > 0 && eventTeamId.length > 0

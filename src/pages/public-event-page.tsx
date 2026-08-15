@@ -9,6 +9,12 @@ import type {
   PublicAudienceGameProjection,
   PublicAudienceScheduleProjection,
 } from "@/lib/audience-projection";
+import {
+  applyPublicEventStreamMessage,
+  createPublicEventStreamReplica,
+  PUBLIC_EVENT_STREAM_PROTOCOL,
+  type PublicAudienceProjectionMessage,
+} from "@/lib/public-event-stream";
 import { DEFAULT_AWAY_TEAM_COLOR, DEFAULT_HOME_TEAM_COLOR } from "@/lib/team-colors";
 import { PublicGameTimeline } from "@/pages/public-game-timeline";
 
@@ -69,27 +75,7 @@ export function PublicEventHomePage({ showAll = false }: { showAll?: boolean }) 
 }
 
 export function PublicEventPage({ eventId }: { eventId: string }) {
-  const [event, setEvent] = useState<PublicAudienceEventProjection | null>(null);
-  const [unavailable, setUnavailable] = useState(false);
-
-  useEffect(() => {
-    let active = true;
-    setEvent(null);
-    setUnavailable(false);
-    void fetch(`/api/audience/events/${encodeURIComponent(eventId)}`)
-      .then(async (response) => {
-        if (!response.ok) throw new Error("Event unavailable");
-        const payload = (await response.json()) as AudienceEventResponse;
-        if (payload.status !== "accepted") throw new Error("Event unavailable");
-        if (active) setEvent(payload.value);
-      })
-      .catch(() => {
-        if (active) setUnavailable(true);
-      });
-    return () => {
-      active = false;
-    };
-  }, [eventId]);
+  const { event, unavailable } = usePublicEventProjection(eventId);
 
   if (unavailable) return <UnavailablePanel />;
   if (event === null) {
@@ -105,6 +91,7 @@ export function PublicEventPage({ eventId }: { eventId: string }) {
   return (
     <PublicShell title={event.name} description={`Published Event · ${event.timeZone}`}>
       <div className="space-y-4">
+        {event.teamAssignmentNotice !== undefined ? <TeamAssignmentCorrectionNotice /> : null}
         <div className="flex flex-wrap items-center justify-between gap-3">
           <p className="text-sm text-muted-foreground">{lifecycleLabel(event.lifecycle)}</p>
           <Button variant="outline" onClick={() => navigateTo("/events?view=all")}>
@@ -165,6 +152,145 @@ export function PublicEventPage({ eventId }: { eventId: string }) {
   );
 }
 
+function usePublicEventProjection(eventId: string) {
+  const [event, setEvent] = useState<PublicAudienceEventProjection | null>(null);
+  const [unavailable, setUnavailable] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+    let socket: WebSocket | null = null;
+    let reconnectAttempts = 0;
+    let recovering = false;
+    let terminalUnavailable = false;
+    setEvent(null);
+    setUnavailable(false);
+
+    const readAuthoritativeEvent = async () => {
+      const response = await fetch(`/api/audience/events/${encodeURIComponent(eventId)}`);
+      if (!response.ok) throw new Error("Event unavailable");
+      const payload = (await response.json()) as AudienceEventResponse;
+      if (payload.status !== "accepted") throw new Error("Event unavailable");
+      return payload.value;
+    };
+
+    const makeReplica = (nextEvent: PublicAudienceEventProjection) => {
+      const nextReplica = createPublicEventStreamReplica<PublicAudienceEventProjection>(eventId);
+      applyPublicEventStreamMessage(nextReplica, {
+        protocol: PUBLIC_EVENT_STREAM_PROTOCOL,
+        type: "snapshot",
+        eventId,
+        version: 0,
+        projection: nextEvent,
+      });
+      return nextReplica;
+    };
+
+    let recoverFromDisconnect: () => Promise<void>;
+    const connect = (replica: ReturnType<typeof makeReplica>) => {
+      if (!active || terminalUnavailable) return;
+      const connection = new WebSocket(publicEventWebSocketUrl());
+      socket = connection;
+      connection.onopen = () => {
+        connection.send(JSON.stringify({ type: "subscribe-public-event", eventId }));
+      };
+      connection.onmessage = (message) => {
+        if (!active || socket !== connection) return;
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(message.data);
+        } catch {
+          return;
+        }
+        if (!isPublicAudienceProjectionMessage(parsed, eventId)) return;
+        const result = applyPublicEventStreamMessage(replica, parsed);
+        if (result.status === "unavailable" && parsed.type === "event-unavailable") {
+          terminalUnavailable = true;
+          setEvent(null);
+          setUnavailable(true);
+          connection.close();
+          return;
+        }
+        if (result.status !== "applied" || replica.projection === null) return;
+        setEvent(replica.projection);
+      };
+      connection.onclose = () => {
+        if (!active || terminalUnavailable || socket !== connection) return;
+        socket = null;
+        void recoverFromDisconnect();
+      };
+    };
+
+    recoverFromDisconnect = async () => {
+      if (!active || terminalUnavailable || recovering) return;
+      if (reconnectAttempts >= PUBLIC_EVENT_MAX_RECONNECT_ATTEMPTS) {
+        setEvent(null);
+        setUnavailable(true);
+        return;
+      }
+      recovering = true;
+      reconnectAttempts += 1;
+      setEvent(null);
+      try {
+        const nextEvent = await readAuthoritativeEvent();
+        if (!active || terminalUnavailable) return;
+        setEvent(nextEvent);
+        reconnectAttempts = 0;
+        connect(makeReplica(nextEvent));
+      } catch {
+        if (active) {
+          setEvent(null);
+          setUnavailable(true);
+        }
+      } finally {
+        recovering = false;
+      }
+    };
+
+    void readAuthoritativeEvent()
+      .then((nextEvent) => {
+        if (!active) return;
+        setEvent(nextEvent);
+        reconnectAttempts = 0;
+        connect(makeReplica(nextEvent));
+      })
+      .catch(() => {
+        if (active) {
+          setEvent(null);
+          setUnavailable(true);
+        }
+      });
+    return () => {
+      active = false;
+      terminalUnavailable = true;
+      socket?.close();
+    };
+  }, [eventId]);
+
+  return { event, unavailable };
+}
+
+const PUBLIC_EVENT_MAX_RECONNECT_ATTEMPTS = 2;
+
+function publicEventWebSocketUrl() {
+  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  return `${protocol}//${window.location.host}/ws`;
+}
+
+function isPublicAudienceProjectionMessage(
+  value: unknown,
+  eventId: string,
+): value is PublicAudienceProjectionMessage<PublicAudienceEventProjection> {
+  if (value === null || typeof value !== "object") return false;
+  const message = value as { protocol?: unknown; eventId?: unknown; type?: unknown };
+  return (
+    message.protocol === PUBLIC_EVENT_STREAM_PROTOCOL &&
+    message.eventId === eventId &&
+    (message.type === "snapshot" ||
+      message.type === "projection-replaced" ||
+      message.type === "event-unavailable")
+  );
+}
+
 export function PublicEventGamePage({
   eventId,
   eventGameId,
@@ -172,34 +298,12 @@ export function PublicEventGamePage({
   eventId: string;
   eventGameId: string;
 }) {
-  const [game, setGame] = useState<PublicAudienceGameProjection | null>(null);
-  const [unavailable, setUnavailable] = useState(false);
+  const { event, unavailable } = usePublicEventProjection(eventId);
+  const game =
+    event?.schedule.scheduleGames.find((candidate) => candidate.eventGameId === eventGameId) ??
+    null;
   const [compactScoreboard, setCompactScoreboard] = useState(false);
   const scoreboardSentinelRef = useRef<HTMLDivElement | null>(null);
-
-  useEffect(() => {
-    let active = true;
-    setGame(null);
-    setUnavailable(false);
-    void fetch(
-      `/api/audience/events/${encodeURIComponent(eventId)}/games/${encodeURIComponent(eventGameId)}`,
-    )
-      .then(async (response) => {
-        if (!response.ok) throw new Error("Game unavailable");
-        const payload = (await response.json()) as AudienceGameResponse;
-        if (payload.status !== "accepted") throw new Error("Game unavailable");
-        return payload.value;
-      })
-      .then((nextGame) => {
-        if (active) setGame(nextGame);
-      })
-      .catch(() => {
-        if (active) setUnavailable(true);
-      });
-    return () => {
-      active = false;
-    };
-  }, [eventGameId, eventId]);
 
   useEffect(() => {
     const sentinel = scoreboardSentinelRef.current;
@@ -219,6 +323,7 @@ export function PublicEventGamePage({
 
   if (unavailable) return <GameUnavailablePanel eventId={eventId} />;
   if (game === null) {
+    if (event !== null) return <GameUnavailablePanel eventId={eventId} />;
     return (
       <PublicShell title="Live spectator Game" description="Loading public Game information…">
         <p className="rounded-2xl border bg-card/80 p-5 text-sm text-muted-foreground">Loading…</p>
@@ -241,6 +346,7 @@ export function PublicEventGamePage({
   return (
     <PublicShell title={title} description="Public Audience Projection · no sign-in required">
       <div className="space-y-4">
+        {game.teamAssignmentNotice !== undefined ? <TeamAssignmentCorrectionNotice /> : null}
         <div className="flex flex-wrap items-center justify-between gap-3">
           <Button
             variant="outline"
@@ -383,6 +489,17 @@ export function PublicEventGamePage({
   );
 }
 
+function TeamAssignmentCorrectionNotice() {
+  return (
+    <p
+      className="rounded-2xl border border-amber-300 bg-amber-50 p-4 text-sm text-amber-950"
+      role="status"
+    >
+      An Event Team assignment was corrected. Current team identities are shown.
+    </p>
+  );
+}
+
 function PublicScoreSide({
   side,
   label,
@@ -407,7 +524,7 @@ function PublicScoreSide({
         {side.name ?? "Unassigned Team"}
       </p>
       <p className="mt-2 text-4xl font-bold tabular-nums sm:text-5xl">
-        {side.score ?? "—"}
+        <span aria-label={`${label} score`}>{side.score ?? "—"}</span>
         {isCatching ? (
           <span className="mt-1 block text-xs font-semibold tracking-wide text-foreground uppercase">
             Flag catch
@@ -1156,9 +1273,6 @@ function lifecycleLabel(lifecycle: PublicAudienceEventProjection["lifecycle"]): 
 
 type AudienceEventResponse =
   | { status: "accepted"; value: PublicAudienceEventProjection }
-  | { status: "unavailable" };
-type AudienceGameResponse =
-  | { status: "accepted"; value: PublicAudienceGameProjection }
   | { status: "unavailable" };
 type AudienceEventsResponse =
   | { status: "accepted"; value: { events: readonly PublicAudienceEventProjection[] } }
