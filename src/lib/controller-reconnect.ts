@@ -6,6 +6,8 @@ import type {
   LiveHeatState,
   LiveCatchState,
   LiveResultState,
+  LiveSuspensionPenaltyState,
+  LiveSuspensionState,
   LiveStoppageState,
   LiveTimeoutState,
 } from "@/lib/live-event-game-control";
@@ -18,6 +20,7 @@ import {
 } from "@/lib/clock-authority";
 import {
   orderControllerGameFacts,
+  LIVE_SUSPENSION_SNAPSHOT_VERSION,
   parseLiveEventControllerIntent,
 } from "@/lib/live-event-game-control";
 import {
@@ -738,27 +741,11 @@ function applyOptimisticAction(
         },
       );
     }
-    return {
-      ...state,
-      projection: {
-        ...state.projection,
-        phase:
-          state.projection.commencement.status === "provisional"
-            ? "in-progress"
-            : state.projection.phase,
-        commencement:
-          commencementAtDispatch.status === "provisional"
-            ? {
-                ...commencementAtDispatch,
-                status: "commenced",
-                commencedAtMs: action.dispatchedAtMs,
-                provisionalRunningSinceMs: null,
-              }
-            : commencementAtDispatch,
-        gameFacts: nextFacts,
-        penalties: deriveLivePenaltyProjection(nextFacts, state.projection.clock.gameTimeMs),
-      },
-    };
+    return rebuildOptimisticProjection(
+      state,
+      nextFacts,
+      commencementAtDispatch.commencedAtMs ?? action.dispatchedAtMs,
+    );
   }
   if (intent.type === "record-penalty-reason") {
     const nextFacts = appendOptimisticFact(state.projection, {
@@ -773,14 +760,7 @@ function applyOptimisticAction(
         sportingOrder: intent.sportingOrder ?? intent.gameTimeMs,
       },
     });
-    return {
-      ...state,
-      projection: {
-        ...state.projection,
-        gameFacts: nextFacts,
-        penalties: deriveLivePenaltyProjection(nextFacts, state.projection.clock.gameTimeMs),
-      },
-    };
+    return rebuildOptimisticProjection(state, nextFacts, action.dispatchedAtMs);
   }
   if (intent.type === "resolve-penalty-expiration") {
     const scoreFact = (state.projection.gameFacts ?? []).find(
@@ -801,14 +781,7 @@ function applyOptimisticAction(
         sportingOrder: scoreSportingOrder,
       },
     });
-    return {
-      ...state,
-      projection: {
-        ...state.projection,
-        gameFacts: nextFacts,
-        penalties: deriveLivePenaltyProjection(nextFacts, state.projection.clock.gameTimeMs),
-      },
-    };
+    return rebuildOptimisticProjection(state, nextFacts, action.dispatchedAtMs);
   }
   if (
     intent.type === "record-flag-catch" ||
@@ -1033,6 +1006,7 @@ function sameProjection(left: ControllerProjection, right: ControllerProjection)
   const rightFacts = JSON.stringify(right.gameFacts ?? []);
   const leftDependent = JSON.stringify([
     left.timeout ?? null,
+    left.suspension ?? null,
     left.stoppage ?? null,
     left.heat ?? null,
     left.result ?? null,
@@ -1043,6 +1017,7 @@ function sameProjection(left: ControllerProjection, right: ControllerProjection)
   ]);
   const rightDependent = JSON.stringify([
     right.timeout ?? null,
+    right.suspension ?? null,
     right.stoppage ?? null,
     right.heat ?? null,
     right.result ?? null,
@@ -1200,7 +1175,10 @@ function parseProjection(value: unknown): ControllerProjection {
     : projectClockBaseline(createInitialClockBaseline(), 0);
   const gameFacts = parseGameFacts(value.gameFacts);
   const guardrails = parseGuardrails(value.guardrails);
+  const knownDodgeballIds = parseKnownDodgeballIds(value.knownDodgeballIds);
   const timeout = value.timeout === undefined ? undefined : parseTimeoutState(value.timeout);
+  const suspension =
+    value.suspension === undefined ? undefined : parseSuspensionState(value.suspension);
   const stoppage = value.stoppage === undefined ? undefined : parseStoppageState(value.stoppage);
   const heat = value.heat === undefined ? undefined : parseHeatState(value.heat);
   const result = value.result === undefined ? undefined : parseResultState(value.result);
@@ -1221,7 +1199,10 @@ function parseProjection(value: unknown): ControllerProjection {
     phase,
     scoreByGameSide: scores,
     goalCount: goalCount.value,
+    ...(value.knownDodgeballIds === undefined ? {} : { knownDodgeballIds }),
+    ...(value.penalties === undefined ? {} : { penalties }),
     ...(value.timeout === undefined ? {} : { timeout }),
+    ...(value.suspension === undefined ? {} : { suspension }),
     ...(value.stoppage === undefined ? {} : { stoppage }),
     ...(value.heat === undefined ? {} : { heat }),
     ...(value.result === undefined ? {} : { result }),
@@ -1230,7 +1211,6 @@ function parseProjection(value: unknown): ControllerProjection {
     ...(winnerGameSideId === undefined ? {} : { winnerGameSideId }),
     ...(catchState === undefined ? {} : { catch: catchState }),
     ...(value.gameFacts === undefined ? {} : { gameFacts }),
-    ...(penalties === undefined ? {} : { penalties }),
     ...(value.guardrails === undefined ? {} : { guardrails }),
     clock,
     commencement: {
@@ -1285,10 +1265,177 @@ function parseOptionalCatch(value: unknown): LiveCatchState | null | undefined {
 }
 
 function parseTimeoutState(value: unknown): LiveTimeoutState {
-  if (!isRecord(value) || (value.status !== "inactive" && value.status !== "started")) {
+  if (
+    !isRecord(value) ||
+    (value.status !== "inactive" &&
+      value.status !== "stoppage" &&
+      value.status !== "started" &&
+      value.status !== "completed")
+  ) {
     throw new Error("Projection timeout state is invalid.");
   }
-  return { status: value.status, factId: parseNullableFactId(value.factId, "timeout.factId") };
+  return {
+    ...structuredClone(value),
+    status: value.status,
+    factId: parseNullableFactId(value.factId, "timeout.factId"),
+  } as LiveTimeoutState;
+}
+
+function parseSuspensionState(value: unknown): LiveSuspensionState {
+  if (!isRecord(value) || (value.status !== "none" && value.status !== "suspended")) {
+    throw new Error("Projection suspension state is invalid.");
+  }
+  const factId = parseNullableFactId(value.factId, "suspension.factId");
+  if (value.snapshot === null || value.snapshot === undefined) {
+    if (value.status === "suspended") {
+      throw new Error("Suspended projection must include a recovery snapshot.");
+    }
+    return { status: value.status, factId, snapshot: null };
+  }
+  if (!isRecord(value.snapshot) || !isRecord(value.snapshot.scoreByGameSide)) {
+    throw new Error("Projection suspension snapshot is invalid.");
+  }
+  if (value.snapshot.version !== LIVE_SUSPENSION_SNAPSHOT_VERSION) {
+    throw new Error("Projection suspension snapshot version is invalid.");
+  }
+  const parsedScores: Record<string, number> = {};
+  for (const [sideId, score] of Object.entries(value.snapshot.scoreByGameSide)) {
+    if (!validateOpaqueIdentifier(sideId, "suspension.snapshot.gameSideId").ok) {
+      throw new Error("Projection suspension side is invalid.");
+    }
+    const parsed = validateIntegerInRange(score, 0, SHARED_LIMITS.score.max, "suspension.score");
+    if (!parsed.ok) throw new Error(parsed.error);
+    parsedScores[sideId] = parsed.value;
+  }
+  const penalties = parsePenaltyState(value.snapshot.penalties);
+  const volleyballPossession = value.snapshot.volleyballPossession;
+  if (typeof volleyballPossession !== "string" || volleyballPossession.length === 0) {
+    throw new Error("Projection volleyball possession is invalid.");
+  }
+  if (!isRecord(value.snapshot.dodgeballPossession)) {
+    throw new Error("Projection dodgeball possession is invalid.");
+  }
+  if (Object.keys(value.snapshot.dodgeballPossession).length === 0) {
+    throw new Error("Projection dodgeball possession is incomplete.");
+  }
+  const knownGameSideIds = new Set(Object.keys(parsedScores));
+  if (!knownGameSideIds.has(volleyballPossession)) {
+    throw new Error("Projection volleyball possession is not an admitted Game Side.");
+  }
+  const dodgeballPossession: Record<string, string | null> = {};
+  for (const [ballId, possession] of Object.entries(value.snapshot.dodgeballPossession)) {
+    if (!validateOpaqueIdentifier(ballId, "suspension.snapshot.dodgeballId").ok) {
+      throw new Error("Projection dodgeball id is invalid.");
+    }
+    if (possession !== null && typeof possession !== "string") {
+      throw new Error("Projection dodgeball possession is invalid.");
+    }
+    if (possession !== null && !knownGameSideIds.has(possession)) {
+      throw new Error("Projection dodgeball possession is not an admitted Game Side.");
+    }
+    dodgeballPossession[ballId] = possession;
+  }
+  const gameTimeMs = validateIntegerInRange(
+    value.snapshot.gameTimeMs,
+    0,
+    SHARED_LIMITS.clock.maxMs,
+    "suspension.snapshot.gameTimeMs",
+  );
+  if (!gameTimeMs.ok) throw new Error(gameTimeMs.error);
+  return {
+    status: value.status,
+    factId,
+    snapshot: {
+      version: LIVE_SUSPENSION_SNAPSHOT_VERSION,
+      gameTimeMs: gameTimeMs.value,
+      scoreByGameSide: parsedScores,
+      penalties,
+      volleyballPossession,
+      dodgeballPossession,
+    },
+  };
+}
+
+function parseKnownDodgeballIds(value: unknown): string[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) {
+    throw new Error("Projection known dodgeball identities are invalid.");
+  }
+  const ids = value.map((candidate) => requireIdentifier(candidate, "knownDodgeballId"));
+  if (new Set(ids).size !== ids.length) {
+    throw new Error("Projection known dodgeball identities are duplicated.");
+  }
+  return ids;
+}
+
+function parsePenaltyState(value: unknown): LiveSuspensionPenaltyState {
+  if (!isRecord(value) || !Array.isArray(value.segments)) {
+    throw new Error("Projection suspension penalties are invalid.");
+  }
+  const seen = new Set<string>();
+  const segments = value.segments.map((segment) => {
+    if (!isRecord(segment)) throw new Error("Projection suspension penalty is invalid.");
+    const sourceFactId = requireIdentifier(segment.sourceFactId, "suspension.penalty.sourceFactId");
+    const elapsedMs = validateIntegerInRange(
+      segment.elapsedMs,
+      0,
+      60_000,
+      "suspension.penalty.elapsedMs",
+    );
+    const remainingMs = validateIntegerInRange(
+      segment.remainingMs,
+      1,
+      60_000,
+      "suspension.penalty.remainingMs",
+    );
+    if (
+      !elapsedMs.ok ||
+      !remainingMs.ok ||
+      elapsedMs.value + remainingMs.value !== 60_000 ||
+      seen.has(sourceFactId) ||
+      typeof segment.expirableByScore !== "boolean"
+    ) {
+      throw new Error("Projection suspension penalty timing is invalid.");
+    }
+    seen.add(sourceFactId);
+    return {
+      sourceFactId,
+      elapsedMs: elapsedMs.value,
+      remainingMs: remainingMs.value,
+      expirableByScore: segment.expirableByScore,
+      ...(segment.cardFactId === undefined
+        ? {}
+        : { cardFactId: requireIdentifier(segment.cardFactId, "suspension.penalty.cardFactId") }),
+      ...(segment.cardType === undefined
+        ? {}
+        : {
+            cardType:
+              segment.cardType as LiveSuspensionPenaltyState["segments"][number]["cardType"],
+          }),
+      ...(segment.gameSideId === undefined
+        ? {}
+        : { gameSideId: requireIdentifier(segment.gameSideId, "suspension.penalty.gameSideId") }),
+      ...(segment.playerKey === undefined
+        ? {}
+        : { playerKey: requireIdentifier(segment.playerKey, "suspension.penalty.playerKey") }),
+      ...(segment.playerNumber === undefined
+        ? {}
+        : { playerNumber: segment.playerNumber as number | null }),
+      ...(segment.eligibleForScoreAtGameTimeMs === undefined
+        ? {}
+        : { eligibleForScoreAtGameTimeMs: segment.eligibleForScoreAtGameTimeMs as number }),
+      ...(segment.notBeforeGameTimeMs === undefined
+        ? {}
+        : { notBeforeGameTimeMs: segment.notBeforeGameTimeMs as number }),
+      ...(segment.startsAtGameTimeMs === undefined
+        ? {}
+        : { startsAtGameTimeMs: segment.startsAtGameTimeMs as number }),
+      ...(segment.endsAtGameTimeMs === undefined
+        ? {}
+        : { endsAtGameTimeMs: segment.endsAtGameTimeMs as number }),
+    };
+  });
+  return { segments };
 }
 
 function parseStoppageState(value: unknown): LiveStoppageState {
@@ -1660,20 +1807,21 @@ function rebuildOptimisticProjection(
       winnerGameSideId,
       catch: catchState,
       gameFacts: structuredClone(gameFacts),
+      penalties: deriveLivePenaltyProjection(gameFacts, projection.clock.gameTimeMs),
     },
   };
 }
 
 function deriveOptimisticDependentState(facts: readonly ControllerGameFact[]): {
   timeout: LiveTimeoutState;
+  suspension: LiveSuspensionState;
   stoppage: LiveStoppageState;
   heat: LiveHeatState;
   result: LiveResultState;
 } {
   const latest = (factType: string) =>
     facts.filter((fact) => fact.effective && fact.factType === factType).at(-1) ?? null;
-  const timeoutFact = latest("timeout");
-  const suspensionFact = latest("suspension");
+  const timeoutFacts = facts.filter((fact) => fact.effective && fact.factType === "timeout");
   const heatFact = latest("heat-stoppage");
   const resultFact = latest("result");
   const heatData =
@@ -1724,14 +1872,32 @@ function deriveOptimisticDependentState(facts: readonly ControllerGameFact[]): {
     startedAtGameTimeMs,
     nominalDurationMs,
   };
+  let suspension: LiveSuspensionState = { status: "none", factId: null, snapshot: null };
+  for (const fact of facts.filter(
+    (candidate) => candidate.effective && candidate.factType === "suspension",
+  )) {
+    const data = isRecord(fact.data) ? (fact.data as Record<string, unknown>) : null;
+    if (data?.suspensionAction === "resume") {
+      if (data.resumesSuspensionFactId === suspension.factId) {
+        suspension = { status: "none", factId: null, snapshot: null };
+      }
+      continue;
+    }
+    if (data?.suspensionAction !== "start") continue;
+    if (suspension.status === "suspended") continue;
+    const rawSnapshot = data?.suspensionSnapshot;
+    const snapshot =
+      isRecord(rawSnapshot) && isRecord(rawSnapshot.scoreByGameSide)
+        ? (structuredClone(rawSnapshot) as LiveSuspensionState["snapshot"])
+        : null;
+    suspension = { status: "suspended", factId: fact.factId, snapshot };
+  }
   return {
-    timeout: {
-      status: timeoutFact === null ? "inactive" : "started",
-      factId: timeoutFact?.factId ?? null,
-    },
+    timeout: deriveOptimisticTimeoutState(timeoutFacts),
+    suspension,
     stoppage:
-      suspensionFact !== null
-        ? { status: "suspension", factId: suspensionFact.factId }
+      suspension.status === "suspended"
+        ? { status: "suspension", factId: suspension.factId }
         : heat.status === "started" || heat.status === "extended"
           ? { status: "heat-stoppage", factId: heat.factId }
           : { status: "none", factId: null },
@@ -1741,6 +1907,46 @@ function deriveOptimisticDependentState(facts: readonly ControllerGameFact[]): {
         ? null
         : { factId: resultFact.factId, data: structuredClone(resultFact.data) },
   };
+}
+
+function deriveOptimisticTimeoutState(facts: readonly ControllerGameFact[]): LiveTimeoutState {
+  const usedGameSideIds = new Set<string>();
+  let timeout: LiveTimeoutState = {
+    status: "inactive",
+    factId: null,
+    gameSideId: null,
+    usedGameSideIds: [],
+    startedAtMs: null,
+    remainingMs: null,
+    longWhistleCue: "not-applicable",
+  };
+  for (const fact of facts) {
+    const data = isRecord(fact.data) ? (fact.data as Record<string, unknown>) : null;
+    if (data === null || typeof data.timeoutGameSideId !== "string") continue;
+    const gameSideId = data.timeoutGameSideId;
+    if (gameSideId !== null) usedGameSideIds.add(gameSideId);
+    const action =
+      data?.timeoutAction === "stoppage" ||
+      data?.timeoutAction === "complete" ||
+      data?.timeoutAction === "start"
+        ? data.timeoutAction
+        : null;
+    if (action === null) continue;
+    timeout = {
+      status: action === "stoppage" ? "stoppage" : action === "complete" ? "completed" : "started",
+      factId: fact.factId,
+      gameSideId,
+      usedGameSideIds: [...usedGameSideIds].sort(),
+      startedAtMs:
+        action === "start" && data !== null && typeof data.timeoutStartedAtMs === "number"
+          ? data.timeoutStartedAtMs
+          : null,
+      remainingMs: action === "start" ? 60_000 : action === "complete" ? 0 : null,
+      longWhistleCue:
+        action === "start" ? "pending" : action === "complete" ? "passed" : "not-applicable",
+    };
+  }
+  return timeout;
 }
 
 function isRecord(value: unknown): value is Record<string, any> {

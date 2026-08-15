@@ -32,7 +32,10 @@ export function createAuditEntry(
     actor:
       | { kind: "authority"; value: GrantAuthorityActor }
       | { kind: "session"; sessionId: string; pseudonymKeyVersion: string }
-      | { kind: "system"; value: "grant-expiry" | "grant-session-termination" }
+      | {
+          kind: "system";
+          value: "grant-expiry" | "grant-session-termination" | "timeout-completion";
+        }
       | { kind: "external"; value: string };
     grant: StoredGrant;
     sessionId: string | null;
@@ -193,7 +196,10 @@ function deriveAuditActorReference(
   actor:
     | { kind: "authority"; value: GrantAuthorityActor }
     | { kind: "session"; sessionId: string; pseudonymKeyVersion: string }
-    | { kind: "system"; value: "grant-expiry" | "grant-session-termination" }
+    | {
+        kind: "system";
+        value: "grant-expiry" | "grant-session-termination" | "timeout-completion";
+      }
     | { kind: "external"; value: string },
 ): string {
   const source =

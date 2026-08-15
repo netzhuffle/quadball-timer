@@ -54,6 +54,14 @@ export type ControlActionGrantProvenance = {
   authorityReference?: string;
 };
 
+export const SYSTEM_TIMEOUT_COMPLETION_GRANT: Readonly<{
+  sessionId: "system-timeout-completion";
+  versionId: "system-v1";
+}> = Object.freeze({
+  sessionId: "system-timeout-completion",
+  versionId: "system-v1",
+});
+
 export type ControlActionLifecycleContext = {
   phase: EventGameLifecyclePhase;
   commencedAtMs: number | null;

@@ -17,6 +17,7 @@ import { createLiveEventGameControlTransport } from "@/lib/live-event-game-trans
 import {
   openLiveEventGameRuntime,
   createControlScopeResolver,
+  readLiveEventDodgeballIdsByEventGame,
   readLiveEventGrantKeyRing,
   type LiveEventGameRuntime,
 } from "@/lib/live-event-game-runtime";
@@ -308,6 +309,7 @@ async function startServer() {
           databasePath: liveEventDatabasePath,
           environmentId: environment,
           keyRing: liveEventKeyRing,
+          knownDodgeballIdsForEventGame: readLiveEventDodgeballIdsByEventGame(),
         });
         startupCleanup.add(() => liveEventRuntime?.close());
       } catch (error) {

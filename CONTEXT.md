@@ -36,6 +36,22 @@ _Avoid_: Automatic stoppage, heat timer
 A complete stoppage started by a Controller on Head Referee direction after a Heat Stoppage Trigger. The first actual Heat Stoppage normally lasts four minutes and later ones two minutes. A required within-one-goal skip and the permitted following extension are ordinary rule operation; suppressing another required trigger, ending early, or extending beyond the rulebook allowance is an Official Override. Disabling Heat Stoppage Mode ends an active heat timer but does not resume play.
 _Avoid_: Team timeout, automatic clock pause
 
+**Team Timeout**:
+One Game Side's single timeout entitlement in an Event Game. Its stoppage procedure and separate 60-second timeout minute are recorded as immutable Game Facts; the long-whistle cue is due at 45 seconds, and correction or reinstatement rebuilds the entitlement and elapsed state.
+_Avoid_: Automatic stoppage, mutable timeout flag
+
+**Game Suspension**:
+A Head Referee-directed stoppage of an Event Game while the Game Clock is stopped. It blocks Clock restart until a Controller records a resume targeting the effective suspension Game Fact and does not replace the Game Clock, score, penalties, or possession evidence.
+_Avoid_: Pause, inactivity timeout, discarded game state
+
+**Suspension Recovery Snapshot**:
+The versioned `live-suspension-snapshot-v1` Game Fact data attached to a Game Suspension. It records the accepted Game Clock and score, every actual remaining penalty segment including simultaneous or queued segments, confirmed volleyball possession, and one entry for every recorded dodgeball possession so another Controller can verify recovery before resume.
+_Avoid_: Raw card facts, partial possession list, device snapshot
+
+**Known Game Ball Set**:
+The authoritative dodgeball identities configured for one Event Game or recovered from its accepted durable suspension history, including corrected facts. A new Suspension Recovery Snapshot must list each known dodgeball exactly once and cannot introduce an extra identity. Before the first suspension, Event Administration must provide the Event-Game-scoped set; without it, suspension admission fails closed.
+_Avoid_: Client-entered ball list, partial possession list, device snapshot
+
 **Gameplay Slot**:
 A tournament-system-defined row in a Game Day schedule that groups up to one Event Game per Pitch, usually under one Scheduled Start. A general Expected Delay can move its Games together while allowing a more-delayed Pitch Slot to remain later.
 _Avoid_: Game Slot, round, timeslot, batch

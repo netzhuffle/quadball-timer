@@ -17,6 +17,7 @@ import type { GrantKeyRing } from "@/lib/grant-types";
 import {
   createControlScopeResolver,
   openLiveEventGameRuntime,
+  readLiveEventDodgeballIdsByEventGame,
   readLiveEventGrantKeyRing,
 } from "@/lib/live-event-game-runtime";
 import {
@@ -25,6 +26,20 @@ import {
 } from "@/lib/live-event-game-control";
 
 describe("Live Event Game SQLite runtime", () => {
+  test("resolves known dodgeballs by Event Game and ignores the removed process-wide list", () => {
+    const resolve = readLiveEventDodgeballIdsByEventGame({
+      EVENT_GAME_DODGEBALL_IDS: "ball-old",
+      EVENT_GAME_DODGEBALL_IDS_BY_EVENT_GAME: JSON.stringify({
+        "game-a": ["ball-2", "ball-1", "ball-1"],
+      }),
+    });
+    expect(resolve?.("game-a")).toEqual(["ball-1", "ball-2"]);
+    expect(resolve?.("game-b")).toBeUndefined();
+    expect(
+      readLiveEventDodgeballIdsByEventGame({ EVENT_GAME_DODGEBALL_IDS: "ball-old" }),
+    ).toBeUndefined();
+  });
+
   test("fails closed when any required runtime secret is absent", () => {
     expect(
       readLiveEventGrantKeyRing({

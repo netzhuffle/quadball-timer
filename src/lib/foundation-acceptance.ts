@@ -16,6 +16,7 @@ import {
   materializeControlAction,
   prepareControlAction,
   sha256,
+  SYSTEM_TIMEOUT_COMPLETION_GRANT,
   validateControlActionEnvelope,
 } from "@/lib/event-game-actions";
 import { appendConcurrentCorrectionAudits } from "@/lib/event-game-record";
@@ -91,6 +92,7 @@ export type ControlActionBatchInput = {
   lifecycleTransition?: EventGameRecordRoot["lifecycle"];
   /** Only the composed Live Event Game seam may reconcile derived scoring lifecycle. */
   reconcileDerivedLifecycle?: boolean;
+  systemOperation?: "timeout-completion";
 };
 
 export type FoundationActionResult =
@@ -200,6 +202,10 @@ type BatchPreflight = {
   trustedLockedReplay: boolean;
   actions: readonly { prepared: PreparedControlAction | null; error: string | null }[];
 };
+
+function isSystemTimeoutCompletionBatch(batch: PreparedBatch): boolean {
+  return batch.input.systemOperation === "timeout-completion";
+}
 type OneOutcome = { result: FoundationActionResult; reservationId?: string; receipt?: string };
 type AuthorizedControl = {
   grant: StoredGrant;
@@ -407,15 +413,21 @@ export function createFoundationAcceptance(
       authorization.status !== "authorized" ||
       authorization.grantType !== "control" ||
       authorization.eventGameId !== batch.input.eventGameId ||
-      authorization.grantSessionId !== first.envelope.grant.sessionId ||
-      authorization.grantVersion !== first.envelope.grant.versionId
+      (!isSystemTimeoutCompletionBatch(batch) &&
+        (authorization.grantSessionId !== first.envelope.grant.sessionId ||
+          authorization.grantVersion !== first.envelope.grant.versionId)) ||
+      (isSystemTimeoutCompletionBatch(batch) &&
+        (first.envelope.grant.sessionId !== SYSTEM_TIMEOUT_COMPLETION_GRANT.sessionId ||
+          first.envelope.grant.versionId !== SYSTEM_TIMEOUT_COMPLETION_GRANT.versionId))
     )
       return { authorized: false, root: null, trustedLockedReplay: false, actions: [] };
     if (
-      batch.actions.some(
-        ({ envelope }) =>
-          envelope.grant.sessionId !== authorization.grantSessionId ||
-          envelope.grant.versionId !== authorization.grantVersion,
+      batch.actions.some(({ envelope }) =>
+        isSystemTimeoutCompletionBatch(batch)
+          ? envelope.grant.sessionId !== SYSTEM_TIMEOUT_COMPLETION_GRANT.sessionId ||
+            envelope.grant.versionId !== SYSTEM_TIMEOUT_COMPLETION_GRANT.versionId
+          : envelope.grant.sessionId !== authorization.grantSessionId ||
+            envelope.grant.versionId !== authorization.grantVersion,
       )
     )
       return { authorized: false, root: null, trustedLockedReplay: false, actions: [] };
@@ -671,8 +683,12 @@ export function createFoundationAcceptance(
       authorization.status !== "authorized" ||
       authorization.grantType !== "control" ||
       authorization.eventGameId !== batch.input.eventGameId ||
-      authorization.grantSessionId !== structural.envelope.grant.sessionId ||
-      authorization.grantVersion !== structural.envelope.grant.versionId
+      (!isSystemTimeoutCompletionBatch(batch) &&
+        (authorization.grantSessionId !== structural.envelope.grant.sessionId ||
+          authorization.grantVersion !== structural.envelope.grant.versionId)) ||
+      (isSystemTimeoutCompletionBatch(batch) &&
+        (structural.envelope.grant.sessionId !== SYSTEM_TIMEOUT_COMPLETION_GRANT.sessionId ||
+          structural.envelope.grant.versionId !== SYSTEM_TIMEOUT_COMPLETION_GRANT.versionId))
     )
       return authorityFailure();
     const root = transaction.findRootByRecordId(batch.input.recordId);
@@ -750,8 +766,12 @@ export function createFoundationAcceptance(
       currentAuthorization.status !== "authorized" ||
       currentAuthorization.grantType !== "control" ||
       currentAuthorization.eventGameId !== batch.input.eventGameId ||
-      currentAuthorization.grantSessionId !== structural.envelope.grant.sessionId ||
-      currentAuthorization.grantVersion !== structural.envelope.grant.versionId
+      (!isSystemTimeoutCompletionBatch(batch) &&
+        (currentAuthorization.grantSessionId !== structural.envelope.grant.sessionId ||
+          currentAuthorization.grantVersion !== structural.envelope.grant.versionId)) ||
+      (isSystemTimeoutCompletionBatch(batch) &&
+        (structural.envelope.grant.sessionId !== SYSTEM_TIMEOUT_COMPLETION_GRANT.sessionId ||
+          structural.envelope.grant.versionId !== SYSTEM_TIMEOUT_COMPLETION_GRANT.versionId))
     )
       return authorityFailure();
     const grant = transaction.findGrantById(currentAuthorization.grantId);
@@ -981,6 +1001,7 @@ export function createFoundationAcceptance(
         existing.action,
         batch.input.lifecycleTransition,
         batch.input.reconcileDerivedLifecycle === true,
+        batch.input.systemOperation,
       );
     if (existing !== null)
       return writeOutcome(
@@ -1070,6 +1091,7 @@ export function createFoundationAcceptance(
       replayState,
       batch.input.lifecycleTransition,
       batch.input.reconcileDerivedLifecycle === true,
+      batch.input.systemOperation,
     );
   }
 
@@ -1084,6 +1106,7 @@ export function createFoundationAcceptance(
     reservation: StoredReplayReservation | undefined,
     lifecycleTransition: EventGameRecordRoot["lifecycle"] | undefined,
     reconcileDerivedLifecycle: boolean,
+    systemOperation?: ControlActionBatchInput["systemOperation"],
   ): OneOutcome {
     const acceptanceId = `accept-${sha256(`${root.recordId}:${action.operationId}:${action.grant.sessionId}`)}`;
     const grantAudit = linkedGrantAudit(
@@ -1098,6 +1121,7 @@ export function createFoundationAcceptance(
       action.acceptedAtMs,
       null,
       ACCEPTED_AUDIT_DETAIL,
+      systemOperation,
     );
     controlAudit.links = {
       ...controlAudit.links!,
@@ -1252,6 +1276,7 @@ export function createFoundationAcceptance(
     existing: ControlAction,
     lifecycleTransition: EventGameRecordRoot["lifecycle"] | undefined,
     reconcileDerivedLifecycle: boolean,
+    systemOperation?: ControlActionBatchInput["systemOperation"],
   ): OneOutcome {
     const nowMs = readNow(clock);
     const controlAudit = createControlAudit(
@@ -1278,6 +1303,7 @@ export function createFoundationAcceptance(
       nowMs,
       null,
       "The Control Action was already committed.",
+      systemOperation,
     );
     controlAudit.links = {
       ...controlAudit.links!,
@@ -1658,6 +1684,9 @@ export function createFoundationAcceptance(
         lifecycleTransition: isRecord(raw.lifecycleTransition)
           ? (structuredClone(raw.lifecycleTransition) as EventGameRecordRoot["lifecycle"])
           : undefined,
+        ...(raw.systemOperation === "timeout-completion"
+          ? { systemOperation: raw.systemOperation }
+          : {}),
       },
       actions,
       order,
@@ -2082,6 +2111,7 @@ function linkedGrantAudit(
   createdAtMs: number,
   reason: FoundationRejectionReason | null,
   detail: string | null = null,
+  systemOperation?: ControlActionBatchInput["systemOperation"],
 ) {
   const action =
     outcome === "accepted"
@@ -2099,13 +2129,15 @@ function linkedGrantAudit(
       auditInput(
         action,
         grant,
-        {
-          kind: "session",
-          sessionId: session.sessionId,
-          pseudonymKeyVersion: session.browserContextKeyVersion,
-        },
+        systemOperation === "timeout-completion"
+          ? { kind: "system", value: "timeout-completion" as const }
+          : {
+              kind: "session",
+              sessionId: session.sessionId,
+              pseudonymKeyVersion: session.browserContextKeyVersion,
+            },
         grant.status,
-        session.sessionId,
+        systemOperation === "timeout-completion" ? null : session.sessionId,
         null,
         session.eventGameId,
         grant.status,
@@ -2124,6 +2156,9 @@ function linkedGrantAudit(
       status: outcome,
       reason,
       detail: detail ?? "",
+      ...(systemOperation === "timeout-completion"
+        ? { provenance: "system-timeout-completion" }
+        : {}),
     }),
     createdAtMs,
   };
