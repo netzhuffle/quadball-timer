@@ -12,7 +12,9 @@ import {
   createLiveEventGameControl,
   createLiveEventGameIqaInterpreter,
   LIVE_EVENT_CONTROL_INTENT_VERSION,
+  LIVE_SUSPENSION_SNAPSHOT_VERSION,
   parseLiveEventControllerIntent,
+  suspensionPenaltyStateFromProjection,
   type LiveEventControllerIntent,
   validateLiveEventGameActionInTransaction,
 } from "@/lib/live-event-game-control";
@@ -2980,7 +2982,7 @@ describe("Live Event Game control", () => {
   });
 
   test("rebuilds penalty, timeout, stoppage, heat, and result state through Corrections", async () => {
-    const harness = await createHarness();
+    const harness = await createHarness({ knownDodgeballIds: ["ball-1"] });
     const opened = await harness.control.openController({
       qrCredential: harness.qrCredential,
       browserContext: "dependent-state-corrections",
@@ -2995,11 +2997,36 @@ describe("Live Event Game control", () => {
       });
     await submit(clockIntent("dependent-clock-start", true));
     harness.setNow(11_000);
-    await submit(substantiveIntent("card-state", "card"));
+    await submit(
+      cardIntent({ operationId: "card-state", factId: "fact-card-state", gameTimeMs: 0 }),
+    );
     harness.setNow(12_000);
-    await submit(clockIntent("dependent-clock-pause", false));
-    await submit(substantiveIntent("timeout-state", "timeout"));
-    await submit(substantiveIntent("suspension-state", "suspension"));
+    const pausedState = await submit(clockIntent("dependent-clock-pause", false));
+    if (pausedState.status !== "accepted" || pausedState.projection === null) {
+      throw new Error("Expected the paused projection.");
+    }
+    await submit({
+      ...substantiveIntent("timeout-stoppage-state", "timeout"),
+      timeoutAction: "stoppage",
+      timeoutGameSideId: "side-a",
+    });
+    await submit({
+      ...substantiveIntent("timeout-state", "timeout"),
+      timeoutAction: "start",
+      timeoutGameSideId: "side-a",
+    });
+    await submit({
+      ...substantiveIntent("suspension-state", "suspension"),
+      suspensionAction: "start",
+      suspensionSnapshot: {
+        version: LIVE_SUSPENSION_SNAPSHOT_VERSION,
+        gameTimeMs: pausedState.projection.clock.gameTimeMs,
+        scoreByGameSide: pausedState.projection.scoreByGameSide,
+        penalties: suspensionPenaltyStateFromProjection(pausedState.projection.penalties!),
+        volleyballPossession: "side-a",
+        dodgeballPossession: { "ball-1": "side-a" },
+      },
+    });
     await submit({
       ...substantiveIntent("heat-state", "heat-stoppage"),
       heatAction: "start",
@@ -3022,7 +3049,7 @@ describe("Live Event Game control", () => {
     if (finished.status !== "authorized" || finished.projection === null) {
       throw new Error("Expected the finished Controller projection.");
     }
-    expect(finished.projection.clock.activePenaltyTimeMs).toBe(1_000);
+    expect(finished.projection.clock.activePenaltyTimeMs).toBe(0);
 
     await submit(
       correctionIntent("correct-card-state", "correction-card-state", false, "fact-card-state"),
@@ -3033,6 +3060,14 @@ describe("Live Event Game control", () => {
         "correction-timeout-state",
         false,
         "fact-timeout-state",
+      ),
+    );
+    await submit(
+      correctionIntent(
+        "correct-timeout-stoppage-state",
+        "correction-timeout-stoppage-state",
+        false,
+        "fact-timeout-stoppage-state",
       ),
     );
     await submit(
@@ -3133,7 +3168,7 @@ describe("Live Event Game control", () => {
           gameTimeMs: 15_000,
           reason: "head-referee-direction",
           beforeValue: { running: true },
-          afterValue: { timeout: "started" },
+          afterValue: { timeout: "stoppage" },
         },
       },
     });
@@ -3145,7 +3180,7 @@ describe("Live Event Game control", () => {
       authorityReference: "head-referee",
       reason: "head-referee-direction",
       beforeValue: { running: true },
-      afterValue: { timeout: "started" },
+      afterValue: { timeout: "stoppage" },
     });
     expect(acceptedAction?.grant.sessionId).toBe(opened.session.grantSessionId);
 
@@ -3162,7 +3197,7 @@ describe("Live Event Game control", () => {
           gameTimeMs: 0,
           reason: "head-referee-direction",
           beforeValue: { running: false },
-          afterValue: { timeout: "started" },
+          afterValue: { timeout: "stoppage" },
         },
       },
     });
@@ -3480,7 +3515,9 @@ describe("Live Event Game control", () => {
   test.each(["card", "timeout", "suspension", "result"] as const)(
     "commences irreversibly on the first %s trigger",
     async (trigger) => {
-      const harness = await createHarness();
+      const harness = await createHarness(
+        trigger === "suspension" ? { knownDodgeballIds: ["ball-1"] } : {},
+      );
       const opened = await harness.control.openController({
         qrCredential: harness.qrCredential,
         browserContext: `trigger-${trigger}`,
@@ -3491,6 +3528,8 @@ describe("Live Event Game control", () => {
         eventGameId: harness.root.eventGameId,
         intent: substantiveIntent(`trigger-${trigger}`, trigger),
       });
+      if (result.status !== "accepted")
+        throw new Error(`trigger rejected: ${JSON.stringify(result)}`);
       expect(result.status).toBe("accepted");
       expect((await harness.record.readRoot(harness.root.recordId))?.lifecycle.commencedAtMs).toBe(
         10_000,
@@ -5392,6 +5431,7 @@ async function createHarness(
     projectionFailure?: () => boolean;
     scopeStatus?: "empty" | "conflict";
     controlClock?: () => number;
+    knownDodgeballIds?: readonly string[];
     sessionResolution?: ControlGrantSessionResolution;
     acceptanceLimits?: AcceptanceLimits;
   } = {},
@@ -5461,6 +5501,7 @@ async function createHarness(
         transaction.listActions(root.recordId),
         root,
         action,
+        overrides.knownDodgeballIds ?? null,
       ),
     limits: overrides.acceptanceLimits,
   });
@@ -5475,6 +5516,8 @@ async function createHarness(
     grantAuthority: authority,
     clock: overrides.controlClock ?? (() => grantOptions.clock.nowMs()),
     listEventGameRoots: async () => [root, reassignedRoot],
+    knownDodgeballIdsForEventGame:
+      overrides.knownDodgeballIds === undefined ? undefined : () => overrides.knownDodgeballIds!,
     projectionFailure: overrides.projectionFailure,
   });
   triggerLifecycleChange = () => {
@@ -5745,6 +5788,22 @@ function substantiveIntent(
     operationId,
     factId: `fact-${operationId}`,
     gameTimeMs,
+    ...(trigger === "timeout"
+      ? { timeoutAction: "stoppage" as const, timeoutGameSideId: "side-a" }
+      : {}),
+    ...(trigger === "suspension"
+      ? {
+          suspensionAction: "start" as const,
+          suspensionSnapshot: {
+            version: LIVE_SUSPENSION_SNAPSHOT_VERSION,
+            gameTimeMs,
+            scoreByGameSide: { "side-a": 0, "side-b": 0 },
+            penalties: { segments: [] },
+            volleyballPossession: "side-a",
+            dodgeballPossession: { "ball-1": "side-a" },
+          },
+        }
+      : {}),
     occurrence: { clientOriginAtMs: null },
   };
 }

@@ -36,6 +36,7 @@ export async function openLiveEventGameRuntime(input: {
   environmentId: string;
   keyRing: GrantKeyRing;
   clock?: () => number;
+  knownDodgeballIdsForEventGame?: (eventGameId: string) => readonly string[] | undefined;
 }): Promise<LiveEventGameRuntime> {
   const readiness = await readSqliteFoundationStorageReadiness(input.databasePath, {
     grantKeyRing: input.keyRing,
@@ -122,6 +123,7 @@ export async function openLiveEventGameRuntime(input: {
           transaction.listActions(root.recordId),
           root,
           action,
+          input.knownDodgeballIdsForEventGame?.(root.eventGameId) ?? null,
         ),
     });
     const hasLifecycleInventory = await storage.transaction(
@@ -186,6 +188,7 @@ export async function openLiveEventGameRuntime(input: {
           eventGameId,
           lockedAtMs,
         }),
+      knownDodgeballIdsForEventGame: input.knownDodgeballIdsForEventGame,
     });
     const lockTimer = setInterval(() => {
       void control.reconcileEventGameLocks();
@@ -280,6 +283,34 @@ function createGrantOptions(
     };
   }
   return options;
+}
+
+export function readLiveEventDodgeballIdsByEventGame(
+  environmentVariables: Record<string, string | undefined> = process.env,
+): ((eventGameId: string) => readonly string[] | undefined) | undefined {
+  const configured = environmentVariables.EVENT_GAME_DODGEBALL_IDS_BY_EVENT_GAME?.trim();
+  if (configured === undefined || configured === "") return undefined;
+  try {
+    const parsed: unknown = JSON.parse(configured);
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+    const entries = Object.entries(parsed);
+    const map = new Map<string, readonly string[]>();
+    for (const [eventGameId, value] of entries) {
+      if (
+        !Array.isArray(value) ||
+        value.length === 0 ||
+        value.some((ballId) => typeof ballId !== "string" || ballId.trim() === "")
+      )
+        return undefined;
+      map.set(
+        eventGameId,
+        [...new Set(value)].sort((left, right) => left.localeCompare(right)),
+      );
+    }
+    return (eventGameId) => map.get(eventGameId);
+  } catch {
+    return undefined;
+  }
 }
 
 export function createControlScopeResolver(

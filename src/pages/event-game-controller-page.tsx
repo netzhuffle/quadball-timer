@@ -18,6 +18,8 @@ import type { OfficialOverrideMetadata } from "@/lib/event-game-actions";
 import {
   CLOSE_PLAY_ADJUDICATION_WINDOW_MS,
   LIVE_EVENT_CONTROL_INTENT_VERSION,
+  LIVE_SUSPENSION_SNAPSHOT_VERSION,
+  suspensionPenaltyStateFromProjection,
 } from "@/lib/live-event-game-control";
 import {
   deriveLivePenaltyProjection,
@@ -77,6 +79,8 @@ type ReplayRequest = { state: ControllerReplicaState; authority: ReplayAuthority
 
 type ActiveReplay = ReplayRequest & { requestToken: symbol };
 
+type PossessionSelection = Record<string, string | null>;
+
 type PendingClosePlayAdjudication = {
   intentType: "record-goal" | "record-flag-catch";
   gameSideId: string;
@@ -135,6 +139,9 @@ export function EventGameControllerPage() {
   const [skippedPenaltyReasonCardIds, setSkippedPenaltyReasonCardIds] = useState<
     ReadonlySet<string>
   >(() => new Set());
+  const [volleyballPossession, setVolleyballPossession] = useState("");
+  const [dodgeballPossession, setDodgeballPossession] = useState<PossessionSelection>({});
+  const [showSuspensionRecovery, setShowSuspensionRecovery] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [pendingClosePlayAdjudication, setPendingClosePlayAdjudication] =
@@ -752,9 +759,42 @@ export function EventGameControllerPage() {
     });
   }
 
-  function trigger(type: "card" | "timeout" | "suspension" | "result") {
+  function trigger(
+    type: "card" | "timeout" | "suspension" | "result",
+    options: {
+      timeoutAction?: "stoppage" | "start" | "complete";
+      timeoutGameSideId?: string;
+      suspensionAction?: "start" | "resume";
+      resumesSuspensionFactId?: string;
+    } = {},
+  ) {
     const gameTimeMs = currentSportingTimeMs();
     if (gameTimeMs === null) return;
+    if (type === "suspension" && options.suspensionAction !== "resume") {
+      if (projection === null || projection.penalties === undefined) {
+        setMessage("A current authoritative projection is required before suspending.");
+        return;
+      }
+      if (volleyballPossession === "") {
+        setMessage("Confirm volleyball possession before suspending.");
+        return;
+      }
+      if ((projection.knownDodgeballIds ?? []).some((ballId) => !(ballId in dodgeballPossession))) {
+        setMessage("Confirm every known dodgeball possession before suspending.");
+        return;
+      }
+    }
+    const suspensionSnapshot =
+      type === "suspension" && options.suspensionAction !== "resume" && projection !== null
+        ? {
+            version: LIVE_SUSPENSION_SNAPSHOT_VERSION,
+            gameTimeMs,
+            scoreByGameSide: projection.scoreByGameSide,
+            penalties: suspensionPenaltyStateFromProjection(projection.penalties!),
+            volleyballPossession,
+            dodgeballPossession,
+          }
+        : undefined;
     queueIntent({
       version: LIVE_EVENT_CONTROL_INTENT_VERSION,
       type: "substantive",
@@ -764,6 +804,8 @@ export function EventGameControllerPage() {
       gameTimeMs,
       sportingOrder: gameTimeMs,
       occurrence: { clientOriginAtMs: Date.now() },
+      ...options,
+      ...(suspensionSnapshot === undefined ? {} : { suspensionSnapshot }),
     });
   }
 
@@ -1207,7 +1249,7 @@ export function EventGameControllerPage() {
   }
 
   return (
-    <main className="mx-auto w-full max-w-xl p-4 pb-12 sm:p-6">
+    <main className="mx-auto max-h-[calc(100vh-1rem)] w-full max-w-xl overflow-y-auto p-4 pb-12 sm:max-h-none sm:overflow-visible sm:p-6">
       <Card>
         <CardHeader>
           <CardTitle>Event Game Controller</CardTitle>
@@ -1262,7 +1304,7 @@ export function EventGameControllerPage() {
                   <p className="mt-1 text-muted-foreground">Projection temporarily unavailable.</p>
                 ) : null}
               </div>
-              <div className="flex flex-wrap gap-2">
+              <div className="flex flex-wrap gap-2 max-[639px]:hidden">
                 <Button variant="outline" onClick={() => void revealQr()} disabled={busy}>
                   Reveal active Grant QR
                 </Button>
@@ -1312,7 +1354,7 @@ export function EventGameControllerPage() {
                 </p>
               </div>
               {clockProjection === null ? null : (
-                <div className="space-y-1 rounded-lg border border-amber-500/50 bg-amber-50 p-3 text-sm text-amber-950">
+                <div className="space-y-1 rounded-lg border border-amber-500/50 bg-amber-50 p-3 text-sm text-amber-950 max-[639px]:hidden">
                   <p data-clock-cue="flag-runner">
                     {clockProjection.cues.flagRunnerEntry === "pending"
                       ? "Flag-runner entry pending at 19:00"
@@ -1354,7 +1396,7 @@ export function EventGameControllerPage() {
                     {Math.abs(adjustmentMs) / 1000}s
                   </Button>
                 ))}
-                <div className="flex w-full flex-wrap items-end gap-2 rounded border p-2 text-left">
+                <div className="flex w-full flex-wrap items-end gap-2 rounded border p-2 text-left max-[639px]:hidden">
                   <div className="min-w-48 flex-1 space-y-1">
                     <Label htmlFor="clock-correction">Set game clock (milliseconds)</Label>
                     <Input
@@ -1375,7 +1417,7 @@ export function EventGameControllerPage() {
                     Correct clock
                   </Button>
                 </div>
-                <div className="flex w-full flex-wrap items-end gap-2 rounded border border-amber-500/50 p-2 text-left">
+                <div className="flex w-full flex-wrap items-end gap-2 rounded border border-amber-500/50 p-2 text-left max-[639px]:hidden">
                   <div className="min-w-48 flex-1 space-y-1">
                     <Label htmlFor="clock-takeover-adjustment">
                       Emergency takeover adjustment (ms)
@@ -1398,7 +1440,7 @@ export function EventGameControllerPage() {
                     Emergency clock takeover
                   </Button>
                 </div>
-                <div className="flex w-full flex-wrap items-end gap-2 rounded border p-2 text-left">
+                <div className="flex w-full flex-wrap items-end gap-2 rounded border p-2 text-left max-[639px]:hidden">
                   <div className="min-w-32 flex-1 space-y-1">
                     <Label htmlFor="penalty-game-side">Penalized Game Side</Label>
                     <select
@@ -1478,18 +1520,145 @@ export function EventGameControllerPage() {
                     Penalized player is the seeker (Head Referee confirmed)
                   </label>
                 </div>
-                <Button variant="outline" onClick={() => trigger("timeout")} disabled={busy}>
-                  Start timeout
+                {projection === null
+                  ? null
+                  : Object.keys(projection.scoreByGameSide).map((gameSideId) => {
+                      const timeout = projection.timeout;
+                      const isStoppageForSide =
+                        timeout?.status === "stoppage" && timeout.gameSideId === gameSideId;
+                      const used = timeout?.usedGameSideIds?.includes(gameSideId) === true;
+                      const anotherSideActive =
+                        (timeout?.status === "stoppage" || timeout?.status === "started") &&
+                        timeout.gameSideId !== gameSideId;
+                      return (
+                        <Button
+                          key={gameSideId}
+                          variant="outline"
+                          onClick={() =>
+                            trigger("timeout", {
+                              timeoutAction: isStoppageForSide ? "start" : "stoppage",
+                              timeoutGameSideId: gameSideId,
+                            })
+                          }
+                          disabled={busy || anotherSideActive || (used && !isStoppageForSide)}
+                        >
+                          {isStoppageForSide
+                            ? `Start timeout minute: ${gameSideId}`
+                            : used
+                              ? `Timeout used: ${gameSideId}`
+                              : `Timeout stoppage: ${gameSideId}`}
+                        </Button>
+                      );
+                    })}
+                <Button
+                  variant="outline"
+                  onClick={() => setShowSuspensionRecovery(true)}
+                  disabled={busy}
+                >
+                  Review suspension recovery
                 </Button>
-                <Button variant="outline" onClick={() => trigger("suspension")} disabled={busy}>
-                  Suspend game
-                </Button>
+                {showSuspensionRecovery || projection?.suspension?.status === "suspended" ? (
+                  <div className="w-full space-y-2 rounded-lg border p-3 text-left">
+                    <p className="text-sm font-medium">Suspension recovery review</p>
+                    <p className="text-xs text-muted-foreground">
+                      Verify the effective snapshot with another Controller before resuming.
+                    </p>
+                    {projection?.suspension?.snapshot === null ||
+                    projection?.suspension?.snapshot === undefined ? (
+                      <div className="grid gap-2 sm:grid-cols-2">
+                        <div className="space-y-1">
+                          <Label htmlFor="volleyball-possession">Volleyball possession</Label>
+                          <select
+                            id="volleyball-possession"
+                            className="h-9 w-full rounded-md border bg-background px-3 text-sm"
+                            value={volleyballPossession}
+                            onChange={(event) => setVolleyballPossession(event.target.value)}
+                            disabled={busy}
+                          >
+                            <option value="">Select Game Side</option>
+                            {Object.keys(projection?.scoreByGameSide ?? {}).map((sideId) => (
+                              <option key={sideId} value={sideId}>
+                                {sideId}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+                        <div className="space-y-1">
+                          <p className="text-sm font-medium">Dodgeball possession</p>
+                          {(projection?.knownDodgeballIds ?? []).map((ballId) => (
+                            <div key={ballId} className="space-y-1">
+                              <Label htmlFor={`dodgeball-possession-${ballId}`}>{ballId}</Label>
+                              <select
+                                id={`dodgeball-possession-${ballId}`}
+                                className="h-9 w-full rounded-md border bg-background px-3 text-sm"
+                                value={dodgeballPossession[ballId] ?? ""}
+                                onChange={(event) =>
+                                  setDodgeballPossession((current) => ({
+                                    ...current,
+                                    [ballId]: event.target.value || null,
+                                  }))
+                                }
+                                disabled={busy}
+                              >
+                                <option value="">No confirmed side</option>
+                                {Object.keys(projection?.scoreByGameSide ?? {}).map((sideId) => (
+                                  <option key={sideId} value={sideId}>
+                                    {sideId}
+                                  </option>
+                                ))}
+                              </select>
+                            </div>
+                          ))}
+                        </div>
+                        <Button
+                          variant="outline"
+                          onClick={() => trigger("suspension", { suspensionAction: "start" })}
+                          disabled={busy}
+                        >
+                          Suspend with verified snapshot
+                        </Button>
+                      </div>
+                    ) : (
+                      <div className="space-y-2">
+                        <div
+                          data-suspension-snapshot="effective"
+                          className="rounded-md bg-muted p-2 text-xs"
+                        >
+                          <p>Volleyball: {projection.suspension.snapshot.volleyballPossession}</p>
+                          {Object.entries(projection.suspension.snapshot.dodgeballPossession).map(
+                            ([ballId, gameSideId]) => (
+                              <p key={ballId} data-dodgeball-id={ballId}>
+                                {ballId}={gameSideId ?? "unconfirmed"}
+                              </p>
+                            ),
+                          )}
+                          <p>
+                            Penalty segments:{" "}
+                            {projection.suspension.snapshot.penalties.segments.length}
+                          </p>
+                        </div>
+                        <Button
+                          variant="outline"
+                          onClick={() =>
+                            trigger("suspension", {
+                              suspensionAction: "resume",
+                              resumesSuspensionFactId: projection.suspension?.factId ?? undefined,
+                            })
+                          }
+                          disabled={busy || projection.suspension?.factId === null}
+                        >
+                          Resume verified suspension
+                        </Button>
+                      </div>
+                    )}
+                  </div>
+                ) : null}
                 <Button variant="outline" onClick={() => trigger("result")} disabled={busy}>
                   Record result
                 </Button>
               </div>
               {projection === null ? null : (
-                <div className="space-y-3">
+                <div className="space-y-3 max-[639px]:hidden">
                   <p className="text-sm text-muted-foreground">
                     Phase: {projection.phase} · Goals: {projection.goalCount}
                     {projection.overtime ? " · Overtime" : ""}

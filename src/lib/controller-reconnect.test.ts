@@ -13,7 +13,10 @@ import {
   serializeControllerReplica,
   type ControllerReplicaStorage,
 } from "@/lib/controller-reconnect";
-import { LIVE_EVENT_CONTROL_INTENT_VERSION } from "@/lib/live-event-game-control";
+import {
+  LIVE_EVENT_CONTROL_INTENT_VERSION,
+  LIVE_SUSPENSION_SNAPSHOT_VERSION,
+} from "@/lib/live-event-game-control";
 import { createInitialClockBaseline, projectClockBaseline } from "@/lib/clock-authority";
 
 describe("Controller reconnect replica", () => {
@@ -709,6 +712,22 @@ function substantive(
     factId: `fact-${operationId}`,
     gameTimeMs: 0,
     ...(gameSideId === undefined ? {} : { gameSideId }),
+    ...(trigger === "timeout"
+      ? { timeoutAction: "stoppage" as const, timeoutGameSideId: "side-a" }
+      : {}),
+    ...(trigger === "suspension"
+      ? {
+          suspensionAction: "start" as const,
+          suspensionSnapshot: {
+            version: LIVE_SUSPENSION_SNAPSHOT_VERSION,
+            gameTimeMs: 0,
+            scoreByGameSide: { "side-a": 0, "side-b": 0 },
+            penalties: { segments: [] },
+            volleyballPossession: "side-a",
+            dodgeballPossession: { "ball-1": "side-a" },
+          },
+        }
+      : {}),
     occurrence: { clientOriginAtMs: 0, source: "offline" as const },
   };
 }

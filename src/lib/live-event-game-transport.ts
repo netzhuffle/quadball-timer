@@ -29,6 +29,7 @@ export type LiveEventGameControlTransportTarget = {
   refreshController(input: {
     sessionBearer: string;
     eventGameId: string;
+    deferTimeoutMaterialization?: boolean;
   }): Promise<ControllerRefreshResult>;
   switchController(input: { sessionBearer: string }): Promise<ControllerRefreshResult>;
   stayController(input: {
@@ -168,6 +169,7 @@ export function createLiveEventGameControlTransport(
       const result = await control.refreshController({
         sessionBearer: input.sessionBearer,
         eventGameId: input.eventGameId,
+        deferTimeoutMaterialization: input.deferTimeoutMaterialization,
       });
       return noStoreJson(result, controllerResultStatus(result));
     },
@@ -221,12 +223,22 @@ export function createLiveEventGameControlTransport(
 async function readSessionInput(
   request: Request,
   isAllowedRequest: (request: Request) => boolean,
-): Promise<{ sessionBearer: string; eventGameId?: string } | null> {
+): Promise<{
+  sessionBearer: string;
+  eventGameId?: string;
+  deferTimeoutMaterialization?: boolean;
+} | null> {
   if (!isAllowedRequest(request)) return null;
   const body = await readJsonBodyWithinLimit(request, SHARED_LIMITS.transport.httpJsonBodyBytes);
   if (!body.ok || !isRecord(body.body) || typeof body.body.sessionBearer !== "string") return null;
   if (typeof body.body.eventGameId === "string") {
-    return { sessionBearer: body.body.sessionBearer, eventGameId: body.body.eventGameId };
+    return {
+      sessionBearer: body.body.sessionBearer,
+      eventGameId: body.body.eventGameId,
+      ...(body.body.deferTimeoutMaterialization === true
+        ? { deferTimeoutMaterialization: true }
+        : {}),
+    };
   }
   return { sessionBearer: body.body.sessionBearer };
 }
