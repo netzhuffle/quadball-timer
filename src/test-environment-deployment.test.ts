@@ -146,7 +146,9 @@ describe("Test Environment deployment contract", () => {
     expect(provisioning).toContain(
       "/releases/$release_id/deploy/systemd/quadball-timer-test.service",
     );
-    expect(provisioning).toContain("NOPASSWD: /usr/bin/systemctl restart quadball-timer-test");
+    expect(provisioning).toContain(
+      "NOPASSWD: /usr/bin/systemctl stop quadball-timer-test, /usr/bin/systemctl restart quadball-timer-test",
+    );
     expect(provisioning).not.toContain("NOPASSWD: /bin/systemctl");
     expect(provisioning).toContain("Test Grant Key Ring Recovery");
     expect(provisioning).toContain("test-grant-key-ring.json");

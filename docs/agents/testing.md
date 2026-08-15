@@ -30,6 +30,10 @@ The reference environment for timing review is the supported Bun version from `p
 
 The fixed-seed 1,000-sequence Event Game correction test remains a Fast Test: it uses the in-memory adapter, injected clocks, and deterministic action fixtures. After splitting the correction tests, the generated file measured 2.54 seconds on Darwin arm64 with Bun 1.3.14, narrowly over the two-second per-file review target while remaining within the ten-second ordinary-suite target. The test retains the required 1,000 sequences and is not weakened; revisit the implementation if the file grows materially or the ordinary suite approaches the ten-second target.
 
+### Issue #165 production activation matrix
+
+The fixed eleven-phase Production activation matrix remains a Fast Test: it uses deterministic injected process, filesystem, service, and maintenance-CLI seams while exercising the shipped orchestration. Review and handoff measurements on Darwin arm64 with Bun 1.3.14 ranged from 1.91 to 2.54 seconds for the file; the same worktree’s full suite measured 21.11 seconds, recorded as local baseline/context rather than a new regression baseline. Revisit if the matrix exceeds 3 seconds in three consecutive native runs or the ordinary-suite baseline changes materially.
+
 ## Ordinary execution boundary
 
 The ordinary boundary is:

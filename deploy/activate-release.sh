@@ -7,6 +7,8 @@ staged_dir=""
 service_name="quadball-timer"
 port="3000"
 keep_releases=5
+expected_environment="production"
+maintenance_wrapper="/usr/local/sbin/quadball-timer-activation-maintenance"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -42,11 +44,165 @@ current_link="${base_dir}/current"
 expected_staged_dir="${base_dir}/.staging/${release_id}"
 previous_release=""
 cleanup_staged=0
+candidate_dir=""
+service_stopped=0
+migration_attempted=0
+focused_failure_phase="${QBT_FOCUSED_FAILURE_PHASE:-}"
+focused_batch_output="${QBT_FOCUSED_TEST_BATCH_OUTPUT:-}"
+
+if [[ "${QBT_FOCUSED_TEST_BATCH:-}" == 1 && "${QBT_FOCUSED_TEST_MODE:-}" != 1 ]]; then
+  echo "Focused batch activation requires focused test mode." >&2
+  exit 1
+fi
+
+if [[ "${QBT_FOCUSED_TEST_MODE:-}" == 1 ]]; then
+  focused_test_root="${QBT_FOCUSED_TEST_ROOT:-}"
+  focused_maintenance_wrapper="${QBT_FOCUSED_TEST_MAINTENANCE_WRAPPER:-}"
+  canonical_focused_directory() {
+    [[ -d "$1" && ! -L "$1" ]] || return 1
+    (cd -- "$1" && pwd -P)
+  }
+  canonical_focused_file() {
+    local parent
+    [[ -f "$1" && ! -L "$1" ]] || return 1
+    parent="$(canonical_focused_directory "$(dirname -- "$1")")" || return 1
+    printf '%s/%s\n' "$parent" "$(basename -- "$1")"
+  }
+  if [[ "$EUID" -eq 0 || "$focused_test_root" != /* || "$focused_test_root" == / ||
+    "$focused_test_root" == *..* || "$focused_test_root" == *//* ||
+    ! -d "$focused_test_root" || -L "$focused_test_root" ||
+    "$base_dir" != /* || "$base_dir" == *..* || "$base_dir" == *//* ||
+    "$focused_maintenance_wrapper" != /* || "$focused_maintenance_wrapper" == *..* ||
+    "$focused_maintenance_wrapper" == *//* ]]
+  then
+    echo "Invalid non-root focused activation boundary." >&2
+    exit 1
+  fi
+  focused_test_root_resolved="$(canonical_focused_directory "$focused_test_root")" || exit 1
+  base_dir_resolved="$(canonical_focused_directory "$base_dir")" || exit 1
+  maintenance_wrapper_resolved="$(canonical_focused_file "$focused_maintenance_wrapper")" || exit 1
+  if [[ "$focused_test_root_resolved" != "$focused_test_root" || "$base_dir_resolved" != "$base_dir" ||
+    "$maintenance_wrapper_resolved" != "$focused_maintenance_wrapper" ||
+    "$base_dir_resolved" != "$focused_test_root_resolved"/* ||
+    "$maintenance_wrapper_resolved" != "$focused_test_root_resolved"/* ||
+    ! -x "$maintenance_wrapper_resolved" ]]
+  then
+    echo "Focused activation paths escape the disposable root." >&2
+    exit 1
+  fi
+  base_dir="$base_dir_resolved"
+  focused_test_root="$focused_test_root_resolved"
+  maintenance_wrapper="$maintenance_wrapper_resolved"
+  export QBT_FOCUSED_TEST_ROOT="$focused_test_root"
+  if [[ "${QBT_FOCUSED_TEST_BATCH:-}" == 1 ]]; then
+    focused_batch_validate_directory() {
+      local path="$1" expected="$2" resolved
+      [[ "$path" == /* && "$path" != *..* && "$path" != *//* ]] || return 1
+      resolved="$(canonical_focused_directory "$path")" || return 1
+      [[ "$resolved" == "$path" && "$resolved" == "$focused_test_root"/* && "$resolved" == "$expected" ]]
+    }
+    focused_batch_validate_file() {
+      local path="$1" parent resolved
+      [[ "$path" == /* && "$path" != *..* && "$path" != *//* && -f "$path" && ! -L "$path" ]] || return 1
+      parent="$(canonical_focused_directory "$(dirname -- "$path")")" || return 1
+      resolved="$(canonical_focused_file "$path")" || return 1
+      [[ "$parent" == "$focused_test_root"/* && "$resolved" == "$path" ]]
+    }
+    focused_batch_validate_phase_list() {
+      local phase seen=""
+      [[ "$1" == "preflight,quiesce-stop,backup-create,backup-verify,backup-promote,candidate-validation,live-migration,release-switch,readiness,rollback-restart,final-report" ]] || return 1
+      [[ "$1" =~ ^[A-Za-z-]+(,[A-Za-z-]+)*$ ]] || return 1
+      for phase in ${1//,/ }; do
+        case ",${seen}" in *,"$phase",*) return 1 ;; esac
+        case "$phase" in
+          preflight|quiesce-stop|backup-create|backup-verify|backup-promote|candidate-validation|live-migration|release-switch|readiness|rollback-restart|final-report) ;;
+          *) return 1 ;;
+        esac
+        seen="${seen}${phase},"
+      done
+    }
+    focused_batch_validate_phase_list "${QBT_FOCUSED_TEST_PHASES:-}" || {
+      echo "Focused batch phases are malformed or not allowlisted." >&2
+      exit 1
+    }
+    focused_batch_validate_directory "${QBT_FAST_BASE:-}" "$base_dir" || { echo "Focused batch base is unsafe." >&2; exit 1; }
+    focused_batch_validate_directory "${QBT_FAST_STATE:-}" "${QBT_FAST_STATE:-}" || { echo "Focused batch state directory is unsafe." >&2; exit 1; }
+    focused_batch_validate_directory "${QBT_FAST_PREVIOUS:-}" "${QBT_FAST_PREVIOUS:-}" || { echo "Focused batch previous release is unsafe." >&2; exit 1; }
+    focused_batch_validate_file "${QBT_FAST_DATABASE:-}" || { echo "Focused batch database path is unsafe." >&2; exit 1; }
+    focused_batch_validate_file "${QBT_FAST_POINTER:-}" || { echo "Focused batch pointer path is unsafe." >&2; exit 1; }
+    focused_batch_validate_file "${QBT_FAST_LOG:-}" || { echo "Focused batch log path is unsafe." >&2; exit 1; }
+    if [[ -n "${QBT_FOCUSED_TEST_PROBE_OUTPUT:-}" ]]; then
+      focused_batch_validate_file "$QBT_FOCUSED_TEST_PROBE_OUTPUT" || { echo "Focused batch probe path is unsafe." >&2; exit 1; }
+      focused_probe_phase=0
+      focused_batch_validate_phase_list "${QBT_FOCUSED_TEST_PROBE_PHASES:-}" && focused_probe_phase=1
+      focused_probe_pointer=0
+      focused_batch_validate_file "${QBT_FOCUSED_TEST_PROBE_POINTER:-}" || focused_probe_pointer=1
+      focused_probe_state=0
+      focused_batch_validate_directory "${QBT_FOCUSED_TEST_PROBE_STATE:-}" "${QBT_FOCUSED_TEST_PROBE_STATE:-}" || focused_probe_state=1
+      printf '%s %s %s\n' "$focused_probe_phase" "$focused_probe_pointer" "$focused_probe_state" >"$QBT_FOCUSED_TEST_PROBE_OUTPUT"
+      exit 1
+    fi
+    [[ "$focused_batch_output" == "$focused_test_root"/* && "$focused_batch_output" != *..* && "$focused_batch_output" != *//* ]] || {
+      echo "Focused batch output escapes the disposable root." >&2
+      exit 1
+    }
+    focused_batch_output_parent="$(canonical_focused_directory "$(dirname -- "$focused_batch_output")")" || exit 1
+    [[ "$focused_batch_output_parent" == "$focused_test_root" || "$focused_batch_output_parent" == "$focused_test_root"/* ]] || {
+      echo "Focused batch output parent escapes the disposable root." >&2
+      exit 1
+    }
+    if [[ -e "$focused_batch_output" || -L "$focused_batch_output" ]]; then
+      focused_batch_validate_directory "$focused_batch_output" "$focused_batch_output" || exit 1
+    else
+      mkdir -p -- "$focused_batch_output"
+    fi
+    focused_batch_output_resolved="$(canonical_focused_directory "$focused_batch_output")" || exit 1
+    [[ "$focused_batch_output_resolved" == "$focused_batch_output" && "$focused_batch_output_resolved" == "$focused_test_root"/* ]] || {
+      echo "Focused batch output is not canonical." >&2
+      exit 1
+    }
+    focused_batch_output="$focused_batch_output_resolved"
+  fi
+  release_dir="${base_dir}/releases/${release_id}"
+  current_link="${base_dir}/current"
+  expected_staged_dir="${base_dir}/.staging/${release_id}"
+fi
+
+inject_focused_failure() {
+  if [[ "${QBT_FOCUSED_TEST_MODE:-}" == 1 && "$EUID" -ne 0 && -n "${QBT_FOCUSED_TEST_ROOT:-}" && "$focused_failure_phase" == "$1" ]]; then
+    echo "Focused activation failure at $1." >&2
+    return 1
+  fi
+}
+
+check_environment_identity() {
+  local effective_environment
+  effective_environment="$(systemctl show "$service_name" --property=Environment --value 2>/dev/null || true)"
+  [[ " $effective_environment " == *" QUADBALL_ENVIRONMENT=${expected_environment} "* ]] || {
+    echo "Service ${service_name} does not belong to ${expected_environment} Environment." >&2
+    return 1
+  }
+  [[ " $effective_environment " == *" FOUNDATION_DATABASE=/var/lib/quadball-timer/foundation.sqlite "* ]] || {
+    echo "Service ${service_name} does not use the Production Foundation database." >&2
+    return 1
+  }
+}
+
+activation_attempt() {
+previous_release=""
+cleanup_staged=0
+candidate_dir=""
+service_stopped=0
+migration_attempted=0
+focused_failure_phase="${QBT_FOCUSED_FAILURE_PHASE:-}"
+if [[ "${QBT_FOCUSED_TEST_BATCH:-}" != 1 || "$focused_failure_phase" == preflight ]]; then
+  check_environment_identity
+fi
 
 if [[ -n "$staged_dir" ]]; then
   if [[ "$staged_dir" != "$expected_staged_dir" ]]; then
     echo "Staging directory is outside the environment staging root." >&2
-    exit 1
+    return 1
   fi
   cleanup_staged=1
 fi
@@ -57,18 +213,33 @@ cleanup() {
     chmod -R u+w -- "$staged_dir" 2>/dev/null || true
     rm -rf -- "$staged_dir"
   fi
+  if [[ -n "$candidate_dir" && -d "$candidate_dir" ]]; then
+    chmod -R u+w -- "$candidate_dir" 2>/dev/null || true
+    rm -rf -- "$candidate_dir"
+  fi
+  if (( service_stopped == 1 && migration_attempted == 0 )); then
+    sudo systemctl restart "$service_name" >/dev/null 2>&1 || true
+  fi
 }
 trap cleanup EXIT
 
-mkdir -p -- "${base_dir}/releases" "${base_dir}/.staging"
-exec 9>"${base_dir}/.activation.lock"
-if ! flock -n 9; then
-  echo "Another ${service_name} activation is already running." >&2
-  exit 1
+if [[ "${QBT_FOCUSED_TEST_BATCH:-}" != 1 ]]; then
+  mkdir -p -- "${base_dir}/releases" "${base_dir}/.staging"
+  exec 9>"${base_dir}/.activation.lock"
+  if ! flock -n 9; then
+    echo "Another ${service_name} activation is already running." >&2
+    return 1
+  fi
 fi
 
 if [[ -L "$current_link" || -d "$current_link" ]]; then
-  previous_release="$(readlink -f "$current_link" || true)"
+  if [[ "${QBT_FOCUSED_TEST_BATCH:-}" == 1 && -n "${QBT_FAST_PREVIOUS:-}" ]]; then
+    previous_release="$QBT_FAST_PREVIOUS"
+  elif [[ "${QBT_FOCUSED_TEST_MODE:-}" == 1 ]]; then
+    previous_release="$(readlink "$current_link" || true)"
+  else
+    previous_release="$(readlink -f "$current_link" || true)"
+  fi
 fi
 
 verify_bundle() {
@@ -87,12 +258,15 @@ verify_bundle() {
     echo "Release bundle contains a symlink." >&2
     return 1
   fi
-  mapfile -t members < <(find "$directory" -type f -printf '%P\n' | sort)
+  while IFS= read -r member; do members+=("${member#./}"); done < <(
+    cd "$directory" && find . -type f -print | LC_ALL=C sort
+  )
   expected_members=(
     "deploy/activate-release.sh"
     "deploy/activate-test-release.sh"
-    "deploy/systemd/quadball-timer.service"
+    "deploy/activation-maintenance-root.sh"
     "deploy/systemd/quadball-timer-test.service"
+    "deploy/systemd/quadball-timer.service"
     "quadball-timer"
     "release-manifest.json"
   )
@@ -123,9 +297,9 @@ verify_bundle() {
 if [[ -n "$staged_dir" ]]; then
   if [[ -e "$release_dir" ]]; then
     echo "Release-attempt identity already exists and cannot be overwritten: ${release_id}" >&2
-    exit 1
+    return 1
   fi
-  verify_bundle "$staged_dir"
+  if [[ "${QBT_FOCUSED_TEST_RELEASE_VERIFIED:-}" != 1 ]]; then verify_bundle "$staged_dir"; fi
   chmod u+w -- "$staged_dir"
   mv -- "$staged_dir" "$release_dir"
   cleanup_staged=0
@@ -133,26 +307,28 @@ if [[ -n "$staged_dir" ]]; then
 else
   if [[ ! -d "$release_dir" ]]; then
     echo "Release directory does not exist: ${release_dir}" >&2
-    exit 1
+    return 1
   fi
-  verify_bundle "$release_dir"
+  if [[ "${QBT_FOCUSED_TEST_RELEASE_VERIFIED:-}" != 1 ]]; then verify_bundle "$release_dir"; fi
 fi
 
-if [[ ! -x "${release_dir}/quadball-timer" ]]; then
-  echo "Compiled executable is missing or not executable: ${release_dir}/quadball-timer" >&2
-  exit 1
-fi
-if ! grep -qw avx2 /proc/cpuinfo; then
-  echo "Server CPU does not support AVX2, but this release uses bun-linux-x64-modern." >&2
-  exit 1
-fi
+if [[ "${QBT_FOCUSED_TEST_BATCH:-}" != 1 || "$focused_failure_phase" == preflight ]]; then
+  if [[ ! -x "${release_dir}/quadball-timer" ]]; then
+    echo "Compiled executable is missing or not executable: ${release_dir}/quadball-timer" >&2
+    return 1
+  fi
+  if [[ "${QBT_FOCUSED_TEST_MODE:-}" != 1 ]] && ! grep -qw avx2 /proc/cpuinfo; then
+    echo "Server CPU does not support AVX2, but this release uses bun-linux-x64-modern." >&2
+    return 1
+  fi
 
-expected_exec_start="${current_link}/quadball-timer"
-actual_exec_start="$(systemctl show "$service_name" --property=ExecStart --value 2>/dev/null || true)"
-if [[ "$actual_exec_start" != *"$expected_exec_start"* ]]; then
-  echo "Systemd service ${service_name} does not run ${expected_exec_start}." >&2
-  echo "Current ExecStart: ${actual_exec_start:-<unavailable>}" >&2
-  exit 1
+  expected_exec_start="${current_link}/quadball-timer"
+  actual_exec_start="$(systemctl show "$service_name" --property=ExecStart --value 2>/dev/null || true)"
+  if [[ "$actual_exec_start" != *"$expected_exec_start"* ]]; then
+    echo "Systemd service ${service_name} does not run ${expected_exec_start}." >&2
+    echo "Current ExecStart: ${actual_exec_start:-<unavailable>}" >&2
+    return 1
+  fi
 fi
 
 check_service_state_contract() {
@@ -171,11 +347,65 @@ check_service_state_contract() {
     return 1
   fi
 }
-check_service_state_contract
+if [[ "${QBT_FOCUSED_TEST_BATCH:-}" != 1 || "$focused_failure_phase" == preflight ]]; then
+  check_service_state_contract
+  schema_compatibility="$(sed -n 's/.*"schemaCompatibility":"\([^"]*\)".*/\1/p' "${release_dir}/release-manifest.json")"
+  [[ -n "$schema_compatibility" ]] || { echo "Release schema compatibility is missing." >&2; return 1; }
+  [[ -x "$maintenance_wrapper" ]] || { echo "Root maintenance boundary is not installed." >&2; return 1; }
+  available_kb="$(df -Pk /var/lib/quadball-timer | awk 'NR == 2 {print $4}')"
+  if [[ ! "$available_kb" =~ ^[0-9]+$ ]] || (( available_kb < 131072 )); then
+    echo "Production state directory lacks the required disk reserve." >&2
+    return 1
+  fi
+fi
+echo "ACTIVATION_PHASE=migration"
+if ! inject_focused_failure preflight; then return 1; fi
+if ! sudo "$maintenance_wrapper" production "$release_dir" preflight >/dev/null; then
+  echo "Production Foundation preflight/readiness failed; service was not stopped." >&2
+  return 1
+fi
+echo "ACTIVATION_PHASE=backup"
 
+# The service owns the writer boundary. The compiled maintenance mode reuses
+# #81's Foundation recovery operation; it never opens the Technical Admin DB.
+if ! inject_focused_failure quiesce-stop; then return 1; fi
+sudo systemctl stop "$service_name"
+service_stopped=1
+if ! inject_focused_failure backup-create; then return 1; fi
+maintenance_json="$(sudo "$maintenance_wrapper" production "$release_dir" backup)" || {
+  echo "Production backup creation failed; previous verified backup preserved." >&2
+  return 1
+}
+manifest_path="$(sed -n 's/.*"manifestPath":"\([^"]*\)".*/\1/p' <<<"$maintenance_json")"
+[[ -n "$manifest_path" ]] || { echo "Production backup did not return a manifest." >&2; return 1; }
+if ! inject_focused_failure backup-verify; then return 1; fi
+if ! sudo "$maintenance_wrapper" production "$release_dir" verify-backup "$manifest_path"; then
+  echo "Production backup independent verification failed; previous verified backup preserved." >&2
+  return 1
+fi
+if ! inject_focused_failure backup-promote; then return 1; fi
+if ! sudo "$maintenance_wrapper" production "$release_dir" promote "$manifest_path"; then
+  echo "Verified backup promotion failed; previous retained backup preserved." >&2
+  return 1
+fi
+echo "ACTIVATION_PHASE=migration"
+if ! inject_focused_failure candidate-validation; then return 1; fi
+if ! sudo "$maintenance_wrapper" production "$release_dir" validate-migration; then
+  echo "Disposable migration candidate did not reach readiness." >&2
+  return 1
+fi
+migration_attempted=1
+if ! inject_focused_failure live-migration; then return 1; fi
+if ! sudo "$maintenance_wrapper" production "$release_dir" apply-migrations; then
+  echo "Live migration failed; database preserved without automatic restore." >&2
+  return 1
+fi
+
+echo "ACTIVATION_PHASE=activation"
+if ! inject_focused_failure release-switch; then return 1; fi
 ln -sfn -- "$release_dir" "$current_link"
 
-restart_service() { sudo systemctl restart "$service_name"; }
+restart_service() { inject_focused_failure rollback-restart || return 1; sudo systemctl restart "$service_name"; }
 
 report_service_state() {
   local property value
@@ -190,18 +420,21 @@ check_release_identity() {
   local selected_release_id="$1"
   local selected_release_dir="$2"
   local identity_url="http://127.0.0.1:${port}/internal/release"
-  local identity expected_digest
+  local identity expected_digest candidate_schema
   identity="$(curl --fail --silent --show-error --max-time 2 "$identity_url")" || return 1
   expected_digest="$(sed -n 's/.*"executableSha256":"\([0-9a-f]\{64\}\)".*/\1/p' "${selected_release_dir}/release-manifest.json")"
+  candidate_schema="$(sed -n 's/.*"schemaCompatibility":"\([^"]*\)".*/\1/p' "${selected_release_dir}/release-manifest.json")"
   grep -Fq "\"releaseAttemptId\":\"${selected_release_id}\"" <<<"$identity" || return 1
   grep -Fq "\"executableSha256\":\"${expected_digest}\"" <<<"$identity" || return 1
   grep -Fq "\"runningExecutableSha256\":\"${expected_digest}\"" <<<"$identity" || return 1
+  grep -Fq "\"schemaCompatibility\":\"${candidate_schema}\"" <<<"$identity" || return 1
 }
 
 check_health() {
   local selected_release_id="$1"
   local selected_release_dir="$2"
   local internal_health_url="http://127.0.0.1:${port}/internal/healthz" root_url="http://127.0.0.1:${port}/"
+  inject_focused_failure readiness || return 1
   for ((attempt = 1; attempt <= 20; attempt++)); do
     if curl --fail --silent --show-error --max-time 2 "$internal_health_url" >/dev/null &&
       curl --fail --silent --show-error --max-time 2 "$root_url" | grep -qi "<!doctype html" &&
@@ -226,16 +459,19 @@ check_representative_behavior() {
 }
 
 compatible_previous_release() {
-  local previous_manifest="${previous_release}/release-manifest.json" candidate_schema previous_schema
+  local previous_manifest="${previous_release}/release-manifest.json" actual_schema supported_versions
   [[ -s "$previous_manifest" ]] || return 1
-  candidate_schema="$(sed -n 's/.*"schemaCompatibility":"\([^"]*\)".*/\1/p' "${release_dir}/release-manifest.json")"
-  previous_schema="$(sed -n 's/.*"schemaCompatibility":"\([^"]*\)".*/\1/p' "$previous_manifest")"
-  [[ -n "$candidate_schema" && "$candidate_schema" == "$previous_schema" ]]
+  actual_schema="$(sudo "$maintenance_wrapper" production "$release_dir" preflight | sed -n 's/.*"schemaVersion":\([0-9][0-9]*\).*/\1/p')"
+  [[ -n "$actual_schema" ]] || return 1
+  supported_versions="$(sed -n 's/.*"supportedFoundationSchemaVersions":\[\([^]]*\)\].*/\1/p' "$previous_manifest")"
+  [[ -n "$supported_versions" ]] || return 1
+  [[ ",${supported_versions}," == *,"\"${actual_schema}\"",* ]]
 }
 
 prune_releases() {
   local current_release="$1" rollback_release="$2" release_path
   local -a all_releases
+  if [[ "${QBT_FOCUSED_TEST_MODE:-}" == 1 ]]; then return 0; fi
   mapfile -t all_releases < <(find "${base_dir}/releases" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' | sort -rn | cut -d' ' -f2-)
   local release_count=0
   for release_path in "${all_releases[@]}"; do
@@ -247,8 +483,9 @@ prune_releases() {
 
 if restart_service && check_health "$release_id" "$release_dir" && check_representative_behavior; then
   prune_releases "$release_dir" "$previous_release"
+  if ! inject_focused_failure final-report; then return 1; fi
   echo "Activated immutable release attempt ${release_id}."
-  exit 0
+  return 0
 fi
 
 report_service_state
@@ -264,4 +501,57 @@ if [[ -n "$previous_release" && -d "$previous_release" ]] && compatible_previous
 else
   echo "No compatible previous release available for rollback." >&2
 fi
-exit 1
+return 1
+}
+
+if [[ "${QBT_FOCUSED_TEST_BATCH:-}" == 1 ]]; then
+  mkdir -p -- "${base_dir}/releases" "${base_dir}/.staging"
+  exec 9>"${base_dir}/.activation.lock"
+  if ! flock -n 9; then
+    echo "Another ${service_name} activation is already running." >&2
+    exit 1
+  fi
+  focused_batch_directories=()
+  for focused_batch_phase in ${QBT_FOCUSED_TEST_PHASES//,/ }; do
+    focused_batch_directories+=("${focused_batch_output}/${focused_batch_phase}")
+  done
+  for focused_batch_directory in "${focused_batch_directories[@]}"; do
+    if [[ -e "$focused_batch_directory" || -L "$focused_batch_directory" ]]; then
+      echo "Focused batch phase evidence path already exists: ${focused_batch_directory}" >&2
+      exit 1
+    fi
+  done
+  for focused_batch_directory in "${focused_batch_directories[@]}"; do
+    mkdir -- "$focused_batch_directory"
+    focused_batch_directory_resolved="$(canonical_focused_directory "$focused_batch_directory")" || exit 1
+    [[ "$focused_batch_directory_resolved" == "$focused_batch_directory" &&
+      "$focused_batch_directory_resolved" == "$focused_batch_output"/* ]] || {
+      echo "Focused batch phase evidence path escapes the disposable output root." >&2
+      exit 1
+    }
+  done
+  for focused_batch_phase in ${QBT_FOCUSED_TEST_PHASES//,/ }; do
+    rm -f -- "$current_link"
+    ln -s -- "$QBT_FAST_PREVIOUS" "$current_link"
+    printf 'schema-before\n' >"$QBT_FAST_DATABASE"
+    printf 'retained-before\n' >"$QBT_FAST_POINTER"
+    rm -rf -- "$QBT_FAST_STATE/backup-candidate"
+    : >"$QBT_FAST_LOG"
+    focused_batch_directory="${focused_batch_output}/${focused_batch_phase}"
+    if QBT_FOCUSED_FAILURE_PHASE="$focused_batch_phase" activation_attempt >"${focused_batch_directory}/output" 2>&1; then
+      focused_batch_status=0
+    else
+      focused_batch_status=$?
+    fi
+    cleanup >>"${focused_batch_directory}/output" 2>&1 || true
+    trap - EXIT
+    printf '%s\n' "$focused_batch_status" >"${focused_batch_directory}/status"
+    readlink "$current_link" >"${focused_batch_directory}/current"
+    printf '%s\n' "$(<"$QBT_FAST_POINTER")" >"${focused_batch_directory}/pointer"
+    printf '%s\n' "$(<"$QBT_FAST_DATABASE")" >"${focused_batch_directory}/database"
+    cat -- "$QBT_FAST_LOG" >>"${focused_batch_directory}/output"
+  done
+  exit 1
+fi
+activation_attempt
+exit $?

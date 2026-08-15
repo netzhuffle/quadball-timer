@@ -8,6 +8,7 @@ User=quadball-timer
 Group=quadball-timer
 WorkingDirectory=/srv/quadball-timer/current
 Environment=NODE_ENV=production
+Environment=QUADBALL_ENVIRONMENT=production
 Environment=HOST=127.0.0.1
 Environment=PORT=3000
 Environment=TECHNICAL_ADMIN_DATABASE=/var/lib/quadball-timer/technical-admin.sqlite

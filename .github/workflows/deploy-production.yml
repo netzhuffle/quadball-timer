@@ -189,7 +189,13 @@ jobs:
           trap cleanup_remote_stage EXIT
           ssh $ssh_opts "${DEPLOY_USER}@${DEPLOY_HOST}" "test ! -e '${stage_dir}' && install -d -m 750 '${stage_dir}'"
           rsync -a -e "ssh ${ssh_opts}" release/ "${DEPLOY_USER}@${DEPLOY_HOST}:${stage_dir}/"
-          ssh $ssh_opts "${DEPLOY_USER}@${DEPLOY_HOST}" "'${stage_dir}/deploy/activate-test-release.sh' --base-dir '${base_dir}' --staged-dir '${stage_dir}' --release '${release_id}'"
+          set +e
+          ssh $ssh_opts "${DEPLOY_USER}@${DEPLOY_HOST}" "'${stage_dir}/deploy/activate-test-release.sh' --base-dir '${base_dir}' --staged-dir '${stage_dir}' --release '${release_id}'" 2>&1 | tee "$RUNNER_TEMP/quadball-test-deployment.log"
+          activation_status=${PIPESTATUS[0]}
+          set -e
+          phase="$(sed -n 's/^ACTIVATION_PHASE=//p' "$RUNNER_TEMP/quadball-test-deployment.log" | tail -n 1)"
+          echo "DEPLOYMENT_PHASE=${phase:-activation}" >> "$GITHUB_ENV"
+          exit "$activation_status"
 
       - name: Record Test deployment outcome
         id: deployment-outcome
@@ -308,7 +314,13 @@ jobs:
           trap cleanup_remote_stage EXIT
           ssh $ssh_opts "${DEPLOY_USER}@${DEPLOY_HOST}" "test ! -e '${stage_dir}' && install -d -m 750 '${stage_dir}'"
           rsync -a -e "ssh ${ssh_opts}" release/ "${DEPLOY_USER}@${DEPLOY_HOST}:${stage_dir}/"
-          ssh $ssh_opts "${DEPLOY_USER}@${DEPLOY_HOST}" "'${stage_dir}/deploy/activate-release.sh' --base-dir '${base_dir}' --staged-dir '${stage_dir}' --release '${release_id}' --service '${service_name}' --port '${app_port}'"
+          set +e
+          ssh $ssh_opts "${DEPLOY_USER}@${DEPLOY_HOST}" "'${stage_dir}/deploy/activate-release.sh' --base-dir '${base_dir}' --staged-dir '${stage_dir}' --release '${release_id}' --service '${service_name}' --port '${app_port}'" 2>&1 | tee "$RUNNER_TEMP/quadball-production-deployment.log"
+          activation_status=${PIPESTATUS[0]}
+          set -e
+          phase="$(sed -n 's/^ACTIVATION_PHASE=//p' "$RUNNER_TEMP/quadball-production-deployment.log" | tail -n 1)"
+          echo "DEPLOYMENT_PHASE=${phase:-activation}" >> "$GITHUB_ENV"
+          if (( activation_status != 0 )); then exit "$activation_status"; fi
           curl --fail --silent --show-error --max-time 10 https://timer.quadball.app/ | grep -qi "<!doctype html"
 
       - name: Record Production deployment outcome

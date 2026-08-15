@@ -1,4 +1,4 @@
-import { accessSync, constants, lstatSync } from "node:fs";
+import { accessSync, constants, lstatSync, realpathSync } from "node:fs";
 import { dirname, isAbsolute } from "node:path";
 import type { TechnicalAdminEnvironment } from "@/lib/technical-admin-auth";
 
@@ -16,6 +16,29 @@ export function readRuntimeStoragePaths(
   environmentVariables: Record<string, string | undefined> = process.env,
 ): RuntimeStoragePaths {
   if (environment === "production") {
+    if (environmentVariables.QBT_FOCUSED_TEST_MODE === "1") {
+      const focusedRoot = environmentVariables.QBT_FOCUSED_TEST_ROOT;
+      const paths = {
+        technicalAdminDatabase: environmentVariables.TECHNICAL_ADMIN_DATABASE,
+        foundationDatabase: environmentVariables.FOUNDATION_DATABASE,
+        eventGameDatabase: environmentVariables.EVENT_GAME_DATABASE,
+      };
+      if (
+        process.getuid?.() === 0 ||
+        focusedRoot === undefined ||
+        !focusedRoot.startsWith("/") ||
+        focusedRoot === "/" ||
+        focusedRoot.includes("..") ||
+        focusedRoot.includes("//") ||
+        !isCanonicalFocusedDirectory(focusedRoot) ||
+        Object.values(paths).some(
+          (path) => path === undefined || !isCanonicalFocusedPath(path, focusedRoot),
+        )
+      ) {
+        throw new Error("Focused activation paths must be absolute and disposable.");
+      }
+      return paths as RuntimeStoragePaths;
+    }
     const canonicalPaths = {
       technicalAdminDatabase: `${PRODUCTION_STATE_DIRECTORY}/technical-admin.sqlite`,
       foundationDatabase: `${PRODUCTION_STATE_DIRECTORY}/foundation.sqlite`,
@@ -50,6 +73,25 @@ export function readRuntimeStoragePaths(
     eventGameDatabase:
       environmentVariables.EVENT_GAME_DATABASE?.trim() || `${defaultDirectory}/event-game.sqlite`,
   };
+}
+
+function isCanonicalFocusedDirectory(path: string): boolean {
+  try {
+    const stat = lstatSync(path);
+    return stat.isDirectory() && !stat.isSymbolicLink() && realpathSync(path) === path;
+  } catch {
+    return false;
+  }
+}
+
+function isCanonicalFocusedPath(path: string, root: string): boolean {
+  if (!path.startsWith(`${root}/`) || path.includes("..") || path.includes("//")) return false;
+  const directory = dirname(path);
+  try {
+    return realpathSync(root) === root && realpathSync(directory) === directory;
+  } catch {
+    return false;
+  }
 }
 
 export function assertProductionStateBoundary(

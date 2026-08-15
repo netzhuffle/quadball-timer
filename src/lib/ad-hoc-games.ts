@@ -220,6 +220,22 @@ export type AdHocRecoveryAdapter = {
   quiesceForRecovery(): Promise<void>;
 };
 
+export function resolveAdHocEnvironmentIdentity(
+  environment: "production" | "test",
+  publicOrigin: string,
+  configuredIdentity?: string,
+): string {
+  const canonicalIdentity = `${environment}:${publicOrigin}`;
+  const override = configuredIdentity?.trim();
+  if (environment === "production") {
+    if (override !== undefined && override !== canonicalIdentity) {
+      throw new Error("Production Ad Hoc environment identity must match its canonical value.");
+    }
+    return canonicalIdentity;
+  }
+  return override || canonicalIdentity;
+}
+
 export type AdHocLiveSessionIdentity = {
   gameId: string;
   sessionId: string;

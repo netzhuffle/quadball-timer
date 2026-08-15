@@ -14,7 +14,11 @@ export function readGrantAuthorityOptions(
   }
   const keyRing = loadGrantKeyRingFile(keyRingPath, environment, {
     requiredOwnerUid:
-      environment === "test" && variables.NODE_ENV !== "production" ? (process.getuid?.() ?? 0) : 0,
+      environment === "test" && variables.NODE_ENV !== "production"
+        ? (process.getuid?.() ?? 0)
+        : variables.QBT_FOCUSED_TEST_MODE === "1"
+          ? (process.getuid?.() ?? 0)
+          : 0,
   }).keyRing;
   return {
     environmentId: environment,

@@ -24,6 +24,7 @@
     "test:focused-admission": "bun scripts/test-focused-admission.ts",
     "test": "bun test --isolate",
     "test:focused:sqlite": "bun test --isolate ./src/lib/event-game-actions-sqlite.focused.ts",
+    "test:focused:activation": "bun test --timeout=30000 --isolate ./src/lib/production-activation.focused.ts",
     "test:focused:acceptance": "bun test --isolate ./src/lib/foundation-acceptance-sqlite.focused.ts",
     "test:focused:grant": "bun test ./src/lib/grant-authority.focused.ts",
     "test:focused:event-catalog": "bun test --isolate ./src/lib/event-catalog.focused.ts",
@@ -36,7 +37,7 @@
     "format": "bunx --bun oxfmt \"**/*.{js,jsx,ts,tsx,mjs,cjs}\" \"!docs/**\"",
     "format:check": "bunx --bun oxfmt \"**/*.{js,jsx,ts,tsx,mjs,cjs}\" \"!docs/**\" --check",
     "lint": "bunx --bun oxlint --type-aware --type-check --ignore-pattern \"docs/**\"",
-    "lint:shell": "shellcheck deploy/activate-release.sh deploy/activate-test-release.sh",
+    "lint:shell": "shellcheck deploy/activate-release.sh deploy/activate-test-release.sh deploy/activation-maintenance-root.sh",
     "check:bun-version": "bun scripts/check-bun-version.ts",
     "check:testing-policy": "bun scripts/check-testing-policy.ts",
     "check": "bun run check:bun-version && bun run check:testing-policy && bun run format:check && bun run lint && bun run lint:shell"
