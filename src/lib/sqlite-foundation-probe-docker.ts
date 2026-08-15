@@ -20,6 +20,9 @@ export const SQLITE_FOUNDATION_PROBE_DOCKER_PROCESS_LIMIT =
 export const SQLITE_FOUNDATION_PROBE_DOCKER_TMPFS = `/tmp:rw,size=${SQLITE_FOUNDATION_PROBE_MAX_DISK_BYTES},mode=1777`;
 export const SQLITE_FOUNDATION_PROBE_DOCKER_LOG_MAX_SIZE = "4k";
 export const SQLITE_FOUNDATION_PROBE_DOCKER_LOG_MAX_FILE = "1";
+export const SQLITE_FOUNDATION_PROBE_DOCKER_CREATE_RECONCILIATION_MS = 250;
+export const SQLITE_FOUNDATION_PROBE_DOCKER_RECONCILIATION_INTERVAL_MS = 25;
+export const SQLITE_FOUNDATION_PROBE_DOCKER_FINAL_CLEANUP_SLICE_MS = 1_000;
 export const SQLITE_FOUNDATION_PROBE_DOCKER_INFO_IDENTITY_FORMAT =
   '{"OSType":{{json .OSType}},"Architecture":{{json .Architecture}}}';
 export const SQLITE_FOUNDATION_PROBE_DOCKER_VERSION_IDENTITY_FORMAT =
@@ -79,12 +82,28 @@ export type DockerProbeExecution = {
 export type DockerProbeDependencies = {
   runCommand?: DockerCommandRunner;
   signal?: AbortSignal;
+  admissionSignal?: AbortSignal;
+  reconciliationSignal?: AbortSignal;
   platform?: NodeJS.Platform;
   architecture?: string;
   invocationId?: string;
   image?: string;
   cleanupSignal?: AbortSignal;
   expectedBunVersion?: string;
+};
+
+export type DockerProbeLifecycle = {
+  workSignal: AbortSignal;
+  admissionSignal: AbortSignal;
+  reconciliationSignal: AbortSignal;
+  cleanupSignal: AbortSignal;
+};
+
+export type DockerCleanupLifecycle = {
+  cleanupSignal: AbortSignal;
+  reconciliationSignal: AbortSignal;
+  /** True only when the caller has proved create never reached the daemon. */
+  preCreateConfirmed?: boolean;
 };
 
 export type DockerContainerArguments = {
@@ -216,6 +235,8 @@ export async function createDockerProbeExecution(
 ): Promise<DockerProbeExecution> {
   const runCommand = dependencies.runCommand ?? runDockerCommand;
   const cleanupSignal = dependencies.cleanupSignal ?? new AbortController().signal;
+  const reconciliationSignal = dependencies.reconciliationSignal ?? cleanupSignal;
+  const admissionSignal = dependencies.admissionSignal ?? dependencies.signal;
   await admitDockerEngine({ ...dependencies, runCommand });
   const artifactPath = await validateArtifactPath(executablePath);
   const expectedBunVersion = dependencies.expectedBunVersion ?? expectedPackageBunVersion();
@@ -229,15 +250,16 @@ export async function createDockerProbeExecution(
       command: ["/opt/quadball-timer", "--sqlite-foundation-probe"],
       image: dependencies.image,
     }),
-    { signal: dependencies.signal },
+    // A work-timeout may race the daemon-side create request. Keep the Docker
+    // client alive only through the short admission grace; cleanup owns the
+    // remaining reserve for exact identity and absence proof.
+    { signal: admissionSignal },
   ).catch(() => null);
   if (create === null || create.exitCode !== 0 || create.outputExceeded) {
-    const cleanupDisposition = await cleanupMalformedCreateOutput(
-      runCommand,
-      name,
-      capability,
+    const cleanupDisposition = await cleanupMalformedCreateOutput(runCommand, name, capability, {
       cleanupSignal,
-    );
+      reconciliationSignal,
+    });
     throw new DockerAdmissionError(
       "Docker could not create the owned qualification container.",
       cleanupDisposition,
@@ -245,12 +267,10 @@ export async function createDockerProbeExecution(
   }
   const id = parseContainerId(create.stdout);
   if (id === null) {
-    const cleanupDisposition = await cleanupMalformedCreateOutput(
-      runCommand,
-      name,
-      capability,
+    const cleanupDisposition = await cleanupMalformedCreateOutput(runCommand, name, capability, {
       cleanupSignal,
-    );
+      reconciliationSignal,
+    });
     throw new DockerAdmissionError(
       "Docker returned an invalid qualification container identity.",
       cleanupDisposition,
@@ -266,7 +286,7 @@ export async function createDockerProbeExecution(
   const admitted = await verifyDockerContainerConfiguration(
     runCommand,
     container,
-    dependencies.signal,
+    admissionSignal,
     artifactPath,
   );
   if (!admitted) {
@@ -791,39 +811,129 @@ export async function cleanupMalformedCreateOutput(
   runCommand: DockerCommandRunner,
   name: string,
   capability: string,
-  signal?: AbortSignal,
+  lifecycle: DockerCleanupLifecycle,
 ): Promise<DockerAdmissionDisposition> {
+  let observedEmpty = false;
+  let observedNonEmpty = false;
+  while (!lifecycle.reconciliationSignal.aborted) {
+    const discovery = await discoverMalformedCreateContainer(
+      runCommand,
+      name,
+      capability,
+      lifecycle.reconciliationSignal,
+    );
+    if (discovery.kind === "unverified") return "unverified";
+    if (discovery.kind === "cutoff") break;
+    if (discovery.kind === "empty") {
+      observedEmpty = true;
+    } else if (discovery.kind === "found") {
+      const candidate: DockerProbeContainer = {
+        id: discovery.id,
+        name,
+        capability,
+        artifactPath: "",
+        identityVerified: false,
+      };
+      const cleanup = await cleanupOwnedDockerContainer(
+        runCommand,
+        candidate,
+        lifecycle.cleanupSignal,
+      );
+      return cleanup.identityVerified && cleanup.removed ? "removed" : "unverified";
+    } else {
+      observedNonEmpty = true;
+    }
+    if (!(await waitForDockerReconciliationInterval(lifecycle.reconciliationSignal))) break;
+  }
+  return observedEmpty && !observedNonEmpty && lifecycle.preCreateConfirmed === true
+    ? "not-created"
+    : "unverified";
+}
+
+async function discoverMalformedCreateContainer(
+  runCommand: DockerCommandRunner,
+  name: string,
+  capability: string,
+  signal?: AbortSignal,
+): Promise<
+  | { kind: "empty" }
+  | { kind: "found"; id: string; atCutoff?: boolean }
+  | { kind: "one-sided" }
+  | { kind: "cutoff" }
+  | { kind: "unverified" }
+> {
+  const byName = await discoverDockerContainerDimension(runCommand, ["name", `^/${name}$`], signal);
+  if (byName.kind === "cutoff") return byName;
+  if (byName.kind === "unverified") return byName;
+  const byCapability = await discoverDockerContainerDimension(
+    runCommand,
+    ["label", `${SQLITE_FOUNDATION_PROBE_DOCKER_LABEL}=${capability}`],
+    signal,
+  );
+  if (byCapability.kind === "cutoff")
+    return byName.kind === "found" ? { kind: "found", id: byName.id } : byCapability;
+  if (byCapability.kind === "unverified") return byCapability;
+  if (byName.kind === "empty" && byCapability.kind === "empty") return { kind: "empty" };
+  if (byName.kind === "found" && byCapability.kind === "found") {
+    return byName.id === byCapability.id
+      ? { kind: "found", id: byName.id }
+      : { kind: "unverified" };
+  }
+  if (byCapability.kind === "found" && byCapability.atCutoff)
+    return { kind: "found", id: byCapability.id };
+  if (byName.kind === "found" && byName.atCutoff) return { kind: "found", id: byName.id };
+  if (byName.kind === "found" || byCapability.kind === "found") return { kind: "one-sided" };
+  return { kind: "unverified" };
+}
+
+async function discoverDockerContainerDimension(
+  runCommand: DockerCommandRunner,
+  filter: readonly ["name" | "label", string],
+  signal?: AbortSignal,
+): Promise<
+  | { kind: "empty" }
+  | { kind: "found"; id: string; atCutoff?: boolean }
+  | { kind: "cutoff" }
+  | { kind: "unverified" }
+> {
+  if (signal?.aborted) return { kind: "cutoff" };
   const discovered = await runCommand(
-    [
-      "ps",
-      "--all",
-      "--no-trunc",
-      "--filter",
-      `name=^/${name}$`,
-      "--filter",
-      `label=${SQLITE_FOUNDATION_PROBE_DOCKER_LABEL}=${capability}`,
-      "--format",
-      "{{.ID}}",
-    ],
+    ["ps", "--all", "--no-trunc", "--filter", `${filter[0]}=${filter[1]}`, "--format", "{{.ID}}"],
     { signal },
   ).catch(() => null);
-  if (discovered === null || discovered.exitCode !== 0 || discovered.outputExceeded)
-    return "unverified";
+  if (discovered === null) return signal?.aborted ? { kind: "cutoff" } : { kind: "unverified" };
+  if (discovered.exitCode !== 0 || discovered.outputExceeded) return { kind: "unverified" };
+  const completedAfterCutoff = signal?.aborted === true;
   const lines = discovered.stdout
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter(Boolean);
+  if (lines.length === 0) return completedAfterCutoff ? { kind: "cutoff" } : { kind: "empty" };
   const id = lines.length === 1 ? parseContainerId(lines[0] ?? "") : null;
-  if (id === null) return "unverified";
-  const candidate: DockerProbeContainer = {
-    id,
-    name,
-    capability,
-    artifactPath: "",
-    identityVerified: false,
-  };
-  const cleanup = await cleanupOwnedDockerContainer(runCommand, candidate, signal);
-  return cleanup.identityVerified && cleanup.removed ? "removed" : "unverified";
+  return id === null
+    ? { kind: "unverified" }
+    : { kind: "found", id, atCutoff: completedAfterCutoff };
+}
+
+async function waitForDockerReconciliationInterval(signal: AbortSignal): Promise<boolean> {
+  if (signal?.aborted) return false;
+  return await new Promise<boolean>((resolve) => {
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const onAbort = () => finish(false);
+    const finish = (value: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      resolve(value);
+    };
+    timer = setTimeout(
+      () => finish(true),
+      SQLITE_FOUNDATION_PROBE_DOCKER_RECONCILIATION_INTERVAL_MS,
+    );
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 export function parseDockerArtifactIdentity(

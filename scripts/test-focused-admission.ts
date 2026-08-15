@@ -6,9 +6,12 @@ import {
   cleanupOwnedDockerContainer,
   parseContainerId,
   DockerAdmissionError,
+  SQLITE_FOUNDATION_PROBE_DOCKER_FINAL_CLEANUP_SLICE_MS,
   runDockerCommand,
+  SQLITE_FOUNDATION_PROBE_DOCKER_CREATE_RECONCILIATION_MS,
   verifyDockerContainerConfiguration,
   type DockerAdmissionDisposition,
+  type DockerProbeLifecycle,
 } from "@/lib/sqlite-foundation-probe-docker";
 import {
   focusedAdmissionExitCode,
@@ -37,9 +40,23 @@ let descendantsTerminated: boolean | null = null;
 let descendantsReaped = false;
 let temporaryDataRemoved = false;
 const workAbort = new AbortController();
+const admissionAbort = new AbortController();
+const reconciliationAbort = new AbortController();
 const hardAbort = new AbortController();
 const workTimer = setTimeout(() => workAbort.abort(), 3_000);
+const admissionTimer = setTimeout(
+  () => admissionAbort.abort(),
+  3_000 + SQLITE_FOUNDATION_PROBE_DOCKER_CREATE_RECONCILIATION_MS,
+);
+const reconciliationTimer = setTimeout(
+  () => reconciliationAbort.abort(),
+  5_000 - SQLITE_FOUNDATION_PROBE_DOCKER_FINAL_CLEANUP_SLICE_MS,
+);
 const hardTimer = setTimeout(() => hardAbort.abort(), 5_000);
+const abortAdmissionAtHardDeadline = () => admissionAbort.abort();
+hardAbort.signal.addEventListener("abort", abortAdmissionAtHardDeadline, { once: true });
+const abortReconciliationAtHardDeadline = () => reconciliationAbort.abort();
+hardAbort.signal.addEventListener("abort", abortReconciliationAtHardDeadline, { once: true });
 let execution: Awaited<ReturnType<typeof createHarmlessExecution>> | undefined;
 
 try {
@@ -49,12 +66,12 @@ try {
   const command = buildFocusedDockerCommand(`quadball-timer-focused-${invocationId}`, invocationId);
   if (command.includes("--sqlite-foundation-probe"))
     throw new Error("focused command contains the qualification workload");
-  execution = await createHarmlessExecution(
-    command,
-    invocationId,
-    workAbort.signal,
-    hardAbort.signal,
-  );
+  execution = await createHarmlessExecution(command, invocationId, {
+    workSignal: workAbort.signal,
+    admissionSignal: admissionAbort.signal,
+    reconciliationSignal: reconciliationAbort.signal,
+    cleanupSignal: hardAbort.signal,
+  });
   workloadLaunched = true;
   const result = await execution.run();
   if (result.exitCode !== 0) throw new Error("Docker containment helper failed");
@@ -64,6 +81,10 @@ try {
   else if (error instanceof FocusedAdmissionError) {
     errorReference = error.name;
     temporaryDataRemoved = error.disposition !== "unverified";
+    if (error.disposition === "removed") {
+      identityVerified = true;
+      containerRemoved = true;
+    }
   } else errorReference = error instanceof Error ? error.name : "UnknownError";
   outcome = engine === null ? "blocked" : "failed";
 } finally {
@@ -93,7 +114,13 @@ try {
     }
   }
   clearTimeout(workTimer);
+  clearTimeout(admissionTimer);
+  clearTimeout(reconciliationTimer);
   clearTimeout(hardTimer);
+  hardAbort.signal.removeEventListener("abort", abortAdmissionAtHardDeadline);
+  hardAbort.signal.removeEventListener("abort", abortReconciliationAtHardDeadline);
+  admissionAbort.abort();
+  reconciliationAbort.abort();
 }
 
 const evidence = {
@@ -124,17 +151,20 @@ process.exitCode = focusedAdmissionExitCode(outcome);
 async function createHarmlessExecution(
   command: string[],
   capability: string,
-  workSignal: AbortSignal,
-  cleanupSignal: AbortSignal,
+  lifecycle: DockerProbeLifecycle,
 ) {
   const name = command[command.indexOf("--name") + 1] ?? `quadball-timer-focused-${capability}`;
-  const create = await runDockerCommand(command, { signal: workSignal }).catch(() => null);
+  // Allow only the short admission grace after the work deadline; cleanup keeps
+  // the remaining reserve for exact ownership and absence proof.
+  const create = await runDockerCommand(command, { signal: lifecycle.admissionSignal }).catch(
+    () => null,
+  );
   if (create === null || create.exitCode !== 0 || create.outputExceeded) {
     const cleanupDisposition = await cleanupMalformedCreateOutput(
       runDockerCommand,
       name,
       capability,
-      cleanupSignal,
+      lifecycle,
     );
     throw new FocusedAdmissionError(
       "Docker could not create focused container",
@@ -147,7 +177,7 @@ async function createHarmlessExecution(
       runDockerCommand,
       name,
       capability,
-      cleanupSignal,
+      lifecycle,
     );
     throw new FocusedAdmissionError(
       "Docker returned an invalid focused container identity",
@@ -157,7 +187,7 @@ async function createHarmlessExecution(
   const admitted = await verifyDockerContainerConfiguration(
     runDockerCommand,
     { id, name, capability },
-    workSignal,
+    lifecycle.admissionSignal,
     null,
   );
   if (!admitted) {
@@ -165,7 +195,7 @@ async function createHarmlessExecution(
       runDockerCommand,
       name,
       capability,
-      cleanupSignal,
+      lifecycle,
     );
     throw new FocusedAdmissionError(
       "Docker focused containment configuration could not be verified",
@@ -176,14 +206,16 @@ async function createHarmlessExecution(
   const execution = {
     container: { id, name, capability, artifactPath: "", identityVerified: false },
     async run() {
-      const start = await runDockerCommand(["start", id], { signal: workSignal });
+      const start = await runDockerCommand(["start", id], { signal: lifecycle.workSignal });
       if (start.exitCode !== 0) throw new Error("Docker could not start focused container");
       await Bun.sleep(25);
-      const stop = await runDockerCommand(["stop", "--time", "1", id], { signal: workSignal });
+      const stop = await runDockerCommand(["stop", "--time", "1", id], {
+        signal: lifecycle.workSignal,
+      });
       if (stop.exitCode !== 0) {
-        await runDockerCommand(["kill", id], { signal: workSignal });
+        await runDockerCommand(["kill", id], { signal: lifecycle.workSignal });
       }
-      const wait = await runDockerCommand(["wait", id], { signal: workSignal });
+      const wait = await runDockerCommand(["wait", id], { signal: lifecycle.workSignal });
       parseFocusedWaitExitCode(wait);
       stopVerified = true;
       return {
@@ -210,7 +242,7 @@ async function createHarmlessExecution(
       const cleanup = await cleanupOwnedDockerContainer(
         runDockerCommand,
         { id, name, capability },
-        cleanupSignal,
+        lifecycle.cleanupSignal,
       );
       if (!cleanup.identityVerified) throw new Error("focused container ownership failed");
       return {

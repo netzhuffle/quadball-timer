@@ -5,8 +5,11 @@ import {
   createDockerProbeExecution,
   DockerExecutionError,
   DockerResourceLimitError,
+  SQLITE_FOUNDATION_PROBE_DOCKER_CREATE_RECONCILIATION_MS,
+  SQLITE_FOUNDATION_PROBE_DOCKER_FINAL_CLEANUP_SLICE_MS,
   type DockerProbeDependencies,
   type DockerProbeExecution,
+  type DockerProbeLifecycle,
 } from "@/lib/sqlite-foundation-probe-docker";
 import {
   SQLITE_FOUNDATION_PROBE_CLEANUP_RESERVE_MS,
@@ -35,8 +38,7 @@ export type CompiledSqliteFoundationProbeOptions = {
   docker?: DockerProbeDependencies;
   createExecution?: (
     executablePath: string,
-    signal?: AbortSignal,
-    cleanupSignal?: AbortSignal,
+    lifecycle: DockerProbeLifecycle,
   ) => Promise<DockerProbeExecution>;
   command?: string;
   commit?: string | ((signal?: AbortSignal) => string | Promise<string>);
@@ -58,14 +60,36 @@ export async function runCompiledSqliteFoundationProbe(
   const invocationId = crypto.randomUUID();
   const timeoutMs = options.timeoutMs ?? SQLITE_FOUNDATION_PROBE_TIMEOUT_MS;
   const workAbort = new AbortController();
+  const admissionAbort = new AbortController();
+  const reconciliationAbort = new AbortController();
   const hardAbort = new AbortController();
   const removeCallerSignal = forwardAbort(options.signal, workAbort);
+  const removeCallerAdmissionSignal = forwardAbort(options.signal, admissionAbort);
+  const removeCallerReconciliationSignal = forwardAbort(options.signal, reconciliationAbort);
   const cleanupReserveMs = Math.min(
     SQLITE_FOUNDATION_PROBE_CLEANUP_RESERVE_MS,
     Math.floor(timeoutMs / 2),
   );
+  const admissionGraceMs = Math.min(
+    SQLITE_FOUNDATION_PROBE_DOCKER_CREATE_RECONCILIATION_MS,
+    Math.max(1, Math.floor(cleanupReserveMs / 2)),
+  );
+  const finalCleanupSliceMs = Math.min(
+    SQLITE_FOUNDATION_PROBE_DOCKER_FINAL_CLEANUP_SLICE_MS,
+    Math.max(1, Math.floor(cleanupReserveMs / 2)),
+  );
   const workTimer = setTimeout(() => workAbort.abort(), Math.max(1, timeoutMs - cleanupReserveMs));
+  const admissionTimer = setTimeout(
+    () => admissionAbort.abort(),
+    Math.max(1, timeoutMs - cleanupReserveMs + admissionGraceMs),
+  );
+  const reconciliationTimer = setTimeout(
+    () => reconciliationAbort.abort(),
+    Math.max(1, timeoutMs - finalCleanupSliceMs),
+  );
   const hardTimer = setTimeout(() => hardAbort.abort(), timeoutMs);
+  const removeHardAdmissionSignal = forwardAbort(hardAbort.signal, admissionAbort);
+  const removeHardReconciliationSignal = forwardAbort(hardAbort.signal, reconciliationAbort);
   let execution: DockerProbeExecution | undefined;
   let result: ProbeWorkerResult | undefined;
   let terminalError: unknown;
@@ -92,11 +116,18 @@ export async function runCompiledSqliteFoundationProbe(
 
   try {
     const admission = options.createExecution
-      ? options.createExecution(executablePath, workAbort.signal, hardAbort.signal)
+      ? options.createExecution(executablePath, {
+          workSignal: workAbort.signal,
+          admissionSignal: admissionAbort.signal,
+          reconciliationSignal: reconciliationAbort.signal,
+          cleanupSignal: hardAbort.signal,
+        })
       : createDockerProbeExecution(executablePath, {
           ...options.docker,
           invocationId,
           signal: workAbort.signal,
+          admissionSignal: admissionAbort.signal,
+          reconciliationSignal: reconciliationAbort.signal,
           cleanupSignal: hardAbort.signal,
         });
     try {
@@ -209,9 +240,17 @@ export async function runCompiledSqliteFoundationProbe(
     );
   await emitResult("final");
   clearTimeout(workTimer);
+  clearTimeout(admissionTimer);
+  clearTimeout(reconciliationTimer);
   clearTimeout(hardTimer);
   removeCallerSignal();
+  removeCallerAdmissionSignal();
+  removeCallerReconciliationSignal();
+  removeHardAdmissionSignal();
+  removeHardReconciliationSignal();
   hardAbort.abort();
+  reconciliationAbort.abort();
+  admissionAbort.abort();
   workAbort.abort();
   if (probeError !== undefined) throw probeError;
   if (result === undefined)
