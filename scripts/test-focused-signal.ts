@@ -1,4 +1,4 @@
-import { installProbeSignalHandlers } from "@/lib/sqlite-foundation-probe-process";
+import { runSqliteRuntimeEntrypoint } from "@/lib/sqlite-foundation-probe-cli";
 
 const CHILD_ARGUMENT = "--focused-signal-child";
 const GRANDCHILD_ARGUMENT = "--focused-signal-grandchild";
@@ -29,43 +29,76 @@ if (process.argv.includes(GRANDCHILD_ARGUMENT)) {
 }
 
 async function runSignalChild(): Promise<void> {
-  const signalScope = installProbeSignalHandlers();
+  const directExit = process.argv.includes("--direct-exit");
   const grandchild = Bun.spawn(
     [process.execPath, process.argv[1] ?? import.meta.filename, GRANDCHILD_ARGUMENT],
     {
-      detached: !process.argv.includes("--direct-exit"),
+      detached: !directExit,
       env: allowlistedEnvironment(),
       stdout: "ignore",
       stderr: "ignore",
     },
   );
-  process.stdout.write("RE");
-  await Bun.sleep(5);
-  process.stdout.write("ADY\n");
-  process.stderr.write("diagnostic\n");
-  if (process.argv.includes("--direct-exit")) {
-    signalScope.cleanup();
+  if (directExit) {
+    process.stdout.write("READY\n");
     process.exit(0);
   }
-  await new Promise<void>((resolve) => {
-    signalScope.signal.addEventListener("abort", () => resolve(), { once: true });
-  });
-  process.stdout.write(`ABORTED ${signalScope.signal.reason ?? "signal"}\n`);
-  grandchild.kill("SIGTERM");
-  const exited = await Promise.race([grandchild.exited, Bun.sleep(100).then(() => null)]);
-  if (exited === null) {
-    grandchild.kill("SIGKILL");
-    try {
-      process.kill(grandchild.pid, "SIGKILL");
-    } catch {
-      // The process may have exited between TERM grace and the bounded KILL.
-    }
+  const expectedSignal = process.argv[3] as NodeJS.Signals;
+  const receivedSignals: NodeJS.Signals[] = [];
+  const recordSignal = () => receivedSignals.push(expectedSignal);
+  process.on(expectedSignal, recordSignal);
+  let aborted = false;
+  const emittedPhases: string[] = [];
+  try {
+    await runSqliteRuntimeEntrypoint("/focused/synthetic-artifact", {
+      timeoutMs: TIMEOUT_MS,
+      emitResult: (result) => {
+        emittedPhases.push(result.phase);
+      },
+      createExecution: async () => {
+        process.stdout.write("READY\n");
+        process.stderr.write("diagnostic\n");
+        return {
+          container: {
+            id: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            name: "focused",
+            capability: "focused",
+            artifactPath: "/focused/synthetic-artifact",
+            identityVerified: true,
+          },
+          run: async () => new Promise<never>(() => {}),
+          stop: async () => {
+            grandchild.kill("SIGTERM");
+            const exited = await Promise.race([grandchild.exited, Bun.sleep(100).then(() => null)]);
+            if (exited === null) grandchild.kill("SIGKILL");
+            if (!(await waitForProcessGone(grandchild.pid, TIMEOUT_MS)))
+              throw new Error("focused signal grandchild did not exit after bounded KILL");
+          },
+          cleanup: async () => ({
+            identityVerified: true,
+            removed: true,
+            descendantsTerminated: true,
+            descendantsReaped: true,
+            temporaryDataRemoved: true,
+          }),
+        };
+      },
+    });
+  } catch {
+    aborted = true;
+  } finally {
+    process.off(expectedSignal, recordSignal);
   }
-  const exitedAfterKill = await waitForProcessGone(grandchild.pid, TIMEOUT_MS);
-  if (!exitedAfterKill)
-    throw new Error("focused signal grandchild did not exit after bounded KILL");
-  process.stdout.write("REAPED\n");
-  signalScope.cleanup();
+  if (!aborted) throw new Error("outer runtime entrypoint did not abort on signal");
+  if (!receivedSignals.includes(expectedSignal))
+    throw new Error(`focused child did not receive ${expectedSignal}`);
+  if (emittedPhases.join(",") !== "pre-cleanup,final")
+    throw new Error(
+      `signal cleanup did not emit both bounded evidence records: ${emittedPhases.join(",")}`,
+    );
+  {
+    process.stdout.write("ABORTED\nREAPED\n");
+  }
 }
 
 async function runDirectChildExitCase(): Promise<void> {
@@ -105,7 +138,7 @@ type SignalMeasurement = {
 async function runSignalCase(signal: NodeJS.Signals): Promise<SignalMeasurement> {
   const startedAt = performance.now();
   const child = Bun.spawn(
-    [process.execPath, process.argv[1] ?? import.meta.filename, CHILD_ARGUMENT],
+    [process.execPath, process.argv[1] ?? import.meta.filename, CHILD_ARGUMENT, signal],
     {
       detached: true,
       env: allowlistedEnvironment(),
@@ -133,7 +166,8 @@ async function runSignalCase(signal: NodeJS.Signals): Promise<SignalMeasurement>
       !stdoutText.includes("READY\n") ||
       !stdoutText.includes("REAPED\n") ||
       !stdoutText.includes("ABORTED") ||
-      !stderrText.includes("diagnostic\n")
+      !stderrText.includes("diagnostic\n") ||
+      performance.now() - readyAt >= TIMEOUT_MS - 250
     ) {
       throw new Error(
         `${signal} child did not complete installed-signal cleanup (exitCode=${exitCode}, stdout=${JSON.stringify(stdoutText)}, stderr=${JSON.stringify(stderrText)})`,

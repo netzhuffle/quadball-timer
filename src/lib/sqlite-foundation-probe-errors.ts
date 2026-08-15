@@ -4,11 +4,13 @@ import {
   ProbeTimeoutError,
   ProbeWorkerFailureError,
 } from "@/lib/sqlite-foundation-probe-process";
-import { ProbeNetworkBoundaryError } from "@/lib/sqlite-foundation-probe-network";
 import {
-  ProbeResourceControlError,
-  ProbeResourceLimitError,
-} from "@/lib/sqlite-foundation-probe-resources";
+  DockerAdmissionError,
+  DockerCleanupError,
+  DockerExecutionError,
+  DockerOwnershipError,
+  DockerResourceLimitError,
+} from "@/lib/sqlite-foundation-probe-docker";
 
 export class SqliteFoundationGateError extends Error {
   readonly decisionRequired = true;
@@ -26,9 +28,11 @@ export function translateProbeError(error: unknown): SqliteFoundationGateError {
     error instanceof ProbeInterruptedError ||
     error instanceof ProbeReapTimeoutError ||
     error instanceof ProbeWorkerFailureError ||
-    error instanceof ProbeNetworkBoundaryError ||
-    error instanceof ProbeResourceControlError ||
-    error instanceof ProbeResourceLimitError
+    error instanceof DockerAdmissionError ||
+    error instanceof DockerCleanupError ||
+    error instanceof DockerExecutionError ||
+    error instanceof DockerOwnershipError ||
+    error instanceof DockerResourceLimitError
   ) {
     return new SqliteFoundationGateError(error.message);
   }

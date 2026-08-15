@@ -35,7 +35,8 @@
     "lint": "bunx --bun oxlint --type-aware --type-check --ignore-pattern \"docs/**\"",
     "lint:shell": "shellcheck deploy/activate-release.sh deploy/activate-test-release.sh",
     "check:bun-version": "bun scripts/check-bun-version.ts",
-    "check": "bun run check:bun-version && bun run format:check && bun run lint && bun run lint:shell"
+    "check:testing-policy": "bun scripts/check-testing-policy.ts",
+    "check": "bun run check:bun-version && bun run check:testing-policy && bun run format:check && bun run lint && bun run lint:shell"
   },
   "dependencies": {
     "@radix-ui/react-label": "^2.1.8",

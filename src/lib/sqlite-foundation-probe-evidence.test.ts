@@ -1,65 +1,59 @@
 import { describe, expect, test } from "bun:test";
 import {
   boundedProbeQualificationResult,
-  SQLITE_FOUNDATION_PROBE_RESULT_MAX_BYTES,
+  jsonByteLength,
 } from "@/lib/sqlite-foundation-probe-evidence";
 import type { ProbeQualificationResult } from "@/lib/sqlite-foundation-probe-result";
 
-describe("sqlite qualification evidence", () => {
-  test("caps external commit and command strings before emission", () => {
-    const result: ProbeQualificationResult = {
-      schemaVersion: 1,
-      invocationId: "invocation",
-      phase: "final",
-      command: "x".repeat(20_000),
-      commit: "secret-and-not-a-commit".repeat(20_000),
-      platform: {
-        os: "linux",
-        arch: "x64",
-        bunVersion: "1.3.14",
-        bunRevision: "revision",
-        sqliteVersion: null,
-      },
-      startedAt: "2026-08-14T00:00:00.000Z",
-      endedAt: "2026-08-14T00:00:01.000Z",
-      durationMs: 1,
-      measuredResources: {
-        processCount: 7,
-        peakMemoryBytes: 512,
-        diskBytes: 4096,
-        outputBytes: 123,
-      },
-      outcome: "failed",
-      cleanup: {
-        descendantsTerminated: null,
-        descendantsReaped: false,
-        controllerEmpty: null,
-        controllerRemoved: false,
-        tmpfsRemoved: null,
-        workspaceRemoved: false,
-        temporaryDataRemoved: false,
-        retainedController: { state: "unknown", scope: "invocation-cgroup", resources: [] },
-        status: "failed",
-        failures: ["failure"],
-      },
-      evidence: {
-        disposition: "cleanup-failure",
-        location: null,
-        retention: "coordinator-handoff",
-      },
-      diagnostics: { references: [], stdoutBytes: 0, stderrBytes: 0 },
-    };
-    const bounded = boundedProbeQualificationResult(result);
-    expect(new TextEncoder().encode(JSON.stringify(bounded)).byteLength).toBeLessThanOrEqual(
-      SQLITE_FOUNDATION_PROBE_RESULT_MAX_BYTES,
-    );
-    expect(bounded.commit).toBe("unknown");
-    expect(bounded.measuredResources).toEqual({
-      processCount: 7,
-      peakMemoryBytes: 512,
-      diskBytes: 4096,
-      outputBytes: 123,
-    });
-    expect(JSON.stringify(bounded)).not.toContain("secret-and-not-a-commit");
+function result(): ProbeQualificationResult {
+  return {
+    schemaVersion: 1,
+    invocationId: "invocation",
+    phase: "final",
+    command: "bun run check:sqlite-runtime [compiled-executable]",
+    commit: "abcdef1",
+    platform: {
+      os: "linux",
+      arch: "x64",
+      bunVersion: "1.3.14",
+      bunRevision: "abcdef12",
+      sqliteVersion: "3.53.0",
+    },
+    startedAt: new Date(0).toISOString(),
+    endedAt: new Date(1).toISOString(),
+    durationMs: 1,
+    measuredResources: { processCount: 1, peakMemoryBytes: 1, diskBytes: null, outputBytes: 1 },
+    outcome: "passed",
+    cleanup: {
+      descendantsTerminated: true,
+      descendantsReaped: true,
+      containerIdentityVerified: true,
+      containerRemoved: true,
+      temporaryDataRemoved: true,
+      retainedContainer: { state: "none", scope: null, resources: [] },
+      status: "verified",
+      failures: [],
+    },
+    evidence: {
+      disposition: "transient-cleanup",
+      location: null,
+      retention: "none",
+      emission: "verified",
+      failures: [],
+    },
+    diagnostics: { references: [], stdoutBytes: 1, stderrBytes: 0 },
+  };
+}
+
+describe("bounded Docker qualification evidence", () => {
+  test("measures UTF-8 JSON bytes", () => {
+    expect(jsonByteLength({ value: "😀" })).toBe(16);
+  });
+
+  test("marks oversized evidence as a truthful cleanup failure", () => {
+    const bounded = boundedProbeQualificationResult({ ...result(), command: "x".repeat(10_000) });
+    expect(bounded.cleanup.status).toBe("verified");
+    expect(bounded.evidence.failures).toContain("evidence-size");
+    expect(bounded.cleanup.temporaryDataRemoved).toBe(true);
   });
 });

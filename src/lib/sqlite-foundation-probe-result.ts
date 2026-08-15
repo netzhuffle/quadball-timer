@@ -9,12 +9,12 @@ export const SQLITE_FOUNDATION_PROBE_COMMAND = "bun run check:sqlite-runtime [co
 export const SQLITE_FOUNDATION_PROBE_MAX_MEMORY_BYTES = 512 * 1024 * 1024;
 export const SQLITE_FOUNDATION_PROBE_MAX_DISK_BYTES = 16 * 1024 * 1024;
 
-export type ProbeOutcome = "passed" | "failed" | "timed-out" | "interrupted";
+export type ProbeOutcome = "passed" | "failed" | "timed-out" | "interrupted" | "blocked";
 
-export type ProbeRetainedControllerEvidence = {
-  state: "none" | "retained" | "unknown";
-  scope: "invocation-cgroup" | null;
-  resources: Array<"root" | "helper" | "workload" | "capability-marker">;
+export type ProbeRetainedContainerEvidence = {
+  state: "none" | "unknown";
+  scope: "docker-container" | null;
+  resources: Array<"container" | "capability-label">;
 };
 
 export type ProbeResourceMeasurement = {
@@ -22,6 +22,7 @@ export type ProbeResourceMeasurement = {
   peakMemoryBytes: number | null;
   diskBytes: number | null;
   outputBytes: number | null;
+  resourceViolations?: string[];
 };
 
 export type ProbeQualificationResult = {
@@ -45,12 +46,10 @@ export type ProbeQualificationResult = {
   cleanup: {
     descendantsTerminated: boolean | null;
     descendantsReaped: boolean;
-    controllerEmpty: boolean | null;
-    controllerRemoved: boolean | null;
-    tmpfsRemoved: boolean | null;
-    workspaceRemoved: boolean | null;
+    containerIdentityVerified: boolean | null;
+    containerRemoved: boolean | null;
     temporaryDataRemoved: boolean;
-    retainedController: ProbeRetainedControllerEvidence;
+    retainedContainer: ProbeRetainedContainerEvidence;
     status: "pending" | "verified" | "failed";
     failures: string[];
   };
@@ -58,6 +57,8 @@ export type ProbeQualificationResult = {
     disposition: "transient-cleanup" | "retained-owned-state" | "cleanup-failure";
     location: null;
     retention: "none" | "coordinator-handoff";
+    emission: "pending" | "verified" | "failed";
+    failures: string[];
   };
   diagnostics: {
     references: string[];

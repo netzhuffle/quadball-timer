@@ -1,7 +1,5 @@
-import {
-  runCompiledSqliteFoundationProbe,
-  SQLITE_FOUNDATION_PROBE_TIMEOUT_MS,
-} from "@/lib/sqlite-foundation-probe";
+import { SQLITE_FOUNDATION_PROBE_TIMEOUT_MS } from "@/lib/sqlite-foundation-probe";
+import { runSqliteRuntimeEntrypoint } from "@/lib/sqlite-foundation-probe-cli";
 
 /**
  * Intentional release-candidate diagnostic for #71/#70. It runs only when explicitly invoked,
@@ -19,14 +17,7 @@ if (cliArguments.length > 1) {
 }
 
 const executablePath = cliArguments[0] ?? "dist/quadball-timer";
-if (!(await Bun.file(executablePath).exists())) {
-  throw new Error(`Compiled executable does not exist: ${executablePath}`);
-}
-if (process.platform !== "linux" || process.arch !== "x64") {
-  throw new Error("SQLite runtime qualification requires native Linux x86-64.");
-}
-
-const result = await runCompiledSqliteFoundationProbe(executablePath, {
+const result = await runSqliteRuntimeEntrypoint(executablePath, {
   timeoutMs: SQLITE_FOUNDATION_PROBE_TIMEOUT_MS,
   command: "bun run check:sqlite-runtime [compiled-executable]",
   emitResult: (qualificationResult) => {
