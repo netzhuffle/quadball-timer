@@ -40,7 +40,7 @@ import {
   FOUNDATION_GRANT_AUDIT_NO_LEGACY_TAG_INSERT_TRIGGER_SQL,
   FOUNDATION_EVENT_CATALOG_EVENTS_TABLE_SQL,
   FOUNDATION_EVENT_CATALOG_GAME_DAYS_TABLE_SQL,
-  FOUNDATION_EVENT_CATALOG_AUDIT_TABLE_V2_SQL,
+  FOUNDATION_EVENT_CATALOG_AUDIT_TABLE_V3_SQL,
   FOUNDATION_EVENT_CATALOG_TEAMS_TABLE_SQL,
   FOUNDATION_EVENT_CATALOG_ROSTER_TABLE_SQL,
   FOUNDATION_EVENT_CATALOG_PITCHES_TABLE_SQL,
@@ -48,6 +48,12 @@ import {
   FOUNDATION_EVENT_CATALOG_AUDIT_EVENT_INDEX_SQL,
   FOUNDATION_EVENT_CATALOG_ROSTER_TEAM_INDEX_SQL,
   FOUNDATION_EVENT_CATALOG_PITCHES_EVENT_INDEX_SQL,
+  FOUNDATION_EVENT_CATALOG_GAMEPLAY_SLOTS_TABLE_SQL,
+  FOUNDATION_EVENT_CATALOG_GAMEPLAY_SLOTS_INDEX_SQL,
+  FOUNDATION_EVENT_CATALOG_PITCH_SLOTS_TABLE_SQL,
+  FOUNDATION_EVENT_CATALOG_PITCH_SLOTS_INDEX_SQL,
+  FOUNDATION_EVENT_CATALOG_GAMES_TABLE_SQL,
+  FOUNDATION_EVENT_CATALOG_GAMES_INDEX_SQL,
 } from "@/lib/foundation-migrations";
 import {
   computeGrantAuditIntegrityTag,
@@ -144,6 +150,9 @@ const EVENT_CATALOG_AUDIT_TABLE = "foundation_event_catalog_audit";
 const EVENT_CATALOG_TEAMS_TABLE = "foundation_event_catalog_teams";
 const EVENT_CATALOG_ROSTER_TABLE = "foundation_event_catalog_roster";
 const EVENT_CATALOG_PITCHES_TABLE = "foundation_event_catalog_pitches";
+const EVENT_CATALOG_GAMEPLAY_SLOTS_TABLE = "foundation_event_catalog_gameplay_slots";
+const EVENT_CATALOG_PITCH_SLOTS_TABLE = "foundation_event_catalog_pitch_slots";
+const EVENT_CATALOG_GAMES_TABLE = "foundation_event_catalog_games";
 const GRANT_CODE_TABLE = "foundation_grant_codes";
 const GRANT_ADMISSION_TELEMETRY_TABLE = "foundation_grant_admission_telemetry";
 const GRANT_ADMISSION_GLOBAL_TABLE = "foundation_grant_admission_global_windows";
@@ -265,7 +274,7 @@ const expectedManifest: FoundationSchemaManifest = {
       "table",
       EVENT_CATALOG_AUDIT_TABLE,
       EVENT_CATALOG_AUDIT_TABLE,
-      FOUNDATION_EVENT_CATALOG_AUDIT_TABLE_V2_SQL,
+      FOUNDATION_EVENT_CATALOG_AUDIT_TABLE_V3_SQL,
     ),
     object(
       "table",
@@ -284,6 +293,24 @@ const expectedManifest: FoundationSchemaManifest = {
       EVENT_CATALOG_PITCHES_TABLE,
       EVENT_CATALOG_PITCHES_TABLE,
       FOUNDATION_EVENT_CATALOG_PITCHES_TABLE_SQL,
+    ),
+    object(
+      "table",
+      EVENT_CATALOG_GAMEPLAY_SLOTS_TABLE,
+      EVENT_CATALOG_GAMEPLAY_SLOTS_TABLE,
+      FOUNDATION_EVENT_CATALOG_GAMEPLAY_SLOTS_TABLE_SQL,
+    ),
+    object(
+      "table",
+      EVENT_CATALOG_PITCH_SLOTS_TABLE,
+      EVENT_CATALOG_PITCH_SLOTS_TABLE,
+      FOUNDATION_EVENT_CATALOG_PITCH_SLOTS_TABLE_SQL,
+    ),
+    object(
+      "table",
+      EVENT_CATALOG_GAMES_TABLE,
+      EVENT_CATALOG_GAMES_TABLE,
+      FOUNDATION_EVENT_CATALOG_GAMES_TABLE_SQL,
     ),
     object(
       "trigger",
@@ -428,6 +455,24 @@ const expectedManifest: FoundationSchemaManifest = {
       "foundation_event_catalog_pitches_event_id",
       EVENT_CATALOG_PITCHES_TABLE,
       FOUNDATION_EVENT_CATALOG_PITCHES_EVENT_INDEX_SQL,
+    ),
+    object(
+      "index",
+      "foundation_event_catalog_gameplay_slots_game_day_id",
+      EVENT_CATALOG_GAMEPLAY_SLOTS_TABLE,
+      FOUNDATION_EVENT_CATALOG_GAMEPLAY_SLOTS_INDEX_SQL,
+    ),
+    object(
+      "index",
+      "foundation_event_catalog_pitch_slots_game_day_id",
+      EVENT_CATALOG_PITCH_SLOTS_TABLE,
+      FOUNDATION_EVENT_CATALOG_PITCH_SLOTS_INDEX_SQL,
+    ),
+    object(
+      "index",
+      "foundation_event_catalog_games_game_day_id",
+      EVENT_CATALOG_GAMES_TABLE,
+      FOUNDATION_EVENT_CATALOG_GAMES_INDEX_SQL,
     ),
   ].sort(compareNamed),
   tables: [
@@ -985,6 +1030,181 @@ const expectedManifest: FoundationSchemaManifest = {
       ],
     },
     {
+      name: EVENT_CATALOG_GAMEPLAY_SLOTS_TABLE,
+      columns: [
+        column("gameplay_slot_id", "TEXT", 1, 1),
+        column("event_id", "TEXT", 1, 0),
+        column("game_day_id", "TEXT", 1, 0),
+        column("sequence_number", "INTEGER", 1, 0),
+        column("scheduled_start_ms", "INTEGER", 1, 0),
+        column("created_at_ms", "INTEGER", 1, 0),
+        column("updated_at_ms", "INTEGER", 1, 0),
+      ],
+      foreignKeys: [
+        {
+          id: 0,
+          sequence: 0,
+          table: EVENT_CATALOG_GAME_DAYS_TABLE,
+          from: "game_day_id",
+          to: "game_day_id",
+          onUpdate: "NO ACTION",
+          onDelete: "CASCADE",
+          match: "NONE",
+        },
+        {
+          id: 1,
+          sequence: 0,
+          table: EVENT_CATALOG_EVENTS_TABLE,
+          from: "event_id",
+          to: "event_id",
+          onUpdate: "NO ACTION",
+          onDelete: "CASCADE",
+          match: "NONE",
+        },
+      ],
+    },
+    {
+      name: EVENT_CATALOG_PITCH_SLOTS_TABLE,
+      columns: [
+        column("pitch_slot_id", "TEXT", 1, 1),
+        column("event_id", "TEXT", 1, 0),
+        column("game_day_id", "TEXT", 1, 0),
+        column("pitch_id", "TEXT", 1, 0),
+        column("gameplay_slot_id", "TEXT", 1, 0),
+        column("sequence_number", "INTEGER", 1, 0),
+        column("created_at_ms", "INTEGER", 1, 0),
+        column("updated_at_ms", "INTEGER", 1, 0),
+      ],
+      foreignKeys: [
+        {
+          id: 0,
+          sequence: 0,
+          table: EVENT_CATALOG_GAMEPLAY_SLOTS_TABLE,
+          from: "gameplay_slot_id",
+          to: "gameplay_slot_id",
+          onUpdate: "NO ACTION",
+          onDelete: "CASCADE",
+          match: "NONE",
+        },
+        {
+          id: 1,
+          sequence: 0,
+          table: EVENT_CATALOG_PITCHES_TABLE,
+          from: "pitch_id",
+          to: "pitch_id",
+          onUpdate: "NO ACTION",
+          onDelete: "CASCADE",
+          match: "NONE",
+        },
+        {
+          id: 2,
+          sequence: 0,
+          table: EVENT_CATALOG_GAME_DAYS_TABLE,
+          from: "game_day_id",
+          to: "game_day_id",
+          onUpdate: "NO ACTION",
+          onDelete: "CASCADE",
+          match: "NONE",
+        },
+        {
+          id: 3,
+          sequence: 0,
+          table: EVENT_CATALOG_EVENTS_TABLE,
+          from: "event_id",
+          to: "event_id",
+          onUpdate: "NO ACTION",
+          onDelete: "CASCADE",
+          match: "NONE",
+        },
+      ],
+    },
+    {
+      name: EVENT_CATALOG_GAMES_TABLE,
+      columns: [
+        column("event_game_id", "TEXT", 1, 1),
+        column("event_id", "TEXT", 1, 0),
+        column("game_day_id", "TEXT", 1, 0),
+        column("gameplay_slot_id", "TEXT", 1, 0),
+        column("pitch_slot_id", "TEXT", 1, 0),
+        column("game_code", "TEXT", 0, 0),
+        column("game_designation", "TEXT", 0, 0),
+        column("side_a_id", "TEXT", 1, 0),
+        column("side_a_event_team_id", "TEXT", 0, 0),
+        column("side_a_event_team_name", "TEXT", 0, 0),
+        column("side_a_source_label", "TEXT", 0, 0),
+        column("side_a_confirmed_at_ms", "INTEGER", 0, 0),
+        column("side_b_id", "TEXT", 1, 0),
+        column("side_b_event_team_id", "TEXT", 0, 0),
+        column("side_b_event_team_name", "TEXT", 0, 0),
+        column("side_b_source_label", "TEXT", 0, 0),
+        column("side_b_confirmed_at_ms", "INTEGER", 0, 0),
+        column("created_at_ms", "INTEGER", 1, 0),
+        column("updated_at_ms", "INTEGER", 1, 0),
+      ],
+      foreignKeys: [
+        {
+          id: 0,
+          sequence: 0,
+          table: EVENT_CATALOG_TEAMS_TABLE,
+          from: "side_b_event_team_id",
+          to: "event_team_id",
+          onUpdate: "NO ACTION",
+          onDelete: "NO ACTION",
+          match: "NONE",
+        },
+        {
+          id: 1,
+          sequence: 0,
+          table: EVENT_CATALOG_TEAMS_TABLE,
+          from: "side_a_event_team_id",
+          to: "event_team_id",
+          onUpdate: "NO ACTION",
+          onDelete: "NO ACTION",
+          match: "NONE",
+        },
+        {
+          id: 2,
+          sequence: 0,
+          table: EVENT_CATALOG_PITCH_SLOTS_TABLE,
+          from: "pitch_slot_id",
+          to: "pitch_slot_id",
+          onUpdate: "NO ACTION",
+          onDelete: "CASCADE",
+          match: "NONE",
+        },
+        {
+          id: 3,
+          sequence: 0,
+          table: EVENT_CATALOG_GAMEPLAY_SLOTS_TABLE,
+          from: "gameplay_slot_id",
+          to: "gameplay_slot_id",
+          onUpdate: "NO ACTION",
+          onDelete: "CASCADE",
+          match: "NONE",
+        },
+        {
+          id: 4,
+          sequence: 0,
+          table: EVENT_CATALOG_GAME_DAYS_TABLE,
+          from: "game_day_id",
+          to: "game_day_id",
+          onUpdate: "NO ACTION",
+          onDelete: "CASCADE",
+          match: "NONE",
+        },
+        {
+          id: 5,
+          sequence: 0,
+          table: EVENT_CATALOG_EVENTS_TABLE,
+          from: "event_id",
+          to: "event_id",
+          onUpdate: "NO ACTION",
+          onDelete: "CASCADE",
+          match: "NONE",
+        },
+      ],
+    },
+    {
       name: GRANT_ADMISSION_GLOBAL_TABLE,
       columns: [
         column("mode", "TEXT", 1, 1),
@@ -1042,6 +1262,22 @@ const expectedManifest: FoundationSchemaManifest = {
     index("foundation_grant_audit_provenance_grant_id", 0, ["grant_id", "audit_id"]),
     index("foundation_event_catalog_game_days_event_id", 0, ["event_id", "game_day_date"]),
     index("foundation_event_catalog_audit_event_id", 0, ["event_id", "occurred_at_ms", "audit_id"]),
+    index("foundation_event_catalog_gameplay_slots_game_day_id", 0, [
+      "game_day_id",
+      "sequence_number",
+      "gameplay_slot_id",
+    ]),
+    index("foundation_event_catalog_pitch_slots_game_day_id", 0, [
+      "game_day_id",
+      "pitch_id",
+      "sequence_number",
+      "pitch_slot_id",
+    ]),
+    index("foundation_event_catalog_games_game_day_id", 0, [
+      "game_day_id",
+      "gameplay_slot_id",
+      "event_game_id",
+    ]),
   ].sort(compareNamed),
 };
 
@@ -2213,6 +2449,9 @@ function readSchemaManifest(database: Database): FoundationSchemaManifest {
     EVENT_CATALOG_TEAMS_TABLE,
     EVENT_CATALOG_ROSTER_TABLE,
     EVENT_CATALOG_PITCHES_TABLE,
+    EVENT_CATALOG_GAMEPLAY_SLOTS_TABLE,
+    EVENT_CATALOG_PITCH_SLOTS_TABLE,
+    EVENT_CATALOG_GAMES_TABLE,
     GRANT_CODE_TABLE,
     GRANT_ADMISSION_TELEMETRY_TABLE,
     GRANT_ADMISSION_GLOBAL_TABLE,
@@ -2238,6 +2477,9 @@ function readSchemaManifest(database: Database): FoundationSchemaManifest {
     "foundation_event_catalog_audit_event_id",
     "foundation_event_catalog_roster_team_id",
     "foundation_event_catalog_pitches_event_id",
+    "foundation_event_catalog_gameplay_slots_game_day_id",
+    "foundation_event_catalog_pitch_slots_game_day_id",
+    "foundation_event_catalog_games_game_day_id",
   ].map((name) => readIndex(database, name));
 
   return {
@@ -2334,6 +2576,11 @@ function readIndex(database: Database, name: string): SchemaIndex {
 }
 
 function indexTable(name: string): string {
+  if (name.startsWith("foundation_event_catalog_gameplay_slots"))
+    return EVENT_CATALOG_GAMEPLAY_SLOTS_TABLE;
+  if (name.startsWith("foundation_event_catalog_pitch_slots"))
+    return EVENT_CATALOG_PITCH_SLOTS_TABLE;
+  if (name.startsWith("foundation_event_catalog_games")) return EVENT_CATALOG_GAMES_TABLE;
   if (name.startsWith("foundation_event_catalog_game_days")) return EVENT_CATALOG_GAME_DAYS_TABLE;
   if (name.startsWith("foundation_event_catalog_audit")) return EVENT_CATALOG_AUDIT_TABLE;
   if (name.startsWith("foundation_event_catalog_roster")) return EVENT_CATALOG_ROSTER_TABLE;
