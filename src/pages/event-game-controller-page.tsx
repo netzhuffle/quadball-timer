@@ -46,6 +46,8 @@ import {
   persistControllerReplica,
   rebindControllerReplica,
   reconcileControllerReplay,
+  deriveControllerConnectionStatus,
+  type ControllerConnectionStatus,
   type ControllerReplicaLoad,
   type ControllerReplicaState,
   type ControllerReplayBatchResponse,
@@ -137,6 +139,8 @@ export function EventGameControllerPage() {
   >({});
   const [clockRunning, setClockRunning] = useState(false);
   const [clockReceiptAnchor, setClockReceiptAnchor] = useState<ClockReceiptAnchor | null>(null);
+  const [controllerConnectionStatus, setControllerConnectionStatus] =
+    useState<ControllerConnectionStatus>("disconnected");
   const [localMonotonicMs, setLocalMonotonicMs] = useState(readMonotonicNow);
   const [clockCorrectionInput, setClockCorrectionInput] = useState("");
   const [takeoverAdjustmentInput, setTakeoverAdjustmentInput] = useState("");
@@ -168,6 +172,8 @@ export function EventGameControllerPage() {
   const activeReplayRef = useRef<ActiveReplay | null>(null);
   const queuedReplayRef = useRef<ReplayRequest | null>(null);
   const resynchronizationTimerRef = useRef<number | null>(null);
+  const lastControllerSyncAtRef = useRef<number | null>(null);
+  const controllerConnectionStatusRef = useRef<ControllerConnectionStatus>("disconnected");
   const [durabilityWarning, setDurabilityWarning] = useState<string | null>(
     persistedReplicaLoad.warning,
   );
@@ -176,7 +182,11 @@ export function EventGameControllerPage() {
   const qrDialogRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    const timer = window.setInterval(() => setLocalMonotonicMs(readMonotonicNow()), 250);
+    const timer = window.setInterval(() => {
+      const nowMs = readMonotonicNow();
+      setLocalMonotonicMs(nowMs);
+      updateControllerConnectionStatus(nowMs);
+    }, 250);
     return () => {
       window.clearInterval(timer);
       if (resynchronizationTimerRef.current !== null) {
@@ -184,6 +194,23 @@ export function EventGameControllerPage() {
       }
     };
   }, []);
+
+  function updateControllerConnectionStatus(nowMs = readMonotonicNow()) {
+    const next = deriveControllerConnectionStatus({
+      lastSynchronizedAtMs: lastControllerSyncAtRef.current,
+      nowMs,
+      online: navigator.onLine !== false,
+    });
+    if (controllerConnectionStatusRef.current === next) return next;
+    controllerConnectionStatusRef.current = next;
+    setControllerConnectionStatus(next);
+    return next;
+  }
+
+  function markControllerSynchronized() {
+    lastControllerSyncAtRef.current = readMonotonicNow();
+    updateControllerConnectionStatus(lastControllerSyncAtRef.current);
+  }
 
   const clockProjection =
     clockReceiptAnchor === null
@@ -253,6 +280,7 @@ export function EventGameControllerPage() {
     const reconcileWhenForegrounded = () => {
       if (document.visibilityState === "hidden") return;
       projectClockImmediately();
+      updateControllerConnectionStatus();
       void (async () => {
         const revalidated = await refreshController(true);
         if (revalidated && replicaRef.current !== null) {
@@ -1329,7 +1357,7 @@ export function EventGameControllerPage() {
         { nowMs: Math.floor(readMonotonicNow()) },
       );
       commitReplica(dispatched.state);
-      receiveProjection(dispatched.state.projection);
+      receiveProjection(dispatched.state.projection, { markSynchronized: false });
       setMessage(
         intent.type === "clock-takeover"
           ? "Emergency clock takeover retained for synchronization."
@@ -1347,10 +1375,11 @@ export function EventGameControllerPage() {
 
   function receiveProjection(
     nextProjection: ControllerProjection | null,
-    options: { resynchronized?: boolean } = {},
+    options: { markSynchronized?: boolean; resynchronized?: boolean } = {},
   ) {
     setProjection(nextProjection);
     setProjectionStatus(nextProjection === null ? "unavailable" : "available");
+    if (options.markSynchronized !== false) markControllerSynchronized();
     setClockRunning(nextProjection?.clock.running ?? false);
     setClockReceiptAnchor(
       nextProjection === null
@@ -1415,6 +1444,9 @@ export function EventGameControllerPage() {
     }
     setSessionBearer(null);
     setEventGameId(null);
+    lastControllerSyncAtRef.current = null;
+    controllerConnectionStatusRef.current = "disconnected";
+    setControllerConnectionStatus("disconnected");
     setProjection(null);
     setProjectionStatus("unavailable");
     setClockRunning(false);
@@ -1520,6 +1552,18 @@ export function EventGameControllerPage() {
             <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain [&_button]:min-h-11">
               <div className="rounded-lg border bg-muted/30 p-3 text-sm">
                 <p className="font-medium">Controller Device: {eventGameId}</p>
+                <p
+                  role="status"
+                  aria-live="polite"
+                  data-controller-freshness="true"
+                  className="mt-1 text-muted-foreground"
+                >
+                  {controllerConnectionStatus === "fresh"
+                    ? "Controller connection: fresh"
+                    : controllerConnectionStatus === "stale"
+                      ? "Controller connection: stale; reconnect to reconcile"
+                      : "Controller connection: disconnected; reconnect to reconcile"}
+                </p>
                 <p className="mt-1 text-muted-foreground">
                   {projection?.commencement.status === "commenced"
                     ? "Game Commencement is irreversible."

@@ -37,6 +37,34 @@ import {
 
 export const CONTROLLER_REPLICA_VERSION = "controller-replica-v3" as const;
 export const CONTROLLER_REPLICA_STORAGE_KEY = "quadball:event-controller-replica";
+/** A Controller must revalidate after five seconds without a fresh server response. */
+export const CONTROLLER_STALE_DISCONNECTED_AFTER_MS = 5_000 as const;
+
+export type ControllerConnectionStatus = "fresh" | "stale" | "disconnected";
+
+/**
+ * Shared monotonic freshness contract for the browser Controller reconnect seam.
+ * Offline transport is disconnected immediately; an online session is stale at
+ * (and only at) the configured five-second boundary after its last response.
+ */
+export function deriveControllerConnectionStatus(input: {
+  lastSynchronizedAtMs: number | null;
+  nowMs: number;
+  online: boolean;
+}): ControllerConnectionStatus {
+  if (!input.online) return "disconnected";
+  if (
+    input.lastSynchronizedAtMs === null ||
+    !Number.isFinite(input.lastSynchronizedAtMs) ||
+    !Number.isFinite(input.nowMs) ||
+    input.nowMs < input.lastSynchronizedAtMs
+  ) {
+    return "disconnected";
+  }
+  return input.nowMs - input.lastSynchronizedAtMs < CONTROLLER_STALE_DISCONNECTED_AFTER_MS
+    ? "fresh"
+    : "stale";
+}
 
 export function controllerReplicaStorageKey(eventGameId?: string): string {
   return eventGameId === undefined
