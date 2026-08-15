@@ -104,24 +104,27 @@ describe("Docker qualification orchestration", () => {
     const events: string[] = [];
     await expect(
       runCompiledSqliteFoundationProbe("/owned/artifact", {
-        timeoutMs: 80,
-        createExecution: async (_path, workSignal, _cleanupSignal) =>
+        timeoutMs: 160,
+        createExecution: async (_path, { workSignal }) =>
           new Promise((resolve) => {
             workSignal?.addEventListener(
               "abort",
               () => {
-                events.push("admission-resolved");
-                resolve(
-                  fakeExecution({
-                    stop: async () => {
-                      events.push("stop");
-                    },
-                    cleanup: async (signal) => {
-                      events.push(`cleanup:${signal?.aborted === false}`);
-                      return { identityVerified: true, removed: true };
-                    },
-                  }),
-                );
+                events.push("work-aborted");
+                setTimeout(() => {
+                  events.push("admission-resolved");
+                  resolve(
+                    fakeExecution({
+                      stop: async () => {
+                        events.push("stop");
+                      },
+                      cleanup: async (signal) => {
+                        events.push(`cleanup:${signal?.aborted === false}`);
+                        return { identityVerified: true, removed: true };
+                      },
+                    }),
+                  );
+                }, 5);
               },
               { once: true },
             );
@@ -131,7 +134,14 @@ describe("Docker qualification orchestration", () => {
         },
       }),
     ).rejects.toBeInstanceOf(Error);
-    expect(events).toEqual(["admission-resolved", "stop", "pre-cleanup", "cleanup:true", "final"]);
+    expect(events).toEqual([
+      "work-aborted",
+      "admission-resolved",
+      "stop",
+      "pre-cleanup",
+      "cleanup:true",
+      "final",
+    ]);
   });
 
   test("retains verified cleanup when late admission rejects after timeout", async () => {
@@ -146,10 +156,10 @@ describe("Docker qualification orchestration", () => {
     }> = [];
     await expect(
       runCompiledSqliteFoundationProbe("/owned/artifact", {
-        timeoutMs: 80,
-        createExecution: async (_path, workSignal) =>
+        timeoutMs: 160,
+        createExecution: async (_path, { admissionSignal }) =>
           new Promise((_resolve, reject) => {
-            workSignal?.addEventListener(
+            admissionSignal?.addEventListener(
               "abort",
               () => reject(new DockerAdmissionError("late create cleaned", "removed")),
               { once: true },
@@ -166,6 +176,39 @@ describe("Docker qualification orchestration", () => {
       containerRemoved: true,
       failures: [],
     });
+  });
+
+  test("fails closed at the admission boundary without claiming removal", async () => {
+    const events: string[] = [];
+    const emitted: Array<{ cleanup: { status: string; containerRemoved: boolean | null } }> = [];
+    await expect(
+      runCompiledSqliteFoundationProbe("/owned/artifact", {
+        timeoutMs: 1_000,
+        createExecution: async (_path, { cleanupSignal, admissionSignal }) =>
+          new Promise((_resolve, reject) => {
+            cleanupSignal?.addEventListener("abort", () => events.push("hard-aborted"), {
+              once: true,
+            });
+            admissionSignal?.addEventListener(
+              "abort",
+              () => {
+                events.push("admission-aborted");
+                reject(new DockerAdmissionError("late create unresolved", "unverified"));
+              },
+              { once: true },
+            );
+          }),
+        emitResult: (value) => {
+          events.push(value.phase);
+          emitted.push({ cleanup: value.cleanup });
+        },
+      }),
+    ).rejects.toThrow("timed out");
+    expect(emitted.at(-1)?.cleanup).toMatchObject({
+      status: "failed",
+      containerRemoved: null,
+    });
+    expect(events).toEqual(["admission-aborted", "pre-cleanup", "final", "hard-aborted"]);
   });
 
   test("does not claim malformed admission cleanup when ownership removal was unverified", async () => {

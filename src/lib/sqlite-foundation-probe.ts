@@ -81,7 +81,9 @@ export type {
   DockerAdmissionDisposition,
   DockerCommandResult,
   DockerArtifactIdentity,
+  DockerCleanupLifecycle,
   DockerProbeDependencies,
+  DockerProbeLifecycle,
   DockerProbeExecution,
 } from "@/lib/sqlite-foundation-probe-docker";
 export {

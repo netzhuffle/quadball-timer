@@ -22,6 +22,31 @@ import {
 const capability = "00000000-0000-0000-0000-000000000000";
 const containerId = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
+function cleanupLifecycle(reconciliationMs = 40) {
+  const reconciliation = new AbortController();
+  const cleanupTimer = setTimeout(() => reconciliation.abort(), reconciliationMs);
+  return {
+    cleanupSignal: new AbortController().signal,
+    reconciliationSignal: reconciliation.signal,
+    cleanupTimer,
+  };
+}
+
+function dockerResult(stdout = "", exitCode = 0) {
+  return {
+    exitCode,
+    stdout,
+    stderr: "",
+    stdoutBytes: stdout.length,
+    stderrBytes: 0,
+    outputExceeded: false,
+  };
+}
+
+function emptyDockerResult() {
+  return dockerResult();
+}
+
 function admittedContainerInspection(artifactPath: string): string {
   return JSON.stringify({
     Id: containerId,
@@ -223,6 +248,10 @@ describe("Docker SQLite qualification boundary", () => {
   test("fails the start barrier before the artifact can run", async () => {
     const artifactPath = await realpath("/bin/sh");
     const calls: string[][] = [];
+    const workSignal = new AbortController().signal;
+    const admissionSignal = new AbortController().signal;
+    const cleanupSignal = new AbortController().signal;
+    let createSignal: AbortSignal | undefined;
     const responses = [
       { exitCode: 0, stdout: JSON.stringify({ OSType: "linux", Architecture: "x86_64" }) },
       { exitCode: 0, stdout: JSON.stringify({ Os: "linux", Arch: "amd64" }) },
@@ -243,8 +272,12 @@ describe("Docker SQLite qualification boundary", () => {
       platform: "linux",
       architecture: "x64",
       invocationId: capability,
-      runCommand: async (arguments_) => {
+      signal: workSignal,
+      admissionSignal,
+      cleanupSignal,
+      runCommand: async (arguments_, options) => {
         calls.push([...arguments_]);
+        if (arguments_[0] === "create") createSignal = options?.signal;
         const response = responses.shift();
         if (response === undefined) throw new Error("unexpected Docker command");
         return {
@@ -269,6 +302,7 @@ describe("Docker SQLite qualification boundary", () => {
     ]);
     expect(calls[2]).toContain(`type=bind,src=${artifactPath},dst=/opt/quadball-timer,readonly`);
     expect(calls.map((value) => value[0])).not.toContain("start");
+    expect(createSignal).toBe(admissionSignal);
   });
 
   test("uses production stop, kill, wait, removal, and exact absence in order", async () => {
@@ -665,6 +699,7 @@ describe("Docker SQLite qualification boundary", () => {
       { exitCode: 0, stdout: JSON.stringify({ Os: "linux", Arch: "amd64" }) },
       { exitCode: 0, stdout: "" },
       { exitCode: 0, stdout: `${executionId}\n` },
+      { exitCode: 0, stdout: `${executionId}\n` },
       {
         exitCode: 0,
         stdout: JSON.stringify({
@@ -700,10 +735,297 @@ describe("Docker SQLite qualification boundary", () => {
       "version",
       "create",
       "ps",
+      "ps",
       "inspect",
       "rm",
       "ps",
     ]);
+  });
+
+  test("reconciles a focused-style late create after the first absence observation", async () => {
+    const name = `quadball-timer-focused-${capability}`;
+    const calls: string[] = [];
+    const responses = [
+      { stdout: "" },
+      { stdout: "" },
+      { stdout: `${containerId}\n` },
+      { stdout: "" },
+      { stdout: `${containerId}\n` },
+      { stdout: `${containerId}\n` },
+      {
+        stdout: JSON.stringify({
+          Id: containerId,
+          Name: `/${name}`,
+          Config: { Labels: { ["com.quadball-timer.sqlite-probe"]: capability } },
+        }),
+      },
+      { stdout: "" },
+      { stdout: "" },
+    ];
+    const cleanup = await cleanupMalformedCreateOutput(
+      async (arguments_) => {
+        calls.push(arguments_[0] ?? "");
+        const response = responses.shift();
+        if (response === undefined) throw new Error("unexpected Docker command");
+        return {
+          exitCode: 0,
+          stdout: response.stdout,
+          stderr: "",
+          stdoutBytes: response.stdout.length,
+          stderrBytes: 0,
+          outputExceeded: false,
+        };
+      },
+      name,
+      capability,
+      cleanupLifecycle(100),
+    );
+    expect(cleanup).toBe("removed");
+    expect(calls).toEqual(["ps", "ps", "ps", "ps", "ps", "ps", "inspect", "rm", "ps"]);
+  });
+
+  test("classifies explicit pre-create empty observations as not-created", async () => {
+    const calls: string[] = [];
+    const cleanup = await cleanupMalformedCreateOutput(
+      async (arguments_) => {
+        calls.push(arguments_[0] ?? "");
+        return {
+          exitCode: 0,
+          stdout: "",
+          stderr: "",
+          stdoutBytes: 0,
+          stderrBytes: 0,
+          outputExceeded: false,
+        };
+      },
+      "quadball-timer-focused-empty",
+      capability,
+      { ...cleanupLifecycle(35), preCreateConfirmed: true },
+    );
+    expect(cleanup).toBe("not-created");
+    expect(calls.length).toBeGreaterThanOrEqual(4);
+    expect(calls.length % 2).toBe(0);
+  });
+
+  test("fails closed when reconciliation cuts off between independent dimensions", async () => {
+    const reconciliation = new AbortController();
+    const calls: string[] = [];
+    const cleanup = await cleanupMalformedCreateOutput(
+      async (arguments_) => {
+        calls.push(arguments_[0] ?? "");
+        if (arguments_.includes("name=^/partial$")) return emptyDockerResult();
+        reconciliation.abort();
+        return emptyDockerResult();
+      },
+      "partial",
+      capability,
+      {
+        cleanupSignal: new AbortController().signal,
+        reconciliationSignal: reconciliation.signal,
+        preCreateConfirmed: true,
+      },
+    );
+    expect(cleanup).toBe("unverified");
+    expect(calls).toEqual(["ps", "ps"]);
+  });
+
+  test("does not claim absence when a container can materialize after cutoff", async () => {
+    const reconciliation = new AbortController();
+    const calls: string[] = [];
+    let materializedAfterCutoff = false;
+    const cleanup = await cleanupMalformedCreateOutput(
+      async (arguments_) => {
+        calls.push(arguments_[0] ?? "");
+        const result = emptyDockerResult();
+        if (calls.length === 2) {
+          reconciliation.abort();
+          materializedAfterCutoff = true;
+        }
+        return result;
+      },
+      "late-materialization",
+      capability,
+      {
+        cleanupSignal: new AbortController().signal,
+        reconciliationSignal: reconciliation.signal,
+      },
+    );
+    expect(cleanup).toBe("unverified");
+    expect(materializedAfterCutoff).toBe(true);
+    expect(calls).toEqual(["ps", "ps"]);
+  });
+
+  test("finishes exact cleanup after discovery reaches the cutoff", async () => {
+    const reconciliation = new AbortController();
+    const calls: string[] = [];
+    const inspection = JSON.stringify({
+      Id: containerId,
+      Name: "/owned",
+      Config: { Labels: { ["com.quadball-timer.sqlite-probe"]: capability } },
+    });
+    const cleanup = await cleanupMalformedCreateOutput(
+      async (arguments_) => {
+        calls.push(arguments_[0] ?? "");
+        if (arguments_[0] === "inspect") {
+          await Bun.sleep(10);
+          return dockerResult(inspection);
+        }
+        if (arguments_[0] === "rm") {
+          await Bun.sleep(10);
+          return dockerResult();
+        }
+        if (arguments_[0] === "ps" && arguments_.includes("name=^/owned$"))
+          return dockerResult(`${containerId}\n`);
+        if (
+          arguments_[0] === "ps" &&
+          arguments_.includes(`label=${"com.quadball-timer.sqlite-probe=" + capability}`)
+        ) {
+          reconciliation.abort();
+          return dockerResult(`${containerId}\n`);
+        }
+        await Bun.sleep(10);
+        return dockerResult();
+      },
+      "owned",
+      capability,
+      {
+        cleanupSignal: new AbortController().signal,
+        reconciliationSignal: reconciliation.signal,
+      },
+    );
+    expect(cleanup).toBe("removed");
+    expect(calls).toEqual(["ps", "ps", "inspect", "rm", "ps"]);
+  });
+
+  test("keeps an exact first-dimension ID when the second query sees cutoff", async () => {
+    const reconciliation = new AbortController();
+    const calls: string[] = [];
+    const inspection = JSON.stringify({
+      Id: containerId,
+      Name: "/owned",
+      Config: { Labels: { ["com.quadball-timer.sqlite-probe"]: capability } },
+    });
+    const cleanup = await cleanupMalformedCreateOutput(
+      async (arguments_) => {
+        calls.push(arguments_[0] ?? "");
+        if (arguments_[0] === "ps" && arguments_.includes("name=^/owned$")) {
+          reconciliation.abort();
+          return dockerResult(`${containerId}\n`);
+        }
+        if (arguments_[0] === "inspect") return dockerResult(inspection);
+        if (arguments_[0] === "rm") return dockerResult();
+        return dockerResult();
+      },
+      "owned",
+      capability,
+      {
+        cleanupSignal: new AbortController().signal,
+        reconciliationSignal: reconciliation.signal,
+      },
+    );
+    expect(cleanup).toBe("removed");
+    expect(calls).toEqual(["ps", "inspect", "rm", "ps"]);
+  });
+
+  test("keeps an exact second-dimension ID when the first query is empty", async () => {
+    const reconciliation = new AbortController();
+    const calls: string[] = [];
+    const inspection = JSON.stringify({
+      Id: containerId,
+      Name: "/owned",
+      Config: { Labels: { ["com.quadball-timer.sqlite-probe"]: capability } },
+    });
+    const cleanup = await cleanupMalformedCreateOutput(
+      async (arguments_) => {
+        calls.push(arguments_[0] ?? "");
+        if (arguments_[0] === "ps" && arguments_.includes("name=^/owned$")) return dockerResult();
+        if (
+          arguments_[0] === "ps" &&
+          arguments_.includes(`label=${"com.quadball-timer.sqlite-probe=" + capability}`)
+        ) {
+          reconciliation.abort();
+          return dockerResult(`${containerId}\n`);
+        }
+        if (arguments_[0] === "inspect") return dockerResult(inspection);
+        if (arguments_[0] === "rm") return dockerResult();
+        return dockerResult();
+      },
+      "owned",
+      capability,
+      {
+        cleanupSignal: new AbortController().signal,
+        reconciliationSignal: reconciliation.signal,
+      },
+    );
+    expect(cleanup).toBe("removed");
+    expect(calls).toEqual(["ps", "ps", "inspect", "rm", "ps"]);
+  });
+
+  test("fails closed at the reconciliation cutoff for persistent one-sided visibility", async () => {
+    const changedLabelCommands: string[] = [];
+    const changedLabel = await cleanupMalformedCreateOutput(
+      async (arguments_) => {
+        changedLabelCommands.push(arguments_[0] ?? "");
+        return {
+          exitCode: 0,
+          stdout:
+            arguments_[0] === "ps" && arguments_.includes("name=^/owned$")
+              ? `${containerId}\n`
+              : "",
+          stderr: "",
+          stdoutBytes: 65,
+          stderrBytes: 0,
+          outputExceeded: false,
+        };
+      },
+      "owned",
+      capability,
+      cleanupLifecycle(35),
+    );
+    expect(changedLabel).toBe("unverified");
+    expect(changedLabelCommands).not.toContain("inspect");
+    expect(changedLabelCommands).not.toContain("rm");
+
+    const changedNameCommands: string[] = [];
+    const changedName = await cleanupMalformedCreateOutput(
+      async (arguments_) => {
+        changedNameCommands.push(arguments_[0] ?? "");
+        return {
+          exitCode: 0,
+          stdout:
+            arguments_[0] === "ps" &&
+            arguments_.includes(`label=com.quadball-timer.sqlite-probe=${capability}`)
+              ? `${containerId}\n`
+              : "",
+          stderr: "",
+          stdoutBytes: 65,
+          stderrBytes: 0,
+          outputExceeded: false,
+        };
+      },
+      "owned",
+      capability,
+      cleanupLifecycle(35),
+    );
+    expect(changedName).toBe("unverified");
+    expect(changedNameCommands).not.toContain("inspect");
+    expect(changedNameCommands).not.toContain("rm");
+
+    const otherContainerId = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+    const mismatched = await cleanupMalformedCreateOutput(
+      async (arguments_) => ({
+        exitCode: 0,
+        stdout: arguments_.includes("name=^/owned$") ? `${containerId}\n` : `${otherContainerId}\n`,
+        stderr: "",
+        stdoutBytes: 65,
+        stderrBytes: 0,
+        outputExceeded: false,
+      }),
+      "owned",
+      capability,
+      cleanupLifecycle(35),
+    );
+    expect(mismatched).toBe("unverified");
   });
 
   test("does not clean up from failed or ambiguous discovery output", async () => {
@@ -722,6 +1044,7 @@ describe("Docker SQLite qualification boundary", () => {
       },
       "owned",
       capability,
+      cleanupLifecycle(35),
     );
     expect(failed).toBe("unverified");
     expect(commandNames).toEqual(["ps"]);
