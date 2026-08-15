@@ -103,6 +103,169 @@ describe("Event operations catalog", () => {
     ]);
   });
 
+  test("publishes with a schedule warning, requires impact confirmation, and keeps private audit evidence", async () => {
+    const fixture = createFixture();
+    const event = await fixture.catalog.createEvent(
+      { name: "Publication", timeZone: "UTC" },
+      authority,
+    );
+    if (event.status !== "accepted") throw new Error("Expected Event.");
+
+    expect(
+      await fixture.catalog.changePublicationStatus(
+        event.value.eventId,
+        { status: "published" },
+        authority,
+      ),
+    ).toMatchObject({ status: "rejected", reason: "invalid-input" });
+    await fixture.catalog.addGameDay(event.value.eventId, { date: "2026-08-14" }, authority);
+    const published = await fixture.catalog.changePublicationStatus(
+      event.value.eventId,
+      { status: "published" },
+      authority,
+    );
+    expect(published).toMatchObject({
+      status: "accepted",
+      value: {
+        previousStatus: "unpublished",
+        publicationStatus: "published",
+        warnings: [
+          "missing-event-teams",
+          "missing-pitches",
+          "missing-gameplay-slots",
+          "missing-pitch-slots",
+          "missing-event-games",
+        ],
+        event: { publicationStatus: "published" },
+      },
+    });
+    expect(
+      await fixture.catalog.changePublicationStatus(
+        event.value.eventId,
+        { status: "unpublished" },
+        authority,
+      ),
+    ).toMatchObject({ status: "rejected", reason: "invalid-input" });
+    expect(
+      await fixture.catalog.changePublicationStatus(
+        event.value.eventId,
+        { status: "unpublished", impactConfirmed: true },
+        authority,
+      ),
+    ).toMatchObject({ status: "accepted", value: { event: { publicationStatus: "unpublished" } } });
+    expect(
+      await fixture.catalog.changePublicationStatus(
+        event.value.eventId,
+        { status: "cancelled" },
+        authority,
+      ),
+    ).toMatchObject({ status: "accepted", value: { event: { publicationStatus: "cancelled" } } });
+
+    const audit = await fixture.catalog.listAuditTrail(event.value.eventId, authority);
+    if (audit.status !== "accepted") throw new Error("Expected audit trail.");
+    const publicationAudits = audit.value.filter(
+      (entry) => entry.action === "event-publication-changed",
+    );
+    expect(publicationAudits).toHaveLength(3);
+    const firstPublication = publicationAudits.find(
+      (entry) => (entry.after as { publicationStatus?: string }).publicationStatus === "published",
+    );
+    expect(firstPublication).toMatchObject({
+      before: { publicationStatus: "unpublished" },
+      after: { publicationStatus: "published" },
+    });
+    expect(firstPublication?.after).not.toHaveProperty("reason");
+  });
+
+  test("rolls back a publication transition when the catalog transaction fails", async () => {
+    const fixture = createFixture();
+    const event = await fixture.catalog.createEvent({ name: "Atomic", timeZone: "UTC" }, authority);
+    if (event.status !== "accepted") throw new Error("Expected Event.");
+    await fixture.catalog.addGameDay(event.value.eventId, { date: "2026-08-14" }, authority);
+    fixture.storage.failNextTransaction(new Error("commit failed"));
+    expect(
+      await fixture.catalog.changePublicationStatus(
+        event.value.eventId,
+        { status: "published" },
+        authority,
+      ),
+    ).toMatchObject({ status: "retryable-failure" });
+    expect(await fixture.catalog.inspectEvent(event.value.eventId, authority)).toMatchObject({
+      status: "accepted",
+      value: { publicationStatus: "unpublished" },
+    });
+  });
+
+  test("warns about unresolved matchups after the Event schedule categories exist", async () => {
+    const fixture = createFixture();
+    const event = await fixture.catalog.createEvent(
+      { name: "Unresolved", timeZone: "UTC" },
+      authority,
+    );
+    if (event.status !== "accepted") throw new Error("Expected Event.");
+    const day = await fixture.catalog.addGameDay(
+      event.value.eventId,
+      { date: "2026-08-14" },
+      authority,
+    );
+    const pitch = await fixture.catalog.createPitch(
+      event.value.eventId,
+      { name: "Pitch" },
+      authority,
+    );
+    const blue = await fixture.catalog.createEventTeam(
+      event.value.eventId,
+      { name: "Blue" },
+      authority,
+    );
+    const red = await fixture.catalog.createEventTeam(
+      event.value.eventId,
+      { name: "Red" },
+      authority,
+    );
+    if (
+      day.status !== "accepted" ||
+      pitch.status !== "accepted" ||
+      blue.status !== "accepted" ||
+      red.status !== "accepted"
+    )
+      throw new Error("Expected Event schedule setup.");
+    const slot = await fixture.catalog.createGameplaySlot(
+      event.value.eventId,
+      day.value.gameDayId,
+      { sequence: 1, scheduledStart: "2026-08-14T10:00" },
+      authority,
+    );
+    if (slot.status !== "accepted") throw new Error("Expected Gameplay Slot.");
+    const pitchSlot = (await fixture.storage.snapshot()).listPitchSlots(
+      day.value.gameDayId,
+      pitch.value.pitchId,
+    )[0];
+    if (pitchSlot === undefined) throw new Error("Expected Pitch Slot.");
+    const game = await fixture.catalog.createEventGame(
+      event.value.eventId,
+      day.value.gameDayId,
+      {
+        gameplaySlotId: slot.value.gameplaySlotId,
+        pitchSlotId: pitchSlot.pitchSlotId,
+        sideA: { sourceLabel: "Winner A" },
+        sideB: { sourceLabel: "Winner B" },
+      },
+      authority,
+    );
+    if (game.status !== "accepted") throw new Error("Expected Event Game.");
+    expect(
+      await fixture.catalog.changePublicationStatus(
+        event.value.eventId,
+        { status: "published" },
+        authority,
+      ),
+    ).toMatchObject({
+      status: "accepted",
+      value: { warnings: ["unresolved-matchups"] },
+    });
+  });
+
   test("only the verified Technical Admin can mutate metadata and Game Days", async () => {
     const fixture = createFixture();
     expect(

@@ -127,7 +127,7 @@ export type StoredEventCatalogEvent = {
   eventId: string;
   name: string;
   timeZone: string;
-  publicationStatus: "unpublished";
+  publicationStatus: "unpublished" | "published" | "cancelled";
   createdAtMs: number;
   updatedAtMs: number;
 };
@@ -228,7 +228,8 @@ export type EventCatalogAuditEntry = {
     | "gameplay-slot-created"
     | "pitch-slot-created"
     | "event-game-created"
-    | "event-game-teams-confirmed";
+    | "event-game-teams-confirmed"
+    | "event-publication-changed";
   eventId: string;
   gameDayId: string | null;
   actorReference: string;

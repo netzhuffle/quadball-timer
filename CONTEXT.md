@@ -185,7 +185,7 @@ A person holding the Event's shared Event Admin Grant. Event Admins create and m
 _Avoid_: Pitch Manager, Controller
 
 **Technical Admin**:
-The sole operator authorized to create Events, change event-level metadata and Publication Status, and manage Event Admin Grants. A Technical Admin may enter the Event Admin interface and exercise every Event Admin capability. Routine administration uses the passkey-authenticated browser interface; a host-local CLI additionally provides selected administration and recovery workflows.
+The sole operator authorized to create Events, change event-level metadata, and manage Event Admin Grants. A Technical Admin may enter the Event Admin interface and exercise every Event Admin capability, including managing Publication Status alongside an Event Admin. Routine administration uses the passkey-authenticated browser interface; a host-local CLI additionally provides selected administration and recovery workflows.
 _Avoid_: Event Admin, Pitch Manager
 
 **Technical Admin Passkey**:

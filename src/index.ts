@@ -38,6 +38,11 @@ import {
   type CatalogOutcome,
 } from "@/lib/event-catalog";
 import {
+  createAudienceProjection,
+  PUBLIC_AUDIENCE_ABSENCE,
+  type AudienceProjectionReader,
+} from "@/lib/audience-projection";
+import {
   createEventAdministration,
   type EventAdministration,
   type EventAdministrationAuthority,
@@ -181,6 +186,7 @@ async function startServer() {
     }
 
     const eventCatalog = createEventCatalog(eventCatalogStorage, {});
+    const audienceProjection = createAudienceProjection(eventCatalogStorage);
     let eventAdministration: EventAdministration | null = null;
     if (foundationStorage !== undefined) {
       try {
@@ -295,6 +301,11 @@ async function startServer() {
               adHocService,
               requestSource(req, technicalAdminConfig.trustProxyHeaders),
             );
+          },
+        },
+        "/api/audience/events/:eventId": {
+          GET(req: Request) {
+            return readAudienceEvent(req, audienceProjection);
           },
         },
         "/api/games/:gameId": {
@@ -579,6 +590,30 @@ async function startServer() {
             return catalogResponse(await eventCatalog.removeEvent(eventId, token));
           },
         },
+        "/api/admin/events/:eventId/publication-status": {
+          async POST(req: Request) {
+            const token = requireTechnicalAdminMutationToken(req, technicalAdminAuth);
+            if (token === null) return genericAuthFailure(401);
+            const body = await readJsonRecord(req);
+            if (body === null)
+              return json(
+                {
+                  status: "rejected",
+                  reason: "invalid-input",
+                  detail: "JSON body must be an object.",
+                },
+                400,
+              );
+            const eventId = new URL(req.url).pathname.split("/").at(-2) ?? "";
+            return catalogResponse(
+              await eventCatalog.changePublicationStatus(
+                eventId,
+                { status: body.status, impactConfirmed: body.impactConfirmed },
+                token,
+              ),
+            );
+          },
+        },
         "/api/admin/events/:eventId/game-days": {
           async POST(req: Request) {
             const token = requireTechnicalAdminMutationToken(req, technicalAdminAuth);
@@ -738,6 +773,23 @@ async function startServer() {
               authority,
             });
             return sensitiveEventAdministrationResponse(result);
+          },
+        },
+        "/api/event-admin/events/:eventId/publication-status": {
+          async POST(req: Request) {
+            if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
+            const authority = resolveEventAdministrationAuthority(req, technicalAdminAuth);
+            const body = await readJsonRecord(req);
+            const eventId = new URL(req.url).pathname.split("/").at(-2) ?? "";
+            if (authority === null || body === null) return sensitiveGenericAuthFailure(401);
+            return sensitiveEventAdministrationMutationResponse(
+              await eventAdministration.changePublicationStatus(
+                eventId,
+                { status: body.status, impactConfirmed: body.impactConfirmed },
+                authority,
+              ),
+              authority,
+            );
           },
         },
         "/api/event-admin/events/:eventId/teams": {
@@ -953,6 +1005,13 @@ async function startServer() {
             return result.status === "accepted" ? index : adHocUnavailableResponse();
           },
         },
+        "/admin": index,
+        "/admin/enroll": index,
+        "/events": index,
+        "/color-test": index,
+        "/prototype/event-operations": index,
+        "/event-admin": index,
+        "/event-control": index,
         "/*": adHocFallbackRoute,
       },
       development: process.env.NODE_ENV !== "production" && {
@@ -1189,6 +1248,16 @@ export async function readGame(req: Request, service: AdHocGamesService = defaul
   return result.status === "accepted"
     ? sensitiveJson({ game: stripSession(result.game) })
     : adHocUnavailableResponse(service);
+}
+
+export async function readAudienceEvent(
+  req: Request,
+  projection: AudienceProjectionReader,
+): Promise<Response> {
+  const eventId = new URL(req.url).pathname.split("/").at(-1) ?? "";
+  const result = await projection.read(eventId);
+  if (result.status === "accepted") return sensitiveJson(result);
+  return sensitiveJson(PUBLIC_AUDIENCE_ABSENCE, 404);
 }
 
 export async function leaveGame(req: Request, service: AdHocGamesService = defaultAdHocService) {

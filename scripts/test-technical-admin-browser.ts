@@ -196,6 +196,30 @@ try {
     (event) => event.name === "Browser Event Updated",
   )?.eventId;
   if (!eventId) throw new Error("Browser Event was not returned by the catalog.");
+
+  const currentCsrfToken = (await context.cookies()).find(
+    (cookie) => cookie.name === "__Host-technical-admin-csrf",
+  )?.value;
+  if (!currentCsrfToken) throw new Error("Technical Admin CSRF cookie was not retained.");
+  const zeroDayResponse = await context.request.post(`${origin}/api/admin/events`, {
+    data: { name: "Zero Day Browser Event", timeZone: "UTC" },
+    headers: { origin, "x-technical-admin-csrf": currentCsrfToken },
+  });
+  const zeroDayPayload = (await zeroDayResponse.json()) as {
+    status: string;
+    value?: { eventId?: string };
+  };
+  const zeroDayEventId = zeroDayPayload.value?.eventId;
+  assert(
+    zeroDayResponse.status() === 201 && zeroDayEventId !== undefined,
+    "zero-Day browser Event creation failed",
+  );
+  await page.goto(`${origin}/event-admin?eventId=${zeroDayEventId}`);
+  await page.getByText("Event Hub", { exact: true }).waitFor();
+  await page.getByRole("button", { name: "Published Event", exact: true }).click();
+  await page.getByText("Publishing requires at least one Game Day.", { exact: true }).waitFor();
+  await page.goto(`${origin}/admin`);
+  await page.getByText("Technical Admin administration").waitFor();
   await page.getByRole("button", { name: /Browser Event Updated/ }).click();
   await page.getByRole("button", { name: "Create Grant" }).click();
   const revealResponsePromise = page.waitForResponse(
@@ -306,6 +330,54 @@ try {
   );
   await eventAdminPage.getByRole("button", { name: "Refresh Slot setup" }).click();
   await eventAdminPage.getByText("Opening", { exact: true }).waitFor();
+  await eventAdminPage.getByRole("button", { name: "Published Event", exact: true }).click();
+  const publicationWarning = eventAdminPage.getByText(/Published with incomplete schedule:/u);
+  await publicationWarning.waitFor();
+  const publicationWarningText = await publicationWarning.innerText();
+  assert(
+    publicationWarningText.includes("Gameplay Slots") &&
+      publicationWarningText.includes("Pitch Slots") &&
+      publicationWarningText.includes("Event Games"),
+    "publication warning did not identify incomplete schedule categories",
+  );
+  const publishedAudience = await eventAdminContext.request.get(
+    `${origin}/api/audience/events/${eventId}`,
+  );
+  assert(publishedAudience.status() === 200, "published Event was not anonymously available");
+  const publishedAudiencePayload = await publishedAudience.json();
+  assert(
+    publishedAudiencePayload.value?.auditTrail === undefined &&
+      publishedAudiencePayload.value?.publicationStatus === "published",
+    "anonymous projection leaked private publication history",
+  );
+  const unpublishedButton = eventAdminPage.getByRole("button", {
+    name: "Unpublished Event",
+    exact: true,
+  });
+  assert(await unpublishedButton.isDisabled(), "leaving Published was not gated by confirmation");
+  await eventAdminPage.getByLabel("Confirm leaving Published").check();
+  assert(!(await unpublishedButton.isDisabled()), "impact confirmation did not enable hiding");
+  await unpublishedButton.click();
+  await eventAdminPage.getByText("Publication Status updated.", { exact: true }).waitFor();
+  const unpublishedAudience = await eventAdminContext.request.get(
+    `${origin}/api/audience/events/${eventId}`,
+  );
+  assert(unpublishedAudience.status() === 404, "unpublished Event remained anonymously available");
+  await eventAdminPage.getByRole("button", { name: "Published Event", exact: true }).click();
+  await eventAdminPage.getByLabel("Confirm leaving Published").check();
+  await eventAdminPage.getByRole("button", { name: "Cancel Event", exact: true }).click();
+  const cancelledAudience = await eventAdminContext.request.get(
+    `${origin}/api/audience/events/${eventId}`,
+  );
+  assert(cancelledAudience.status() === 404, "cancelled Event remained anonymously available");
+  const unknownAudience = await eventAdminContext.request.get(
+    `${origin}/api/audience/events/unknown-event`,
+  );
+  assert(
+    unknownAudience.status() === cancelledAudience.status() &&
+      (await unknownAudience.text()) === (await cancelledAudience.text()),
+    "unknown Event did not use the same anonymous absence response",
+  );
   await eventAdminPage
     .getByText(/Slot 1.*10:00/u)
     .last()

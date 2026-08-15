@@ -36,7 +36,14 @@ import type {
 import type { EventGameRecordRoot } from "@/lib/foundation-record-types";
 import { createInMemoryFoundationStorage } from "@/lib/foundation-storage-memory";
 
-export type EventPublicationStatus = "unpublished";
+export type EventPublicationStatus = "unpublished" | "published" | "cancelled";
+export type EventPublicationWarning =
+  | "missing-event-teams"
+  | "missing-pitches"
+  | "missing-gameplay-slots"
+  | "missing-pitch-slots"
+  | "missing-event-games"
+  | "unresolved-matchups";
 export type EventLifecycle = "unscheduled" | "future" | "current" | "past";
 export type GameDayClassification = "future" | "current" | "past";
 
@@ -73,6 +80,13 @@ export type EventProjection = StoredEvent & {
   pitchSlots: readonly PitchSlot[];
   eventGames: readonly EventGame[];
   auditTrail: readonly EventAdministrationAuditEntry[];
+};
+
+export type EventPublicationStatusChange = {
+  event: EventProjection;
+  previousStatus: EventPublicationStatus;
+  publicationStatus: EventPublicationStatus;
+  warnings: readonly EventPublicationWarning[];
 };
 
 /** Shared projection seam for composed Event Administration workflows. */
@@ -140,6 +154,10 @@ export type EventCatalogOptions = {
 };
 
 export type EventCatalogMutationOperations = {
+  changePublicationStatus(
+    eventId: unknown,
+    input: { status: unknown; impactConfirmed?: unknown },
+  ): CatalogOutcome<EventPublicationStatusChange>;
   createEventTeam(
     eventId: unknown,
     input: { name: unknown; defaultColor?: unknown },
@@ -263,6 +281,11 @@ export type EventCatalog = {
     input: { name?: unknown; timeZone?: unknown },
     authority: TechnicalAdminAuthority,
   ): Promise<CatalogOutcome<EventProjection>>;
+  changePublicationStatus(
+    eventId: unknown,
+    input: { status: unknown; impactConfirmed?: unknown },
+    authority: TechnicalAdminAuthority,
+  ): Promise<CatalogOutcome<EventPublicationStatusChange>>;
   addGameDay(
     eventId: unknown,
     input: { date: unknown },
@@ -532,6 +555,20 @@ export function createEventCatalog(
           ),
         );
       });
+    },
+
+    async changePublicationStatus(eventIdInput, input, authority) {
+      if (!isTechnicalAdminAuthority(authority)) return unauthorized();
+      return commit(storage, (transaction) =>
+        changePublicationStatusOperation(
+          transaction,
+          clock,
+          ids,
+          eventIdInput,
+          input,
+          authorityActor(authority),
+        ),
+      );
     },
 
     async addGameDay(eventIdInput, input, authority) {
@@ -941,6 +978,14 @@ function validateEventName(value: unknown) {
   );
 }
 
+function validatePublicationStatus(
+  value: unknown,
+): { ok: true; value: EventPublicationStatus } | { ok: false; error: string } {
+  if (value === "unpublished" || value === "published" || value === "cancelled")
+    return { ok: true, value };
+  return { ok: false, error: "Publication Status must be unpublished, published, or cancelled." };
+}
+
 function validateId(value: unknown, field: string) {
   return validateOpaqueIdentifier(value, field);
 }
@@ -1072,6 +1117,28 @@ function project(
   };
 }
 
+function projectEventFromTransaction(
+  transaction: EventCatalogStorageTransaction,
+  event: StoredEvent,
+  nowMs: number,
+): EventProjection {
+  const gameDays = transaction.listGameDays(event.eventId);
+  return project(
+    event,
+    gameDays,
+    transaction.listAuditTrail(event.eventId),
+    nowMs,
+    transaction.listEventTeams(event.eventId),
+    transaction
+      .listEventTeams(event.eventId)
+      .flatMap((team) => transaction.listRoster(team.eventTeamId)),
+    transaction.listPitches(event.eventId),
+    gameDays.flatMap((day) => transaction.listGameplaySlots(day.gameDayId)),
+    gameDays.flatMap((day) => transaction.listPitchSlots(day.gameDayId)),
+    gameDays.flatMap((day) => transaction.listEventGames(day.gameDayId)),
+  );
+}
+
 function projectDay(day: StoredGameDay, timeZone: string, nowMs: number): EventGameDay {
   const today = localDate(nowMs, timeZone);
   return {
@@ -1123,6 +1190,8 @@ function createMutationOperations(
   actorReference: string,
 ): EventCatalogMutationOperations {
   return {
+    changePublicationStatus: (eventId, input) =>
+      changePublicationStatusOperation(transaction, clock, ids, eventId, input, actorReference),
     createEventTeam: (eventId, input) =>
       createEventTeamOperation(transaction, clock, ids, eventId, input, actorReference),
     updateEventTeam: (eventId, eventTeamId, input) =>
@@ -1165,6 +1234,93 @@ function createMutationOperations(
         actorReference,
       ),
   };
+}
+
+function changePublicationStatusOperation(
+  transaction: EventCatalogStorageTransaction,
+  clock: EventCatalogClock,
+  ids: EventCatalogIds,
+  eventIdInput: unknown,
+  input: { status: unknown; impactConfirmed?: unknown },
+  actorReference: string,
+): CatalogOutcome<EventPublicationStatusChange> {
+  const eventId = validateId(eventIdInput, "eventId");
+  if (!eventId.ok) return invalid(eventId.error);
+  const status = validatePublicationStatus(input.status);
+  if (!status.ok) return invalid(status.error);
+  if (input.impactConfirmed !== undefined && typeof input.impactConfirmed !== "boolean")
+    return invalid("Publication impact confirmation must be a boolean.");
+  const nowMs = validNow(clock);
+  if (nowMs === null) return invalid("Event clock returned an invalid timestamp.");
+  const existing = transaction.findEvent(eventId.value);
+  if (existing === null) return notFound("Event was not found.");
+  if (existing.publicationStatus === status.value)
+    return noChange("Publication Status is unchanged.");
+  if (
+    existing.publicationStatus === "published" &&
+    status.value !== "published" &&
+    input.impactConfirmed !== true
+  )
+    return invalid("Impact confirmation is required before leaving Published.");
+  const gameDays = transaction.listGameDays(existing.eventId);
+  if (status.value === "published") {
+    if (existing.name.trim().length === 0 || existing.timeZone.trim().length === 0)
+      return invalid("Publishing requires an Event name and timezone.");
+    if (gameDays.length === 0) return invalid("Publishing requires at least one Game Day.");
+  }
+  const teams = transaction.listEventTeams(existing.eventId);
+  const pitches = transaction.listPitches(existing.eventId);
+  const daySchedules = gameDays.map((day) => ({
+    gameplaySlots: transaction.listGameplaySlots(day.gameDayId),
+    pitchSlots: transaction.listPitchSlots(day.gameDayId),
+    eventGames: transaction.listEventGames(day.gameDayId),
+  }));
+  const gameplaySlots = daySchedules.flatMap((day) => day.gameplaySlots);
+  const pitchSlots = daySchedules.flatMap((day) => day.pitchSlots);
+  const eventGames = daySchedules.flatMap((day) => day.eventGames);
+  const warnings: EventPublicationWarning[] = [];
+  if (teams.length === 0) warnings.push("missing-event-teams");
+  if (pitches.length === 0) warnings.push("missing-pitches");
+  if (gameplaySlots.length === 0 || daySchedules.some((day) => day.gameplaySlots.length === 0))
+    warnings.push("missing-gameplay-slots");
+  if (pitchSlots.length === 0 || daySchedules.some((day) => day.pitchSlots.length === 0))
+    warnings.push("missing-pitch-slots");
+  if (eventGames.length === 0 || daySchedules.some((day) => day.eventGames.length === 0))
+    warnings.push("missing-event-games");
+  if (
+    eventGames.some(
+      (game) =>
+        game.sideA.eventTeamId === null ||
+        game.sideB.eventTeamId === null ||
+        game.sideA.confirmedAtMs === null ||
+        game.sideB.confirmedAtMs === null,
+    )
+  )
+    warnings.push("unresolved-matchups");
+  const updated: StoredEvent = {
+    ...existing,
+    publicationStatus: status.value,
+    updatedAtMs: nowMs,
+  };
+  const audit = createAudit(
+    ids,
+    "event-publication-changed",
+    existing.eventId,
+    null,
+    actorReference,
+    nowMs,
+    existing,
+    updated,
+  );
+  transaction.updateEvent(updated);
+  transaction.appendAudit(audit);
+  const event = projectEventFromTransaction(transaction, updated, nowMs);
+  return accepted({
+    event,
+    previousStatus: existing.publicationStatus,
+    publicationStatus: updated.publicationStatus,
+    warnings: status.value === "published" ? warnings : [],
+  });
 }
 
 function createEventTeamOperation(

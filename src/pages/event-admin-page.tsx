@@ -12,6 +12,7 @@ type HubResponse = {
       name: string;
       timeZone: string;
       lifecycle: string;
+      publicationStatus: "unpublished" | "published" | "cancelled";
       gameDays: Array<{ gameDayId: string; date: string; classification: string }>;
       teams: Array<{
         eventTeamId: string;
@@ -61,6 +62,17 @@ type ScheduleResponse = {
   };
 };
 
+class EventPublicationValidationError extends Error {}
+
+const publicationWarningLabels: Record<string, string> = {
+  "missing-event-teams": "Event Teams",
+  "missing-pitches": "Pitches",
+  "missing-gameplay-slots": "Gameplay Slots",
+  "missing-pitch-slots": "Pitch Slots",
+  "missing-event-games": "Event Games",
+  "unresolved-matchups": "unresolved matchups or confirmed sides",
+};
+
 export function EventAdminPage() {
   const queryEventId = new URLSearchParams(window.location.search).get("eventId") ?? "";
   const [eventId, setEventId] = useState(queryEventId);
@@ -96,6 +108,7 @@ export function EventAdminPage() {
     pitchSlots: HubResponse["value"]["event"]["pitchSlots"];
     eventGames: HubResponse["value"]["event"]["eventGames"];
   } | null>(null);
+  const [publicationImpactConfirmed, setPublicationImpactConfirmed] = useState(false);
 
   const loadHub = async (nextGameDayId = selectedGameDayId) => {
     if (eventId.trim().length === 0) return;
@@ -173,6 +186,44 @@ export function EventAdminPage() {
     setPitchView(payload.value);
   };
 
+  const changePublicationStatus = async (status: "unpublished" | "published" | "cancelled") => {
+    if (hub === null) return;
+    const leavingPublished = hub.event.publicationStatus === "published" && status !== "published";
+    const response = await fetch(`/api/event-admin/events/${eventId}/publication-status`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        status,
+        impactConfirmed: leavingPublished ? publicationImpactConfirmed : undefined,
+      }),
+    });
+    const payload = (await response.json()) as {
+      status: "accepted" | "rejected" | "retryable-failure";
+      reason?: string;
+      detail?: string;
+      value?: { warnings?: readonly string[] };
+    };
+    if (
+      response.status === 400 &&
+      payload.status === "rejected" &&
+      payload.reason === "invalid-input" &&
+      typeof payload.detail === "string"
+    )
+      throw new EventPublicationValidationError(payload.detail);
+    if (!response.ok || payload.status !== "accepted")
+      throw new Error("Publication update failed.");
+    setPublicationImpactConfirmed(false);
+    const warningLabels = (payload.value?.warnings ?? []).map(
+      (warning) => publicationWarningLabels[warning] ?? "incomplete schedule content",
+    );
+    setMessage(
+      warningLabels.length > 0
+        ? `Published with incomplete schedule: ${warningLabels.join(", ")}.`
+        : "Publication Status updated.",
+    );
+    await loadHub(selectedGameDayId);
+  };
+
   const confirmGameplaySlot = async (
     gameplaySlotId: string,
     games: HubResponse["value"]["event"]["eventGames"],
@@ -205,8 +256,12 @@ export function EventAdminPage() {
     setMessage(null);
     try {
       await action();
-    } catch {
-      setMessage("Unable to authorize the Event Hub.");
+    } catch (error) {
+      setMessage(
+        error instanceof EventPublicationValidationError
+          ? error.message
+          : "Unable to authorize the Event Hub.",
+      );
     } finally {
       setBusy(false);
     }
@@ -275,8 +330,47 @@ export function EventAdminPage() {
               <div>
                 <p className="font-semibold">{hub.event.name}</p>
                 <p className="text-sm text-muted-foreground">
-                  {hub.event.timeZone} · {hub.authority}
+                  {hub.event.timeZone} · {hub.authority} · {hub.event.publicationStatus}
                 </p>
+              </div>
+              <div className="space-y-3 rounded-lg border p-3">
+                <p className="font-semibold">Publication Status</p>
+                <p className="text-sm text-muted-foreground">
+                  Only Published Events are visible to anonymous audiences.
+                </p>
+                {hub.event.publicationStatus === "published" ? (
+                  <label className="flex items-start gap-2 text-sm">
+                    <input
+                      aria-label="Confirm leaving Published"
+                      checked={publicationImpactConfirmed}
+                      onChange={(event) => setPublicationImpactConfirmed(event.target.checked)}
+                      type="checkbox"
+                    />
+                    <span>I understand that leaving Published removes public availability.</span>
+                  </label>
+                ) : null}
+                <div className="flex flex-wrap gap-2">
+                  {(["unpublished", "published", "cancelled"] as const).map((status) => {
+                    const leavingPublished =
+                      hub.event.publicationStatus === "published" && status !== "published";
+                    return (
+                      <Button
+                        key={status}
+                        disabled={
+                          busy ||
+                          hub.event.publicationStatus === status ||
+                          (leavingPublished && !publicationImpactConfirmed)
+                        }
+                        onClick={() => void run(() => changePublicationStatus(status))}
+                        variant={status === "published" ? "default" : "outline"}
+                      >
+                        {status === "cancelled"
+                          ? "Cancel Event"
+                          : `${status[0]?.toUpperCase()}${status.slice(1)} Event`}
+                      </Button>
+                    );
+                  })}
+                </div>
               </div>
               <div className="space-y-2">
                 <Label htmlFor="game-day-selector">Game Day</Label>
