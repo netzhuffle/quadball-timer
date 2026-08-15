@@ -1,5 +1,6 @@
 import type { ValidationResult } from "@/lib/validation-policy";
 import type { EventGameLifecyclePhase, EventGameRecordRoot } from "@/lib/foundation-record-types";
+import type { IqaSportingRules } from "@/lib/iqa-game-rules";
 import { canonicalizeJson, sha256 } from "@/lib/event-game-action-json";
 import {
   invalid,
@@ -260,6 +261,7 @@ export type IqaGameRulesRebuildInput = {
 export type IqaGameRulesInterpreter = {
   version: string;
   rebuild(input: IqaGameRulesRebuildInput): unknown;
+  sporting?: IqaSportingRules;
 };
 
 export type ControlActionCodec<TPayload = unknown> = {

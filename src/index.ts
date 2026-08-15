@@ -876,6 +876,15 @@ async function startServer() {
                 operations: parsed.message.commands,
               });
               if (result.status === "rejected") {
+                if (result.outcomes !== undefined) {
+                  await broadcastGameSnapshot({
+                    gameId: parsed.message.gameId,
+                    service: adHocService,
+                    sender: ws,
+                    senderAckedCommandIds: [],
+                    operationOutcomes: result.outcomes,
+                  });
+                }
                 sendMessage(ws, {
                   type: "error",
                   message:
@@ -890,6 +899,7 @@ async function startServer() {
                 service: adHocService,
                 sender: ws,
                 senderAckedCommandIds: result.ackedOperationIds,
+                operationOutcomes: result.outcomes,
               });
               return;
             }
@@ -1107,11 +1117,18 @@ async function broadcastGameSnapshot({
   service,
   sender,
   senderAckedCommandIds,
+  operationOutcomes,
 }: {
   gameId: string;
   service: AdHocGamesService;
   sender: ServerWebSocket<SessionData>;
   senderAckedCommandIds: string[];
+  operationOutcomes: readonly {
+    operationId: string;
+    workflow: "ad-hoc" | "event";
+    status: "accepted" | "duplicate" | "rejected" | "causally-blocked";
+    detail?: string;
+  }[];
 }) {
   await Promise.all(
     [...sockets].map(async (ws) => {
@@ -1131,6 +1148,7 @@ async function broadcastGameSnapshot({
         game: stripSession(game),
         serverNowMs,
         ackedCommandIds: ws === sender ? senderAckedCommandIds : [],
+        operationOutcomes,
       });
     }),
   );

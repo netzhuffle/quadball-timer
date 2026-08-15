@@ -11,6 +11,7 @@ import {
   rebuildControlActionHistory,
 } from "@/lib/event-game-actions";
 import { parseJsonValue, validateOverride } from "@/lib/event-game-action-codecs";
+import { DEFAULT_IQA_SPORTING_RULES } from "@/lib/iqa-game-rules";
 import {
   CLOCK_AUTHORITY_VERSION,
   deriveClockAuthority,
@@ -291,6 +292,7 @@ export function createLiveEventGameIqaInterpreter(
 ): IqaGameRulesInterpreter {
   return {
     version,
+    sporting: DEFAULT_IQA_SPORTING_RULES,
     rebuild({ root, canonicalActions, effectiveFacts }) {
       return deriveLiveEventGameState(
         root,

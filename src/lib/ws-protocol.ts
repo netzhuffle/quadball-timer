@@ -15,6 +15,8 @@ export type ClientCommandEnvelope = {
   id: string;
   clientSentAtMs: number;
   command: GameCommand;
+  workflow?: "ad-hoc";
+  causalPredecessorIds?: string[];
 };
 
 export type SubscribeLobbyMessage = {
@@ -57,6 +59,12 @@ export type ServerWsMessage =
       };
       serverNowMs: number;
       ackedCommandIds: string[];
+      operationOutcomes?: readonly {
+        operationId: string;
+        workflow: "ad-hoc" | "event";
+        status: "accepted" | "duplicate" | "rejected" | "causally-blocked";
+        detail?: string;
+      }[];
     };
 
 export function parseClientWsMessage(
@@ -208,10 +216,27 @@ export function parseClientWsMessage(
         };
       }
 
+      if (entry.workflow !== undefined && entry.workflow !== "ad-hoc") {
+        return { ok: false, error: "Unsupported Controller workflow." };
+      }
+      if (
+        entry.causalPredecessorIds !== undefined &&
+        (!Array.isArray(entry.causalPredecessorIds) ||
+          entry.causalPredecessorIds.some((predecessor) => typeof predecessor !== "string"))
+      ) {
+        return { ok: false, error: "Invalid causal predecessor identities." };
+      }
+
       commands.push({
         id: commandId.value,
         clientSentAtMs: clientSentAtMs.value,
         command: parsedCommand.command,
+        ...(entry.workflow === undefined
+          ? {}
+          : { workflow: entry.workflow === "ad-hoc" ? "ad-hoc" : undefined }),
+        ...(entry.causalPredecessorIds === undefined
+          ? {}
+          : { causalPredecessorIds: entry.causalPredecessorIds as string[] }),
       });
       commandIds.add(commandId.value);
     }

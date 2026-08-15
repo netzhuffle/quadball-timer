@@ -22,6 +22,7 @@ import type {
   OfficialOverrideMetadata,
 } from "@/lib/event-game-actions";
 import type { EventGameRecordRoot } from "@/lib/foundation-record-types";
+import { DEFAULT_IQA_SPORTING_RULES } from "@/lib/iqa-game-rules";
 
 const MAX_TIMESTAMP_MS = Number.MAX_SAFE_INTEGER;
 
@@ -53,6 +54,7 @@ export function createDefaultControlActionCodecs(): readonly ControlActionCodec[
 export function createDeterministicTestIqaInterpreter(version: string): IqaGameRulesInterpreter {
   return {
     version,
+    sporting: DEFAULT_IQA_SPORTING_RULES,
     rebuild({ canonicalActions, effectiveFacts }) {
       return {
         interpreterVersion: version,
