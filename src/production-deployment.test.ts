@@ -201,6 +201,9 @@ describe("Production deployment contract", () => {
     expect(wrapper).toContain("local previous_cleanup_allowed=0");
     expect(wrapper).toContain('stat_command="${QBT_FOCUSED_TEST_STAT:-stat}"');
     expect(wrapper).toContain('[[ -n "$previous_target" && "$previous_cleanup_allowed" == 1 ]]');
+    expect(wrapper).toContain('exec 8<"$previous_path"');
+    expect(wrapper).toContain('"/proc/self/fd/8"');
+    expect(wrapper).toContain("previous_fd_open=1");
     expect(wrapper).toContain(
       '[[ "$command" == "promote" ]] && foundation_backup_directory="$backup_directory"',
     );
