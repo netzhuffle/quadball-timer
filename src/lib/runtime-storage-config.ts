@@ -3,10 +3,12 @@ import { dirname, isAbsolute } from "node:path";
 import type { TechnicalAdminEnvironment } from "@/lib/technical-admin-auth";
 
 export const PRODUCTION_STATE_DIRECTORY = "/var/lib/quadball-timer";
+export const TEST_STATE_DIRECTORY = "/var/lib/quadball-timer-test";
 
 export type RuntimeStoragePaths = {
   technicalAdminDatabase: string;
   foundationDatabase: string;
+  eventGameDatabase: string;
 };
 
 export function readRuntimeStoragePaths(
@@ -17,6 +19,7 @@ export function readRuntimeStoragePaths(
     const canonicalPaths = {
       technicalAdminDatabase: `${PRODUCTION_STATE_DIRECTORY}/technical-admin.sqlite`,
       foundationDatabase: `${PRODUCTION_STATE_DIRECTORY}/foundation.sqlite`,
+      eventGameDatabase: `${PRODUCTION_STATE_DIRECTORY}/event-game.sqlite`,
     };
     requireCanonicalProductionPath(
       "TECHNICAL_ADMIN_DATABASE",
@@ -27,6 +30,11 @@ export function readRuntimeStoragePaths(
       "FOUNDATION_DATABASE",
       environmentVariables.FOUNDATION_DATABASE,
       canonicalPaths.foundationDatabase,
+    );
+    requireCanonicalProductionPath(
+      "EVENT_GAME_DATABASE",
+      environmentVariables.EVENT_GAME_DATABASE,
+      canonicalPaths.eventGameDatabase,
     );
     return canonicalPaths;
   }
@@ -39,6 +47,8 @@ export function readRuntimeStoragePaths(
       `${defaultDirectory}/technical-admin.sqlite`,
     foundationDatabase:
       environmentVariables.FOUNDATION_DATABASE?.trim() || `${defaultDirectory}/foundation.sqlite`,
+    eventGameDatabase:
+      environmentVariables.EVENT_GAME_DATABASE?.trim() || `${defaultDirectory}/event-game.sqlite`,
   };
 }
 
@@ -48,13 +58,21 @@ export function assertProductionStateBoundary(
 ): void {
   if (environment !== "production") return;
 
-  if (!isAbsolute(paths.technicalAdminDatabase) || !isAbsolute(paths.foundationDatabase)) {
+  if (
+    !isAbsolute(paths.technicalAdminDatabase) ||
+    !isAbsolute(paths.foundationDatabase) ||
+    !isAbsolute(paths.eventGameDatabase)
+  ) {
     throw new Error("Production database paths must be absolute.");
   }
 
   const technicalAdminDirectory = dirname(paths.technicalAdminDatabase);
-  const foundationDirectory = dirname(paths.foundationDatabase);
-  if (technicalAdminDirectory !== foundationDirectory) {
+  const databaseDirectories = [
+    technicalAdminDirectory,
+    dirname(paths.foundationDatabase),
+    dirname(paths.eventGameDatabase),
+  ];
+  if (databaseDirectories.some((directory) => directory !== technicalAdminDirectory)) {
     throw new Error("Production databases must use one state directory.");
   }
 
@@ -85,6 +103,22 @@ export function assertProductionStateBoundary(
   }
 
   assertTechnicalAdminDatabaseFile(paths.technicalAdminDatabase, currentUserId);
+}
+
+export function assertEnvironmentStorageBoundary(
+  environment: "production" | "test",
+  paths: RuntimeStoragePaths,
+): void {
+  if (environment !== "test") return;
+
+  const productionPrefix = `${PRODUCTION_STATE_DIRECTORY}/`;
+  if (
+    [paths.technicalAdminDatabase, paths.foundationDatabase, paths.eventGameDatabase].some(
+      (path) => path === PRODUCTION_STATE_DIRECTORY || path.startsWith(productionPrefix),
+    )
+  ) {
+    throw new Error("Test databases must not use Production state.");
+  }
 }
 
 function requireCanonicalProductionPath(

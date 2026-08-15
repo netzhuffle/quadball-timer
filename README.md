@@ -48,6 +48,16 @@ stored in `technical-admin.sqlite`, while Event administration foundation data
 uses the separate `foundation.sqlite` file. Activation fails before switching a
 release when the installed unit does not provide this state contract.
 
+The permanent Test Environment is deployed independently at
+`https://test.timer.quadball.app` by `.github/workflows/deploy-test.yml`. It uses
+the separate `quadball-timer-test` service on `127.0.0.1:3001`, release root
+`/srv/quadball-timer-test`, and state directory `/var/lib/quadball-timer-test`.
+Its root-controlled key file is `/etc/quadball-timer/test.env`; Test keys must
+never be copied from Production or committed to the repository. Test data is
+persistent across ordinary restarts but explicitly expendable and has no
+standing backup or availability guarantee. See
+`deploy/test-environment-provisioning.md` for the one-time privileged setup.
+
 Pushes to `main` skip CI and deployment when every changed path is limited to
 `AGENTS.md`, `CONTEXT.md`, `README.md`, `docs/`, or `.github/dependabot.yml`.
 Files under `docs/` are also excluded from formatting, linting, and type-aware

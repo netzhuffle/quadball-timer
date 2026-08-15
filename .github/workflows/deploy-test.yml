@@ -1,0 +1,136 @@
+name: Deploy Test Environment
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - AGENTS.md
+      - CONTEXT.md
+      - README.md
+      - docs/**
+      - .github/dependabot.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: timer-test-deploy
+  cancel-in-progress: false
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version-file: package.json
+
+      - name: Install ShellCheck
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends shellcheck
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Check
+        run: bun run check
+
+      - name: Test
+        run: bun run test
+
+      - name: Build Test executable
+        run: bun run build:executable
+
+      - name: Prepare Test release bundle
+        env:
+          SOURCE_COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          install -d release/deploy
+          install -m 755 dist/quadball-timer release/quadball-timer
+          install -m 755 deploy/activate-test-release.sh release/deploy/activate-test-release.sh
+          install -m 644 deploy/systemd/quadball-timer-test.service release/deploy/quadball-timer-test.service
+          executable_sha256="$(sha256sum release/quadball-timer | awk '{print $1}')"
+          printf '{"schemaVersion":1,"environment":"test","sourceCommit":"%s","executableSha256":"%s"}\n' "$SOURCE_COMMIT" "$executable_sha256" > release/release-manifest.json
+
+      - name: Audit Test release bundle
+        run: |
+          set -euo pipefail
+          find release -type f -print | sort
+          test "$(find release -type f | wc -l)" -eq 4
+          ! find release -type f \( -name '.env' -o -name '*.sqlite' -o -name '*.sqlite-*' -o -name '*secret*' -o -name '*credential*' \) -print -quit | grep -q .
+
+      - name: Upload Test release artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: test-release-${{ github.sha }}
+          path: release
+          if-no-files-found: error
+          retention-days: 7
+
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    needs: ci
+    runs-on: ubuntu-latest
+    environment:
+      name: test
+      url: https://test.timer.quadball.app
+    steps:
+      - name: Download Test release artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: test-release-${{ github.sha }}
+          path: release
+
+      - name: Configure SSH
+        env:
+          TEST_SSH_KEY: ${{ secrets.TEST_SSH_KEY }}
+          TEST_KNOWN_HOSTS: ${{ secrets.TEST_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          : "${TEST_SSH_KEY:?Missing TEST_SSH_KEY secret}"
+          : "${TEST_KNOWN_HOSTS:?Missing TEST_KNOWN_HOSTS secret}"
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$TEST_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$TEST_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+
+      - name: Sync Test release
+        env:
+          DEPLOY_HOST: ${{ secrets.TEST_HOST }}
+          DEPLOY_USER: ${{ secrets.TEST_USER }}
+          DEPLOY_BASE: ${{ vars.TEST_DEPLOY_BASE }}
+        run: |
+          set -euo pipefail
+          : "${DEPLOY_HOST:?Missing TEST_HOST secret}"
+          : "${DEPLOY_USER:?Missing TEST_USER secret}"
+          base_dir="${DEPLOY_BASE:-/srv/quadball-timer-test}"
+          release_id="${GITHUB_SHA}"
+          remote_release_dir="${base_dir}/releases/${release_id}"
+          ssh_opts="-i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=yes"
+          ssh $ssh_opts "${DEPLOY_USER}@${DEPLOY_HOST}" "mkdir -p '${remote_release_dir}'"
+          rsync -az --delete -e "ssh $ssh_opts" release/ "${DEPLOY_USER}@${DEPLOY_HOST}:${remote_release_dir}/"
+
+      - name: Activate Test release
+        env:
+          DEPLOY_HOST: ${{ secrets.TEST_HOST }}
+          DEPLOY_USER: ${{ secrets.TEST_USER }}
+          DEPLOY_BASE: ${{ vars.TEST_DEPLOY_BASE }}
+        run: |
+          set -euo pipefail
+          : "${DEPLOY_HOST:?Missing TEST_HOST secret}"
+          : "${DEPLOY_USER:?Missing TEST_USER secret}"
+          base_dir="${DEPLOY_BASE:-/srv/quadball-timer-test}"
+          release_id="${GITHUB_SHA}"
+          remote_release_dir="${base_dir}/releases/${release_id}"
+          ssh_opts="-i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=yes"
+          ssh $ssh_opts "${DEPLOY_USER}@${DEPLOY_HOST}" "chmod +x '${remote_release_dir}/deploy/activate-test-release.sh' '${remote_release_dir}/quadball-timer' && '${remote_release_dir}/deploy/activate-test-release.sh' --release '${release_id}'"
