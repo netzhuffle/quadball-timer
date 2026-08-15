@@ -24,6 +24,7 @@ describe("Event Game Controller reconnect browser seam", () => {
   let container: HTMLDivElement;
   let root: Root;
   let replayMode: "lost" | "success" | "deferred";
+  let openBodies: Record<string, unknown>[];
   let replayCalls: number;
   let replayBodies: Record<string, any>[];
   let intentCalls: number;
@@ -39,6 +40,7 @@ describe("Event Game Controller reconnect browser seam", () => {
 
   beforeEach(() => {
     replayMode = "lost";
+    openBodies = [];
     replayCalls = 0;
     replayBodies = [];
     intentCalls = 0;
@@ -62,6 +64,7 @@ describe("Event Game Controller reconnect browser seam", () => {
         const url =
           typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
         if (url.endsWith("/api/event-control/open")) {
+          openBodies.push(JSON.parse(typeof init?.body === "string" ? init.body : "{}"));
           return new Response(
             JSON.stringify({
               status: "opened",
@@ -199,13 +202,7 @@ describe("Event Game Controller reconnect browser seam", () => {
     });
     const grantInput = container.querySelector("input#control-grant") as HTMLInputElement;
     await act(async () => {
-      grantInput.value = "qr-credential";
-      grantInput.dispatchEvent(
-        new testWindow.Event("input", { bubbles: true }) as unknown as Event,
-      );
-      grantInput.dispatchEvent(
-        new testWindow.Event("change", { bubbles: true }) as unknown as Event,
-      );
+      setInputValue(grantInput, "qr-credential");
       await Promise.resolve();
     });
     await act(async () => {
@@ -214,7 +211,25 @@ describe("Event Game Controller reconnect browser seam", () => {
         ?.click();
       await Promise.resolve();
       await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
     });
+  }
+
+  function setInputValue(input: HTMLInputElement, value: string) {
+    const setter = Object.getOwnPropertyDescriptor(
+      testWindow.HTMLInputElement.prototype,
+      "value",
+    )?.set;
+    setter?.call(input, value);
+    input.dispatchEvent(new testWindow.Event("input", { bubbles: true }) as unknown as Event);
+    input.dispatchEvent(new testWindow.Event("change", { bubbles: true }) as unknown as Event);
   }
 
   afterEach(async () => {
@@ -243,13 +258,7 @@ describe("Event Game Controller reconnect browser seam", () => {
     });
     const grantInput = container.querySelector("input#control-grant") as HTMLInputElement;
     await act(async () => {
-      grantInput.value = "qr-credential";
-      grantInput.dispatchEvent(
-        new testWindow.Event("input", { bubbles: true }) as unknown as Event,
-      );
-      grantInput.dispatchEvent(
-        new testWindow.Event("change", { bubbles: true }) as unknown as Event,
-      );
+      setInputValue(grantInput, "qr-credential");
       await Promise.resolve();
     });
     const openButton = Array.from(container.getElementsByTagName("button")).find((button) =>
@@ -275,6 +284,72 @@ describe("Event Game Controller reconnect browser seam", () => {
       testWindow.localStorage.getItem(controllerReplicaStorageKey("game-browser")) ?? "null",
     ) as { pendingActions?: unknown[] };
     expect(stored.pendingActions).toHaveLength(1);
+  });
+
+  test("requires exactly one Controller credential and keeps both/none local", async () => {
+    await act(async () => {
+      root.render(<EventGameControllerPage />);
+      await Promise.resolve();
+    });
+    const qrInput = container.querySelector("input#control-grant") as HTMLInputElement;
+    const codeInput = container.querySelector("input#control-grant-code") as HTMLInputElement;
+    const openButton = () =>
+      Array.from(container.getElementsByTagName("button")).find((button) =>
+        button.textContent?.includes("Open Controller"),
+      );
+
+    await act(async () => {
+      setInputValue(qrInput, "qr-credential");
+      setInputValue(codeInput, "alpha-bravo-123");
+      await Promise.resolve();
+      openButton()?.click();
+      await Promise.resolve();
+    });
+    expect(openBodies).toHaveLength(0);
+    expect(container.textContent).toContain(
+      "Enter exactly one Controller QR credential or Grant Code.",
+    );
+
+    await act(async () => {
+      setInputValue(qrInput, "");
+      setInputValue(codeInput, "");
+      await Promise.resolve();
+      openButton()?.click();
+      await Promise.resolve();
+    });
+    expect(openBodies).toHaveLength(0);
+    expect(container.textContent).toContain(
+      "Enter exactly one Controller QR credential or Grant Code.",
+    );
+  });
+
+  test("sends a code-only Controller admission and clears both inputs after acceptance", async () => {
+    await act(async () => {
+      root.render(<EventGameControllerPage />);
+      await Promise.resolve();
+    });
+    const qrInput = container.querySelector("input#control-grant") as HTMLInputElement;
+    const codeInput = container.querySelector("input#control-grant-code") as HTMLInputElement;
+    await act(async () => {
+      setInputValue(codeInput, "alpha-bravo-123");
+      await Promise.resolve();
+      Array.from(container.getElementsByTagName("button"))
+        .find((button) => button.textContent?.includes("Open Controller"))
+        ?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(openBodies).toEqual([
+      { grantCode: "alpha-bravo-123", browserContext: expect.any(String) },
+    ]);
+    expect(qrInput.value).toBe("");
+    expect(codeInput.value).toBe("");
   });
 
   test("renders stable fact identity and sends a contextual Correction from the browser seam", async () => {
@@ -306,13 +381,7 @@ describe("Event Game Controller reconnect browser seam", () => {
     });
     const grantInput = container.querySelector("input#control-grant") as HTMLInputElement;
     await act(async () => {
-      grantInput.value = "qr-credential";
-      grantInput.dispatchEvent(
-        new testWindow.Event("input", { bubbles: true }) as unknown as Event,
-      );
-      grantInput.dispatchEvent(
-        new testWindow.Event("change", { bubbles: true }) as unknown as Event,
-      );
+      setInputValue(grantInput, "qr-credential");
       await Promise.resolve();
     });
     await act(async () => {
@@ -648,13 +717,7 @@ describe("Event Game Controller reconnect browser seam", () => {
     });
     const grantInput = container.querySelector("input#control-grant") as HTMLInputElement;
     await act(async () => {
-      grantInput.value = "qr-credential";
-      grantInput.dispatchEvent(
-        new testWindow.Event("input", { bubbles: true }) as unknown as Event,
-      );
-      grantInput.dispatchEvent(
-        new testWindow.Event("change", { bubbles: true }) as unknown as Event,
-      );
+      setInputValue(grantInput, "qr-credential");
       await Promise.resolve();
     });
     await act(async () => {
@@ -691,13 +754,7 @@ describe("Event Game Controller reconnect browser seam", () => {
     });
     const grantInput = container.querySelector("input#control-grant") as HTMLInputElement;
     await act(async () => {
-      grantInput.value = "qr-credential";
-      grantInput.dispatchEvent(
-        new testWindow.Event("input", { bubbles: true }) as unknown as Event,
-      );
-      grantInput.dispatchEvent(
-        new testWindow.Event("change", { bubbles: true }) as unknown as Event,
-      );
+      setInputValue(grantInput, "qr-credential");
       await Promise.resolve();
     });
     await act(async () => {

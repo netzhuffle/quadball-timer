@@ -212,6 +212,7 @@ export type OpenControllerResult =
         grantSessionId: string;
         grantVersion: string;
       };
+      sessionExpiresAtMs: number | null;
       projection: ControllerProjection | null;
       projectionStatus: "available" | "unavailable";
       synchronization: ControllerSynchronization;
@@ -255,6 +256,8 @@ export type LiveEventGameControlOptions = {
   grantAuthority: Pick<
     TypedGrantAuthority,
     | "admitGrant"
+    | "admitGrantCode"
+    | "admitControlGrantCode"
     | "authorizeGrant"
     | "acceptControlGrantSessionSwitch"
     | "revealGrant"
@@ -647,12 +650,29 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
   }
 
   async function openController(input: {
-    qrCredential: string;
+    qrCredential?: string;
+    grantCode?: string;
     browserContext: string;
     deviceClass?: string;
     browserClass?: string;
   }): Promise<OpenControllerResult> {
-    const admitted = await options.grantAuthority.admitGrant(input);
+    const admitted =
+      input.grantCode === undefined
+        ? await options.grantAuthority.admitGrant(
+            {
+              qrCredential: input.qrCredential ?? "",
+              browserContext: input.browserContext,
+              deviceClass: input.deviceClass,
+              browserClass: input.browserClass,
+            },
+            "control",
+          )
+        : await options.grantAuthority.admitControlGrantCode({
+            grantCode: input.grantCode,
+            browserContext: input.browserContext,
+            deviceClass: input.deviceClass,
+            browserClass: input.browserClass,
+          });
     if (admitted.status !== "admitted" || admitted.eventGameId === null) {
       return rejectedOpen();
     }
@@ -698,6 +718,7 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
         grantSessionId: authorized.grantSessionId,
         grantVersion: authorized.grantVersion,
       },
+      sessionExpiresAtMs: admitted.sessionExpiresAtMs ?? null,
       projection,
       projectionStatus: projection === null ? "unavailable" : "available",
       synchronization: synchronized(),

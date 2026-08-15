@@ -52,6 +52,7 @@ import {
   type EventAdministrationAuthority,
   type EventAdministrationMutationOutcome,
   type EventAdministrationOutcome,
+  type GrantCodeProjection,
 } from "@/lib/event-administration";
 import {
   createAdministrativeAuditProjection,
@@ -60,7 +61,11 @@ import {
 } from "@/lib/administrative-audit";
 import { createGrantAuthority } from "@/lib/grant-authority";
 import { readGrantAuthorityOptions } from "@/lib/grant-runtime";
-import type { TypedGrantMutation, TypedGrantReveal } from "@/lib/grant-management";
+import type {
+  TypedGrantMutation,
+  TypedGrantReveal,
+  TypedGrantRotated,
+} from "@/lib/grant-management";
 import { createInMemoryFoundationStorage } from "@/lib/foundation-storage-memory";
 import { openSqliteFoundationStorage } from "@/lib/foundation-storage-sqlite";
 import type { FoundationStorage } from "@/lib/foundation-storage";
@@ -304,12 +309,15 @@ async function startServer() {
       ) =>
       async (req: Request) => {
         const token = requireTechnicalAdminMutationToken(req, technicalAdminAuth);
-        if (token === null) return genericAuthFailure(401);
-        if (eventAdministration === null) return genericAuthFailure(503);
+        if (token === null) return sensitiveGenericAuthFailure(401);
+        if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
         const eventId = new URL(req.url).pathname.split("/").at(-3) ?? "";
         const result = await eventAdministration[operation](eventId, token);
         await liveEventRuntime?.control.reconcileActiveControllerSessions();
-        return eventAdministrationResponse(result);
+        return sensitiveEventAdministrationMutationResponse(
+          result as EventAdministrationMutationOutcome<TypedGrantRotated | TypedGrantMutation>,
+          token,
+        );
       };
     const pitchManagerGrantMutation = async (
       req: Request,
@@ -362,8 +370,12 @@ async function startServer() {
       if (operation !== "revealPitchManagerGrant") {
         await liveEventRuntime?.control.reconcileActiveControllerSessions();
       }
-      return sensitiveEventAdministrationMutationResponse<TypedGrantMutation | TypedGrantReveal>(
-        result as EventAdministrationMutationOutcome<TypedGrantMutation | TypedGrantReveal>,
+      return sensitiveEventAdministrationMutationResponse<
+        TypedGrantMutation | TypedGrantReveal | TypedGrantRotated
+      >(
+        result as EventAdministrationMutationOutcome<
+          TypedGrantMutation | TypedGrantReveal | TypedGrantRotated
+        >,
         authority,
       );
     };
@@ -391,8 +403,70 @@ async function startServer() {
       if (operation !== "reveal") {
         await liveEventRuntime?.control.reconcileActiveControllerSessions();
       }
-      return sensitiveEventAdministrationMutationResponse<TypedGrantMutation | TypedGrantReveal>(
-        result as EventAdministrationMutationOutcome<TypedGrantMutation | TypedGrantReveal>,
+      return sensitiveEventAdministrationMutationResponse<
+        TypedGrantMutation | TypedGrantReveal | TypedGrantRotated
+      >(
+        result as EventAdministrationMutationOutcome<
+          TypedGrantMutation | TypedGrantReveal | TypedGrantRotated
+        >,
+        authority,
+        200,
+        audience,
+      );
+    };
+    const pitchManagerCodeMutation = async (
+      req: Request,
+      operation: "inspect" | "create" | "replace" | "disable",
+    ) => {
+      if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
+      const authority = resolveEventAdministrationAuthority(req, technicalAdminAuth);
+      const path = new URL(req.url).pathname.split("/");
+      if (authority === null) return sensitiveGenericAuthFailure(401);
+      const common = [path[4] ?? "", path[6] ?? "", path[8] ?? ""] as const;
+      const result =
+        operation === "inspect"
+          ? await eventAdministration.inspectPitchManagerGrantCode(...common, authority)
+          : operation === "create"
+            ? await eventAdministration.createPitchManagerGrantCode(...common, authority)
+            : operation === "replace"
+              ? await eventAdministration.replacePitchManagerGrantCode(...common, authority)
+              : await eventAdministration.disablePitchManagerGrantCode(...common, authority);
+      if (operation === "inspect")
+        return sensitiveEventAdministrationResponse(
+          result as EventAdministrationOutcome<GrantCodeProjection | null>,
+        );
+      return sensitiveEventAdministrationMutationResponse(
+        result as EventAdministrationMutationOutcome<unknown>,
+        authority,
+      );
+    };
+    const controlCodeMutation = async (
+      req: Request,
+      operation: "inspect" | "create" | "replace" | "disable",
+      audience: "event-admin" | "pitch-manager" = "event-admin",
+    ) => {
+      if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
+      const authority =
+        audience === "pitch-manager"
+          ? resolvePitchManagerAuthority(req, technicalAdminAuth)
+          : resolveEventAdministrationAuthority(req, technicalAdminAuth);
+      const path = new URL(req.url).pathname.split("/");
+      if (authority === null) return sensitiveGenericAuthFailure(401);
+      const common = [path[4] ?? "", path[6] ?? "", path[8] ?? "", path[10] ?? ""] as const;
+      const result =
+        operation === "inspect"
+          ? await eventAdministration.inspectControlGrantCode(...common, authority)
+          : operation === "create"
+            ? await eventAdministration.createControlGrantCode(...common, authority)
+            : operation === "replace"
+              ? await eventAdministration.replaceControlGrantCode(...common, authority)
+              : await eventAdministration.disableControlGrantCode(...common, authority);
+      if (operation === "inspect")
+        return sensitiveEventAdministrationResponse(
+          result as EventAdministrationOutcome<GrantCodeProjection | null>,
+        );
+      return sensitiveEventAdministrationMutationResponse(
+        result as EventAdministrationMutationOutcome<unknown>,
         authority,
         200,
         audience,
@@ -894,6 +968,51 @@ async function startServer() {
             );
           },
         },
+        "/api/admin/events/:eventId/event-admin-grant/code": {
+          async GET(req: Request) {
+            const token = requireTechnicalAdminToken(req, technicalAdminAuth);
+            if (token === null) return sensitiveGenericAuthFailure(401);
+            if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
+            const eventId = new URL(req.url).pathname.split("/").at(-3) ?? "";
+            return sensitiveEventAdministrationResponse(
+              await eventAdministration.inspectEventAdminGrantCode(eventId, token),
+            );
+          },
+          async POST(req: Request) {
+            const token = requireTechnicalAdminMutationToken(req, technicalAdminAuth);
+            if (token === null) return sensitiveGenericAuthFailure(401);
+            if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
+            const eventId = new URL(req.url).pathname.split("/").at(-3) ?? "";
+            return sensitiveEventAdministrationMutationResponse(
+              await eventAdministration.createEventAdminGrantCode(eventId, token),
+              token,
+            );
+          },
+        },
+        "/api/admin/events/:eventId/event-admin-grant/code/replace": {
+          POST: async (req: Request) => {
+            const token = requireTechnicalAdminMutationToken(req, technicalAdminAuth);
+            if (token === null) return sensitiveGenericAuthFailure(401);
+            if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
+            const eventId = new URL(req.url).pathname.split("/").at(-4) ?? "";
+            return sensitiveEventAdministrationMutationResponse(
+              await eventAdministration.replaceEventAdminGrantCode(eventId, token),
+              token,
+            );
+          },
+        },
+        "/api/admin/events/:eventId/event-admin-grant/code/disable": {
+          POST: async (req: Request) => {
+            const token = requireTechnicalAdminMutationToken(req, technicalAdminAuth);
+            if (token === null) return sensitiveGenericAuthFailure(401);
+            if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
+            const eventId = new URL(req.url).pathname.split("/").at(-4) ?? "";
+            return sensitiveEventAdministrationMutationResponse(
+              await eventAdministration.disableEventAdminGrantCode(eventId, token),
+              token,
+            );
+          },
+        },
         "/api/admin/events/:eventId/event-admin-grant/rotate": {
           POST: adminGrantMutationRoute("rotateEventAdminGrant"),
         },
@@ -908,18 +1027,38 @@ async function startServer() {
         },
         "/api/event-admin/admit": {
           async POST(req: Request) {
-            if (eventAdministration === null) return genericAuthFailure(503);
+            if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
             const body = await readJsonRecord(req);
-            if (body === null || typeof body.qrCredential !== "string")
-              return json({ error: "Unable to admit this Grant." }, 400);
+            if (
+              body === null ||
+              (typeof body.qrCredential !== "string" && typeof body.grantCode !== "string") ||
+              (typeof body.qrCredential === "string" && typeof body.grantCode === "string")
+            )
+              return sensitiveJson({ error: "Unable to admit this Grant." }, 400);
             const context = readEventAdminContext(req.headers.get("cookie")) ?? crypto.randomUUID();
-            const result = await eventAdministration.admitEventAdmin({
-              qrCredential: body.qrCredential,
-              browserContext: context,
-              deviceClass: body.deviceClass,
-              browserClass: body.browserClass,
-            });
+            const result =
+              typeof body.grantCode === "string"
+                ? await eventAdministration.admitEventAdminCode({
+                    grantCode: body.grantCode,
+                    browserContext: context,
+                    deviceClass: body.deviceClass,
+                    browserClass: body.browserClass,
+                  })
+                : await eventAdministration.admitEventAdmin({
+                    qrCredential: body.qrCredential,
+                    browserContext: context,
+                    deviceClass: body.deviceClass,
+                    browserClass: body.browserClass,
+                  });
             if (result.status !== "admitted") return sensitiveJson(result, 401);
+            const sessionHeaders: Array<[string, string]> = [
+              ["set-cookie", eventAdminContextCookie(context)],
+            ];
+            if (typeof result.sessionExpiresAtMs === "number")
+              sessionHeaders.push([
+                "set-cookie",
+                eventAdminSessionCookie(result.sessionBearer, result.sessionExpiresAtMs),
+              ]);
             return sensitiveJson(
               {
                 status: "admitted",
@@ -928,15 +1067,10 @@ async function startServer() {
                 grantType: result.grantType,
                 scope: result.scope,
                 grantSessionId: result.grantSessionId,
+                sessionExpiresAtMs: result.sessionExpiresAtMs ?? null,
               },
               200,
-              [
-                ["set-cookie", eventAdminContextCookie(context)],
-                [
-                  "set-cookie",
-                  eventAdminSessionCookie(result.sessionBearer, result.sessionExpiresAtMs),
-                ],
-              ],
+              sessionHeaders,
             );
           },
         },
@@ -993,6 +1127,15 @@ async function startServer() {
           {
             POST: (req: Request) => pitchManagerGrantMutation(req, "reactivatePitchManagerGrant"),
           },
+        "/api/event-admin/events/:eventId/game-days/:gameDayId/pitches/:pitchId/pitch-manager-grant/code":
+          {
+            GET: (req: Request) => pitchManagerCodeMutation(req, "inspect"),
+            POST: (req: Request) => pitchManagerCodeMutation(req, "create"),
+          },
+        "/api/event-admin/events/:eventId/game-days/:gameDayId/pitches/:pitchId/pitch-manager-grant/code/replace":
+          { POST: (req: Request) => pitchManagerCodeMutation(req, "replace") },
+        "/api/event-admin/events/:eventId/game-days/:gameDayId/pitches/:pitchId/pitch-manager-grant/code/disable":
+          { POST: (req: Request) => pitchManagerCodeMutation(req, "disable") },
         "/api/event-admin/events/:eventId/game-days/:gameDayId/pitches/:pitchId/pitch-slots/:pitchSlotId/control-grant":
           {
             async GET(req: Request) {
@@ -1037,6 +1180,15 @@ async function startServer() {
                 "reveal",
               ),
           },
+        "/api/event-admin/events/:eventId/game-days/:gameDayId/pitches/:pitchId/pitch-slots/:pitchSlotId/control-grant/code":
+          {
+            GET: (req: Request) => controlCodeMutation(req, "inspect"),
+            POST: (req: Request) => controlCodeMutation(req, "create"),
+          },
+        "/api/event-admin/events/:eventId/game-days/:gameDayId/pitches/:pitchId/pitch-slots/:pitchSlotId/control-grant/code/replace":
+          { POST: (req: Request) => controlCodeMutation(req, "replace") },
+        "/api/event-admin/events/:eventId/game-days/:gameDayId/pitches/:pitchId/pitch-slots/:pitchSlotId/control-grant/code/disable":
+          { POST: (req: Request) => controlCodeMutation(req, "disable") },
         "/api/event-admin/events/:eventId/game-days/:gameDayId/pitches/:pitchId/pitch-slots/:pitchSlotId/control-grant/rotate":
           {
             POST: (req: Request) =>
@@ -1077,17 +1229,37 @@ async function startServer() {
           async POST(req: Request) {
             if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
             const body = await readJsonRecord(req);
-            if (body === null || typeof body.qrCredential !== "string")
+            if (
+              body === null ||
+              (typeof body.qrCredential !== "string" && typeof body.grantCode !== "string") ||
+              (typeof body.qrCredential === "string" && typeof body.grantCode === "string")
+            )
               return sensitiveJson({ error: "Unable to admit this Grant." }, 400);
             const context =
               readPitchManagerContext(req.headers.get("cookie")) ?? crypto.randomUUID();
-            const result = await eventAdministration.admitPitchManager({
-              qrCredential: body.qrCredential,
-              browserContext: context,
-              deviceClass: body.deviceClass,
-              browserClass: body.browserClass,
-            });
+            const result =
+              typeof body.grantCode === "string"
+                ? await eventAdministration.admitPitchManagerCode({
+                    grantCode: body.grantCode,
+                    browserContext: context,
+                    deviceClass: body.deviceClass,
+                    browserClass: body.browserClass,
+                  })
+                : await eventAdministration.admitPitchManager({
+                    qrCredential: body.qrCredential,
+                    browserContext: context,
+                    deviceClass: body.deviceClass,
+                    browserClass: body.browserClass,
+                  });
             if (result.status !== "admitted") return sensitiveJson(result, 401);
+            const sessionHeaders: Array<[string, string]> = [
+              ["set-cookie", pitchManagerContextCookie(context)],
+            ];
+            if (typeof result.sessionExpiresAtMs === "number")
+              sessionHeaders.push([
+                "set-cookie",
+                pitchManagerSessionCookie(result.sessionBearer, result.sessionExpiresAtMs),
+              ]);
             return sensitiveJson(
               {
                 status: "admitted",
@@ -1099,13 +1271,7 @@ async function startServer() {
                 sessionExpiresAtMs: result.sessionExpiresAtMs ?? null,
               },
               200,
-              [
-                ["set-cookie", pitchManagerContextCookie(context)],
-                [
-                  "set-cookie",
-                  pitchManagerSessionCookie(result.sessionBearer, result.sessionExpiresAtMs),
-                ],
-              ],
+              sessionHeaders,
             );
           },
         },
@@ -1232,6 +1398,19 @@ async function startServer() {
             ]);
           },
         },
+        "/api/pitch-manager/events/:eventId/game-days/:gameDayId/pitches/:pitchId/pitch-slots/:pitchSlotId/control-grant/code":
+          {
+            GET: (req: Request) => controlCodeMutation(req, "inspect", "pitch-manager"),
+            POST: (req: Request) => controlCodeMutation(req, "create", "pitch-manager"),
+          },
+        "/api/pitch-manager/events/:eventId/game-days/:gameDayId/pitches/:pitchId/pitch-slots/:pitchSlotId/control-grant/code/replace":
+          {
+            POST: (req: Request) => controlCodeMutation(req, "replace", "pitch-manager"),
+          },
+        "/api/pitch-manager/events/:eventId/game-days/:gameDayId/pitches/:pitchId/pitch-slots/:pitchSlotId/control-grant/code/disable":
+          {
+            POST: (req: Request) => controlCodeMutation(req, "disable", "pitch-manager"),
+          },
         "/api/event-admin/hub": {
           async GET(req: Request) {
             if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
@@ -2524,7 +2703,9 @@ function sensitiveEventAdministrationMutationResponse<T>(
   audience: "event-admin" | "pitch-manager" = "event-admin",
 ) {
   const refreshHeaders: Array<[string, string]> =
-    authority.kind === "grant-session" && result.status === "accepted"
+    authority.kind === "grant-session" &&
+    result.status === "accepted" &&
+    typeof result.sessionExpiresAtMs === "number"
       ? [
           [
             "set-cookie",
@@ -2599,11 +2780,11 @@ function eventAdminContextCookie(value: string): string {
   return `__Host-event-admin-context=${encodeURIComponent(value)}; Path=/; HttpOnly; Secure; SameSite=Strict`;
 }
 
-function eventAdminSessionCookie(value: string, expiresAtMs: number | null | undefined): string {
-  const maxAgeSeconds =
-    expiresAtMs === null || expiresAtMs === undefined
-      ? 2_592_000
-      : Math.max(0, Math.min(2_592_000, Math.ceil((expiresAtMs - Date.now()) / 1_000)));
+function eventAdminSessionCookie(value: string, expiresAtMs: number): string {
+  const maxAgeSeconds = Math.max(
+    0,
+    Math.min(2_592_000, Math.ceil((expiresAtMs - Date.now()) / 1_000)),
+  );
   return `__Host-event-admin-session=${encodeURIComponent(value)}; Path=/; Max-Age=${maxAgeSeconds}; HttpOnly; Secure; SameSite=Strict`;
 }
 
@@ -2611,11 +2792,8 @@ function pitchManagerContextCookie(value: string): string {
   return `__Host-pitch-manager-context=${encodeURIComponent(value)}; Path=/; HttpOnly; Secure; SameSite=Strict`;
 }
 
-function pitchManagerSessionCookie(value: string, expiresAtMs: number | null | undefined): string {
-  const maxAgeSeconds =
-    expiresAtMs === null || expiresAtMs === undefined
-      ? 0
-      : Math.max(0, Math.ceil((expiresAtMs - Date.now()) / 1_000));
+function pitchManagerSessionCookie(value: string, expiresAtMs: number): string {
+  const maxAgeSeconds = Math.max(0, Math.ceil((expiresAtMs - Date.now()) / 1_000));
   return `__Host-pitch-manager-session=${encodeURIComponent(value)}; Path=/; Max-Age=${maxAgeSeconds}; HttpOnly; Secure; SameSite=Strict`;
 }
 

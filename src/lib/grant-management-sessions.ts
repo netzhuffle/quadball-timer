@@ -11,8 +11,6 @@ import {
   GRANT_TYPE,
   PITCH_MANAGER_GRANT_TYPE,
   type GrantType,
-  validateEventAdminGrantScope,
-  validatePitchManagerGrantScope,
   type ControlGrantScope,
   type ControlGrantScopeResolution,
   type ControlGrantSessionDecision,
@@ -64,6 +62,12 @@ import {
   unavailableGrant,
 } from "@/lib/grant-management-results";
 import { grantAdmissionThrottled } from "@/lib/grant-authority-types";
+import {
+  grantTypeMatchesExpected,
+  resolveControlGrantAdmission,
+  sessionExpiresAtMsForGrant,
+  validateExpectedGrantScope,
+} from "@/lib/grant-admission-policy";
 
 export async function admitGrant(
   storage: FoundationStorage,
@@ -95,6 +99,10 @@ export async function admitGrant(
         recordAdmissionFailure(transaction, "qr", budget.sourceDigest, nowMs);
         return GENERIC_GRANT_ADMISSION_FAILURE;
       }
+      if (!grantTypeMatchesExpected(grant, expectedGrantType)) {
+        recordAdmissionFailure(transaction, "qr", budget.sourceDigest, nowMs);
+        return GENERIC_GRANT_ADMISSION_FAILURE;
+      }
       const current = expireGrantIfDue(transaction, options, grant);
       if (
         current.status !== "active" ||
@@ -103,37 +111,22 @@ export async function admitGrant(
         recordAdmissionFailure(transaction, "qr", budget.sourceDigest, nowMs);
         return GENERIC_GRANT_ADMISSION_FAILURE;
       }
-      if (expectedGrantType !== undefined && current.grantType !== expectedGrantType) {
+      if (
+        expectedGrantType !== undefined &&
+        !validateExpectedGrantScope(transaction, current, expectedGrantType)
+      ) {
         recordAdmissionFailure(transaction, "qr", budget.sourceDigest, nowMs);
         return GENERIC_GRANT_ADMISSION_FAILURE;
       }
-      if (expectedGrantType === PITCH_MANAGER_GRANT_TYPE) {
-        const scope = validatePitchManagerGrantScope(current.scope);
-        if (!scope.ok || !isLivePitchManagerScope(transaction, scope.value)) {
-          recordAdmissionFailure(transaction, "qr", budget.sourceDigest, nowMs);
-          return GENERIC_GRANT_ADMISSION_FAILURE;
-        }
-      }
-      if (expectedGrantType === EVENT_ADMIN_GRANT_TYPE) {
-        if (!validateEventAdminGrantScope(current.scope).ok) {
-          recordAdmissionFailure(transaction, "qr", budget.sourceDigest, nowMs);
-          return GENERIC_GRANT_ADMISSION_FAILURE;
-        }
-      }
       let eventGameId: string | null = null;
       if (current.grantType === GRANT_TYPE) {
-        const resolved = options.controlScopeResolver.resolve(
-          current.scope as ControlGrantScope,
-          transaction,
-        );
-        if (
-          resolved.status !== "eligible" ||
-          !validateOpaqueIdentifier(resolved.eventGameId, "eventGameId").ok
-        ) {
+        const scope = current.scope as ControlGrantScope;
+        const resolvedEventGameId = resolveControlGrantAdmission(options, transaction, scope);
+        if (resolvedEventGameId === null) {
           recordAdmissionFailure(transaction, "qr", budget.sourceDigest, nowMs);
           return GENERIC_GRANT_ADMISSION_FAILURE;
         }
-        eventGameId = resolved.eventGameId;
+        eventGameId = resolvedEventGameId;
       }
       const lookupVersion = options.keyRing.lookup.currentVersion;
       const contextDigest = computeBrowserContextDigest(
@@ -192,42 +185,12 @@ export async function admitGrant(
         eventGameId,
         grantSessionId: session.sessionId,
         sessionBearer: bearer,
-        sessionExpiresAtMs:
-          current.grantType === EVENT_ADMIN_GRANT_TYPE
-            ? Math.min(current.expiresAtMs ?? Number.MAX_SAFE_INTEGER, nowMs + 30 * DAY_MS)
-            : current.grantType === PITCH_MANAGER_GRANT_TYPE || current.grantType === GRANT_TYPE
-              ? current.expiresAtMs
-              : null,
+        sessionExpiresAtMs: sessionExpiresAtMsForGrant(current, nowMs),
       };
     });
   } catch {
     return GENERIC_GRANT_ADMISSION_FAILURE;
   }
-}
-
-function isLivePitchManagerScope(
-  transaction: FoundationStorageTransaction,
-  scope: {
-    eventId: string;
-    gameDayId: string;
-    gameDayDate: string;
-    eventTimeZone: string;
-    pitchId: string;
-  },
-): boolean {
-  const event = transaction.findEvent(scope.eventId);
-  const gameDay = transaction
-    .listGameDays(scope.eventId)
-    .find((candidate) => candidate.gameDayId === scope.gameDayId);
-  const pitch = transaction.findPitch(scope.pitchId);
-  return (
-    event !== null &&
-    gameDay !== undefined &&
-    gameDay.date === scope.gameDayDate &&
-    event.timeZone === scope.eventTimeZone &&
-    pitch !== null &&
-    pitch.eventId === scope.eventId
-  );
 }
 
 export async function authorizeGrant(

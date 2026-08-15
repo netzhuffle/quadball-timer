@@ -199,12 +199,33 @@ export type TypedGrantAuthority = {
     deviceClass?: string;
     browserClass?: string;
   }): Promise<TypedGrantAdmission | TypedGrantAdmissionThrottled>;
-  admitGrant(input: {
-    qrCredential: string;
+  admitEventAdminGrantCode(input: {
+    grantCode: string;
     browserContext: string;
     deviceClass?: string;
     browserClass?: string;
   }): Promise<TypedGrantAdmission | TypedGrantAdmissionThrottled>;
+  admitPitchManagerGrantCode(input: {
+    grantCode: string;
+    browserContext: string;
+    deviceClass?: string;
+    browserClass?: string;
+  }): Promise<TypedGrantAdmission | TypedGrantAdmissionThrottled>;
+  admitControlGrantCode(input: {
+    grantCode: string;
+    browserContext: string;
+    deviceClass?: string;
+    browserClass?: string;
+  }): Promise<TypedGrantAdmission | TypedGrantAdmissionThrottled>;
+  admitGrant(
+    input: {
+      qrCredential: string;
+      browserContext: string;
+      deviceClass?: string;
+      browserClass?: string;
+    },
+    expectedGrantType?: GrantType,
+  ): Promise<TypedGrantAdmission | TypedGrantAdmissionThrottled>;
   admitPitchManagerGrant(input: {
     qrCredential: string;
     browserContext: string;

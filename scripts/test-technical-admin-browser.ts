@@ -847,6 +847,65 @@ try {
     currentAfterRestart.status === 200,
     `Pitch Manager current projection failed after restart (${currentAfterRestart.status})`,
   );
+  const pitchManagerCodeResponse = await postJsonBodyFromPage(
+    eventAdminPage,
+    `${origin}/api/event-admin/events/${eventId}/game-days/${pitchManagerGameDayId}/pitches/${pitchManagerPitchId}/pitch-manager-grant/code`,
+    {},
+  );
+  const pitchManagerCodePayload = JSON.parse(pitchManagerCodeResponse.body) as {
+    status: string;
+    value?: { code?: string };
+  };
+  const pitchManagerCode = pitchManagerCodePayload.value?.code ?? "";
+  assert(
+    pitchManagerCodeResponse.status === 200 &&
+      pitchManagerCodePayload.status === "accepted" &&
+      pitchManagerCode.length > 0,
+    "Pitch Manager Grant Code creation failed",
+  );
+  const pitchManagerCodeContext = await browser.newContext({
+    ignoreHTTPSErrors: true,
+    timezoneId: "UTC",
+  });
+  const pitchManagerCodePage = await pitchManagerCodeContext.newPage();
+  pitchManagerCodePage.setDefaultTimeout(5_000);
+  await pitchManagerCodePage.goto(`${origin}/pitch-manager`);
+  const pitchManagerCodeAdmissionResponsePromise = pitchManagerCodePage.waitForResponse(
+    (response) =>
+      response.url() === `${origin}/api/pitch-manager/admit` &&
+      response.request().method() === "POST",
+  );
+  const pitchManagerCodeAdmission = await postJsonBodyFromPage(
+    pitchManagerCodePage,
+    `${origin}/api/pitch-manager/admit`,
+    { grantCode: pitchManagerCode, browserContext: "browser-pitch-manager-code" },
+  );
+  const pitchManagerCodeAdmissionResponse = await pitchManagerCodeAdmissionResponsePromise;
+  const pitchManagerCodeCookie = (await pitchManagerCodeAdmissionResponse.headersArray())
+    .filter((header) => header.name === "set-cookie")
+    .find((header) => header.value.includes("__Host-pitch-manager-session="))?.value;
+  const pitchManagerCodeAdmissionPayload = JSON.parse(pitchManagerCodeAdmission.body) as {
+    status: string;
+    sessionExpiresAtMs?: number | null;
+  };
+  assert(
+    pitchManagerCodeAdmission.status === 200 &&
+      pitchManagerCodeAdmissionResponse.status() === 200 &&
+      pitchManagerCodeAdmissionPayload.status === "admitted" &&
+      typeof pitchManagerCodeAdmissionPayload.sessionExpiresAtMs === "number" &&
+      pitchManagerCodeCookie?.includes("__Host-pitch-manager-session=") === true &&
+      pitchManagerCodeCookie.includes("__Host-event-admin-session=") === false,
+    "Pitch Manager code admission did not set only its audience cookie",
+  );
+  assertCappedPitchManagerCookie(pitchManagerCodeCookie);
+  const pitchManagerCodeProtected = await pitchManagerCodeContext.request.get(
+    `${origin}/api/pitch-manager/current`,
+    { headers: { cookie: cookieHeaderFor(await pitchManagerCodeContext.cookies()) } },
+  );
+  assert(
+    pitchManagerCodeProtected.status() === 200,
+    "Pitch Manager code admission did not authorize a protected current-view request",
+  );
   await pitchManagerPage.reload();
   await pitchManagerPage.getByText("Pitch Main", { exact: true }).waitFor();
   await pitchManagerPage.getByText(/2026-08-15 10:00 Europe\/Zurich/u).waitFor();
@@ -871,6 +930,8 @@ try {
     (await pitchManagerRotateResponsePromise).status() === 200,
     "Pitch Manager Grant rotation failed",
   );
+  await eventAdminPage.getByText(/Dictate now:/u).waitFor();
+  await eventAdminPage.getByAltText("Pitch Manager Grant QR code").waitFor();
   const rotatedPitchManagerInspect = await eventAdminContext.request.get(
     `${origin}/api/event-admin/events/${eventId}/game-days/${await eventAdminPage.getByLabel("Pitch Manager Game Day").inputValue()}/pitches/${await eventAdminPage.getByLabel("Pitch Manager Pitch").inputValue()}/pitch-manager-grant`,
   );
@@ -1196,6 +1257,8 @@ try {
   );
   await page.getByRole("button", { name: "Rotate Grant" }).click();
   assert((await rotateResponsePromise).status() === 200, "Grant rotation failed");
+  await page.getByText(/Dictate now:/u).waitFor();
+  await page.getByAltText("Event Admin Grant QR code").waitFor();
   const staleAfterRotation = await fetchFromPage(
     eventAdminPage,
     `${origin}/api/event-admin/hub?eventId=${eventId}`,
@@ -1216,6 +1279,66 @@ try {
   assert(
     freshRevealResponse.status() === 200 && freshCredential.length > 0,
     "fresh QR reveal failed",
+  );
+  const eventAdminCodeResponse = await context.request.post(
+    `${origin}/api/admin/events/${eventId}/event-admin-grant/code/replace`,
+    {
+      headers: { origin, "x-technical-admin-csrf": currentCsrfToken },
+    },
+  );
+  const eventAdminCodePayload = (await eventAdminCodeResponse.json()) as {
+    status: string;
+    reason?: string;
+    value?: { code?: string };
+  };
+  const eventAdminCode = eventAdminCodePayload.value?.code ?? "";
+  assert(
+    eventAdminCodeResponse.status() === 200 &&
+      eventAdminCodePayload.status === "accepted" &&
+      eventAdminCode.length > 0,
+    `Event Admin Grant Code creation failed (http=${eventAdminCodeResponse.status()} result=${eventAdminCodePayload.status} reason=${eventAdminCodePayload.reason ?? "none"})`,
+  );
+  const eventAdminCodeContext = await browser.newContext({ ignoreHTTPSErrors: true });
+  const eventAdminCodePage = await eventAdminCodeContext.newPage();
+  eventAdminCodePage.setDefaultTimeout(5_000);
+  await eventAdminCodePage.goto(`${origin}/event-admin?eventId=${eventId}`);
+  const eventAdminCodeAdmissionResponsePromise = eventAdminCodePage.waitForResponse(
+    (response) =>
+      response.url() === `${origin}/api/event-admin/admit` &&
+      response.request().method() === "POST",
+  );
+  const eventAdminCodeAdmission = await postJsonBodyFromPage(
+    eventAdminCodePage,
+    `${origin}/api/event-admin/admit`,
+    { grantCode: eventAdminCode, browserContext: "browser-event-admin-code" },
+  );
+  const eventAdminCodeAdmissionResponse = await eventAdminCodeAdmissionResponsePromise;
+  const eventAdminCodeCookie = (await eventAdminCodeAdmissionResponse.headersArray())
+    .filter((header) => header.name === "set-cookie")
+    .find((header) => header.value.includes("__Host-event-admin-session="))?.value;
+  assert(
+    eventAdminCodeAdmission.status === 200 &&
+      eventAdminCodeAdmissionResponse.status() === 200 &&
+      eventAdminCodeCookie?.includes("__Host-event-admin-session=") === true &&
+      eventAdminCodeCookie.includes("__Host-pitch-manager-session=") === false,
+    "Event Admin code admission did not set only its audience cookie",
+  );
+  const eventAdminCodeAdmissionPayload = JSON.parse(eventAdminCodeAdmission.body) as {
+    sessionExpiresAtMs?: number | null;
+  };
+  assert(
+    typeof eventAdminCodeAdmissionPayload.sessionExpiresAtMs === "number",
+    "Event Admin code admission omitted the canonical session expiry",
+  );
+  assertCappedEventAdminCookie(eventAdminCodeCookie);
+  const eventAdminCodeCookies = await eventAdminCodeContext.cookies();
+  const eventAdminCodeProtected = await eventAdminCodeContext.request.get(
+    `${origin}/api/event-admin/hub?eventId=${eventId}`,
+    { headers: { cookie: cookieHeaderFor(eventAdminCodeCookies) } },
+  );
+  assert(
+    eventAdminCodeProtected.status() === 200,
+    "Event Admin code admission did not authorize a protected Hub request",
   );
   const revokedEventAdminContext = await browser.newContext({ ignoreHTTPSErrors: true });
   const revokedEventAdminPage = await revokedEventAdminContext.newPage();
@@ -1248,6 +1371,7 @@ try {
     revokedFreshSession.status === 401,
     "explicitly revoked live Event Admin session remained live",
   );
+  await pitchManagerCodeContext.close();
   await pitchManagerContext.close();
   await eventAdminContext.close();
   await revokedEventAdminContext.close();
@@ -1327,6 +1451,8 @@ try {
       pitchManagerControlCookieIsolation: true,
       pitchManagerControlReadOnly: true,
       pitchManagerControlScopedView: true,
+      eventAdminCodeAdmission: true,
+      pitchManagerCodeAdmission: true,
       forgedAuthorityRejected: true,
       revocationRevalidated: true,
     }),
@@ -1407,6 +1533,10 @@ async function fetchFromPage(page: Page, url: string) {
   }, url);
 }
 
+function cookieHeaderFor(cookies: Array<{ name: string; value: string }>): string {
+  return cookies.map(({ name, value }) => `${name}=${value}`).join("; ");
+}
+
 async function postJsonFromPage(page: Page, url: string, body: Record<string, string>) {
   return page.evaluate(
     async ({ requestUrl, requestBody }) => {
@@ -1464,5 +1594,14 @@ function assertCappedEventAdminCookie(setCookie: string | undefined) {
   assert(
     maxAge !== null && maxAge > 0 && maxAge < 2_592_000,
     `Event Admin session cap was reset (maxAge=${maxAge ?? "missing"})`,
+  );
+}
+
+function assertCappedPitchManagerCookie(setCookie: string | undefined) {
+  const match = setCookie?.match(/__Host-pitch-manager-session=[^;]+;[^\n]*Max-Age=(\d+)/u);
+  const maxAge = match?.[1] === undefined ? null : Number(match[1]);
+  assert(
+    maxAge !== null && maxAge > 0 && maxAge < 2_592_000,
+    `Pitch Manager session cap was reset (maxAge=${maxAge ?? "missing"})`,
   );
 }

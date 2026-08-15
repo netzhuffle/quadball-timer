@@ -18,6 +18,7 @@ import {
 } from "@/lib/live-event-game-control";
 import { createLiveEventGameControlTransport } from "@/lib/live-event-game-transport";
 import { createAdHocGamesService } from "@/lib/ad-hoc-games";
+import { createControlScopeResolver as createRuntimeControlScopeResolver } from "@/lib/live-event-game-runtime";
 
 describe("Live Event Game control", () => {
   test("Event authority, storage, and control remain accepted after Ad Hoc pressure", async () => {
@@ -2199,6 +2200,117 @@ describe("Live Event Game control", () => {
     expect(leaveResponse.status).toBe(200);
     expect(await leaveResponse.json()).toEqual({ status: "left" });
   });
+
+  test("admits a Controller through the independent Grant Code path without exposing code material", async () => {
+    const harness = await createHarness();
+    const created = await harness.authority.createGrantCode(harness.grantId, {
+      kind: "fixture",
+      id: "fixture",
+    });
+    if (created.status !== "created") throw new Error("Expected a Control Grant Code.");
+    const allowedOrigin = "https://timer.quadball.app";
+    const transport = createLiveEventGameControlTransport(
+      () => harness.control,
+      (request) =>
+        request.headers.get("origin") === allowedOrigin &&
+        request.headers.get("host") === "timer.quadball.app",
+    );
+    const response = await transport.openController(
+      new Request("https://timer.quadball.app/api/event-control/open", {
+        method: "POST",
+        headers: { origin: allowedOrigin, host: "timer.quadball.app" },
+        body: JSON.stringify({ grantCode: created.code, browserContext: "code-controller" }),
+      }),
+    );
+    expect(response.status).toBe(200);
+    expect(response.headers.get("set-cookie")).toBeNull();
+    const opened = await response.json();
+    expect(opened).toMatchObject({ status: "opened", eventGameId: harness.root.eventGameId });
+    expect(opened).toMatchObject({ sessionExpiresAtMs: null });
+    expect(JSON.stringify(opened)).not.toContain(created.code);
+
+    const refreshResponse = await transport.refreshController(
+      new Request("https://timer.quadball.app/api/event-control/refresh", {
+        method: "POST",
+        headers: { origin: allowedOrigin, host: "timer.quadball.app" },
+        body: JSON.stringify({
+          sessionBearer: opened.session.sessionBearer,
+          eventGameId: opened.eventGameId,
+        }),
+      }),
+    );
+    expect(refreshResponse.status).toBe(200);
+    expect(await refreshResponse.json()).toMatchObject({ status: "authorized" });
+  });
+
+  test("uses the production Control scope resolver transaction for typed code admission", async () => {
+    const harness = await createHarness();
+    const created = await harness.authority.createGrantCode(harness.grantId, {
+      kind: "fixture",
+      id: "fixture",
+    });
+    if (created.status !== "created") throw new Error("Expected a Control Grant Code.");
+    const wrongScope = await harness.authority.createControlGrant({
+      authority: { kind: "fixture", id: "fixture" },
+      scope: { ...harness.root.externalScope, pitchSlotId: "wrong-slot" },
+    });
+    if (wrongScope.status !== "created") throw new Error("Expected wrong-scope Control Grant.");
+    const wrongCode = await harness.authority.createGrantCode(wrongScope.grantId, {
+      kind: "fixture",
+      id: "fixture",
+    });
+    if (wrongCode.status !== "created") throw new Error("Expected wrong-scope Grant Code.");
+    harness.grantOptions.controlScopeResolver = createRuntimeControlScopeResolver(() => 10_000);
+    expect(
+      await harness.authority.admitControlGrantCode({
+        grantCode: created.code,
+        browserContext: "production-resolver-controller",
+      }),
+    ).toMatchObject({ status: "admitted", eventGameId: harness.root.eventGameId });
+    expect(
+      await harness.authority.admitControlGrantCode({
+        grantCode: wrongCode.code,
+        browserContext: "production-resolver-wrong-scope",
+      }),
+    ).toEqual({
+      status: "rejected",
+      code: "grant-admission-failed",
+      message: "Unable to admit this Grant.",
+    });
+  });
+
+  test("rejects a non-Control Grant Code before Controller session admission", async () => {
+    const harness = await createHarness();
+    const eventAdmin = await harness.authority.createEventAdminGrant({
+      authority: { kind: "fixture", id: "fixture" },
+      scope: {
+        eventId: harness.root.eventId,
+        eventTimeZone: "UTC",
+        finalGameDayDate: "2026-08-14",
+      },
+    });
+    if (eventAdmin.status !== "created") throw new Error("Expected Event Admin Grant.");
+    const code = await harness.authority.createGrantCode(eventAdmin.grantId, {
+      kind: "fixture",
+      id: "fixture",
+    });
+    if (code.status !== "created") throw new Error("Expected Event Admin Grant Code.");
+
+    const opened = await harness.control.openController({
+      grantCode: code.code,
+      browserContext: "wrong-controller-type",
+    });
+    expect(opened).toEqual({
+      status: "rejected",
+      message: "Unable to open Controller experience.",
+    });
+    expect(
+      await harness.authority.listGrantSessions(eventAdmin.grantId, {
+        kind: "fixture",
+        id: "fixture",
+      }),
+    ).toMatchObject({ status: "ok", value: [] });
+  });
 });
 
 async function createHarness(
@@ -2294,6 +2406,7 @@ async function createHarness(
     record,
     control,
     authority,
+    grantOptions,
     grantId: created.grantId,
     qrCredential: created.qrCredential,
     sessionBearer: admitted.sessionBearer,

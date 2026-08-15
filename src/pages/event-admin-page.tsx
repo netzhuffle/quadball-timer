@@ -5,6 +5,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { AdministrativeAuditBrowser } from "@/pages/administrative-audit-browser";
+import { createGrantSecretOwner, type GrantSecretToken } from "@/lib/grant-secret-owner";
 
 type HubResponse = {
   status: "accepted";
@@ -90,6 +91,12 @@ type ControlGrantResponse = {
     eventGameId: string | null;
   } | null;
 };
+type GrantCodeProjection = {
+  grantId: string;
+  grantVersion: string;
+  state: "absent" | "present" | "disabled" | "erased";
+  formatVersion: 1 | null;
+};
 type ControlSession = {
   label: string;
   deviceClass: string;
@@ -97,6 +104,10 @@ type ControlSession = {
 };
 
 class EventPublicationValidationError extends Error {}
+
+export type GrantQrRenderer = (credential: string) => Promise<string>;
+
+const defaultGrantQrRenderer: GrantQrRenderer = (credential) => QRCode.toDataURL(credential);
 
 const publicationWarningLabels: Record<string, string> = {
   "missing-event-teams": "Event Teams",
@@ -125,10 +136,15 @@ type ScheduleDelayPreview = {
   }>;
 };
 
-export function EventAdminPage() {
+export function EventAdminPage({
+  qrRenderer = defaultGrantQrRenderer,
+}: {
+  qrRenderer?: GrantQrRenderer;
+} = {}) {
   const queryEventId = new URLSearchParams(window.location.search).get("eventId") ?? "";
   const [eventId, setEventId] = useState(queryEventId);
   const [credential, setCredential] = useState("");
+  const [grantCode, setGrantCode] = useState("");
   const [hub, setHub] = useState<HubResponse["value"] | null>(null);
   const [selectedGameDayId, setSelectedGameDayId] = useState<string | null>(null);
   const [pitchManagerGameDayId, setPitchManagerGameDayId] = useState("");
@@ -171,160 +187,539 @@ export function EventAdminPage() {
     PitchManagerGrantResponse["value"] | null
   >(null);
   const [pitchManagerQrDataUrl, setPitchManagerQrDataUrl] = useState<string | null>(null);
+  const [pitchManagerCode, setPitchManagerCode] = useState<GrantCodeProjection | null>(null);
+  const [pitchManagerCodePlaintext, setPitchManagerCodePlaintext] = useState<string | null>(null);
   const [controlGrants, setControlGrants] = useState<Record<string, ControlGrantResponse["value"]>>(
     {},
   );
   const [controlQrDataUrls, setControlQrDataUrls] = useState<Record<string, string>>({});
   const [controlSessions, setControlSessions] = useState<Record<string, ControlSession[]>>({});
+  const [controlCodes, setControlCodes] = useState<Record<string, GrantCodeProjection | null>>({});
+  const [controlCodePlaintexts, setControlCodePlaintexts] = useState<Record<string, string>>({});
+  const [pitchManagerQrCredential, setPitchManagerQrCredential] = useState<string | null>(null);
+  const [controlQrCredentials, setControlQrCredentials] = useState<Record<string, string>>({});
+  const [pitchManagerRotationCount, setPitchManagerRotationCount] = useState<number | null>(null);
+  const [controlRotationCounts, setControlRotationCounts] = useState<Record<string, number>>({});
+  const [secretWarning, setSecretWarning] = useState<string | null>(null);
   const [publicationImpactConfirmed, setPublicationImpactConfirmed] = useState(false);
+  const [secretOwner] = useState(createGrantSecretOwner);
 
-  const loadHub = async (nextGameDayId = selectedGameDayId) => {
+  const secretScopeKey = (
+    nextEventId = eventId,
+    nextGameDayId = selectedGameDayId,
+    nextPitchId = selectedPitchId,
+  ) => `event-admin:${nextEventId}:${nextGameDayId ?? "none"}:${nextPitchId || "none"}`;
+
+  const hubScopeKey = () => `event-admin-hub:${eventId}`;
+
+  const clearGrantSecrets = () => {
+    setCredential("");
+    setGrantCode("");
+    setPitchManagerQrDataUrl(null);
+    setPitchManagerQrCredential(null);
+    setPitchManagerCodePlaintext(null);
+    setControlQrDataUrls({});
+    setControlQrCredentials({});
+    setControlCodePlaintexts({});
+    setPitchManagerRotationCount(null);
+    setControlRotationCounts({});
+    setSecretWarning(null);
+    setMessage(null);
+  };
+
+  const invalidateGrantSecrets = () => {
+    secretOwner.invalidate(secretScopeKey());
+    secretOwner.invalidate(hubScopeKey());
+    clearGrantSecrets();
+  };
+
+  const changeEventId = (nextEventId: string) => {
+    invalidateGrantSecrets();
+    setHub(null);
+    setSelectedGameDayId(null);
+    setPitchManagerGameDayId("");
+    setTeamDrafts({});
+    setPitchDrafts({});
+    setConfirmationDrafts({});
+    setSchedule(null);
+    setDelayDrafts({});
+    setCascadeDrafts({});
+    setDelayPreviews({});
+    setReassignmentTargets({});
+    setReassignmentModes({});
+    setSelectedPitchId("");
+    setPitchView(null);
+    setPitchManagerPitchId("");
+    setPitchManagerGrant(null);
+    setPitchManagerCode(null);
+    setControlGrants({});
+    setControlSessions({});
+    setControlCodes({});
+    setTeamName("");
+    setTeamColor("#00afe8");
+    setPitchName("");
+    setRosterTeamId("");
+    setPlayerNumber("");
+    setPlayerName("");
+    setSlotSequence("1");
+    setScheduledStart("");
+    setGameplaySlotId("");
+    setPitchSlotId("");
+    setGameCode("");
+    setGameDesignation("");
+    setSideASource("");
+    setSideBSource("");
+    setPublicationImpactConfirmed(false);
+    setEventId(nextEventId);
+  };
+
+  const clearControlGrantSecrets = (pitchSlotId: string) => {
+    setControlQrDataUrls((current) => {
+      const next = { ...current };
+      delete next[pitchSlotId];
+      return next;
+    });
+    setControlQrCredentials((current) => {
+      const next = { ...current };
+      delete next[pitchSlotId];
+      return next;
+    });
+    setControlCodePlaintexts((current) => {
+      const next = { ...current };
+      delete next[pitchSlotId];
+      return next;
+    });
+    setControlRotationCounts((current) => {
+      const next = { ...current };
+      delete next[pitchSlotId];
+      return next;
+    });
+  };
+
+  useEffect(
+    () => () => {
+      secretOwner.unmount();
+      setCredential("");
+      setGrantCode("");
+      setPitchManagerQrDataUrl(null);
+      setPitchManagerQrCredential(null);
+      setPitchManagerCodePlaintext(null);
+      setControlQrDataUrls({});
+      setControlQrCredentials({});
+      setControlCodePlaintexts({});
+      setPitchManagerRotationCount(null);
+      setControlRotationCounts({});
+      setSecretWarning(null);
+    },
+    [secretOwner],
+  );
+
+  const loadHub = async (nextGameDayId = selectedGameDayId, providedToken?: GrantSecretToken) => {
     if (eventId.trim().length === 0) return;
+    const token = providedToken ?? secretOwner.capture(hubScopeKey());
+    if (!secretOwner.current(token)) return;
     const params = new URLSearchParams({ eventId: eventId.trim() });
     if (nextGameDayId !== null) params.set("gameDayId", nextGameDayId);
-    const response = await fetch(`/api/event-admin/hub?${params}`);
-    const payload = (await response.json()) as
-      | HubResponse
-      | { status: "rejected" | "retryable-failure"; message?: string };
-    if (!response.ok || payload.status !== "accepted")
-      throw new Error("Unable to open the Event Hub.");
-    setTeamDrafts(
-      Object.fromEntries(
-        payload.value.event.teams.map((team) => [
-          team.eventTeamId,
-          {
-            name: team.name,
-            defaultColor: team.defaultColor,
-          },
-        ]),
-      ),
-    );
-    setPitchDrafts(
-      Object.fromEntries(payload.value.event.pitches.map((pitch) => [pitch.pitchId, pitch.name])),
-    );
-    setHub(payload.value);
-    setSelectedGameDayId(payload.value.selectedGameDayId);
-    setSchedule({
-      gameDayId: payload.value.selectedGameDayId ?? "",
-      gameplaySlots: payload.value.event.gameplaySlots.filter(
-        (slot) => slot.gameDayId === payload.value.selectedGameDayId,
-      ),
-      pitchSlots: payload.value.event.pitchSlots.filter(
-        (slot) => slot.gameDayId === payload.value.selectedGameDayId,
-      ),
-      eventGames: payload.value.event.eventGames.filter(
-        (game) => game.gameDayId === payload.value.selectedGameDayId,
-      ),
-    });
-    setConfirmationDrafts((current) =>
-      Object.fromEntries(
-        payload.value.event.eventGames.map((game) => [
-          game.eventGameId,
-          current[game.eventGameId] ?? {
-            sideA: game.sideA.eventTeamId ?? "",
-            sideB: game.sideB.eventTeamId ?? "",
-          },
-        ]),
-      ),
-    );
+    try {
+      const response = await fetch(`/api/event-admin/hub?${params}`);
+      const payload = (await response.json()) as
+        | HubResponse
+        | { status: "rejected" | "retryable-failure"; message?: string };
+      if (!response.ok || payload.status !== "accepted")
+        throw new Error("Unable to open the Event Hub.");
+      if (!secretOwner.current(token)) return;
+      secretOwner.commit(token, () => {
+        setTeamDrafts(
+          Object.fromEntries(
+            payload.value.event.teams.map((team) => [
+              team.eventTeamId,
+              {
+                name: team.name,
+                defaultColor: team.defaultColor,
+              },
+            ]),
+          ),
+        );
+        setPitchDrafts(
+          Object.fromEntries(
+            payload.value.event.pitches.map((pitch) => [pitch.pitchId, pitch.name]),
+          ),
+        );
+        setHub(payload.value);
+        setSelectedGameDayId(payload.value.selectedGameDayId);
+        setSchedule({
+          gameDayId: payload.value.selectedGameDayId ?? "",
+          gameplaySlots: payload.value.event.gameplaySlots.filter(
+            (slot) => slot.gameDayId === payload.value.selectedGameDayId,
+          ),
+          pitchSlots: payload.value.event.pitchSlots.filter(
+            (slot) => slot.gameDayId === payload.value.selectedGameDayId,
+          ),
+          eventGames: payload.value.event.eventGames.filter(
+            (game) => game.gameDayId === payload.value.selectedGameDayId,
+          ),
+        });
+        setConfirmationDrafts((current) =>
+          Object.fromEntries(
+            payload.value.event.eventGames.map((game) => [
+              game.eventGameId,
+              current[game.eventGameId] ?? {
+                sideA: game.sideA.eventTeamId ?? "",
+                sideB: game.sideB.eventTeamId ?? "",
+              },
+            ]),
+          ),
+        );
+      });
+    } catch (error) {
+      if (secretOwner.current(token)) throw error;
+    }
   };
 
-  const loadSchedule = async (gameDayId = selectedGameDayId) => {
+  const loadSchedule = async (gameDayId = selectedGameDayId, providedToken?: GrantSecretToken) => {
     if (eventId.trim().length === 0 || gameDayId === null) return;
-    const response = await fetch(
-      `/api/event-admin/slot-setup?eventId=${encodeURIComponent(eventId)}&gameDayId=${encodeURIComponent(gameDayId)}`,
-    );
-    const payload = (await response.json()) as ScheduleResponse;
-    if (!response.ok || payload.status !== "accepted")
-      throw new Error("Unable to load Slot setup.");
-    setSchedule(payload.value);
+    const token =
+      providedToken ?? secretOwner.capture(secretScopeKey(eventId, gameDayId, selectedPitchId));
+    if (!secretOwner.current(token)) return;
+    try {
+      const response = await fetch(
+        `/api/event-admin/slot-setup?eventId=${encodeURIComponent(eventId)}&gameDayId=${encodeURIComponent(gameDayId)}`,
+      );
+      const payload = (await response.json()) as ScheduleResponse;
+      if (!response.ok || payload.status !== "accepted")
+        throw new Error("Unable to load Slot setup.");
+      if (!secretOwner.current(token)) return;
+      secretOwner.commit(token, () => setSchedule(payload.value));
+    } catch (error) {
+      if (secretOwner.current(token)) throw error;
+    }
   };
 
-  const loadPitchView = async (pitchId: string) => {
+  const loadPitchView = async (pitchId: string, providedToken?: GrantSecretToken) => {
     if (selectedGameDayId === null || pitchId.length === 0) return;
-    const response = await fetch(
-      `/api/event-admin/pitch-view?eventId=${encodeURIComponent(eventId)}&gameDayId=${encodeURIComponent(selectedGameDayId)}&pitchId=${encodeURIComponent(pitchId)}`,
-    );
-    const payload = (await response.json()) as {
-      status: "accepted";
-      value: NonNullable<typeof pitchView>;
-    };
-    if (!response.ok || payload.status !== "accepted")
-      throw new Error("Unable to load Pitch view.");
-    setPitchView(payload.value);
+    const token =
+      providedToken ?? secretOwner.capture(secretScopeKey(eventId, selectedGameDayId, pitchId));
+    if (!secretOwner.current(token)) return;
+    try {
+      const response = await fetch(
+        `/api/event-admin/pitch-view?eventId=${encodeURIComponent(eventId)}&gameDayId=${encodeURIComponent(selectedGameDayId)}&pitchId=${encodeURIComponent(pitchId)}`,
+      );
+      const payload = (await response.json()) as {
+        status: string;
+        value?: NonNullable<typeof pitchView>;
+      };
+      if (!response.ok || payload.status !== "accepted" || payload.value === undefined)
+        throw new Error("Unable to load Pitch view.");
+      if (!secretOwner.current(token)) return;
+      secretOwner.commit(token, () => setPitchView(payload.value!));
+    } catch (error) {
+      if (secretOwner.current(token)) throw error;
+    }
   };
 
   const controlGrantUrl = (pitchSlotId: string) =>
     `/api/event-admin/events/${eventId}/game-days/${selectedGameDayId}/pitches/${selectedPitchId}/pitch-slots/${pitchSlotId}/control-grant`;
 
-  const inspectControlGrant = async (pitchSlotId: string) => {
-    const response = await fetch(controlGrantUrl(pitchSlotId));
-    const payload = (await response.json()) as ControlGrantResponse;
-    if (!response.ok || payload.status !== "accepted")
-      throw new Error("Control Grant lookup failed.");
-    setControlGrants((current) => ({ ...current, [pitchSlotId]: payload.value }));
-    setControlQrDataUrls((current) => ({ ...current, [pitchSlotId]: "" }));
+  const controlCodeUrl = (pitchSlotId: string) => `${controlGrantUrl(pitchSlotId)}/code`;
+
+  const inspectControlGrant = async (
+    pitchSlotId: string,
+    preserveSecrets = false,
+    providedToken?: GrantSecretToken,
+  ) => {
+    let token = providedToken;
+    if (!preserveSecrets) {
+      invalidateGrantSecrets();
+      clearControlGrantSecrets(pitchSlotId);
+      token = secretOwner.capture(secretScopeKey());
+    }
+    token ??= secretOwner.capture(secretScopeKey());
+    if (!secretOwner.current(token)) return null;
+    try {
+      const response = await fetch(controlGrantUrl(pitchSlotId));
+      const payload = (await response.json()) as ControlGrantResponse;
+      if (!response.ok || payload.status !== "accepted")
+        throw new Error("Control Grant lookup failed.");
+      if (!secretOwner.current(token)) return null;
+      secretOwner.commit(token, () =>
+        setControlGrants((current) => ({ ...current, [pitchSlotId]: payload.value })),
+      );
+      const codeResponse = await fetch(controlCodeUrl(pitchSlotId));
+      const codePayload = (await codeResponse.json()) as {
+        status: string;
+        value?: GrantCodeProjection | null;
+      };
+      if (codeResponse.ok && codePayload.status === "accepted" && secretOwner.current(token)) {
+        const projection = codePayload.value ?? null;
+        secretOwner.commit(token, () => {
+          setControlCodes((current) => ({ ...current, [pitchSlotId]: projection }));
+          if (projection === null || projection.state !== "present")
+            clearControlGrantSecrets(pitchSlotId);
+        });
+      }
+      return payload.value;
+    } catch (error) {
+      if (secretOwner.current(token)) throw error;
+      return null;
+    }
   };
 
   const createControlGrant = async (pitchSlotId: string) => {
+    invalidateGrantSecrets();
+    const token = secretOwner.capture(secretScopeKey());
     const response = await fetch(controlGrantUrl(pitchSlotId), { method: "POST" });
-    if (!response.ok) throw new Error("Control Grant creation failed.");
-    await inspectControlGrant(pitchSlotId);
+    if (!response.ok) {
+      if (secretOwner.current(token)) throw new Error("Control Grant creation failed.");
+      return;
+    }
+    await inspectControlGrant(pitchSlotId, true, token);
   };
 
   const revealControlGrant = async (pitchSlotId: string) => {
+    invalidateGrantSecrets();
+    const token = secretOwner.capture(secretScopeKey());
     const response = await fetch(`${controlGrantUrl(pitchSlotId)}/reveal`, { method: "POST" });
     const payload = (await response.json()) as {
       status: string;
       value?: { qrCredential?: string };
     };
-    if (!response.ok || payload.status !== "accepted" || payload.value?.qrCredential === undefined)
-      throw new Error("Control Grant QR reveal failed.");
-    const dataUrl = await QRCode.toDataURL(payload.value.qrCredential);
-    setControlQrDataUrls((current) => ({ ...current, [pitchSlotId]: dataUrl }));
+    if (
+      !response.ok ||
+      payload.status !== "accepted" ||
+      payload.value?.qrCredential === undefined
+    ) {
+      if (secretOwner.current(token)) throw new Error("Control Grant QR reveal failed.");
+      return;
+    }
+    try {
+      const dataUrl = await qrRenderer(payload.value.qrCredential);
+      secretOwner.commit(token, () =>
+        setControlQrDataUrls((current) => ({ ...current, [pitchSlotId]: dataUrl })),
+      );
+    } catch (error) {
+      if (secretOwner.current(token)) throw error;
+    }
   };
 
-  const loadControlSessions = async (pitchSlotId: string) => {
-    const response = await fetch(`${controlGrantUrl(pitchSlotId)}/sessions`);
-    const payload = (await response.json()) as { status: string; value?: ControlSession[] };
-    if (!response.ok || payload.status !== "accepted") throw new Error("Session list failed.");
-    setControlSessions((current) => ({ ...current, [pitchSlotId]: payload.value ?? [] }));
+  const loadControlSessions = async (pitchSlotId: string, providedToken?: GrantSecretToken) => {
+    const token = providedToken ?? secretOwner.capture(secretScopeKey());
+    if (!secretOwner.current(token)) return;
+    try {
+      const response = await fetch(`${controlGrantUrl(pitchSlotId)}/sessions`);
+      const payload = (await response.json()) as { status: string; value?: ControlSession[] };
+      if (!response.ok || payload.status !== "accepted") throw new Error("Session list failed.");
+      secretOwner.commit(token, () =>
+        setControlSessions((current) => ({ ...current, [pitchSlotId]: payload.value ?? [] })),
+      );
+    } catch (error) {
+      if (secretOwner.current(token)) throw error;
+    }
   };
 
   const rotateControlGrant = async (pitchSlotId: string) => {
+    invalidateGrantSecrets();
+    const token = secretOwner.capture(secretScopeKey());
     const response = await fetch(`${controlGrantUrl(pitchSlotId)}/rotate`, { method: "POST" });
     const payload = (await response.json()) as {
       status: string;
-      value?: { affectedSessionCount?: number };
+      value?: { affectedSessionCount?: number; qrCredential?: string; code?: string };
     };
-    if (!response.ok || payload.status !== "accepted")
-      throw new Error("Control Grant rotation failed.");
-    setMessage(
-      `Control Grant rotated; ${payload.value?.affectedSessionCount ?? 0} session(s) revoked.`,
+    if (!response.ok || payload.status !== "accepted") {
+      if (secretOwner.current(token)) throw new Error("Control Grant rotation failed.");
+      return;
+    }
+    if (payload.value?.qrCredential === undefined || payload.value.code === undefined)
+      throw new Error("Control Grant rotation did not return replacement credentials.");
+    const { code, qrCredential, affectedSessionCount = 0 } = payload.value;
+    if (
+      !secretOwner.commit(token, () => {
+        setControlQrCredentials((current) => ({ ...current, [pitchSlotId]: qrCredential }));
+        setControlCodePlaintexts((current) => ({ ...current, [pitchSlotId]: code }));
+        setControlRotationCounts((current) => ({
+          ...current,
+          [pitchSlotId]: affectedSessionCount,
+        }));
+        setMessage(
+          `Control Grant fully rotated; ${affectedSessionCount} session(s) revoked. Dictate the new code and scan the new QR now.`,
+        );
+      })
+    )
+      return;
+    await renderControlQr(pitchSlotId, qrCredential, token);
+    if (!secretOwner.current(token)) return;
+    const refreshWarnings: string[] = [];
+    try {
+      await inspectControlGrant(pitchSlotId, true, token);
+    } catch {
+      refreshWarnings.push("Control Grant state refresh failed.");
+    }
+    try {
+      await loadControlSessions(pitchSlotId, token);
+    } catch {
+      refreshWarnings.push("Control session refresh failed.");
+    }
+    if (refreshWarnings.length > 0 && secretOwner.current(token))
+      setSecretWarning(refreshWarnings.join(" ") + " Replacement credentials remain visible.");
+  };
+
+  const renderControlQr = async (
+    pitchSlotId: string,
+    credential = controlQrCredentials[pitchSlotId],
+    providedToken?: GrantSecretToken,
+  ) => {
+    if (credential === undefined) return;
+    const token = providedToken ?? secretOwner.capture(secretScopeKey());
+    if (!secretOwner.current(token)) return;
+    try {
+      const dataUrl = await qrRenderer(credential);
+      secretOwner.commit(token, () => {
+        setControlQrDataUrls((current) => ({ ...current, [pitchSlotId]: dataUrl }));
+        setControlQrCredentials((current) => {
+          const next = { ...current };
+          delete next[pitchSlotId];
+          return next;
+        });
+        setSecretWarning((current) => (current?.includes("QR render failed") ? null : current));
+      });
+    } catch {
+      if (secretOwner.current(token))
+        setSecretWarning("Replacement QR render failed. Retry QR render locally.");
+    }
+  };
+
+  const manageControlCode = async (
+    pitchSlotId: string,
+    operation: "create" | "replace" | "disable",
+  ) => {
+    invalidateGrantSecrets();
+    const token = secretOwner.capture(secretScopeKey());
+    const response = await fetch(
+      `${controlCodeUrl(pitchSlotId)}${operation === "create" ? "" : `/${operation}`}`,
+      { method: "POST" },
     );
-    await inspectControlGrant(pitchSlotId);
-    await loadControlSessions(pitchSlotId);
+    const payload = (await response.json()) as {
+      status: string;
+      value?: GrantCodeProjection & { code?: string };
+    };
+    if (!response.ok || payload.status !== "accepted") {
+      if (secretOwner.current(token)) throw new Error("Grant Code operation failed.");
+      return;
+    }
+    if (operation !== "disable" && payload.value?.code !== undefined)
+      secretOwner.commit(token, () =>
+        setControlCodePlaintexts((current) => ({
+          ...current,
+          [pitchSlotId]: payload.value!.code!,
+        })),
+      );
+    const inspected = await fetch(controlCodeUrl(pitchSlotId));
+    const inspectedPayload = (await inspected.json()) as {
+      status: string;
+      value?: GrantCodeProjection | null;
+    };
+    if (inspected.ok && inspectedPayload.status === "accepted" && secretOwner.current(token)) {
+      const projection = inspectedPayload.value ?? null;
+      secretOwner.commit(token, () => {
+        setControlCodes((current) => ({ ...current, [pitchSlotId]: projection }));
+        if (projection === null || projection.state !== "present")
+          clearControlGrantSecrets(pitchSlotId);
+      });
+    }
   };
 
   const revokeControlSession = async (pitchSlotId: string, label: string) => {
-    const response = await fetch(`${controlGrantUrl(pitchSlotId)}/sessions/revoke`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ sessionReference: label }),
-    });
-    if (!response.ok) throw new Error("Control session revocation failed.");
-    await loadControlSessions(pitchSlotId);
+    invalidateGrantSecrets();
+    const token = secretOwner.capture(secretScopeKey());
+    try {
+      const response = await fetch(`${controlGrantUrl(pitchSlotId)}/sessions/revoke`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ sessionReference: label }),
+      });
+      if (!response.ok) throw new Error("Control session revocation failed.");
+      await loadControlSessions(pitchSlotId, token);
+    } catch (error) {
+      if (secretOwner.current(token)) throw error;
+    }
   };
 
-  const loadPitchManagerGrant = async () => {
+  const loadPitchManagerGrant = async (
+    preserveSecrets = false,
+    providedToken?: GrantSecretToken,
+  ) => {
     if (pitchManagerGameDayId.length === 0 || pitchManagerPitchId.length === 0) return;
+    const token = providedToken ?? secretOwner.capture(secretScopeKey());
+    if (!secretOwner.current(token)) return;
     const response = await fetch(
       `/api/event-admin/events/${eventId}/game-days/${pitchManagerGameDayId}/pitches/${pitchManagerPitchId}/pitch-manager-grant`,
     );
     const payload = (await response.json()) as PitchManagerGrantResponse | { status: string };
-    if (!response.ok || payload.status !== "accepted") throw new Error("Grant lookup failed.");
-    setPitchManagerGrant((payload as PitchManagerGrantResponse).value ?? null);
-    setPitchManagerQrDataUrl(null);
+    if (!response.ok || payload.status !== "accepted") {
+      if (secretOwner.current(token)) throw new Error("Grant lookup failed.");
+      return;
+    }
+    if (!secretOwner.current(token)) return;
+    secretOwner.commit(token, () =>
+      setPitchManagerGrant((payload as PitchManagerGrantResponse).value ?? null),
+    );
+    if (!preserveSecrets) secretOwner.commit(token, () => setPitchManagerQrDataUrl(null));
+    if (
+      !preserveSecrets &&
+      ((payload as PitchManagerGrantResponse).value === null ||
+        (payload as PitchManagerGrantResponse).value?.status !== "active")
+    ) {
+      secretOwner.commit(token, () => {
+        setPitchManagerCode(null);
+        setPitchManagerCodePlaintext(null);
+        setPitchManagerQrCredential(null);
+        setPitchManagerRotationCount(null);
+      });
+      return;
+    }
+    const codeResponse = await fetch(
+      `/api/event-admin/events/${eventId}/game-days/${pitchManagerGameDayId}/pitches/${pitchManagerPitchId}/pitch-manager-grant/code`,
+    );
+    const codePayload = (await codeResponse.json()) as {
+      status: string;
+      value?: GrantCodeProjection | null;
+    };
+    if (!codeResponse.ok || codePayload.status !== "accepted") {
+      if (secretOwner.current(token)) throw new Error("Grant Code lookup failed.");
+      return;
+    }
+    if (!secretOwner.current(token)) return;
+    secretOwner.commit(token, () => setPitchManagerCode(codePayload.value ?? null));
+    if (
+      !preserveSecrets &&
+      (codePayload.value === null || codePayload.value?.state !== "present")
+    ) {
+      secretOwner.commit(token, () => {
+        setPitchManagerCodePlaintext(null);
+        setPitchManagerQrCredential(null);
+        setPitchManagerRotationCount(null);
+      });
+    }
+  };
+
+  const managePitchManagerCode = async (operation: "create" | "replace" | "disable") => {
+    invalidateGrantSecrets();
+    const token = secretOwner.capture(secretScopeKey());
+    const response = await fetch(
+      `/api/event-admin/events/${eventId}/game-days/${pitchManagerGameDayId}/pitches/${pitchManagerPitchId}/pitch-manager-grant/code${operation === "create" ? "" : `/${operation}`}`,
+      { method: "POST" },
+    );
+    const payload = (await response.json()) as {
+      status: string;
+      value?: GrantCodeProjection & { code?: string };
+    };
+    if (!response.ok || payload.status !== "accepted") {
+      if (secretOwner.current(token)) throw new Error("Grant Code operation failed.");
+      return;
+    }
+    if (operation !== "disable" && payload.value?.code !== undefined)
+      secretOwner.commit(token, () => setPitchManagerCodePlaintext(payload.value!.code!));
+    if (!secretOwner.current(token)) return;
+    await loadPitchManagerGrant(operation !== "disable", token);
   };
 
   const changePublicationStatus = async (status: "unpublished" | "published" | "cancelled") => {
@@ -369,12 +764,69 @@ export function EventAdminPage() {
     operation: "rotate" | "disable" | "revoke" | "reactivate",
   ) => {
     if (pitchManagerGameDayId.length === 0 || pitchManagerPitchId.length === 0) return;
+    invalidateGrantSecrets();
+    const token = secretOwner.capture(secretScopeKey());
     const response = await fetch(
       `/api/event-admin/events/${eventId}/game-days/${pitchManagerGameDayId}/pitches/${pitchManagerPitchId}/pitch-manager-grant/${operation}`,
       { method: "POST" },
     );
-    if (!response.ok) throw new Error("Pitch Manager Grant lifecycle change failed.");
-    await loadPitchManagerGrant();
+    const payload = (await response.json()) as {
+      status: string;
+      value?: { qrCredential?: string; code?: string; affectedSessionCount?: number };
+    };
+    if (!response.ok || payload.status !== "accepted") {
+      if (secretOwner.current(token))
+        throw new Error("Pitch Manager Grant lifecycle change failed.");
+      return;
+    }
+    if (operation === "rotate") {
+      if (payload.value?.qrCredential === undefined || payload.value.code === undefined)
+        throw new Error("Pitch Manager rotation did not return replacement credentials.");
+      const { code, qrCredential, affectedSessionCount = 0 } = payload.value;
+      if (
+        !secretOwner.commit(token, () => {
+          setPitchManagerQrCredential(qrCredential);
+          setPitchManagerCodePlaintext(code);
+          setPitchManagerRotationCount(affectedSessionCount);
+          setMessage(
+            `Pitch Manager Grant fully rotated; ${affectedSessionCount} session(s) revoked. Dictate the new code and scan the new QR now.`,
+          );
+        })
+      )
+        return;
+      await renderPitchManagerQr(qrCredential, token);
+      if (!secretOwner.current(token)) return;
+      try {
+        await loadPitchManagerGrant(true, token);
+      } catch {
+        if (secretOwner.current(token))
+          setSecretWarning(
+            "Pitch Manager Grant state refresh failed. Replacement credentials remain visible.",
+          );
+      }
+      return;
+    }
+    await loadPitchManagerGrant(false, token);
+  };
+
+  const renderPitchManagerQr = async (
+    credential = pitchManagerQrCredential,
+    providedToken?: GrantSecretToken,
+  ) => {
+    if (credential === null || credential === undefined) return;
+    const token = providedToken ?? secretOwner.capture(secretScopeKey());
+    if (!secretOwner.current(token)) return;
+    try {
+      const dataUrl = await qrRenderer(credential);
+      secretOwner.commit(token, () => {
+        setPitchManagerQrDataUrl(dataUrl);
+        setPitchManagerQrCredential(null);
+        setSecretWarning((current) => (current?.includes("QR render failed") ? null : current));
+      });
+    } catch {
+      if (secretOwner.current(token))
+        setSecretWarning("Replacement QR render failed. Retry QR render locally.");
+    }
   };
 
   const delayMsFor = (slotId: string) => {
@@ -406,6 +858,7 @@ export function EventAdminPage() {
 
   const applyGameplayDelay = async (slotId: string) => {
     if (selectedGameDayId === null) return;
+    const token = secretOwner.capture(secretScopeKey());
     const response = await fetch(
       `/api/event-admin/events/${eventId}/game-days/${selectedGameDayId}/gameplay-slots/${slotId}/expected-delay`,
       {
@@ -418,7 +871,7 @@ export function EventAdminPage() {
       },
     );
     if (!response.ok) throw new Error(await responseError(response, "Delay apply failed."));
-    await loadSchedule();
+    await loadSchedule(selectedGameDayId, token);
     setDelayPreviews((current) => {
       const next = { ...current };
       delete next[slotId];
@@ -448,6 +901,7 @@ export function EventAdminPage() {
 
   const applyPitchDelay = async (slotId: string) => {
     if (selectedGameDayId === null) return;
+    const token = secretOwner.capture(secretScopeKey());
     const response = await fetch(
       `/api/event-admin/events/${eventId}/game-days/${selectedGameDayId}/pitch-slots/${slotId}/expected-delay`,
       {
@@ -460,8 +914,8 @@ export function EventAdminPage() {
       },
     );
     if (!response.ok) throw new Error(await responseError(response, "Delay apply failed."));
-    await loadSchedule();
-    if (selectedPitchId.length > 0) await loadPitchView(selectedPitchId);
+    await loadSchedule(selectedGameDayId, token);
+    if (selectedPitchId.length > 0) await loadPitchView(selectedPitchId, token);
     setDelayPreviews((current) => {
       const next = { ...current };
       delete next[slotId];
@@ -471,6 +925,7 @@ export function EventAdminPage() {
 
   const reassignEventGame = async (eventGameId: string) => {
     if (selectedGameDayId === null) return;
+    const token = secretOwner.capture(secretScopeKey());
     const targetPitchSlotId = reassignmentTargets[eventGameId];
     if (targetPitchSlotId === undefined || targetPitchSlotId.length === 0)
       throw new Error("Choose a target Pitch Slot.");
@@ -486,8 +941,8 @@ export function EventAdminPage() {
       },
     );
     if (!response.ok) throw new Error(await responseError(response, "Pitch Reassignment failed."));
-    await loadSchedule();
-    if (selectedPitchId.length > 0) await loadPitchView(selectedPitchId);
+    await loadSchedule(selectedGameDayId, token);
+    if (selectedPitchId.length > 0) await loadPitchView(selectedPitchId, token);
   };
 
   const confirmGameplaySlot = async (
@@ -548,7 +1003,7 @@ export function EventAdminPage() {
             <Input
               id="event-id"
               value={eventId}
-              onChange={(event) => setEventId(event.target.value)}
+              onInput={(event) => changeEventId(event.currentTarget.value)}
             />
           </div>
           {hub === null ? (
@@ -560,25 +1015,53 @@ export function EventAdminPage() {
                   type="password"
                   value={credential}
                   onChange={(event) => setCredential(event.target.value)}
+                  onInput={(event) => setCredential(event.currentTarget.value)}
                   autoComplete="off"
                 />
                 <p className="text-xs text-muted-foreground">
                   Use a trusted QR scanner and submit its value here.
                 </p>
               </div>
+              <div className="space-y-2">
+                <Label htmlFor="event-admin-grant-code">Radio Grant Code</Label>
+                <Input
+                  id="event-admin-grant-code"
+                  type="password"
+                  value={grantCode}
+                  onChange={(event) => setGrantCode(event.target.value)}
+                  onInput={(event) => setGrantCode(event.currentTarget.value)}
+                  autoComplete="off"
+                  placeholder="two words and three digits"
+                />
+              </div>
               <div className="flex flex-wrap gap-2">
                 <Button
-                  disabled={busy || eventId.trim().length === 0 || credential.length === 0}
+                  disabled={
+                    busy ||
+                    eventId.trim().length === 0 ||
+                    (credential.length === 0 && grantCode.length === 0) ||
+                    (credential.length > 0 && grantCode.length > 0)
+                  }
                   onClick={() =>
                     void run(async () => {
-                      const response = await fetch("/api/event-admin/admit", {
-                        method: "POST",
-                        headers: { "content-type": "application/json" },
-                        body: JSON.stringify({ qrCredential: credential }),
-                      });
-                      if (!response.ok) throw new Error("Admission failed.");
-                      setCredential("");
-                      await loadHub(null);
+                      const body =
+                        grantCode.length > 0 ? { grantCode } : { qrCredential: credential };
+                      invalidateGrantSecrets();
+                      const token = secretOwner.capture(hubScopeKey());
+                      try {
+                        const response = await fetch("/api/event-admin/admit", {
+                          method: "POST",
+                          headers: { "content-type": "application/json" },
+                          body: JSON.stringify(body),
+                        });
+                        const payload = (await response.json()) as { status?: string };
+                        if (!response.ok || payload.status !== "admitted")
+                          throw new Error("Admission failed.");
+                        if (!secretOwner.current(token)) return;
+                        await loadHub(null, token);
+                      } catch (error) {
+                        if (secretOwner.current(token)) throw error;
+                      }
                     })
                   }
                 >
@@ -649,6 +1132,7 @@ export function EventAdminPage() {
                   value={selectedGameDayId ?? ""}
                   onChange={(event) => {
                     const next = event.target.value || null;
+                    invalidateGrantSecrets();
                     setSelectedGameDayId(next);
                     void run(() => loadHub(next));
                   }}
@@ -1220,8 +1704,12 @@ export function EventAdminPage() {
                       key={pitch.pitchId}
                       variant={selectedPitchId === pitch.pitchId ? "default" : "outline"}
                       onClick={() => {
+                        invalidateGrantSecrets();
+                        const token = secretOwner.capture(
+                          secretScopeKey(eventId, selectedGameDayId, pitch.pitchId),
+                        );
                         setSelectedPitchId(pitch.pitchId);
-                        void run(() => loadPitchView(pitch.pitchId));
+                        void run(() => loadPitchView(pitch.pitchId, token));
                       }}
                     >
                       {pitch.name}
@@ -1362,7 +1850,9 @@ export function EventAdminPage() {
                                 size="sm"
                                 variant="outline"
                                 onClick={() =>
-                                  void run(() => inspectControlGrant(slot.pitchSlotId))
+                                  void run(async () => {
+                                    await inspectControlGrant(slot.pitchSlotId);
+                                  })
                                 }
                               >
                                 Inspect Control Grant
@@ -1405,6 +1895,35 @@ export function EventAdminPage() {
                                   >
                                     Rotate Grant
                                   </Button>
+                                  <Button
+                                    size="sm"
+                                    variant="outline"
+                                    onClick={() =>
+                                      void run(() => manageControlCode(slot.pitchSlotId, "create"))
+                                    }
+                                  >
+                                    Create Radio Code
+                                  </Button>
+                                  <Button
+                                    size="sm"
+                                    variant="outline"
+                                    disabled={controlCodes[slot.pitchSlotId]?.state !== "present"}
+                                    onClick={() =>
+                                      void run(() => manageControlCode(slot.pitchSlotId, "replace"))
+                                    }
+                                  >
+                                    Replace Code
+                                  </Button>
+                                  <Button
+                                    size="sm"
+                                    variant="outline"
+                                    disabled={controlCodes[slot.pitchSlotId]?.state !== "present"}
+                                    onClick={() =>
+                                      void run(() => manageControlCode(slot.pitchSlotId, "disable"))
+                                    }
+                                  >
+                                    Disable Code
+                                  </Button>
                                 </>
                               )}
                             </div>
@@ -1414,12 +1933,52 @@ export function EventAdminPage() {
                                 {controlGrant.eventGameId ? ` · ${controlGrant.eventGameId}` : ""}
                               </p>
                             ) : null}
+                            {controlGrant ? (
+                              <p className="text-xs text-muted-foreground">
+                                Radio code: {controlCodes[slot.pitchSlotId]?.state ?? "absent"}
+                              </p>
+                            ) : null}
+                            {controlRotationCounts[slot.pitchSlotId] !== undefined ? (
+                              <p className="text-xs text-muted-foreground">
+                                Full rotation affected {controlRotationCounts[slot.pitchSlotId]}{" "}
+                                session(s).
+                              </p>
+                            ) : null}
+                            {controlCodePlaintexts[slot.pitchSlotId] ? (
+                              <div className="flex items-center gap-2 rounded bg-muted p-2">
+                                <p aria-live="polite" className="font-mono text-sm">
+                                  Dictate now: {controlCodePlaintexts[slot.pitchSlotId]}
+                                </p>
+                                <Button
+                                  size="sm"
+                                  variant="outline"
+                                  onClick={() =>
+                                    setControlCodePlaintexts((current) => {
+                                      const next = { ...current };
+                                      delete next[slot.pitchSlotId];
+                                      return next;
+                                    })
+                                  }
+                                >
+                                  Clear
+                                </Button>
+                              </div>
+                            ) : null}
                             {controlQrDataUrls[slot.pitchSlotId] ? (
                               <img
                                 alt={`Control Grant QR for Pitch Slot ${slot.sequence}`}
                                 className="h-40 w-40 rounded border bg-white p-2"
                                 src={controlQrDataUrls[slot.pitchSlotId]}
                               />
+                            ) : null}
+                            {controlQrCredentials[slot.pitchSlotId] ? (
+                              <Button
+                                size="sm"
+                                variant="outline"
+                                onClick={() => void renderControlQr(slot.pitchSlotId)}
+                              >
+                                Retry QR render
+                              </Button>
                             ) : null}
                             {(controlSessions[slot.pitchSlotId] ?? []).map((session) => (
                               <div
@@ -1463,9 +2022,12 @@ export function EventAdminPage() {
                     className="h-10 rounded-md border bg-background px-3 text-sm"
                     value={pitchManagerGameDayId}
                     onChange={(event) => {
+                      invalidateGrantSecrets();
                       setPitchManagerGameDayId(event.target.value);
                       setPitchManagerGrant(null);
                       setPitchManagerQrDataUrl(null);
+                      setPitchManagerCode(null);
+                      setPitchManagerCodePlaintext(null);
                     }}
                   >
                     <option value="">Game Day</option>
@@ -1480,9 +2042,12 @@ export function EventAdminPage() {
                     className="h-10 rounded-md border bg-background px-3 text-sm"
                     value={pitchManagerPitchId}
                     onChange={(event) => {
+                      invalidateGrantSecrets();
                       setPitchManagerPitchId(event.target.value);
                       setPitchManagerGrant(null);
                       setPitchManagerQrDataUrl(null);
+                      setPitchManagerCode(null);
+                      setPitchManagerCodePlaintext(null);
                     }}
                   >
                     <option value="">Pitch</option>
@@ -1586,6 +2151,30 @@ export function EventAdminPage() {
                   >
                     Reactivate Grant
                   </Button>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    disabled={busy || pitchManagerGrant?.status !== "active"}
+                    onClick={() => void run(() => managePitchManagerCode("create"))}
+                  >
+                    Create Radio Code
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    disabled={busy || pitchManagerCode?.state !== "present"}
+                    onClick={() => void run(() => managePitchManagerCode("replace"))}
+                  >
+                    Replace Code
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    disabled={busy || pitchManagerCode?.state !== "present"}
+                    onClick={() => void run(() => managePitchManagerCode("disable"))}
+                  >
+                    Disable Code
+                  </Button>
                 </div>
                 {pitchManagerGrant ? (
                   <p className="text-sm">
@@ -1595,6 +2184,31 @@ export function EventAdminPage() {
                       : new Date(pitchManagerGrant.expiresAtMs).toLocaleString()}
                   </p>
                 ) : null}
+                {pitchManagerGrant ? (
+                  <p className="text-xs text-muted-foreground">
+                    Radio code: {pitchManagerCode?.state ?? "absent"}
+                  </p>
+                ) : null}
+                {pitchManagerRotationCount !== null ? (
+                  <p className="text-xs text-muted-foreground">
+                    Full rotation affected {pitchManagerRotationCount} session(s).
+                  </p>
+                ) : null}
+                {pitchManagerCodePlaintext ? (
+                  <div className="flex items-center gap-2 rounded bg-muted p-2">
+                    <p aria-live="polite" className="font-mono text-sm">
+                      Dictate now: {pitchManagerCodePlaintext}
+                    </p>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      onClick={() => setPitchManagerCodePlaintext(null)}
+                    >
+                      Clear
+                    </Button>
+                  </div>
+                ) : null}
                 {pitchManagerQrDataUrl ? (
                   <img
                     alt="Pitch Manager Grant QR code"
@@ -1602,12 +2216,29 @@ export function EventAdminPage() {
                     src={pitchManagerQrDataUrl}
                   />
                 ) : null}
+                {pitchManagerQrCredential ? (
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    onClick={() => void renderPitchManagerQr()}
+                  >
+                    Retry QR render
+                  </Button>
+                ) : null}
               </div>
-              <Button variant="outline" onClick={() => setHub(null)}>
+              <Button
+                variant="outline"
+                onClick={() => {
+                  invalidateGrantSecrets();
+                  setHub(null);
+                }}
+              >
                 Change authority
               </Button>
             </div>
           )}
+          {secretWarning ? <p className="text-sm text-destructive">{secretWarning}</p> : null}
           {message ? <p className="text-sm text-destructive">{message}</p> : null}
         </CardContent>
       </Card>

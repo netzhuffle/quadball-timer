@@ -1,10 +1,20 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import QRCode from "qrcode/lib/browser";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { AdministrativeAuditBrowser } from "@/pages/administrative-audit-browser";
+import { createGrantSecretOwner, type GrantSecretToken } from "@/lib/grant-secret-owner";
+
+export type GrantQrRenderer = (credential: string) => Promise<string>;
+
+const defaultGrantQrRenderer: GrantQrRenderer = (credential) =>
+  QRCode.toDataURL(credential, {
+    errorCorrectionLevel: "M",
+    margin: 2,
+    width: 320,
+  });
 
 type AdminSession = {
   authenticated: true;
@@ -12,11 +22,18 @@ type AdminSession = {
   activeSessionCount: number;
 };
 
-export function TechnicalAdminPage({ enrollment }: { enrollment: boolean }) {
+export function TechnicalAdminPage({
+  enrollment,
+  qrRenderer = defaultGrantQrRenderer,
+}: {
+  enrollment: boolean;
+  qrRenderer?: GrantQrRenderer;
+}) {
   const [session, setSession] = useState<AdminSession | null>(null);
   const [enrollmentToken, setEnrollmentToken] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
+  const clearEventAdminSecretsRef = useRef<() => void>(() => undefined);
 
   useEffect(() => {
     if (enrollment) {
@@ -158,6 +175,7 @@ export function TechnicalAdminPage({ enrollment }: { enrollment: boolean }) {
         variant="outline"
         onClick={() =>
           void run(async () => {
+            clearEventAdminSecretsRef.current();
             await adminFetch("/api/admin/logout", {
               method: "POST",
               headers: { "content-type": "application/json" },
@@ -172,6 +190,7 @@ export function TechnicalAdminPage({ enrollment }: { enrollment: boolean }) {
         variant="outline"
         onClick={() =>
           void run(async () => {
+            clearEventAdminSecretsRef.current();
             await completeStepUp("replace-credential");
             const optionsResponse = await adminFetch("/api/admin/replacement/options", {
               method: "POST",
@@ -215,7 +234,7 @@ export function TechnicalAdminPage({ enrollment }: { enrollment: boolean }) {
       >
         Log out other sessions
       </Button>
-      <EventCatalogPanel />
+      <EventCatalogPanel clearSecretsRef={clearEventAdminSecretsRef} qrRenderer={qrRenderer} />
     </AdminCard>
   );
 }
@@ -244,7 +263,20 @@ type EventAdminGrantProjection = {
   expiresAtMs: number | null;
 };
 
-function EventCatalogPanel() {
+type GrantCodeProjection = {
+  grantId: string;
+  grantVersion: string;
+  state: "absent" | "present" | "disabled" | "erased";
+  formatVersion: 1 | null;
+};
+
+function EventCatalogPanel({
+  clearSecretsRef,
+  qrRenderer,
+}: {
+  clearSecretsRef: { current: () => void };
+  qrRenderer: GrantQrRenderer;
+}) {
   const [events, setEvents] = useState<EventProjection[]>([]);
   const [selected, setSelected] = useState<EventProjection | null>(null);
   const [editedName, setEditedName] = useState("");
@@ -255,27 +287,59 @@ function EventCatalogPanel() {
   const [gameDayDate, setGameDayDate] = useState("");
   const [message, setMessage] = useState<string | null>(null);
   const [eventAdminGrant, setEventAdminGrant] = useState<EventAdminGrantProjection | null>(null);
+  const [eventAdminCode, setEventAdminCode] = useState<GrantCodeProjection | null>(null);
+  const [eventAdminCodePlaintext, setEventAdminCodePlaintext] = useState<string | null>(null);
   const [revealedCredential, setRevealedCredential] = useState<string | null>(null);
   const [qrDataUrl, setQrDataUrl] = useState<string | null>(null);
+  const [eventAdminRotationCount, setEventAdminRotationCount] = useState<number | null>(null);
+  const [secretWarning, setSecretWarning] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [secretOwner] = useState(createGrantSecretOwner);
+
+  const secretScopeKey = (eventId = selected?.eventId) =>
+    `technical-admin:event:${eventId ?? "catalog"}`;
+
+  const clearEventAdminSecrets = () => {
+    setEventAdminCodePlaintext(null);
+    setRevealedCredential(null);
+    setQrDataUrl(null);
+    setEventAdminRotationCount(null);
+    setSecretWarning(null);
+    setMessage(null);
+    secretOwner.invalidate(secretScopeKey());
+  };
 
   useEffect(() => {
-    if (revealedCredential === null) {
-      setQrDataUrl(null);
-      return;
-    }
-    let cancelled = false;
-    void QRCode.toDataURL(revealedCredential, {
-      errorCorrectionLevel: "M",
-      margin: 2,
-      width: 320,
-    }).then((dataUrl) => {
-      if (!cancelled) setQrDataUrl(dataUrl);
-    });
+    clearSecretsRef.current = clearEventAdminSecrets;
     return () => {
-      cancelled = true;
+      secretOwner.unmount();
+      clearEventAdminSecrets();
+      clearSecretsRef.current = () => undefined;
     };
-  }, [revealedCredential]);
+  }, [secretOwner]);
+
+  const renderEventAdminQr = async (
+    credential = revealedCredential,
+    providedToken?: GrantSecretToken,
+  ): Promise<boolean> => {
+    if (credential === null) return false;
+    const token = providedToken ?? secretOwner.capture(secretScopeKey());
+    if (!secretOwner.current(token)) return false;
+    try {
+      const dataUrl = await qrRenderer(credential);
+      if (!secretOwner.current(token)) return false;
+      secretOwner.commit(token, () => {
+        setQrDataUrl(dataUrl);
+        setRevealedCredential(null);
+        setSecretWarning((current) => (current?.includes("QR render failed") ? null : current));
+      });
+      return true;
+    } catch {
+      if (secretOwner.current(token))
+        setSecretWarning("Replacement QR render failed. Retry QR render locally.");
+      return false;
+    }
+  };
 
   const request = async <T,>(url: string, init?: RequestInit) => {
     const response = await adminFetch(url, init);
@@ -286,11 +350,14 @@ function EventCatalogPanel() {
     return payload.value;
   };
 
-  const refresh = async () => {
+  const refresh = async (providedToken?: GrantSecretToken) => {
+    const token = providedToken ?? secretOwner.capture(secretScopeKey());
     const value = await request<readonly EventProjection[]>("/api/admin/events");
+    if (!secretOwner.current(token)) return;
     setEvents([...value]);
     if (selected !== null) {
       const current = await request<EventProjection>(`/api/admin/events/${selected.eventId}`);
+      if (!secretOwner.current(token)) return;
       setSelected(current);
       setEditedName(current.name);
       setEditedTimeZone(current.timeZone);
@@ -300,22 +367,40 @@ function EventCatalogPanel() {
       const grant = await request<EventAdminGrantProjection | null>(
         `/api/admin/events/${current.eventId}/event-admin-grant`,
       );
+      if (!secretOwner.current(token)) return;
       setEventAdminGrant(grant);
+      if (grant === null || grant.status !== "active") clearEventAdminSecrets();
+      const code =
+        grant === null
+          ? null
+          : await request<GrantCodeProjection | null>(
+              `/api/admin/events/${current.eventId}/event-admin-grant/code`,
+            );
+      if (!secretOwner.current(token)) return;
+      setEventAdminCode(code);
+      if (code === null || code.state !== "present") clearEventAdminSecrets();
     }
   };
 
   const selectEvent = async (eventId: string) => {
+    clearEventAdminSecrets();
+    const token = secretOwner.capture(secretScopeKey(eventId));
     const current = await request<EventProjection>(`/api/admin/events/${eventId}`);
+    if (!secretOwner.current(token)) return;
     setSelected(current);
     setEditedName(current.name);
     setEditedTimeZone(current.timeZone);
     setEditedGameDays(Object.fromEntries(current.gameDays.map((day) => [day.gameDayId, day.date])));
-    setEventAdminGrant(
-      await request<EventAdminGrantProjection | null>(
-        `/api/admin/events/${current.eventId}/event-admin-grant`,
-      ),
+    const grant = await request<EventAdminGrantProjection | null>(
+      `/api/admin/events/${current.eventId}/event-admin-grant`,
     );
-    setRevealedCredential(null);
+    if (!secretOwner.current(token)) return;
+    setEventAdminGrant(grant);
+    const code = await request<GrantCodeProjection | null>(
+      `/api/admin/events/${current.eventId}/event-admin-grant/code`,
+    );
+    if (!secretOwner.current(token)) return;
+    setEventAdminCode(code);
   };
 
   useEffect(() => {
@@ -458,6 +543,7 @@ function EventCatalogPanel() {
                   disabled={busy || selected.gameDays.length > 0}
                   onClick={() =>
                     void run(async () => {
+                      clearEventAdminSecrets();
                       await request(`/api/admin/events/${selected.eventId}`, {
                         method: "DELETE",
                         headers: { "x-technical-admin-csrf": "1" },
@@ -473,7 +559,10 @@ function EventCatalogPanel() {
                 </Button>
                 <Button
                   variant="outline"
-                  onClick={() => window.location.assign(`/event-admin?eventId=${selected.eventId}`)}
+                  onClick={() => {
+                    clearEventAdminSecrets();
+                    window.location.assign(`/event-admin?eventId=${selected.eventId}`);
+                  }}
                 >
                   Open Event Hub
                 </Button>
@@ -503,6 +592,7 @@ function EventCatalogPanel() {
                     disabled={busy || eventAdminGrant !== null}
                     onClick={() =>
                       void run(async () => {
+                        clearEventAdminSecrets();
                         setEventAdminGrant(
                           await request<EventAdminGrantProjection>(
                             `/api/admin/events/${selected.eventId}/event-admin-grant`,
@@ -521,6 +611,8 @@ function EventCatalogPanel() {
                     disabled={busy || eventAdminGrant === null}
                     onClick={() =>
                       void run(async () => {
+                        clearEventAdminSecrets();
+                        const token = secretOwner.capture(secretScopeKey(selected.eventId));
                         const response = await adminFetch(
                           `/api/admin/events/${selected.eventId}/event-admin-grant/reveal`,
                           { method: "POST", headers: { "content-type": "application/json" } },
@@ -530,7 +622,13 @@ function EventCatalogPanel() {
                         }>;
                         if (!response.ok || payload.status !== "accepted")
                           throw new Error("Grant reveal failed.");
-                        setRevealedCredential(payload.value.qrCredential);
+                        if (
+                          !secretOwner.commit(token, () =>
+                            setRevealedCredential(payload.value.qrCredential),
+                          )
+                        )
+                          return;
+                        await renderEventAdminQr(payload.value.qrCredential, token);
                       })
                     }
                   >
@@ -541,15 +639,55 @@ function EventCatalogPanel() {
                     disabled={busy || eventAdminGrant?.status !== "active"}
                     onClick={() =>
                       void run(async () => {
-                        await request(
-                          `/api/admin/events/${selected.eventId}/event-admin-grant/rotate`,
-                          {
+                        clearEventAdminSecrets();
+                        const token = secretOwner.capture(secretScopeKey(selected.eventId));
+                        let rotated: {
+                          qrCredential?: string;
+                          code?: string;
+                          affectedSessionCount?: number;
+                        };
+                        try {
+                          rotated = await request<{
+                            qrCredential?: string;
+                            code?: string;
+                            affectedSessionCount?: number;
+                          }>(`/api/admin/events/${selected.eventId}/event-admin-grant/rotate`, {
                             method: "POST",
                             headers: { "content-type": "application/json" },
-                          },
-                        );
-                        setRevealedCredential(null);
-                        await refresh();
+                          });
+                        } catch (error) {
+                          if (secretOwner.current(token)) throw error;
+                          return;
+                        }
+                        if (!secretOwner.current(token)) return;
+                        if (rotated.qrCredential === undefined || rotated.code === undefined)
+                          throw new Error(
+                            "Event Admin rotation did not return replacement credentials.",
+                          );
+                        const { qrCredential, code } = rotated;
+                        if (
+                          !secretOwner.commit(token, () => {
+                            setRevealedCredential(qrCredential);
+                            setEventAdminCodePlaintext(code);
+                            setEventAdminRotationCount(rotated.affectedSessionCount ?? 0);
+                            setMessage(
+                              `Event Admin Grant fully rotated; ${rotated.affectedSessionCount ?? 0} session(s) revoked. Dictate the new code and scan the new QR now.`,
+                            );
+                          })
+                        )
+                          return;
+                        await renderEventAdminQr(qrCredential, token);
+                        if (!secretOwner.current(token)) return;
+                        try {
+                          await refresh(token);
+                        } catch {
+                          if (secretOwner.current(token))
+                            setSecretWarning((current) =>
+                              current === null
+                                ? "Event Admin Grant state refresh failed. Replacement credentials remain visible."
+                                : `${current} Event Admin Grant state refresh failed. Replacement credentials remain visible.`,
+                            );
+                        }
                       })
                     }
                   >
@@ -560,6 +698,7 @@ function EventCatalogPanel() {
                     disabled={busy || eventAdminGrant?.status !== "active"}
                     onClick={() =>
                       void run(async () => {
+                        clearEventAdminSecrets();
                         await request(
                           `/api/admin/events/${selected.eventId}/event-admin-grant/disable`,
                           { method: "POST", headers: { "content-type": "application/json" } },
@@ -575,6 +714,7 @@ function EventCatalogPanel() {
                     disabled={busy || eventAdminGrant?.status !== "active"}
                     onClick={() =>
                       void run(async () => {
+                        clearEventAdminSecrets();
                         await request(
                           `/api/admin/events/${selected.eventId}/event-admin-grant/revoke`,
                           { method: "POST", headers: { "content-type": "application/json" } },
@@ -592,11 +732,11 @@ function EventCatalogPanel() {
                     }
                     onClick={() =>
                       void run(async () => {
+                        clearEventAdminSecrets();
                         await request(
                           `/api/admin/events/${selected.eventId}/event-admin-grant/reactivate`,
                           { method: "POST", headers: { "content-type": "application/json" } },
                         );
-                        setRevealedCredential(null);
                         await refresh();
                       })
                     }
@@ -604,6 +744,108 @@ function EventCatalogPanel() {
                     Reactivate Grant
                   </Button>
                 </div>
+                <div className="space-y-2 rounded-md border border-dashed p-3">
+                  <p className="text-sm font-medium">Radio Grant Code</p>
+                  <p className="text-xs text-muted-foreground">
+                    Technical Admin only. Create or replace returns the code once for immediate
+                    dictation; it is never included in the Grant projection.
+                  </p>
+                  <p className="text-xs">Code state: {eventAdminCode?.state ?? "absent"}</p>
+                  <div className="flex flex-wrap gap-2">
+                    <Button
+                      variant="outline"
+                      disabled={busy || eventAdminGrant?.status !== "active"}
+                      onClick={() =>
+                        void run(async () => {
+                          clearEventAdminSecrets();
+                          const token = secretOwner.capture(secretScopeKey(selected.eventId));
+                          const created = await request<{ code: string }>(
+                            `/api/admin/events/${selected.eventId}/event-admin-grant/code`,
+                            { method: "POST", headers: { "content-type": "application/json" } },
+                          );
+                          if (
+                            !secretOwner.commit(token, () =>
+                              setEventAdminCodePlaintext(created.code),
+                            )
+                          )
+                            return;
+                          const projection = await request<GrantCodeProjection>(
+                            `/api/admin/events/${selected.eventId}/event-admin-grant/code`,
+                          );
+                          secretOwner.commit(token, () => setEventAdminCode(projection));
+                        })
+                      }
+                    >
+                      Create Code
+                    </Button>
+                    <Button
+                      variant="outline"
+                      disabled={busy || eventAdminCode?.state !== "present"}
+                      onClick={() =>
+                        void run(async () => {
+                          clearEventAdminSecrets();
+                          const token = secretOwner.capture(secretScopeKey(selected.eventId));
+                          const created = await request<{ code: string }>(
+                            `/api/admin/events/${selected.eventId}/event-admin-grant/code/replace`,
+                            { method: "POST", headers: { "content-type": "application/json" } },
+                          );
+                          if (
+                            !secretOwner.commit(token, () =>
+                              setEventAdminCodePlaintext(created.code),
+                            )
+                          )
+                            return;
+                          const projection = await request<GrantCodeProjection>(
+                            `/api/admin/events/${selected.eventId}/event-admin-grant/code`,
+                          );
+                          secretOwner.commit(token, () => setEventAdminCode(projection));
+                        })
+                      }
+                    >
+                      Replace Code
+                    </Button>
+                    <Button
+                      variant="outline"
+                      disabled={busy || eventAdminCode?.state !== "present"}
+                      onClick={() =>
+                        void run(async () => {
+                          clearEventAdminSecrets();
+                          const token = secretOwner.capture(secretScopeKey(selected.eventId));
+                          await request(
+                            `/api/admin/events/${selected.eventId}/event-admin-grant/code/disable`,
+                            { method: "POST", headers: { "content-type": "application/json" } },
+                          );
+                          const projection = await request<GrantCodeProjection>(
+                            `/api/admin/events/${selected.eventId}/event-admin-grant/code`,
+                          );
+                          secretOwner.commit(token, () => setEventAdminCode(projection));
+                        })
+                      }
+                    >
+                      Disable Code
+                    </Button>
+                    {eventAdminCodePlaintext ? (
+                      <Button variant="outline" onClick={() => setEventAdminCodePlaintext(null)}>
+                        Clear Dictation
+                      </Button>
+                    ) : null}
+                  </div>
+                  {eventAdminCodePlaintext ? (
+                    <p aria-live="polite" className="rounded bg-muted p-2 font-mono text-lg">
+                      Dictate now: {eventAdminCodePlaintext}
+                    </p>
+                  ) : null}
+                  {eventAdminRotationCount !== null ? (
+                    <p className="text-xs text-muted-foreground">
+                      Full rotation affected {eventAdminRotationCount} session(s).
+                    </p>
+                  ) : null}
+                </div>
+                {secretWarning ? (
+                  <p className="text-sm text-destructive" role="status">
+                    {secretWarning}
+                  </p>
+                ) : null}
                 {qrDataUrl ? (
                   <div className="space-y-2 rounded-md border bg-white p-3">
                     <img
@@ -615,6 +857,11 @@ function EventCatalogPanel() {
                       Scan this protected QR code on the Event Admin device.
                     </p>
                   </div>
+                ) : null}
+                {revealedCredential ? (
+                  <Button variant="outline" onClick={() => void renderEventAdminQr()}>
+                    Retry QR render
+                  </Button>
                 ) : null}
               </div>
               <div className="space-y-2">
