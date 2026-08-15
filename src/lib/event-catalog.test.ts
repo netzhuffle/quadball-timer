@@ -541,4 +541,471 @@ describe("Event operations catalog", () => {
       after: { name: "Pitch Updated" },
     });
   });
+
+  test("creates ordered Slots, unresolved Event Games, and confirms one Gameplay Slot atomically", async () => {
+    const fixture = createFixture();
+    const event = await fixture.catalog.createEvent(
+      { name: "Schedule", timeZone: "UTC" },
+      authority,
+    );
+    if (event.status !== "accepted") throw new Error("Expected Event.");
+    const day = await fixture.catalog.addGameDay(
+      event.value.eventId,
+      { date: "2026-08-14" },
+      authority,
+    );
+    if (day.status !== "accepted") throw new Error("Expected Game Day.");
+    const pitch = await fixture.catalog.createPitch(
+      event.value.eventId,
+      { name: "Pitch 1" },
+      authority,
+    );
+    const firstTeam = await fixture.catalog.createEventTeam(
+      event.value.eventId,
+      { name: "Blue" },
+      authority,
+    );
+    const secondTeam = await fixture.catalog.createEventTeam(
+      event.value.eventId,
+      { name: "Red" },
+      authority,
+    );
+    if (
+      pitch.status !== "accepted" ||
+      firstTeam.status !== "accepted" ||
+      secondTeam.status !== "accepted"
+    )
+      throw new Error("Expected schedule references.");
+    const slot = await fixture.catalog.createGameplaySlot(
+      event.value.eventId,
+      day.value.gameDayId,
+      { sequence: 1, scheduledStart: "2026-08-14T09:00" },
+      authority,
+    );
+    if (slot.status !== "accepted") throw new Error("Expected Gameplay Slot.");
+    const snapshot = await fixture.storage.snapshot();
+    const pitchSlot = snapshot.listPitchSlots(day.value.gameDayId, pitch.value.pitchId)[0];
+    if (pitchSlot === undefined) throw new Error("Expected Pitch Slot.");
+    const game = await fixture.catalog.createEventGame(
+      event.value.eventId,
+      day.value.gameDayId,
+      {
+        gameplaySlotId: slot.value.gameplaySlotId,
+        pitchSlotId: pitchSlot.pitchSlotId,
+        sideA: { sourceLabel: "Winner QF 1" },
+        sideB: { sourceLabel: "Winner QF 2" },
+        gameCode: "SF.1",
+      },
+      authority,
+    );
+    expect(game).toMatchObject({ status: "accepted", value: { sideA: { eventTeamId: null } } });
+    if (game.status !== "accepted") return;
+    const confirmed = await fixture.catalog.confirmGameplaySlotTeams(
+      event.value.eventId,
+      day.value.gameDayId,
+      slot.value.gameplaySlotId,
+      {
+        games: [
+          {
+            eventGameId: game.value.eventGameId,
+            sideAEventTeamId: firstTeam.value.eventTeamId,
+            sideBEventTeamId: secondTeam.value.eventTeamId,
+          },
+        ],
+      },
+      authority,
+    );
+    expect(confirmed).toMatchObject({
+      status: "accepted",
+      value: [{ sideA: { eventTeamId: firstTeam.value.eventTeamId, eventTeamName: "Blue" } }],
+    });
+    const auditBeforeNoChange = await fixture.catalog.listAuditTrail(
+      event.value.eventId,
+      authority,
+    );
+    const renamed = await fixture.catalog.updateEventTeam(
+      event.value.eventId,
+      firstTeam.value.eventTeamId,
+      { name: "Blue Renamed" },
+      authority,
+    );
+    expect(renamed).toMatchObject({ status: "accepted" });
+    expect(
+      await fixture.catalog.confirmGameplaySlotTeams(
+        event.value.eventId,
+        day.value.gameDayId,
+        slot.value.gameplaySlotId,
+        {
+          games: [
+            {
+              eventGameId: game.value.eventGameId,
+              sideAEventTeamId: firstTeam.value.eventTeamId,
+              sideBEventTeamId: secondTeam.value.eventTeamId,
+            },
+          ],
+        },
+        authority,
+      ),
+    ).toMatchObject({ status: "rejected", reason: "no-change" });
+    expect(
+      await fixture.catalog.confirmGameplaySlotTeams(
+        event.value.eventId,
+        day.value.gameDayId,
+        slot.value.gameplaySlotId,
+        {
+          games: [
+            {
+              eventGameId: game.value.eventGameId,
+              sideAEventTeamId: secondTeam.value.eventTeamId,
+              sideBEventTeamId: firstTeam.value.eventTeamId,
+            },
+          ],
+        },
+        authority,
+      ),
+    ).toMatchObject({ status: "rejected", reason: "invalid-input" });
+    const inspected = await fixture.catalog.inspectEvent(event.value.eventId, authority);
+    expect(inspected).toMatchObject({
+      status: "accepted",
+      value: {
+        gameplaySlots: [{ sequence: 1 }],
+        pitchSlots: [{ pitchId: pitch.value.pitchId, gameplaySlotId: slot.value.gameplaySlotId }],
+        eventGames: [{ gameCode: "SF.1", sideA: { eventTeamId: firstTeam.value.eventTeamId } }],
+      },
+    });
+    expect(inspected).toMatchObject({
+      value: {
+        eventGames: [{ sideA: { eventTeamName: "Blue" }, sideB: { eventTeamName: "Red" } }],
+      },
+    });
+    const audit = await fixture.catalog.listAuditTrail(event.value.eventId, authority);
+    expect(audit).toMatchObject({ status: "accepted" });
+    if (audit.status === "accepted") {
+      expect(audit.value.some((entry) => entry.action === "event-game-teams-confirmed")).toBe(true);
+      expect(
+        audit.value.filter((entry) => entry.action === "event-game-teams-confirmed"),
+      ).toHaveLength(1);
+      if (auditBeforeNoChange.status !== "accepted") throw new Error("Expected audit trail.");
+      expect(audit.value.length).toBe(auditBeforeNoChange.value.length + 1);
+    }
+  });
+
+  test("interprets scheduled starts in the Event timezone and rejects malformed, wrong-day, and DST-gap times", async () => {
+    const fixture = createFixture();
+    const event = await fixture.catalog.createEvent(
+      { name: "Zurich Schedule", timeZone: "Europe/Zurich" },
+      authority,
+    );
+    if (event.status !== "accepted") throw new Error("Expected Event.");
+    const day = await fixture.catalog.addGameDay(
+      event.value.eventId,
+      { date: "2026-03-29" },
+      authority,
+    );
+    if (day.status !== "accepted") throw new Error("Expected Game Day.");
+    const before = await fixture.catalog.listAuditTrail(event.value.eventId, authority);
+    expect(
+      await fixture.catalog.createGameplaySlot(
+        event.value.eventId,
+        day.value.gameDayId,
+        { sequence: 1, scheduledStart: "2026-03-29T02:30" },
+        authority,
+      ),
+    ).toMatchObject({ status: "rejected", reason: "invalid-input" });
+    expect(
+      await fixture.catalog.createGameplaySlot(
+        event.value.eventId,
+        day.value.gameDayId,
+        { sequence: 1, scheduledStart: "2026-03-30T10:00" },
+        authority,
+      ),
+    ).toMatchObject({ status: "rejected", reason: "invalid-input" });
+    expect(
+      await fixture.catalog.createGameplaySlot(
+        event.value.eventId,
+        day.value.gameDayId,
+        { sequence: 1, scheduledStart: "2026-03-29 10:00" },
+        authority,
+      ),
+    ).toMatchObject({ status: "rejected", reason: "invalid-input" });
+    const after = await fixture.catalog.listAuditTrail(event.value.eventId, authority);
+    expect(after).toMatchObject({
+      status: "accepted",
+      value: before.status === "accepted" ? before.value : [],
+    });
+    const valid = await fixture.catalog.createGameplaySlot(
+      event.value.eventId,
+      day.value.gameDayId,
+      { sequence: 1, scheduledStart: "2026-03-29T10:00" },
+      authority,
+    );
+    expect(valid).toMatchObject({
+      status: "accepted",
+      value: { scheduledStartMs: Date.parse("2026-03-29T08:00:00Z") },
+    });
+  });
+
+  test("rejects an ambiguous Event-timezone fall-back wall time", async () => {
+    const fixture = createFixture();
+    const event = await fixture.catalog.createEvent(
+      { name: "Zurich Fall Back", timeZone: "Europe/Zurich" },
+      authority,
+    );
+    if (event.status !== "accepted") throw new Error("Expected Event.");
+    const day = await fixture.catalog.addGameDay(
+      event.value.eventId,
+      { date: "2026-10-25" },
+      authority,
+    );
+    if (day.status !== "accepted") throw new Error("Expected Game Day.");
+    const before = await fixture.catalog.listAuditTrail(event.value.eventId, authority);
+    expect(
+      await fixture.catalog.createGameplaySlot(
+        event.value.eventId,
+        day.value.gameDayId,
+        { sequence: 1, scheduledStart: "2026-10-25T02:30" },
+        authority,
+      ),
+    ).toMatchObject({ status: "rejected", reason: "invalid-input" });
+    expect(await fixture.catalog.inspectEvent(event.value.eventId, authority)).toMatchObject({
+      status: "accepted",
+      value: { gameplaySlots: [] },
+    });
+    const after = await fixture.catalog.listAuditTrail(event.value.eventId, authority);
+    expect(after).toMatchObject({ status: "accepted" });
+    if (before.status === "accepted" && after.status === "accepted")
+      expect(after.value.length).toBe(before.value.length);
+  });
+
+  test("preflights every Game before rejecting a late-invalid multi-Game confirmation", async () => {
+    const fixture = createFixture();
+    const event = await fixture.catalog.createEvent({ name: "Batch", timeZone: "UTC" }, authority);
+    const foreignEvent = await fixture.catalog.createEvent(
+      { name: "Foreign", timeZone: "UTC" },
+      authority,
+    );
+    if (event.status !== "accepted" || foreignEvent.status !== "accepted")
+      throw new Error("Expected Events.");
+    const day = await fixture.catalog.addGameDay(
+      event.value.eventId,
+      { date: "2026-08-14" },
+      authority,
+    );
+    const pitchA = await fixture.catalog.createPitch(event.value.eventId, { name: "A" }, authority);
+    const pitchB = await fixture.catalog.createPitch(event.value.eventId, { name: "B" }, authority);
+    const firstTeam = await fixture.catalog.createEventTeam(
+      event.value.eventId,
+      { name: "Blue" },
+      authority,
+    );
+    const secondTeam = await fixture.catalog.createEventTeam(
+      event.value.eventId,
+      { name: "Red" },
+      authority,
+    );
+    const foreignTeam = await fixture.catalog.createEventTeam(
+      foreignEvent.value.eventId,
+      { name: "Foreign" },
+      authority,
+    );
+    if (
+      day.status !== "accepted" ||
+      pitchA.status !== "accepted" ||
+      pitchB.status !== "accepted" ||
+      firstTeam.status !== "accepted" ||
+      secondTeam.status !== "accepted" ||
+      foreignTeam.status !== "accepted"
+    )
+      throw new Error("Expected batch setup.");
+    const slot = await fixture.catalog.createGameplaySlot(
+      event.value.eventId,
+      day.value.gameDayId,
+      { sequence: 1, scheduledStart: "2026-08-14T10:00" },
+      authority,
+    );
+    if (slot.status !== "accepted") throw new Error("Expected Gameplay Slot.");
+    const pitchSlots = await fixture.storage.snapshot();
+    const pitchSlotA = pitchSlots.listPitchSlots(day.value.gameDayId, pitchA.value.pitchId)[0];
+    const pitchSlotB = pitchSlots.listPitchSlots(day.value.gameDayId, pitchB.value.pitchId)[0];
+    if (pitchSlotA === undefined || pitchSlotB === undefined)
+      throw new Error("Expected Pitch Slots.");
+    const gameA = await fixture.catalog.createEventGame(
+      event.value.eventId,
+      day.value.gameDayId,
+      {
+        gameplaySlotId: slot.value.gameplaySlotId,
+        pitchSlotId: pitchSlotA.pitchSlotId,
+        sideA: { sourceLabel: "A" },
+        sideB: { sourceLabel: "B" },
+      },
+      authority,
+    );
+    const gameB = await fixture.catalog.createEventGame(
+      event.value.eventId,
+      day.value.gameDayId,
+      {
+        gameplaySlotId: slot.value.gameplaySlotId,
+        pitchSlotId: pitchSlotB.pitchSlotId,
+        sideA: { sourceLabel: "C" },
+        sideB: { sourceLabel: "D" },
+      },
+      authority,
+    );
+    if (gameA.status !== "accepted" || gameB.status !== "accepted")
+      throw new Error("Expected Event Games.");
+    const beforeAudit = await fixture.catalog.listAuditTrail(event.value.eventId, authority);
+    const rejected = await fixture.catalog.confirmGameplaySlotTeams(
+      event.value.eventId,
+      day.value.gameDayId,
+      slot.value.gameplaySlotId,
+      {
+        games: [
+          {
+            eventGameId: gameA.value.eventGameId,
+            sideAEventTeamId: firstTeam.value.eventTeamId,
+            sideBEventTeamId: secondTeam.value.eventTeamId,
+          },
+          {
+            eventGameId: gameB.value.eventGameId,
+            sideAEventTeamId: firstTeam.value.eventTeamId,
+            sideBEventTeamId: foreignTeam.value.eventTeamId,
+          },
+        ],
+      },
+      authority,
+    );
+    expect(rejected).toMatchObject({ status: "rejected", reason: "cross-event" });
+    const after = await fixture.catalog.inspectEvent(event.value.eventId, authority);
+    expect(after).toMatchObject({
+      status: "accepted",
+      value: {
+        eventGames: [
+          { eventGameId: gameA.value.eventGameId, sideA: { eventTeamId: null } },
+          { eventGameId: gameB.value.eventGameId, sideA: { eventTeamId: null } },
+        ],
+      },
+    });
+    const afterAudit = await fixture.catalog.listAuditTrail(event.value.eventId, authority);
+    if (beforeAudit.status === "accepted" && afterAudit.status === "accepted")
+      expect(afterAudit.value.length).toBe(beforeAudit.value.length);
+  });
+
+  test("rejects Gameplay Slot confirmation after the transaction-local Game Record has commenced", async () => {
+    const foundation = createInMemoryFoundationStorage();
+    let nextId = 0;
+    const catalog = createEventCatalog(createFoundationEventCatalogStorage(foundation), {
+      clock: { nowMs: () => 2_000 },
+      ids: { next: (kind) => `${kind}-${++nextId}` },
+    });
+    const event = await catalog.createEvent({ name: "Lifecycle", timeZone: "UTC" }, authority);
+    if (event.status !== "accepted") throw new Error("Expected Event.");
+    const day = await catalog.addGameDay(event.value.eventId, { date: "2026-08-14" }, authority);
+    const pitch = await catalog.createPitch(event.value.eventId, { name: "Pitch" }, authority);
+    const firstTeam = await catalog.createEventTeam(
+      event.value.eventId,
+      { name: "Blue" },
+      authority,
+    );
+    const secondTeam = await catalog.createEventTeam(
+      event.value.eventId,
+      { name: "Red" },
+      authority,
+    );
+    if (
+      day.status !== "accepted" ||
+      pitch.status !== "accepted" ||
+      firstTeam.status !== "accepted" ||
+      secondTeam.status !== "accepted"
+    )
+      throw new Error("Expected schedule setup.");
+    const slot = await catalog.createGameplaySlot(
+      event.value.eventId,
+      day.value.gameDayId,
+      { sequence: 1, scheduledStart: "2026-08-14T10:00" },
+      authority,
+    );
+    if (slot.status !== "accepted") throw new Error("Expected Gameplay Slot.");
+    const pitchSlot = await foundation.transaction(
+      (transaction) => transaction.listPitchSlots(day.value.gameDayId, pitch.value.pitchId)[0],
+    );
+    if (pitchSlot === undefined) throw new Error("Expected Pitch Slot.");
+    const game = await catalog.createEventGame(
+      event.value.eventId,
+      day.value.gameDayId,
+      {
+        gameplaySlotId: slot.value.gameplaySlotId,
+        pitchSlotId: pitchSlot.pitchSlotId,
+        sideA: { sourceLabel: "Winner A" },
+        sideB: { sourceLabel: "Winner B" },
+      },
+      authority,
+    );
+    if (game.status !== "accepted") throw new Error("Expected Event Game.");
+    await foundation.transaction((transaction) =>
+      transaction.insertRoot({
+        root: {
+          recordId: "record-1",
+          eventId: event.value.eventId,
+          eventGameId: game.value.eventGameId,
+          ownership: { eventId: event.value.eventId, eventGameId: game.value.eventGameId },
+          externalScope: {
+            eventId: event.value.eventId,
+            gameDayId: day.value.gameDayId,
+            pitchId: pitch.value.pitchId,
+            pitchSlotId: pitchSlot.pitchSlotId,
+          },
+          gameSides: [
+            {
+              id: "record-side-a",
+              eventTeamId: firstTeam.value.eventTeamId,
+              teamInterpretationRef: "team",
+            },
+            {
+              id: "record-side-b",
+              eventTeamId: secondTeam.value.eventTeamId,
+              teamInterpretationRef: "team",
+            },
+          ],
+          lifecycle: {
+            phase: "in-progress",
+            commencedAtMs: 1_500,
+            finishedAtMs: null,
+            lockedAtMs: null,
+            lockReason: null,
+          },
+          compatibility: { recordVersion: "v1", schemaVersion: "v1", interpreterVersion: "v1" },
+          creationEvidence: {
+            operationId: "operation-1",
+            actorReference: "test",
+            source: "event-game-registration",
+            createdAtMs: 1_000,
+          },
+        },
+        canonicalContent: "{}",
+      }),
+    );
+    const before = await catalog.listAuditTrail(event.value.eventId, authority);
+    expect(
+      await catalog.confirmGameplaySlotTeams(
+        event.value.eventId,
+        day.value.gameDayId,
+        slot.value.gameplaySlotId,
+        {
+          games: [
+            {
+              eventGameId: game.value.eventGameId,
+              sideAEventTeamId: firstTeam.value.eventTeamId,
+              sideBEventTeamId: secondTeam.value.eventTeamId,
+            },
+          ],
+        },
+        authority,
+      ),
+    ).toMatchObject({ status: "rejected", reason: "invalid-input" });
+    const after = await catalog.listAuditTrail(event.value.eventId, authority);
+    expect(after).toMatchObject({ status: "accepted" });
+    if (before.status === "accepted" && after.status === "accepted")
+      expect(after.value.length).toBe(before.value.length);
+    foundation.close();
+  });
 });

@@ -259,8 +259,71 @@ try {
   await eventAdminPage.getByLabel("Pitch Pitch One name").fill("Pitch Main");
   await eventAdminPage.getByRole("button", { name: "Save Pitch" }).click();
   await eventAdminPage.getByLabel("Pitch Pitch Main name").waitFor();
+  await eventAdminPage.getByLabel("New Event Team name").fill("Red");
+  await eventAdminPage.getByRole("button", { name: "Add Team" }).click();
+  await eventAdminPage.getByText("Red", { exact: true }).first().waitFor();
+  await eventAdminPage.getByLabel("Gameplay Slot sequence").fill("1");
+  await eventAdminPage.getByLabel("Gameplay Slot scheduled start").fill("2026-08-15T10:00");
+  const createGameplaySlotResponsePromise = eventAdminPage.waitForResponse(
+    (response) =>
+      response.url().includes(`/api/event-admin/events/${eventId}/game-days/`) &&
+      response.url().endsWith("/gameplay-slots") &&
+      response.request().method() === "POST",
+  );
+  await eventAdminPage.getByRole("button", { name: "Add Gameplay Slot" }).click();
+  assert(
+    (await createGameplaySlotResponsePromise).status() === 201,
+    "Gameplay Slot creation failed",
+  );
+  await eventAdminPage.getByLabel("Gameplay Slot for Event Game").selectOption({ index: 1 });
+  await eventAdminPage.getByLabel("Pitch Slot for Event Game").selectOption({ index: 1 });
+  await eventAdminPage.getByLabel("Game Code").fill("G-01");
+  await eventAdminPage.getByLabel("Game Designation").fill("Opening");
+  await eventAdminPage.getByLabel("Side A source label").fill("Winner A");
+  await eventAdminPage.getByLabel("Side B source label").fill("Winner B");
+  const createEventGameResponsePromise = eventAdminPage.waitForResponse(
+    (response) =>
+      response.url().includes(`/api/event-admin/events/${eventId}/game-days/`) &&
+      response.url().endsWith("/event-games") &&
+      response.request().method() === "POST",
+  );
+  await eventAdminPage.getByRole("button", { name: "Add unresolved Event Game" }).click();
+  assert((await createEventGameResponsePromise).status() === 201, "Event Game creation failed");
+  await eventAdminPage
+    .locator('select[aria-label$="Side A"]')
+    .selectOption({ label: "Blue Updated" });
+  await eventAdminPage.locator('select[aria-label$="Side B"]').selectOption({ label: "Red" });
+  const confirmGameplaySlotResponsePromise = eventAdminPage.waitForResponse(
+    (response) =>
+      response.url().includes(`/api/event-admin/events/${eventId}/game-days/`) &&
+      response.url().endsWith("/confirm-teams") &&
+      response.request().method() === "POST",
+  );
+  await eventAdminPage.getByRole("button", { name: "Confirm teams for Slot" }).click();
+  assert(
+    (await confirmGameplaySlotResponsePromise).status() === 200,
+    "Gameplay Slot confirmation failed",
+  );
+  await eventAdminPage.getByRole("button", { name: "Refresh Slot setup" }).click();
+  await eventAdminPage.getByText("Opening", { exact: true }).waitFor();
+  await eventAdminPage
+    .getByText(/Slot 1.*10:00/u)
+    .last()
+    .waitFor();
+  await eventAdminPage.getByRole("button", { name: "Pitch Main" }).click();
+  await eventAdminPage
+    .getByText(/Slot 1/)
+    .last()
+    .waitFor();
   const sessionCookieBeforeRefresh = (await eventAdminContext.cookies()).find(
     (cookie) => cookie.name === "__Host-event-admin-session",
+  );
+  const projectionResponse = await eventAdminContext.request.get(
+    `${origin}/api/event-admin/hub?eventId=${eventId}`,
+  );
+  assert(
+    projectionResponse.status() === 200 && projectionResponse.headers()["set-cookie"] === undefined,
+    "Event Admin projection emitted a session refresh header",
   );
   await eventAdminPage.reload();
   await eventAdminPage.getByText(/event-admin/u).waitFor();
@@ -270,8 +333,9 @@ try {
   assert(
     sessionCookieBeforeRefresh !== undefined &&
       sessionCookieAfterRefresh !== undefined &&
-      sessionCookieAfterRefresh.expires >= sessionCookieBeforeRefresh.expires,
-    "Event Admin Hub did not refresh the rolling session cookie",
+      sessionCookieAfterRefresh.expires === sessionCookieBeforeRefresh.expires &&
+      sessionCookieAfterRefresh.value === sessionCookieBeforeRefresh.value,
+    "Event Admin projection changed the rolling session cookie",
   );
   const wrongEventResponse = await fetchFromPage(
     eventAdminPage,
@@ -340,8 +404,6 @@ try {
   await revokedEventAdminContext.close();
   const removeButtons = page.getByRole("button", { name: "Remove", exact: true });
   await removeButtons.nth(0).click();
-  await removeButtons.nth(0).click();
-  await page.getByText("No Game Days.").waitFor();
   const attachedGrantRemoval = await page.evaluate(async (url) => {
     const csrf = document.cookie
       .split(";")

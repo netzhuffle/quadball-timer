@@ -10,6 +10,9 @@ import {
   type EventProjection,
   type StoredPitch,
   type StoredRosterEntry,
+  type GameplaySlot,
+  type EventGame,
+  type PitchSlot,
 } from "@/lib/event-catalog";
 import type { TechnicalAdminAuthority } from "@/lib/technical-admin-auth";
 import type {
@@ -49,6 +52,23 @@ export type EventHubProjection = {
   authority: "technical-admin" | "event-admin";
   grantSessionId: string | null;
   grantSessionExpiresAtMs: number | null;
+};
+
+export type SlotSetupProjection = {
+  gameDayId: string;
+  gameplaySlots: readonly GameplaySlot[];
+  pitchSlots: readonly PitchSlot[];
+  eventGames: readonly EventGame[];
+  pitches: readonly { pitchId: string; name: string }[];
+};
+
+export type PitchViewProjection = {
+  gameDayId: string;
+  pitchId: string;
+  pitch: { pitchId: string; name: string };
+  gameplaySlots: readonly GameplaySlot[];
+  pitchSlots: readonly PitchSlot[];
+  eventGames: readonly EventGame[];
 };
 
 export type EventAdministrationOutcome<T> =
@@ -136,6 +156,43 @@ export type EventAdministration = {
     input: { name: unknown },
     authority: EventAdministrationAuthority,
   ): Promise<EventAdministrationMutationOutcome<StoredPitch>>;
+  createGameplaySlot(
+    eventId: unknown,
+    gameDayId: unknown,
+    input: { sequence: unknown; scheduledStart?: unknown; scheduledStartMs?: unknown },
+    authority: EventAdministrationAuthority,
+  ): Promise<EventAdministrationMutationOutcome<GameplaySlot>>;
+  createEventGame(
+    eventId: unknown,
+    gameDayId: unknown,
+    input: {
+      gameplaySlotId: unknown;
+      pitchSlotId: unknown;
+      gameCode?: unknown;
+      gameDesignation?: unknown;
+      sideA?: unknown;
+      sideB?: unknown;
+    },
+    authority: EventAdministrationAuthority,
+  ): Promise<EventAdministrationMutationOutcome<EventGame>>;
+  confirmGameplaySlotTeams(
+    eventId: unknown,
+    gameDayId: unknown,
+    gameplaySlotId: unknown,
+    input: { games: unknown },
+    authority: EventAdministrationAuthority,
+  ): Promise<EventAdministrationMutationOutcome<readonly EventGame[]>>;
+  openSlotSetup(
+    eventId: unknown,
+    gameDayId: unknown,
+    authority: EventAdministrationAuthority,
+  ): Promise<EventAdministrationOutcome<SlotSetupProjection>>;
+  openPitchView(
+    eventId: unknown,
+    gameDayId: unknown,
+    pitchId: unknown,
+    authority: EventAdministrationAuthority,
+  ): Promise<EventAdministrationOutcome<PitchViewProjection>>;
 };
 
 export function createEventAdministration(
@@ -186,8 +243,13 @@ export function createEventAdministration(
       try {
         return await options.storage.transaction((transaction) => {
           if (
-            authorizeEventScopeInTransaction(options, transaction, eventId.value, authority) ===
-            null
+            authorizeEventScopeInTransaction(
+              options,
+              transaction,
+              eventId.value,
+              authority,
+              true,
+            ) === null
           )
             return unauthorized();
           const grant =
@@ -269,6 +331,7 @@ export function createEventAdministration(
             transaction,
             eventId.value,
             input.authority,
+            true,
           );
           if (authorized === null) return unauthorized();
           const stored = transaction.findEvent(eventId.value);
@@ -283,6 +346,15 @@ export function createEventAdministration(
               .listEventTeams(eventId.value)
               .flatMap((team) => transaction.listRoster(team.eventTeamId)),
             transaction.listPitches(eventId.value),
+            transaction
+              .listGameDays(eventId.value)
+              .flatMap((day) => transaction.listGameplaySlots(day.gameDayId)),
+            transaction
+              .listGameDays(eventId.value)
+              .flatMap((day) => transaction.listPitchSlots(day.gameDayId)),
+            transaction
+              .listGameDays(eventId.value)
+              .flatMap((day) => transaction.listEventGames(day.gameDayId)),
           );
           if (gameDayId !== null && !event.gameDays.some((day) => day.gameDayId === gameDayId))
             return unauthorized();
@@ -328,6 +400,45 @@ export function createEventAdministration(
         operations.updatePitch(eventId, pitchId, input),
       );
     },
+
+    async createGameplaySlot(eventId, gameDayId, input, authority) {
+      return runCatalogMutation(catalog, options, eventId, authority, (operations) =>
+        operations.createGameplaySlot(eventId, gameDayId, input),
+      );
+    },
+
+    async createEventGame(eventId, gameDayId, input, authority) {
+      return runCatalogMutation(catalog, options, eventId, authority, (operations) =>
+        operations.createEventGame(eventId, gameDayId, input),
+      );
+    },
+
+    async confirmGameplaySlotTeams(eventId, gameDayId, gameplaySlotId, input, authority) {
+      return runCatalogMutation(catalog, options, eventId, authority, (operations) =>
+        operations.confirmGameplaySlotTeams(eventId, gameDayId, gameplaySlotId, input),
+      );
+    },
+
+    async openSlotSetup(eventIdInput, gameDayIdInput, authority) {
+      return openScheduleProjection<SlotSetupProjection>(
+        options,
+        eventIdInput,
+        gameDayIdInput,
+        authority,
+        "slot",
+      );
+    },
+
+    async openPitchView(eventIdInput, gameDayIdInput, pitchIdInput, authority) {
+      return openScheduleProjection<PitchViewProjection>(
+        options,
+        eventIdInput,
+        gameDayIdInput,
+        authority,
+        "pitch",
+        pitchIdInput,
+      );
+    },
   };
 }
 
@@ -336,6 +447,7 @@ function authorizeEventScopeInTransaction(
   transaction: FoundationStorageTransaction,
   eventId: string,
   authority: EventAdministrationAuthority,
+  readOnly = false,
 ): {
   kind: "technical-admin" | "event-admin";
   sessionId: string | null;
@@ -358,6 +470,7 @@ function authorizeEventScopeInTransaction(
     return null;
   const result = options.grants.authorizeGrantInTransaction(transaction, {
     sessionBearer: authority.sessionBearer,
+    readOnly,
   });
   if (
     result.status !== "authorized" ||
@@ -371,6 +484,61 @@ function authorizeEventScopeInTransaction(
     sessionExpiresAtMs: result.sessionExpiresAtMs ?? null,
     actorReference: `event-admin:${result.grantSessionId}`,
   };
+}
+
+async function openScheduleProjection<T extends SlotSetupProjection | PitchViewProjection>(
+  options: EventAdministrationOptions,
+  eventIdInput: unknown,
+  gameDayIdInput: unknown,
+  authority: EventAdministrationAuthority,
+  mode: "slot" | "pitch",
+  pitchIdInput?: unknown,
+): Promise<EventAdministrationOutcome<T>> {
+  const eventId = validateEventId(eventIdInput);
+  const gameDayId = validateEventId(gameDayIdInput);
+  if (!eventId.ok || !gameDayId.ok) return unauthorized();
+  const pitchId = mode === "pitch" ? validateEventId(pitchIdInput) : null;
+  if (pitchId !== null && !pitchId.ok) return unauthorized();
+  try {
+    return await options.storage.transaction((transaction) => {
+      if (
+        authorizeEventScopeInTransaction(options, transaction, eventId.value, authority, true) ===
+        null
+      )
+        return unauthorized();
+      const event = transaction.findEvent(eventId.value);
+      const day = transaction
+        .listGameDays(eventId.value)
+        .find((candidate) => candidate.gameDayId === gameDayId.value);
+      if (event === null || day === undefined) return notFound("Game Day was not found.");
+      const games = transaction.listEventGames(day.gameDayId);
+      if (mode === "slot")
+        return accepted({
+          gameDayId: day.gameDayId,
+          gameplaySlots: transaction.listGameplaySlots(day.gameDayId),
+          pitchSlots: transaction.listPitchSlots(day.gameDayId),
+          eventGames: games,
+          pitches: transaction
+            .listPitches(event.eventId)
+            .map(({ pitchId: id, name }) => ({ pitchId: id, name })),
+        } as unknown as T);
+      const pitch = transaction.findPitch(pitchId?.value ?? "");
+      if (pitch === null || pitch.eventId !== event.eventId)
+        return notFound("Pitch was not found.");
+      return accepted({
+        gameDayId: day.gameDayId,
+        pitchId: pitch.pitchId,
+        pitch: { pitchId: pitch.pitchId, name: pitch.name },
+        gameplaySlots: transaction.listGameplaySlots(day.gameDayId),
+        pitchSlots: transaction.listPitchSlots(day.gameDayId, pitch.pitchId),
+        eventGames: games.filter(
+          (game) => transaction.findPitchSlot(game.pitchSlotId)?.pitchId === pitch.pitchId,
+        ),
+      } as unknown as T);
+    });
+  } catch {
+    return unavailable();
+  }
 }
 
 async function runCatalogMutation<T>(

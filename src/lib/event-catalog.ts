@@ -28,7 +28,12 @@ import type {
   StoredEventCatalogTeam,
   StoredEventCatalogRosterEntry,
   StoredEventCatalogPitch,
+  StoredGameplaySlot,
+  StoredPitchSlot,
+  StoredEventCatalogGame,
+  StoredEventGameSide,
 } from "@/lib/foundation-storage";
+import type { EventGameRecordRoot } from "@/lib/foundation-record-types";
 import { createInMemoryFoundationStorage } from "@/lib/foundation-storage-memory";
 
 export type EventPublicationStatus = "unpublished";
@@ -40,6 +45,10 @@ export type StoredGameDay = StoredEventCatalogGameDay;
 export type StoredEventTeam = StoredEventCatalogTeam;
 export type StoredRosterEntry = StoredEventCatalogRosterEntry;
 export type StoredPitch = StoredEventCatalogPitch;
+export type GameplaySlot = StoredGameplaySlot;
+export type PitchSlot = StoredPitchSlot;
+export type EventGame = StoredEventCatalogGame;
+export type EventGameSide = StoredEventGameSide;
 export type EventAdministrationAuditEntry = EventCatalogAuditEntry;
 
 export type EventGameDay = StoredGameDay & {
@@ -60,6 +69,9 @@ export type EventProjection = StoredEvent & {
   gameDays: readonly EventGameDay[];
   teams: readonly EventTeamProjection[];
   pitches: readonly StoredPitch[];
+  gameplaySlots: readonly GameplaySlot[];
+  pitchSlots: readonly PitchSlot[];
+  eventGames: readonly EventGame[];
   auditTrail: readonly EventAdministrationAuditEntry[];
 };
 
@@ -72,8 +84,22 @@ export function projectEventProjection(
   teams: readonly StoredEventTeam[] = [],
   roster: readonly StoredEventCatalogRosterEntry[] = [],
   pitches: readonly StoredEventCatalogPitch[] = [],
+  gameplaySlots: readonly StoredGameplaySlot[] = [],
+  pitchSlots: readonly StoredPitchSlot[] = [],
+  eventGames: readonly StoredEventCatalogGame[] = [],
 ): EventProjection {
-  return project(event, gameDays, auditTrail, nowMs, teams, roster, pitches);
+  return project(
+    event,
+    gameDays,
+    auditTrail,
+    nowMs,
+    teams,
+    roster,
+    pitches,
+    gameplaySlots,
+    pitchSlots,
+    eventGames,
+  );
 }
 
 export type CatalogRejectedReason =
@@ -95,7 +121,17 @@ export type EventCatalogClock = {
 };
 
 export type EventCatalogIds = {
-  next(kind: "event" | "game-day" | "audit" | "operation"): string;
+  next(
+    kind:
+      | "event"
+      | "game-day"
+      | "audit"
+      | "operation"
+      | "gameplay-slot"
+      | "pitch-slot"
+      | "event-game"
+      | "event-game-side",
+  ): string;
 };
 
 export type EventCatalogOptions = {
@@ -124,6 +160,31 @@ export type EventCatalogMutationOperations = {
     pitchId: unknown,
     input: { name: unknown },
   ): CatalogOutcome<StoredPitch>;
+  createGameplaySlot(
+    eventId: unknown,
+    gameDayId: unknown,
+    input: { sequence: unknown; scheduledStart?: unknown; scheduledStartMs?: unknown },
+  ): CatalogOutcome<GameplaySlot>;
+  createEventGame(
+    eventId: unknown,
+    gameDayId: unknown,
+    input: {
+      gameplaySlotId: unknown;
+      pitchSlotId: unknown;
+      gameCode?: unknown;
+      gameDesignation?: unknown;
+      sideA?: unknown;
+      sideB?: unknown;
+    },
+  ): CatalogOutcome<EventGame>;
+  confirmGameplaySlotTeams(
+    eventId: unknown,
+    gameDayId: unknown,
+    gameplaySlotId: unknown,
+    input: {
+      games: unknown;
+    },
+  ): CatalogOutcome<readonly EventGame[]>;
 };
 
 export type EventCatalogStorageSnapshot = {
@@ -136,6 +197,13 @@ export type EventCatalogStorageSnapshot = {
   findRosterEntry(eventTeamId: string, playerNumber: number): StoredRosterEntry | null;
   findPitch(pitchId: string): StoredPitch | null;
   listPitches(eventId: string): StoredPitch[];
+  findGameplaySlot(gameplaySlotId: string): GameplaySlot | null;
+  listGameplaySlots(gameDayId: string): GameplaySlot[];
+  findPitchSlot(pitchSlotId: string): PitchSlot | null;
+  listPitchSlots(gameDayId: string, pitchId?: string): PitchSlot[];
+  findEventGame(eventGameId: string): EventGame | null;
+  listEventGames(gameDayId: string): EventGame[];
+  findRootByEventGameId(eventGameId: string): EventGameRecordRoot | null;
   listAuditTrail(eventId: string): EventAdministrationAuditEntry[];
 };
 
@@ -153,6 +221,10 @@ export type EventCatalogStorageTransaction = EventCatalogStorageSnapshot & {
   updateRosterEntry(entry: StoredRosterEntry): void;
   insertPitch(pitch: StoredPitch): void;
   updatePitch(pitch: StoredPitch): void;
+  insertGameplaySlot(slot: GameplaySlot): void;
+  insertPitchSlot(slot: PitchSlot): void;
+  insertEventGame(game: EventGame): void;
+  updateEventGame(game: EventGame): void;
   appendAudit(entry: EventAdministrationAuditEntry): void;
 };
 
@@ -230,6 +302,32 @@ export type EventCatalog = {
     input: { name: unknown },
     authority: TechnicalAdminAuthority,
   ): Promise<CatalogOutcome<StoredPitch>>;
+  createGameplaySlot(
+    eventId: unknown,
+    gameDayId: unknown,
+    input: { sequence: unknown; scheduledStart?: unknown; scheduledStartMs?: unknown },
+    authority: TechnicalAdminAuthority,
+  ): Promise<CatalogOutcome<GameplaySlot>>;
+  createEventGame(
+    eventId: unknown,
+    gameDayId: unknown,
+    input: {
+      gameplaySlotId: unknown;
+      pitchSlotId: unknown;
+      gameCode?: unknown;
+      gameDesignation?: unknown;
+      sideA?: unknown;
+      sideB?: unknown;
+    },
+    authority: TechnicalAdminAuthority,
+  ): Promise<CatalogOutcome<EventGame>>;
+  confirmGameplaySlotTeams(
+    eventId: unknown,
+    gameDayId: unknown,
+    gameplaySlotId: unknown,
+    input: { games: unknown },
+    authority: TechnicalAdminAuthority,
+  ): Promise<CatalogOutcome<readonly EventGame[]>>;
   lookupAudienceRoster(
     eventId: unknown,
     eventTeamId: unknown,
@@ -319,6 +417,15 @@ export function createEventCatalog(
                 .listEventTeams(event.eventId)
                 .flatMap((team) => snapshot.listRoster(team.eventTeamId)),
               snapshot.listPitches(event.eventId),
+              snapshot
+                .listGameDays(event.eventId)
+                .flatMap((day) => snapshot.listGameplaySlots(day.gameDayId)),
+              snapshot
+                .listGameDays(event.eventId)
+                .flatMap((day) => snapshot.listPitchSlots(day.gameDayId)),
+              snapshot
+                .listGameDays(event.eventId)
+                .flatMap((day) => snapshot.listEventGames(day.gameDayId)),
             ),
           ),
         );
@@ -348,6 +455,15 @@ export function createEventCatalog(
               .listEventTeams(event.eventId)
               .flatMap((team) => snapshot.listRoster(team.eventTeamId)),
             snapshot.listPitches(event.eventId),
+            snapshot
+              .listGameDays(event.eventId)
+              .flatMap((day) => snapshot.listGameplaySlots(day.gameDayId)),
+            snapshot
+              .listGameDays(event.eventId)
+              .flatMap((day) => snapshot.listPitchSlots(day.gameDayId)),
+            snapshot
+              .listGameDays(event.eventId)
+              .flatMap((day) => snapshot.listEventGames(day.gameDayId)),
           ),
         );
       } catch {
@@ -404,6 +520,15 @@ export function createEventCatalog(
               .listEventTeams(updated.eventId)
               .flatMap((team) => transaction.listRoster(team.eventTeamId)),
             transaction.listPitches(updated.eventId),
+            transaction
+              .listGameDays(updated.eventId)
+              .flatMap((day) => transaction.listGameplaySlots(day.gameDayId)),
+            transaction
+              .listGameDays(updated.eventId)
+              .flatMap((day) => transaction.listPitchSlots(day.gameDayId)),
+            transaction
+              .listGameDays(updated.eventId)
+              .flatMap((day) => transaction.listEventGames(day.gameDayId)),
           ),
         );
       });
@@ -563,6 +688,52 @@ export function createEventCatalog(
           ids,
           eventId,
           pitchId,
+          input,
+          authorityActor(authority),
+        ),
+      );
+    },
+
+    async createGameplaySlot(eventId, gameDayId, input, authority) {
+      if (!isTechnicalAdminAuthority(authority)) return unauthorized();
+      return commit(storage, (transaction) =>
+        createGameplaySlotOperation(
+          transaction,
+          clock,
+          ids,
+          eventId,
+          gameDayId,
+          input,
+          authorityActor(authority),
+        ),
+      );
+    },
+
+    async createEventGame(eventId, gameDayId, input, authority) {
+      if (!isTechnicalAdminAuthority(authority)) return unauthorized();
+      return commit(storage, (transaction) =>
+        createEventGameOperation(
+          transaction,
+          clock,
+          ids,
+          eventId,
+          gameDayId,
+          input,
+          authorityActor(authority),
+        ),
+      );
+    },
+
+    async confirmGameplaySlotTeams(eventId, gameDayId, gameplaySlotId, input, authority) {
+      if (!isTechnicalAdminAuthority(authority)) return unauthorized();
+      return commit(storage, (transaction) =>
+        confirmGameplaySlotTeamsOperation(
+          transaction,
+          clock,
+          ids,
+          eventId,
+          gameDayId,
+          gameplaySlotId,
           input,
           authorityActor(authority),
         ),
@@ -839,6 +1010,9 @@ function project(
   teams: readonly StoredEventTeam[] = [],
   roster: readonly StoredRosterEntry[] = [],
   pitches: readonly StoredPitch[] = [],
+  gameplaySlots: readonly GameplaySlot[] = [],
+  pitchSlots: readonly PitchSlot[] = [],
+  eventGames: readonly EventGame[] = [],
 ): EventProjection {
   const projectedDays = gameDays
     .map((day) => projectDay(day, event.timeZone, nowMs))
@@ -869,6 +1043,27 @@ function project(
     pitches: pitches
       .map((pitch) => structuredClone(pitch))
       .sort((left, right) => left.pitchId.localeCompare(right.pitchId)),
+    gameplaySlots: gameplaySlots
+      .map((slot) => structuredClone(slot))
+      .sort((left, right) =>
+        left.sequence === right.sequence
+          ? left.gameplaySlotId.localeCompare(right.gameplaySlotId)
+          : left.sequence - right.sequence,
+      ),
+    pitchSlots: pitchSlots
+      .map((slot) => structuredClone(slot))
+      .sort((left, right) =>
+        left.gameDayId === right.gameDayId
+          ? left.pitchId === right.pitchId
+            ? left.sequence === right.sequence
+              ? left.pitchSlotId.localeCompare(right.pitchSlotId)
+              : left.sequence - right.sequence
+            : left.pitchId.localeCompare(right.pitchId)
+          : left.gameDayId.localeCompare(right.gameDayId),
+      ),
+    eventGames: eventGames
+      .map((game) => structuredClone(game))
+      .sort((left, right) => left.eventGameId.localeCompare(right.eventGameId)),
     auditTrail: [...structuredClone(auditTrail)].sort((left, right) =>
       left.occurredAtMs === right.occurredAtMs
         ? left.auditId.localeCompare(right.auditId)
@@ -917,6 +1112,10 @@ function validateEventTeamColor(
   return { ok: true, value: `#${normalized}` };
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 function createMutationOperations(
   transaction: EventCatalogStorageTransaction,
   clock: EventCatalogClock,
@@ -942,6 +1141,29 @@ function createMutationOperations(
       createPitchOperation(transaction, clock, ids, eventId, input, actorReference),
     updatePitch: (eventId, pitchId, input) =>
       updatePitchOperation(transaction, clock, ids, eventId, pitchId, input, actorReference),
+    createGameplaySlot: (eventId, gameDayId, input) =>
+      createGameplaySlotOperation(
+        transaction,
+        clock,
+        ids,
+        eventId,
+        gameDayId,
+        input,
+        actorReference,
+      ),
+    createEventGame: (eventId, gameDayId, input) =>
+      createEventGameOperation(transaction, clock, ids, eventId, gameDayId, input, actorReference),
+    confirmGameplaySlotTeams: (eventId, gameDayId, gameplaySlotId, input) =>
+      confirmGameplaySlotTeamsOperation(
+        transaction,
+        clock,
+        ids,
+        eventId,
+        gameDayId,
+        gameplaySlotId,
+        input,
+        actorReference,
+      ),
   };
 }
 
@@ -1140,8 +1362,525 @@ function createPitchOperation(
     pitch,
   );
   transaction.insertPitch(pitch);
+  for (const day of transaction.listGameDays(event.eventId)) {
+    for (const gameplaySlot of transaction.listGameplaySlots(day.gameDayId)) {
+      const pitchSlot: PitchSlot = {
+        pitchSlotId: ids.next("pitch-slot"),
+        eventId: event.eventId,
+        gameDayId: day.gameDayId,
+        pitchId: pitch.pitchId,
+        gameplaySlotId: gameplaySlot.gameplaySlotId,
+        sequence: gameplaySlot.sequence,
+        createdAtMs: nowMs,
+        updatedAtMs: nowMs,
+      };
+      transaction.insertPitchSlot(pitchSlot);
+      transaction.appendAudit(
+        createAudit(
+          ids,
+          "pitch-slot-created",
+          event.eventId,
+          day.gameDayId,
+          actorReference,
+          nowMs,
+          null,
+          pitchSlot,
+        ),
+      );
+    }
+  }
   transaction.appendAudit(audit);
   return accepted(pitch);
+}
+
+function createGameplaySlotOperation(
+  transaction: EventCatalogStorageTransaction,
+  clock: EventCatalogClock,
+  ids: EventCatalogIds,
+  eventIdInput: unknown,
+  gameDayIdInput: unknown,
+  input: { sequence: unknown; scheduledStart?: unknown; scheduledStartMs?: unknown },
+  actorReference: string,
+): CatalogOutcome<GameplaySlot> {
+  const eventId = validateId(eventIdInput, "eventId");
+  const gameDayId = validateId(gameDayIdInput, "gameDayId");
+  if (!eventId.ok) return invalid(eventId.error);
+  if (!gameDayId.ok) return invalid(gameDayId.error);
+  const sequence = validatePositiveSequence(input.sequence);
+  if (!sequence.ok) return invalid(sequence.error);
+  const nowMs = validNow(clock);
+  if (nowMs === null) return invalid("Event clock returned an invalid timestamp.");
+  const event = transaction.findEvent(eventId.value);
+  if (event === null) return notFound("Event was not found.");
+  const day = transaction
+    .listGameDays(event.eventId)
+    .find((candidate) => candidate.gameDayId === gameDayId.value);
+  if (day === undefined) {
+    const elsewhere = transaction
+      .listEvents()
+      .some((candidate) =>
+        transaction
+          .listGameDays(candidate.eventId)
+          .some((candidateDay) => candidateDay.gameDayId === gameDayId.value),
+      );
+    return elsewhere
+      ? crossEvent("Game Day belongs to another Event.")
+      : notFound("Game Day was not found.");
+  }
+  const scheduledStartMs = validateScheduledStart(
+    input.scheduledStart ?? input.scheduledStartMs,
+    event.timeZone,
+    day.date,
+  );
+  if (!scheduledStartMs.ok) return invalid(scheduledStartMs.error);
+  if (transaction.listGameplaySlots(day.gameDayId).some((slot) => slot.sequence === sequence.value))
+    return duplicate("The Game Day already has a Gameplay Slot with this sequence.");
+  const slot: GameplaySlot = {
+    gameplaySlotId: ids.next("gameplay-slot"),
+    eventId: event.eventId,
+    gameDayId: day.gameDayId,
+    sequence: sequence.value,
+    scheduledStartMs: scheduledStartMs.value,
+    createdAtMs: nowMs,
+    updatedAtMs: nowMs,
+  };
+  transaction.insertGameplaySlot(slot);
+  for (const pitch of transaction.listPitches(event.eventId)) {
+    const pitchSlot: PitchSlot = {
+      pitchSlotId: ids.next("pitch-slot"),
+      eventId: event.eventId,
+      gameDayId: day.gameDayId,
+      pitchId: pitch.pitchId,
+      gameplaySlotId: slot.gameplaySlotId,
+      sequence: slot.sequence,
+      createdAtMs: nowMs,
+      updatedAtMs: nowMs,
+    };
+    transaction.insertPitchSlot(pitchSlot);
+    transaction.appendAudit(
+      createAudit(
+        ids,
+        "pitch-slot-created",
+        event.eventId,
+        day.gameDayId,
+        actorReference,
+        nowMs,
+        null,
+        pitchSlot,
+      ),
+    );
+  }
+  transaction.appendAudit(
+    createAudit(
+      ids,
+      "gameplay-slot-created",
+      event.eventId,
+      day.gameDayId,
+      actorReference,
+      nowMs,
+      null,
+      slot,
+    ),
+  );
+  return accepted(slot);
+}
+
+function createEventGameOperation(
+  transaction: EventCatalogStorageTransaction,
+  clock: EventCatalogClock,
+  ids: EventCatalogIds,
+  eventIdInput: unknown,
+  gameDayIdInput: unknown,
+  input: {
+    gameplaySlotId: unknown;
+    pitchSlotId: unknown;
+    gameCode?: unknown;
+    gameDesignation?: unknown;
+    sideA?: unknown;
+    sideB?: unknown;
+  },
+  actorReference: string,
+): CatalogOutcome<EventGame> {
+  const eventId = validateId(eventIdInput, "eventId");
+  const gameDayId = validateId(gameDayIdInput, "gameDayId");
+  const gameplaySlotId = validateId(input.gameplaySlotId, "gameplaySlotId");
+  const pitchSlotId = validateId(input.pitchSlotId, "pitchSlotId");
+  if (!eventId.ok) return invalid(eventId.error);
+  if (!gameDayId.ok) return invalid(gameDayId.error);
+  if (!gameplaySlotId.ok) return invalid(gameplaySlotId.error);
+  if (!pitchSlotId.ok) return invalid(pitchSlotId.error);
+  const gameCode = validateOptionalText(input.gameCode, 32, "Game Code");
+  const gameDesignation = validateOptionalText(
+    input.gameDesignation,
+    SHARED_LIMITS.names.eventAndGameDesignationMaxCodePoints,
+    "Game Designation",
+  );
+  if (!gameCode.ok) return invalid(gameCode.error);
+  if (!gameDesignation.ok) return invalid(gameDesignation.error);
+  const nowMs = validNow(clock);
+  if (nowMs === null) return invalid("Event clock returned an invalid timestamp.");
+  const event = transaction.findEvent(eventId.value);
+  if (event === null) return notFound("Event was not found.");
+  const day = transaction
+    .listGameDays(event.eventId)
+    .find((candidate) => candidate.gameDayId === gameDayId.value);
+  if (day === undefined) return notFound("Game Day was not found.");
+  const gameplaySlot = transaction.findGameplaySlot(gameplaySlotId.value);
+  const pitchSlot = transaction.findPitchSlot(pitchSlotId.value);
+  if (gameplaySlot === null || pitchSlot === null) return notFound("Schedule Slot was not found.");
+  if (gameplaySlot.eventId !== event.eventId || pitchSlot.eventId !== event.eventId)
+    return crossEvent("Schedule Slot belongs to another Event.");
+  if (gameplaySlot.gameDayId !== day.gameDayId || pitchSlot.gameDayId !== day.gameDayId)
+    return invalid("Event Game must use Slots from the selected Game Day.");
+  if (pitchSlot.gameplaySlotId !== gameplaySlot.gameplaySlotId)
+    return invalid("Pitch Slot must belong to the selected Gameplay Slot.");
+  if (
+    transaction
+      .listEventGames(day.gameDayId)
+      .some((game) => game.pitchSlotId === pitchSlot.pitchSlotId)
+  ) {
+    return duplicate("The Pitch Slot already contains an Event Game.");
+  }
+  if (
+    gameCode.value !== null &&
+    transaction
+      .listGameDays(event.eventId)
+      .flatMap((candidateDay) => transaction.listEventGames(candidateDay.gameDayId))
+      .some((game) => game.gameCode === gameCode.value)
+  )
+    return duplicate("The Event already has an Event Game with this Game Code.");
+  const rawSideA =
+    input.sideA ??
+    ((input as { sideAEventTeamId?: unknown }).sideAEventTeamId === undefined
+      ? undefined
+      : { eventTeamId: (input as { sideAEventTeamId?: unknown }).sideAEventTeamId });
+  const rawSideB =
+    input.sideB ??
+    ((input as { sideBEventTeamId?: unknown }).sideBEventTeamId === undefined
+      ? undefined
+      : { eventTeamId: (input as { sideBEventTeamId?: unknown }).sideBEventTeamId });
+  const sideA = parseEventGameSide(transaction, event.eventId, rawSideA, "sideA", nowMs);
+  if (!sideA.ok) return invalid(sideA.error);
+  const sideB = parseEventGameSide(transaction, event.eventId, rawSideB, "sideB", nowMs);
+  if (!sideB.ok) return invalid(sideB.error);
+  if (sideA.value.eventTeamId !== null && sideA.value.eventTeamId === sideB.value.eventTeamId)
+    return invalid("Event Game sides must use distinct Event Teams.");
+  if (sideA.value.eventTeamId !== null || sideB.value.eventTeamId !== null)
+    return invalid(
+      "Create Event Games with source labels, then confirm actual teams by Gameplay Slot.",
+    );
+  const game: EventGame = {
+    eventGameId: ids.next("event-game"),
+    eventId: event.eventId,
+    gameDayId: day.gameDayId,
+    gameplaySlotId: gameplaySlot.gameplaySlotId,
+    pitchSlotId: pitchSlot.pitchSlotId,
+    gameCode: gameCode.value,
+    gameDesignation: gameDesignation.value,
+    sideA: { ...sideA.value, sideId: ids.next("event-game-side") },
+    sideB: { ...sideB.value, sideId: ids.next("event-game-side") },
+    createdAtMs: nowMs,
+    updatedAtMs: nowMs,
+  };
+  transaction.insertEventGame(game);
+  transaction.appendAudit(
+    createAudit(
+      ids,
+      "event-game-created",
+      event.eventId,
+      day.gameDayId,
+      actorReference,
+      nowMs,
+      null,
+      game,
+    ),
+  );
+  return accepted(game);
+}
+
+function confirmGameplaySlotTeamsOperation(
+  transaction: EventCatalogStorageTransaction,
+  clock: EventCatalogClock,
+  ids: EventCatalogIds,
+  eventIdInput: unknown,
+  gameDayIdInput: unknown,
+  gameplaySlotIdInput: unknown,
+  input: { games: unknown },
+  actorReference: string,
+): CatalogOutcome<readonly EventGame[]> {
+  const eventId = validateId(eventIdInput, "eventId");
+  const gameDayId = validateId(gameDayIdInput, "gameDayId");
+  const gameplaySlotId = validateId(gameplaySlotIdInput, "gameplaySlotId");
+  if (!eventId.ok) return invalid(eventId.error);
+  if (!gameDayId.ok) return invalid(gameDayId.error);
+  if (!gameplaySlotId.ok) return invalid(gameplaySlotId.error);
+  if (!Array.isArray(input.games))
+    return invalid("Gameplay Slot confirmation requires a games array.");
+  const nowMs = validNow(clock);
+  if (nowMs === null) return invalid("Event clock returned an invalid timestamp.");
+  const event = transaction.findEvent(eventId.value);
+  const slot = transaction.findGameplaySlot(gameplaySlotId.value);
+  if (event === null || slot === null) return notFound("Event or Gameplay Slot was not found.");
+  if (slot.eventId !== event.eventId || slot.gameDayId !== gameDayId.value)
+    return crossEvent("Gameplay Slot does not belong to the selected Event and Game Day.");
+  const games = transaction
+    .listEventGames(gameDayId.value)
+    .filter((game) => game.gameplaySlotId === slot.gameplaySlotId);
+  if (games.length === 0) return invalid("Gameplay Slot has no Event Games to confirm.");
+  if (games.length !== input.games.length)
+    return invalid("Confirm every Event Game in one Gameplay Slot together.");
+  const assignments = new Map<string, { sideA: string; sideB: string }>();
+  for (const value of input.games) {
+    if (!isRecord(value)) return invalid("Each Gameplay Slot confirmation must be an object.");
+    const gameId = validateId(value.eventGameId, "eventGameId");
+    const sideA = validateId(value.sideAEventTeamId, "sideAEventTeamId");
+    const sideB = validateId(value.sideBEventTeamId, "sideBEventTeamId");
+    if (!gameId.ok) return invalid(gameId.error);
+    if (!sideA.ok) return invalid(sideA.error);
+    if (!sideB.ok) return invalid(sideB.error);
+    if (sideA.value === sideB.value)
+      return invalid("Event Game sides must use distinct Event Teams.");
+    if (assignments.has(gameId.value))
+      return invalid("Gameplay Slot confirmation contains a duplicate Event Game.");
+    assignments.set(gameId.value, { sideA: sideA.value, sideB: sideB.value });
+  }
+  if (games.some((game) => !assignments.has(game.eventGameId)))
+    return invalid("Confirm every Event Game in one Gameplay Slot together.");
+  const teams = new Map(
+    transaction.listEventTeams(event.eventId).map((team) => [team.eventTeamId, team]),
+  );
+  const prepared = new Map<string, { game: EventGame; next: EventGame | null }>();
+  let changed = false;
+  for (const game of games) {
+    const assignment = assignments.get(game.eventGameId);
+    if (assignment === undefined)
+      return invalid("Confirm every Event Game in one Gameplay Slot together.");
+    const sideATeam = teams.get(assignment.sideA);
+    const sideBTeam = teams.get(assignment.sideB);
+    if (sideATeam === undefined || sideBTeam === undefined)
+      return crossEvent("Confirmed Event Teams must belong to the selected Event.");
+    const root = transaction.findRootByEventGameId(game.eventGameId);
+    if (
+      root !== null &&
+      (root.lifecycle.phase !== "scheduled" || root.lifecycle.commencedAtMs !== null)
+    )
+      return invalid("Gameplay Slot teams cannot change after Game commencement.");
+    if (
+      (game.sideA.eventTeamId !== null && game.sideA.eventTeamId !== assignment.sideA) ||
+      (game.sideB.eventTeamId !== null && game.sideB.eventTeamId !== assignment.sideB)
+    )
+      return invalid("Confirmed Event Game teams cannot be changed here.");
+    if (
+      (game.sideA.eventTeamId !== null && game.sideA.eventTeamName === null) ||
+      (game.sideB.eventTeamId !== null && game.sideB.eventTeamName === null)
+    )
+      return invalid("Confirmed Event Game teams are missing required name snapshots.");
+    if (
+      game.sideA.eventTeamId === assignment.sideA &&
+      game.sideB.eventTeamId === assignment.sideB
+    ) {
+      prepared.set(game.eventGameId, { game, next: null });
+      continue;
+    }
+    const next: EventGame = {
+      ...game,
+      sideA: {
+        ...game.sideA,
+        eventTeamId: assignment.sideA,
+        eventTeamName: sideATeam.name,
+        sourceLabel: null,
+        confirmedAtMs: nowMs,
+      },
+      sideB: {
+        ...game.sideB,
+        eventTeamId: assignment.sideB,
+        eventTeamName: sideBTeam.name,
+        sourceLabel: null,
+        confirmedAtMs: nowMs,
+      },
+      updatedAtMs: nowMs,
+    };
+    prepared.set(game.eventGameId, { game, next });
+    changed = true;
+  }
+  const updated: EventGame[] = [];
+  for (const { game, next } of prepared.values()) {
+    if (next === null) updated.push(game);
+    else {
+      transaction.updateEventGame(next);
+      updated.push(next);
+    }
+  }
+  for (const { game, next } of prepared.values()) {
+    if (next !== null)
+      transaction.appendAudit(
+        createAudit(
+          ids,
+          "event-game-teams-confirmed",
+          event.eventId,
+          gameDayId.value,
+          actorReference,
+          nowMs,
+          game,
+          next,
+        ),
+      );
+  }
+  return changed ? accepted(updated) : noChange("Gameplay Slot teams are already confirmed.");
+}
+
+function parseEventGameSide(
+  transaction: EventCatalogStorageSnapshot,
+  eventId: string,
+  value: unknown,
+  field: string,
+  nowMs: number,
+): { ok: true; value: Omit<EventGameSide, "sideId"> } | { ok: false; error: string } {
+  if (typeof value === "string") value = { eventTeamId: value };
+  if (!isRecord(value))
+    return { ok: false, error: `${field} must specify an Event Team or source label.` };
+  if (value.eventTeamId !== undefined) {
+    const eventTeamId = validateId(value.eventTeamId, `${field}.eventTeamId`);
+    if (!eventTeamId.ok) return eventTeamId;
+    const team = transaction.findEventTeam(eventTeamId.value);
+    if (team === null) return { ok: false, error: `${field} Event Team was not found.` };
+    if (team.eventId !== eventId)
+      return { ok: false, error: `${field} Event Team belongs to another Event.` };
+    return {
+      ok: true,
+      value: {
+        eventTeamId: team.eventTeamId,
+        eventTeamName: team.name,
+        sourceLabel: null,
+        confirmedAtMs: nowMs,
+      },
+    };
+  }
+  const sourceLabel = normalizeBoundedText(
+    value.sourceLabel,
+    SHARED_LIMITS.names.eventAndGameDesignationMaxCodePoints,
+    `${field} source label`,
+  );
+  if (!sourceLabel.ok) return sourceLabel;
+  return {
+    ok: true,
+    value: {
+      eventTeamId: null,
+      eventTeamName: null,
+      sourceLabel: sourceLabel.value,
+      confirmedAtMs: null,
+    },
+  };
+}
+
+function validatePositiveSequence(
+  value: unknown,
+): { ok: true; value: number } | { ok: false; error: string } {
+  if (!Number.isSafeInteger(value) || (value as number) < 1 || (value as number) > 10_000)
+    return { ok: false, error: "Gameplay Slot sequence must be a positive integer." };
+  return { ok: true, value: value as number };
+}
+
+function validateScheduledStart(
+  value: unknown,
+  timeZone: string,
+  gameDayDate: string,
+): { ok: true; value: number } | { ok: false; error: string } {
+  if (typeof value !== "string")
+    return { ok: false, error: "Scheduled Start must be a local Event time." };
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?$/.exec(value);
+  if (match === null) return { ok: false, error: "Scheduled Start must be a local Event time." };
+  const [, yearText, monthText, dayText, hourText, minuteText, secondText = "00"] = match;
+  const localDate = `${yearText}-${monthText}-${dayText}`;
+  if (localDate !== gameDayDate)
+    return { ok: false, error: "Scheduled Start must be on the selected Game Day." };
+  const year = Number(yearText);
+  const month = Number(monthText);
+  const day = Number(dayText);
+  const hour = Number(hourText);
+  const minute = Number(minuteText);
+  const second = Number(secondText);
+  if (
+    month < 1 ||
+    month > 12 ||
+    day < 1 ||
+    day > 31 ||
+    hour > 23 ||
+    minute > 59 ||
+    second > 59 ||
+    new Date(Date.UTC(year, month - 1, day)).toISOString().slice(0, 10) !== localDate
+  )
+    return { ok: false, error: "Scheduled Start must be a valid local Event time." };
+  const wallUtcMs = Date.UTC(year, month - 1, day, hour, minute, second);
+  const formatter = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    hourCycle: "h23",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+  let candidateMs = wallUtcMs;
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const parts = Object.fromEntries(
+      formatter.formatToParts(new Date(candidateMs)).map((part) => [part.type, part.value]),
+    );
+    const representedWallUtcMs = Date.UTC(
+      Number(parts.year),
+      Number(parts.month) - 1,
+      Number(parts.day),
+      Number(parts.hour),
+      Number(parts.minute),
+      Number(parts.second),
+    );
+    candidateMs += wallUtcMs - representedWallUtcMs;
+  }
+  const localPartsMatch = (instantMs: number) => {
+    const parts = Object.fromEntries(
+      formatter.formatToParts(new Date(instantMs)).map((part) => [part.type, part.value]),
+    );
+    return (
+      `${parts.year}-${parts.month}-${parts.day}T${parts.hour}:${parts.minute}:${parts.second}` ===
+      `${localDate}T${hourText}:${minuteText}:${secondText}`
+    );
+  };
+  const offsetAt = (instantMs: number) => {
+    const parts = Object.fromEntries(
+      formatter.formatToParts(new Date(instantMs)).map((part) => [part.type, part.value]),
+    );
+    return (
+      Date.UTC(
+        Number(parts.year),
+        Number(parts.month) - 1,
+        Number(parts.day),
+        Number(parts.hour),
+        Number(parts.minute),
+        Number(parts.second),
+      ) - instantMs
+    );
+  };
+  const dayMs = 24 * 60 * 60 * 1000;
+  const candidates = new Set<number>();
+  for (const probeMs of [candidateMs - dayMs, candidateMs, candidateMs + dayMs])
+    candidates.add(wallUtcMs - offsetAt(probeMs));
+  const validCandidates = [...candidates].filter(localPartsMatch);
+  if (validCandidates.length === 0)
+    return { ok: false, error: "Scheduled Start is not a real local Event time." };
+  if (validCandidates.length > 1)
+    return { ok: false, error: "Scheduled Start is ambiguous during the Event timezone fallback." };
+  return { ok: true, value: validCandidates[0] as number };
+}
+
+function validateOptionalText(
+  value: unknown,
+  maxCodePoints: number,
+  field: string,
+): { ok: true; value: string | null } | { ok: false; error: string } {
+  if (value === undefined || value === null || value === "") return { ok: true, value: null };
+  const result = normalizeBoundedText(value, maxCodePoints, field);
+  return result.ok ? { ok: true, value: result.value } : result;
 }
 
 function updatePitchOperation(
@@ -1270,6 +2009,13 @@ function eventCatalogSnapshot(transaction: FoundationStorageSnapshot): EventCata
       transaction.findRosterEntry(eventTeamId, playerNumber),
     findPitch: (pitchId) => transaction.findPitch(pitchId),
     listPitches: (eventId) => transaction.listPitches(eventId),
+    findGameplaySlot: (gameplaySlotId) => transaction.findGameplaySlot?.(gameplaySlotId) ?? null,
+    listGameplaySlots: (gameDayId) => transaction.listGameplaySlots?.(gameDayId) ?? [],
+    findPitchSlot: (pitchSlotId) => transaction.findPitchSlot?.(pitchSlotId) ?? null,
+    listPitchSlots: (gameDayId, pitchId) => transaction.listPitchSlots?.(gameDayId, pitchId) ?? [],
+    findEventGame: (eventGameId) => transaction.findEventGame?.(eventGameId) ?? null,
+    listEventGames: (gameDayId) => transaction.listEventGames?.(gameDayId) ?? [],
+    findRootByEventGameId: (eventGameId) => transaction.findRootByEventGameId(eventGameId),
     listAuditTrail: (eventId) => transaction.listEventAuditTrail(eventId),
   };
 }
@@ -1295,6 +2041,10 @@ function eventCatalogTransaction(
     updateRosterEntry: (entry) => transaction.updateRosterEntry(entry),
     insertPitch: (pitch) => transaction.insertPitch(pitch),
     updatePitch: (pitch) => transaction.updatePitch(pitch),
+    insertGameplaySlot: (slot) => transaction.insertGameplaySlot(slot),
+    insertPitchSlot: (slot) => transaction.insertPitchSlot(slot),
+    insertEventGame: (game) => transaction.insertEventGame(game),
+    updateEventGame: (game) => transaction.updateEventGame(game),
     appendAudit: (entry) => transaction.appendEventAudit(entry),
   };
 }

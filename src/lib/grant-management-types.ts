@@ -207,7 +207,7 @@ export type TypedGrantAuthority = {
   /** Revalidates and refreshes a Grant Session on the caller's existing transaction. */
   authorizeGrantInTransaction(
     transaction: FoundationStorageTransaction,
-    input: { sessionBearer: string },
+    input: { sessionBearer: string; readOnly?: boolean },
   ): TypedGrantAuthorization;
   acceptControlGrantSessionSwitch(input: {
     sessionBearer: string;

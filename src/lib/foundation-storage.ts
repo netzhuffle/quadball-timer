@@ -84,6 +84,16 @@ export const REQUIRED_EVENT_CATALOG_STORAGE_TRANSACTION_METHODS = Object.freeze(
   "updateRosterEntry",
   "insertPitch",
   "updatePitch",
+  "findGameplaySlot",
+  "listGameplaySlots",
+  "findPitchSlot",
+  "listPitchSlots",
+  "findEventGame",
+  "listEventGames",
+  "insertGameplaySlot",
+  "insertPitchSlot",
+  "insertEventGame",
+  "updateEventGame",
 ] as const);
 
 export const DURABLE_EVIDENCE_PROVENANCE = Symbol("durable-evidence-provenance");
@@ -157,6 +167,49 @@ export type StoredEventCatalogPitch = {
   updatedAtMs: number;
 };
 
+export type StoredGameplaySlot = {
+  gameplaySlotId: string;
+  eventId: string;
+  gameDayId: string;
+  sequence: number;
+  scheduledStartMs: number;
+  createdAtMs: number;
+  updatedAtMs: number;
+};
+
+export type StoredPitchSlot = {
+  pitchSlotId: string;
+  eventId: string;
+  gameDayId: string;
+  pitchId: string;
+  gameplaySlotId: string;
+  sequence: number;
+  createdAtMs: number;
+  updatedAtMs: number;
+};
+
+export type StoredEventGameSide = {
+  sideId: string;
+  eventTeamId: string | null;
+  eventTeamName: string | null;
+  sourceLabel: string | null;
+  confirmedAtMs: number | null;
+};
+
+export type StoredEventCatalogGame = {
+  eventGameId: string;
+  eventId: string;
+  gameDayId: string;
+  gameplaySlotId: string;
+  pitchSlotId: string;
+  gameCode: string | null;
+  gameDesignation: string | null;
+  sideA: StoredEventGameSide;
+  sideB: StoredEventGameSide;
+  createdAtMs: number;
+  updatedAtMs: number;
+};
+
 export type EventCatalogAuditEntry = {
   auditId: string;
   operationId: string;
@@ -171,7 +224,11 @@ export type EventCatalogAuditEntry = {
     | "event-team-updated"
     | "roster-updated"
     | "pitch-created"
-    | "pitch-updated";
+    | "pitch-updated"
+    | "gameplay-slot-created"
+    | "pitch-slot-created"
+    | "event-game-created"
+    | "event-game-teams-confirmed";
   eventId: string;
   gameDayId: string | null;
   actorReference: string;
@@ -372,6 +429,12 @@ export type FoundationStorageSnapshot = {
   findRosterEntry(eventTeamId: string, playerNumber: number): StoredEventCatalogRosterEntry | null;
   findPitch(pitchId: string): StoredEventCatalogPitch | null;
   listPitches(eventId: string): StoredEventCatalogPitch[];
+  findGameplaySlot?(gameplaySlotId: string): StoredGameplaySlot | null;
+  listGameplaySlots?(gameDayId: string): StoredGameplaySlot[];
+  findPitchSlot?(pitchSlotId: string): StoredPitchSlot | null;
+  listPitchSlots?(gameDayId: string, pitchId?: string): StoredPitchSlot[];
+  findEventGame?(eventGameId: string): StoredEventCatalogGame | null;
+  listEventGames?(gameDayId: string): StoredEventCatalogGame[];
   listEventAuditTrail(eventId: string): EventCatalogAuditEntry[];
   readGrantAdmissionTelemetry?(
     mode: GrantAdmissionMode,
@@ -382,6 +445,12 @@ export type FoundationStorageSnapshot = {
 };
 
 export type FoundationStorageTransaction = FoundationStorageSnapshot & {
+  findGameplaySlot(gameplaySlotId: string): StoredGameplaySlot | null;
+  listGameplaySlots(gameDayId: string): StoredGameplaySlot[];
+  findPitchSlot(pitchSlotId: string): StoredPitchSlot | null;
+  listPitchSlots(gameDayId: string, pitchId?: string): StoredPitchSlot[];
+  findEventGame(eventGameId: string): StoredEventCatalogGame | null;
+  listEventGames(gameDayId: string): StoredEventCatalogGame[];
   insertRoot(root: StoredEventGameRecordRoot): void;
   updateRoot(root: StoredEventGameRecordRoot): void;
   insertAction(action: StoredControlAction): void;
@@ -416,6 +485,10 @@ export type FoundationStorageTransaction = FoundationStorageSnapshot & {
   updateRosterEntry(entry: StoredEventCatalogRosterEntry): void;
   insertPitch(pitch: StoredEventCatalogPitch): void;
   updatePitch(pitch: StoredEventCatalogPitch): void;
+  insertGameplaySlot(slot: StoredGameplaySlot): void;
+  insertPitchSlot(slot: StoredPitchSlot): void;
+  insertEventGame(game: StoredEventCatalogGame): void;
+  updateEventGame(game: StoredEventCatalogGame): void;
   appendEventAudit(entry: EventCatalogAuditEntry): void;
   writeGrantAdmissionTelemetry?(value: GrantAdmissionTelemetry): void;
   writeGrantAdmissionGlobalWindow?(value: GrantAdmissionGlobalWindow): void;
@@ -576,10 +649,17 @@ export type FoundationStorageConstraint =
   | "game-day-date"
   | "event-team-id"
   | "event-team-name"
+  | "event-team-name-snapshot"
   | "roster-entry-id"
   | "roster-player-number"
   | "pitch-id"
   | "pitch-name"
+  | "gameplay-slot-id"
+  | "gameplay-slot-sequence"
+  | "pitch-slot-identity"
+  | "pitch-slot-game"
+  | "event-game-side-id"
+  | "event-game-code"
   | "event-audit-id"
   | "event-operation-id"
   | "grant-code-digest";

@@ -1540,6 +1540,12 @@ export const FOUNDATION_EVENT_CATALOG_AUDIT_TABLE_V2_SQL =
     "'game-day-added', 'game-day-updated', 'game-day-removed', 'event-team-created', 'event-team-updated', 'roster-updated', 'pitch-created', 'pitch-updated'",
   );
 
+export const FOUNDATION_EVENT_CATALOG_AUDIT_TABLE_V3_SQL =
+  FOUNDATION_EVENT_CATALOG_AUDIT_TABLE_V2_SQL.replace(
+    "'pitch-created', 'pitch-updated'",
+    "'pitch-created', 'pitch-updated', 'gameplay-slot-created', 'pitch-slot-created', 'event-game-created', 'event-game-teams-confirmed'",
+  );
+
 export const FOUNDATION_EVENT_CATALOG_TEAMS_TABLE_SQL = `
   CREATE TABLE foundation_event_catalog_teams (
     event_team_id TEXT PRIMARY KEY,
@@ -1631,6 +1637,96 @@ const FOUNDATION_EVENT_TEAMS_AND_PITCHES_MIGRATION_SQL = `
   ${FOUNDATION_EVENT_CATALOG_AUDIT_EVENT_INDEX_SQL};
   ${FOUNDATION_EVENT_CATALOG_ROSTER_TEAM_INDEX_SQL};
   ${FOUNDATION_EVENT_CATALOG_PITCHES_EVENT_INDEX_SQL};
+`;
+
+export const FOUNDATION_EVENT_CATALOG_GAMEPLAY_SLOTS_TABLE_SQL = `
+  CREATE TABLE foundation_event_catalog_gameplay_slots (
+    gameplay_slot_id TEXT PRIMARY KEY,
+    event_id TEXT NOT NULL REFERENCES foundation_event_catalog_events(event_id) ON DELETE CASCADE,
+    game_day_id TEXT NOT NULL REFERENCES foundation_event_catalog_game_days(game_day_id) ON DELETE CASCADE,
+    sequence_number INTEGER NOT NULL CHECK (sequence_number > 0),
+    scheduled_start_ms INTEGER NOT NULL CHECK (scheduled_start_ms >= 0),
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    UNIQUE (game_day_id, sequence_number)
+  ) STRICT;
+`;
+export const FOUNDATION_EVENT_CATALOG_GAMEPLAY_SLOTS_INDEX_SQL = `
+  CREATE INDEX foundation_event_catalog_gameplay_slots_game_day_id
+    ON foundation_event_catalog_gameplay_slots (game_day_id, sequence_number, gameplay_slot_id)
+`;
+export const FOUNDATION_EVENT_CATALOG_PITCH_SLOTS_TABLE_SQL = `
+  CREATE TABLE foundation_event_catalog_pitch_slots (
+    pitch_slot_id TEXT PRIMARY KEY,
+    event_id TEXT NOT NULL REFERENCES foundation_event_catalog_events(event_id) ON DELETE CASCADE,
+    game_day_id TEXT NOT NULL REFERENCES foundation_event_catalog_game_days(game_day_id) ON DELETE CASCADE,
+    pitch_id TEXT NOT NULL REFERENCES foundation_event_catalog_pitches(pitch_id) ON DELETE CASCADE,
+    gameplay_slot_id TEXT NOT NULL REFERENCES foundation_event_catalog_gameplay_slots(gameplay_slot_id) ON DELETE CASCADE,
+    sequence_number INTEGER NOT NULL CHECK (sequence_number > 0),
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    UNIQUE (pitch_id, gameplay_slot_id),
+    UNIQUE (pitch_slot_id, gameplay_slot_id)
+  ) STRICT;
+`;
+export const FOUNDATION_EVENT_CATALOG_PITCH_SLOTS_INDEX_SQL = `
+  CREATE INDEX foundation_event_catalog_pitch_slots_game_day_id
+    ON foundation_event_catalog_pitch_slots (game_day_id, pitch_id, sequence_number, pitch_slot_id)
+`;
+export const FOUNDATION_EVENT_CATALOG_GAMES_TABLE_SQL = `
+  CREATE TABLE foundation_event_catalog_games (
+    event_game_id TEXT PRIMARY KEY,
+    event_id TEXT NOT NULL REFERENCES foundation_event_catalog_events(event_id) ON DELETE CASCADE,
+    game_day_id TEXT NOT NULL REFERENCES foundation_event_catalog_game_days(game_day_id) ON DELETE CASCADE,
+    gameplay_slot_id TEXT NOT NULL REFERENCES foundation_event_catalog_gameplay_slots(gameplay_slot_id) ON DELETE CASCADE,
+    pitch_slot_id TEXT NOT NULL REFERENCES foundation_event_catalog_pitch_slots(pitch_slot_id) ON DELETE CASCADE,
+    game_code TEXT,
+    game_designation TEXT,
+    side_a_id TEXT NOT NULL UNIQUE,
+    side_a_event_team_id TEXT REFERENCES foundation_event_catalog_teams(event_team_id),
+    side_a_event_team_name TEXT,
+    side_a_source_label TEXT,
+    side_a_confirmed_at_ms INTEGER,
+    side_b_id TEXT NOT NULL UNIQUE,
+    side_b_event_team_id TEXT REFERENCES foundation_event_catalog_teams(event_team_id),
+    side_b_event_team_name TEXT,
+    side_b_source_label TEXT,
+    side_b_confirmed_at_ms INTEGER,
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    UNIQUE (pitch_slot_id),
+    UNIQUE (event_id, game_code),
+    CHECK ((side_a_event_team_id IS NOT NULL AND side_a_event_team_name IS NOT NULL AND side_a_source_label IS NULL AND side_a_confirmed_at_ms IS NOT NULL) OR (side_a_event_team_id IS NULL AND side_a_event_team_name IS NULL AND side_a_source_label IS NOT NULL AND side_a_confirmed_at_ms IS NULL)),
+    CHECK ((side_b_event_team_id IS NOT NULL AND side_b_event_team_name IS NOT NULL AND side_b_source_label IS NULL AND side_b_confirmed_at_ms IS NOT NULL) OR (side_b_event_team_id IS NULL AND side_b_event_team_name IS NULL AND side_b_source_label IS NOT NULL AND side_b_confirmed_at_ms IS NULL)),
+    CHECK (side_a_event_team_id IS NULL OR side_a_event_team_id <> side_b_event_team_id)
+  ) STRICT;
+`;
+export const FOUNDATION_EVENT_CATALOG_GAMES_INDEX_SQL = `
+  CREATE INDEX foundation_event_catalog_games_game_day_id
+    ON foundation_event_catalog_games (game_day_id, gameplay_slot_id, event_game_id)
+`;
+export const FOUNDATION_EVENT_SCHEDULE_MIGRATION_SQL = `
+  CREATE TABLE foundation_event_catalog_audit_v3 AS SELECT * FROM foundation_event_catalog_audit;
+  DROP TABLE foundation_event_catalog_audit;
+  ${FOUNDATION_EVENT_CATALOG_AUDIT_TABLE_V3_SQL.replace(
+    "CREATE TABLE foundation_event_catalog_audit",
+    "CREATE TABLE foundation_event_catalog_audit_rebuilt",
+  )};
+  INSERT INTO foundation_event_catalog_audit_rebuilt
+    (audit_id, operation_id, action, event_id, game_day_id, actor_reference,
+     occurred_at_ms, before_json, after_json)
+  SELECT audit_id, operation_id, action, event_id, game_day_id, actor_reference,
+         occurred_at_ms, before_json, after_json
+  FROM foundation_event_catalog_audit_v3;
+  DROP TABLE foundation_event_catalog_audit_v3;
+  ALTER TABLE foundation_event_catalog_audit_rebuilt RENAME TO foundation_event_catalog_audit;
+  ${FOUNDATION_EVENT_CATALOG_AUDIT_EVENT_INDEX_SQL};
+  ${FOUNDATION_EVENT_CATALOG_GAMEPLAY_SLOTS_TABLE_SQL};
+  ${FOUNDATION_EVENT_CATALOG_GAMEPLAY_SLOTS_INDEX_SQL};
+  ${FOUNDATION_EVENT_CATALOG_PITCH_SLOTS_TABLE_SQL};
+  ${FOUNDATION_EVENT_CATALOG_PITCH_SLOTS_INDEX_SQL};
+  ${FOUNDATION_EVENT_CATALOG_GAMES_TABLE_SQL};
+  ${FOUNDATION_EVENT_CATALOG_GAMES_INDEX_SQL};
 `;
 
 export const FOUNDATION_MIGRATIONS: readonly FoundationMigration[] = Object.freeze([
@@ -1771,6 +1867,12 @@ export const FOUNDATION_MIGRATIONS: readonly FoundationMigration[] = Object.free
     ordinal: 23,
     schemaVersion: 23,
     sql: FOUNDATION_EVENT_TEAMS_AND_PITCHES_MIGRATION_SQL,
+  }),
+  createMigration({
+    id: "024-event-schedule-slots-and-games",
+    ordinal: 24,
+    schemaVersion: 24,
+    sql: FOUNDATION_EVENT_SCHEDULE_MIGRATION_SQL,
   }),
 ]);
 

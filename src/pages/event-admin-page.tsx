@@ -20,6 +20,29 @@ type HubResponse = {
         roster: Array<{ playerNumber: number; publicName: string }>;
       }>;
       pitches: Array<{ pitchId: string; name: string }>;
+      gameplaySlots: Array<{
+        gameplaySlotId: string;
+        gameDayId: string;
+        sequence: number;
+        scheduledStartMs: number;
+      }>;
+      pitchSlots: Array<{
+        pitchSlotId: string;
+        gameDayId: string;
+        pitchId: string;
+        gameplaySlotId: string;
+        sequence: number;
+      }>;
+      eventGames: Array<{
+        eventGameId: string;
+        gameDayId: string;
+        gameplaySlotId: string;
+        pitchSlotId: string;
+        gameCode: string | null;
+        gameDesignation: string | null;
+        sideA: { eventTeamId: string | null; sourceLabel: string | null };
+        sideB: { eventTeamId: string | null; sourceLabel: string | null };
+      }>;
     };
     selectedGameDayId: string | null;
     authority: "technical-admin" | "event-admin";
@@ -27,6 +50,16 @@ type HubResponse = {
 };
 
 type TeamDraft = { name: string; defaultColor: string };
+type ConfirmationDraft = { sideA: string; sideB: string };
+type ScheduleResponse = {
+  status: "accepted";
+  value: {
+    gameDayId: string;
+    gameplaySlots: HubResponse["value"]["event"]["gameplaySlots"];
+    pitchSlots: HubResponse["value"]["event"]["pitchSlots"];
+    eventGames: HubResponse["value"]["event"]["eventGames"];
+  };
+};
 
 export function EventAdminPage() {
   const queryEventId = new URLSearchParams(window.location.search).get("eventId") ?? "";
@@ -44,6 +77,25 @@ export function EventAdminPage() {
   const [playerName, setPlayerName] = useState("");
   const [teamDrafts, setTeamDrafts] = useState<Record<string, TeamDraft>>({});
   const [pitchDrafts, setPitchDrafts] = useState<Record<string, string>>({});
+  const [slotSequence, setSlotSequence] = useState("1");
+  const [scheduledStart, setScheduledStart] = useState("");
+  const [gameplaySlotId, setGameplaySlotId] = useState("");
+  const [pitchSlotId, setPitchSlotId] = useState("");
+  const [gameCode, setGameCode] = useState("");
+  const [gameDesignation, setGameDesignation] = useState("");
+  const [sideASource, setSideASource] = useState("");
+  const [sideBSource, setSideBSource] = useState("");
+  const [confirmationDrafts, setConfirmationDrafts] = useState<Record<string, ConfirmationDraft>>(
+    {},
+  );
+  const [schedule, setSchedule] = useState<ScheduleResponse["value"] | null>(null);
+  const [selectedPitchId, setSelectedPitchId] = useState("");
+  const [pitchView, setPitchView] = useState<{
+    pitch: { pitchId: string; name: string };
+    gameplaySlots: HubResponse["value"]["event"]["gameplaySlots"];
+    pitchSlots: HubResponse["value"]["event"]["pitchSlots"];
+    eventGames: HubResponse["value"]["event"]["eventGames"];
+  } | null>(null);
 
   const loadHub = async (nextGameDayId = selectedGameDayId) => {
     if (eventId.trim().length === 0) return;
@@ -71,6 +123,77 @@ export function EventAdminPage() {
     );
     setHub(payload.value);
     setSelectedGameDayId(payload.value.selectedGameDayId);
+    setSchedule({
+      gameDayId: payload.value.selectedGameDayId ?? "",
+      gameplaySlots: payload.value.event.gameplaySlots.filter(
+        (slot) => slot.gameDayId === payload.value.selectedGameDayId,
+      ),
+      pitchSlots: payload.value.event.pitchSlots.filter(
+        (slot) => slot.gameDayId === payload.value.selectedGameDayId,
+      ),
+      eventGames: payload.value.event.eventGames.filter(
+        (game) => game.gameDayId === payload.value.selectedGameDayId,
+      ),
+    });
+    setConfirmationDrafts((current) =>
+      Object.fromEntries(
+        payload.value.event.eventGames.map((game) => [
+          game.eventGameId,
+          current[game.eventGameId] ?? {
+            sideA: game.sideA.eventTeamId ?? "",
+            sideB: game.sideB.eventTeamId ?? "",
+          },
+        ]),
+      ),
+    );
+  };
+
+  const loadSchedule = async (gameDayId = selectedGameDayId) => {
+    if (eventId.trim().length === 0 || gameDayId === null) return;
+    const response = await fetch(
+      `/api/event-admin/slot-setup?eventId=${encodeURIComponent(eventId)}&gameDayId=${encodeURIComponent(gameDayId)}`,
+    );
+    const payload = (await response.json()) as ScheduleResponse;
+    if (!response.ok || payload.status !== "accepted")
+      throw new Error("Unable to load Slot setup.");
+    setSchedule(payload.value);
+  };
+
+  const loadPitchView = async (pitchId: string) => {
+    if (selectedGameDayId === null || pitchId.length === 0) return;
+    const response = await fetch(
+      `/api/event-admin/pitch-view?eventId=${encodeURIComponent(eventId)}&gameDayId=${encodeURIComponent(selectedGameDayId)}&pitchId=${encodeURIComponent(pitchId)}`,
+    );
+    const payload = (await response.json()) as {
+      status: "accepted";
+      value: NonNullable<typeof pitchView>;
+    };
+    if (!response.ok || payload.status !== "accepted")
+      throw new Error("Unable to load Pitch view.");
+    setPitchView(payload.value);
+  };
+
+  const confirmGameplaySlot = async (
+    gameplaySlotId: string,
+    games: HubResponse["value"]["event"]["eventGames"],
+  ) => {
+    if (selectedGameDayId === null) return;
+    const response = await fetch(
+      `/api/event-admin/events/${eventId}/game-days/${selectedGameDayId}/gameplay-slots/${gameplaySlotId}/confirm-teams`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          games: games.map((game) => ({
+            eventGameId: game.eventGameId,
+            sideAEventTeamId: confirmationDrafts[game.eventGameId]?.sideA ?? "",
+            sideBEventTeamId: confirmationDrafts[game.eventGameId]?.sideB ?? "",
+          })),
+        }),
+      },
+    );
+    if (!response.ok) throw new Error("Gameplay Slot confirmation failed.");
+    await loadHub(selectedGameDayId);
   };
 
   useEffect(() => {
@@ -404,6 +527,314 @@ export function EventAdminPage() {
                     Add Pitch
                   </Button>
                 </div>
+              </div>
+              <div className="space-y-3 rounded-lg border p-3">
+                <div>
+                  <p className="font-semibold">Slot setup</p>
+                  <p className="text-xs text-muted-foreground">
+                    Create the ordered Gameplay Slots first. Each Pitch receives its matching Pitch
+                    Slot automatically.
+                  </p>
+                </div>
+                {selectedGameDayId === null ? (
+                  <p className="text-sm text-muted-foreground">
+                    Choose a Game Day to schedule Games.
+                  </p>
+                ) : (
+                  <>
+                    <div className="grid gap-2 sm:grid-cols-3">
+                      <Input
+                        aria-label="Gameplay Slot sequence"
+                        inputMode="numeric"
+                        placeholder="Slot #"
+                        value={slotSequence}
+                        onChange={(event) => setSlotSequence(event.target.value)}
+                      />
+                      <Input
+                        aria-label="Gameplay Slot scheduled start"
+                        type="datetime-local"
+                        value={scheduledStart}
+                        onChange={(event) => setScheduledStart(event.target.value)}
+                      />
+                      <Button
+                        disabled={busy || scheduledStart.length === 0}
+                        onClick={() =>
+                          void run(async () => {
+                            const response = await fetch(
+                              `/api/event-admin/events/${eventId}/game-days/${selectedGameDayId}/gameplay-slots`,
+                              {
+                                method: "POST",
+                                headers: { "content-type": "application/json" },
+                                body: JSON.stringify({
+                                  sequence: Number(slotSequence),
+                                  scheduledStart,
+                                }),
+                              },
+                            );
+                            if (!response.ok) throw new Error("Gameplay Slot creation failed.");
+                            await loadHub(selectedGameDayId);
+                          })
+                        }
+                      >
+                        Add Gameplay Slot
+                      </Button>
+                    </div>
+                    <Button
+                      variant="outline"
+                      disabled={busy}
+                      onClick={() => void run(() => loadSchedule())}
+                    >
+                      Refresh Slot setup
+                    </Button>
+                    <div className="space-y-2">
+                      {(schedule?.gameplaySlots ?? hub.event.gameplaySlots).map((slot) => {
+                        const slotGames = (schedule?.eventGames ?? hub.event.eventGames).filter(
+                          (game) => game.gameplaySlotId === slot.gameplaySlotId,
+                        );
+                        return (
+                          <div className="rounded border p-2" key={slot.gameplaySlotId}>
+                            <div className="flex flex-wrap items-center justify-between gap-2">
+                              <span className="font-medium">
+                                Slot {slot.sequence} ·{" "}
+                                {new Intl.DateTimeFormat(undefined, {
+                                  timeZone: hub.event.timeZone,
+                                  hour: "2-digit",
+                                  minute: "2-digit",
+                                }).format(new Date(slot.scheduledStartMs))}
+                              </span>
+                              <span className="text-xs text-muted-foreground">
+                                {slotGames.length} Games
+                              </span>
+                            </div>
+                            <div className="mt-2 grid gap-1 text-sm sm:grid-cols-2">
+                              {slotGames.map((game) => {
+                                const draft = confirmationDrafts[game.eventGameId] ?? {
+                                  sideA: game.sideA.eventTeamId ?? "",
+                                  sideB: game.sideB.eventTeamId ?? "",
+                                };
+                                return (
+                                  <div className="rounded bg-muted/50 p-2" key={game.eventGameId}>
+                                    <span className="font-medium">
+                                      {game.gameCode ?? game.eventGameId}
+                                    </span>
+                                    {game.gameDesignation ? (
+                                      <span className="ml-2 text-muted-foreground">
+                                        {game.gameDesignation}
+                                      </span>
+                                    ) : null}
+                                    <div className="mt-1 grid gap-1 sm:grid-cols-2">
+                                      <select
+                                        aria-label={`Confirm ${game.eventGameId} Side A`}
+                                        className="h-9 rounded-md border bg-background px-2 text-sm"
+                                        value={draft.sideA}
+                                        onChange={(event) =>
+                                          setConfirmationDrafts((current) => ({
+                                            ...current,
+                                            [game.eventGameId]: {
+                                              ...draft,
+                                              sideA: event.target.value,
+                                            },
+                                          }))
+                                        }
+                                      >
+                                        <option value="">Side A Team</option>
+                                        {hub.event.teams.map((team) => (
+                                          <option key={team.eventTeamId} value={team.eventTeamId}>
+                                            {team.name}
+                                          </option>
+                                        ))}
+                                      </select>
+                                      <select
+                                        aria-label={`Confirm ${game.eventGameId} Side B`}
+                                        className="h-9 rounded-md border bg-background px-2 text-sm"
+                                        value={draft.sideB}
+                                        onChange={(event) =>
+                                          setConfirmationDrafts((current) => ({
+                                            ...current,
+                                            [game.eventGameId]: {
+                                              ...draft,
+                                              sideB: event.target.value,
+                                            },
+                                          }))
+                                        }
+                                      >
+                                        <option value="">Side B Team</option>
+                                        {hub.event.teams.map((team) => (
+                                          <option key={team.eventTeamId} value={team.eventTeamId}>
+                                            {team.name}
+                                          </option>
+                                        ))}
+                                      </select>
+                                    </div>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                            <Button
+                              className="mt-2"
+                              variant="outline"
+                              disabled={
+                                busy ||
+                                slotGames.length === 0 ||
+                                slotGames.some((game) => {
+                                  const draft = confirmationDrafts[game.eventGameId];
+                                  return (
+                                    draft === undefined ||
+                                    draft.sideA.length === 0 ||
+                                    draft.sideB.length === 0 ||
+                                    draft.sideA === draft.sideB
+                                  );
+                                })
+                              }
+                              onClick={() =>
+                                void run(() => confirmGameplaySlot(slot.gameplaySlotId, slotGames))
+                              }
+                            >
+                              Confirm teams for Slot
+                            </Button>
+                          </div>
+                        );
+                      })}
+                    </div>
+                    <div className="space-y-2 border-t pt-3">
+                      <p className="font-medium">Add Event Game</p>
+                      <div className="grid gap-2 sm:grid-cols-2">
+                        <select
+                          aria-label="Gameplay Slot for Event Game"
+                          className="h-10 rounded-md border bg-background px-3 text-sm"
+                          value={gameplaySlotId}
+                          onChange={(event) => setGameplaySlotId(event.target.value)}
+                        >
+                          <option value="">Gameplay Slot</option>
+                          {(schedule?.gameplaySlots ?? hub.event.gameplaySlots).map((slot) => (
+                            <option key={slot.gameplaySlotId} value={slot.gameplaySlotId}>
+                              Slot {slot.sequence}
+                            </option>
+                          ))}
+                        </select>
+                        <select
+                          aria-label="Pitch Slot for Event Game"
+                          className="h-10 rounded-md border bg-background px-3 text-sm"
+                          value={pitchSlotId}
+                          onChange={(event) => setPitchSlotId(event.target.value)}
+                        >
+                          <option value="">Pitch Slot</option>
+                          {(schedule?.pitchSlots ?? hub.event.pitchSlots).map((slot) => (
+                            <option key={slot.pitchSlotId} value={slot.pitchSlotId}>
+                              {hub.event.pitches.find((pitch) => pitch.pitchId === slot.pitchId)
+                                ?.name ?? slot.pitchId}{" "}
+                              · Slot {slot.sequence}
+                            </option>
+                          ))}
+                        </select>
+                        <Input
+                          aria-label="Game Code"
+                          placeholder="Game Code (optional)"
+                          value={gameCode}
+                          onChange={(event) => setGameCode(event.target.value)}
+                        />
+                        <Input
+                          aria-label="Game Designation"
+                          placeholder="Game Designation (optional)"
+                          value={gameDesignation}
+                          onChange={(event) => setGameDesignation(event.target.value)}
+                        />
+                        <Input
+                          aria-label="Side A source label"
+                          placeholder="Side A source label"
+                          value={sideASource}
+                          onChange={(event) => setSideASource(event.target.value)}
+                        />
+                        <Input
+                          aria-label="Side B source label"
+                          placeholder="Side B source label"
+                          value={sideBSource}
+                          onChange={(event) => setSideBSource(event.target.value)}
+                        />
+                      </div>
+                      <Button
+                        disabled={
+                          busy ||
+                          gameplaySlotId.length === 0 ||
+                          pitchSlotId.length === 0 ||
+                          sideASource.trim().length === 0 ||
+                          sideBSource.trim().length === 0
+                        }
+                        onClick={() =>
+                          void run(async () => {
+                            const response = await fetch(
+                              `/api/event-admin/events/${eventId}/game-days/${selectedGameDayId}/event-games`,
+                              {
+                                method: "POST",
+                                headers: { "content-type": "application/json" },
+                                body: JSON.stringify({
+                                  gameplaySlotId,
+                                  pitchSlotId,
+                                  gameCode,
+                                  gameDesignation,
+                                  sideA: { sourceLabel: sideASource },
+                                  sideB: { sourceLabel: sideBSource },
+                                }),
+                              },
+                            );
+                            if (!response.ok) throw new Error("Event Game creation failed.");
+                            setGameCode("");
+                            setGameDesignation("");
+                            setSideASource("");
+                            setSideBSource("");
+                            await loadHub(selectedGameDayId);
+                          })
+                        }
+                      >
+                        Add unresolved Event Game
+                      </Button>
+                    </div>
+                  </>
+                )}
+              </div>
+              <div className="space-y-3 rounded-lg border p-3">
+                <p className="font-semibold">Pitch view</p>
+                <div className="flex flex-wrap gap-2">
+                  {hub.event.pitches.map((pitch) => (
+                    <Button
+                      key={pitch.pitchId}
+                      variant={selectedPitchId === pitch.pitchId ? "default" : "outline"}
+                      onClick={() => {
+                        setSelectedPitchId(pitch.pitchId);
+                        void run(() => loadPitchView(pitch.pitchId));
+                      }}
+                    >
+                      {pitch.name}
+                    </Button>
+                  ))}
+                </div>
+                {pitchView ? (
+                  <div className="grid gap-2 sm:grid-cols-2">
+                    {pitchView.pitchSlots.map((slot) => {
+                      const gameplaySlot = pitchView.gameplaySlots.find(
+                        (candidate) => candidate.gameplaySlotId === slot.gameplaySlotId,
+                      );
+                      const game = pitchView.eventGames.find(
+                        (candidate) => candidate.pitchSlotId === slot.pitchSlotId,
+                      );
+                      return (
+                        <div className="rounded border p-2 text-sm" key={slot.pitchSlotId}>
+                          <span className="font-medium">
+                            Slot {slot.sequence}
+                            {gameplaySlot
+                              ? ` · ${new Intl.DateTimeFormat(undefined, { timeZone: hub.event.timeZone, hour: "2-digit", minute: "2-digit" }).format(new Date(gameplaySlot.scheduledStartMs))}`
+                              : ""}
+                          </span>
+                          <span className="ml-2 text-muted-foreground">
+                            {game
+                              ? `${game.sideA.eventTeamId ?? game.sideA.sourceLabel} vs ${game.sideB.eventTeamId ?? game.sideB.sourceLabel}`
+                              : "Empty"}
+                          </span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                ) : null}
               </div>
               <Button variant="outline" onClick={() => setHub(null)}>
                 Change authority
