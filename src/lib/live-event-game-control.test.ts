@@ -3,7 +3,10 @@ import { applyGameCommand, createInitialGameState } from "@/lib/game-engine";
 import { createFoundationAcceptance, type AcceptanceLimits } from "@/lib/foundation-acceptance";
 import { createInMemoryFoundationStorage } from "@/lib/foundation-storage-memory";
 import { createEventCatalog, createFoundationEventCatalogStorage } from "@/lib/event-catalog";
-import { createEventGameRecord } from "@/lib/event-game-record";
+import {
+  createEventGameRecord,
+  createEventGameRecordTransactionSeam,
+} from "@/lib/event-game-record";
 import { createGrantTestAuthorityVerifier } from "@/lib/grant-authority-test-support";
 import { createTypedGrantAuthority } from "@/lib/grant-management";
 import type { GrantAuthorityOptions } from "@/lib/grant-authority";
@@ -37,6 +40,116 @@ import {
 } from "@/lib/technical-admin-auth";
 
 describe("Live Event Game control", () => {
+  test("projects only the current correction with its correction-time name and gates acknowledgement", async () => {
+    let liveName = "Renamed Later";
+    const harness = await createHarness({
+      eventTeamNameResolver: (eventTeamId) =>
+        eventTeamId === "team-c" || eventTeamId === "team-d" ? liveName : null,
+    });
+    const commenced = await harness.record.transitionLifecycle({
+      ...harness.root.lifecycle,
+      phase: "in-progress",
+      commencedAtMs: 1_000,
+    });
+    expect(commenced.status).toBe("updated");
+
+    const correct = (operationId: string, eventTeamId: string, eventTeamName: string) =>
+      harness.storage.transaction((transaction) =>
+        createEventGameRecordTransactionSeam(transaction, {
+          externalScopeResolver: createScopeResolver(harness.root),
+          interpreter: createLiveEventGameIqaInterpreter(),
+          clock: () => harness.grantOptions.clock.nowMs(),
+        }).correctTeamAssignment({
+          recordId: harness.root.recordId,
+          eventGameId: harness.root.eventGameId,
+          operationId,
+          gameSideId: "side-a",
+          eventTeamId,
+          teamInterpretationRef: `${eventTeamId}-v1`,
+          eventTeamName,
+          trustedAtMs: 2_000,
+          grant: { sessionId: "event-admin", versionId: "event-admin" },
+        }),
+      );
+    expect(
+      await correct("identity-correction-1", "team-c", "Correction-time Team C"),
+    ).toMatchObject({ status: "accepted" });
+
+    const opened = await harness.control.openController({
+      qrCredential: harness.qrCredential,
+      browserContext: "identity-current-controller",
+    });
+    if (opened.status !== "opened") throw new Error("Expected the Controller to open.");
+    expect(opened.projection?.teamAssignmentCorrections).toEqual([
+      {
+        operationId: "identity-correction-1",
+        gameSideId: "side-a",
+        eventTeamId: "team-c",
+        eventTeamName: "Correction-time Team C",
+        teamInterpretationRef: "team-c-v1",
+      },
+    ]);
+    expect(
+      await harness.control.submitControllerIntent({
+        sessionBearer: opened.session.sessionBearer,
+        eventGameId: harness.root.eventGameId,
+        intent: goalIntent({ operationId: "blocked-unacknowledged-goal", gameSideId: "side-a" }),
+      }),
+    ).toMatchObject({ status: "rejected" });
+
+    const acknowledgement = (operationId: string, correctionOperationId: string) => ({
+      version: LIVE_EVENT_CONTROL_INTENT_VERSION,
+      type: "acknowledge-team-assignment" as const,
+      operationId,
+      factId: `${operationId}-fact`,
+      gameSideId: "side-a",
+      correctionOperationId,
+      gameTimeMs: 0,
+      occurrence: { clientOriginAtMs: null },
+    });
+    expect(
+      await harness.control.submitControllerIntent({
+        sessionBearer: opened.session.sessionBearer,
+        eventGameId: harness.root.eventGameId,
+        intent: acknowledgement("acknowledge-correction-1", "identity-correction-1"),
+      }),
+    ).toMatchObject({ status: "accepted" });
+
+    expect(
+      await correct("identity-correction-2", "team-d", "Correction-time Team D"),
+    ).toMatchObject({ status: "accepted" });
+    liveName = "Renamed Again";
+    const refreshed = await harness.control.openController({
+      qrCredential: harness.qrCredential,
+      browserContext: "identity-current-controller-2",
+    });
+    if (refreshed.status !== "opened")
+      throw new Error("Expected the refreshed Controller to open.");
+    expect(refreshed.projection?.teamAssignmentCorrections).toEqual([
+      {
+        operationId: "identity-correction-2",
+        gameSideId: "side-a",
+        eventTeamId: "team-d",
+        eventTeamName: "Correction-time Team D",
+        teamInterpretationRef: "team-d-v1",
+      },
+    ]);
+    expect(
+      await harness.control.submitControllerIntent({
+        sessionBearer: opened.session.sessionBearer,
+        eventGameId: harness.root.eventGameId,
+        intent: acknowledgement("stale-acknowledgement", "identity-correction-1"),
+      }),
+    ).toMatchObject({ status: "rejected" });
+    expect(
+      await harness.control.submitControllerIntent({
+        sessionBearer: opened.session.sessionBearer,
+        eventGameId: harness.root.eventGameId,
+        intent: acknowledgement("acknowledge-correction-2", "identity-correction-2"),
+      }),
+    ).toMatchObject({ status: "accepted" });
+  });
+
   test("keeps Penalty Reason values fixed while skip remains a Controller-only absence", () => {
     expect(
       parseLiveEventControllerIntent({
@@ -6657,6 +6770,7 @@ async function createHarness(
     readHeatStoppageConfiguration?: (
       scope: HeatStoppageConfigurationScope,
     ) => HeatStoppageConfiguration | null | Promise<HeatStoppageConfiguration | null>;
+    eventTeamNameResolver?: (eventTeamId: string) => string | null;
   } = {},
 ) {
   const root = createRoot(overrides.eventGameId ?? "game-live-control");
@@ -6742,6 +6856,8 @@ async function createHarness(
     knownDodgeballIdsForEventGame:
       overrides.knownDodgeballIds === undefined ? undefined : () => overrides.knownDodgeballIds!,
     projectionFailure: overrides.projectionFailure,
+    resolveEventTeamName: async (_eventId, eventTeamId) =>
+      overrides.eventTeamNameResolver?.(eventTeamId) ?? null,
     ...(overrides.heatStoppageConfiguration === undefined
       ? {}
       : { heatStoppageConfiguration: overrides.heatStoppageConfiguration }),

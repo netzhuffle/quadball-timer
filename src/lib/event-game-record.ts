@@ -28,6 +28,7 @@ import {
   validateDependencies,
   validateIdempotencyHistory,
 } from "@/lib/event-game-record-helpers";
+import { validateId } from "@/lib/event-game-action-codecs";
 import {
   CONTROL_ACTION_ORDERING_VERSION,
   createControlActionCodecRegistry,
@@ -38,11 +39,13 @@ import {
   rebuildControlActionHistory,
   type ActionRebuildResult,
   type ControlAction,
+  type ControlActionInput,
   type ControlActionCodec,
   type ControlActionCodecRegistry,
   type ControlActionRecoveryProvenance,
   type ControlAuditEntry,
   type EventGameRecordMetadata,
+  type EffectiveGameSideAssignment,
   type IqaGameRulesInterpreter,
   sha256,
 } from "@/lib/event-game-actions";
@@ -236,6 +239,28 @@ export type GamePresentationAcceptanceOutcome =
       detail: string;
     };
 
+export type EventGameRecordTeamAssignmentCorrectionRequest = {
+  recordId: string;
+  eventGameId: string;
+  operationId: string;
+  gameSideId: string;
+  eventTeamId: string;
+  teamInterpretationRef: string;
+  eventTeamName?: string;
+  trustedAtMs: number;
+  grant: { sessionId: string; versionId: string };
+};
+
+export type EventGameRecordTransactionSeam = {
+  correctTeamAssignment(
+    input: EventGameRecordTeamAssignmentCorrectionRequest,
+  ): ControlActionAcceptanceOutcome & {
+    effectiveTeamAssignments?: readonly EffectiveGameSideAssignment[];
+  };
+  acceptPresentationChange(input: unknown): GamePresentationAcceptanceOutcome;
+  readPresentation(recordId: string): GamePresentation;
+};
+
 export type EventGameRecordReadiness =
   | {
       ok: true;
@@ -332,10 +357,18 @@ function presentationDefaultColors(
   root: EventGameRecordRoot,
   snapshot: FoundationStorageSnapshot,
   resolver: ExternalScopeResolver,
+  effectiveTeamAssignments: readonly EffectiveGameSideAssignment[] = [],
 ): Record<string, string> {
   const defaults: Record<string, string> = {};
+  const effectiveBySide = new Map(
+    effectiveTeamAssignments.map((assignment) => [assignment.gameSideId, assignment.eventTeamId]),
+  );
   for (const side of root.gameSides) {
-    const color = resolver.resolveEventTeamDefaultColor?.(root.eventId, side.eventTeamId, snapshot);
+    const color = resolver.resolveEventTeamDefaultColor?.(
+      root.eventId,
+      effectiveBySide.get(side.id) ?? side.eventTeamId,
+      snapshot,
+    );
     if (color !== null && color !== undefined && isValidHexColor(color)) {
       defaults[side.id] = `#${color.trim().replace(/^#/, "").toLowerCase()}`;
     }
@@ -496,6 +529,19 @@ export function createEventGameRecord(
       throw new Error("Event Game Record has not been registered.");
     }
     return activeRecordId;
+  }
+
+  function presentationDefaults(
+    root: EventGameRecordRoot,
+    transaction: FoundationStorageSnapshot,
+  ): Record<string, string> {
+    const rebuilt = rebuildRecordSnapshot(root, transaction, codecRegistry, options.interpreter);
+    return presentationDefaultColors(
+      root,
+      transaction,
+      options.externalScopeResolver,
+      rebuilt.status === "ready" ? rebuilt.effectiveTeamAssignments : [],
+    );
   }
 
   async function rebuildActiveRecord(): Promise<ActionRebuildResult> {
@@ -1062,7 +1108,7 @@ export function createEventGameRecord(
           root,
           transaction.listPresentationChanges?.(root.recordId) ?? [],
           transaction.listPresentationAuditEntries?.(root.recordId) ?? [],
-          presentationDefaultColors(root, transaction, options.externalScopeResolver),
+          presentationDefaults(root, transaction),
         );
       });
       const presentationRanks = await storage.transaction((transaction) => {
@@ -1086,22 +1132,7 @@ export function createEventGameRecord(
         } satisfies GamePresentationAcceptanceOutcome;
       }
       try {
-        const outcome = await storage.transaction((transaction) => {
-          if (
-            transaction.findPresentationChangeByOperationId === undefined ||
-            transaction.listPresentationChanges === undefined ||
-            transaction.listPresentationAuditEntries === undefined ||
-            transaction.insertPresentationChange === undefined ||
-            transaction.appendPresentationAuditEntry === undefined ||
-            transaction.appendPresentationAuditRevision === undefined ||
-            transaction.sealPresentationEvidence === undefined
-          ) {
-            return {
-              status: "rejected",
-              reason: "storage-not-ready",
-              detail: "The presentation record seam is not durably available.",
-            } satisfies GamePresentationAcceptanceOutcome;
-          }
+        return await storage.transaction((transaction) => {
           const root = transaction.findRootByRecordId(parsed.recordId);
           if (root === null || root.eventGameId !== parsed.eventGameId) {
             return {
@@ -1117,198 +1148,11 @@ export function createEventGameRecord(
               detail: "The Event Game Record is not active.",
             } satisfies GamePresentationAcceptanceOutcome;
           }
-          if (parsed.change.type === "displayed-team-color") {
-            const gameSideId = parsed.change.gameSideId;
-            if (!root.gameSides.some((side) => side.id === gameSideId)) {
-              return {
-                status: "rejected",
-                reason: "invalid-change",
-                detail: "Game Presentation Change references an unknown stable Game Side.",
-              } satisfies GamePresentationAcceptanceOutcome;
-            }
-          }
-          const retainedPresentationChanges = transaction.listPresentationChanges(root.recordId);
-          const predecessorIds = new Set(parsed.causalPredecessorIds);
-          const retainedOperationIds = new Set([
-            ...transaction.listActions(root.recordId).map((stored) => stored.action.operationId),
-            ...retainedPresentationChanges.map((change) => change.operationId),
-          ]);
-          if (
-            predecessorIds.size !== parsed.causalPredecessorIds.length ||
-            predecessorIds.has(parsed.operationId) ||
-            parsed.causalPredecessorIds.some(
-              (predecessor) => !retainedOperationIds.has(predecessor),
-            )
-          ) {
-            return {
-              status: "rejected",
-              reason: "invalid-change",
-              detail: "Game Presentation Change causal predecessors are not retained.",
-            } satisfies GamePresentationAcceptanceOutcome;
-          }
-          const previousPresentation = deriveGamePresentation(
-            root.gameSides.map((side) => side.id),
-            retainedPresentationChanges,
-            presentationDefaultColors(root, transaction, options.externalScopeResolver),
-          );
-          const existing = transaction.findPresentationChangeByOperationId?.(
-            root.recordId,
-            parsed.operationId,
-          );
-          const fingerprint = fingerprintGamePresentationChange(parsed);
-          if (existing !== null && existing !== undefined) {
-            if (existing.contentFingerprint === fingerprint) {
-              const audit: StoredGamePresentationAuditEntry = {
-                auditVersion: "control-audit-v1",
-                auditId: presentationAuditId(
-                  root,
-                  "presentation-duplicate",
-                  parsed.operationId,
-                  "",
-                ),
-                recordId: root.recordId,
-                eventGameId: root.eventGameId,
-                operationId: parsed.operationId,
-                presentationChangeId: parsed.presentationChangeId,
-                kind: "presentation-duplicate",
-                classification: "game-presentation-change",
-                outcome: "duplicate-accepted",
-                createdAtMs: parsed.acceptedAtMs,
-                redactedDetail: "Duplicate Game Presentation Change acknowledged idempotently.",
-                previousPresentation: structuredClone(previousPresentation),
-                resultingPresentation: structuredClone(previousPresentation),
-                change: parsed.change,
-                grant: parsed.grant,
-              };
-              if (
-                !transaction
-                  .listPresentationAuditEntries?.(root.recordId)
-                  .some((entry) => entry.auditId === audit.auditId)
-              ) {
-                transaction.appendPresentationAuditEntry?.(audit);
-                transaction.sealPresentationEvidence(root.recordId);
-              }
-              return {
-                status: "duplicate-accepted",
-                change: structuredClone(existing),
-                auditId: audit.auditId,
-              } satisfies GamePresentationAcceptanceOutcome;
-            }
-            const audit: StoredGamePresentationAuditEntry = {
-              auditVersion: "control-audit-v1",
-              auditId: presentationAuditId(
-                root,
-                "presentation-conflict",
-                parsed.operationId,
-                fingerprint,
-              ),
-              recordId: root.recordId,
-              eventGameId: root.eventGameId,
-              operationId: parsed.operationId,
-              presentationChangeId: parsed.presentationChangeId,
-              kind: "presentation-conflict",
-              classification: "game-presentation-change",
-              outcome: "rejected",
-              createdAtMs: parsed.acceptedAtMs,
-              redactedDetail:
-                "operation identity is already bound to different presentation content",
-              previousPresentation: structuredClone(previousPresentation),
-              resultingPresentation: structuredClone(previousPresentation),
-              change: parsed.change,
-              grant: parsed.grant,
-            };
-            transaction.appendPresentationAuditEntry?.(audit);
-            transaction.sealPresentationEvidence(root.recordId);
-            return {
-              status: "rejected",
-              reason: "operation-conflict",
-              detail: "The presentation operation identity is already bound to different content.",
-            } satisfies GamePresentationAcceptanceOutcome;
-          }
-          const sameChange = transaction
-            .listPresentationChanges?.(root.recordId)
-            .find((change) => change.presentationChangeId === parsed.presentationChangeId);
-          if (sameChange !== undefined) {
-            return {
-              status: "rejected",
-              reason: "operation-conflict",
-              detail: "The presentation change identity is already retained.",
-            } satisfies GamePresentationAcceptanceOutcome;
-          }
-          const stored: StoredGamePresentationChange = {
-            ...parsed,
-            causalPredecessorIds: [...parsed.causalPredecessorIds],
-            canonicalContent: canonicalizeGamePresentationChange(parsed),
-            contentFingerprint: fingerprint,
-          };
-          transaction.insertPresentationChange?.(stored);
-          const orderedChanges = orderGamePresentationChanges(
-            transaction.listPresentationChanges(root.recordId),
-          );
-          const storedIndex = orderedChanges.findIndex(
-            (change) => change.operationId === stored.operationId,
-          );
-          const canonicalPreviousPresentation = deriveGamePresentation(
-            root.gameSides.map((side) => side.id),
-            orderedChanges.slice(0, storedIndex),
-            presentationDefaultColors(root, transaction, options.externalScopeResolver),
-          );
-          const resultingPresentation = deriveGamePresentation(
-            root.gameSides.map((side) => side.id),
-            orderedChanges.slice(0, storedIndex + 1),
-            presentationDefaultColors(root, transaction, options.externalScopeResolver),
-          );
-          const audit: StoredGamePresentationAuditEntry = {
-            auditVersion: "control-audit-v1",
-            auditId: presentationAuditId(root, "presentation-accepted", parsed.operationId, ""),
-            recordId: root.recordId,
-            eventGameId: root.eventGameId,
-            operationId: parsed.operationId,
-            presentationChangeId: parsed.presentationChangeId,
-            kind: "presentation-accepted",
-            classification: "game-presentation-change",
-            outcome: "accepted",
-            createdAtMs: parsed.acceptedAtMs,
-            redactedDetail: "Game Presentation Change accepted and synchronized.",
-            previousPresentation: structuredClone(canonicalPreviousPresentation),
-            resultingPresentation: structuredClone(resultingPresentation),
-            change: parsed.change,
-            grant: parsed.grant,
-          };
-          transaction.appendPresentationAuditEntry?.(audit);
-          const allAudits = transaction.listPresentationAuditEntries(root.recordId);
-          const canonicalAudits = materializePresentationAuditSnapshots(
-            root,
-            orderedChanges,
-            allAudits,
-            presentationDefaultColors(root, transaction, options.externalScopeResolver),
-          );
-          const effectiveAudits = collapseGamePresentationAuditEntries(allAudits);
-          for (const canonicalAudit of canonicalAudits) {
-            if (canonicalAudit.kind !== "presentation-accepted") continue;
-            const currentAudit = effectiveAudits.find(
-              (entry) => entry.auditId === canonicalAudit.auditId,
-            );
-            if (
-              currentAudit !== undefined &&
-              (JSON.stringify(currentAudit.previousPresentation) !==
-                JSON.stringify(canonicalAudit.previousPresentation) ||
-                JSON.stringify(currentAudit.resultingPresentation) !==
-                  JSON.stringify(canonicalAudit.resultingPresentation))
-            ) {
-              transaction.appendPresentationAuditRevision(
-                revisionGamePresentationAuditEntry(canonicalAudit),
-              );
-            }
-          }
-          transaction.sealPresentationEvidence(root.recordId);
-          return {
-            status: "accepted",
-            change: stored,
-            auditId: audit.auditId,
-          } satisfies GamePresentationAcceptanceOutcome;
+          return createEventGameRecordTransactionSeam(
+            transaction,
+            options,
+          ).acceptPresentationChange(parsed);
         });
-        return outcome;
       } catch (error) {
         if (error instanceof FoundationStorageNotReadyError) {
           return {
@@ -1333,7 +1177,7 @@ export function createEventGameRecord(
         return deriveGamePresentation(
           root.gameSides.map((side) => side.id),
           changes,
-          presentationDefaultColors(root, transaction, options.externalScopeResolver),
+          presentationDefaults(root, transaction),
         );
       });
     },
@@ -1369,7 +1213,7 @@ export function createEventGameRecord(
           root,
           changes,
           transaction.listPresentationAuditEntries?.(root.recordId) ?? [],
-          presentationDefaultColors(root, transaction, options.externalScopeResolver),
+          presentationDefaults(root, transaction),
         ).sort((left, right) => compareAuditEntries(left, right, presentationRanks));
       });
     },
@@ -1434,6 +1278,379 @@ export function createEventGameRecord(
       } satisfies EventGameRecordReadiness;
     },
   };
+}
+
+export function createEventGameRecordTransactionSeam(
+  transaction: FoundationStorageTransaction,
+  options: EventGameRecordOptions,
+): EventGameRecordTransactionSeam {
+  const clock = options.clock ?? (() => Date.now());
+  const registry =
+    options.actionCodecRegistry ?? createControlActionCodecRegistry(options.actionCodecs);
+
+  function readReadyHistory(root: EventGameRecordRoot): ActionRebuildResult {
+    return rebuildRecordSnapshot(root, transaction, registry, options.interpreter);
+  }
+
+  function presentationDefaults(
+    root: EventGameRecordRoot,
+    snapshot: FoundationStorageSnapshot,
+  ): Record<string, string> {
+    const rebuilt = readReadyHistory(root);
+    return presentationDefaultColors(
+      root,
+      snapshot,
+      options.externalScopeResolver,
+      rebuilt.status === "ready" ? rebuilt.effectiveTeamAssignments : [],
+    );
+  }
+
+  function correctTeamAssignment(
+    input: EventGameRecordTeamAssignmentCorrectionRequest,
+  ): ControlActionAcceptanceOutcome & {
+    effectiveTeamAssignments?: readonly EffectiveGameSideAssignment[];
+  } {
+    const recordId = validateId(input.recordId, "recordId");
+    const eventGameId = validateId(input.eventGameId, "eventGameId");
+    const operationId = validateId(input.operationId, "operationId");
+    const gameSideId = validateId(input.gameSideId, "gameSideId");
+    const eventTeamId = validateId(input.eventTeamId, "eventTeamId");
+    const teamInterpretationRef = validateId(input.teamInterpretationRef, "teamInterpretationRef");
+    const eventTeamName =
+      input.eventTeamName === undefined
+        ? { ok: true as const, value: undefined }
+        : validateId(input.eventTeamName, "eventTeamName");
+    if (
+      !recordId.ok ||
+      !eventGameId.ok ||
+      !operationId.ok ||
+      !gameSideId.ok ||
+      !eventTeamId.ok ||
+      !teamInterpretationRef.ok ||
+      !eventTeamName.ok
+    )
+      return {
+        status: "rejected",
+        reason: "invalid-action",
+        detail: "Event Team Assignment Correction identity is invalid.",
+      };
+    const root = transaction.findRootByRecordId(recordId.value);
+    if (root === null || root.eventGameId !== eventGameId.value)
+      return {
+        status: "rejected",
+        reason: "record-not-found",
+        detail: "The Event Game Record is not registered for this Event Game.",
+      };
+    if (!root.gameSides.some((side) => side.id === gameSideId.value))
+      return {
+        status: "rejected",
+        reason: "invalid-action",
+        detail: "Team Assignment Correction references an unknown stable Game Side.",
+      };
+    const scope = options.externalScopeResolver.resolve(root.externalScope, transaction);
+    if (scope.status !== "resolved")
+      return { status: "rejected", reason: "storage-not-ready", detail: scope.detail };
+    const team = options.externalScopeResolver.resolveEventTeam(
+      root.eventId,
+      eventTeamId.value,
+      transaction,
+    );
+    if (team.status !== "resolved")
+      return { status: "rejected", reason: "invalid-action", detail: team.detail };
+    const before = readReadyHistory(root);
+    if (before.status !== "ready")
+      return { status: "rejected", reason: "storage-not-ready", detail: before.detail };
+    const actionInput: ControlActionInput = {
+      recordId: recordId.value,
+      eventGameId: eventGameId.value,
+      operationId: operationId.value,
+      kind: { id: "team-assignment-correction", version: "1" },
+      payload: {
+        correctionId: operationId.value,
+        gameSideId: gameSideId.value,
+        eventTeamId: eventTeamId.value,
+        teamInterpretationRef: teamInterpretationRef.value,
+        ...(eventTeamName.value === undefined ? {} : { eventTeamName: eventTeamName.value }),
+      },
+      causalPredecessorIds: [],
+      occurrence: { trustedAtMs: input.trustedAtMs, clientOriginAtMs: null, source: "online" },
+      grant: input.grant,
+      lifecycle: structuredClone(root.lifecycle),
+    };
+    const prepared = prepareControlAction(actionInput, root, registry, clock(), {
+      allowConcurrentTeamAssignment: true,
+    });
+    if (!prepared.ok)
+      return { status: "rejected", reason: "invalid-action", detail: prepared.error };
+    const existing = transaction.findActionByOperationId(root.recordId, operationId.value);
+    if (existing !== null) {
+      if (existing.contentFingerprint === prepared.value.contentFingerprint) {
+        return {
+          status: "duplicate-accepted",
+          action: structuredClone(existing.action),
+          auditId: acceptedAuditId(existing.action),
+          effectiveTeamAssignments: structuredClone(before.effectiveTeamAssignments),
+        };
+      }
+      transaction.appendAuditEntry(
+        createAuditEntry(
+          prepared.value.input,
+          "action-conflict",
+          "operation identity is already bound to different content",
+          clock(),
+          {
+            interpretation: prepared.value.interpretation,
+            collision: {
+              acceptedAction: existing.action,
+              acceptedContentFingerprint: existing.contentFingerprint,
+              rejectedAttempt: prepared.value,
+            },
+          },
+        ),
+      );
+      return {
+        status: "rejected",
+        reason: "operation-conflict",
+        detail: "The operation identity is already bound to different content.",
+      };
+    }
+    const action = materializeControlAction(prepared.value, clock());
+    const candidate = rebuildControlActionHistory(
+      root,
+      [
+        ...transaction.listActions(root.recordId),
+        {
+          action,
+          canonicalContent: prepared.value.canonicalContent,
+          contentFingerprint: prepared.value.contentFingerprint,
+        },
+      ],
+      registry,
+      options.interpreter!,
+    );
+    if (candidate.status !== "ready")
+      return { status: "rejected", reason: "storage-not-ready", detail: candidate.detail };
+    transaction.insertAction({
+      action,
+      canonicalContent: prepared.value.canonicalContent,
+      contentFingerprint: prepared.value.contentFingerprint,
+    });
+    const metadata = transaction.readRecordMetadata(root.recordId);
+    const acceptedAtMs = action.acceptedAtMs;
+    transaction.upsertRecordMetadata({
+      recordId: root.recordId,
+      actionCount: (metadata?.actionCount ?? 0) + 1,
+      orderingVersion: CONTROL_ACTION_ORDERING_VERSION,
+      lastAcceptedAtMs: Math.max(metadata?.lastAcceptedAtMs ?? 0, acceptedAtMs),
+      updatedAtMs: Math.max(
+        metadata?.updatedAtMs ?? root.creationEvidence.createdAtMs,
+        acceptedAtMs,
+      ),
+    });
+    const audit = createAuditEntry(
+      prepared.value.input,
+      "action-accepted",
+      ACCEPTED_AUDIT_DETAIL,
+      acceptedAtMs,
+      { interpretation: prepared.value.interpretation },
+    );
+    transaction.appendAuditEntry(audit);
+    appendConcurrentCorrectionAudits(transaction, root.recordId, acceptedAtMs);
+    const after = readReadyHistory(root);
+    if (after.status !== "ready")
+      return { status: "rejected", reason: "storage-not-ready", detail: after.detail };
+    return {
+      status: "accepted",
+      action,
+      auditId: audit.auditId,
+      effectiveTeamAssignments: structuredClone(after.effectiveTeamAssignments),
+    };
+  }
+
+  function acceptPresentationChange(input: unknown): GamePresentationAcceptanceOutcome {
+    const parsed = readPresentationAcceptanceInput(input);
+    if (parsed === null)
+      return {
+        status: "rejected",
+        reason: "invalid-change",
+        detail: "Game Presentation Change is malformed.",
+      };
+    if (
+      transaction.findPresentationChangeByOperationId === undefined ||
+      transaction.listPresentationChanges === undefined ||
+      transaction.listPresentationAuditEntries === undefined ||
+      transaction.insertPresentationChange === undefined ||
+      transaction.appendPresentationAuditEntry === undefined ||
+      transaction.appendPresentationAuditRevision === undefined ||
+      transaction.sealPresentationEvidence === undefined
+    )
+      return {
+        status: "rejected",
+        reason: "storage-not-ready",
+        detail: "The presentation record seam is not durably available.",
+      };
+    const root = transaction.findRootByRecordId(parsed.recordId);
+    if (root === null || root.eventGameId !== parsed.eventGameId)
+      return {
+        status: "rejected",
+        reason: "record-not-found",
+        detail: "The Event Game Record is not registered for this Event Game.",
+      };
+    if (parsed.change.type === "displayed-team-color") {
+      const gameSideId = parsed.change.gameSideId;
+      if (!root.gameSides.some((side) => side.id === gameSideId))
+        return {
+          status: "rejected",
+          reason: "invalid-change",
+          detail: "Game Presentation Change references an unknown stable Game Side.",
+        };
+    }
+    const retained = transaction.listPresentationChanges(root.recordId);
+    const predecessorIds = new Set(parsed.causalPredecessorIds);
+    const retainedOperationIds = new Set([
+      ...transaction.listActions(root.recordId).map((stored) => stored.action.operationId),
+      ...retained.map((change) => change.operationId),
+    ]);
+    if (
+      predecessorIds.size !== parsed.causalPredecessorIds.length ||
+      predecessorIds.has(parsed.operationId) ||
+      parsed.causalPredecessorIds.some((predecessor) => !retainedOperationIds.has(predecessor))
+    )
+      return {
+        status: "rejected",
+        reason: "invalid-change",
+        detail: "Game Presentation Change causal predecessors are not retained.",
+      };
+    const existing = transaction.findPresentationChangeByOperationId(
+      root.recordId,
+      parsed.operationId,
+    );
+    const fingerprint = fingerprintGamePresentationChange(parsed);
+    const defaults = presentationDefaults(root, transaction);
+    const previous = deriveGamePresentation(
+      root.gameSides.map((side) => side.id),
+      retained,
+      defaults,
+    );
+    if (existing !== null) {
+      if (existing.contentFingerprint === fingerprint) {
+        const audit: StoredGamePresentationAuditEntry = {
+          auditVersion: "control-audit-v1",
+          auditId: presentationAuditId(root, "presentation-duplicate", parsed.operationId, ""),
+          recordId: root.recordId,
+          eventGameId: root.eventGameId,
+          operationId: parsed.operationId,
+          presentationChangeId: parsed.presentationChangeId,
+          kind: "presentation-duplicate",
+          classification: "game-presentation-change",
+          outcome: "duplicate-accepted",
+          createdAtMs: parsed.acceptedAtMs,
+          redactedDetail: "Duplicate Game Presentation Change acknowledged idempotently.",
+          previousPresentation: structuredClone(previous),
+          resultingPresentation: structuredClone(previous),
+          change: parsed.change,
+          grant: parsed.grant,
+        };
+        if (
+          !transaction
+            .listPresentationAuditEntries(root.recordId)
+            .some((entry) => entry.auditId === audit.auditId)
+        )
+          transaction.appendPresentationAuditEntry(audit);
+        transaction.sealPresentationEvidence(root.recordId);
+        return {
+          status: "duplicate-accepted",
+          change: structuredClone(existing),
+          auditId: audit.auditId,
+        };
+      }
+      return {
+        status: "rejected",
+        reason: "operation-conflict",
+        detail: "The presentation operation identity is already bound to different content.",
+      };
+    }
+    if (retained.some((change) => change.presentationChangeId === parsed.presentationChangeId))
+      return {
+        status: "rejected",
+        reason: "operation-conflict",
+        detail: "The presentation change identity is already retained.",
+      };
+    const stored: StoredGamePresentationChange = {
+      ...parsed,
+      causalPredecessorIds: [...parsed.causalPredecessorIds],
+      canonicalContent: canonicalizeGamePresentationChange(parsed),
+      contentFingerprint: fingerprint,
+    };
+    transaction.insertPresentationChange(stored);
+    const ordered = orderGamePresentationChanges([...retained, stored]);
+    const index = ordered.findIndex((change) => change.operationId === stored.operationId);
+    const canonicalPrevious = deriveGamePresentation(
+      root.gameSides.map((side) => side.id),
+      ordered.slice(0, index),
+      defaults,
+    );
+    const resulting = deriveGamePresentation(
+      root.gameSides.map((side) => side.id),
+      ordered.slice(0, index + 1),
+      defaults,
+    );
+    const audit: StoredGamePresentationAuditEntry = {
+      auditVersion: "control-audit-v1",
+      auditId: presentationAuditId(root, "presentation-accepted", parsed.operationId, ""),
+      recordId: root.recordId,
+      eventGameId: root.eventGameId,
+      operationId: parsed.operationId,
+      presentationChangeId: parsed.presentationChangeId,
+      kind: "presentation-accepted",
+      classification: "game-presentation-change",
+      outcome: "accepted",
+      createdAtMs: parsed.acceptedAtMs,
+      redactedDetail: "Game Presentation Change accepted and synchronized.",
+      previousPresentation: structuredClone(canonicalPrevious),
+      resultingPresentation: structuredClone(resulting),
+      change: parsed.change,
+      grant: parsed.grant,
+    };
+    transaction.appendPresentationAuditEntry(audit);
+    const audits = transaction.listPresentationAuditEntries(root.recordId);
+    const effectiveAudits = collapseGamePresentationAuditEntries(audits);
+    for (const canonicalAudit of materializePresentationAuditSnapshots(
+      root,
+      ordered,
+      audits,
+      defaults,
+    )) {
+      if (canonicalAudit.kind !== "presentation-accepted") continue;
+      const currentAudit = effectiveAudits.find(
+        (entry) => entry.auditId === canonicalAudit.auditId,
+      );
+      if (
+        currentAudit !== undefined &&
+        (JSON.stringify(currentAudit.previousPresentation) !==
+          JSON.stringify(canonicalAudit.previousPresentation) ||
+          JSON.stringify(currentAudit.resultingPresentation) !==
+            JSON.stringify(canonicalAudit.resultingPresentation))
+      )
+        transaction.appendPresentationAuditRevision(
+          revisionGamePresentationAuditEntry(canonicalAudit),
+        );
+    }
+    transaction.sealPresentationEvidence(root.recordId);
+    return { status: "accepted", change: stored, auditId: audit.auditId };
+  }
+
+  function readPresentation(recordId: string): GamePresentation {
+    const root = transaction.findRootByRecordId(recordId);
+    if (root === null) throw new Error("The Event Game Record is not registered.");
+    return deriveGamePresentation(
+      root.gameSides.map((side) => side.id),
+      transaction.listPresentationChanges?.(root.recordId) ?? [],
+      presentationDefaults(root, transaction),
+    );
+  }
+
+  return { correctTeamAssignment, acceptPresentationChange, readPresentation };
 }
 
 export function appendConcurrentCorrectionAudits(

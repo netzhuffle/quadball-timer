@@ -1,6 +1,8 @@
 import type {
   ActionJsonValue,
+  ActionRebuildResult,
   EffectiveGameFact,
+  EffectiveGameSideAssignment,
   IqaGameRulesInterpreter,
   OfficialOverrideMetadata,
 } from "@/lib/event-game-actions";
@@ -115,6 +117,11 @@ type ControllerPresentationIntentBase = Omit<ControllerIntentBase, "factId"> & {
 };
 
 export type LiveEventControllerIntent =
+  | (ControllerIntentBase & {
+      type: "acknowledge-team-assignment";
+      gameSideId: string;
+      correctionOperationId: string;
+    })
   | (ControllerIntentBase & {
       type: "record-goal";
       gameSideId: string;
@@ -440,6 +447,14 @@ export type ControllerProjection = {
   commencement: ControllerCommencement;
   clock: ClockProjection;
   presentation?: GamePresentation;
+  teamAssignments?: readonly EffectiveGameSideAssignment[];
+  teamAssignmentCorrections?: readonly {
+    operationId: string;
+    gameSideId: string;
+    eventTeamId: string;
+    eventTeamName: string;
+    teamInterpretationRef: string;
+  }[];
 };
 
 type LiveMaterializationAuthority = {
@@ -548,6 +563,10 @@ export type LiveEventGameControlOptions = {
   knownDodgeballIdsForEventGame?: (eventGameId: string) => readonly string[] | undefined;
   /** Test-only seam for proving the post-commit projection response. */
   projectionFailure?: () => boolean;
+  resolveEventTeamName?: (
+    eventId: string,
+    eventTeamId: string,
+  ) => string | null | Promise<string | null>;
   /** Production composition seam backed by the Event Admin catalog snapshot. */
   readHeatStoppageConfiguration?: (
     scope: HeatStoppageConfigurationScope,
@@ -606,6 +625,7 @@ export function parseLiveEventControllerIntent(
   }
   if (
     value.type !== "record-goal" &&
+    value.type !== "acknowledge-team-assignment" &&
     value.type !== "record-flag-catch" &&
     value.type !== "record-concession" &&
     value.type !== "record-forfeit" &&
@@ -649,6 +669,48 @@ export function parseLiveEventControllerIntent(
   );
   if (!operationId.ok) return invalid(operationId.error);
   if (!gameTimeMs.ok) return invalid(gameTimeMs.error);
+
+  if (value.type === "acknowledge-team-assignment") {
+    const factId = validateOpaqueIdentifier(value.factId, "factId");
+    const gameSideId = validateOpaqueIdentifier(value.gameSideId, "gameSideId");
+    const correctionOperationId = validateOpaqueIdentifier(
+      value.correctionOperationId,
+      "correctionOperationId",
+    );
+    if (!factId.ok) return invalid(factId.error);
+    if (!gameSideId.ok) return invalid(gameSideId.error);
+    if (!correctionOperationId.ok) return invalid(correctionOperationId.error);
+    if (!isRecord(value.occurrence)) return invalid("occurrence must be an object.");
+    const clientOrigin =
+      value.occurrence.clientOriginAtMs === null || value.occurrence.clientOriginAtMs === undefined
+        ? null
+        : validateIntegerInRange(
+            value.occurrence.clientOriginAtMs,
+            0,
+            Number.MAX_SAFE_INTEGER,
+            "occurrence.clientOriginAtMs",
+          );
+    if (clientOrigin !== null && !clientOrigin.ok) return invalid(clientOrigin.error);
+    const source = value.occurrence.source;
+    if (source !== undefined && source !== "online" && source !== "offline")
+      return invalid("occurrence.source is unsupported.");
+    return {
+      ok: true,
+      value: {
+        version: LIVE_EVENT_CONTROL_INTENT_VERSION,
+        type: value.type,
+        operationId: operationId.value,
+        factId: factId.value,
+        gameSideId: gameSideId.value,
+        correctionOperationId: correctionOperationId.value,
+        gameTimeMs: gameTimeMs.value,
+        occurrence: {
+          clientOriginAtMs: clientOrigin === null ? null : clientOrigin.value,
+          ...(source === undefined ? {} : { source }),
+        },
+      },
+    } as { ok: true; value: LiveEventControllerIntent };
+  }
 
   if (value.type === "set-pitch-orientation" || value.type === "set-displayed-team-color") {
     const presentationChangeId = validateOpaqueIdentifier(
@@ -1391,11 +1453,42 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
     string,
     { eventGameId: string; expiresAtMs: number | null }
   >();
+  const teamAssignmentAcknowledgements = new Map<string, Set<string>>();
   let reconcilingActiveControllerSessions = false;
   let reconciliationDirty = false;
   let reconciliationGeneration = 0;
   let reconciliationCompletion: Promise<number> | null = null;
   let closed = false;
+
+  function currentTeamAssignmentCorrection(
+    rebuild: Extract<ActionRebuildResult, { status: "ready" }>,
+    gameSideId: string,
+  ) {
+    const assignment = rebuild.effectiveTeamAssignments.find(
+      (candidate) => candidate.gameSideId === gameSideId,
+    );
+    if (assignment === undefined) return undefined;
+    const action = [...rebuild.canonicalActions].reverse().find((candidate) => {
+      const interpretation = candidate.interpretation;
+      return (
+        interpretation.type === "team-assignment-correction" &&
+        interpretation.gameSideId === gameSideId &&
+        interpretation.eventTeamId === assignment.eventTeamId &&
+        interpretation.teamInterpretationRef === assignment.teamInterpretationRef &&
+        candidate.lifecycle.commencedAtMs !== null
+      );
+    });
+    if (action === undefined || action.interpretation.type !== "team-assignment-correction") {
+      return undefined;
+    }
+    return {
+      operationId: action.operationId,
+      gameSideId,
+      eventTeamId: assignment.eventTeamId,
+      eventTeamName: action.interpretation.eventTeamName ?? assignment.eventTeamName,
+      teamInterpretationRef: assignment.teamInterpretationRef,
+    };
+  }
 
   async function lockEventGameIfDue(eventGameId: string): Promise<boolean> {
     try {
@@ -2035,6 +2128,40 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
     }
 
     const actionsBefore = await owner.record.readActions();
+    const correctionSideId = controllerGameSideId(parsed.value);
+    const currentRebuild = correctionSideId === null ? undefined : await owner.record.rebuild();
+    if (currentRebuild?.status === "failed") return retryableAction(parsed.value.operationId);
+    const latestTeamCorrection =
+      correctionSideId === null || currentRebuild === undefined
+        ? undefined
+        : currentTeamAssignmentCorrection(currentRebuild, correctionSideId);
+    if (parsed.value.type === "acknowledge-team-assignment") {
+      if (
+        latestTeamCorrection === undefined ||
+        latestTeamCorrection.operationId !== parsed.value.correctionOperationId
+      )
+        return rejectedAction(parsed.value.operationId);
+      const acknowledged =
+        teamAssignmentAcknowledgements.get(authorized.grantSessionId) ?? new Set();
+      acknowledged.add(parsed.value.correctionOperationId);
+      teamAssignmentAcknowledgements.set(authorized.grantSessionId, acknowledged);
+      const currentRoot = await owner.record.readRoot(owner.recordId);
+      const projection =
+        currentRoot === null ? null : await readProjection(owner.record, currentRoot);
+      return {
+        status: "accepted",
+        acknowledgement: { status: "acknowledged", operationId: parsed.value.operationId },
+        projection,
+        projectionStatus: projection === null ? "unavailable" : "available",
+        synchronization: synchronized(),
+        auditReference: { kind: "control", id: parsed.value.correctionOperationId },
+      };
+    }
+    if (correctionSideId !== null && latestTeamCorrection !== undefined) {
+      const acknowledged = teamAssignmentAcknowledgements.get(authorized.grantSessionId);
+      if (!acknowledged?.has(latestTeamCorrection.operationId))
+        return rejectedAction(parsed.value.operationId);
+    }
     const existingAction = actionsBefore.find(
       (stored) => stored.action.operationId === parsed.value.operationId,
     );
@@ -3043,6 +3170,19 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
             ? { status: "heat-stoppage", factId: projectedHeat.factId }
             : { status: "none", factId: null };
       const presentation = await record.readPresentation();
+      const teamAssignmentCorrections = await Promise.all(
+        rebuild.effectiveTeamAssignments.map(async (assignment) => {
+          const correction = currentTeamAssignmentCorrection(rebuild, assignment.gameSideId);
+          if (correction === undefined) return null;
+          return {
+            ...correction,
+            eventTeamName:
+              correction.eventTeamName ??
+              (await options.resolveEventTeamName?.(root.eventId, correction.eventTeamId)) ??
+              `Event Team ${correction.eventTeamId}`,
+          };
+        }),
+      ).then((corrections) => corrections.filter((correction) => correction !== null));
       const runningSinceMs =
         root.lifecycle.commencedAtMs === null ? latestRunningClockStart(derived.gameFacts) : null;
       const controllerProjection: ControllerProjection = {
@@ -3081,6 +3221,8 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
           provisionalElapsedMs: runningSinceMs === null ? 0 : Math.max(0, clock() - runningSinceMs),
         },
         presentation: structuredClone(presentation),
+        teamAssignments: structuredClone(rebuild.effectiveTeamAssignments),
+        teamAssignmentCorrections: structuredClone(teamAssignmentCorrections),
       };
       return controllerProjection;
     } catch {
@@ -3369,6 +3511,7 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
       reconciliationGeneration += 1;
       reconciliationDirty = false;
       activeControllerSessions.clear();
+      teamAssignmentAcknowledgements.clear();
     },
     submitControllerIntent,
     replayControllerActions,
@@ -4438,30 +4581,6 @@ function buildMissingAutomaticPenaltyConsequence(
       sportingOrder: sourceFact?.sportingOrder ?? release.releasedMs,
     },
   };
-}
-
-async function ensureClockCommencement(
-  owner: { recordId: string; record: EventGameRecord },
-  root: EventGameRecordRoot,
-  nowMs: number,
-): Promise<{ status: "ready"; root: EventGameRecordRoot } | { status: "rejected" }> {
-  if (root.lifecycle.commencedAtMs !== null || root.lifecycle.phase !== "scheduled") {
-    return { status: "ready", root };
-  }
-  const actions = await owner.record.readActions();
-  const rebuilt = rebuildLiveDerivedState(root, actions);
-  if (rebuilt === null) return { status: "rejected" };
-  const runningSinceMs = latestRunningClockStart(rebuilt.gameFacts);
-  if (runningSinceMs === null || nowMs - runningSinceMs < 10_000) {
-    return { status: "ready", root };
-  }
-  const transition = await owner.record.transitionLifecycle({
-    ...root.lifecycle,
-    phase: "in-progress",
-    commencedAtMs: runningSinceMs + 10_000,
-  });
-  if (transition.status === "rejected") return { status: "rejected" };
-  return { status: "ready", root: transition.root };
 }
 
 function createHeatModeSnapshotAction(input: {

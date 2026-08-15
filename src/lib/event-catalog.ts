@@ -232,6 +232,99 @@ export type EventCatalogOptions = {
   ids?: EventCatalogIds;
 };
 
+/** Trusted transaction-local catalog seam used when a record and catalog mutation must commit together. */
+export function correctEventGameIdentityInTransaction(
+  transaction: FoundationStorageTransaction,
+  clock: EventCatalogClock,
+  ids: EventCatalogIds,
+  eventId: unknown,
+  gameDayId: unknown,
+  eventGameId: unknown,
+  input: EventGameIdentityCorrectionInput,
+  actorReference: string,
+): CatalogOutcome<EventGameIdentityCorrection> {
+  return correctEventGameIdentityOperation(
+    eventCatalogTransaction(transaction),
+    clock,
+    ids,
+    eventId,
+    gameDayId,
+    eventGameId,
+    input,
+    actorReference,
+  );
+}
+
+/**
+ * Reconciles the catalog projection with the already-canonical Record winner.
+ * The Record decides lifecycle, ordering, and conflicts; the catalog only keeps
+ * its public Event Team identity in step and records the resulting catalog edit.
+ */
+export function reconcileEventGameIdentityInTransaction(
+  transaction: FoundationStorageTransaction,
+  ids: EventCatalogIds,
+  eventIdInput: unknown,
+  gameDayIdInput: unknown,
+  eventGameIdInput: unknown,
+  gameSideIdInput: unknown,
+  eventTeamIdInput: unknown,
+  actorReference: string,
+): CatalogOutcome<EventGame> {
+  const eventId = validateId(eventIdInput, "eventId");
+  const gameDayId = validateId(gameDayIdInput, "gameDayId");
+  const eventGameId = validateId(eventGameIdInput, "eventGameId");
+  const gameSideId = validateId(gameSideIdInput, "gameSideId");
+  const eventTeamId = validateId(eventTeamIdInput, "eventTeamId");
+  if (!eventId.ok || !gameDayId.ok || !eventGameId.ok || !gameSideId.ok || !eventTeamId.ok)
+    return invalid("Event Game identity reconciliation identifier is invalid.");
+  const event = transaction.findEvent(eventId.value);
+  const game = transaction.findEventGame(eventGameId.value);
+  const team = transaction.findEventTeam(eventTeamId.value);
+  if (event === null || game === null || team === null)
+    return notFound("Event Game was not found.");
+  if (game.eventId !== event.eventId || game.gameDayId !== gameDayId.value)
+    return crossEvent("Event Game does not belong to the selected Event and Game Day.");
+  const side =
+    game.sideA.sideId === gameSideId.value
+      ? "sideA"
+      : game.sideB.sideId === gameSideId.value
+        ? "sideB"
+        : null;
+  if (side === null)
+    return invalid("Event Game identity reconciliation references an unknown Game Side.");
+  if (team.eventId !== event.eventId) return crossEvent("Event Team belongs to another Event.");
+  const otherSide = side === "sideA" ? game.sideB : game.sideA;
+  if (otherSide.eventTeamId === team.eventTeamId)
+    return invalid("Event Game sides must use distinct Event Teams.");
+  const previous = side === "sideA" ? game.sideA : game.sideB;
+  if (previous.eventTeamId === team.eventTeamId) return accepted(game);
+  const nextSide = {
+    ...previous,
+    eventTeamId: team.eventTeamId,
+    eventTeamName: team.name,
+    sourceLabel: null,
+    confirmedAtMs: game.updatedAtMs,
+  };
+  const next: EventGame = {
+    ...game,
+    ...(side === "sideA" ? { sideA: nextSide } : { sideB: nextSide }),
+  };
+  transaction.updateEventGame(next);
+  transaction.appendEventAudit(
+    createAudit(
+      ids,
+      "event-game-teams-confirmed",
+      event.eventId,
+      gameDayId.value,
+      actorReference,
+      next.updatedAtMs,
+      { eventGame: game, correction: { gameSideId: gameSideId.value, reason: null } },
+      { eventGame: next, correction: { gameSideId: gameSideId.value, reason: null } },
+    ),
+  );
+  return accepted(next);
+}
+
 export type EventCatalogMutationOperations = {
   previewEventCatalogRemoval(
     target: EventCatalogRemovalTargetInput,
@@ -325,6 +418,12 @@ export type EventCatalogMutationOperations = {
     eventGameId: unknown,
     input: { targetPitchSlotId: unknown; mode?: unknown },
   ): CatalogOutcome<PitchReassignmentResult>;
+  correctEventGameIdentity(
+    eventId: unknown,
+    gameDayId: unknown,
+    eventGameId: unknown,
+    input: EventGameIdentityCorrectionInput,
+  ): CatalogOutcome<EventGameIdentityCorrection>;
 };
 
 export type ScheduleDelayChange = {
@@ -355,6 +454,27 @@ export type PitchReassignmentResult = {
   swappedEventGame: EventGame | null;
   scheduleConflict: boolean;
   teamScheduleConflicts: readonly string[];
+};
+
+export type EventGameIdentityCorrectionInput = {
+  gameSideId: unknown;
+  eventTeamId: unknown;
+  operationId?: unknown;
+  confirmation?: unknown;
+  reason?: unknown;
+};
+
+export type EventGameIdentityCorrection = {
+  operationId: string;
+  eventGameId: string;
+  gameSideId: string;
+  previousEventTeamId: string;
+  previousEventTeamName: string;
+  eventTeamId: string;
+  eventTeamName: string;
+  commenced: boolean;
+  reason: string | null;
+  controllerAcknowledgementRequired: boolean;
 };
 
 export type EventCatalogStorageSnapshot = {
@@ -551,6 +671,13 @@ export type EventCatalog = {
     input: { targetPitchSlotId: unknown; mode?: unknown },
     authority: TechnicalAdminAuthority,
   ): Promise<CatalogOutcome<PitchReassignmentResult>>;
+  correctEventGameIdentity(
+    eventId: unknown,
+    gameDayId: unknown,
+    eventGameId: unknown,
+    input: EventGameIdentityCorrectionInput,
+    authority: TechnicalAdminAuthority,
+  ): Promise<CatalogOutcome<EventGameIdentityCorrection>>;
   lookupAudienceRoster(
     eventId: unknown,
     eventTeamId: unknown,
@@ -1059,6 +1186,22 @@ export function createEventCatalog(
       );
     },
 
+    async correctEventGameIdentity(eventId, gameDayId, eventGameId, input, authority) {
+      if (!isTechnicalAdminAuthority(authority)) return unauthorized();
+      return commit(storage, (transaction) =>
+        correctEventGameIdentityOperation(
+          transaction,
+          clock,
+          ids,
+          eventId,
+          gameDayId,
+          eventGameId,
+          input,
+          authorityActor(authority),
+        ),
+      );
+    },
+
     async lookupAudienceRoster(eventIdInput, eventTeamIdInput, playerNumberInput) {
       const eventId = validateId(eventIdInput, "eventId");
       const eventTeamId = validateId(eventTeamIdInput, "eventTeamId");
@@ -1244,10 +1387,11 @@ function createAudit(
   occurredAtMs: number,
   before: unknown,
   after: unknown,
+  operationId?: string,
 ): EventAdministrationAuditEntry {
   return {
     auditId: ids.next("audit"),
-    operationId: ids.next("operation"),
+    operationId: operationId ?? ids.next("operation"),
     action,
     eventId,
     gameDayId,
@@ -1506,6 +1650,17 @@ function createMutationOperations(
       ),
     reassignEventGame: (eventId, gameDayId, eventGameId, input) =>
       reassignEventGameOperation(
+        transaction,
+        clock,
+        ids,
+        eventId,
+        gameDayId,
+        eventGameId,
+        input,
+        actorReference,
+      ),
+    correctEventGameIdentity: (eventId, gameDayId, eventGameId, input) =>
+      correctEventGameIdentityOperation(
         transaction,
         clock,
         ids,
@@ -2660,6 +2815,164 @@ function previewPitchSlotExpectedDelayOperation(
   return accepted(
     createDelayPreview(transaction, "pitch-slot", slot.pitchSlotId, slots, delay.value, cascade),
   );
+}
+
+function correctEventGameIdentityOperation(
+  transaction: EventCatalogStorageTransaction,
+  clock: EventCatalogClock,
+  ids: EventCatalogIds,
+  eventIdInput: unknown,
+  gameDayIdInput: unknown,
+  eventGameIdInput: unknown,
+  input: EventGameIdentityCorrectionInput,
+  actorReference: string,
+): CatalogOutcome<EventGameIdentityCorrection> {
+  const eventId = validateId(eventIdInput, "eventId");
+  const gameDayId = validateId(gameDayIdInput, "gameDayId");
+  const eventGameId = validateId(eventGameIdInput, "eventGameId");
+  const gameSideId = validateId(input.gameSideId, "gameSideId");
+  const targetEventTeamId = validateId(input.eventTeamId, "eventTeamId");
+  const operationId =
+    input.operationId === undefined
+      ? { ok: true as const, value: ids.next("operation") }
+      : validateId(input.operationId, "operationId");
+  if (
+    !eventId.ok ||
+    !gameDayId.ok ||
+    !eventGameId.ok ||
+    !gameSideId.ok ||
+    !targetEventTeamId.ok ||
+    !operationId.ok
+  )
+    return invalid("Event Game identity correction identifier is invalid.");
+  if (input.confirmation !== undefined && typeof input.confirmation !== "boolean")
+    return invalid("Event Game identity correction confirmation must be a boolean.");
+  const reasonResult =
+    input.reason === undefined || input.reason === null
+      ? { ok: true as const, value: null }
+      : normalizeBoundedText(
+          input.reason,
+          SHARED_LIMITS.names.operatorNoteMaxCodePoints,
+          "Event Game identity correction reason",
+        );
+  if (!reasonResult.ok) return invalid(reasonResult.error);
+  const reason = reasonResult.value;
+  if (reason !== null && reason.length === 0)
+    return invalid("Event Game identity correction reason must not be empty.");
+  const nowMs = validNow(clock);
+  if (nowMs === null) return invalid("Event clock returned an invalid timestamp.");
+  const event = transaction.findEvent(eventId.value);
+  const game = transaction.findEventGame(eventGameId.value);
+  if (event === null || game === null) return notFound("Event Game was not found.");
+  const priorRoot = transaction.findRootByEventGameId(game.eventGameId);
+  const commenced =
+    priorRoot?.lifecycle.commencedAtMs !== null && priorRoot?.lifecycle.commencedAtMs !== undefined;
+  const previousAttempt = transaction
+    .listAuditTrail(event.eventId)
+    .find(
+      (entry) =>
+        entry.operationId === operationId.value && entry.action === "event-game-teams-confirmed",
+    );
+  if (previousAttempt !== undefined) {
+    const before = isRecord(previousAttempt.before) ? previousAttempt.before : null;
+    const beforeGame = before !== null && isRecord(before.eventGame) ? before.eventGame : null;
+    const beforeSideCandidate = beforeGame?.[sideKey(game, gameSideId.value)];
+    const beforeSide = isRecord(beforeSideCandidate) ? beforeSideCandidate : null;
+    const after = isRecord(previousAttempt.after) ? previousAttempt.after : null;
+    const afterGame = after !== null && isRecord(after.eventGame) ? after.eventGame : null;
+    const afterSideCandidate = afterGame?.[sideKey(game, gameSideId.value)];
+    const afterSide = isRecord(afterSideCandidate) ? afterSideCandidate : null;
+    const originalCorrection =
+      after !== null && isRecord(after.correction) ? after.correction : null;
+    if (afterSide !== null && afterSide.eventTeamId === targetEventTeamId.value) {
+      return accepted({
+        operationId: operationId.value,
+        eventGameId: game.eventGameId,
+        gameSideId: gameSideId.value,
+        previousEventTeamId:
+          typeof beforeSide?.eventTeamId === "string" ? beforeSide.eventTeamId : "",
+        previousEventTeamName:
+          typeof beforeSide?.eventTeamName === "string" ? beforeSide.eventTeamName : "",
+        eventTeamId: afterSide.eventTeamId,
+        eventTeamName: typeof afterSide.eventTeamName === "string" ? afterSide.eventTeamName : "",
+        commenced,
+        reason: typeof originalCorrection?.reason === "string" ? originalCorrection.reason : null,
+        controllerAcknowledgementRequired: commenced,
+      });
+    }
+    return {
+      status: "rejected",
+      reason: "duplicate",
+      detail: "The identity correction operation is already bound to another Event Team.",
+    };
+  }
+  if (game.eventId !== event.eventId || game.gameDayId !== gameDayId.value)
+    return crossEvent("Event Game does not belong to the selected Event and Game Day.");
+  const side =
+    game.sideA.sideId === gameSideId.value
+      ? "sideA"
+      : game.sideB.sideId === gameSideId.value
+        ? "sideB"
+        : null;
+  if (side === null)
+    return invalid("Event Game identity correction references an unknown Game Side.");
+  const target = transaction.findEventTeam(targetEventTeamId.value);
+  if (target === null) return notFound("Event Team was not found.");
+  if (target.eventId !== event.eventId) return crossEvent("Event Team belongs to another Event.");
+  const otherSide = side === "sideA" ? game.sideB : game.sideA;
+  if (otherSide.eventTeamId === target.eventTeamId)
+    return invalid("Event Game sides must use distinct Event Teams.");
+  if (commenced && input.confirmation !== true)
+    return invalid("Post-commencement Event Game identity correction requires confirmation.");
+  if (commenced && reason === null)
+    return invalid("Post-commencement Event Game identity correction requires a reason.");
+  const previous = side === "sideA" ? game.sideA : game.sideB;
+  if (previous.eventTeamId === null || previous.eventTeamName === null)
+    return invalid("Only an assigned Event Team identity can be corrected.");
+  if (previous.eventTeamId === target.eventTeamId)
+    return noChange("Event Game identity is unchanged.");
+  const nextSide = {
+    ...previous,
+    eventTeamId: target.eventTeamId,
+    eventTeamName: target.name,
+    sourceLabel: null,
+    confirmedAtMs: nowMs,
+  };
+  const next: EventGame = {
+    ...game,
+    ...(side === "sideA" ? { sideA: nextSide } : { sideB: nextSide }),
+    updatedAtMs: nowMs,
+  };
+  transaction.updateEventGame(next);
+  transaction.appendAudit(
+    createAudit(
+      ids,
+      "event-game-teams-confirmed",
+      event.eventId,
+      gameDayId.value,
+      actorReference,
+      nowMs,
+      { eventGame: game, correction: { gameSideId: gameSideId.value, reason } },
+      { eventGame: next, correction: { gameSideId: gameSideId.value, reason } },
+      operationId.value,
+    ),
+  );
+  return accepted({
+    operationId: operationId.value,
+    eventGameId: game.eventGameId,
+    gameSideId: gameSideId.value,
+    previousEventTeamId: previous.eventTeamId ?? "",
+    previousEventTeamName: previous.eventTeamName ?? "",
+    eventTeamId: target.eventTeamId,
+    eventTeamName: target.name,
+    commenced,
+    reason,
+    controllerAcknowledgementRequired: commenced,
+  });
+}
+
+function sideKey(game: EventGame, gameSideId: string): "sideA" | "sideB" {
+  return game.sideA.sideId === gameSideId ? "sideA" : "sideB";
 }
 
 function reassignEventGameOperation(

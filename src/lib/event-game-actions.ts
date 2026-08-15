@@ -131,6 +131,7 @@ export type TeamAssignmentCorrectionInterpretation = {
   gameSideId: string;
   eventTeamId: string;
   teamInterpretationRef: string;
+  eventTeamName?: string;
 };
 
 export type NonFactInterpretation = {
@@ -254,6 +255,7 @@ export type EffectiveGameSideAssignment = {
   gameSideId: string;
   eventTeamId: string;
   teamInterpretationRef: string;
+  eventTeamName?: string;
 };
 
 export type ControlActionConflict = {
@@ -687,7 +689,7 @@ export function rebuildControlActionHistory(
   }
 
   const effectiveByFactId = new Map([...factsById.keys()].map((factId) => [factId, true]));
-  const effectiveTeamAssignments = new Map(
+  const effectiveTeamAssignments = new Map<string, EffectiveGameSideAssignment>(
     root.gameSides.map((side) => [
       side.id,
       {
@@ -716,7 +718,7 @@ export function rebuildControlActionHistory(
   }
   for (const action of ordered.actions) {
     if (action.interpretation.type !== "team-assignment-correction") continue;
-    const { gameSideId, eventTeamId, teamInterpretationRef } = action.interpretation;
+    const { gameSideId, eventTeamId, teamInterpretationRef, eventTeamName } = action.interpretation;
     const current = effectiveTeamAssignments.get(gameSideId);
     if (current === undefined) {
       return {
@@ -745,6 +747,7 @@ export function rebuildControlActionHistory(
       ...current,
       eventTeamId,
       teamInterpretationRef,
+      eventTeamName,
     });
   }
 

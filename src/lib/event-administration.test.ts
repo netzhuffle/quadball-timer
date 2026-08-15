@@ -2,7 +2,16 @@ import { describe, expect, test } from "bun:test";
 import { createAudienceProjection } from "@/lib/audience-projection";
 import { createEventAdministration } from "@/lib/event-administration";
 import { createEventCatalog, createFoundationEventCatalogStorage } from "@/lib/event-catalog";
-import type { FoundationStorage } from "@/lib/foundation-storage";
+import {
+  createEventGameRecord,
+  createEventGameRecordTransactionSeam,
+} from "@/lib/event-game-record";
+import { createLiveEventGameIqaInterpreter } from "@/lib/live-event-game-control";
+import {
+  canonicalizeEventGameRecordRoot,
+  type EventGameRecordRoot,
+} from "@/lib/foundation-record-types";
+import type { FoundationStorage, FoundationStorageSnapshot } from "@/lib/foundation-storage";
 import { createInMemoryFoundationStorage } from "@/lib/foundation-storage-memory";
 import { createGrantAuthority, createGrantAuthorityVerifier } from "@/lib/grant-authority";
 import type { GrantKeyRing } from "@/lib/grant-types";
@@ -2392,6 +2401,411 @@ describe("Event Administration handoff", () => {
       browserContext: "right-type",
     });
     expect(accepted).toMatchObject({ status: "admitted", grantType: "event-admin" });
+  });
+
+  test("composes identity retry, current winner, and transaction rollback through Event Admin", async () => {
+    const fixture = createFixture();
+    const event = await fixture.catalog.createEvent(
+      { name: "Composed identity", timeZone: "UTC" },
+      fixture.technical,
+    );
+    if (event.status !== "accepted") throw new Error("Expected Event.");
+    const day = await fixture.catalog.addGameDay(
+      event.value.eventId,
+      { date: "2026-08-14" },
+      fixture.technical,
+    );
+    const home = await fixture.catalog.createEventTeam(
+      event.value.eventId,
+      { name: "Home" },
+      fixture.technical,
+    );
+    const replacement = await fixture.catalog.createEventTeam(
+      event.value.eventId,
+      { name: "Replacement" },
+      fixture.technical,
+    );
+    const later = await fixture.catalog.createEventTeam(
+      event.value.eventId,
+      { name: "Later" },
+      fixture.technical,
+    );
+    const other = await fixture.catalog.createEventTeam(
+      event.value.eventId,
+      { name: "Other" },
+      fixture.technical,
+    );
+    const pitch = await fixture.catalog.createPitch(
+      event.value.eventId,
+      { name: "Composed Pitch" },
+      fixture.technical,
+    );
+    if (
+      day.status !== "accepted" ||
+      home.status !== "accepted" ||
+      replacement.status !== "accepted" ||
+      later.status !== "accepted" ||
+      other.status !== "accepted" ||
+      pitch.status !== "accepted"
+    )
+      throw new Error("Expected catalog structure.");
+    const slot = await fixture.catalog.createGameplaySlot(
+      event.value.eventId,
+      day.value.gameDayId,
+      { sequence: 1, scheduledStart: "2026-08-14T10:00" },
+      fixture.technical,
+    );
+    if (slot.status !== "accepted") throw new Error("Expected Gameplay Slot.");
+    const pitchSlot = (
+      await fixture.storage.transaction((transaction) =>
+        transaction.listPitchSlots(day.value.gameDayId, pitch.value.pitchId),
+      )
+    )[0];
+    if (pitchSlot === undefined) throw new Error("Expected Pitch Slot.");
+    const game = await fixture.catalog.createEventGame(
+      event.value.eventId,
+      day.value.gameDayId,
+      {
+        gameplaySlotId: slot.value.gameplaySlotId,
+        pitchSlotId: pitchSlot.pitchSlotId,
+        sideA: { sourceLabel: "Home" },
+        sideB: { sourceLabel: "Other" },
+      },
+      fixture.technical,
+    );
+    if (game.status !== "accepted") throw new Error("Expected Event Game.");
+    const confirmed = await fixture.catalog.confirmGameplaySlotTeams(
+      event.value.eventId,
+      day.value.gameDayId,
+      slot.value.gameplaySlotId,
+      {
+        games: [
+          {
+            eventGameId: game.value.eventGameId,
+            sideAEventTeamId: home.value.eventTeamId,
+            sideBEventTeamId: other.value.eventTeamId,
+          },
+        ],
+      },
+      fixture.technical,
+    );
+    if (confirmed.status !== "accepted") throw new Error("Expected confirmed Game.");
+    const assigned = confirmed.value[0];
+    if (assigned === undefined) throw new Error("Expected assigned Game.");
+    const root: EventGameRecordRoot = {
+      recordId: `record-${game.value.eventGameId}`,
+      eventId: event.value.eventId,
+      eventGameId: game.value.eventGameId,
+      ownership: { eventId: event.value.eventId, eventGameId: game.value.eventGameId },
+      externalScope: {
+        eventId: event.value.eventId,
+        gameDayId: day.value.gameDayId,
+        pitchId: pitch.value.pitchId,
+        pitchSlotId: pitchSlot.pitchSlotId,
+      },
+      gameSides: [
+        {
+          id: assigned.sideA.sideId,
+          eventTeamId: home.value.eventTeamId,
+          teamInterpretationRef: `event-team:${home.value.eventTeamId}`,
+        },
+        {
+          id: assigned.sideB.sideId,
+          eventTeamId: other.value.eventTeamId,
+          teamInterpretationRef: `event-team:${other.value.eventTeamId}`,
+        },
+      ],
+      lifecycle: {
+        phase: "scheduled",
+        commencedAtMs: null,
+        finishedAtMs: null,
+        lockedAtMs: null,
+        lockReason: null,
+      },
+      compatibility: {
+        recordVersion: "record-v1",
+        schemaVersion: "schema-v1",
+        interpreterVersion: "live-event-iqa-v1",
+      },
+      creationEvidence: {
+        operationId: "record-registration",
+        actorReference: "technical-admin",
+        source: "event-game-registration",
+        createdAtMs: Date.parse("2026-08-14T12:00:00Z"),
+      },
+    };
+    const externalScopeResolver = {
+      resolve(scope: EventGameRecordRoot["externalScope"], snapshot: FoundationStorageSnapshot) {
+        const pitchSlot = snapshot.findPitchSlot?.(scope.pitchSlotId);
+        return pitchSlot === null || pitchSlot === undefined
+          ? { status: "mismatch" as const, detail: "scope mismatch" }
+          : pitchSlot.eventId === scope.eventId &&
+              pitchSlot.gameDayId === scope.gameDayId &&
+              pitchSlot.pitchId === scope.pitchId
+            ? { status: "resolved" as const, scope: structuredClone(scope) }
+            : { status: "mismatch" as const, detail: "scope mismatch" };
+      },
+      resolveEventTeam(eventId: string, eventTeamId: string, snapshot: FoundationStorageSnapshot) {
+        const team = snapshot.findEventTeam(eventTeamId);
+        return team === null || team.eventId !== eventId
+          ? { status: "missing" as const, detail: "Event Team is unavailable." }
+          : { status: "resolved" as const };
+      },
+    };
+    const record = createEventGameRecord(fixture.storage, {
+      externalScopeResolver,
+      interpreter: createLiveEventGameIqaInterpreter(),
+      clock: () => Date.parse("2026-08-14T12:00:00Z"),
+    });
+    expect(await record.registerRoot(root)).toMatchObject({ status: "registered" });
+    const administration = createEventAdministration({
+      storage: fixture.storage,
+      grants: fixture.grants,
+      nowMs: () => Date.parse("2026-08-14T12:00:00Z"),
+      eventGameRecordTransaction: (transaction) =>
+        createEventGameRecordTransactionSeam(transaction, {
+          externalScopeResolver,
+          interpreter: createLiveEventGameIqaInterpreter(),
+          clock: () => Date.parse("2026-08-14T12:00:00Z"),
+        }),
+    });
+    const grant = await administration.createEventAdminGrant(
+      event.value.eventId,
+      fixture.technical,
+    );
+    if (grant.status !== "accepted") throw new Error("Expected Event Admin Grant.");
+    const revealed = await fixture.grants.revealGrant(grant.value.grantId, fixture.technical);
+    if (revealed.status !== "revealed") throw new Error("Expected Event Admin QR.");
+    const admission = await administration.admitEventAdmin({
+      qrCredential: revealed.qrCredential,
+      browserContext: "composed-identity-admin",
+    });
+    if (admission.status !== "admitted") throw new Error("Expected Event Admin session.");
+    const eventAdmin = { kind: "grant-session" as const, sessionBearer: admission.sessionBearer };
+    const identityInput = {
+      gameSideId: assigned.sideA.sideId,
+      eventTeamId: replacement.value.eventTeamId,
+      operationId: "composed-auth-check",
+    };
+    expect(
+      await administration.correctEventGameIdentity(
+        "wrong-event",
+        day.value.gameDayId,
+        game.value.eventGameId,
+        identityInput,
+        eventAdmin,
+      ),
+    ).toMatchObject({ status: "rejected", reason: "unauthorized" });
+    expect(
+      await administration.correctEventGameIdentity(
+        event.value.eventId,
+        "wrong-day",
+        game.value.eventGameId,
+        identityInput,
+        eventAdmin,
+      ),
+    ).toMatchObject({ status: "rejected" });
+    expect(
+      await administration.correctEventGameIdentity(
+        event.value.eventId,
+        day.value.gameDayId,
+        game.value.eventGameId,
+        identityInput,
+        { kind: "grant-session", sessionBearer: "wrong-session" },
+      ),
+    ).toMatchObject({ status: "rejected", reason: "unauthorized" });
+    expect(
+      await administration.changePublicationStatus(
+        event.value.eventId,
+        { status: "published" },
+        eventAdmin,
+      ),
+    ).toMatchObject({ status: "accepted" });
+
+    const first = await administration.correctEventGameIdentity(
+      event.value.eventId,
+      day.value.gameDayId,
+      game.value.eventGameId,
+      {
+        gameSideId: assigned.sideA.sideId,
+        eventTeamId: replacement.value.eventTeamId,
+        operationId: "composed-op-a",
+      },
+      fixture.technical,
+    );
+    expect(first).toMatchObject({
+      status: "accepted",
+      value: {
+        operationId: "composed-op-a",
+        eventTeamId: replacement.value.eventTeamId,
+        eventTeamName: "Replacement",
+      },
+    });
+    const second = await administration.correctEventGameIdentity(
+      event.value.eventId,
+      day.value.gameDayId,
+      game.value.eventGameId,
+      {
+        gameSideId: assigned.sideA.sideId,
+        eventTeamId: later.value.eventTeamId,
+        operationId: "composed-op-b",
+      },
+      eventAdmin,
+    );
+    expect(second).toMatchObject({
+      status: "accepted",
+      value: { eventTeamId: later.value.eventTeamId },
+    });
+    const beforeRetry = await fixture.storage.transaction((transaction) => ({
+      actions: transaction.listActions(root.recordId),
+      recordAudit: transaction.listAuditEntries(root.recordId),
+      eventAudit: transaction.listEventAuditTrail(event.value.eventId),
+    }));
+    const retry = await administration.correctEventGameIdentity(
+      event.value.eventId,
+      day.value.gameDayId,
+      game.value.eventGameId,
+      {
+        gameSideId: assigned.sideA.sideId,
+        eventTeamId: replacement.value.eventTeamId,
+        operationId: "composed-op-a",
+      },
+      fixture.technical,
+    );
+    expect(retry).toMatchObject({
+      status: "accepted",
+      value: {
+        operationId: "composed-op-a",
+        eventTeamId: replacement.value.eventTeamId,
+        eventTeamName: "Replacement",
+      },
+    });
+    const afterRetry = await fixture.storage.transaction((transaction) => ({
+      actions: transaction.listActions(root.recordId),
+      recordAudit: transaction.listAuditEntries(root.recordId),
+      eventAudit: transaction.listEventAuditTrail(event.value.eventId),
+    }));
+    expect(afterRetry).toEqual(beforeRetry);
+    expect(
+      await fixture.catalog.inspectEvent(event.value.eventId, fixture.technical),
+    ).toMatchObject({
+      value: {
+        eventGames: [{ sideA: { eventTeamId: later.value.eventTeamId, eventTeamName: "Later" } }],
+      },
+    });
+
+    await fixture.storage.transaction((transaction) => {
+      const storedRoot = transaction.findRootByEventGameId(game.value.eventGameId);
+      if (storedRoot === null) throw new Error("Expected stored root.");
+      const nextRoot: EventGameRecordRoot = structuredClone(storedRoot);
+      nextRoot.lifecycle = {
+        ...nextRoot.lifecycle,
+        phase: "in-progress",
+        commencedAtMs: 1,
+      };
+      transaction.updateRoot({
+        root: nextRoot,
+        canonicalContent: canonicalizeEventGameRecordRoot(nextRoot),
+      });
+    });
+    expect(
+      await administration.correctEventGameIdentity(
+        event.value.eventId,
+        day.value.gameDayId,
+        game.value.eventGameId,
+        {
+          gameSideId: assigned.sideA.sideId,
+          eventTeamId: later.value.eventTeamId,
+          operationId: "composed-post-no-confirmation",
+        },
+        eventAdmin,
+      ),
+    ).toMatchObject({ status: "rejected" });
+    expect(
+      await administration.correctEventGameIdentity(
+        event.value.eventId,
+        day.value.gameDayId,
+        game.value.eventGameId,
+        {
+          gameSideId: assigned.sideA.sideId,
+          eventTeamId: replacement.value.eventTeamId,
+          operationId: "composed-post-no-reason",
+          confirmation: true,
+        },
+        eventAdmin,
+      ),
+    ).toMatchObject({ status: "rejected" });
+    expect(
+      await administration.correctEventGameIdentity(
+        event.value.eventId,
+        day.value.gameDayId,
+        game.value.eventGameId,
+        {
+          gameSideId: assigned.sideA.sideId,
+          eventTeamId: replacement.value.eventTeamId,
+          operationId: "composed-post-accepted",
+          confirmation: true,
+          reason: "Corrected after commencement",
+        },
+        eventAdmin,
+      ),
+    ).toMatchObject({
+      status: "accepted",
+      value: {
+        eventTeamId: replacement.value.eventTeamId,
+        eventTeamName: "Replacement",
+        commenced: true,
+        controllerAcknowledgementRequired: true,
+      },
+    });
+    const beforeFailure = await fixture.storage.transaction((transaction) => ({
+      actions: transaction.listActions(root.recordId),
+      recordAudit: transaction.listAuditEntries(root.recordId),
+      eventAudit: transaction.listEventAuditTrail(event.value.eventId),
+    }));
+    const audience = createAudienceProjection(
+      createFoundationEventCatalogStorage(fixture.storage),
+      { now: () => Date.parse("2026-08-14T12:00:00Z") },
+    );
+    const publicBeforeFailure = await audience.read(event.value.eventId);
+    const failing = createEventAdministration({
+      storage: fixture.storage,
+      grants: fixture.grants,
+      nowMs: () => Date.parse("2026-08-14T12:00:00Z"),
+      eventGameRecordTransaction: () => {
+        throw new Error("injected Record failure");
+      },
+    });
+    expect(
+      await failing.correctEventGameIdentity(
+        event.value.eventId,
+        day.value.gameDayId,
+        game.value.eventGameId,
+        {
+          gameSideId: assigned.sideA.sideId,
+          eventTeamId: later.value.eventTeamId,
+          operationId: "composed-op-failure",
+          confirmation: true,
+          reason: "Injected failure rollback",
+        },
+        eventAdmin,
+      ),
+    ).toMatchObject({ status: "retryable-failure" });
+    expect(
+      await fixture.storage.transaction((transaction) => transaction.listActions(root.recordId)),
+    ).toEqual(beforeFailure.actions);
+    expect(
+      await fixture.storage.transaction((transaction) =>
+        transaction.listAuditEntries(root.recordId),
+      ),
+    ).toEqual(beforeFailure.recordAudit);
+    expect(
+      await fixture.storage.transaction((transaction) =>
+        transaction.listEventAuditTrail(event.value.eventId),
+      ),
+    ).toEqual(beforeFailure.eventAudit);
+    const publicAfterFailure = await audience.read(event.value.eventId);
+    expect(publicAfterFailure).toEqual(publicBeforeFailure);
   });
 });
 

@@ -17,10 +17,12 @@ import { createLiveEventGameControlTransport } from "@/lib/live-event-game-trans
 import {
   openLiveEventGameRuntime,
   createControlScopeResolver,
+  createExternalScopeResolver,
   readLiveEventDodgeballIdsByEventGame,
   readLiveEventGrantKeyRing,
   type LiveEventGameRuntime,
 } from "@/lib/live-event-game-runtime";
+import { createEventGameRecordTransactionSeam } from "@/lib/event-game-record";
 import {
   clearTechnicalAdminCookie,
   clearTechnicalAdminCsrfCookie,
@@ -349,6 +351,11 @@ async function startServer() {
           grants: grantAuthority,
           controlScopeResolver: grantOptions.controlScopeResolver,
           environmentId: environment,
+          eventGameRecordTransaction: (transaction) =>
+            createEventGameRecordTransactionSeam(transaction, {
+              externalScopeResolver: createExternalScopeResolver(),
+              interpreter: createLiveEventGameIqaInterpreter(),
+            }),
         });
         administrativeAuditProjection = createAdministrativeAuditProjection({
           storage: foundationStorage,
@@ -2012,6 +2019,54 @@ async function startServer() {
             );
           },
         },
+        "/api/event-admin/events/:eventId/game-days/:gameDayId/event-games/:eventGameId/identity": {
+          async POST(req: Request) {
+            if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
+            const authority = resolveEventAdministrationAuthority(req, technicalAdminAuth);
+            const body = await readJsonRecord(req);
+            const path = new URL(req.url).pathname.split("/");
+            if (authority === null || body === null) return sensitiveGenericAuthFailure(401);
+            return sensitiveEventAdministrationMutationResponse(
+              await eventAdministration.correctEventGameIdentity(
+                readEventAdminIdentityRoute(path).eventId,
+                readEventAdminIdentityRoute(path).gameDayId,
+                readEventAdminIdentityRoute(path).eventGameId,
+                {
+                  gameSideId: body.gameSideId,
+                  eventTeamId: body.eventTeamId,
+                  operationId: body.operationId,
+                  confirmation: body.confirmation,
+                  reason: body.reason,
+                },
+                authority,
+              ),
+              authority,
+            );
+          },
+        },
+        "/api/event-admin/events/:eventId/event-games/:eventGameId/presentation": {
+          async POST(req: Request) {
+            if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
+            const authority = resolveEventAdministrationAuthority(req, technicalAdminAuth);
+            const body = await readJsonRecord(req);
+            const path = new URL(req.url).pathname.split("/");
+            if (authority === null || body === null) return sensitiveGenericAuthFailure(401);
+            return sensitiveEventAdministrationMutationResponse(
+              await eventAdministration.changeEventGamePresentation(
+                readEventAdminPresentationRoute(path).eventId,
+                readEventAdminPresentationRoute(path).eventGameId,
+                {
+                  operationId: body.operationId,
+                  presentationChangeId: body.presentationChangeId,
+                  causalPredecessorIds: body.causalPredecessorIds,
+                  change: body.change,
+                },
+                authority,
+              ),
+              authority,
+            );
+          },
+        },
         "/api/event-admin/slot-setup": {
           async GET(req: Request) {
             if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
@@ -3187,6 +3242,25 @@ export function calculateAdHocUpgradeCapacity(
   input: ControllerCapacityInput & { maxConnectedSockets: number },
 ): number {
   return availableNonControllerCapacity(input, input.maxConnectedSockets);
+}
+
+export function readEventAdminPresentationRoute(path: readonly string[]): {
+  eventId: string;
+  eventGameId: string;
+} {
+  return { eventId: path.at(-4) ?? "", eventGameId: path.at(-2) ?? "" };
+}
+
+export function readEventAdminIdentityRoute(path: readonly string[]): {
+  eventId: string;
+  gameDayId: string;
+  eventGameId: string;
+} {
+  return {
+    eventId: path.at(-6) ?? "",
+    gameDayId: path.at(-4) ?? "",
+    eventGameId: path.at(-2) ?? "",
+  };
 }
 
 function releasePendingSocketReservation(socketId: string) {

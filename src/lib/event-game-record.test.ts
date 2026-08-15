@@ -4,7 +4,11 @@ import {
   type EventGameRecordRoot,
 } from "@/lib/foundation-record-types";
 import { createDeterministicTestIqaInterpreter } from "@/lib/event-game-actions";
-import { createEventGameRecord, type ExternalScopeResolver } from "@/lib/event-game-record";
+import {
+  createEventGameRecord,
+  createEventGameRecordTransactionSeam,
+  type ExternalScopeResolver,
+} from "@/lib/event-game-record";
 import { createInMemoryFoundationStorage } from "@/lib/foundation-storage-memory";
 
 function createRoot(overrides: Partial<EventGameRecordRoot> = {}): EventGameRecordRoot {
@@ -128,6 +132,63 @@ describe("Event Game Record contract", () => {
     }
 
     expect(await storage.readRoot(root.recordId)).toBeNull();
+  });
+
+  test("uses the transaction-local Record seam for equal-time identity corrections", async () => {
+    const root = createRoot();
+    const storage = createInMemoryFoundationStorage();
+    const record = createEventGameRecord(storage, {
+      externalScopeResolver: createScopeResolver(root),
+      interpreter: createDeterministicTestIqaInterpreter("rules-v1"),
+      clock: () => 2_000,
+    });
+    expect(await record.registerRoot(root)).toMatchObject({ status: "registered" });
+
+    const outcomes = await storage.transaction((transaction) => {
+      const seam = createEventGameRecordTransactionSeam(transaction, {
+        externalScopeResolver: createScopeResolver(root),
+        interpreter: createDeterministicTestIqaInterpreter("rules-v1"),
+        clock: () => 2_000,
+      });
+      const base = {
+        recordId: root.recordId,
+        eventGameId: root.eventGameId,
+        gameSideId: "side-1",
+        teamInterpretationRef: "team-3-v1",
+        eventTeamName: "Correction-time Team Three",
+        trustedAtMs: 2_000,
+        grant: { sessionId: "event-admin", versionId: "event-admin" },
+      };
+      const first = seam.correctTeamAssignment({
+        ...base,
+        operationId: "identity-a",
+        eventTeamId: "team-3",
+      });
+      const second = seam.correctTeamAssignment({
+        ...base,
+        operationId: "identity-b",
+        eventTeamId: "team-4",
+        teamInterpretationRef: "team-4-v1",
+        eventTeamName: "Correction-time Team Four",
+      });
+      return { first, second };
+    });
+
+    expect(outcomes.first.status).toBe("accepted");
+    expect(outcomes.second.status).toBe("accepted");
+    const rebuilt = await record.rebuild();
+    expect(rebuilt).toMatchObject({
+      status: "ready",
+      effectiveTeamAssignments: [
+        {
+          gameSideId: "side-1",
+          eventTeamId: "team-4",
+          teamInterpretationRef: "team-4-v1",
+          eventTeamName: "Correction-time Team Four",
+        },
+        { gameSideId: "side-2", eventTeamId: "team-2" },
+      ],
+    });
   });
 });
 

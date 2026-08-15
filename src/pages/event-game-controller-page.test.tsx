@@ -287,6 +287,47 @@ describe("Event Game Controller reconnect browser seam", () => {
     expect(testWindow.document.activeElement?.getAttribute("aria-label")).toBe("Pause game clock");
   });
 
+  test("acknowledges only the current corrected Event Team identity before team actions", async () => {
+    replayMode = "success";
+    openProjection = {
+      ...projection(),
+      teamAssignmentCorrections: [
+        {
+          operationId: "identity-op-current",
+          gameSideId: "side-a",
+          eventTeamId: "team-corrected",
+          eventTeamName: "Correction-time Team",
+          teamInterpretationRef: "event-team:team-corrected",
+        },
+      ],
+    };
+    await enterAndOpen();
+
+    expect(container.textContent).toContain("Correction-time Team");
+    expect(container.textContent).toContain("Acknowledge the corrected identity");
+    expect(container.textContent).not.toContain("Old historical Team");
+    const acknowledge = Array.from(container.getElementsByTagName("button")).find((button) =>
+      button.textContent?.includes("Acknowledge identity"),
+    );
+    expect(acknowledge).not.toBeNull();
+    await act(async () => {
+      acknowledge?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const acknowledgement = replayBodies.flatMap((body) => body.actions ?? []).at(-1);
+    expect(acknowledgement?.intent).toMatchObject({
+      type: "acknowledge-team-assignment",
+      gameSideId: "side-a",
+      correctionOperationId: "identity-op-current",
+    });
+    expect(container.textContent).not.toContain("Acknowledge the corrected identity");
+    expect(container.querySelector('button[aria-label="Start game clock"]')).not.toBeNull();
+  });
+
   test("production Grant QR dialog closes on an outside pointer and returns focus", async () => {
     await enterAndOpen();
     const revealButton = container.querySelector<HTMLButtonElement>(

@@ -51,8 +51,18 @@ type HubResponse = {
         pitchSlotId: string;
         gameCode: string | null;
         gameDesignation: string | null;
-        sideA: { eventTeamId: string | null; sourceLabel: string | null };
-        sideB: { eventTeamId: string | null; sourceLabel: string | null };
+        sideA: {
+          sideId: string;
+          eventTeamId: string | null;
+          eventTeamName: string | null;
+          sourceLabel: string | null;
+        };
+        sideB: {
+          sideId: string;
+          eventTeamId: string | null;
+          eventTeamName: string | null;
+          sourceLabel: string | null;
+        };
         expectedStartMs: number;
         expectedPlayingPeriod: { startMs: number; endMs: number };
         scheduleConflict: boolean;
@@ -66,6 +76,12 @@ type HubResponse = {
 
 type TeamDraft = { name: string; defaultColor: string };
 type ConfirmationDraft = { sideA: string; sideB: string };
+type IdentityDraft = { eventTeamId: string; confirmation: boolean; reason: string };
+type PresentationDraft = {
+  pitchOrientation: "side-a-left" | "side-b-left";
+  sideAColor: string;
+  sideBColor: string;
+};
 type ScheduleResponse = {
   status: "accepted";
   value: {
@@ -281,6 +297,10 @@ export function EventAdminPage({
   const [confirmationDrafts, setConfirmationDrafts] = useState<Record<string, ConfirmationDraft>>(
     {},
   );
+  const [identityDrafts, setIdentityDrafts] = useState<Record<string, IdentityDraft>>({});
+  const [presentationDrafts, setPresentationDrafts] = useState<Record<string, PresentationDraft>>(
+    {},
+  );
   const [schedule, setSchedule] = useState<ScheduleResponse["value"] | null>(null);
   const [delayDrafts, setDelayDrafts] = useState<Record<string, string>>({});
   const [cascadeDrafts, setCascadeDrafts] = useState<Record<string, boolean>>({});
@@ -367,6 +387,8 @@ export function EventAdminPage({
     setTeamDrafts({});
     setPitchDrafts({});
     setConfirmationDrafts({});
+    setIdentityDrafts({});
+    setPresentationDrafts({});
     setSchedule(null);
     setDelayDrafts({});
     setCascadeDrafts({});
@@ -493,6 +515,45 @@ export function EventAdminPage({
               current[game.eventGameId] ?? {
                 sideA: game.sideA.eventTeamId ?? "",
                 sideB: game.sideB.eventTeamId ?? "",
+              },
+            ]),
+          ),
+        );
+        setIdentityDrafts((current) =>
+          Object.fromEntries(
+            payload.value.event.eventGames.flatMap((game) =>
+              [
+                [game.eventGameId, game.sideA],
+                [game.eventGameId, game.sideB],
+              ].map(([, value]) => {
+                const sideValue = value as typeof game.sideA;
+                const key = `${game.eventGameId}:${sideValue.sideId}`;
+                return [
+                  key,
+                  current[key] ?? {
+                    eventTeamId: sideValue.eventTeamId ?? "",
+                    confirmation: false,
+                    reason: "",
+                  },
+                ];
+              }),
+            ),
+          ),
+        );
+        setPresentationDrafts((current) =>
+          Object.fromEntries(
+            payload.value.event.eventGames.map((game) => [
+              game.eventGameId,
+              current[game.eventGameId] ?? {
+                pitchOrientation: "side-a-left",
+                sideAColor:
+                  payload.value.event.teams.find(
+                    (team) => team.eventTeamId === game.sideA.eventTeamId,
+                  )?.defaultColor ?? "#112233",
+                sideBColor:
+                  payload.value.event.teams.find(
+                    (team) => team.eventTeamId === game.sideB.eventTeamId,
+                  )?.defaultColor ?? "#445566",
               },
             ]),
           ),
@@ -1254,16 +1315,87 @@ export function EventAdminPage({
     await loadHub(selectedGameDayId);
   };
 
+  const correctEventGameIdentity = async (
+    game: HubResponse["value"]["event"]["eventGames"][number],
+    side: "sideA" | "sideB",
+    token: GrantSecretToken,
+  ) => {
+    if (selectedGameDayId === null) return;
+    if (!secretOwner.current(token)) return;
+    const sideValue = game[side];
+    const key = `${game.eventGameId}:${sideValue.sideId}`;
+    const draft = identityDrafts[key] ?? {
+      eventTeamId: sideValue.eventTeamId ?? "",
+      confirmation: false,
+      reason: "",
+    };
+    const response = await fetch(
+      `/api/event-admin/events/${eventId}/game-days/${selectedGameDayId}/event-games/${game.eventGameId}/identity`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          operationId: crypto.randomUUID(),
+          gameSideId: sideValue.sideId,
+          eventTeamId: draft.eventTeamId,
+          confirmation: draft.confirmation,
+          reason: draft.reason.trim() || undefined,
+        }),
+      },
+    );
+    if (!secretOwner.current(token)) return;
+    if (!response.ok) {
+      const detail = await responseError(response, "Event Team correction failed.");
+      if (secretOwner.current(token)) throw new Error(detail);
+      return;
+    }
+    await loadHub(selectedGameDayId, token);
+  };
+
+  const changeEventGamePresentation = async (
+    eventGameId: string,
+    change:
+      | { type: "pitch-orientation"; pitchOrientation: "side-a-left" | "side-b-left" }
+      | {
+          type: "displayed-team-color";
+          gameSideId: string;
+          color: string;
+        },
+    token: GrantSecretToken,
+  ) => {
+    if (!secretOwner.current(token)) return;
+    const response = await fetch(
+      `/api/event-admin/events/${eventId}/event-games/${eventGameId}/presentation`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          operationId: crypto.randomUUID(),
+          presentationChangeId: crypto.randomUUID(),
+          change,
+        }),
+      },
+    );
+    if (!secretOwner.current(token)) return;
+    if (!response.ok) {
+      const detail = await responseError(response, "Game Presentation Change failed.");
+      if (secretOwner.current(token)) throw new Error(detail);
+      return;
+    }
+    await loadHub(selectedGameDayId, token);
+  };
+
   useEffect(() => {
     if (eventId.length > 0) void loadHub().catch(() => undefined);
   }, []);
 
-  const run = async (action: () => Promise<void>) => {
+  const run = async (action: () => Promise<void>, ownerToken?: GrantSecretToken) => {
     setBusy(true);
     setMessage(null);
     try {
       await action();
     } catch (error) {
+      if (ownerToken !== undefined && !secretOwner.current(ownerToken)) return;
       setMessage(
         error instanceof EventPublicationValidationError
           ? error.message
@@ -1272,7 +1404,7 @@ export function EventAdminPage({
             : "Unable to authorize the Event Hub.",
       );
     } finally {
-      setBusy(false);
+      if (ownerToken === undefined || secretOwner.current(ownerToken)) setBusy(false);
     }
   };
 
@@ -1994,6 +2126,194 @@ export function EventAdminPage({
                                           </option>
                                         ))}
                                       </select>
+                                    </div>
+                                    <div className="mt-2 space-y-2 border-t pt-2">
+                                      {(["sideA", "sideB"] as const).map((side) => {
+                                        const sideValue = game[side];
+                                        const key = `${game.eventGameId}:${sideValue.sideId}`;
+                                        const identity = identityDrafts[key] ?? {
+                                          eventTeamId: sideValue.eventTeamId ?? "",
+                                          confirmation: false,
+                                          reason: "",
+                                        };
+                                        return (
+                                          <div
+                                            className="grid gap-1 sm:grid-cols-[auto_1fr_auto]"
+                                            key={sideValue.sideId}
+                                          >
+                                            <span className="text-xs text-muted-foreground">
+                                              {side === "sideA" ? "Side A" : "Side B"} ·{" "}
+                                              {sideValue.sideId}
+                                            </span>
+                                            <select
+                                              aria-label={`Correct ${game.eventGameId} ${side} Event Team`}
+                                              className="h-9 rounded-md border bg-background px-2 text-sm"
+                                              value={identity.eventTeamId}
+                                              onChange={(event) =>
+                                                setIdentityDrafts((current) => ({
+                                                  ...current,
+                                                  [key]: {
+                                                    ...identity,
+                                                    eventTeamId: event.target.value,
+                                                  },
+                                                }))
+                                              }
+                                            >
+                                              <option value="">Corrected Event Team</option>
+                                              {hub.event.teams.map((team) => (
+                                                <option
+                                                  key={team.eventTeamId}
+                                                  value={team.eventTeamId}
+                                                >
+                                                  {team.name}
+                                                </option>
+                                              ))}
+                                            </select>
+                                            <Button
+                                              variant="outline"
+                                              disabled={busy || identity.eventTeamId.length === 0}
+                                              onClick={() => {
+                                                const token = secretOwner.capture(secretScopeKey());
+                                                void run(
+                                                  () => correctEventGameIdentity(game, side, token),
+                                                  token,
+                                                );
+                                              }}
+                                            >
+                                              Correct identity
+                                            </Button>
+                                            <label className="flex items-center gap-2 text-xs sm:col-start-2">
+                                              <input
+                                                type="checkbox"
+                                                checked={identity.confirmation}
+                                                onChange={(event) =>
+                                                  setIdentityDrafts((current) => ({
+                                                    ...current,
+                                                    [key]: {
+                                                      ...identity,
+                                                      confirmation: event.target.checked,
+                                                    },
+                                                  }))
+                                                }
+                                              />
+                                              Confirm if Game has commenced
+                                            </label>
+                                            <Input
+                                              aria-label={`${game.eventGameId} ${side} correction reason`}
+                                              placeholder="Reason when commenced"
+                                              value={identity.reason}
+                                              onChange={(event) =>
+                                                setIdentityDrafts((current) => ({
+                                                  ...current,
+                                                  [key]: {
+                                                    ...identity,
+                                                    reason: event.target.value,
+                                                  },
+                                                }))
+                                              }
+                                            />
+                                          </div>
+                                        );
+                                      })}
+                                      {(() => {
+                                        const presentation = presentationDrafts[
+                                          game.eventGameId
+                                        ] ?? {
+                                          pitchOrientation: "side-a-left" as const,
+                                          sideAColor: "#112233",
+                                          sideBColor: "#445566",
+                                        };
+                                        return (
+                                          <div className="grid gap-2 border-t pt-2 text-xs sm:grid-cols-3">
+                                            <select
+                                              aria-label={`${game.eventGameId} pitch orientation`}
+                                              className="h-9 rounded-md border bg-background px-2 text-sm"
+                                              value={presentation.pitchOrientation}
+                                              onChange={(event) => {
+                                                const pitchOrientation = event.target
+                                                  .value as PresentationDraft["pitchOrientation"];
+                                                setPresentationDrafts((current) => ({
+                                                  ...current,
+                                                  [game.eventGameId]: {
+                                                    ...presentation,
+                                                    pitchOrientation,
+                                                  },
+                                                }));
+                                                const token = secretOwner.capture(secretScopeKey());
+                                                void run(
+                                                  () =>
+                                                    changeEventGamePresentation(
+                                                      game.eventGameId,
+                                                      {
+                                                        type: "pitch-orientation",
+                                                        pitchOrientation,
+                                                      },
+                                                      token,
+                                                    ),
+                                                  token,
+                                                );
+                                              }}
+                                            >
+                                              <option value="side-a-left">Side A left</option>
+                                              <option value="side-b-left">Side B left</option>
+                                            </select>
+                                            {(["sideA", "sideB"] as const).map((side) => {
+                                              const colorKey =
+                                                side === "sideA" ? "sideAColor" : "sideBColor";
+                                              const color = presentation[colorKey];
+                                              return (
+                                                <label
+                                                  className="flex items-center gap-2"
+                                                  key={side}
+                                                >
+                                                  {side === "sideA" ? "Side A" : "Side B"} color
+                                                  <input
+                                                    type="color"
+                                                    aria-label={`${game.eventGameId} ${side} displayed color`}
+                                                    value={color}
+                                                    onInput={(event) => {
+                                                      const nextColor = (
+                                                        event.target as HTMLInputElement
+                                                      ).value;
+                                                      setPresentationDrafts((current) => ({
+                                                        ...current,
+                                                        [game.eventGameId]: {
+                                                          ...presentation,
+                                                          [colorKey]: nextColor,
+                                                        },
+                                                      }));
+                                                    }}
+                                                  />
+                                                  <Button
+                                                    variant="outline"
+                                                    size="sm"
+                                                    disabled={busy}
+                                                    onClick={() => {
+                                                      const token =
+                                                        secretOwner.capture(secretScopeKey());
+                                                      void run(
+                                                        () =>
+                                                          changeEventGamePresentation(
+                                                            game.eventGameId,
+                                                            {
+                                                              type: "displayed-team-color",
+                                                              gameSideId: game[side].sideId,
+                                                              color,
+                                                            },
+                                                            token,
+                                                          ),
+                                                        token,
+                                                      );
+                                                    }}
+                                                  >
+                                                    Apply
+                                                  </Button>
+                                                </label>
+                                              );
+                                            })}
+                                          </div>
+                                        );
+                                      })()}
                                     </div>
                                   </div>
                                 );
