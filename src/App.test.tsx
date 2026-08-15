@@ -7,6 +7,7 @@ import { captureAdHocHandoffFromLocation } from "@/lib/ad-hoc-handoff";
 import { createInitialGameState, projectGameView } from "@/lib/game-engine";
 import { DEFAULT_AWAY_TEAM_COLOR, DEFAULT_HOME_TEAM_COLOR } from "@/lib/team-colors";
 import { createInitialClockBaseline, projectClockBaseline } from "@/lib/clock-authority";
+import type { PublicAudienceEventProjection } from "@/lib/audience-projection";
 
 class MockWebSocket {
   static CONNECTING = 0;
@@ -42,6 +43,14 @@ class MockWebSocket {
     this.sentMessages.push(data);
   }
 
+  receive(data: unknown) {
+    this.onmessage?.(
+      new MessageEvent("message", {
+        data: JSON.stringify(data),
+      }),
+    );
+  }
+
   close() {
     if (this.readyState === MockWebSocket.CLOSED) {
       return;
@@ -50,6 +59,27 @@ class MockWebSocket {
     this.readyState = MockWebSocket.CLOSED;
     this.onclose?.(new CloseEvent("close"));
   }
+}
+
+function publishedEventProjection(eventId: string, name: string): PublicAudienceEventProjection {
+  return {
+    eventId,
+    name,
+    timeZone: "UTC",
+    publicationStatus: "published",
+    gameDays: ["2026-08-14"],
+    lifecycle: "current",
+    canonicalPath: `/events/${eventId}`,
+    teams: [],
+    pitches: [],
+    schedule: {
+      asOfMs: 0,
+      runningGames: [],
+      upcomingGames: [],
+      scheduleGames: [],
+      focusIndex: null,
+    },
+  };
 }
 
 describe("App", () => {
@@ -1267,5 +1297,120 @@ describe("App", () => {
     });
     expect(testWindow.location.pathname).toBe("/events");
     expect(testWindow.location.search).toBe("?view=all");
+  });
+
+  test("converges a Published Event page from HTTP to a committed Audience Projection update", async () => {
+    testWindow.history.replaceState(null, "", "/events/streamed-event");
+    const projection = publishedEventProjection("streamed-event", "Streamed Event");
+    projection.teamAssignmentNotice = "event-team-assignment-corrected";
+    (globalThis.fetch as typeof fetch) = (async () =>
+      new Response(JSON.stringify({ status: "accepted", value: projection }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      })) as unknown as typeof fetch;
+
+    await act(async () => {
+      root.render(<App />);
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const socket = MockWebSocket.instances.at(-1);
+    expect(socket).not.toBeUndefined();
+    expect(socket?.sentMessages).toContain(
+      JSON.stringify({ type: "subscribe-public-event", eventId: "streamed-event" }),
+    );
+    expect(container.textContent).toContain("Streamed Event");
+    expect(container.textContent).toContain(
+      "An Event Team assignment was corrected. Current team identities are shown.",
+    );
+
+    await act(async () => {
+      socket?.receive({
+        protocol: "public-event-stream-v1",
+        type: "projection-replaced",
+        eventId: "streamed-event",
+        version: 2,
+        projection: { ...projection, name: "Updated Streamed Event" },
+      });
+      await Promise.resolve();
+    });
+
+    expect(container.textContent).toContain("Updated Streamed Event");
+  });
+
+  test("refetches the authoritative projection before reconnecting after a dropped WebSocket", async () => {
+    testWindow.history.replaceState(null, "", "/events/reconnect-event");
+    const projection = publishedEventProjection("reconnect-event", "Initial Event");
+    let reads = 0;
+    (globalThis.fetch as typeof fetch) = (async () => {
+      reads += 1;
+      const value =
+        reads === 1 ? projection : { ...projection, name: `Recovered Event ${reads - 1}` };
+      return new Response(JSON.stringify({ status: "accepted", value }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }) as unknown as typeof fetch;
+
+    await act(async () => {
+      root.render(<App />);
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    let priorSocket = MockWebSocket.instances.at(-1);
+    expect(priorSocket).not.toBeUndefined();
+    expect(container.textContent).toContain("Initial Event");
+
+    for (let cycle = 1; cycle <= 3; cycle += 1) {
+      await act(async () => {
+        priorSocket?.close();
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      const recoveredSocket = MockWebSocket.instances.at(-1);
+      expect(reads).toBe(cycle + 1);
+      expect(recoveredSocket).not.toBe(priorSocket);
+      expect(recoveredSocket?.sentMessages).toContain(
+        JSON.stringify({ type: "subscribe-public-event", eventId: "reconnect-event" }),
+      );
+      expect(container.textContent).toContain(`Recovered Event ${cycle}`);
+      priorSocket = recoveredSocket;
+    }
+  });
+
+  test("clears the prior Audience Projection before rendering terminal Event unavailability", async () => {
+    testWindow.history.replaceState(null, "", "/events/terminal-event");
+    const projection = publishedEventProjection("terminal-event", "Previously Published Event");
+    (globalThis.fetch as typeof fetch) = (async () =>
+      new Response(JSON.stringify({ status: "accepted", value: projection }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      })) as unknown as typeof fetch;
+
+    await act(async () => {
+      root.render(<App />);
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const socket = MockWebSocket.instances.at(-1);
+    expect(container.textContent).toContain("Previously Published Event");
+
+    await act(async () => {
+      socket?.receive({
+        protocol: "public-event-stream-v1",
+        type: "event-unavailable",
+        eventId: "terminal-event",
+      });
+      await Promise.resolve();
+    });
+
+    expect(container.textContent).toContain("Event unavailable");
+    expect(container.textContent).not.toContain("Previously Published Event");
   });
 });

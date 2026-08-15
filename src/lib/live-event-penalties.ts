@@ -1,4 +1,5 @@
 import type { ActionJsonValue } from "@/lib/event-game-actions";
+import { validatePlayerNumber } from "@/lib/validation-policy";
 
 export const LIVE_PENALTY_MINUTE_MS = 60_000;
 export const LIVE_SEEKER_RELEASE_MS = 20 * LIVE_PENALTY_MINUTE_MS;
@@ -14,6 +15,21 @@ export const LIVE_PENALTY_REASONS = [
 export type LivePenaltyReason = (typeof LIVE_PENALTY_REASONS)[number];
 export type LiveCardType = "blue" | "yellow" | "red" | "ejection";
 export type LivePenaltyStart = "immediate" | "sticks-up" | "seeker-release";
+
+export type LivePenaltyPlayerKey = {
+  gameSideId: string;
+  playerNumber: number;
+};
+
+/** Parse the canonical side:number key used by durable penalty facts. */
+export function parseLivePenaltyPlayerKey(value: string): LivePenaltyPlayerKey | null {
+  const separator = value.lastIndexOf(":");
+  if (separator <= 0 || separator === value.length - 1) return null;
+  const gameSideId = value.slice(0, separator);
+  const playerNumber = Number(value.slice(separator + 1));
+  const validated = validatePlayerNumber(playerNumber);
+  return validated.ok ? { gameSideId, playerNumber: validated.value } : null;
+}
 
 export type LivePenaltyFact = {
   factId: string;

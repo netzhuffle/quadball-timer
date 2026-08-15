@@ -2,6 +2,15 @@ import { describe, expect, test } from "bun:test";
 import { parseClientWsMessage } from "@/lib/ws-protocol";
 
 describe("ws-protocol", () => {
+  test("accepts a public Event stream subscription", () => {
+    expect(
+      parseClientWsMessage(JSON.stringify({ type: "subscribe-public-event", eventId: "event-1" })),
+    ).toEqual({
+      ok: true,
+      message: { type: "subscribe-public-event", eventId: "event-1" },
+    });
+  });
+
   test("rejects a WebSocket text frame over the UTF-8 byte boundary before JSON parsing", () => {
     const parsed = parseClientWsMessage(
       JSON.stringify({

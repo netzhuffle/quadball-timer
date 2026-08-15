@@ -18,12 +18,13 @@ export const AD_HOC_REPLAY_SUSTAINED_PER_SECOND = 20;
 export const AD_HOC_REPLAY_BURST = AD_HOC_REPLAY_SUSTAINED_PER_SECOND;
 export const AD_HOC_REPLAY_MAX_UNACKNOWLEDGED_BATCHES = 1;
 
-// This is an Ad Hoc-only ceiling.  Event connection capacity is not read or
-// mutated here, so a full Ad Hoc pool cannot consume Event capacity.
+// Ad Hoc still applies its own 256-controller workflow cap below. The shared
+// WebSocket envelope leaves room for 500 public spectators and two reserved
+// Controller connections before role-specific admission.
 export const AD_HOC_MAX_CONNECTED_CONTROLLERS = 256;
 export const AD_HOC_MAX_QUEUED_OUTPUT_BYTES = 256 * 1024;
-export const AD_HOC_EVENT_TOTAL_CONNECTION_CAPACITY = AD_HOC_MAX_CONNECTED_CONTROLLERS + 1;
-export const AD_HOC_EVENT_RESERVED_CONNECTION_CAPACITY = 1;
+export const AD_HOC_EVENT_TOTAL_CONNECTION_CAPACITY = 502;
+export const AD_HOC_EVENT_RESERVED_CONNECTION_CAPACITY = 2;
 
 export type AdHocResourceMetric =
   | "creation-delay"

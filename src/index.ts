@@ -1,5 +1,5 @@
 import { serve, type ServerWebSocket } from "bun";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { dirname } from "node:path";
 import index from "./index.html";
 import { readJsonBodyWithinLimit } from "@/lib/http-body";
@@ -43,13 +43,21 @@ import {
   createFoundationEventCatalogStorage,
   createUnavailableEventCatalogStorage,
   type CatalogOutcome,
+  type EventPublicationStatus,
 } from "@/lib/event-catalog";
 import {
   createAudienceProjection,
   PUBLIC_AUDIENCE_ABSENCE,
   type AudienceProjectionListOutcome,
   type AudienceProjectionReader,
+  type PublicAudienceEventProjection,
 } from "@/lib/audience-projection";
+import { createPublicAudienceEventStream } from "@/lib/public-audience-event-stream";
+import { createPublicAudienceEventWebSocketHub } from "@/lib/public-audience-event-websocket";
+import {
+  serializePublicAudienceProjectionMessage,
+  type PublicAudienceProjectionMessage,
+} from "@/lib/public-event-stream";
 import {
   createEventAdministration,
   type EventAdministration,
@@ -94,11 +102,10 @@ import {
   type ControllerCapacityInput,
 } from "@/lib/controller-capacity";
 import {
-  AD_HOC_EVENT_RESERVED_CONNECTION_CAPACITY,
-  AD_HOC_EVENT_TOTAL_CONNECTION_CAPACITY,
   AD_HOC_MAX_CONNECTED_CONTROLLERS,
   AD_HOC_MAX_QUEUED_OUTPUT_BYTES,
 } from "@/lib/ad-hoc-resource-budgets";
+import { readEventConnectionCapacity } from "@/lib/event-connection-capacity";
 import {
   initializeServerMonitoring,
   readTrustedMonitoringIdentity,
@@ -122,6 +129,10 @@ type SessionSubscription =
       type: "game";
       gameId: string;
       sessionId: string;
+    }
+  | {
+      type: "public-event";
+      eventId: string;
     };
 
 type SessionData = {
@@ -232,6 +243,9 @@ async function startServer() {
       process.env.AD_HOC_ENVIRONMENT_ID,
     );
     let eventCapacitySource = () => 0;
+    const eventConnectionCapacity = readEventConnectionCapacity(process.env, () =>
+      eventCapacitySource(),
+    );
     const adHocService = createAdHocGamesService({
       environmentIdentity: adHocEnvironmentIdentity,
       deferReplayAcknowledgement: true,
@@ -239,17 +253,7 @@ async function startServer() {
         process.env.AD_HOC_MAX_CONNECTED_SOCKETS,
         AD_HOC_MAX_CONNECTED_CONTROLLERS,
       ),
-      eventCapacity: {
-        totalConnections: readRuntimeCapacity(
-          process.env.EVENT_TOTAL_CONNECTION_CAPACITY,
-          AD_HOC_EVENT_TOTAL_CONNECTION_CAPACITY,
-        ),
-        reservedConnections: readRuntimeCapacity(
-          process.env.EVENT_RESERVED_CONNECTION_CAPACITY,
-          AD_HOC_EVENT_RESERVED_CONNECTION_CAPACITY,
-        ),
-        activeControllerSessions: () => eventCapacitySource(),
-      },
+      eventCapacity: eventConnectionCapacity,
       store:
         environment === "test" && !process.env.AD_HOC_DATABASE?.trim()
           ? undefined
@@ -330,14 +334,33 @@ async function startServer() {
 
     const eventCatalog = createEventCatalog(eventCatalogStorage, {});
     let liveEventRuntime: LiveEventGameRuntime | null = null;
-    const audienceProjection = createAudienceProjection(eventCatalogStorage, {
-      gameInput: {
-        async read(eventGameId) {
-          return liveEventRuntime === null
-            ? { status: "unavailable" as const }
-            : await liveEventRuntime.readAudienceProjectionGameInput(eventGameId);
-        },
-      },
+    const liveEventKeyRing = readLiveEventGrantKeyRing();
+    const liveAudienceGameInput =
+      liveEventKeyRing === null
+        ? undefined
+        : {
+            async read(eventGameId: string) {
+              return liveEventRuntime === null
+                ? { status: "unavailable" as const }
+                : await liveEventRuntime.readAudienceProjectionGameInput(eventGameId);
+            },
+          };
+    const audienceProjection = createAudienceProjection(
+      eventCatalogStorage,
+      liveAudienceGameInput === undefined ? {} : { gameInput: liveAudienceGameInput },
+    );
+    const publicEventStream = createPublicAudienceEventStream(audienceProjection);
+    let reconcilePublicSpectators = () => {};
+    const publicEventWebSocketHub = createPublicAudienceEventWebSocketHub({
+      stream: publicEventStream,
+      controllerCapacity: eventConnectionCapacity,
+    });
+    reconcilePublicSpectators = () => {
+      publicEventWebSocketHub.reconcileControllerCapacity();
+    };
+    startupCleanup.add(() => {
+      publicEventWebSocketHub.close();
+      publicEventStream.close();
     });
     let eventAdministration: EventAdministration | null = null;
     let administrativeAuditProjection: AdministrativeAuditProjection | null = null;
@@ -370,7 +393,6 @@ async function startServer() {
       }
     }
     const liveEventDatabasePath = storagePaths.eventGameDatabase;
-    const liveEventKeyRing = readLiveEventGrantKeyRing();
     if (liveEventKeyRing !== null) {
       try {
         liveEventRuntime = await openLiveEventGameRuntime({
@@ -378,6 +400,7 @@ async function startServer() {
           environmentId: environment,
           keyRing: liveEventKeyRing,
           knownDodgeballIdsForEventGame: readLiveEventDodgeballIdsByEventGame(),
+          onControllerCapacityChange: () => reconcilePublicSpectators(),
         });
         startupCleanup.add(() => liveEventRuntime?.close());
       } catch (error) {
@@ -582,18 +605,13 @@ async function startServer() {
       monitoringIdentity === null
         ? undefined
         : process.env.PUBLIC_GLITCHTIP_DSN?.trim() || undefined;
-    const htmlRoute =
-      monitoringIdentity !== null &&
-      ((environment === "test" && process.env.NODE_ENV === "production") ||
-        browserMonitoringDsn !== undefined)
-        ? await createHtmlRoute({
-            testEnvironment: environment === "test" && process.env.NODE_ENV === "production",
-            browserMonitoring: browserMonitoringPublicConfig(
-              monitoringIdentity,
-              browserMonitoringDsn,
-            ),
-          })
-        : index;
+    const htmlRoute = await createHtmlRoute({
+      testEnvironment: environment === "test" && process.env.NODE_ENV === "production",
+      browserMonitoring:
+        monitoringIdentity === null
+          ? undefined
+          : browserMonitoringPublicConfig(monitoringIdentity, browserMonitoringDsn),
+    });
 
     server = serve<SessionData>({
       hostname: process.env.HOST ?? "127.0.0.1",
@@ -615,21 +633,7 @@ async function startServer() {
           }
 
           const socketId = crypto.randomUUID();
-          const totalSocketCapacity = calculateAdHocUpgradeCapacity({
-            totalConnections: readRuntimeCapacity(
-              process.env.EVENT_TOTAL_CONNECTION_CAPACITY,
-              AD_HOC_EVENT_TOTAL_CONNECTION_CAPACITY,
-            ),
-            reservedConnections: readRuntimeCapacity(
-              process.env.EVENT_RESERVED_CONNECTION_CAPACITY,
-              AD_HOC_EVENT_RESERVED_CONNECTION_CAPACITY,
-            ),
-            activeControllerSessions: eventCapacitySource(),
-            maxConnectedSockets: readRuntimeCapacity(
-              process.env.AD_HOC_MAX_CONNECTED_SOCKETS,
-              AD_HOC_MAX_CONNECTED_CONTROLLERS,
-            ),
-          });
+          const totalSocketCapacity = eventConnectionCapacity.totalConnections;
           if (sockets.size + pendingSocketReservations.size >= totalSocketCapacity) {
             adHocService.recordResourcePressure("connection-shed");
             return json({ error: "Ad Hoc connection busy.", retryAfterMs: 1_000 }, 503, [
@@ -1075,13 +1079,13 @@ async function startServer() {
                 400,
               );
             const eventId = new URL(req.url).pathname.split("/").at(-2) ?? "";
-            return catalogResponse(
-              await eventCatalog.changePublicationStatus(
-                eventId,
-                { status: body.status, impactConfirmed: body.impactConfirmed },
-                token,
-              ),
+            const result = await eventCatalog.changePublicationStatus(
+              eventId,
+              { status: body.status, impactConfirmed: body.impactConfirmed },
+              token,
             );
+            await synchronizePublicEventPublication(publicEventStream, eventId, result);
+            return catalogResponse(result);
           },
         },
         "/api/admin/events/:eventId/game-days": {
@@ -1784,14 +1788,13 @@ async function startServer() {
             const body = await readJsonRecord(req);
             const eventId = new URL(req.url).pathname.split("/").at(-2) ?? "";
             if (authority === null || body === null) return sensitiveGenericAuthFailure(401);
-            return sensitiveEventAdministrationMutationResponse(
-              await eventAdministration.changePublicationStatus(
-                eventId,
-                { status: body.status, impactConfirmed: body.impactConfirmed },
-                authority,
-              ),
+            const result = await eventAdministration.changePublicationStatus(
+              eventId,
+              { status: body.status, impactConfirmed: body.impactConfirmed },
               authority,
             );
+            await synchronizePublicEventPublication(publicEventStream, eventId, result);
+            return sensitiveEventAdministrationMutationResponse(result, authority);
           },
         },
         "/api/event-admin/events/:eventId/catalog-removal/preview": {
@@ -2238,7 +2241,14 @@ async function startServer() {
         "/events/:eventId": {
           async GET(req: Request, routeServer: Bun.Server<SessionData>) {
             return readPublicAudienceEventPage(req, audienceProjection, () =>
-              fetch(new URL("/", routeServer.url)),
+              fetch(new Request(new URL("/", routeServer.url), { headers: req.headers })),
+            );
+          },
+        },
+        "/events/:eventId/games/:eventGameId": {
+          async GET(req: Request, routeServer: Bun.Server<SessionData>) {
+            return readPublicAudienceGamePage(req, audienceProjection, () =>
+              fetch(new Request(new URL("/", routeServer.url), { headers: req.headers })),
             );
           },
         },
@@ -2287,6 +2297,7 @@ async function startServer() {
           releasePendingSocketReservation(ws.data.id);
           sockets.delete(ws);
           ws.data.closed = true;
+          publicEventWebSocketHub.disconnect(ws.data.id, "client-closed");
           void ws.data.subscriptionWork
             .then(
               () => liveAdHocSessions.disconnect(ws.data.id),
@@ -2321,6 +2332,53 @@ async function startServer() {
             case "subscribe-lobby": {
               sendMessage(ws, { type: "error", message: adHocService.genericUnavailableMessage });
               ws.close(1008, "Ad Hoc subscription unavailable.");
+              return;
+            }
+
+            case "subscribe-public-event": {
+              const eventId = parsed.message.eventId;
+              const handleSubscription = async () => {
+                if (ws.data.closed) return;
+                if (ws.data.subscription.type !== "none") {
+                  sendMessage(ws, {
+                    type: "error",
+                    message: "WebSocket is already subscribed.",
+                  });
+                  return;
+                }
+                const subscriber = {
+                  send(serialized: string) {
+                    return sendPublicAudienceSerializedEnvelope(ws, serialized);
+                  },
+                  close(code: number, reason: string) {
+                    if (!ws.data.closed) ws.close(code, reason);
+                  },
+                };
+                const result = await publicEventWebSocketHub.subscribe(
+                  ws.data.id,
+                  eventId,
+                  subscriber,
+                );
+                if (ws.data.closed) return;
+                if (result.status === "rejected") {
+                  sendMessage(ws, { type: "error", message: result.message });
+                  ws.close(1013, result.message);
+                  return;
+                }
+                if (result.status !== "admitted") {
+                  sendPublicEventStreamMessage(ws, {
+                    protocol: "public-event-stream-v1",
+                    type: "event-unavailable",
+                    eventId,
+                  });
+                  ws.close(1008, "Event unavailable.");
+                  return;
+                }
+                ws.data.subscription = { type: "public-event", eventId };
+              };
+              const queued = ws.data.subscriptionWork.then(handleSubscription, handleSubscription);
+              ws.data.subscriptionWork = queued.catch(() => undefined);
+              await queued;
               return;
             }
 
@@ -2481,29 +2539,55 @@ async function startServer() {
   }
 }
 
-async function createHtmlRoute({
+export async function createHtmlRoute({
   testEnvironment,
   browserMonitoring,
 }: {
   testEnvironment: boolean;
-  browserMonitoring: {
+  browserMonitoring?: {
     dsn?: string;
     environment: "production" | "test";
     release: string;
     browserCorrelation: string;
   };
-}) {
+}): Promise<HtmlRoute> {
   const html = await Bun.file(index.index)
     .text()
     .catch(() => null);
   if (html === null) {
     throw new Error("Test HTML presentation bundle is unavailable.");
   }
+  // Bun's source HTML route owns development-time TSX transpilation. The built
+  // release HTML contains versioned browser assets and is safe to serve directly.
+  if (/src=["']\.\/frontend\.tsx["']/u.test(html)) return index;
+  return createHtmlBundleRoute(html, dirname(index.index), { testEnvironment, browserMonitoring });
+}
 
-  const monitoringScript = `<script>globalThis.__QUADBALL_TIMER_MONITORING__=${serializeBrowserMonitoringConfig(
+export function createHtmlBundleRoute(
+  html: string,
+  assetDirectory: string,
+  {
+    testEnvironment,
     browserMonitoring,
-  )};</script>`;
-  const bodyWithMonitoring = html.replace("</head>", `${monitoringScript}</head>`);
+  }: {
+    testEnvironment: boolean;
+    browserMonitoring?: {
+      dsn?: string;
+      environment: "production" | "test";
+      release: string;
+      browserCorrelation: string;
+    };
+  },
+) {
+  const bodyWithMonitoring =
+    browserMonitoring === undefined
+      ? html
+      : html.replace(
+          "</head>",
+          `<script>globalThis.__QUADBALL_TIMER_MONITORING__=${serializeBrowserMonitoringConfig(
+            browserMonitoring,
+          )};</script></head>`,
+        );
   const body = testEnvironment
     ? bodyWithMonitoring
         .replace(
@@ -2517,29 +2601,42 @@ async function createHtmlRoute({
     : bodyWithMonitoring;
   const headers = new Headers({
     "content-type": "text/html; charset=utf-8",
+    etag: contentEtag(body),
     ...(testEnvironment
       ? {
           "cache-control": "no-store",
           "x-robots-tag": "noindex, nofollow, noarchive, noimageindex",
         }
-      : {}),
+      : { "cache-control": "no-cache" }),
   });
-  const assetDirectory = dirname(index.index);
   const assetPaths = collectHtmlBundleAssetPaths(html, assetDirectory);
 
   return (req: Request) => {
     const assetPath = assetPaths.get(new URL(req.url).pathname);
-    return assetPath === undefined
-      ? new Response(body, { headers })
-      : new Response(Bun.file(assetPath), {
-          headers: {
-            "cache-control": "no-store",
-            ...(testEnvironment
-              ? { "x-robots-tag": "noindex, nofollow, noarchive, noimageindex" }
-              : {}),
-          },
-        });
+    if (assetPath === undefined) {
+      if (!testEnvironment && req.headers.get("if-none-match") === headers.get("etag")) {
+        return new Response(null, { status: 304, headers });
+      }
+      return new Response(body, { headers });
+    }
+    const immutable = isVersionedAssetPath(new URL(req.url).pathname);
+    return new Response(Bun.file(assetPath), {
+      headers: {
+        "cache-control": assetCacheControl(immutable, testEnvironment),
+        ...(testEnvironment
+          ? { "x-robots-tag": "noindex, nofollow, noarchive, noimageindex" }
+          : {}),
+      },
+    });
   };
+}
+
+export function isVersionedAssetPath(pathname: string): boolean {
+  return /(?:^|[.-])[a-z0-9]{8,}(?=\.)/iu.test(pathname);
+}
+
+export function assetCacheControl(versioned: boolean, testEnvironment: boolean): string {
+  return versioned && !testEnvironment ? "public, max-age=31536000, immutable" : "no-cache";
 }
 
 if (import.meta.main) void main();
@@ -2691,7 +2788,7 @@ export async function readAudienceEvent(
 ): Promise<Response> {
   const eventId = readPathSegment(req.url);
   const result = await projection.read(eventId);
-  if (result.status === "accepted") return sensitiveJson(result);
+  if (result.status === "accepted") return publicRevalidatedJson(req, result);
   return publicAudienceUnavailableResponse();
 }
 
@@ -2703,7 +2800,7 @@ export async function readAudienceGame(
   const eventId = decodePathSegment(segments.at(-3));
   const eventGameId = decodePathSegment(segments.at(-1));
   const result = await projection.readGame(eventId, eventGameId);
-  if (result.status === "accepted") return sensitiveJson(result);
+  if (result.status === "accepted") return publicRevalidatedJson(req, result);
   return publicAudienceUnavailableResponse();
 }
 
@@ -2718,12 +2815,27 @@ export async function readPublicAudienceEventPage(
   return response;
 }
 
+export async function readPublicAudienceGamePage(
+  req: Request,
+  projection: Pick<AudienceProjectionReader, "readGame">,
+  readIndex: () => Response | Promise<Response>,
+): Promise<Response> {
+  const segments = new URL(req.url).pathname.split("/");
+  const result = await projection.readGame(
+    decodePathSegment(segments.at(-3)),
+    decodePathSegment(segments.at(-1)),
+  );
+  const response = await readIndex();
+  if (result.status !== "accepted") response.headers.set("x-robots-tag", "noindex");
+  return response;
+}
+
 export async function readAudienceEvents(
-  _req: Request,
+  req: Request,
   projection: Pick<AudienceProjectionReader, "list">,
 ): Promise<Response> {
   const result = await projection.list();
-  if (result.status === "accepted") return sensitiveJson(result);
+  if (result.status === "accepted") return publicRevalidatedJson(req, result);
   return publicAudienceUnavailableResponse();
 }
 
@@ -2769,6 +2881,16 @@ export async function resolveAdHocWebSocketSubscription({
   if (result.status === "capacity") return result;
   if (result.status !== "accepted") return { status: "unavailable" };
   return { status: "accepted", sessionId: result.game.sessionId, game: result.game };
+}
+
+async function synchronizePublicEventPublication(
+  stream: ReturnType<typeof createPublicAudienceEventStream>,
+  eventId: string,
+  result: { status: string; value?: { publicationStatus?: EventPublicationStatus } },
+) {
+  if (result.status !== "accepted" || result.value?.publicationStatus === undefined) return;
+  if (result.value.publicationStatus === "published") await stream.republish(eventId);
+  else await stream.unpublish(eventId);
 }
 
 export async function readAuthorizedAdHocGame(
@@ -2828,19 +2950,59 @@ async function broadcastGameSnapshot({
 
 function sendMessage(ws: ServerWebSocket<SessionData>, payload: ServerWsMessage) {
   const serialized = JSON.stringify(payload);
+  return sendWebSocketText(ws, serialized, {
+    maxBytes: AD_HOC_MAX_QUEUED_OUTPUT_BYTES,
+    overflowCloseReason: "Ad Hoc output limit reached.",
+    shortSendCloseReason: "Ad Hoc output backpressure.",
+    sendErrorCloseReason: "Ad Hoc output unavailable.",
+  });
+}
+
+function sendPublicEventStreamMessage(
+  ws: ServerWebSocket<SessionData>,
+  payload: PublicAudienceProjectionMessage<PublicAudienceEventProjection>,
+): boolean {
+  return sendPublicAudienceSerializedEnvelope(
+    ws,
+    serializePublicAudienceProjectionMessage(payload),
+  );
+}
+
+function sendPublicAudienceSerializedEnvelope(
+  ws: ServerWebSocket<SessionData>,
+  serialized: string,
+): boolean {
+  return sendWebSocketText(ws, serialized, {
+    shortSendCloseReason: "Public Event stream backpressure.",
+    sendErrorCloseReason: "Public Event stream unavailable.",
+  });
+}
+
+type WebSocketTextSendPolicy = {
+  maxBytes?: number;
+  overflowCloseReason?: string;
+  shortSendCloseReason: string;
+  sendErrorCloseReason: string;
+};
+
+function sendWebSocketText(
+  ws: ServerWebSocket<SessionData>,
+  serialized: string,
+  policy: WebSocketTextSendPolicy,
+): boolean {
   const bytes = new TextEncoder().encode(serialized).byteLength;
-  if (bytes > AD_HOC_MAX_QUEUED_OUTPUT_BYTES) {
-    ws.close(1013, "Ad Hoc output limit reached.");
+  if (policy.maxBytes !== undefined && bytes > policy.maxBytes) {
+    ws.close(1013, policy.overflowCloseReason ?? policy.shortSendCloseReason);
     return false;
   }
   try {
     const sentBytes = ws.send(serialized);
     if (sentBytes !== bytes) {
-      ws.close(1013, "Ad Hoc output backpressure.");
+      ws.close(1013, policy.shortSendCloseReason);
       return false;
     }
   } catch {
-    ws.close(1011, "Ad Hoc output unavailable.");
+    ws.close(1011, policy.sendErrorCloseReason);
     return false;
   }
   return true;
@@ -2950,7 +3112,25 @@ function decodePathSegment(segment: string | undefined): string {
 }
 
 function publicAudienceUnavailableResponse() {
-  return sensitiveJson(PUBLIC_AUDIENCE_ABSENCE, 404);
+  return sensitiveJson(PUBLIC_AUDIENCE_ABSENCE, 404, [["x-robots-tag", "noindex"]]);
+}
+
+function publicRevalidatedJson(req: Request, payload: unknown): Response {
+  const body = JSON.stringify(payload);
+  const etag = contentEtag(body);
+  const headers = new Headers({
+    "cache-control": "no-cache",
+    "content-type": "application/json",
+    etag,
+    "referrer-policy": "no-referrer",
+  });
+  return req.headers.get("if-none-match") === etag
+    ? new Response(null, { status: 304, headers })
+    : new Response(body, { headers });
+}
+
+function contentEtag(content: string): string {
+  return `"sha256-${createHash("sha256").update(content).digest("base64url")}"`;
 }
 
 function audienceRobotsResponse(req: Request): Response {

@@ -28,13 +28,22 @@ export type SubscribeGameMessage = {
   gameId: string;
 };
 
+export type SubscribePublicEventMessage = {
+  type: "subscribe-public-event";
+  eventId: string;
+};
+
 export type ApplyCommandsMessage = {
   type: "apply-commands";
   gameId: string;
   commands: ClientCommandEnvelope[];
 };
 
-export type ClientWsMessage = SubscribeLobbyMessage | SubscribeGameMessage | ApplyCommandsMessage;
+export type ClientWsMessage =
+  | SubscribeLobbyMessage
+  | SubscribeGameMessage
+  | SubscribePublicEventMessage
+  | ApplyCommandsMessage;
 
 export type ParseClientWsMessageOptions = {
   serverNowMs?: number;
@@ -136,6 +145,23 @@ export function parseClientWsMessage(
       message: {
         type: "subscribe-game",
         gameId: gameId.value,
+      },
+    };
+  }
+
+  if (payload.type === "subscribe-public-event") {
+    const eventId = validateOpaqueIdentifier(payload.eventId, "eventId");
+    if (!eventId.ok) {
+      return {
+        ok: false,
+        error: `subscribe-public-event ${eventId.error}`,
+      };
+    }
+    return {
+      ok: true,
+      message: {
+        type: "subscribe-public-event",
+        eventId: eventId.value,
       },
     };
   }

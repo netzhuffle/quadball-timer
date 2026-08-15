@@ -12,6 +12,7 @@ import {
   openSqliteFoundationStorage,
   readSqliteFoundationStorageReadiness,
 } from "@/lib/foundation-storage-sqlite";
+import { createControlActionCodecRegistry } from "@/lib/event-game-actions";
 import {
   createLiveEventGameControl,
   createLiveEventGameIqaInterpreter,
@@ -112,6 +113,24 @@ export function readAudienceProjectionGameInput(
     winnerGameSideId: projection.winnerGameSideId ?? null,
     catchingGameSideId: projection.catch?.catchingGameSideId ?? null,
     locked: root.lifecycle.lockedAtMs !== null,
+    gameFacts: structuredClone(projection.gameFacts ?? []),
+    timelineState: {
+      catch:
+        projection.catch === null || projection.catch === undefined
+          ? null
+          : {
+              factId: projection.catch.factId,
+              gameTimeMs: projection.catch.gameTimeMs,
+              catchingGameSideId: projection.catch.catchingGameSideId,
+            },
+      overtime: projection.overtime ?? false,
+      overtimeTarget: projection.overtimeTarget ?? null,
+      result:
+        projection.result === null || projection.result === undefined
+          ? null
+          : { factId: projection.result.factId },
+    },
+    teamAssignmentCorrected: (projection.teamAssignmentCorrections?.length ?? 0) > 0,
   };
   return { status: "accepted", value };
 }
@@ -122,6 +141,7 @@ export async function openLiveEventGameRuntime(input: {
   keyRing: GrantKeyRing;
   clock?: () => number;
   knownDodgeballIdsForEventGame?: (eventGameId: string) => readonly string[] | undefined;
+  onControllerCapacityChange?: () => void;
 }): Promise<LiveEventGameRuntime> {
   const readiness = await readSqliteFoundationStorageReadiness(input.databasePath, {
     grantKeyRing: input.keyRing,
@@ -132,13 +152,20 @@ export async function openLiveEventGameRuntime(input: {
 
   const storage = openSqliteFoundationStorage(input.databasePath, { grantKeyRing: input.keyRing });
   try {
+    storage.setReadinessContext({
+      actionCodecRegistry: createControlActionCodecRegistry(),
+      interpreter: createLiveEventGameIqaInterpreter(),
+    });
     const clock = input.clock ?? (() => Date.now());
     let refreshEventCapacitySnapshot = () => {};
     const grantOptions = createGrantOptions(
       input.environmentId,
       input.keyRing,
       clock,
-      () => refreshEventCapacitySnapshot(),
+      () => {
+        refreshEventCapacitySnapshot();
+        input.onControllerCapacityChange?.();
+      },
       storage,
     );
     const authority = createTypedGrantAuthority(storage, grantOptions);

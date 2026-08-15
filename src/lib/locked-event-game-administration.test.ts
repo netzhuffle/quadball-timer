@@ -3,6 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createFoundationAcceptance } from "@/lib/foundation-acceptance";
+import { createAudienceProjection } from "@/lib/audience-projection";
 import { createEventAdministration } from "@/lib/event-administration";
 import { createEventCatalog, createFoundationEventCatalogStorage } from "@/lib/event-catalog";
 import { createEventGameRecord } from "@/lib/event-game-record";
@@ -14,6 +15,7 @@ import {
 import { createInMemoryFoundationStorage } from "@/lib/foundation-storage-memory";
 import type { FoundationStorage } from "@/lib/foundation-storage";
 import { openSqliteFoundationStorage } from "@/lib/foundation-storage-sqlite";
+import { readAudienceProjectionGameInput } from "@/lib/live-event-game-runtime";
 import { createGrantAuthorityVerifier } from "@/lib/grant-authority";
 import type { GrantAuthorityOptions } from "@/lib/grant-authority";
 import { createTypedGrantAuthority } from "@/lib/grant-management";
@@ -258,6 +260,98 @@ describe("locked Event Game administration", () => {
       expect.arrayContaining([expect.objectContaining({ factType: "locked-game-correction" })]),
     );
     expect(JSON.stringify(projection)).not.toContain("locked-game-correction");
+  });
+
+  test("projects accepted locked correction and reopening through the public Audience seam", async () => {
+    const fixture = await createFixture();
+    const catalogStorage = createFoundationEventCatalogStorage(fixture.storage);
+    const catalog = createEventCatalog(catalogStorage, { clock: { nowMs: () => 3_000 } });
+    expect(
+      await catalog.changePublicationStatus(
+        fixture.eventId,
+        { status: "published" },
+        fixture.technical,
+      ),
+    ).toMatchObject({ status: "accepted" });
+    const control = fixture.createControl();
+    const audience = createAudienceProjection(catalogStorage, {
+      now: () => 3_000,
+      gameInput: {
+        read: async (eventGameId) => {
+          const root = await fixture.storage.readRoot(fixture.recordId);
+          return readAudienceProjectionGameInput(
+            root,
+            await control.readControllerProjection(eventGameId),
+          );
+        },
+      },
+    });
+    const correctionOperationId = "audience-seam-locked-correction";
+    const correction = await fixture.administration.correctLockedEventGame(
+      fixture.eventId,
+      fixture.eventGameId,
+      {
+        operationId: correctionOperationId,
+        endState: {
+          scoreByGameSide: { "side-a": 30, "side-b": 20 },
+          winnerGameSideId: "side-a",
+          flagCatchingGameSideId: "side-a",
+          catchTimeMs: 1_500,
+          endTimeMs: 2_000,
+        },
+      },
+      fixture.technical,
+    );
+    expect(correction).toMatchObject({ status: "accepted", value: { lockRetained: true } });
+
+    const locked = await audience.readGame(fixture.eventId, fixture.eventGameId);
+    expect(locked).toMatchObject({
+      status: "accepted",
+      value: {
+        sideA: { score: 30 },
+        sideB: { score: 20 },
+        flagState: { catchingSide: "side-a" },
+        result: { status: "finished", winner: "side-a", locked: true },
+      },
+    });
+    if (locked.status !== "accepted") throw new Error("Expected locked public projection.");
+    expect(locked.value.timeline).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ kind: "flag-catch", gameTimeMs: 1_500 }),
+        expect.objectContaining({ kind: "finish", outcome: "result" }),
+      ]),
+    );
+    const lockedTimeline = locked.value.timeline;
+    const lockedPublicJson = JSON.stringify(locked.value);
+    expect(lockedPublicJson).not.toContain(correctionOperationId);
+    expect(lockedPublicJson).not.toContain("locked-game-correction");
+    expect(lockedPublicJson).not.toContain("event-admin");
+
+    const reopenOperationId = "audience-seam-game-reopening";
+    expect(
+      await fixture.administration.reopenEventGame(
+        fixture.eventId,
+        fixture.eventGameId,
+        { operationId: reopenOperationId },
+        fixture.technical,
+      ),
+    ).toMatchObject({ status: "accepted", value: { lockRemoved: true } });
+
+    const reopened = await audience.readGame(fixture.eventId, fixture.eventGameId);
+    expect(reopened).toMatchObject({
+      status: "accepted",
+      value: { result: { status: "finished", winner: "side-a", locked: false } },
+    });
+    if (reopened.status !== "accepted") throw new Error("Expected reopened public projection.");
+    expect(reopened.value.sideA.score).toBe(30);
+    expect(reopened.value.sideB.score).toBe(20);
+    expect(reopened.value.flagState).toEqual({ catchingSide: "side-a" });
+    expect(reopened.value.timeline).toEqual(lockedTimeline);
+    const reopenedPublicJson = JSON.stringify(reopened.value);
+    expect(reopenedPublicJson).not.toContain(correctionOperationId);
+    expect(reopenedPublicJson).not.toContain(reopenOperationId);
+    expect(reopenedPublicJson).not.toContain("game-reopening");
+    expect(reopenedPublicJson).not.toContain("event-admin");
   });
 
   test("requires one confirmation for an inconsistent correction and records Official Override", async () => {

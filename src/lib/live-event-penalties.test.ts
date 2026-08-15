@@ -3,6 +3,7 @@ import {
   deriveLivePenaltyProjection,
   LIVE_PENALTY_MINUTE_MS,
   LIVE_SEEKER_RELEASE_MS,
+  parseLivePenaltyPlayerKey,
   type LivePenaltyFact,
 } from "@/lib/live-event-penalties";
 
@@ -44,6 +45,15 @@ function card(
 }
 
 describe("live Event Game penalty timing", () => {
+  test("parses only canonical side:number penalty player keys", () => {
+    expect(parseLivePenaltyPlayerKey("away:7")).toEqual({
+      gameSideId: "away",
+      playerNumber: 7,
+    });
+    expect(parseLivePenaltyPlayerKey("away:unknown:card-1")).toBeNull();
+    expect(parseLivePenaltyPlayerKey("away:not-a-number")).toBeNull();
+  });
+
   test("blue and yellow have one expirable minute while red has two consecutive non-expirable minutes", () => {
     const projection = deriveLivePenaltyProjection(
       [

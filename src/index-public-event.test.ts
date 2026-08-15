@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { readPublicAudienceEventPage } from "./index";
+import { readPublicAudienceEventPage, readPublicAudienceGamePage } from "./index";
 
 const publishedEvent = {
   eventId: "event-published",
@@ -54,6 +54,21 @@ describe("public Event browser responses", () => {
     expect(response.status).toBe(200);
     expect(response.headers.get("x-robots-tag")).toBe("noindex");
     expect(response.headers.get("content-type")).toContain("text/html");
+    expect(await response.text()).not.toContain('"status":"unavailable"');
+  });
+
+  test("marks an unavailable stable Game page noindex while keeping the generic HTML shell", async () => {
+    const response = await readPublicAudienceGamePage(
+      new Request("http://localhost/events/event-published/games/game-unknown"),
+      { readGame: async () => ({ status: "unavailable" }) },
+      () =>
+        new Response('<!doctype html><html><body><div id="root"></div></body></html>', {
+          headers: { "content-type": "text/html; charset=utf-8" },
+        }),
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("x-robots-tag")).toBe("noindex");
     expect(await response.text()).not.toContain('"status":"unavailable"');
   });
 });
