@@ -103,10 +103,18 @@ export function createTypedGrantAuthority(
     disableGrantCode: (grantId, authority) =>
       disableGrantCode(storage, options, grantId, authority),
     admitGrantCode: (input) => admitGrantCode(storage, options, input),
-    admitGrant: (input) => notifyLifecycleChange(admitGrant(storage, options, input)),
+    admitEventAdminGrantCode: (input) =>
+      notifyLifecycleChange(admitGrantCode(storage, options, input, EVENT_ADMIN_GRANT_TYPE)),
+    admitPitchManagerGrantCode: (input) =>
+      notifyLifecycleChange(admitGrantCode(storage, options, input, PITCH_MANAGER_GRANT_TYPE)),
+    admitControlGrantCode: (input) =>
+      notifyLifecycleChange(admitGrantCode(storage, options, input, GRANT_TYPE)),
+    admitGrant: (input, expectedGrantType) =>
+      notifyLifecycleChange(admitGrant(storage, options, input, expectedGrantType)),
     admitPitchManagerGrant: (input) =>
-      admitGrant(storage, options, input, PITCH_MANAGER_GRANT_TYPE),
-    admitEventAdminGrant: (input) => admitGrant(storage, options, input, EVENT_ADMIN_GRANT_TYPE),
+      notifyLifecycleChange(admitGrant(storage, options, input, PITCH_MANAGER_GRANT_TYPE)),
+    admitEventAdminGrant: (input) =>
+      notifyLifecycleChange(admitGrant(storage, options, input, EVENT_ADMIN_GRANT_TYPE)),
     authorizeGrant: (input) =>
       input.readOnly === true
         ? authorizeGrant(storage, options, input)

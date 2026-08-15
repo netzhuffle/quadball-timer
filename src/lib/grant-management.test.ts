@@ -18,6 +18,162 @@ import type { GrantKeyRing } from "@/lib/grant-types";
 import { createGrantTestAuthorityVerifier } from "@/lib/grant-authority-test-support";
 
 describe("typed Grant management", () => {
+  test("shares admission expiry, binds Control resolution to the transaction, and protects wrong-type due Grants", async () => {
+    let nowMs = 10_000;
+    let resolverSnapshotSeen = false;
+    const storage = createInMemoryFoundationStorage();
+    const options = createOptions(() => nowMs);
+    options.controlScopeResolver = {
+      resolve: (_scope, snapshot) => {
+        resolverSnapshotSeen = snapshot !== undefined;
+        return { status: "eligible", eventGameId: "game-1" };
+      },
+    };
+    const authority = createTypedGrantAuthority(storage, options);
+    const technical = { kind: "technical-admin" as const, id: "tech" };
+    const eventAdmin = await authority.createEventAdminGrant({
+      authority: technical,
+      expiresAtMs: nowMs + 40 * 24 * 60 * 60 * 1_000,
+      scope: { eventId: "admission-event", eventTimeZone: "UTC", finalGameDayDate: "2026-03-20" },
+    });
+    if (eventAdmin.status !== "created") throw new Error("Expected Event Admin Grant.");
+    const eventCode = await authority.createGrantCode(eventAdmin.grantId, technical);
+    if (eventCode.status !== "created") throw new Error("Expected Event Admin Grant Code.");
+    const qrAdmission = await authority.admitEventAdminGrant({
+      qrCredential: eventAdmin.qrCredential,
+      browserContext: "expiry-qr",
+    });
+    const codeAdmission = await authority.admitEventAdminGrantCode({
+      grantCode: eventCode.code,
+      browserContext: "expiry-code",
+    });
+    expect(qrAdmission).toMatchObject({
+      status: "admitted",
+      sessionExpiresAtMs: nowMs + 30 * 24 * 60 * 60 * 1_000,
+    });
+    expect(codeAdmission).toMatchObject({
+      status: "admitted",
+      sessionExpiresAtMs: nowMs + 30 * 24 * 60 * 60 * 1_000,
+    });
+
+    const control = await authority.createControlGrant({
+      authority: technical,
+      expiresAtMs: nowMs + 60_000,
+      scope: {
+        eventId: "admission-event",
+        gameDayId: "admission-day",
+        pitchId: "admission-pitch",
+        pitchSlotId: "admission-slot",
+      },
+    });
+    if (control.status !== "created") throw new Error("Expected Control Grant.");
+    const controlCode = await authority.createGrantCode(control.grantId, technical);
+    if (controlCode.status !== "created") throw new Error("Expected Control Grant Code.");
+    const controlAdmission = await authority.admitControlGrantCode({
+      grantCode: controlCode.code,
+      browserContext: "control-code",
+    });
+    expect(controlAdmission).toMatchObject({ status: "admitted", sessionExpiresAtMs: null });
+    expect(resolverSnapshotSeen).toBe(true);
+
+    const due = await authority.createEventAdminGrant({
+      authority: technical,
+      expiresAtMs: nowMs + 1,
+      scope: { eventId: "due-event", eventTimeZone: "UTC", finalGameDayDate: "2026-03-20" },
+    });
+    if (due.status !== "created") throw new Error("Expected due Grant.");
+    const dueCode = await authority.createGrantCode(due.grantId, technical);
+    if (dueCode.status !== "created") throw new Error("Expected due Grant Code.");
+    const before = await storage.transaction((transaction) => ({
+      grant: transaction.findGrantById(due.grantId),
+      sessions: transaction.listGrantSessions(due.grantId),
+      audit: transaction.listGrantAudit(due.grantId),
+    }));
+    nowMs = 10_002;
+    expect(
+      await authority.admitControlGrantCode({
+        grantCode: dueCode.code,
+        browserContext: "wrong-due",
+      }),
+    ).toMatchObject({ status: "rejected", code: "grant-admission-failed" });
+    const after = await storage.transaction((transaction) => ({
+      grant: transaction.findGrantById(due.grantId),
+      sessions: transaction.listGrantSessions(due.grantId),
+      audit: transaction.listGrantAudit(due.grantId),
+    }));
+    expect(after).toEqual(before);
+  });
+
+  test("full rotation returns one-time QR and Grant Code material for each managed type", async () => {
+    const storage = createInMemoryFoundationStorage();
+    const authority = createTypedGrantAuthority(
+      storage,
+      createOptions(() => 1_000),
+    );
+    const technical = { kind: "technical-admin" as const, id: "tech" };
+    const eventAdmin = await authority.createEventAdminGrant({
+      authority: technical,
+      scope: { eventId: "rotation-event", eventTimeZone: "UTC", finalGameDayDate: "2026-03-20" },
+    });
+    if (eventAdmin.status !== "created") throw new Error("Expected Event Admin Grant.");
+    const eventSession = await authority.admitEventAdminGrant({
+      qrCredential: eventAdmin.qrCredential,
+      browserContext: "rotation-browser",
+    });
+    if (eventSession.status !== "admitted") throw new Error("Expected Event Admin Session.");
+    const eventRotation = await authority.rotateGrant(eventAdmin.grantId, technical);
+    expect(eventRotation).toMatchObject({
+      status: "updated",
+      oneTime: true,
+      noStore: true,
+      affectedSessionCount: 1,
+      qrCredential: expect.any(String),
+      code: expect.any(String),
+    });
+
+    const pitch = await authority.createPitchManagerGrant({
+      authority: technical,
+      scope: {
+        eventId: "rotation-event",
+        gameDayId: "rotation-day",
+        gameDayDate: "2026-03-20",
+        eventTimeZone: "UTC",
+        pitchId: "rotation-pitch",
+      },
+    });
+    if (pitch.status !== "created") throw new Error("Expected Pitch Manager Grant.");
+    const pitchRotation = await authority.rotateGrant(pitch.grantId, technical);
+    expect(pitchRotation).toMatchObject({
+      status: "updated",
+      qrCredential: expect.any(String),
+      code: expect.any(String),
+      oneTime: true,
+      noStore: true,
+    });
+
+    const control = await authority.createControlGrant({
+      authority: technical,
+      scope: {
+        eventId: "rotation-event",
+        gameDayId: "rotation-day",
+        pitchId: "rotation-pitch",
+        pitchSlotId: "rotation-slot",
+      },
+    });
+    if (control.status !== "created") throw new Error("Expected Control Grant.");
+    const controlRotation = await authority.rotateGrant(control.grantId, technical);
+    expect(controlRotation).toMatchObject({
+      status: "updated",
+      qrCredential: expect.any(String),
+      code: expect.any(String),
+      oneTime: true,
+      noStore: true,
+    });
+    expect(JSON.stringify(eventRotation)).not.toContain("grantType");
+    expect(JSON.stringify(eventRotation)).not.toContain("scope");
+    void eventSession;
+  });
+
   test("rejects repeated status and session revocation transitions without mutation", async () => {
     const storage = createInMemoryFoundationStorage();
     const authority = createGrantAuthority(

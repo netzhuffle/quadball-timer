@@ -25,8 +25,10 @@ import type {
   TypedGrantAdmission,
   TypedGrantAdmissionThrottled,
   TypedGrantAuthority,
+  TypedGrantCodeCreated,
   TypedGrantMutation,
   TypedGrantReveal,
+  TypedGrantRotated,
   TypedSessionSummary,
 } from "@/lib/grant-management";
 import {
@@ -89,6 +91,13 @@ export type ControlGrantProjection = {
   expiresAtMs: number | null;
   eligibility: "eligible" | "empty" | "conflict" | "mismatch" | "unavailable" | "terminal";
   eventGameId: string | null;
+};
+
+export type GrantCodeProjection = {
+  grantId: string;
+  grantVersion: string;
+  state: "absent" | "present" | "disabled" | "erased";
+  formatVersion: 1 | null;
 };
 
 export type EventHubProjection = {
@@ -186,7 +195,7 @@ export type EventAdministration = {
     gameDayId: unknown,
     pitchId: unknown,
     authority: EventAdministrationAuthority,
-  ): Promise<EventAdministrationMutationOutcome<TypedGrantMutation>>;
+  ): Promise<EventAdministrationMutationOutcome<TypedGrantRotated | TypedGrantMutation>>;
   disablePitchManagerGrant(
     eventId: unknown,
     gameDayId: unknown,
@@ -247,7 +256,7 @@ export type EventAdministration = {
     pitchId: unknown,
     pitchSlotId: unknown,
     authority: EventAdministrationAuthority,
-  ): Promise<EventAdministrationMutationOutcome<TypedGrantMutation>>;
+  ): Promise<EventAdministrationMutationOutcome<TypedGrantRotated | TypedGrantMutation>>;
   inspectEventAdminGrant(
     eventId: unknown,
     authority: EventAdministrationAuthority,
@@ -259,7 +268,7 @@ export type EventAdministration = {
   rotateEventAdminGrant(
     eventId: unknown,
     authority: TechnicalAdminAuthority,
-  ): Promise<EventAdministrationOutcome<TypedGrantMutation>>;
+  ): Promise<EventAdministrationMutationOutcome<TypedGrantRotated | TypedGrantMutation>>;
   disableEventAdminGrant(
     eventId: unknown,
     authority: TechnicalAdminAuthority,
@@ -272,14 +281,94 @@ export type EventAdministration = {
     eventId: unknown,
     authority: TechnicalAdminAuthority,
   ): Promise<EventAdministrationOutcome<TypedGrantMutation>>;
+  inspectEventAdminGrantCode(
+    eventId: unknown,
+    authority: TechnicalAdminAuthority,
+  ): Promise<EventAdministrationOutcome<GrantCodeProjection | null>>;
+  createEventAdminGrantCode(
+    eventId: unknown,
+    authority: TechnicalAdminAuthority,
+  ): Promise<EventAdministrationMutationOutcome<TypedGrantCodeCreated>>;
+  replaceEventAdminGrantCode(
+    eventId: unknown,
+    authority: TechnicalAdminAuthority,
+  ): Promise<EventAdministrationMutationOutcome<TypedGrantCodeCreated>>;
+  disableEventAdminGrantCode(
+    eventId: unknown,
+    authority: TechnicalAdminAuthority,
+  ): Promise<EventAdministrationMutationOutcome<TypedGrantMutation>>;
+  inspectPitchManagerGrantCode(
+    eventId: unknown,
+    gameDayId: unknown,
+    pitchId: unknown,
+    authority: EventAdministrationAuthority,
+  ): Promise<EventAdministrationOutcome<GrantCodeProjection | null>>;
+  createPitchManagerGrantCode(
+    eventId: unknown,
+    gameDayId: unknown,
+    pitchId: unknown,
+    authority: EventAdministrationAuthority,
+  ): Promise<EventAdministrationMutationOutcome<TypedGrantCodeCreated>>;
+  replacePitchManagerGrantCode(
+    eventId: unknown,
+    gameDayId: unknown,
+    pitchId: unknown,
+    authority: EventAdministrationAuthority,
+  ): Promise<EventAdministrationMutationOutcome<TypedGrantCodeCreated>>;
+  disablePitchManagerGrantCode(
+    eventId: unknown,
+    gameDayId: unknown,
+    pitchId: unknown,
+    authority: EventAdministrationAuthority,
+  ): Promise<EventAdministrationMutationOutcome<TypedGrantMutation>>;
+  inspectControlGrantCode(
+    eventId: unknown,
+    gameDayId: unknown,
+    pitchId: unknown,
+    pitchSlotId: unknown,
+    authority: EventAdministrationAuthority,
+  ): Promise<EventAdministrationOutcome<GrantCodeProjection | null>>;
+  createControlGrantCode(
+    eventId: unknown,
+    gameDayId: unknown,
+    pitchId: unknown,
+    pitchSlotId: unknown,
+    authority: EventAdministrationAuthority,
+  ): Promise<EventAdministrationMutationOutcome<TypedGrantCodeCreated>>;
+  replaceControlGrantCode(
+    eventId: unknown,
+    gameDayId: unknown,
+    pitchId: unknown,
+    pitchSlotId: unknown,
+    authority: EventAdministrationAuthority,
+  ): Promise<EventAdministrationMutationOutcome<TypedGrantCodeCreated>>;
+  disableControlGrantCode(
+    eventId: unknown,
+    gameDayId: unknown,
+    pitchId: unknown,
+    pitchSlotId: unknown,
+    authority: EventAdministrationAuthority,
+  ): Promise<EventAdministrationMutationOutcome<TypedGrantMutation>>;
   admitEventAdmin(input: {
     qrCredential: unknown;
     browserContext: unknown;
     deviceClass?: unknown;
     browserClass?: unknown;
   }): Promise<TypedGrantAdmission | TypedGrantAdmissionThrottled>;
+  admitEventAdminCode(input: {
+    grantCode: unknown;
+    browserContext: unknown;
+    deviceClass?: unknown;
+    browserClass?: unknown;
+  }): Promise<TypedGrantAdmission | TypedGrantAdmissionThrottled>;
   admitPitchManager(input: {
     qrCredential: unknown;
+    browserContext: unknown;
+    deviceClass?: unknown;
+    browserClass?: unknown;
+  }): Promise<TypedGrantAdmission | TypedGrantAdmissionThrottled>;
+  admitPitchManagerCode(input: {
+    grantCode: unknown;
     browserContext: unknown;
     deviceClass?: unknown;
     browserClass?: unknown;
@@ -579,6 +668,60 @@ export function createEventAdministration(
       );
     },
 
+    async inspectPitchManagerGrantCode(eventIdInput, gameDayIdInput, pitchIdInput, authority) {
+      const ids = validateScopeIds(eventIdInput, gameDayIdInput, pitchIdInput);
+      if (!ids.ok) return invalid(ids.error);
+      try {
+        return await options.storage.transaction((transaction) => {
+          if (
+            authorizeEventScopeInTransaction(
+              options,
+              transaction,
+              ids.value.eventId,
+              authority,
+              true,
+            ) === null
+          )
+            return unauthorized();
+          const grant = findPitchManagerGrantInTransaction(transaction, ids.value);
+          return accepted(grant === null ? null : projectGrantCode(grant));
+        });
+      } catch {
+        return unavailable();
+      }
+    },
+
+    async createPitchManagerGrantCode(eventIdInput, gameDayIdInput, pitchIdInput, authority) {
+      return managePitchManagerGrantCode(
+        options,
+        eventIdInput,
+        gameDayIdInput,
+        pitchIdInput,
+        authority,
+        "createGrantCode",
+      );
+    },
+    async replacePitchManagerGrantCode(eventIdInput, gameDayIdInput, pitchIdInput, authority) {
+      return managePitchManagerGrantCode(
+        options,
+        eventIdInput,
+        gameDayIdInput,
+        pitchIdInput,
+        authority,
+        "replaceGrantCode",
+      );
+    },
+    async disablePitchManagerGrantCode(eventIdInput, gameDayIdInput, pitchIdInput, authority) {
+      return (await managePitchManagerGrantCode(
+        options,
+        eventIdInput,
+        gameDayIdInput,
+        pitchIdInput,
+        authority,
+        "disableGrantCode",
+      )) as EventAdministrationMutationOutcome<TypedGrantMutation>;
+    },
+
     async createControlGrant(
       eventIdInput,
       gameDayIdInput,
@@ -849,19 +992,101 @@ export function createEventAdministration(
             true,
           );
           return {
-            ...accepted({
-              status: "updated" as const,
-              grantId: result.grantId,
-              grantVersion: result.grantVersion,
-              affectedSessionCount:
-                "affectedSessionCount" in result ? result.affectedSessionCount : 0,
-            }),
+            ...accepted(result),
             sessionExpiresAtMs: refreshed?.sessionExpiresAtMs ?? authorization.sessionExpiresAtMs,
           };
         });
       } catch {
         return unavailable();
       }
+    },
+
+    async inspectControlGrantCode(
+      eventIdInput,
+      gameDayIdInput,
+      pitchIdInput,
+      pitchSlotIdInput,
+      authority,
+    ) {
+      const ids = validateControlScopeIds(
+        eventIdInput,
+        gameDayIdInput,
+        pitchIdInput,
+        pitchSlotIdInput,
+      );
+      if (!ids.ok) return invalid(ids.error);
+      try {
+        return await options.storage.transaction((transaction) => {
+          const scope = readControlGrantScope(transaction, ids.value);
+          if (scope === null) return notFound("Pitch Slot was not found.");
+          if (
+            authorizeControlManagementInTransaction(
+              options,
+              transaction,
+              ids.value,
+              authority,
+              true,
+            ) === null
+          )
+            return unauthorized();
+          const grant = findControlGrantInTransaction(transaction, scope);
+          return accepted(grant === null ? null : projectGrantCode(grant));
+        });
+      } catch {
+        return unavailable();
+      }
+    },
+
+    async createControlGrantCode(
+      eventIdInput,
+      gameDayIdInput,
+      pitchIdInput,
+      pitchSlotIdInput,
+      authority,
+    ) {
+      return manageControlGrantCode(
+        options,
+        eventIdInput,
+        gameDayIdInput,
+        pitchIdInput,
+        pitchSlotIdInput,
+        authority,
+        "createGrantCode",
+      );
+    },
+    async replaceControlGrantCode(
+      eventIdInput,
+      gameDayIdInput,
+      pitchIdInput,
+      pitchSlotIdInput,
+      authority,
+    ) {
+      return manageControlGrantCode(
+        options,
+        eventIdInput,
+        gameDayIdInput,
+        pitchIdInput,
+        pitchSlotIdInput,
+        authority,
+        "replaceGrantCode",
+      );
+    },
+    async disableControlGrantCode(
+      eventIdInput,
+      gameDayIdInput,
+      pitchIdInput,
+      pitchSlotIdInput,
+      authority,
+    ) {
+      return (await manageControlGrantCode(
+        options,
+        eventIdInput,
+        gameDayIdInput,
+        pitchIdInput,
+        pitchSlotIdInput,
+        authority,
+        "disableGrantCode",
+      )) as EventAdministrationOutcome<TypedGrantMutation>;
     },
 
     async inspectEventAdminGrant(eventIdInput, authority) {
@@ -920,6 +1145,28 @@ export function createEventAdministration(
       return manageEventAdminGrant(options, eventIdInput, authority, "reactivateGrant");
     },
 
+    async inspectEventAdminGrantCode(eventIdInput, authority) {
+      if (!isTechnicalAdminAuthority(authority)) return unauthorized();
+      const grant = await findEventAdminGrant(options, eventIdInput);
+      if (grant.status !== "accepted") return grant;
+      return accepted(grant.value === null ? null : projectGrantCode(grant.value));
+    },
+
+    async createEventAdminGrantCode(eventIdInput, authority) {
+      return manageEventAdminGrantCode(options, eventIdInput, authority, "createGrantCode");
+    },
+    async replaceEventAdminGrantCode(eventIdInput, authority) {
+      return manageEventAdminGrantCode(options, eventIdInput, authority, "replaceGrantCode");
+    },
+    async disableEventAdminGrantCode(eventIdInput, authority) {
+      return (await manageEventAdminGrantCode(
+        options,
+        eventIdInput,
+        authority,
+        "disableGrantCode",
+      )) as EventAdministrationOutcome<TypedGrantMutation>;
+    },
+
     async admitEventAdmin(input) {
       if (
         typeof input.qrCredential !== "string" ||
@@ -927,7 +1174,7 @@ export function createEventAdministration(
         input.qrCredential.length === 0 ||
         input.browserContext.length === 0
       )
-        return options.grants.admitGrant({ qrCredential: "", browserContext: "" });
+        return options.grants.admitEventAdminGrant({ qrCredential: "", browserContext: "" });
       return options.grants.admitEventAdminGrant({
         qrCredential: input.qrCredential,
         browserContext: input.browserContext,
@@ -943,9 +1190,41 @@ export function createEventAdministration(
         input.qrCredential.length === 0 ||
         input.browserContext.length === 0
       )
-        return options.grants.admitGrant({ qrCredential: "", browserContext: "" });
+        return options.grants.admitPitchManagerGrant({ qrCredential: "", browserContext: "" });
       return options.grants.admitPitchManagerGrant({
         qrCredential: input.qrCredential,
+        browserContext: input.browserContext,
+        deviceClass: typeof input.deviceClass === "string" ? input.deviceClass : undefined,
+        browserClass: typeof input.browserClass === "string" ? input.browserClass : undefined,
+      });
+    },
+
+    async admitEventAdminCode(input) {
+      if (
+        typeof input.grantCode !== "string" ||
+        typeof input.browserContext !== "string" ||
+        input.grantCode.length === 0 ||
+        input.browserContext.length === 0
+      )
+        return options.grants.admitEventAdminGrantCode({ grantCode: "", browserContext: "" });
+      return options.grants.admitEventAdminGrantCode({
+        grantCode: input.grantCode,
+        browserContext: input.browserContext,
+        deviceClass: typeof input.deviceClass === "string" ? input.deviceClass : undefined,
+        browserClass: typeof input.browserClass === "string" ? input.browserClass : undefined,
+      });
+    },
+
+    async admitPitchManagerCode(input) {
+      if (
+        typeof input.grantCode !== "string" ||
+        typeof input.browserContext !== "string" ||
+        input.grantCode.length === 0 ||
+        input.browserContext.length === 0
+      )
+        return options.grants.admitPitchManagerGrantCode({ grantCode: "", browserContext: "" });
+      return options.grants.admitPitchManagerGrantCode({
+        grantCode: input.grantCode,
         browserContext: input.browserContext,
         deviceClass: typeof input.deviceClass === "string" ? input.deviceClass : undefined,
         browserClass: typeof input.browserClass === "string" ? input.browserClass : undefined,
@@ -959,13 +1238,16 @@ export function createEventAdministration(
         input.qrCredential.length === 0 ||
         input.browserContext.length === 0
       )
-        return options.grants.admitGrant({ qrCredential: "", browserContext: "" });
-      return options.grants.admitGrant({
-        qrCredential: input.qrCredential,
-        browserContext: input.browserContext,
-        deviceClass: typeof input.deviceClass === "string" ? input.deviceClass : undefined,
-        browserClass: typeof input.browserClass === "string" ? input.browserClass : undefined,
-      });
+        return options.grants.admitGrant({ qrCredential: "", browserContext: "" }, GRANT_TYPE);
+      return options.grants.admitGrant(
+        {
+          qrCredential: input.qrCredential,
+          browserContext: input.browserContext,
+          deviceClass: typeof input.deviceClass === "string" ? input.deviceClass : undefined,
+          browserClass: typeof input.browserClass === "string" ? input.browserClass : undefined,
+        },
+        GRANT_TYPE,
+      );
     },
 
     async leaveEventAdminSession(sessionBearer) {
@@ -1564,7 +1846,7 @@ async function managePitchManagerGrant(
   pitchIdInput: unknown,
   authority: EventAdministrationAuthority,
   operation: "rotateGrant" | "disableGrant" | "revokeGrant" | "reactivateGrant",
-): Promise<EventAdministrationMutationOutcome<TypedGrantMutation>> {
+): Promise<EventAdministrationMutationOutcome<TypedGrantRotated | TypedGrantMutation>> {
   const grant = await findPitchManagerGrant(options, eventIdInput, gameDayIdInput, pitchIdInput);
   if (grant.status !== "accepted") return grant;
   if (grant.value === null) return notFound("Pitch Manager Grant was not found.");
@@ -1825,7 +2107,9 @@ async function findEventAdminGrant(
   }
 }
 
-function grantMutationRejection(result: TypedGrantMutation): EventAdministrationOutcome<never> {
+function grantMutationRejection<T = never>(
+  result: TypedGrantMutation,
+): EventAdministrationOutcome<T> {
   if (result.status === "updated") return invalid("Grant creation returned an invalid outcome.");
   if (result.reason === "unauthorized") return unauthorized();
   if (result.reason === "not-found") return notFound(result.detail ?? "Grant was not found.");
@@ -1845,13 +2129,167 @@ async function manageEventAdminGrant(
   eventIdInput: unknown,
   authority: TechnicalAdminAuthority,
   operation: "rotateGrant" | "disableGrant" | "revokeGrant" | "reactivateGrant",
-): Promise<EventAdministrationOutcome<TypedGrantMutation>> {
+): Promise<EventAdministrationMutationOutcome<TypedGrantRotated | TypedGrantMutation>> {
   if (!isTechnicalAdminAuthority(authority)) return unauthorized();
   const grant = await findEventAdminGrant(options, eventIdInput);
   if (grant.status !== "accepted") return grant;
   if (grant.value === null) return notFound("Event Admin Grant was not found.");
   const result = await options.grants[operation](grant.value.grantId, authority);
   return result.status === "updated" ? accepted(result) : grantMutationRejection(result);
+}
+
+async function manageEventAdminGrantCode(
+  options: EventAdministrationOptions,
+  eventIdInput: unknown,
+  authority: TechnicalAdminAuthority,
+  operation: "createGrantCode" | "replaceGrantCode" | "disableGrantCode",
+): Promise<EventAdministrationMutationOutcome<TypedGrantCodeCreated>> {
+  if (!isTechnicalAdminAuthority(authority)) return mutationFailure(unauthorized());
+  const grant = await findEventAdminGrant(options, eventIdInput);
+  if (grant.status !== "accepted") return mutationFailure(grant);
+  if (grant.value === null) return mutationFailure(notFound("Event Admin Grant was not found."));
+  if (operation === "disableGrantCode")
+    return (await disableGrantCodeMutation(
+      options.grants,
+      grant.value.grantId,
+      authority,
+      null,
+    )) as EventAdministrationMutationOutcome<TypedGrantCodeCreated>;
+  return createGrantCodeMutation(options.grants, grant.value.grantId, authority, operation);
+}
+
+async function managePitchManagerGrantCode(
+  options: EventAdministrationOptions,
+  eventIdInput: unknown,
+  gameDayIdInput: unknown,
+  pitchIdInput: unknown,
+  authority: EventAdministrationAuthority,
+  operation: "createGrantCode" | "replaceGrantCode" | "disableGrantCode",
+): Promise<EventAdministrationMutationOutcome<TypedGrantCodeCreated>> {
+  const grant = await findPitchManagerGrant(options, eventIdInput, gameDayIdInput, pitchIdInput);
+  if (grant.status !== "accepted") return mutationFailure(grant);
+  if (grant.value === null) return mutationFailure(notFound("Pitch Manager Grant was not found."));
+  const authorization = await authorizePitchManagerManagement(options, grant.value, authority);
+  if (authorization === null) return mutationFailure(unauthorized());
+  if (operation === "disableGrantCode")
+    return (await disableGrantCodeMutation(
+      options.grants,
+      grant.value.grantId,
+      authority,
+      authorization.sessionExpiresAtMs,
+    )) as EventAdministrationMutationOutcome<TypedGrantCodeCreated>;
+  return createGrantCodeMutation(
+    options.grants,
+    grant.value.grantId,
+    authority,
+    operation,
+    authorization.sessionExpiresAtMs,
+  );
+}
+
+async function manageControlGrantCode(
+  options: EventAdministrationOptions,
+  eventIdInput: unknown,
+  gameDayIdInput: unknown,
+  pitchIdInput: unknown,
+  pitchSlotIdInput: unknown,
+  authority: EventAdministrationAuthority,
+  operation: "createGrantCode" | "replaceGrantCode" | "disableGrantCode",
+): Promise<EventAdministrationMutationOutcome<TypedGrantCodeCreated>> {
+  const ids = validateControlScopeIds(eventIdInput, gameDayIdInput, pitchIdInput, pitchSlotIdInput);
+  if (!ids.ok) return mutationFailure(invalid(ids.error));
+  const grant = await findControlGrant(options, ids.value);
+  if (grant.status !== "accepted") return mutationFailure(grant);
+  if (grant.value === null) return mutationFailure(notFound("Control Grant was not found."));
+  const authorization = await authorizeControlGrantManagement(options, ids.value, authority);
+  if (authorization === null) return mutationFailure(unauthorized());
+  if (operation === "disableGrantCode")
+    return (await disableGrantCodeMutation(
+      options.grants,
+      grant.value.grantId,
+      authority,
+      authorization.sessionExpiresAtMs,
+    )) as EventAdministrationMutationOutcome<TypedGrantCodeCreated>;
+  return createGrantCodeMutation(
+    options.grants,
+    grant.value.grantId,
+    authority,
+    operation,
+    authorization.sessionExpiresAtMs,
+  );
+}
+
+async function createGrantCodeMutation(
+  grants: TypedGrantAuthority,
+  grantId: string,
+  authority: EventAdministrationAuthority,
+  operation: "createGrantCode" | "replaceGrantCode",
+  sessionExpiresAtMs: number | null = null,
+): Promise<EventAdministrationMutationOutcome<TypedGrantCodeCreated>> {
+  const result = await grants[operation](grantId, authority);
+  if (result.status === "created" || result.status === "replaced")
+    return { ...accepted(result), sessionExpiresAtMs };
+  return grantMutationRejection<TypedGrantCodeCreated>(result as TypedGrantMutation);
+}
+
+function mutationFailure<T>(
+  result: EventAdministrationOutcome<unknown>,
+): EventAdministrationMutationOutcome<T> {
+  if (result.status === "accepted")
+    return {
+      status: "retryable-failure",
+      detail: "Event Administration is temporarily unavailable.",
+    };
+  return result;
+}
+
+async function disableGrantCodeMutation(
+  grants: TypedGrantAuthority,
+  grantId: string,
+  authority: EventAdministrationAuthority,
+  sessionExpiresAtMs: number | null,
+): Promise<EventAdministrationMutationOutcome<TypedGrantMutation>> {
+  const result = await grants.disableGrantCode(grantId, authority);
+  return result.status === "updated"
+    ? { ...accepted(result), sessionExpiresAtMs }
+    : grantMutationRejection(result);
+}
+
+async function findControlGrant(
+  options: EventAdministrationOptions,
+  ids: ControlScopeIds,
+): Promise<EventAdministrationOutcome<StoredGrant | null>> {
+  try {
+    return await options.storage.transaction((transaction) => {
+      const scope = readControlGrantScope(transaction, ids);
+      return accepted(scope === null ? null : findControlGrantInTransaction(transaction, scope));
+    });
+  } catch {
+    return unavailable();
+  }
+}
+
+async function authorizeControlGrantManagement(
+  options: EventAdministrationOptions,
+  ids: ControlScopeIds,
+  authority: EventAdministrationAuthority,
+): Promise<{ sessionExpiresAtMs: number | null } | null> {
+  try {
+    return await options.storage.transaction((transaction) =>
+      authorizeControlManagementInTransaction(options, transaction, ids, authority),
+    );
+  } catch {
+    return null;
+  }
+}
+
+function projectGrantCode(grant: StoredGrant): GrantCodeProjection {
+  return {
+    grantId: grant.grantId,
+    grantVersion: grant.grantVersion,
+    state: grant.code?.state ?? "absent",
+    formatVersion: grant.code?.formatVersion ?? null,
+  };
 }
 
 function projectGrant(grant: StoredGrant): EventAdminGrantProjection {

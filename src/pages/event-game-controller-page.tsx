@@ -74,6 +74,9 @@ type ClockReceiptAnchor = {
 export function EventGameControllerPage() {
   const persisted = readPersistedControllerSession();
   const [qrCredential, setQrCredential] = useState("");
+  const [grantCode, setGrantCode] = useState("");
+  const qrCredentialInputRef = useRef<HTMLInputElement>(null);
+  const grantCodeInputRef = useRef<HTMLInputElement>(null);
   const [sessionBearer, setSessionBearer] = useState<string | null>(
     persisted?.sessionBearer ?? null,
   );
@@ -187,6 +190,12 @@ export function EventGameControllerPage() {
   }, [eventGameId, sessionBearer]);
 
   async function openController() {
+    const hasQrCredential = qrCredential.length > 0;
+    const hasGrantCode = grantCode.length > 0;
+    if (hasQrCredential === hasGrantCode) {
+      setMessage("Enter exactly one Controller QR credential or Grant Code.");
+      return;
+    }
     setBusy(true);
     setMessage(null);
     clearReplayAuthority();
@@ -197,10 +206,14 @@ export function EventGameControllerPage() {
     }
     try {
       const response = await postJson<ControllerOpenResponse>("/api/event-control/open", {
-        qrCredential,
+        ...(grantCode.length > 0 ? { grantCode } : { qrCredential }),
         browserContext,
       });
       if (response.status !== "opened") throw new Error("open failed");
+      setQrCredential("");
+      setGrantCode("");
+      if (qrCredentialInputRef.current !== null) qrCredentialInputRef.current.value = "";
+      if (grantCodeInputRef.current !== null) grantCodeInputRef.current.value = "";
       setSessionBearer(response.session.sessionBearer);
       setEventGameId(response.eventGameId);
       receiveProjection(response.projection);
@@ -701,6 +714,8 @@ export function EventGameControllerPage() {
       currentEventGameId,
     );
     setClockCorrectionInput("");
+    setQrCredential("");
+    setGrantCode("");
   }
 
   function emergencyClockTakeover() {
@@ -868,10 +883,26 @@ export function EventGameControllerPage() {
                 <Label htmlFor="control-grant">Active Pitch Slot Control Grant QR</Label>
                 <Input
                   id="control-grant"
+                  ref={qrCredentialInputRef}
                   value={qrCredential}
                   onChange={(event) => setQrCredential(event.target.value)}
+                  onInput={(event) => setQrCredential(event.currentTarget.value)}
                   autoComplete="off"
                   placeholder="Scan or paste the QR credential"
+                  disabled={busy}
+                />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="control-grant-code">Radio Grant Code</Label>
+                <Input
+                  id="control-grant-code"
+                  ref={grantCodeInputRef}
+                  type="password"
+                  value={grantCode}
+                  onChange={(event) => setGrantCode(event.target.value)}
+                  onInput={(event) => setGrantCode(event.currentTarget.value)}
+                  autoComplete="off"
+                  placeholder="two words and three digits"
                   disabled={busy}
                 />
               </div>

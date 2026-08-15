@@ -47,8 +47,19 @@ import {
   unauthorizedGrant,
   unavailableGrant,
 } from "@/lib/grant-management-results";
-import { GRANT_CODE_KIND, GRANT_TYPE, type ControlGrantScope } from "@/lib/grant-types";
+import {
+  GRANT_CODE_KIND,
+  GRANT_TYPE,
+  type ControlGrantScope,
+  type GrantType,
+} from "@/lib/grant-types";
 import { validateOpaqueIdentifier } from "@/lib/validation-policy";
+import {
+  grantTypeMatchesExpected,
+  resolveControlGrantAdmission,
+  sessionExpiresAtMsForGrant,
+  validateExpectedGrantScope,
+} from "@/lib/grant-admission-policy";
 
 export async function createGrantCode(
   storage: FoundationStorage,
@@ -215,6 +226,7 @@ export async function admitGrantCode(
   storage: FoundationStorage,
   options: GrantAuthorityOptions,
   input: unknown,
+  expectedGrantType?: GrantType,
 ): Promise<TypedGrantAdmission | ReturnType<typeof grantAdmissionThrottled>> {
   const record = isGrantRecord(input) ? input : {};
   const browserContext = record.browserContext;
@@ -233,9 +245,20 @@ export async function admitGrantCode(
       const storedGrant = grantTransaction.findGrantByCodeLookupDigest(
         grantCodeLookupDigest(code, options.keyRing),
       );
+      if (storedGrant !== null && !grantTypeMatchesExpected(storedGrant, expectedGrantType)) {
+        recordAdmissionFailure(transaction, "code", budget.sourceDigest, nowMs);
+        return GENERIC_GRANT_ADMISSION_FAILURE;
+      }
       const grant =
         storedGrant === null ? null : expireGrantIfDue(grantTransaction, options, storedGrant);
       if (grant === null || grant.status !== "active" || grant.code?.state !== "present") {
+        recordAdmissionFailure(transaction, "code", budget.sourceDigest, nowMs);
+        return GENERIC_GRANT_ADMISSION_FAILURE;
+      }
+      if (
+        expectedGrantType !== undefined &&
+        !validateExpectedGrantScope(transaction, grant, expectedGrantType)
+      ) {
         recordAdmissionFailure(transaction, "code", budget.sourceDigest, nowMs);
         return GENERIC_GRANT_ADMISSION_FAILURE;
       }
@@ -253,15 +276,16 @@ export async function admitGrantCode(
       }
       let eventGameId: string | null = null;
       if (grant.grantType === GRANT_TYPE) {
-        const resolved = options.controlScopeResolver.resolve(grant.scope as ControlGrantScope);
-        if (
-          resolved.status !== "eligible" ||
-          !validateOpaqueIdentifier(resolved.eventGameId, "eventGameId").ok
-        ) {
+        const resolvedEventGameId = resolveControlGrantAdmission(
+          options,
+          transaction,
+          grant.scope as ControlGrantScope,
+        );
+        if (resolvedEventGameId === null) {
           recordAdmissionFailure(transaction, "code", budget.sourceDigest, nowMs);
           return GENERIC_GRANT_ADMISSION_FAILURE;
         }
-        eventGameId = resolved.eventGameId;
+        eventGameId = resolvedEventGameId;
       }
       const lookupVersion = options.keyRing.lookup.currentVersion;
       const contextDigest = computeBrowserContextDigest(
@@ -344,6 +368,7 @@ export async function admitGrantCode(
         eventGameId,
         grantSessionId: session.sessionId,
         sessionBearer: bearer,
+        sessionExpiresAtMs: sessionExpiresAtMsForGrant(grant, nowMs),
       };
     });
   } catch {

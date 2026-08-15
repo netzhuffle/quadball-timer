@@ -69,6 +69,37 @@ describe("Pitch Manager early response headers", () => {
   });
 });
 
+describe("Event Admin admission response headers", () => {
+  test("keeps malformed and unavailable admission failures sensitive", async () => {
+    await withServer({}, async (serverUrl) => {
+      const malformed = await fetch(new URL("/api/event-admin/admit", serverUrl), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: "{",
+      });
+      await expectSensitiveFailure(malformed, 400, { error: "Unable to admit this Grant." });
+
+      const missingCredential = await fetch(new URL("/api/event-admin/admit", serverUrl), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      await expectSensitiveFailure(missingCredential, 400, {
+        error: "Unable to admit this Grant.",
+      });
+    });
+
+    await withServer({ incompleteGrantKeys: true }, async (serverUrl) => {
+      const unavailable = await fetch(new URL("/api/event-admin/admit", serverUrl), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ qrCredential: "opaque" }),
+      });
+      await expectSensitiveFailure(unavailable, 503, { error: "Authentication failed." });
+    });
+  });
+});
+
 async function expectSensitiveFailure(
   response: Response,
   status: number,

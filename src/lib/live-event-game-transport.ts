@@ -22,7 +22,8 @@ export type LiveEventGameControlTransport = {
 
 export type LiveEventGameControlTransportTarget = {
   openController(input: {
-    qrCredential: string;
+    qrCredential?: string;
+    grantCode?: string;
     browserContext: string;
   }): Promise<OpenControllerResult>;
   refreshController(input: {
@@ -74,10 +75,13 @@ export function createLiveEventGameControlTransport(
         SHARED_LIMITS.transport.httpJsonBodyBytes,
       );
       if (!body.ok || !isRecord(body.body)) return unavailable();
-      if (typeof body.body.qrCredential !== "string") return unavailable();
+      const qrCredential =
+        typeof body.body.qrCredential === "string" ? body.body.qrCredential : undefined;
+      const grantCode = typeof body.body.grantCode === "string" ? body.body.grantCode : undefined;
+      if ((qrCredential === undefined) === (grantCode === undefined)) return unavailable();
 
       const result = await control.openController({
-        qrCredential: body.body.qrCredential,
+        ...(qrCredential === undefined ? { grantCode } : { qrCredential }),
         browserContext:
           typeof body.body.browserContext === "string" ? body.body.browserContext : "phone",
       });
