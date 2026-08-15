@@ -86,6 +86,10 @@ import {
 } from "@/lib/ad-hoc-games";
 import { readBuiltRuntimeIdentity, readRunningReleaseIdentity } from "@/lib/release-identity";
 import {
+  availableNonControllerCapacity,
+  type ControllerCapacityInput,
+} from "@/lib/controller-capacity";
+import {
   AD_HOC_EVENT_RESERVED_CONNECTION_CAPACITY,
   AD_HOC_EVENT_TOTAL_CONNECTION_CAPACITY,
   AD_HOC_MAX_CONNECTED_CONTROLLERS,
@@ -229,7 +233,7 @@ async function startServer() {
           process.env.EVENT_RESERVED_CONNECTION_CAPACITY,
           AD_HOC_EVENT_RESERVED_CONNECTION_CAPACITY,
         ),
-        activeConnections: () => eventCapacitySource(),
+        activeControllerSessions: () => eventCapacitySource(),
       },
       store:
         environment === "test" && !process.env.AD_HOC_DATABASE?.trim()
@@ -592,16 +596,16 @@ async function startServer() {
 
           const socketId = crypto.randomUUID();
           const totalSocketCapacity = calculateAdHocUpgradeCapacity({
-            eventTotalConnections: readRuntimeCapacity(
+            totalConnections: readRuntimeCapacity(
               process.env.EVENT_TOTAL_CONNECTION_CAPACITY,
               AD_HOC_EVENT_TOTAL_CONNECTION_CAPACITY,
             ),
-            eventReservedConnections: readRuntimeCapacity(
+            reservedConnections: readRuntimeCapacity(
               process.env.EVENT_RESERVED_CONNECTION_CAPACITY,
               AD_HOC_EVENT_RESERVED_CONNECTION_CAPACITY,
             ),
-            activeEventConnections: eventCapacitySource(),
-            adHocSocketCeiling: readRuntimeCapacity(
+            activeControllerSessions: eventCapacitySource(),
+            maxConnectedSockets: readRuntimeCapacity(
               process.env.AD_HOC_MAX_CONNECTED_SOCKETS,
               AD_HOC_MAX_CONNECTED_CONTROLLERS,
             ),
@@ -3168,17 +3172,10 @@ function readRuntimeCapacity(value: string | undefined, fallback: number): numbe
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
 }
 
-export function calculateAdHocUpgradeCapacity(input: {
-  eventTotalConnections: number;
-  eventReservedConnections: number;
-  activeEventConnections: number;
-  adHocSocketCeiling: number;
-}): number {
-  const eventTotal = Math.max(0, input.eventTotalConnections);
-  const eventReserve = Math.max(0, input.eventReservedConnections);
-  const activeEvent = Math.max(0, input.activeEventConnections);
-  const adHocCeiling = Math.max(0, input.adHocSocketCeiling);
-  return Math.max(0, Math.min(adHocCeiling, eventTotal - Math.max(eventReserve, activeEvent)));
+export function calculateAdHocUpgradeCapacity(
+  input: ControllerCapacityInput & { maxConnectedSockets: number },
+): number {
+  return availableNonControllerCapacity(input, input.maxConnectedSockets);
 }
 
 function releasePendingSocketReservation(socketId: string) {

@@ -607,14 +607,14 @@ describe("Ad Hoc resource budgets", () => {
   });
 
   test("counts socket instances before ownership and exposes Event reserve pressure", async () => {
-    let activeEventConnections = 0;
+    let activeControllerSessions = 0;
     const service = createAdHocGamesService({
       now: () => 1_000,
       maxConnectedSockets: 2,
       eventCapacity: {
         totalConnections: 3,
         reservedConnections: 1,
-        activeConnections: () => activeEventConnections,
+        activeControllerSessions: () => activeControllerSessions,
       },
     });
     const first = await service.create({ homeName: "One", awayName: "Away" });
@@ -658,7 +658,7 @@ describe("Ad Hoc resource budgets", () => {
       }),
     ).toBe(true);
     expect(service.getResourceMetrics().connectedControllers).toBe(1);
-    activeEventConnections = 1;
+    activeControllerSessions = 1;
     expect(service.getResourceMetrics().eventReservedCapacity).toMatchObject({
       active: 1,
       availableForAdHoc: 2,
