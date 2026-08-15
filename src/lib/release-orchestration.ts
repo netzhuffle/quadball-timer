@@ -34,6 +34,8 @@ export type ReleaseAttemptInput = {
 export type ReleaseEnvironmentOutcome = {
   environment: ReleaseEnvironment;
   status: "succeeded" | "failed";
+  /** The last meaningful lifecycle phase reached by this environment. */
+  phase: string;
   phases: string[];
   errorCode: string | null;
   rollbackReleaseAttemptId: string | null;
@@ -83,20 +85,30 @@ async function runEnvironmentAttempt(
   const phases: string[] = [];
   let releaseLock: (() => Promise<void> | void) | undefined;
   let previousRelease: { releaseAttemptId: string; schemaCompatibility: string } | null = null;
+  let phase = "lock-acquisition";
+  let activationAttempted = false;
   try {
     releaseLock = await environment.acquireLock();
     phases.push("lock-acquired");
+    phase = "configuration-verification";
     await environment.verifyConfiguration(manifest);
     phases.push("configuration-verified");
+    phase = "current-release-read";
     previousRelease = await environment.currentRelease();
+    phase = "staging";
     await environment.stage(manifest);
     phases.push("staged");
+    phase = "finalization";
     await environment.finalize(manifest);
     phases.push("finalized");
+    phase = "activation";
+    activationAttempted = true;
     await environment.activate(manifest);
     phases.push("activated");
+    phase = "verification";
     await environment.verify(manifest);
     phases.push("verified");
+    phase = "pruning";
     await environment.prune(
       [manifest.releaseAttemptId, previousRelease?.releaseAttemptId].filter(
         (value): value is string => value !== undefined,
@@ -106,6 +118,7 @@ async function runEnvironmentAttempt(
     return {
       environment: environment.environment,
       status: "succeeded",
+      phase: "verified",
       phases,
       errorCode: null,
       rollbackReleaseAttemptId: null,
@@ -118,6 +131,7 @@ async function runEnvironmentAttempt(
     }
     let rollbackReleaseAttemptId: string | null = null;
     if (
+      activationAttempted &&
       previousRelease !== null &&
       previousRelease.schemaCompatibility === manifest.schemaCompatibility
     ) {
@@ -134,6 +148,7 @@ async function runEnvironmentAttempt(
     return {
       environment: environment.environment,
       status: "failed",
+      phase,
       phases,
       errorCode,
       rollbackReleaseAttemptId,

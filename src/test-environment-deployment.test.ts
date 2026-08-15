@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { Buffer } from "node:buffer";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -77,6 +78,18 @@ describe("Test Environment deployment contract", () => {
     expect(activation).toContain("--staged-dir");
     expect(activation).toContain("release-attempt identity");
     expect(activation).toContain('check_health "$release_id" "$release_dir"');
+    expect(activation).toContain("check_representative_behavior");
+    expect(activation).toContain("/api/audience/events");
+    const websocketKeys = [
+      ...activation.matchAll(/Sec-WebSocket-Key:\s*([A-Za-z0-9+/]+={0,2})/gu),
+    ].map((match) => match[1]);
+    expect(websocketKeys).toHaveLength(1);
+    const [websocketKey] = websocketKeys;
+    expect(websocketKey).toBeDefined();
+    if (websocketKey === undefined) return;
+    const decodedWebSocketKey = Buffer.from(websocketKey, "base64");
+    expect(decodedWebSocketKey.byteLength).toBe(16);
+    expect(decodedWebSocketKey.toString("base64")).toBe(websocketKey);
     expect(activation).toContain('check_health "$previous_release_id" "$previous_release"');
     expect(activation).toContain(
       'check_release_identity "$selected_release_id" "$selected_release_dir"',

@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { Buffer } from "node:buffer";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -39,6 +40,24 @@ describe("Production deployment contract", () => {
     expect(workflow).toContain("needs: [deploy-test, deploy-production]");
   });
 
+  test("reports each environment outcome with release identity and bounded phase", () => {
+    const workflow = readFileSync(
+      join(repositoryRoot, ".github/workflows/deploy-production.yml"),
+      "utf8",
+    );
+
+    expect(workflow).toContain("Record Test deployment outcome");
+    expect(workflow).toContain("Record Production deployment outcome");
+    expect(workflow).toContain('echo "releaseAttemptId=$RELEASE_ATTEMPT"');
+    expect(workflow).toContain('echo "failureCategory=$failure_category"');
+    expect(workflow).toContain('"releaseAttemptId": "${RELEASE_ATTEMPT_ID}"');
+    expect(workflow).toContain('"phase": "${TEST_PHASE}"');
+    expect(workflow).toContain('"phase": "${PRODUCTION_PHASE}"');
+    expect(workflow).toContain(
+      'if [[ "$TEST_STATUS" != "success" || "$PRODUCTION_STATUS" != "success" ]]; then',
+    );
+  });
+
   test("preserves executable modes across the GitHub artifact boundary", () => {
     const workflow = readFileSync(
       join(repositoryRoot, ".github/workflows/deploy-production.yml"),
@@ -73,6 +92,18 @@ describe("Production deployment contract", () => {
     );
     expect(activation).toContain("check_release_identity");
     expect(activation).toContain('check_health "$release_id" "$release_dir"');
+    expect(activation).toContain("check_representative_behavior");
+    expect(activation).toContain("/api/audience/events");
+    const websocketKeys = [
+      ...activation.matchAll(/Sec-WebSocket-Key:\s*([A-Za-z0-9+/]+={0,2})/gu),
+    ].map((match) => match[1]);
+    expect(websocketKeys).toHaveLength(1);
+    const [websocketKey] = websocketKeys;
+    expect(websocketKey).toBeDefined();
+    if (websocketKey === undefined) return;
+    const decodedWebSocketKey = Buffer.from(websocketKey, "base64");
+    expect(decodedWebSocketKey.byteLength).toBe(16);
+    expect(decodedWebSocketKey.toString("base64")).toBe(websocketKey);
     expect(activation).toContain('check_health "$previous_release_id" "$previous_release"');
     expect(activation).toContain(
       'check_release_identity "$selected_release_id" "$selected_release_dir"',

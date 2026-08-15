@@ -109,6 +109,11 @@ jobs:
   deploy-test:
     if: github.ref == 'refs/heads/main'
     needs: build
+    outputs:
+      status: ${{ steps.deployment-outcome.outputs.status }}
+      phase: ${{ steps.deployment-outcome.outputs.phase }}
+      releaseAttemptId: ${{ steps.deployment-outcome.outputs.releaseAttemptId }}
+      failureCategory: ${{ steps.deployment-outcome.outputs.failureCategory }}
     runs-on: ubuntu-latest
     environment:
       name: test
@@ -123,6 +128,7 @@ jobs:
       - name: Safely extract and verify release bundle modes
         run: |
           set -euo pipefail
+          echo "DEPLOYMENT_PHASE=artifact-verification" >> "$GITHUB_ENV"
           archive="release-bundle.tar.gz"
           install -d -m 700 release
           while IFS= read -r member; do
@@ -169,6 +175,7 @@ jobs:
           DEPLOY_BASE: ${{ vars.TEST_DEPLOY_BASE }}
         run: |
           set -euo pipefail
+          echo "DEPLOYMENT_PHASE=staging-and-activation" >> "$GITHUB_ENV"
           : "${DEPLOY_HOST:?Missing TEST_HOST secret}"
           : "${DEPLOY_USER:?Missing TEST_USER secret}"
           base_dir="${DEPLOY_BASE:-/srv/quadball-timer-test}"
@@ -184,9 +191,44 @@ jobs:
           rsync -a -e "ssh ${ssh_opts}" release/ "${DEPLOY_USER}@${DEPLOY_HOST}:${stage_dir}/"
           ssh $ssh_opts "${DEPLOY_USER}@${DEPLOY_HOST}" "'${stage_dir}/deploy/activate-test-release.sh' --base-dir '${base_dir}' --staged-dir '${stage_dir}' --release '${release_id}'"
 
+      - name: Record Test deployment outcome
+        id: deployment-outcome
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+          RELEASE_ATTEMPT: ${{ env.RELEASE_ATTEMPT_ID }}
+          FAILED_PHASE: ${{ env.DEPLOYMENT_PHASE }}
+        run: |
+          set -euo pipefail
+          case "$JOB_STATUS" in
+            success)
+              phase="verified"
+              failure_category="none"
+              ;;
+            cancelled)
+              phase="${FAILED_PHASE:-deployment}"
+              failure_category="cancelled"
+              ;;
+            *)
+              phase="${FAILED_PHASE:-deployment}"
+              failure_category="${phase}-failed"
+              ;;
+          esac
+          {
+            echo "status=$JOB_STATUS"
+            echo "phase=$phase"
+            echo "releaseAttemptId=$RELEASE_ATTEMPT"
+            echo "failureCategory=$failure_category"
+          } >> "$GITHUB_OUTPUT"
+
   deploy-production:
     if: github.ref == 'refs/heads/main'
     needs: build
+    outputs:
+      status: ${{ steps.deployment-outcome.outputs.status }}
+      phase: ${{ steps.deployment-outcome.outputs.phase }}
+      releaseAttemptId: ${{ steps.deployment-outcome.outputs.releaseAttemptId }}
+      failureCategory: ${{ steps.deployment-outcome.outputs.failureCategory }}
     runs-on: ubuntu-latest
     environment:
       name: production
@@ -201,6 +243,7 @@ jobs:
       - name: Safely extract and verify release bundle modes
         run: |
           set -euo pipefail
+          echo "DEPLOYMENT_PHASE=artifact-verification" >> "$GITHUB_ENV"
           archive="release-bundle.tar.gz"
           install -d -m 700 release
           while IFS= read -r member; do
@@ -249,6 +292,7 @@ jobs:
           PROD_APP_PORT: ${{ vars.PROD_APP_PORT }}
         run: |
           set -euo pipefail
+          echo "DEPLOYMENT_PHASE=staging-and-activation" >> "$GITHUB_ENV"
           : "${DEPLOY_HOST:?Missing PROD_HOST secret}"
           : "${DEPLOY_USER:?Missing PROD_USER secret}"
           base_dir="${DEPLOY_BASE:-/srv/quadball-timer}"
@@ -267,16 +311,68 @@ jobs:
           ssh $ssh_opts "${DEPLOY_USER}@${DEPLOY_HOST}" "'${stage_dir}/deploy/activate-release.sh' --base-dir '${base_dir}' --staged-dir '${stage_dir}' --release '${release_id}' --service '${service_name}' --port '${app_port}'"
           curl --fail --silent --show-error --max-time 10 https://timer.quadball.app/ | grep -qi "<!doctype html"
 
+      - name: Record Production deployment outcome
+        id: deployment-outcome
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+          RELEASE_ATTEMPT: ${{ env.RELEASE_ATTEMPT_ID }}
+          FAILED_PHASE: ${{ env.DEPLOYMENT_PHASE }}
+        run: |
+          set -euo pipefail
+          case "$JOB_STATUS" in
+            success)
+              phase="verified"
+              failure_category="none"
+              ;;
+            cancelled)
+              phase="${FAILED_PHASE:-deployment}"
+              failure_category="cancelled"
+              ;;
+            *)
+              phase="${FAILED_PHASE:-deployment}"
+              failure_category="${phase}-failed"
+              ;;
+          esac
+          {
+            echo "status=$JOB_STATUS"
+            echo "phase=$phase"
+            echo "releaseAttemptId=$RELEASE_ATTEMPT"
+            echo "failureCategory=$failure_category"
+          } >> "$GITHUB_OUTPUT"
+
   report:
     if: always() && github.ref == 'refs/heads/main'
     needs: [deploy-test, deploy-production]
     runs-on: ubuntu-latest
     steps:
       - name: Report both independent environment outcomes
+        env:
+          RELEASE_ATTEMPT_ID: ${{ env.RELEASE_ATTEMPT_ID }}
+          TEST_STATUS: ${{ needs.deploy-test.outputs.status || needs.deploy-test.result }}
+          TEST_PHASE: ${{ needs.deploy-test.outputs.phase || 'deployment' }}
+          TEST_FAILURE_CATEGORY: ${{ needs.deploy-test.outputs.failureCategory || 'job-skipped' }}
+          PRODUCTION_STATUS: ${{ needs.deploy-production.outputs.status || needs.deploy-production.result }}
+          PRODUCTION_PHASE: ${{ needs.deploy-production.outputs.phase || 'deployment' }}
+          PRODUCTION_FAILURE_CATEGORY: ${{ needs.deploy-production.outputs.failureCategory || 'job-skipped' }}
         run: |
           set -euo pipefail
-          echo "Test deployment: ${{ needs.deploy-test.result }}"
-          echo "Production deployment: ${{ needs.deploy-production.result }}"
-          if [[ "${{ needs.deploy-test.result }}" != "success" || "${{ needs.deploy-production.result }}" != "success" ]]; then
+          cat > deployment-report.json <<EOF
+          {
+            "releaseAttemptId": "${RELEASE_ATTEMPT_ID}",
+            "test": {
+              "status": "${TEST_STATUS}",
+              "phase": "${TEST_PHASE}",
+              "failureCategory": "${TEST_FAILURE_CATEGORY}"
+            },
+            "production": {
+              "status": "${PRODUCTION_STATUS}",
+              "phase": "${PRODUCTION_PHASE}",
+              "failureCategory": "${PRODUCTION_FAILURE_CATEGORY}"
+            }
+          }
+          EOF
+          cat deployment-report.json
+          if [[ "$TEST_STATUS" != "success" || "$PRODUCTION_STATUS" != "success" ]]; then
             exit 1
           fi
