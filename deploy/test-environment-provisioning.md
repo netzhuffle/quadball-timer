@@ -176,6 +176,7 @@ set release_id "REPLACE_WITH_RELEASE_ATTEMPT_ID"
 set unit_source /srv/quadball-timer-test/releases/$release_id/deploy/systemd/quadball-timer-test.service
 
 sudo install -o root -g root -m 0644 $unit_source /etc/systemd/system/quadball-timer-test.service
+sudo install -o root -g root -m 0755 /srv/quadball-timer-test/releases/$release_id/deploy/activation-maintenance-root.sh /usr/local/sbin/quadball-timer-activation-maintenance
 sudo systemctl daemon-reload
 sudo systemctl enable quadball-timer-test
 sudo visudo -f /etc/sudoers.d/deploy-quadball-timer-test
@@ -184,7 +185,7 @@ sudo visudo -f /etc/sudoers.d/deploy-quadball-timer-test
 The sudoers file must contain only:
 
 ```text
-deploy-quadball-timer-test ALL=(root) NOPASSWD: /usr/bin/systemctl restart quadball-timer-test
+deploy-quadball-timer-test ALL=(root) NOPASSWD: /usr/bin/systemctl stop quadball-timer-test, /usr/bin/systemctl restart quadball-timer-test, /usr/local/sbin/quadball-timer-activation-maintenance
 ```
 
 Verify the bounded result without printing the key file:

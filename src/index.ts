@@ -81,6 +81,7 @@ import {
   createAdHocLiveSessionTracker,
   createAdHocGamesService,
   openSqliteAdHocStore,
+  resolveAdHocEnvironmentIdentity,
   type AdHocGameView,
   type AdHocGamesService,
 } from "@/lib/ad-hoc-games";
@@ -100,6 +101,7 @@ import {
   browserMonitoringPublicConfig,
   serializeBrowserMonitoringConfig,
 } from "@/lib/monitoring-redaction";
+import { runProductionActivationCli } from "@/lib/production-activation-cli";
 
 type SessionSubscription =
   | {
@@ -138,6 +140,12 @@ async function main() {
 
   if (process.argv.includes("--emit-test-monitoring-error")) {
     await emitTestMonitoringError();
+    return;
+  }
+
+  const maintenanceIndex = process.argv.indexOf("--production-activation");
+  if (maintenanceIndex !== -1) {
+    process.exitCode = await runProductionActivationCli(process.argv.slice(maintenanceIndex + 1));
     return;
   }
 
@@ -210,8 +218,11 @@ async function startServer() {
     ) {
       throw new Error("Production Ad Hoc database must use its canonical path.");
     }
-    const adHocEnvironmentIdentity =
-      process.env.AD_HOC_ENVIRONMENT_ID?.trim() || `${environment}:${technicalAdminConfig.origin}`;
+    const adHocEnvironmentIdentity = resolveAdHocEnvironmentIdentity(
+      environment,
+      technicalAdminConfig.origin,
+      process.env.AD_HOC_ENVIRONMENT_ID,
+    );
     let eventCapacitySource = () => 0;
     const adHocService = createAdHocGamesService({
       environmentIdentity: adHocEnvironmentIdentity,

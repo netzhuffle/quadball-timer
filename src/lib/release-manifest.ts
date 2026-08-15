@@ -1,12 +1,17 @@
 import { createHash } from "node:crypto";
+import { FOUNDATION_MIGRATIONS } from "./foundation-migrations";
 
-export const RELEASE_MANIFEST_SCHEMA_VERSION = 1 as const;
+export const RELEASE_MANIFEST_SCHEMA_VERSION = 2 as const;
 export const RELEASE_EXECUTABLE_PATH = "quadball-timer" as const;
+export const FOUNDATION_SCHEMA_VERSIONS = Object.freeze([
+  ...new Set(FOUNDATION_MIGRATIONS.map((migration) => String(migration.schemaVersion))),
+]);
 
 export const RELEASE_BUNDLE_ALLOWLIST = [
   RELEASE_EXECUTABLE_PATH,
   "deploy/activate-release.sh",
   "deploy/activate-test-release.sh",
+  "deploy/activation-maintenance-root.sh",
   "deploy/systemd/quadball-timer.service",
   "deploy/systemd/quadball-timer-test.service",
 ] as const;
@@ -39,6 +44,7 @@ export type ReleaseManifest = {
   sqliteVersion: string;
   buildTime: string;
   schemaCompatibility: string;
+  supportedFoundationSchemaVersions: string[];
 };
 
 export function sha256(value: Uint8Array | string): string {
@@ -116,6 +122,7 @@ export function createReleaseManifest(input: {
     sqliteVersion: requireText(input.runtime.sqliteVersion, "sqliteVersion"),
     buildTime: requireText(input.buildTime, "buildTime"),
     schemaCompatibility: requireText(input.schemaCompatibility, "schemaCompatibility"),
+    supportedFoundationSchemaVersions: [...FOUNDATION_SCHEMA_VERSIONS],
   };
 
   return manifest;
@@ -180,6 +187,15 @@ export function validateReleaseManifest(value: unknown): asserts value is Releas
   requireText(manifest.sqliteVersion, "sqliteVersion");
   requireText(manifest.buildTime, "buildTime");
   requireText(manifest.schemaCompatibility, "schemaCompatibility");
+  if (
+    !Array.isArray(manifest.supportedFoundationSchemaVersions) ||
+    manifest.supportedFoundationSchemaVersions.length === 0 ||
+    manifest.supportedFoundationSchemaVersions.some(
+      (version) => typeof version !== "string" || !/^[0-9]+$/u.test(version),
+    )
+  ) {
+    throw new Error("Release manifest Foundation schema support is invalid.");
+  }
 }
 
 export function verifyReleaseBundle(

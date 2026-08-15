@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { Buffer } from "node:buffer";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { resolveAdHocEnvironmentIdentity } from "@/lib/ad-hoc-games";
 
 const repositoryRoot = process.cwd();
 
@@ -145,5 +146,117 @@ describe("Production deployment contract", () => {
     expect(rootWrite).toBeGreaterThan(verification);
     expect(promotion).toBeGreaterThan(rootWrite);
     expect(finalization).toBeGreaterThan(promotion);
+  });
+
+  test("uses the fixed root maintenance boundary for schema operations", () => {
+    const wrapper = readFileSync(
+      join(repositoryRoot, "deploy/activation-maintenance-root.sh"),
+      "utf8",
+    );
+    expect(wrapper).toContain('QUADBALL_ENVIRONMENT="$environment"');
+    expect(wrapper).toContain('GRANT_KEY_RING_FILE="$key_ring_file"');
+    expect(wrapper).toContain('backup_directory="/var/backups/quadball-timer"');
+    expect(wrapper).toContain('PUBLIC_ORIGIN="$public_origin"');
+    expect(wrapper).toContain("backup|verify-backup|promote");
+    expect(wrapper).not.toContain("eval ");
+  });
+
+  test("documents the host-observed Production sudoers command path", () => {
+    const readme = readFileSync(join(repositoryRoot, "README.md"), "utf8");
+
+    expect(readme).toContain(
+      "deploy-quadball-timer ALL=(root) NOPASSWD: /usr/bin/systemctl stop quadball-timer, /usr/bin/systemctl restart quadball-timer, /usr/local/sbin/quadball-timer-activation-maintenance",
+    );
+    expect(readme).not.toContain("NOPASSWD: /bin/systemctl");
+  });
+
+  test("keeps the privileged pre-merge handoff single-session and fail-fast", () => {
+    const handoff = readFileSync(
+      join(repositoryRoot, "docs/agents/issue-165-pre-merge-handoff.md"),
+      "utf8",
+    );
+
+    expect(handoff).not.toContain("wc -l < /etc/sudoers.d");
+    expect(handoff).toContain("wc -l /etc/sudoers.d/deploy-quadball-timer");
+    expect(handoff).toContain("wc -l /etc/sudoers.d/deploy-quadball-timer-test");
+    expect(handoff).toContain("set privileged_command (string join ' '");
+    expect(handoff.match(/ssh -tt jannis@jannis\.rocks \$privileged_command/gu)).toHaveLength(1);
+    expect(handoff.match(/\/usr\/bin\/sudo -v/gu)).toHaveLength(1);
+    expect(handoff).toContain("rm -rf -- $remote_dir");
+    expect(handoff).toContain("test ! -e $remote_dir");
+  });
+
+  test("includes the canonical Production Ad Hoc database in backup verification", () => {
+    const activationCli = readFileSync(
+      join(repositoryRoot, "src/lib/production-activation-cli.ts"),
+      "utf8",
+    );
+    const recoveryCreation = activationCli.indexOf(
+      "const recovery = createFoundationRecovery(storage, {",
+    );
+
+    expect(activationCli).toContain("createSqliteAdHocRecoveryAdapter");
+    expect(activationCli).toContain("dirname(storagePaths.foundationDatabase)");
+    expect(activationCli).toContain('"ad-hoc.sqlite"');
+    expect(activationCli).toContain(
+      'throw new Error("Production Ad Hoc database must share the Environment database directory.")',
+    );
+    expect(activationCli).toContain("requireProductionAdHocBackup(manifest)");
+    const adHocOption = activationCli.indexOf(
+      "adHoc: createSqliteAdHocRecoveryAdapter(adHocDatabasePath, adHocEnvironmentIdentity),",
+    );
+    expect(recoveryCreation).toBeGreaterThanOrEqual(0);
+    expect(adHocOption).toBeGreaterThan(recoveryCreation);
+    const wrapper = readFileSync(
+      join(repositoryRoot, "deploy/activation-maintenance-root.sh"),
+      "utf8",
+    );
+    expect(wrapper).toContain('AD_HOC_DATABASE="$ad_hoc_database"');
+    expect(wrapper).toContain('AD_HOC_ENVIRONMENT_ID="$ad_hoc_environment_identity"');
+  });
+
+  test("keeps Production Ad Hoc identity canonical across startup and maintenance", () => {
+    const normalIdentity = resolveAdHocEnvironmentIdentity(
+      "production",
+      "https://timer.quadball.app",
+    );
+    const focusedIdentity = resolveAdHocEnvironmentIdentity(
+      "production",
+      "https://timer.quadball.app",
+      normalIdentity,
+    );
+    expect(normalIdentity).toBe("production:https://timer.quadball.app");
+    expect(focusedIdentity).toBe(normalIdentity);
+    expect(() =>
+      resolveAdHocEnvironmentIdentity(
+        "production",
+        "https://timer.quadball.app",
+        "production:https://other.example",
+      ),
+    ).toThrow("canonical value");
+    expect(
+      resolveAdHocEnvironmentIdentity("test", "https://test.timer.quadball.app", "test:local"),
+    ).toBe("test:local");
+  });
+
+  test("checks rollback schema compatibility with the candidate maintenance executable", () => {
+    const activation = readFileSync(join(repositoryRoot, "deploy/activate-release.sh"), "utf8");
+
+    expect(activation).toContain("preflight");
+    expect(activation).toContain("supportedFoundationSchemaVersions");
+    expect(activation).not.toContain("disabled_legacy_compatible_previous_release");
+    expect(activation).not.toContain(
+      'sudo "$maintenance_wrapper" production "$previous_release" readiness',
+    );
+  });
+
+  test("reports Production migration only after backup promotion", () => {
+    const activation = readFileSync(join(repositoryRoot, "deploy/activate-release.sh"), "utf8");
+    const promotion = activation.indexOf('production "$release_dir" promote');
+    const migrationMarker = activation.indexOf("ACTIVATION_PHASE=migration", promotion);
+    const candidateValidation = activation.indexOf('production "$release_dir" validate-migration');
+    expect(promotion).toBeGreaterThanOrEqual(0);
+    expect(migrationMarker).toBeGreaterThan(promotion);
+    expect(candidateValidation).toBeGreaterThan(migrationMarker);
   });
 });

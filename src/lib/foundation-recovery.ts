@@ -839,7 +839,17 @@ export function createFoundationRecovery(
       });
       verifier.setReadinessContext(options.readinessContext);
       const readiness = await verifier.readiness();
-      if (!readiness.ok || readiness.evidence?.keys.missingCount !== 0) {
+      if (!readiness.ok) {
+        const migration = await verifier.migrationPreflight();
+        if (migration.status !== "pending" && migration.status !== "missing") {
+          throw new Error(
+            "Independent backup integrity, reference, key, or replay verification failed.",
+          );
+        }
+        await verifier.applyMigrations({ requireCandidate: false });
+      }
+      const finalReadiness = await verifier.readiness();
+      if (!finalReadiness.ok || finalReadiness.evidence?.keys.missingCount !== 0) {
         throw new Error(
           "Independent backup integrity, reference, key, or replay verification failed.",
         );

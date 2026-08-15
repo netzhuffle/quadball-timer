@@ -36,8 +36,17 @@ Production deploys upload a compiled Linux executable and activate it under
 sudo access needed to restart the app service:
 
 ```sudoers
-deploy-quadball-timer ALL=NOPASSWD: /bin/systemctl restart quadball-timer
+deploy-quadball-timer ALL=(root) NOPASSWD: /usr/bin/systemctl stop quadball-timer, /usr/bin/systemctl restart quadball-timer, /usr/local/sbin/quadball-timer-activation-maintenance
 ```
+
+Install the root-owned maintenance wrapper once on the host:
+
+```fish
+sudo install -o root -g root -m 0755 deploy/activation-maintenance-root.sh /usr/local/sbin/quadball-timer-activation-maintenance
+```
+
+For the bounded first-time or repair bootstrap of the Production/Test host
+contract, use `docs/agents/issue-165-pre-merge-handoff.md`.
 
 The app itself binds to `127.0.0.1:3000`; public HTTPS and WebSocket traffic is
 terminated by Caddy and proxied to that localhost backend.

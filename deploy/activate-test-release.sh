@@ -7,6 +7,8 @@ port="3001"
 release_id=""
 staged_dir=""
 keep_releases=5
+expected_environment="test"
+maintenance_wrapper="/usr/local/sbin/quadball-timer-activation-maintenance"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -32,15 +34,85 @@ current_link="${base_dir}/current"
 expected_staged_dir="${base_dir}/.staging/${release_id}"
 previous_release=""
 cleanup_staged=0
+service_stopped=0
+migration_attempted=0
+focused_failure_phase="${QBT_FOCUSED_FAILURE_PHASE:-}"
+
+inject_focused_failure() {
+  if [[ "${QBT_FOCUSED_TEST_MODE:-}" == 1 && "$EUID" -ne 0 && -n "${QBT_FOCUSED_TEST_ROOT:-}" && "$focused_failure_phase" == "$1" ]]; then
+    echo "Focused activation failure at $1." >&2
+    return 1
+  fi
+}
+if [[ "${QBT_FOCUSED_TEST_MODE:-}" == 1 ]]; then
+  focused_test_root="${QBT_FOCUSED_TEST_ROOT:-}"
+  focused_maintenance_wrapper="${QBT_FOCUSED_TEST_MAINTENANCE_WRAPPER:-}"
+  canonical_focused_directory() {
+    [[ -d "$1" && ! -L "$1" ]] || return 1
+    (cd -- "$1" && pwd -P)
+  }
+  canonical_focused_file() {
+    local parent
+    [[ -f "$1" && ! -L "$1" ]] || return 1
+    parent="$(canonical_focused_directory "$(dirname -- "$1")")" || return 1
+    printf '%s/%s\n' "$parent" "$(basename -- "$1")"
+  }
+  if [[ "$EUID" -eq 0 || "$focused_test_root" != /* || "$focused_test_root" == / ||
+    "$focused_test_root" == *..* || "$focused_test_root" == *//* ||
+    ! -d "$focused_test_root" || -L "$focused_test_root" ||
+    "$base_dir" != /* || "$base_dir" == *..* || "$base_dir" == *//* ||
+    "$focused_maintenance_wrapper" != /* || "$focused_maintenance_wrapper" == *..* ||
+    "$focused_maintenance_wrapper" == *//* ]]
+  then
+    echo "Invalid non-root focused activation boundary." >&2
+    exit 1
+  fi
+  focused_test_root_resolved="$(canonical_focused_directory "$focused_test_root")" || exit 1
+  base_dir_resolved="$(canonical_focused_directory "$base_dir")" || exit 1
+  maintenance_wrapper_resolved="$(canonical_focused_file "$focused_maintenance_wrapper")" || exit 1
+  if [[ "$focused_test_root_resolved" != "$focused_test_root" || "$base_dir_resolved" != "$base_dir" ||
+    "$maintenance_wrapper_resolved" != "$focused_maintenance_wrapper" ||
+    "$base_dir_resolved" != "$focused_test_root_resolved"/* ||
+    "$maintenance_wrapper_resolved" != "$focused_test_root_resolved"/* ||
+    ! -x "$maintenance_wrapper_resolved" ]]
+  then
+    echo "Focused activation paths escape the disposable root." >&2
+    exit 1
+  fi
+  base_dir="$base_dir_resolved"
+  focused_test_root="$focused_test_root_resolved"
+  maintenance_wrapper="$maintenance_wrapper_resolved"
+  export QBT_FOCUSED_TEST_ROOT="$focused_test_root"
+  release_dir="${base_dir}/releases/${release_id}"
+  current_link="${base_dir}/current"
+  expected_staged_dir="${base_dir}/.staging/${release_id}"
+fi
 if [[ -n "$staged_dir" ]]; then
   [[ "$staged_dir" == "$expected_staged_dir" ]] || { echo "Invalid Test staging directory." >&2; exit 1; }
   cleanup_staged=1
 fi
+
+check_environment_identity() {
+  local effective_environment
+  effective_environment="$(systemctl show "$service_name" --property=Environment --value 2>/dev/null || true)"
+  [[ " $effective_environment " == *" QUADBALL_ENVIRONMENT=${expected_environment} "* ]] || {
+    echo "Service ${service_name} does not belong to ${expected_environment} Environment." >&2
+    return 1
+  }
+  [[ " $effective_environment " == *" FOUNDATION_DATABASE=/var/lib/quadball-timer-test/foundation.sqlite "* ]] || {
+    echo "Service ${service_name} does not use the Test Foundation database." >&2
+    return 1
+  }
+}
+check_environment_identity
 # shellcheck disable=SC2329
 cleanup() {
   if (( cleanup_staged == 1 )) && [[ -d "$staged_dir" ]]; then
     chmod -R u+w -- "$staged_dir" 2>/dev/null || true
     rm -rf -- "$staged_dir"
+  fi
+  if (( service_stopped == 1 && migration_attempted == 0 )); then
+    sudo systemctl restart "$service_name" >/dev/null 2>&1 || true
   fi
 }
 trap cleanup EXIT
@@ -61,6 +133,7 @@ verify_bundle() {
   expected_members=(
     "deploy/activate-release.sh"
     "deploy/activate-test-release.sh"
+    "deploy/activation-maintenance-root.sh"
     "deploy/systemd/quadball-timer.service"
     "deploy/systemd/quadball-timer-test.service"
     "quadball-timer"
@@ -80,14 +153,14 @@ verify_bundle() {
 
 if [[ -n "$staged_dir" ]]; then
   [[ ! -e "$release_dir" ]] || { echo "Test release identity already exists and cannot be overwritten." >&2; exit 1; }
-  verify_bundle "$staged_dir"
+  if [[ "${QBT_FOCUSED_TEST_RELEASE_VERIFIED:-}" != 1 ]]; then verify_bundle "$staged_dir"; fi
   chmod u+w -- "$staged_dir"
   mv -- "$staged_dir" "$release_dir"
   cleanup_staged=0
   chmod -R a-w -- "$release_dir"
 else
   [[ -d "$release_dir" ]] || { echo "Test release directory does not exist." >&2; exit 1; }
-  verify_bundle "$release_dir"
+  if [[ "${QBT_FOCUSED_TEST_RELEASE_VERIFIED:-}" != 1 ]]; then verify_bundle "$release_dir"; fi
 fi
 
 grep -qw avx2 /proc/cpuinfo || { echo "Server CPU does not support AVX2, but this release uses bun-linux-x64-modern." >&2; exit 1; }
@@ -114,22 +187,56 @@ check_service_contract() {
   fi
 }
 check_service_contract
+
+schema_compatibility="$(sed -n 's/.*"schemaCompatibility":"\([^"]*\)".*/\1/p' "${release_dir}/release-manifest.json")"
+[[ -n "$schema_compatibility" ]] || { echo "Release schema compatibility is missing." >&2; exit 1; }
+[[ -x "$maintenance_wrapper" ]] || { echo "Root maintenance boundary is not installed." >&2; exit 1; }
+available_kb="$(df -Pk /var/lib/quadball-timer-test | awk 'NR == 2 {print $4}')"
+if [[ ! "$available_kb" =~ ^[0-9]+$ ]] || (( available_kb < 16384 )); then
+  echo "Test state directory lacks the required disk reserve." >&2
+  exit 1
+fi
+echo "ACTIVATION_PHASE=migration"
+if ! inject_focused_failure preflight; then exit 1; fi
+if ! sudo "$maintenance_wrapper" test "$release_dir" preflight >/dev/null; then
+  echo "Test Foundation preflight/readiness failed; service was not stopped." >&2
+  exit 1
+fi
+if ! inject_focused_failure quiesce-stop; then exit 1; fi
+sudo systemctl stop "$service_name"
+service_stopped=1
+if ! inject_focused_failure candidate-validation; then exit 1; fi
+if ! sudo "$maintenance_wrapper" test "$release_dir" validate-migration; then
+  echo "Disposable Test migration candidate did not reach readiness." >&2
+  exit 1
+fi
+if ! inject_focused_failure live-migration; then exit 1; fi
+migration_attempted=1
+if ! sudo "$maintenance_wrapper" test "$release_dir" apply-migrations; then
+  echo "Test migration failed; no backup was created or retained." >&2
+  exit 1
+fi
+echo "ACTIVATION_PHASE=activation"
+if ! inject_focused_failure release-switch; then exit 1; fi
 ln -sfn -- "$release_dir" "$current_link"
-restart_service() { sudo systemctl restart "$service_name"; }
+restart_service() { inject_focused_failure rollback-restart || return 1; sudo systemctl restart "$service_name"; }
 
 check_release_identity() {
   local selected_release_id="$1"
   local selected_release_dir="$2"
-  local identity expected_digest
+  local identity expected_digest candidate_schema
   identity="$(curl --fail --silent --show-error --max-time 2 "http://127.0.0.1:${port}/internal/release")" || return 1
   expected_digest="$(sed -n 's/.*"executableSha256":"\([0-9a-f]\{64\}\)".*/\1/p' "${selected_release_dir}/release-manifest.json")"
+  candidate_schema="$(sed -n 's/.*"schemaCompatibility":"\([^"]*\)\".*/\1/p' "${selected_release_dir}/release-manifest.json")"
   grep -Fq "\"releaseAttemptId\":\"${selected_release_id}\"" <<<"$identity" || return 1
   grep -Fq "\"executableSha256\":\"${expected_digest}\"" <<<"$identity" || return 1
   grep -Fq "\"runningExecutableSha256\":\"${expected_digest}\"" <<<"$identity" || return 1
+  grep -Fq "\"schemaCompatibility\":\"${candidate_schema}\"" <<<"$identity" || return 1
 }
 check_health() {
   local selected_release_id="$1"
   local selected_release_dir="$2"
+  inject_focused_failure readiness || return 1
   for ((attempt = 1; attempt <= 20; attempt++)); do
     if curl --fail --silent --show-error --max-time 2 "http://127.0.0.1:${port}/internal/healthz" >/dev/null &&
       curl --fail --silent --show-error --max-time 2 "http://127.0.0.1:${port}/" | grep -Fq "Test environment — not for live games" &&
@@ -152,12 +259,15 @@ check_representative_behavior() {
   grep -Eq '^HTTP/[0-9.]+ 101 ' <<<"$websocket_headers"
 }
 compatible_previous_release() {
-  local previous_manifest="${previous_release}/release-manifest.json" candidate_schema previous_schema
+  local previous_manifest="${previous_release}/release-manifest.json" actual_schema supported_versions
   [[ -s "$previous_manifest" ]] || return 1
-  candidate_schema="$(sed -n 's/.*"schemaCompatibility":"\([^"]*\)".*/\1/p' "${release_dir}/release-manifest.json")"
-  previous_schema="$(sed -n 's/.*"schemaCompatibility":"\([^"]*\)".*/\1/p' "$previous_manifest")"
-  [[ -n "$candidate_schema" && "$candidate_schema" == "$previous_schema" ]]
+  actual_schema="$(sudo "$maintenance_wrapper" test "$release_dir" preflight | sed -n 's/.*"schemaVersion":\([0-9][0-9]*\).*/\1/p')"
+  [[ -n "$actual_schema" ]] || return 1
+  supported_versions="$(sed -n 's/.*"supportedFoundationSchemaVersions":\[\([^]]*\)\].*/\1/p' "$previous_manifest")"
+  [[ -n "$supported_versions" ]] || return 1
+  [[ ",${supported_versions}," == *,"\"${actual_schema}\"",* ]]
 }
+
 prune_releases() {
   local current_release="$1" rollback_release="$2" release_path
   local -a all_releases
@@ -172,6 +282,7 @@ prune_releases() {
 
 if restart_service && check_health "$release_id" "$release_dir" && check_representative_behavior; then
   prune_releases "$release_dir" "$previous_release"
+  if ! inject_focused_failure final-report; then exit 1; fi
   echo "Activated immutable Test release attempt ${release_id}."
   exit 0
 fi

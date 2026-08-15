@@ -49,6 +49,30 @@ describe("runtime storage configuration", () => {
     });
   });
 
+  test("rejects focused traversal and symlink roots", () => {
+    if (process.getuid?.() === 0) return;
+    const root = mkdtempSync(join(tmpdir(), "quadball-timer-focused-"));
+    const target = join(root, "target");
+    const linked = join(root, "linked");
+    mkdirSync(target, { mode: 0o750 });
+    symlinkSync(target, linked);
+    try {
+      for (const focusedRoot of [`${root}/../${root.split("/").at(-1)}`, linked]) {
+        expect(() =>
+          readRuntimeStoragePaths("production", {
+            QBT_FOCUSED_TEST_MODE: "1",
+            QBT_FOCUSED_TEST_ROOT: focusedRoot,
+            TECHNICAL_ADMIN_DATABASE: `${focusedRoot}/var/lib/quadball-timer/technical-admin.sqlite`,
+            FOUNDATION_DATABASE: `${focusedRoot}/var/lib/quadball-timer/foundation.sqlite`,
+            EVENT_GAME_DATABASE: `${focusedRoot}/var/lib/quadball-timer/event-game.sqlite`,
+          }),
+        ).toThrow("Focused activation paths");
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("accepts one private writable Production state directory", () => {
     const directory = mkdtempSync(join(tmpdir(), "quadball-timer-state-"));
     chmodSync(directory, 0o750);

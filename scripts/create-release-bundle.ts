@@ -29,6 +29,7 @@ const sourceByBundlePath: Record<string, string> = {
   "quadball-timer": sourceExecutable,
   "deploy/activate-release.sh": "deploy/activate-release.sh",
   "deploy/activate-test-release.sh": "deploy/activate-test-release.sh",
+  "deploy/activation-maintenance-root.sh": "deploy/activation-maintenance-root.sh",
   "deploy/systemd/quadball-timer.service": "deploy/systemd/quadball-timer.service",
   "deploy/systemd/quadball-timer-test.service": "deploy/systemd/quadball-timer-test.service",
 };

@@ -832,6 +832,14 @@ export class SqliteFoundationStorage implements FoundationStorage {
     return this.enqueue(() => this.readinessSync(!this.readOnly));
   }
 
+  /** Read-only migration compatibility used before the service is stopped. */
+  migrationPreflight(): Promise<MigrationReadiness> {
+    return this.enqueue(() => {
+      const state = this.readMigrationState();
+      return assessMigrationReadiness(state.ledgerExists, state.entries, this.migrations);
+    });
+  }
+
   liveness() {
     return { ok: true as const, process: "available" as const };
   }
