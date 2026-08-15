@@ -74,7 +74,7 @@ describe("disposable activation SQLite integration", () => {
         requiredOwnerUid: process.getuid?.() ?? 0,
       });
       const legacy = openSqliteFoundationStorage(foundationPath, {
-        migrations: FOUNDATION_MIGRATIONS.slice(0, -1),
+        migrations: FOUNDATION_MIGRATIONS.slice(0, 2),
         grantKeyRing: keyRing,
         grantValidationContext: { environmentId: "production", keyRing },
       });

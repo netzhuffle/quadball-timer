@@ -87,6 +87,116 @@ if [[ "${QBT_FOCUSED_TEST_MODE:-}" == 1 ]]; then
   current_link="${base_dir}/current"
   expected_staged_dir="${base_dir}/.staging/${release_id}"
 fi
+
+realpath_command="${QBT_FOCUSED_TEST_REALPATH:-realpath}"
+
+remove_validated_release() {
+  local release_path="$1" release_root resolved_release_path trash_root detached_path
+  release_root="$("$realpath_command" -e -- "${base_dir}/releases")" || return 1
+  [[ -d "$release_root" && ! -L "$release_root" ]] || return 1
+  [[ "$release_path" == "$release_root"/* && "$release_path" != *..* && "$release_path" != *//* ]] || return 1
+  [[ -d "$release_path" && ! -L "$release_path" ]] || return 1
+  resolved_release_path="$("$realpath_command" -e -- "$release_path")" || return 1
+  [[ "$resolved_release_path" == "$release_path" && "$(dirname -- "$resolved_release_path")" == "$release_root" ]] || return 1
+  [[ -d "${base_dir}/.staging" && ! -L "${base_dir}/.staging" ]] || return 1
+  trash_root="$(mktemp -d "${base_dir}/.staging/.prune-XXXXXX")" || {
+    echo "Release prune cleanup could not allocate bounded trash: ${release_path}" >&2
+    return 1
+  }
+  detached_path="${trash_root}/$(basename -- "$resolved_release_path")"
+  if ! mv -- "$resolved_release_path" "$detached_path"; then
+    rmdir -- "$trash_root" 2>/dev/null || true
+    echo "Release prune cleanup could not detach validated release: ${release_path}" >&2
+    return 1
+  fi
+  if [[ "${QBT_FOCUSED_TEST_PRUNE_FAILURE:-}" == after-rename ]]; then
+    echo "Release prune cleanup deferred after detach: ${detached_path}" >&2
+    return 1
+  fi
+  if ! chmod -R u+w "$detached_path"; then
+    echo "Release prune cleanup left detached evidence after write-enable failure: ${detached_path}" >&2
+    return 1
+  fi
+  if ! rm -rf -- "$detached_path"; then
+    echo "Release prune cleanup left detached evidence after removal failure: ${detached_path}" >&2
+    return 1
+  fi
+  rmdir -- "$trash_root" 2>/dev/null || true
+}
+
+if [[ "${QBT_FOCUSED_TEST_PRUNE_PROBE:-}" == 1 ]]; then
+  [[ "${QBT_FOCUSED_TEST_MODE:-}" == 1 ]] || exit 1
+  remove_validated_release "${QBT_FOCUSED_TEST_PRUNE_TARGET:-}"
+  exit $?
+fi
+
+readiness_window_seconds=60
+focused_activation_elapsed_seconds=0
+focused_activation_clock_file="${QBT_FOCUSED_TEST_CLOCK_FILE:-}"
+activation_now_seconds() {
+  if [[ "${QBT_FOCUSED_TEST_CLOCK:-}" == logical ]]; then
+    if [[ -n "$focused_activation_clock_file" ]]; then
+      cat "$focused_activation_clock_file"
+    else
+      printf '%s\n' "$focused_activation_elapsed_seconds"
+    fi
+  else
+    date +%s
+  fi
+}
+activation_consume_probe_duration() {
+  if [[ "${QBT_FOCUSED_TEST_CLOCK:-}" != logical ]]; then return 0; fi
+  local duration="${QBT_FOCUSED_TEST_PROBE_SECONDS:-0}" now remaining
+  [[ "$duration" =~ ^[0-9]+$ ]] || return 1
+  now="$(activation_now_seconds)" || return 1
+  remaining=$((readiness_deadline - now))
+  (( remaining > 0 )) || return 0
+  (( duration > remaining )) && duration="$remaining"
+  if [[ -n "$focused_activation_clock_file" ]]; then
+    printf '%s\n' "$((now + duration))" >"$focused_activation_clock_file"
+  else
+    focused_activation_elapsed_seconds=$((now + duration))
+  fi
+}
+activation_probe_timeout() {
+  local now remaining
+  now="$(activation_now_seconds)" || return 1
+  remaining=$((readiness_deadline - now))
+  (( remaining > 0 )) || return 1
+  printf '%s\n' "$remaining"
+}
+activation_record_probe() {
+  local probe_name="$1" phase="$2" status="$3" now
+  [[ -n "${QBT_FOCUSED_TEST_PROBE_LOG:-}" ]] || return 0
+  now="$(activation_now_seconds)" || return 1
+  printf '%s %s %s %s\n' "$now" "$phase" "$probe_name" "$status" >>"$QBT_FOCUSED_TEST_PROBE_LOG"
+}
+activation_curl() {
+  local probe_name="$1" request_timeout status
+  shift
+  request_timeout="$(activation_probe_timeout)" || return 1
+  activation_record_probe "$probe_name" start pending || return 1
+  curl --silent --show-error --max-time "$request_timeout" "$@"
+  status=$?
+  activation_consume_probe_duration || return 1
+  activation_record_probe "$probe_name" end "$status" || return 1
+  return "$status"
+}
+activation_wait_seconds() {
+  local seconds="$1"
+  if [[ "${QBT_FOCUSED_TEST_CLOCK:-}" == logical ]]; then
+    local now
+    now="$(activation_now_seconds)" || return 1
+    if [[ -n "$focused_activation_clock_file" ]]; then
+      printf '%s\n' "$((now + seconds))" >"$focused_activation_clock_file"
+    else
+      focused_activation_elapsed_seconds=$((now + seconds))
+    fi
+  else
+    sleep "$seconds"
+  fi
+}
+
 if [[ -n "$staged_dir" ]]; then
   [[ "$staged_dir" == "$expected_staged_dir" ]] || { echo "Invalid Test staging directory." >&2; exit 1; }
   cleanup_staged=1
@@ -225,7 +335,7 @@ check_release_identity() {
   local selected_release_id="$1"
   local selected_release_dir="$2"
   local identity expected_digest candidate_schema
-  identity="$(curl --fail --silent --show-error --max-time 2 "http://127.0.0.1:${port}/internal/release")" || return 1
+  identity="$(activation_curl release --fail "http://127.0.0.1:${port}/internal/release")" || return 1
   expected_digest="$(sed -n 's/.*"executableSha256":"\([0-9a-f]\{64\}\)".*/\1/p' "${selected_release_dir}/release-manifest.json")"
   candidate_schema="$(sed -n 's/.*"schemaCompatibility":"\([^"]*\)\".*/\1/p' "${selected_release_dir}/release-manifest.json")"
   grep -Fq "\"releaseAttemptId\":\"${selected_release_id}\"" <<<"$identity" || return 1
@@ -236,20 +346,25 @@ check_release_identity() {
 check_health() {
   local selected_release_id="$1"
   local selected_release_dir="$2"
+  local readiness_now
   inject_focused_failure readiness || return 1
-  for ((attempt = 1; attempt <= 20; attempt++)); do
-    if curl --fail --silent --show-error --max-time 2 "http://127.0.0.1:${port}/internal/healthz" >/dev/null &&
-      curl --fail --silent --show-error --max-time 2 "http://127.0.0.1:${port}/" | grep -Fq "Test environment — not for live games" &&
-      check_release_identity "$selected_release_id" "$selected_release_dir"; then return 0; fi
-    sleep 1
+  readiness_now="$(activation_now_seconds)" || return 1
+  readiness_deadline=$((readiness_now + readiness_window_seconds))
+  while (( readiness_now < readiness_deadline )); do
+    if activation_curl health --fail "http://127.0.0.1:${port}/internal/healthz" >/dev/null &&
+      activation_curl home --fail "http://127.0.0.1:${port}/" | grep -Fq "Test environment — not for live games" &&
+      check_release_identity "$selected_release_id" "$selected_release_dir" &&
+      check_representative_behavior; then return 0; fi
+    activation_wait_seconds 1 || return 1
+    readiness_now="$(activation_now_seconds)" || return 1
   done
   return 1
 }
 
 check_representative_behavior() {
-  curl --fail --silent --show-error --max-time 2 "http://127.0.0.1:${port}/api/audience/events" >/dev/null || return 1
   local websocket_headers
-  websocket_headers="$(curl --silent --show-error --max-time 2 \
+  activation_curl events --fail "http://127.0.0.1:${port}/api/audience/events" >/dev/null || return 1
+  websocket_headers="$(activation_curl websocket \
     -H "Origin: http://127.0.0.1:${port}" \
     -H "Connection: Upgrade" \
     -H "Upgrade: websocket" \
@@ -269,18 +384,24 @@ compatible_previous_release() {
 }
 
 prune_releases() {
-  local current_release="$1" rollback_release="$2" release_path
+  local current_release="$1" rollback_release="$2" release_path release_root
   local -a all_releases
-  mapfile -t all_releases < <(find "${base_dir}/releases" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' | sort -rn | cut -d' ' -f2-)
+  release_root="$("$realpath_command" -e -- "${base_dir}/releases")" || return 1
+  all_releases=()
+  while IFS= read -r release_path; do all_releases+=("$release_path"); done < <(
+    find "$release_root" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' | sort -rn | cut -d' ' -f2-
+  )
   local release_count=0
-  for release_path in "${all_releases[@]}"; do
-    [[ "$release_path" == "$current_release" || "$release_path" == "$rollback_release" ]] && continue
-    release_count=$((release_count + 1))
-    if (( release_count > keep_releases - 2 )); then rm -rf -- "$release_path"; fi
-  done
+  if ((${#all_releases[@]} > 0)); then
+    for release_path in "${all_releases[@]}"; do
+      [[ "$release_path" == "$current_release" || "$release_path" == "$rollback_release" ]] && continue
+      release_count=$((release_count + 1))
+      if (( release_count > keep_releases - 2 )); then remove_validated_release "$release_path"; fi
+    done
+  fi
 }
 
-if restart_service && check_health "$release_id" "$release_dir" && check_representative_behavior; then
+if restart_service && check_health "$release_id" "$release_dir"; then
   prune_releases "$release_dir" "$previous_release"
   if ! inject_focused_failure final-report; then exit 1; fi
   echo "Activated immutable Test release attempt ${release_id}."
@@ -290,8 +411,17 @@ echo "Test deployment failed; attempting compatible binary rollback without rest
 if [[ -n "$previous_release" && -d "$previous_release" ]] && compatible_previous_release; then
   previous_release_id="${previous_release##*/}"
   ln -sfn -- "$previous_release" "$current_link"
-  if restart_service && check_health "$previous_release_id" "$previous_release"; then echo "Rolled back Test to ${previous_release}." >&2; else echo "Test rollback failed health checks." >&2; fi
+  if restart_service && check_health "$previous_release_id" "$previous_release"; then
+    echo "Rolled back Test to ${previous_release}." >&2
+    exit 1
+  fi
+  echo "Test rollback failed health checks; stopping Test service fail-closed." >&2
 else
   echo "No compatible previous Test release available for rollback." >&2
+fi
+if ! sudo systemctl stop "$service_name"; then
+  echo "Test fail-closed stop failed; service state is not trusted." >&2
+else
+  echo "Test service stopped after failed activation." >&2
 fi
 exit 1

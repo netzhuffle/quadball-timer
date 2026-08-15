@@ -168,6 +168,48 @@ if [[ "${QBT_FOCUSED_TEST_MODE:-}" == 1 ]]; then
   expected_staged_dir="${base_dir}/.staging/${release_id}"
 fi
 
+realpath_command="${QBT_FOCUSED_TEST_REALPATH:-realpath}"
+
+remove_validated_release() {
+  local release_path="$1" release_root resolved_release_path trash_root detached_path
+  release_root="$("$realpath_command" -e -- "${base_dir}/releases")" || return 1
+  [[ -d "$release_root" && ! -L "$release_root" ]] || return 1
+  [[ "$release_path" == "$release_root"/* && "$release_path" != *..* && "$release_path" != *//* ]] || return 1
+  [[ -d "$release_path" && ! -L "$release_path" ]] || return 1
+  resolved_release_path="$("$realpath_command" -e -- "$release_path")" || return 1
+  [[ "$resolved_release_path" == "$release_path" && "$(dirname -- "$resolved_release_path")" == "$release_root" ]] || return 1
+  [[ -d "${base_dir}/.staging" && ! -L "${base_dir}/.staging" ]] || return 1
+  trash_root="$(mktemp -d "${base_dir}/.staging/.prune-XXXXXX")" || {
+    echo "Release prune cleanup could not allocate bounded trash: ${release_path}" >&2
+    return 1
+  }
+  detached_path="${trash_root}/$(basename -- "$resolved_release_path")"
+  if ! mv -- "$resolved_release_path" "$detached_path"; then
+    rmdir -- "$trash_root" 2>/dev/null || true
+    echo "Release prune cleanup could not detach validated release: ${release_path}" >&2
+    return 1
+  fi
+  if [[ "${QBT_FOCUSED_TEST_PRUNE_FAILURE:-}" == after-rename ]]; then
+    echo "Release prune cleanup deferred after detach: ${detached_path}" >&2
+    return 1
+  fi
+  if ! chmod -R u+w "$detached_path"; then
+    echo "Release prune cleanup left detached evidence after write-enable failure: ${detached_path}" >&2
+    return 1
+  fi
+  if ! rm -rf -- "$detached_path"; then
+    echo "Release prune cleanup left detached evidence after removal failure: ${detached_path}" >&2
+    return 1
+  fi
+  rmdir -- "$trash_root" 2>/dev/null || true
+}
+
+if [[ "${QBT_FOCUSED_TEST_PRUNE_PROBE:-}" == 1 ]]; then
+  [[ "${QBT_FOCUSED_TEST_MODE:-}" == 1 ]] || exit 1
+  remove_validated_release "${QBT_FOCUSED_TEST_PRUNE_TARGET:-}"
+  exit $?
+fi
+
 inject_focused_failure() {
   if [[ "${QBT_FOCUSED_TEST_MODE:-}" == 1 && "$EUID" -ne 0 && -n "${QBT_FOCUSED_TEST_ROOT:-}" && "$focused_failure_phase" == "$1" ]]; then
     echo "Focused activation failure at $1." >&2
@@ -469,16 +511,22 @@ compatible_previous_release() {
 }
 
 prune_releases() {
-  local current_release="$1" rollback_release="$2" release_path
+  local current_release="$1" rollback_release="$2" release_path release_root
   local -a all_releases
   if [[ "${QBT_FOCUSED_TEST_MODE:-}" == 1 ]]; then return 0; fi
-  mapfile -t all_releases < <(find "${base_dir}/releases" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' | sort -rn | cut -d' ' -f2-)
+  release_root="$("$realpath_command" -e -- "${base_dir}/releases")" || return 1
+  all_releases=()
+  while IFS= read -r release_path; do all_releases+=("$release_path"); done < <(
+    find "$release_root" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' | sort -rn | cut -d' ' -f2-
+  )
   local release_count=0
-  for release_path in "${all_releases[@]}"; do
-    [[ "$release_path" == "$current_release" || "$release_path" == "$rollback_release" ]] && continue
-    release_count=$((release_count + 1))
-    if (( release_count > keep_releases - 2 )); then rm -rf -- "$release_path"; fi
-  done
+  if ((${#all_releases[@]} > 0)); then
+    for release_path in "${all_releases[@]}"; do
+      [[ "$release_path" == "$current_release" || "$release_path" == "$rollback_release" ]] && continue
+      release_count=$((release_count + 1))
+      if (( release_count > keep_releases - 2 )); then remove_validated_release "$release_path"; fi
+    done
+  fi
 }
 
 if restart_service && check_health "$release_id" "$release_dir" && check_representative_behavior; then

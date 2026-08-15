@@ -98,7 +98,7 @@ export function inspectRecoveryDatabase(
       logicalDigest.update("\n");
     }
   }
-  const actionCount = included.has("foundation_event_game_record_actions")
+  const actionCount = relations.includes("foundation_event_game_record_actions")
     ? countRows(database, "foundation_event_game_record_actions")
     : 0;
   const grantVersions = relations.includes("foundation_grant_roots")

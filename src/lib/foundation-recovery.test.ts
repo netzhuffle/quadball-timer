@@ -161,6 +161,51 @@ describe("Event foundation recovery", () => {
     });
   });
 
+  test("backs up an older Foundation schema before migration without inventing relations", async () => {
+    await withRecoveryPaths(async ({ livePath, backupDirectory }) => {
+      const harness = await createHarness(livePath, backupDirectory);
+      harness.storage.close();
+
+      const legacyPath = join(dirname(livePath), "legacy.sqlite");
+      const legacy = openSqliteFoundationStorage(legacyPath, {
+        migrations: FOUNDATION_MIGRATIONS.slice(0, 2),
+        grantKeyRing: harness.keyRing,
+        grantValidationContext: { environmentId: "test", keyRing: harness.keyRing },
+      });
+      await legacy.applyMigrations({ requireCandidate: false });
+      const recovery = createFoundationRecovery(legacy, {
+        ...harness.options,
+        createId: () => "legacy-backup",
+      });
+
+      const manifest = await recovery.createPreDeploymentBackup();
+      const source = new Database(legacyPath, { readonly: true });
+      expect(
+        source
+          .query(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'foundation_event_game_record_actions'",
+          )
+          .get(),
+      ).toBeNull();
+      source.close();
+      expect(manifest.actionCount).toBe(0);
+
+      const manifestPath = join(backupDirectory, `${manifest.snapshotId}.manifest.json`);
+      await expect(recovery.verifyBackup(manifestPath)).resolves.toEqual(manifest);
+      legacy.close();
+
+      const migrated = openSqliteFoundationStorage(legacyPath, {
+        grantKeyRing: harness.keyRing,
+        grantValidationContext: { environmentId: "test", keyRing: harness.keyRing },
+      });
+      await migrated.applyMigrations({ requireCandidate: true });
+      expect((await migrated.migrationPreflight()).schemaVersion).toBe(
+        Number(CURRENT_SCHEMA_VERSION),
+      );
+      migrated.close();
+    });
+  });
+
   test("uses a private physical workspace and rejects unsafe existing paths", async () => {
     await withRecoveryPaths(async ({ livePath, backupDirectory }) => {
       let rawMode: number | null = null;
