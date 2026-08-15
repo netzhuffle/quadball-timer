@@ -30,12 +30,12 @@ const lifecycleTimer = setTimeout(() => lifecycleController.abort(), 52_000);
 
 async function run() {
   directory = mkdtempSync(join(tmpdir(), "quadball-timer-adhoc-browser-"));
-  certificatePath = join(directory, "localhost.crt");
-  keyPath = join(directory, "localhost.key");
+  certificatePath = join(directory, "test.timer.quadball.app.crt");
+  keyPath = join(directory, "test.timer.quadball.app.key");
   databasePath = join(directory, "ad-hoc.sqlite");
   grantKeyRingPath = join(directory, "grant-key-ring.json");
   port = 39_000 + Math.floor(Math.random() * 1_000);
-  origin = `https://localhost:${port}`;
+  origin = `https://test.timer.quadball.app:${port}`;
   environment = {
     ...process.env,
     NODE_ENV: "test",
@@ -63,9 +63,9 @@ async function run() {
         "rsa:2048",
         "-nodes",
         "-subj",
-        "/CN=localhost",
+        "/CN=test.timer.quadball.app",
         "-addext",
-        "subjectAltName=DNS:localhost",
+        "subjectAltName=DNS:test.timer.quadball.app",
         "-days",
         "1",
         "-keyout",
@@ -82,7 +82,10 @@ async function run() {
 
     await raceWithDeadline(startServer(), lifecycleController.signal);
     browser = await raceWithDeadline(
-      chromium.launch({ headless: true }),
+      chromium.launch({
+        headless: true,
+        args: ["--host-resolver-rules=MAP test.timer.quadball.app 127.0.0.1"],
+      }),
       lifecycleController.signal,
     );
     await raceWithDeadline(
@@ -94,9 +97,53 @@ async function run() {
         first.setDefaultTimeout(15_000);
         second.setDefaultTimeout(15_000);
 
+        await first.addInitScript(() => {
+          const evidence = { sawBusy: false, sawOffline: false };
+          const inspect = () => {
+            const text = document.body?.textContent ?? "";
+            evidence.sawBusy ||= /Ad Hoc connection busy/u.test(text);
+            evidence.sawOffline ||= /\bOffline(?:\s+\d+)?\b/u.test(text);
+          };
+          const install = () => {
+            const observer = new MutationObserver(inspect);
+            observer.observe(document.body, {
+              childList: true,
+              characterData: true,
+              subtree: true,
+            });
+            inspect();
+          };
+          if (document.body === null) {
+            document.addEventListener("DOMContentLoaded", install, { once: true });
+          } else {
+            install();
+          }
+          (
+            window as typeof window & {
+              __quadballTimerInitialAdHocConnectionEvidence?: typeof evidence;
+            }
+          ).__quadballTimerInitialAdHocConnectionEvidence = evidence;
+        });
         await first.goto(origin);
         await first.getByRole("button", { name: /Start an Ad Hoc Game/ }).click();
         await first.waitForURL(/\/game\/adhoc-/u);
+        await first.getByText("Live", { exact: true }).waitFor();
+        const initialConnectionEvidence = await first.evaluate(() => {
+          const evidence = (
+            window as typeof window & {
+              __quadballTimerInitialAdHocConnectionEvidence?: {
+                sawBusy: boolean;
+                sawOffline: boolean;
+              };
+            }
+          ).__quadballTimerInitialAdHocConnectionEvidence;
+          if (evidence === undefined)
+            throw new Error("Initial connection evidence was unavailable.");
+          return evidence;
+        });
+        if (initialConnectionEvidence.sawBusy || initialConnectionEvidence.sawOffline) {
+          throw new Error("Newly created Test-shaped Ad Hoc Game did not reach Live cleanly.");
+        }
         await assertAccessibleQr(first, "creator");
 
         const gameId = new URL(first.url()).pathname.split("/").at(-1);
@@ -517,7 +564,7 @@ async function waitForServer() {
       "-sSf",
       "-H",
       `host: localhost:${port}`,
-      `${origin}/internal/healthz`,
+      `https://127.0.0.1:${port}/internal/healthz`,
     ]);
     if (response.exitCode === 0) return;
     await Bun.sleep(50);
