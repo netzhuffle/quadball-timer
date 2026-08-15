@@ -351,6 +351,14 @@ export function validateOverride(
     SHARED_LIMITS.clock.maxMs,
     "override.gameTimeMs",
   );
+  const beforeValue =
+    value.beforeValue === undefined
+      ? valid(undefined)
+      : parseJsonValue(value.beforeValue, "override.beforeValue");
+  const afterValue =
+    value.afterValue === undefined
+      ? valid(undefined)
+      : parseJsonValue(value.afterValue, "override.afterValue");
   const reason = validateOptionalBoundedText(value.reason, "override.reason");
   const note = validateOptionalBoundedText(value.note, "override.note");
   if (!guardrail.ok) return guardrail;
@@ -358,6 +366,8 @@ export function validateOverride(
   if (!confirmation.ok) return confirmation;
   if (!authorityReference.ok) return authorityReference;
   if (!gameTimeMs.ok) return gameTimeMs;
+  if (!beforeValue.ok) return beforeValue;
+  if (!afterValue.ok) return afterValue;
   if (!reason.ok) return reason;
   if (!note.ok) return note;
   return valid({
@@ -366,6 +376,8 @@ export function validateOverride(
     confirmation: confirmation.value,
     authorityReference: authorityReference.value,
     gameTimeMs: gameTimeMs.value,
+    ...(beforeValue.value === undefined ? {} : { beforeValue: beforeValue.value }),
+    ...(afterValue.value === undefined ? {} : { afterValue: afterValue.value }),
     ...(reason.value === undefined ? {} : { reason: reason.value }),
     ...(note.value === undefined ? {} : { note: note.value }),
   });

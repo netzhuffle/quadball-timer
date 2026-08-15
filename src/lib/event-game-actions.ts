@@ -76,6 +76,8 @@ export type OfficialOverrideMetadata = {
   confirmation: string;
   authorityReference: string;
   gameTimeMs: number;
+  beforeValue?: ActionJsonValue;
+  afterValue?: ActionJsonValue;
   reason?: string;
   note?: string;
 };

@@ -23,7 +23,20 @@ export function retainControllerIntent(
 export function controllerIntentRetryKey(intent: LiveEventControllerIntent): string {
   switch (intent.type) {
     case "record-goal":
-      return JSON.stringify([intent.type, intent.gameSideId, intent.gameTimeMs]);
+      return JSON.stringify([
+        intent.type,
+        intent.gameSideId,
+        intent.gameTimeMs,
+        intent.sportingOrder ?? null,
+        intent.override ?? null,
+      ]);
+    case "correct-fact":
+      return JSON.stringify([
+        intent.type,
+        intent.targetFactId,
+        intent.effective,
+        intent.gameTimeMs,
+      ]);
     case "clock":
     case "set-running":
       return JSON.stringify([intent.type, intent.running, intent.gameTimeMs]);
@@ -40,7 +53,14 @@ export function controllerIntentRetryKey(intent: LiveEventControllerIntent): str
         intent.gameTimeMs,
       ]);
     case "substantive":
-      return JSON.stringify([intent.type, intent.trigger, intent.gameTimeMs]);
+      return JSON.stringify([
+        intent.type,
+        intent.trigger,
+        intent.heatAction ?? null,
+        intent.gameTimeMs,
+        intent.sportingOrder ?? null,
+        intent.override ?? null,
+      ]);
     case "reset":
     case "undo":
       return JSON.stringify([intent.type, intent.gameTimeMs]);
