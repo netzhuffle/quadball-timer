@@ -325,6 +325,7 @@ verify_bundle() {
     "deploy/activate-release.sh"
     "deploy/activate-test-release.sh"
     "deploy/activation-maintenance-root.sh"
+    "deploy/restore-production.sh"
     "deploy/systemd/quadball-timer-test.service"
     "deploy/systemd/quadball-timer.service"
     "quadball-timer"

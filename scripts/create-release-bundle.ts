@@ -30,6 +30,7 @@ const sourceByBundlePath: Record<string, string> = {
   "deploy/activate-release.sh": "deploy/activate-release.sh",
   "deploy/activate-test-release.sh": "deploy/activate-test-release.sh",
   "deploy/activation-maintenance-root.sh": "deploy/activation-maintenance-root.sh",
+  "deploy/restore-production.sh": "deploy/restore-production.sh",
   "deploy/systemd/quadball-timer.service": "deploy/systemd/quadball-timer.service",
   "deploy/systemd/quadball-timer-test.service": "deploy/systemd/quadball-timer-test.service",
 };

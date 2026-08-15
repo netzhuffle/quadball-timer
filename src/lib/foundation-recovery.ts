@@ -45,6 +45,7 @@ import type { FoundationStorageTransaction } from "@/lib/foundation-storage";
 import type { AdHocRecoveryAdapter, AdHocRecoveryFacts } from "@/lib/ad-hoc-games";
 import type {
   TechnicalAdminAuth,
+  TechnicalAdminRecoveryResult,
   TechnicalAdminRestorePreparationRequest,
   TechnicalAdminRestorePreparationResult,
 } from "@/lib/technical-admin-auth";
@@ -111,6 +112,7 @@ export type FoundationRecoveryOptions = {
       | "after-restore-staging"
       | "after-authoritative-quiescence"
       | "after-final-authority-evaluation"
+      | "after-post-cutover-inspection"
       | "after-live-preserved"
       | "before-live-replacement"
       | "before-completed-restore-evidence",
@@ -159,6 +161,8 @@ export type FoundationRecovery = {
     completionEvidencePath: string | null;
     completionEvidenceStatus: "written" | "write-failed";
     potentiallyNewerWork: boolean | null;
+    technicalAdminAuth: FoundationRestoreSuccessTechnicalAdminReport;
+    authorityResurrectionWarning: string;
   }>;
   importControllerRecovery(
     input: RecoveryImportInput,
@@ -168,6 +172,37 @@ export type FoundationRecovery = {
 export type FoundationRestoreOptions = {
   technicalAdminAuthMode?: TechnicalAdminRestorePreparationRequest["mode"];
 };
+
+export type FoundationRestoreFailurePhase =
+  | "staging"
+  | "auth-sanitation"
+  | "pre-cutover-validation"
+  | "foundation-replacement"
+  | "post-cutover-evidence";
+type FoundationRestoreSuccessTechnicalAdminReport = Exclude<
+  TechnicalAdminRecoveryResult,
+  { outcome: "not-attempted" | "sanitation-failed" }
+>;
+type FoundationRestoreTechnicalAdminReport = TechnicalAdminRecoveryResult;
+
+export class FoundationRestoreFailure extends Error {
+  readonly technicalAdminAuth: FoundationRestoreTechnicalAdminReport;
+  readonly phase: FoundationRestoreFailurePhase;
+  readonly cutoverCompleted: boolean;
+
+  constructor(
+    cause: unknown,
+    technicalAdminAuth: FoundationRestoreTechnicalAdminReport,
+    phase: FoundationRestoreFailurePhase,
+    cutoverCompleted: boolean,
+  ) {
+    super(cause instanceof Error ? cause.message : "Foundation restore failed.");
+    this.name = "FoundationRestoreFailure";
+    this.technicalAdminAuth = technicalAdminAuth;
+    this.phase = phase;
+    this.cutoverCompleted = cutoverCompleted;
+  }
+}
 
 export function createFoundationRecovery(
   storage: SqliteFoundationStorage,
@@ -345,13 +380,14 @@ export function createFoundationRecovery(
     const manifest = await readManifest(manifestPath, backupDirectory);
     const backupPath = resolveBackupDatabasePath(manifestPath, manifest, backupDirectory);
     const restoreId = boundedId(createId(), "restoreId");
-    const stagedPath = join(liveDirectory, `.${basename(livePath)}.${restoreId}.staged`);
+    const restoreAttemptDirectory = join(backupDirectory, `${restoreId}.restore-attempt`);
+    const stagedPath = join(restoreAttemptDirectory, `${basename(livePath)}.staged`);
     const failedDatabasePath = `${livePath}.failed-${restoreId}`;
     const adHocLivePath = options.adHoc?.databasePath ?? null;
     const stagedAdHocPath =
       adHocLivePath === null
         ? null
-        : join(dirname(adHocLivePath), `.${basename(adHocLivePath)}.${restoreId}.staged`);
+        : join(restoreAttemptDirectory, `${basename(adHocLivePath)}.staged`);
     const failedAdHocDatabasePath =
       adHocLivePath === null ? null : `${adHocLivePath}.failed-${restoreId}`;
     const evidencePath = join(backupDirectory, `${restoreId}.restore-evidence.json`);
@@ -362,8 +398,25 @@ export function createFoundationRecovery(
     let staged: SqliteFoundationStorage | undefined;
     let stagedIdentity: StableFileIdentity | null = null;
     let stagedAdHocIdentity: StableFileIdentity | null = null;
+    const stagedSidecarIdentities = new Map<string, StableFileIdentity>();
     let evidenceIdentity: StableFileIdentity | null = null;
+    let cutoverCompleted = false;
+    let restoreSucceeded = false;
+    let restorePhase: FoundationRestoreFailurePhase = "staging";
+    let technicalAdminAuthReport: FoundationRestoreTechnicalAdminReport = {
+      outcome: "not-attempted",
+      credentialPreserved: false,
+      reEnrollmentRequired: false,
+    };
+    const rememberStagedSidecars = async () => {
+      for (const sidecarPath of [`${stagedPath}-wal`, `${stagedPath}-shm`]) {
+        if (stagedSidecarIdentities.has(sidecarPath) || !(await pathExists(sidecarPath))) continue;
+        stagedSidecarIdentities.set(sidecarPath, stableIdentity(await lstat(sidecarPath)));
+      }
+    };
     try {
+      await mkdir(restoreAttemptDirectory, { mode: 0o700 });
+      await assertOwnedPrivateDirectory(restoreAttemptDirectory, "restore attempt workspace");
       await assertPathAbsent(failedDatabasePath, "failed Event foundation image");
       if (failedAdHocDatabasePath !== null)
         await assertPathAbsent(failedAdHocDatabasePath, "failed Ad Hoc image");
@@ -412,6 +465,7 @@ export function createFoundationRecovery(
       // Both authoritative writer domains are closed before the final current-fact
       // evaluation. Any writer already queued drains before this boundary; any
       // later writer is rejected by the closed repositories.
+      restorePhase = "auth-sanitation";
       await options.technicalAdminAuth.quiesce();
       await storage.quiesceForRecovery();
       await options.adHoc?.quiesceForRecovery();
@@ -423,6 +477,7 @@ export function createFoundationRecovery(
       );
       const technicalAdminAuthEvidence =
         redactTechnicalAdminRestoreResult(technicalAdminAuthResult);
+      technicalAdminAuthReport = toTechnicalAdminRecoveryResult(technicalAdminAuthResult);
       if (technicalAdminAuthResult.outcome === "sanitation-failed") {
         evidenceIdentity = await writeJsonFile(
           evidencePath,
@@ -442,6 +497,9 @@ export function createFoundationRecovery(
         );
         throw new Error("Technical Admin authentication sanitation failed before replacement.");
       }
+      const technicalAdminAuthSuccessReport =
+        toTechnicalAdminSuccessResult(technicalAdminAuthResult);
+      restorePhase = "pre-cutover-validation";
       // The finite auth result is committed to the pending record before any
       // Foundation replacement. A later replacement rollback changes only
       // Foundation state and leaves the already-sanitized auth store untouched.
@@ -474,13 +532,35 @@ export function createFoundationRecovery(
           keyRing: options.keyRing,
         },
       });
+      await rememberStagedSidecars();
       staged.setReadinessContext(options.readinessContext);
-      await reevaluateRestoredAuthority(staged, options.grant);
-      const stagedReadiness = await staged.readiness();
+      let stagedReadiness = await staged.readiness();
+      if (!stagedReadiness.ok) {
+        const migration = await staged.migrationPreflight();
+        if (migration.status !== "pending" && migration.status !== "missing") {
+          throw new Error("Restored staging database has incompatible migrations.");
+        }
+        try {
+          await staged.applyMigrations({ requireCandidate: false });
+        } finally {
+          await rememberStagedSidecars();
+        }
+        stagedReadiness = await staged.readiness();
+      }
+      try {
+        await reevaluateRestoredAuthority(staged, options.grant);
+      } finally {
+        await rememberStagedSidecars();
+      }
+      stagedReadiness = await staged.readiness();
       if (!stagedReadiness.ok || stagedReadiness.evidence?.keys.missingCount !== 0) {
         throw new Error("Restored staging database did not pass independent readiness.");
       }
-      await staged.quiesceForRecovery();
+      try {
+        await staged.quiesceForRecovery();
+      } finally {
+        await rememberStagedSidecars();
+      }
       staged = undefined;
       const reevaluatedStagedIdentity = await assertOwnedPrivateFile(
         stagedPath,
@@ -515,6 +595,7 @@ export function createFoundationRecovery(
         identity: StableFileIdentity;
       }> = [];
       const installedPaths: Array<{ path: string; identity: StableFileIdentity }> = [];
+      restorePhase = "foundation-replacement";
       try {
         const failedLiveIdentity = await moveToExclusivePath(
           livePath,
@@ -584,6 +665,10 @@ export function createFoundationRecovery(
             stagedIdentity,
           ),
         });
+        // Once the candidate has replaced the live Foundation path, report the
+        // cutover boundary truthfully even if a later sidecar or Ad Hoc move
+        // fails and the bounded rollback path is entered.
+        cutoverCompleted = true;
         stagedIdentity = null;
         for (const suffix of ["-wal", "-shm"] as const) {
           if (await pathExists(`${stagedPath}${suffix}`)) {
@@ -639,16 +724,18 @@ export function createFoundationRecovery(
           await syncDirectory(dirname(adHocLivePath));
         }
       } catch (error) {
-        for (const installed of installedPaths.reverse())
+        for (const installed of installedPaths.reverse()) {
+          const preservedCandidatePath = join(
+            restoreAttemptDirectory,
+            `installed-${basename(installed.path)}`,
+          );
+          await copyStablePrivateFile(installed.path, preservedCandidatePath);
           await removeStablePath(installed.path, installed.identity);
+        }
         for (const moved of movedSidecars.reverse()) {
-          if (await pathExists(moved.from))
-            await moveToExclusivePath(
-              moved.from,
-              moved.to,
-              "recovery rollback image",
-              moved.identity,
-            );
+          if (await pathExists(moved.from)) {
+            await copyStablePrivateFile(moved.from, moved.to);
+          }
         }
         await syncDirectory(liveDirectory);
         if (adHocLivePath !== null && dirname(adHocLivePath) !== liveDirectory) {
@@ -656,11 +743,21 @@ export function createFoundationRecovery(
         }
         throw error;
       }
+      cutoverCompleted = true;
+      restorePhase = "post-cutover-evidence";
+      // Keep an evaluated candidate copy in the retryable attempt workspace. It
+      // is transient only on complete success and remains evidence on every
+      // later inspection or evidence failure.
+      stagedIdentity = await copyStablePrivateFile(livePath, stagedPath);
+      if (stagedAdHocPath !== null && adHocLivePath !== null) {
+        stagedAdHocIdentity = await copyStablePrivateFile(adHocLivePath, stagedAdHocPath);
+      }
       const restoredFacts = safelyInspectClosedDatabase(livePath);
       const restoredAdHocFacts =
         options.adHoc !== undefined && adHocLivePath !== null
           ? options.adHoc.inspectRecoveryDatabase(adHocLivePath)
           : null;
+      options.faultInjector?.("after-post-cutover-inspection");
       const evidence = {
         version: RECOVERY_EVIDENCE_VERSION,
         kind: "restore",
@@ -692,19 +789,10 @@ export function createFoundationRecovery(
             ? manifest.restoredGrantVersions
             : redactGrantVersions(restoredFacts),
       };
-      let completionEvidencePath: string | null = null;
-      let completionEvidenceStatus: "written" | "write-failed" = "write-failed";
-      try {
-        await assertStablePrivateFile(evidencePath, evidenceIdentity, "pending restore evidence");
-        options.faultInjector?.("before-completed-restore-evidence");
-        await writeAtomicJsonFile(completionEvidenceCandidatePath, evidence);
-        completionEvidencePath = completionEvidenceCandidatePath;
-        completionEvidenceStatus = "written";
-      } catch {
-        // Cutover is already complete. The immutable, synced pending record and
-        // explicit return state prevent a write failure from being reported as
-        // a failed restore or inviting an unsafe retry.
-      }
+      await assertStablePrivateFile(evidencePath, evidenceIdentity, "pending restore evidence");
+      options.faultInjector?.("before-completed-restore-evidence");
+      await writeAtomicJsonFile(completionEvidenceCandidatePath, evidence);
+      restoreSucceeded = true;
       return {
         restoreId,
         failedDatabasePath,
@@ -715,20 +803,50 @@ export function createFoundationRecovery(
             : null,
         completed: true as const,
         evidencePath,
-        completionEvidencePath,
-        completionEvidenceStatus,
+        completionEvidencePath: completionEvidenceCandidatePath,
+        completionEvidenceStatus: "written" as const,
         potentiallyNewerWork,
+        technicalAdminAuth: technicalAdminAuthSuccessReport,
+        authorityResurrectionWarning:
+          "Restoring an older snapshot may resurrect Grants, Grant Sessions, Ad Hoc Controller sessions, or QR-admitting state changed after the snapshot.",
       };
+    } catch (error) {
+      try {
+        if (!(await pathExists(failedDatabasePath)) && (await pathExists(livePath))) {
+          await copyStablePrivateFile(livePath, failedDatabasePath);
+        }
+      } catch {
+        // Preserve the bounded failure classification even if evidence I/O is
+        // unavailable; never replace it with a raw filesystem exception.
+      }
+      try {
+        if (
+          failedAdHocDatabasePath !== null &&
+          adHocLivePath !== null &&
+          !(await pathExists(failedAdHocDatabasePath)) &&
+          (await pathExists(adHocLivePath))
+        ) {
+          await copyStablePrivateFile(adHocLivePath, failedAdHocDatabasePath);
+        }
+      } catch {
+        // The original Foundation failure and auth outcome remain authoritative.
+      }
+      throw new FoundationRestoreFailure(
+        error,
+        technicalAdminAuthReport,
+        restorePhase,
+        cutoverCompleted,
+      );
     } finally {
       staged?.close();
-      if (stagedIdentity !== null) await removeStablePath(stagedPath, stagedIdentity);
-      if (stagedAdHocIdentity !== null && stagedAdHocPath !== null)
-        await removeStablePath(stagedAdHocPath, stagedAdHocIdentity);
-      await rm(`${stagedPath}-wal`, { force: true });
-      await rm(`${stagedPath}-shm`, { force: true });
-      if (stagedAdHocPath !== null) {
-        await rm(`${stagedAdHocPath}-wal`, { force: true });
-        await rm(`${stagedAdHocPath}-shm`, { force: true });
+      if (restoreSucceeded) {
+        if (stagedIdentity !== null) await removeMatchingStablePath(stagedPath, stagedIdentity);
+        if (stagedAdHocIdentity !== null && stagedAdHocPath !== null)
+          await removeMatchingStablePath(stagedAdHocPath, stagedAdHocIdentity);
+        for (const [sidecarPath, identity] of stagedSidecarIdentities) {
+          await removeMatchingStablePath(sidecarPath, identity);
+        }
+        await rm(restoreAttemptDirectory, { recursive: true, force: true });
       }
     }
   }
@@ -889,6 +1007,50 @@ async function prepareTechnicalAdminForRestore(
     // The composition boundary deliberately exposes no adapter or storage error.
   }
   return { outcome: "sanitation-failed" };
+}
+
+function toTechnicalAdminRecoveryResult(
+  result: TechnicalAdminRestorePreparationResult,
+): Exclude<TechnicalAdminRecoveryResult, { outcome: "not-attempted" }> {
+  if (result.outcome === "preserved-transients-invalidated") {
+    return {
+      outcome: result.outcome,
+      credentialPreserved: true,
+      reEnrollmentRequired: false,
+    };
+  }
+  if (result.outcome === "re-enrollment-required") {
+    return {
+      outcome: result.outcome,
+      credentialPreserved: false,
+      reEnrollmentRequired: true,
+    };
+  }
+  return {
+    outcome: "sanitation-failed",
+    credentialPreserved: false,
+    reEnrollmentRequired: false,
+  };
+}
+
+function toTechnicalAdminSuccessResult(
+  result: TechnicalAdminRestorePreparationResult,
+): FoundationRestoreSuccessTechnicalAdminReport {
+  if (result.outcome === "preserved-transients-invalidated") {
+    return {
+      outcome: result.outcome,
+      credentialPreserved: true,
+      reEnrollmentRequired: false,
+    };
+  }
+  if (result.outcome === "re-enrollment-required") {
+    return {
+      outcome: result.outcome,
+      credentialPreserved: false,
+      reEnrollmentRequired: true,
+    };
+  }
+  throw new Error("Technical Admin sanitation did not produce a successful recovery result.");
 }
 
 function redactTechnicalAdminRestoreResult(
@@ -1357,6 +1519,18 @@ async function assertOwnedPrivateFile(path: string, label: string): Promise<Stab
   return stableIdentity(info);
 }
 
+async function assertOwnedPrivateDirectory(path: string, label: string): Promise<void> {
+  const info = await lstat(path);
+  const currentUid = process.getuid?.();
+  if (
+    info.isSymbolicLink() ||
+    !info.isDirectory() ||
+    (info.mode & 0o777) !== 0o700 ||
+    (currentUid !== undefined && info.uid !== currentUid)
+  )
+    throw new Error(`${label} must be an owned non-symlink 0700 directory.`);
+}
+
 async function assertStablePrivateFile(
   path: string,
   expected: StableFileIdentity,
@@ -1364,6 +1538,26 @@ async function assertStablePrivateFile(
 ): Promise<void> {
   const current = await assertOwnedPrivateFile(path, label);
   if (!samePhysicalFile(current, expected)) {
+    throw new Error(`${label} changed file identity during recovery.`);
+  }
+}
+
+async function assertStableSourceFile(
+  path: string,
+  expected: StableFileIdentity,
+  label: string,
+): Promise<void> {
+  const info = await lstat(path);
+  const currentUid = process.getuid?.();
+  if (
+    info.isSymbolicLink() ||
+    !info.isFile() ||
+    (currentUid !== undefined && info.uid !== currentUid)
+  ) {
+    throw new Error(`${label} must be an owned non-symlink regular file.`);
+  }
+  const current = stableIdentity(info);
+  if (!sameFileSnapshot(current, expected)) {
     throw new Error(`${label} changed file identity during recovery.`);
   }
 }
@@ -1379,17 +1573,25 @@ async function assertStableFileIdentity(
   }
 }
 
-async function readStablePrivateFile(path: string): Promise<Buffer> {
+async function readStablePrivateFile(path: string, requirePrivateMode = true): Promise<Buffer> {
   const handle = await openFile(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
   try {
     const before = stableIdentity(await handle.stat());
-    await assertStablePrivateFile(path, before, "recovery source file");
+    if (requirePrivateMode) {
+      await assertStablePrivateFile(path, before, "recovery source file");
+    } else {
+      await assertStableSourceFile(path, before, "recovery source file");
+    }
     const content = await handle.readFile();
     const after = stableIdentity(await handle.stat());
     if (!sameFileSnapshot(before, after)) {
       throw new Error("Recovery source file changed while it was read.");
     }
-    await assertStablePrivateFile(path, before, "recovery source file");
+    if (requirePrivateMode) {
+      await assertStablePrivateFile(path, before, "recovery source file");
+    } else {
+      await assertStableSourceFile(path, before, "recovery source file");
+    }
     return content;
   } finally {
     await handle.close();
@@ -1401,19 +1603,28 @@ async function copyStablePrivateFile(
   destinationPath: string,
   expectedSha256?: string,
 ): Promise<StableFileIdentity> {
-  const content = await readStablePrivateFile(sourcePath);
-  if (
-    expectedSha256 !== undefined &&
-    createHash("sha256").update(content).digest("hex") !== expectedSha256
-  )
-    throw new Error("Verified backup file identity does not match its manifest.");
-  const destination = await openFile(
-    destinationPath,
-    fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
-    0o600,
-  );
+  const source = await openFile(sourcePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  let sourceIdentity: StableFileIdentity | null = null;
+  let destination: Awaited<ReturnType<typeof openFile>> | undefined;
   let openedIdentity: StableFileIdentity | null = null;
   try {
+    sourceIdentity = stableIdentity(await source.stat());
+    await assertStableSourceFile(sourcePath, sourceIdentity, "recovery source file");
+    const content = await source.readFile();
+    const afterReadIdentity = stableIdentity(await source.stat());
+    if (!sameFileSnapshot(sourceIdentity, afterReadIdentity)) {
+      throw new Error("Recovery source file changed while it was read.");
+    }
+    if (
+      expectedSha256 !== undefined &&
+      createHash("sha256").update(content).digest("hex") !== expectedSha256
+    )
+      throw new Error("Verified backup file identity does not match its manifest.");
+    destination = await openFile(
+      destinationPath,
+      fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
+      0o600,
+    );
     await destination.chmod(0o600);
     openedIdentity = stableIdentity(await destination.stat());
     await assertStablePrivateFile(destinationPath, openedIdentity, "recovery copy");
@@ -1425,12 +1636,16 @@ async function copyStablePrivateFile(
     }
     await assertStablePrivateFile(destinationPath, writtenIdentity, "recovery copy");
     await destination.close();
+    destination = undefined;
+    await assertStableSourceFile(sourcePath, sourceIdentity, "recovery source file");
     await assertStablePrivateFile(destinationPath, writtenIdentity, "recovery copy");
     return writtenIdentity;
   } catch (error) {
-    await destination.close().catch(() => undefined);
+    await destination?.close().catch(() => undefined);
     if (openedIdentity !== null) await removeStablePath(destinationPath, openedIdentity);
     throw error;
+  } finally {
+    await source.close();
   }
 }
 
@@ -1447,16 +1662,20 @@ async function moveToExclusivePath(
     destinationCreated = true;
     const destinationIdentity = await assertOwnedPrivateFile(destinationPath, label);
     if (!sameFileSnapshot(sourceIdentity, destinationIdentity)) {
-      throw new Error(`${label} source changed before exclusive publication.`);
+      throw new Error(
+        `${label} source changed before exclusive publication; file identity changed.`,
+      );
     }
     const currentSource = await assertOwnedPrivateFile(sourcePath, `${label} source`);
     if (!sameFileSnapshot(sourceIdentity, currentSource)) {
-      throw new Error(`${label} source changed during exclusive publication.`);
+      throw new Error(
+        `${label} source changed during exclusive publication; file identity changed.`,
+      );
     }
     await unlink(sourcePath);
     const publishedIdentity = await assertOwnedPrivateFile(destinationPath, label);
     if (!sameFileSnapshot(sourceIdentity, publishedIdentity)) {
-      throw new Error(`${label} changed after exclusive publication.`);
+      throw new Error(`${label} changed after exclusive publication; file identity changed.`);
     }
     return publishedIdentity;
   } catch (error) {
@@ -1479,7 +1698,9 @@ async function tightenStableOwnedFile(
     }
     const before = stableIdentity(beforeInfo);
     if (!sameFileSnapshot(before, expected)) {
-      throw new Error(`${label} source changed before exclusive publication.`);
+      throw new Error(
+        `${label} source changed before exclusive publication; file identity changed.`,
+      );
     }
     await assertStableFileIdentity(path, before, `${label} source`);
     await handle.chmod(0o600);
@@ -1513,6 +1734,10 @@ async function removeStablePath(path: string, expected: StableFileIdentity): Pro
     throw new Error("Refusing to remove a recovery path whose file identity changed.");
   }
   await unlink(path);
+}
+
+async function removeMatchingStablePath(path: string, expected: StableFileIdentity): Promise<void> {
+  await removeStablePath(path, expected).catch(() => undefined);
 }
 
 function resolveBackupDatabasePath(

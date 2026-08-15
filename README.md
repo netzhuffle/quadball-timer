@@ -45,6 +45,13 @@ Install the root-owned maintenance wrapper once on the host:
 sudo install -o root -g root -m 0755 deploy/activation-maintenance-root.sh /usr/local/sbin/quadball-timer-activation-maintenance
 ```
 
+For an explicitly authorized host-local Production restore, log in as
+`deploy-quadball-timer` and run the immutable current release's
+`deploy/restore-production.sh --manifest /var/backups/quadball-timer/verified-<release-id>/<snapshot-id>.manifest.json`.
+The operator entry point owns the activation lock, stops the service, invokes the
+root maintenance boundary, and performs bounded post-restart checks. Deploy,
+monitoring, and browser paths never invoke it.
+
 For the bounded first-time or repair bootstrap of the Production/Test host
 contract, use `docs/agents/issue-165-pre-merge-handoff.md`.
 

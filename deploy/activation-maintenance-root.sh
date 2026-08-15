@@ -5,6 +5,45 @@ environment="${1:-}"
 release_dir="${2:-}"
 command="${3:-}"
 manifest_path="${4:-}"
+restore_report_emitted=0
+restore_result_emitted=0
+restore_error_fd=2
+if [[ "$command" == restore ]]; then
+  exec 8>&2
+  exec 2>/dev/null
+  restore_error_fd=8
+fi
+
+restore_preparation_failure() {
+  local outcome="$1"
+  local status="${2:-1}"
+  printf '{"restored":false,"outcome":"%s","cutoverCompleted":false,"technicalAdminAuth":{"outcome":"not-attempted","credentialPreserved":false,"reEnrollmentRequired":false}}\n' "$outcome" >&${restore_error_fd}
+  restore_report_emitted=1
+  exit "$status"
+}
+
+maintenance_preflight_failure() {
+  local outcome="$1"
+  local status="$2"
+  local message="$3"
+  if [[ "$command" == restore ]]; then
+    restore_preparation_failure "$outcome" "$status"
+  fi
+  echo "$message" >&2
+  exit "$status"
+}
+
+# shellcheck disable=SC2329
+restore_exit_report() {
+  local status="$?"
+  trap - EXIT
+  if [[ "$command" == restore && "$restore_report_emitted" == 0 ]]; then
+    printf '{"restored":false,"outcome":"restore-preparation-failed","cutoverCompleted":false,"technicalAdminAuth":{"outcome":"not-attempted","credentialPreserved":false,"reEnrollmentRequired":false}}\n' >&"${restore_error_fd}"
+  fi
+  exit "$status"
+}
+trap restore_exit_report EXIT
+
 case "$environment" in
   production)
     service_user="quadball-timer"
@@ -277,10 +316,14 @@ if [[ "$focused_test_mode" == 1 ]]; then
   [[ -n "$backup_directory" ]] && backup_directory="$focused_test_root${backup_directory}"
 fi
 configure_promotion_test_hooks || exit 2
+owner_identity_command="${QBT_FOCUSED_TEST_OWNER_SEAM:-}"
 systemctl_command="${QBT_FOCUSED_TEST_SYSTEMCTL:-systemctl}"
 runuser_command="${QBT_FOCUSED_TEST_RUNUSER:-/usr/sbin/runuser}"
 flock_command="${QBT_FOCUSED_TEST_FLOCK:-flock}"
 realpath_command="${QBT_FOCUSED_TEST_REALPATH:-realpath}"
+readlink_command="${QBT_FOCUSED_TEST_READLINK:-readlink}"
+install_command="${QBT_FOCUSED_TEST_INSTALL:-/usr/bin/install}"
+mktemp_command="${QBT_FOCUSED_TEST_MKTEMP:-mktemp}"
 [[ "$release_dir" == "$release_base"/releases/* ]] || { echo "Unsafe release path." >&2; exit 2; }
 [[ "$release_dir" != *..* && "$release_dir" != *//* ]] || { echo "Unsafe release path." >&2; exit 2; }
 [[ -d "$release_dir" && ! -L "$release_dir" ]] || { echo "Unsafe release path." >&2; exit 2; }
@@ -293,12 +336,14 @@ resolved_release_dir="$($realpath_command -e -- "$release_dir")"
   echo "Maintenance release is incomplete." >&2
   exit 1
 }
-release_attempt_id="$(sed -n 's/.*"releaseAttemptId":"\([^"]*\)".*/\1/p' "$release_dir/release-manifest.json")"
-schema_compatibility="$(sed -n 's/.*"schemaCompatibility":"\([^"]*\)".*/\1/p' "$release_dir/release-manifest.json")"
-[[ -n "$release_attempt_id" && -n "$schema_compatibility" ]] || {
-  echo "Maintenance release identity is incomplete." >&2
-  exit 1
-}
+if ! release_attempt_id="$(sed -n 's/.*"releaseAttemptId":"\([^"]*\)".*/\1/p' "$release_dir/release-manifest.json")"; then
+  maintenance_preflight_failure release-identity-invalid 1 "Maintenance release identity is unreadable."
+fi
+if ! schema_compatibility="$(sed -n 's/.*"schemaCompatibility":"\([^"]*\)".*/\1/p' "$release_dir/release-manifest.json")"; then
+  maintenance_preflight_failure release-identity-invalid 1 "Maintenance release identity is unreadable."
+fi
+[[ -n "$release_attempt_id" && -n "$schema_compatibility" ]] ||
+  maintenance_preflight_failure release-identity-invalid 1 "Maintenance release identity is incomplete."
 [[ "$release_attempt_id" =~ ^[A-Za-z0-9._-]+$ && "$(basename -- "$release_dir")" == "$release_attempt_id" ]] || {
   echo "Maintenance release identity does not match its path." >&2
   exit 2
@@ -308,11 +353,14 @@ schema_compatibility="$(sed -n 's/.*"schemaCompatibility":"\([^"]*\)".*/\1/p' "$
   exit 2
 }
 case "$command" in
-  backup|verify-backup|promote)
+  backup|verify-backup|promote|restore)
     [[ "$environment" == production ]] || { echo "Production backup operations only." >&2; exit 2; }
     [[ "${SUDO_USER:-}" == "$expected_caller" ]] || { echo "Invalid maintenance caller." >&2; exit 2; }
-    [[ "$($systemctl_command is-active quadball-timer 2>/dev/null || true)" == inactive ]] || { echo "Production service must be inactive." >&2; exit 1; }
-    exec 9>"$release_base/.activation.lock"
+    service_state="$($systemctl_command is-active quadball-timer 2>/dev/null || true)"
+    [[ "$service_state" == inactive || "$service_state" == failed ]] || { echo "Production service must be inactive or failed." >&2; exit 1; }
+    if ! exec 9>"$release_base/.activation.lock"; then
+      maintenance_preflight_failure activation-lock-unavailable 1 "Activation lock could not be opened."
+    fi
     if QBT_ACTIVATION_LOCK_PATH="$release_base/.activation.lock" "$flock_command" -n 9; then echo "Activation lock is not held by the orchestrator." >&2; exit 1; fi
     ;;
   validate-migration|apply-migrations)
@@ -321,12 +369,12 @@ case "$command" in
     exec 9>"$release_base/.activation.lock"
     if QBT_ACTIVATION_LOCK_PATH="$release_base/.activation.lock" "$flock_command" -n 9; then echo "Activation lock is not held by the orchestrator." >&2; exit 1; fi
     ;;
-  readiness|preflight)
+  readiness|authoritative-operation|preflight)
     [[ "${SUDO_USER:-}" == "$expected_caller" ]] || { echo "Invalid maintenance caller." >&2; exit 2; }
     ;;
   *) echo "Unsupported maintenance operation." >&2; exit 2 ;;
 esac
-if [[ "$environment" == production && "$command" != readiness && "$command" != preflight && "$command" != validate-migration && "$command" != apply-migrations ]]; then
+if [[ "$environment" == production && "$command" != readiness && "$command" != authoritative-operation && "$command" != preflight && "$command" != validate-migration && "$command" != apply-migrations ]]; then
   if [[ -e "$backup_directory" || -L "$backup_directory" ]]; then
     [[ -d "$backup_directory" && ! -L "$backup_directory" ]] || { echo "Backup root is missing or symlinked." >&2; exit 2; }
     [[ "$($realpath_command -e -- "$backup_directory")" == "$backup_directory" ]] || { echo "Backup root is not canonical." >&2; exit 2; }
@@ -338,6 +386,91 @@ if [[ "$environment" == production && "$command" != readiness && "$command" != p
     [[ "$(stat -c '%U:%G:%a' "$backup_directory")" == "root:${service_user}:750" ]] || { echo "Backup root ownership or mode drifted." >&2; exit 2; }
   fi
 fi
+
+stage_restore_input() {
+  local source_path="$1"
+  local destination_name="$2"
+  local destination_path="$restore_workspace/$destination_name"
+  local before_identity=""
+  local after_identity=""
+  local source_copy_path="$source_path"
+
+  [[ "$destination_name" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
+  [[ "$source_path" == "$snapshot_directory"/* && "$source_path" != *..* ]] || return 1
+  [[ -f "$source_path" && ! -L "$source_path" ]] || return 1
+  [[ "$($realpath_command -e -- "$source_path")" == "$source_path" ]] || return 1
+  if [[ "$focused_test_mode" == 1 && -n "$owner_identity_command" ]]; then
+    [[ "$($owner_identity_command "$source_path")" == root:root:600 ]] || return 1
+  elif [[ "$focused_test_mode" != 1 ]]; then
+    [[ "$($stat_command -c '%U:%G:%a' -- "$source_path")" == root:root:600 ]] || return 1
+  fi
+  if [[ "$focused_test_mode" == 1 ]]; then
+    before_identity="$($stat_command -f '%d:%i:%z:%m' -- "$source_path")" || return 1
+  else
+    before_identity="$($stat_command -L -c '%d:%i:%s:%Y' -- "$source_path")" || return 1
+    exec 7<"$source_path" || return 1
+    source_copy_path="/proc/self/fd/7"
+    [[ "$($readlink_command "$source_copy_path")" == "$source_path" ]] || {
+      exec 7<&-
+      return 1
+    }
+    held_identity="$($stat_command -L -c '%d:%i:%s:%Y' -- "$source_copy_path")" || {
+      exec 7<&-
+      return 1
+    }
+    [[ "$before_identity" == "$held_identity" ]] || {
+      exec 7<&-
+      return 1
+    }
+  fi
+  local original_umask
+  original_umask="$(umask)"
+  umask 077
+  set -o noclobber
+  if ! exec 6>"$destination_path"; then
+    set +o noclobber
+    umask "$original_umask"
+    [[ "$focused_test_mode" == 1 ]] || exec 7<&-
+    return 1
+  fi
+  set +o noclobber
+  umask "$original_umask"
+  if [[ "$focused_test_mode" == 1 ]]; then
+    cat "$source_copy_path" >&6 || { exec 6>&-; return 1; }
+  else
+    cat <"$source_copy_path" >&6 || { exec 6>&-; exec 7<&-; return 1; }
+  fi
+  if [[ "$focused_test_mode" != 1 ]]; then
+    sync -f -- "$destination_path" || { exec 6>&-; exec 7<&-; return 1; }
+  fi
+  exec 6>&-
+  chmod 0600 "$destination_path" || return 1
+  if [[ "$focused_test_mode" != 1 ]]; then
+    chown "$service_user:$service_user" -- "$destination_path" || return 1
+  fi
+  if [[ "$focused_test_mode" == 1 ]]; then
+    [[ "$($stat_command -f '%Lp' -- "$destination_path")" == 600 ]] || return 1
+    if [[ -n "$owner_identity_command" ]]; then
+      [[ "$($owner_identity_command "$destination_path")" == quadball-timer:quadball-timer:600 ]] || return 1
+    fi
+  else
+    [[ "$($stat_command -c '%U:%G:%a' -- "$destination_path")" == "${service_user}:${service_user}:600" ]] || return 1
+  fi
+  [[ -f "$destination_path" && ! -L "$destination_path" ]] || return 1
+  [[ "$($realpath_command -e -- "$destination_path")" == "$destination_path" ]] || return 1
+  if [[ "$focused_test_mode" == 1 ]]; then
+    [[ "$($stat_command -f '%Lp' -- "$destination_path")" == 600 ]] || return 1
+    after_identity="$($stat_command -f '%d:%i:%z:%m' -- "$source_path")" || return 1
+  else
+    [[ "$($stat_command -c '%U:%G:%a' -- "$destination_path")" == "${service_user}:${service_user}:600" ]] || return 1
+    after_identity="$($stat_command -L -c '%d:%i:%s:%Y' -- "$source_path")" || return 1
+    held_identity="$($stat_command -L -c '%d:%i:%s:%Y' -- "$source_copy_path")" || return 1
+    exec 7<&-
+  fi
+  [[ "$before_identity" == "$after_identity" ]] || return 1
+  [[ "$focused_test_mode" == 1 || "$before_identity" == "$held_identity" ]] || return 1
+}
+
 if [[ "$command" == "backup" ]]; then
   operation_backup_directory="$backup_directory/.candidate-${release_attempt_id}"
   if [[ "$focused_test_mode" == 1 ]]; then rm -rf "$operation_backup_directory"; mkdir -p "$operation_backup_directory"; chmod 0700 "$operation_backup_directory"; else rm -rf -- "$operation_backup_directory"; install -d -o "$service_user" -g "$service_user" -m 0700 "$operation_backup_directory"; fi
@@ -356,13 +489,78 @@ if [[ "$command" == "promote" ]]; then
   [[ "$manifest_path" == "$candidate_directory"/* && "$manifest_path" != *..* ]] || { echo "Unsafe backup manifest path." >&2; exit 2; }
   manifest_path="$($realpath_command -e -- "$manifest_path")"
   [[ "$manifest_path" == "$candidate_directory"/* && ! -L "$manifest_path" ]] || { echo "Backup manifest is not canonical." >&2; exit 2; }
+elif [[ "$command" == "restore" ]]; then
+  [[ "$environment" == production ]] || { echo "Production restore operations only." >&2; exit 2; }
+  [[ -n "$manifest_path" && "$manifest_path" == "$backup_directory"/* && "$manifest_path" != *..* ]] || { echo "Unsafe restore manifest path." >&2; exit 2; }
+  manifest_path="$($realpath_command -e -- "$manifest_path")"
+  [[ "$manifest_path" == "$backup_directory"/* && ! -L "$manifest_path" ]] || { echo "Restore manifest is not canonical." >&2; exit 2; }
+  [[ "$(basename -- "$(dirname -- "$manifest_path")")" =~ ^verified-[A-Za-z0-9._-]+$ ]] || { echo "Restore requires a promoted verified snapshot." >&2; exit 2; }
+  [[ "$(basename -- "$manifest_path")" =~ ^[A-Za-z0-9._-]+\.manifest\.json$ ]] || { echo "Restore manifest filename is unsafe." >&2; exit 2; }
+fi
+restore_workspace=""
+if [[ "$command" == "restore" ]]; then
+  restore_workspace="$($mktemp_command -d "$backup_directory/.restore-${release_attempt_id}-XXXXXX")" || {
+    echo "Restore workspace could not be allocated." >&2
+    exit 1
+  }
+  [[ "$restore_workspace" == "$backup_directory/.restore-${release_attempt_id}-"* && "$restore_workspace" != *..* ]] || {
+    echo "Restore workspace identity is unsafe." >&2
+    exit 2
+  }
+  if ! "$install_command" -d -o root -g root -m 0700 "$restore_workspace" >/dev/null 2>&1; then
+    echo "Restore workspace could not be prepared." >&2
+    exit 1
+  fi
+  [[ -d "$restore_workspace" && ! -L "$restore_workspace" ]] || {
+    echo "Restore workspace is not a regular directory." >&2
+    exit 2
+  }
+  [[ "$($realpath_command -e -- "$restore_workspace")" == "$restore_workspace" ]] || {
+    echo "Restore workspace is not canonical." >&2
+    exit 2
+  }
+  if [[ "$focused_test_mode" != 1 ]]; then
+    [[ "$(stat -c '%U:%G:%a' "$restore_workspace")" == "root:root:700" ]] || {
+      echo "Restore workspace staging ownership or mode drifted." >&2
+      exit 2
+    }
+  fi
+  snapshot_directory="$(dirname -- "$manifest_path")"
+  snapshot_id="$(basename -- "$manifest_path" .manifest.json)"
+  [[ "$snapshot_id" =~ ^[A-Za-z0-9._-]{1,128}$ ]] || {
+    echo "Restore snapshot identity is unsafe." >&2
+    exit 2
+  }
+  [[ "$(basename -- "$snapshot_directory")" =~ ^verified-[A-Za-z0-9._-]+$ ]] || {
+    restore_preparation_failure restore-selection-invalid 2
+  }
+  stage_restore_input "$manifest_path" "$(basename -- "$manifest_path")" || {
+    restore_preparation_failure restore-staging-failed 1
+  }
+  stage_restore_input "$snapshot_directory/$snapshot_id.sqlite" "$snapshot_id.sqlite" || {
+    restore_preparation_failure restore-staging-failed 1
+  }
+  stage_restore_input "$snapshot_directory/$snapshot_id.ad-hoc.sqlite" "$snapshot_id.ad-hoc.sqlite" || {
+    restore_preparation_failure restore-staging-failed 1
+  }
+  stage_restore_input "$snapshot_directory/$snapshot_id.deployment.json" "$snapshot_id.deployment.json" || {
+    restore_preparation_failure restore-staging-failed 1
+  }
+  if [[ "$focused_test_mode" != 1 ]]; then
+    chown "$service_user:$service_user" -- "$restore_workspace" ||
+      restore_preparation_failure restore-staging-failed 1
+    chmod 0700 -- "$restore_workspace" || restore_preparation_failure restore-staging-failed 1
+    [[ "$(stat -c '%U:%G:%a' "$restore_workspace")" == "${service_user}:${service_user}:700" ]] ||
+      restore_preparation_failure restore-staging-failed 1
+  fi
+  manifest_path="$restore_workspace/$(basename -- "$manifest_path")"
 fi
 set +e
 foundation_backup_directory="$operation_backup_directory"
 [[ "$command" == "promote" ]] && foundation_backup_directory="$backup_directory"
 root_promotion=""
 [[ "$command" == "promote" ]] && root_promotion=1
-if [[ "$command" == "promote" ]]; then
+if [[ "$command" == "promote" || "$command" == "restore" ]]; then
   maintenance_output="$("$runuser_command" -u "$service_user" -- env -i PATH=/usr/bin:/bin \
   QUADBALL_ENVIRONMENT="$environment" \
   NODE_ENV=production \
@@ -377,6 +575,7 @@ if [[ "$command" == "promote" ]]; then
   SCHEMA_COMPATIBILITY="$schema_compatibility" \
   RELEASE_MANIFEST_PATH="$release_dir/release-manifest.json" \
   BACKUP_MANIFEST_PATH="$manifest_path" \
+  RESTORE_WORKSPACE_DIRECTORY="$restore_workspace" \
   QBT_FOCUSED_TEST_MODE="$focused_test_mode" \
   QBT_FOCUSED_TEST_ROOT="$focused_test_root" \
   AD_HOC_ENVIRONMENT_ID="$ad_hoc_environment_identity" \
@@ -408,6 +607,17 @@ else
   rc=$?
 fi
 set -e
+if [[ "$command" == "restore" ]]; then
+  bounded_restore_report="$(printf '%s\n' "$maintenance_output" | grep -m1 -E '^\{"restored":true,"restoreId":|^\{"restored":false,"outcome":' || true)"
+  if [[ -z "$bounded_restore_report" ]]; then
+    bounded_restore_report='{"restored":false,"outcome":"restore-preparation-failed","cutoverCompleted":false,"technicalAdminAuth":{"outcome":"not-attempted","credentialPreserved":false,"reEnrollmentRequired":false}}'
+  fi
+  technical_admin_auth="$(printf '%s\n' "$bounded_restore_report" | sed -n -E 's/.*"technicalAdminAuth":(\{"outcome":"[^"]+","credentialPreserved":(true|false),"reEnrollmentRequired":(true|false)\}).*/\1/p')"
+  if [[ -z "$technical_admin_auth" ]]; then
+    technical_admin_auth='{"outcome":"not-attempted","credentialPreserved":false,"reEnrollmentRequired":false}'
+  fi
+  restore_report_emitted=1
+fi
 if [[ "$command" == "promote" ]]; then
   if (( rc != 0 )); then
     if (( ${#maintenance_output} > 4096 )); then
@@ -421,6 +631,19 @@ if [[ "$command" == "promote" ]]; then
       rc=1
     fi
   fi
+fi
+if (( rc == 0 )) && [[ "$command" == "restore" ]]; then
+  if ! "$systemctl_command" restart "$service_name" >/dev/null 2>&1 ||
+    [[ "$($systemctl_command is-active "$service_name" 2>/dev/null || true)" != active ]]
+  then
+    printf '{"restored":false,"outcome":"cutover-completed-readiness-failed","cutoverCompleted":true,"restartVerified":false,"technicalAdminAuth":%s,"authorityResurrectionWarning":"Restoring an older snapshot may resurrect Grants, Grant Sessions, Ad Hoc Controller sessions, or QR-admitting state changed after the snapshot."}\n' "$technical_admin_auth" >&${restore_error_fd}
+    restore_result_emitted=1
+    rc=12
+  fi
+fi
+if [[ "$command" == restore && "$restore_result_emitted" == 0 ]]; then
+  printf '%s\n' "$bounded_restore_report"
+  restore_result_emitted=1
 fi
 if (( rc != 0 )) && [[ "$command" == "backup" || "$command" == "verify-backup" || "$command" == "promote" ]]; then
   if [[ "$focused_test_mode" == 1 ]]; then chmod -R u+w "$operation_backup_directory" 2>/dev/null || true; rm -rf "$operation_backup_directory"; else chmod -R u+w -- "$operation_backup_directory" 2>/dev/null || true; rm -rf -- "$operation_backup_directory"; fi
