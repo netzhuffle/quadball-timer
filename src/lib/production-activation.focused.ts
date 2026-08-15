@@ -147,9 +147,15 @@ describe("disposable activation SQLite integration", () => {
       );
       await chmod(realpathStub, 0o755);
 
-      const run = async (command: string, heldPath = "", manifestPath = "", failurePhase = "") => {
+      const run = async (
+        command: string,
+        heldPath = "",
+        manifestPath = "",
+        failurePhase = "",
+        releasePath = releaseDirectory,
+      ) => {
         const child = Bun.spawn(
-          ["bash", wrapper, "production", releaseDirectory, command, manifestPath],
+          ["bash", wrapper, "production", releasePath, command, manifestPath],
           {
             env: {
               PATH: `${binDirectory}:${process.env.PATH ?? ""}`,
@@ -160,6 +166,7 @@ describe("disposable activation SQLite integration", () => {
               QBT_FOCUSED_TEST_RUNUSER: runuserStub,
               QBT_FOCUSED_TEST_FLOCK: flockStub,
               QBT_FOCUSED_TEST_REALPATH: realpathStub,
+              QBT_FOCUSED_TEST_SKIP_CHOWN: "1",
               QBT_ACTIVATION_LOCK_HELD_PATH: heldPath,
               QBT_FOCUSED_FAILURE_PHASE: failurePhase,
             },
@@ -209,6 +216,44 @@ describe("disposable activation SQLite integration", () => {
           .code,
       ).not.toBe(0);
       expect((await run("promote", canonicalLock, manifestPath)).code).toBe(0);
+      const retainedDirectory = join(root, "var/backups/quadball-timer/verified-lock-test");
+      expect((await lstat(retainedDirectory)).mode & 0o777).toBe(0o700);
+      expect((await lstat(join(retainedDirectory, basename(manifestPath)))).mode & 0o777).toBe(
+        0o600,
+      );
+      expect(await pathExists(join(root, "var/backups/quadball-timer/.candidate-lock-test"))).toBe(
+        false,
+      );
+
+      const secondReleaseDirectory = join(root, "srv/quadball-timer/releases/lock-test-2");
+      await mkdir(secondReleaseDirectory, { recursive: true });
+      await Bun.write(
+        join(secondReleaseDirectory, "quadball-timer"),
+        await Bun.file(join(releaseDirectory, "quadball-timer")).arrayBuffer(),
+      );
+      await chmod(join(secondReleaseDirectory, "quadball-timer"), 0o755);
+      await writeFile(
+        join(secondReleaseDirectory, "release-manifest.json"),
+        JSON.stringify({ releaseAttemptId: "lock-test-2", schemaCompatibility: "foundation-v1" }),
+      );
+      const secondBackup = await run("backup", canonicalLock, "", "", secondReleaseDirectory);
+      expect(secondBackup.code, secondBackup.output).toBe(0);
+      const secondManifestPath = JSON.parse(secondBackup.output).manifestPath as string;
+      const secondPromote = await run(
+        "promote",
+        canonicalLock,
+        secondManifestPath,
+        "",
+        secondReleaseDirectory,
+      );
+      expect(secondPromote.code, secondPromote.output).toBe(0);
+      expect(await readlink(join(root, "var/backups/quadball-timer/retained"))).toBe(
+        "verified-lock-test-2",
+      );
+      expect(await pathExists(retainedDirectory)).toBe(false);
+      expect(
+        (await lstat(join(root, "var/backups/quadball-timer/verified-lock-test-2"))).mode & 0o777,
+      ).toBe(0o700);
       expect((await run("validate-migration", canonicalLock)).code).toBe(0);
       expect((await run("apply-migrations", canonicalLock)).code).toBe(0);
       expect((await run("readiness", canonicalLock)).code).toBe(0);
