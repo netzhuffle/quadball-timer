@@ -164,6 +164,10 @@ _Avoid_: Mutable command, audit entry
 The current score, phase, overtime target, result, stoppages, and other game state rebuilt from effective Game Facts and Locked-Game Corrections whenever either changes the record. Its scoring bounds and lifecycle must agree with the durable Event Game Record root.
 _Avoid_: Stored result, patched state
 
+**Game Phase**:
+The sporting phase of an Event Game: Seeker Floor, Seekers Released, or Overtime. Game Phase describes the rule sequence of play and is distinct from operational status, which describes whether the Game is scheduled, running, paused, suspended, or finished.
+_Avoid_: Operational status, lifecycle phase, game status
+
 **Controller Device**:
 A Controller's personally supplied, working, sufficiently charged phone used to access the app. Each Controller arranges their own device and power; no phone is designated as the primary or backup device, and another person's phone may take over through the same Control Grant.
 _Avoid_: Primary phone, backup phone, dedicated timer phone
