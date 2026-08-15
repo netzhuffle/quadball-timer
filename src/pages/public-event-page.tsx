@@ -10,6 +10,7 @@ import type {
   PublicAudienceScheduleProjection,
 } from "@/lib/audience-projection";
 import { DEFAULT_AWAY_TEAM_COLOR, DEFAULT_HOME_TEAM_COLOR } from "@/lib/team-colors";
+import { PublicGameTimeline } from "@/pages/public-game-timeline";
 
 export function PublicEventHomePage({ showAll = false }: { showAll?: boolean }) {
   const [events, setEvents] = useState<readonly PublicAudienceEventProjection[] | null>(null);
@@ -80,10 +81,7 @@ export function PublicEventPage({ eventId }: { eventId: string }) {
         if (!response.ok) throw new Error("Event unavailable");
         const payload = (await response.json()) as AudienceEventResponse;
         if (payload.status !== "accepted") throw new Error("Event unavailable");
-        return payload.value;
-      })
-      .then((nextEvent) => {
-        if (active) setEvent(nextEvent);
+        if (active) setEvent(payload.value);
       })
       .catch(() => {
         if (active) setUnavailable(true);
@@ -371,10 +369,13 @@ export function PublicEventGamePage({
               <StatusValue label="Heat Stoppage" value={heatLabel(game.heatStoppage)} />
               <StatusValue label="Result" value={resultLabel(game.result)} />
             </dl>
-            <p className="rounded-xl border border-dashed p-3 text-muted-foreground">
-              Public play history will be added by the Timeline work; this page shows the committed
-              scoreboard projection.
-            </p>
+            {game.timeline.length > 0 ? (
+              <PublicGameTimeline entries={game.timeline} />
+            ) : (
+              <p className="rounded-xl border border-dashed p-3 text-muted-foreground">
+                No public play history is available yet.
+              </p>
+            )}
           </CardContent>
         </Card>
       </div>
@@ -691,6 +692,9 @@ function GameCard({
             )
           ) : null}
         </div>
+        {(!compact || game.scheduleStatus === "past") && game.timeline.length > 0 ? (
+          <PublicGameTimeline entries={game.timeline} />
+        ) : null}
       </CardContent>
     </Card>
   );

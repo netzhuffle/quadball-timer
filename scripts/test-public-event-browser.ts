@@ -1,6 +1,7 @@
 import { chromium, type Page } from "playwright";
-import { mkdtempSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import tailwind from "bun-plugin-tailwind";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { basename, join } from "node:path";
 import { tmpdir } from "node:os";
 import {
   createEventCatalog,
@@ -42,6 +43,7 @@ const environment = {
 
 let server: Bun.Subprocess | null = null;
 let serverStderr: Promise<string> | null = null;
+let harnessServer: ReturnType<typeof Bun.serve> | null = null;
 let browser: Awaited<ReturnType<typeof chromium.launch>> | null = null;
 let browserPage: Page | null = null;
 
@@ -56,6 +58,50 @@ try {
   serverStderr = new Response(server.stderr as unknown as BodyInit).text();
   await waitForServer(`${origin}/internal/healthz`);
   await seedCommittedGameRecords(seeded);
+
+  const harnessDirectory = join(directory, "timeline-harness");
+  mkdirSync(harnessDirectory);
+  const harnessBuild = await Bun.build({
+    entrypoints: [join(process.cwd(), "scripts/public-game-timeline-browser-harness.tsx")],
+    outdir: harnessDirectory,
+    plugins: [tailwind],
+    target: "browser",
+    format: "esm",
+    sourcemap: "none",
+  });
+  if (!harnessBuild.success) {
+    throw new Error(
+      `Timeline browser harness build failed: ${harnessBuild.logs.map((log) => log.message).join("; ")}`,
+    );
+  }
+  const harnessEntry = harnessBuild.outputs.find((output) => output.kind === "entry-point");
+  if (harnessEntry === undefined) throw new Error("Timeline browser harness entry is missing.");
+  const harnessAssets = new Map(
+    harnessBuild.outputs.map((output) => [basename(output.path), output.path]),
+  );
+  const harnessScript = basename(harnessEntry.path);
+  const harnessStylesheet = [...harnessAssets.keys()].find((name) => name.endsWith(".css"));
+  harnessServer = Bun.serve({
+    port: 0,
+    fetch(request) {
+      const pathname = new URL(request.url).pathname;
+      if (pathname === "/") {
+        return new Response(
+          `<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1">${
+            harnessStylesheet === undefined
+              ? ""
+              : `<link rel="stylesheet" href="/${harnessStylesheet}">`
+          }</head><body><div id="root"></div><script type="module" src="/${harnessScript}"></script></body></html>`,
+          { headers: { "content-type": "text/html" } },
+        );
+      }
+      const assetPath = harnessAssets.get(pathname.slice(1));
+      return assetPath === undefined
+        ? new Response("Not found", { status: 404 })
+        : new Response(Bun.file(assetPath));
+    },
+  });
+  const harnessOrigin = `http://127.0.0.1:${harnessServer.port}`;
 
   browser = await chromium.launch({ headless: true });
   const context = await browser.newContext({ viewport: { width: 390, height: 844 } });
@@ -79,6 +125,64 @@ try {
   assert(listPayload.status === "accepted", "seeded Audience list was not accepted");
   const current = listPayload.value.events.find((event) => event.eventId === seeded.currentId);
   if (!current) throw new Error("seeded current Event was not listed");
+
+  const eventResponse = await context.request.get(
+    `${origin}/api/audience/events/${encodeURIComponent(seeded.currentId)}`,
+  );
+  assert(eventResponse.status() === 200, "seeded Audience Event was unavailable");
+  const denseEvent = structuredClone((await eventResponse.json()) as PublicEventResponseFixture);
+  const denseGame = denseEvent.value.schedule.scheduleGames.find(
+    (game) => game.gameCode === "BUSY-1",
+  );
+  if (denseGame === undefined) throw new Error("seeded finished Game was not projected");
+  const longReason =
+    "A deliberately long public penalty reason that must wrap inside the narrow Timeline without horizontal overflow";
+  denseGame.timeline = [
+    ...Array.from(
+      { length: 24 },
+      (_, index) =>
+        ({
+          kind: "card",
+          gameTimeMs: 90_000 - index * 1_000,
+          lane: "side-a",
+          teamName: "A deliberately long public Event Team name for wrapping",
+          player: {
+            number: 7,
+            name: "A deliberately long roster-resolved player name for wrapping",
+          },
+          cardColor: "yellow",
+          penaltyReason: longReason,
+        }) satisfies PublicTimelineFixtureEntry,
+    ),
+    {
+      kind: "card",
+      gameTimeMs: 88_000,
+      lane: "side-b",
+      teamName: "The other long public Event Team",
+      player: { number: 12, name: "Side B roster-resolved player" },
+      cardColor: "blue",
+      penaltyReason: "Side B lane coverage",
+    },
+    {
+      kind: "suspension",
+      gameTimeMs: 87_000,
+      lane: "center",
+      teamName: null,
+      player: null,
+      action: "start",
+    },
+    ...denseGame.timeline,
+  ];
+  await page.route(
+    `${origin}/api/audience/events/${encodeURIComponent(seeded.currentId)}`,
+    async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify(denseEvent),
+      });
+    },
+  );
 
   await page.goto(`${origin}/events`);
   await page.waitForURL(`${origin}${current.canonicalPath}`);
@@ -112,6 +216,44 @@ try {
       `${code} did not retain chronological status ${status}`,
     );
   }
+  const finishedTimeline = schedule.locator(
+    '[data-game-code="BUSY-1"][data-schedule-status="past"] [data-game-timeline]',
+  );
+  await finishedTimeline.waitFor();
+  assert(
+    (await finishedTimeline.locator('[data-timeline-kind="finish"]').count()) === 1,
+    "finished Game did not render its effective public Timeline",
+  );
+  await finishedTimeline.getByText("Game Timeline").waitFor();
+  assert(
+    (await finishedTimeline.locator('[data-timeline-kind="card"]').count()) >= 24,
+    "dense public Timeline content was not rendered",
+  );
+  assert(
+    (await finishedTimeline.locator('[data-timeline-lane="side-a"]').count()) >= 24,
+    "side A Timeline events were not rendered in their lane",
+  );
+  assert(
+    (await finishedTimeline.locator('[data-timeline-lane="side-b"]').count()) >= 1,
+    "side B Timeline events were not rendered in their lane",
+  );
+  assert(
+    (await finishedTimeline
+      .locator('[data-timeline-lane="center"][data-timeline-kind="suspension"]')
+      .count()) === 1,
+    "centered lifecycle Timeline event was not rendered",
+  );
+  await finishedTimeline.getByText(longReason).first().waitFor();
+  const timelineScroll = finishedTimeline.locator("[data-timeline-scroll-region]");
+  const scrollMetrics = await timelineScroll.evaluate((element) => ({
+    clientHeight: element.clientHeight,
+    scrollHeight: element.scrollHeight,
+  }));
+  assert(
+    scrollMetrics.scrollHeight > scrollMetrics.clientHeight,
+    "Timeline did not become scrollable",
+  );
+
   assert(
     (await page.locator('[data-schedule-group="coming-up"] h3').count()) === 1,
     "Coming up Games were not grouped by Expected Start",
@@ -128,6 +270,50 @@ try {
       () => document.documentElement.scrollWidth <= document.documentElement.clientWidth,
     ),
     "phone-sized Event schedule overflows horizontally",
+  );
+
+  const harnessPage = await context.newPage();
+  harnessPage.setDefaultTimeout(5_000);
+  harnessPage.on("pageerror", (error) => consoleErrors.push(error.message));
+  harnessPage.on("console", (message) => {
+    if (message.type() === "error") consoleErrors.push(message.text());
+  });
+  await harnessPage.goto(`${harnessOrigin}/`);
+  const harnessTimeline = harnessPage.locator("[data-game-timeline]");
+  await harnessTimeline.waitFor();
+  const harnessScroll = harnessTimeline.locator("[data-timeline-scroll-region]");
+  await harnessScroll.evaluate((element) => {
+    element.scrollTop = Math.floor(element.scrollHeight / 2);
+    element.dispatchEvent(new Event("scroll", { bubbles: true }));
+  });
+  const harnessBeforeNewPlay = await harnessScroll.evaluate((element) => ({
+    bottomDistance: element.scrollHeight - element.clientHeight - element.scrollTop,
+    scrollTop: element.scrollTop,
+  }));
+  assert(harnessBeforeNewPlay.scrollTop > 0, "Timeline harness could not leave the live edge");
+  await harnessPage.getByRole("button", { name: "Deliver newer play while away" }).click();
+  await harnessPage.getByRole("button", { name: "New play" }).waitFor();
+  const harnessAfterNewPlay = await harnessScroll.evaluate((element) => ({
+    bottomDistance: element.scrollHeight - element.clientHeight - element.scrollTop,
+    scrollTop: element.scrollTop,
+  }));
+  assert(
+    Math.abs(harnessAfterNewPlay.bottomDistance - harnessBeforeNewPlay.bottomDistance) <= 4,
+    "Timeline harness changed the older-entry viewport position",
+  );
+  await harnessPage.getByRole("button", { name: "New play" }).click();
+  await harnessPage.waitForFunction(
+    (selector) => ((document.querySelector(selector) as HTMLElement | null)?.scrollTop ?? 0) <= 8,
+    "[data-timeline-scroll-region]",
+  );
+  await harnessPage.getByRole("button", { name: "Deliver newer play at live edge" }).click();
+  await harnessPage.waitForFunction(
+    (selector) => ((document.querySelector(selector) as HTMLElement | null)?.scrollTop ?? 0) <= 8,
+    "[data-timeline-scroll-region]",
+  );
+  assert(
+    (await harnessPage.getByRole("button", { name: "New play" }).count()) === 0,
+    "Timeline harness exposed New play at the live edge",
   );
 
   const spectatorGamePath = `/events/${encodeURIComponent(current.eventId)}/games/browser-fixture`;
@@ -156,6 +342,11 @@ try {
   await page.getByText("Game Suspension").waitFor();
   await page.getByText("Heat Stoppage").waitFor();
   await page.getByText("Winner Side A · Locked").waitFor();
+  await page.getByText("Roster-resolved spectator").waitFor();
+  assert(
+    (await page.locator('[data-game-timeline] [data-timeline-kind="goal"]').count()) === 1,
+    "dedicated spectator Game did not render its roster-resolved Timeline",
+  );
   const expandedSides = page.locator("[data-scoreboard-expanded] [data-side-id]");
   assert((await expandedSides.count()) === 2, "expanded scoreboard did not render two sides");
   assert(
@@ -363,6 +554,7 @@ try {
   process.exitCode = 1;
 } finally {
   if (browser) await browser.close();
+  if (harnessServer) await harnessServer.stop(true);
   if (server) {
     server.kill();
     await server.exited;
@@ -436,8 +628,46 @@ function publicGameFixture(
       displayedTeamColors: { sideA: "#112233", sideB: "#445566" },
     },
     canonicalPath: `/events/${encodeURIComponent(eventId)}/games/browser-fixture`,
+    timeline: [
+      {
+        kind: "goal",
+        gameTimeMs: 124_000,
+        lane: "side-b",
+        teamName: "Another Very Long Team Name For A Narrow Phone",
+        player: { number: 7, name: "Roster-resolved spectator" },
+        points: 10,
+      },
+    ],
   };
 }
+
+type PublicTimelineFixtureEntry = {
+  kind: string;
+  gameTimeMs: number | null;
+  lane: string;
+  teamName: string | null;
+  player: { number: number; name: string | null } | null;
+  cardColor?: string | null;
+  penaltyReason?: string | null;
+  [key: string]: unknown;
+};
+
+type PublicGameProjectionFixture = {
+  gameCode: string | null;
+  timeline: PublicTimelineFixtureEntry[];
+  [key: string]: unknown;
+};
+
+type PublicEventResponseFixture = {
+  status: string;
+  value: {
+    schedule: {
+      scheduleGames: PublicGameProjectionFixture[];
+      [key: string]: unknown;
+    };
+    [key: string]: unknown;
+  };
+};
 
 async function seedDatabase() {
   const foundation = openSqliteFoundationStorage(foundationDatabase, {

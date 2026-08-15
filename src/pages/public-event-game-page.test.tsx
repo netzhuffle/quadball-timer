@@ -171,5 +171,6 @@ function projection(): PublicAudienceGameProjection {
     flagState: { catchingSide: "side-b" },
     result: { status: "finished", winner: "side-a", locked: true },
     canonicalPath: "/events/event-1/games/game-1",
+    timeline: [],
   };
 }

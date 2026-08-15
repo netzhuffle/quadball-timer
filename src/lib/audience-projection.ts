@@ -8,6 +8,10 @@ import type {
 import { projectScheduleGames } from "@/lib/event-catalog";
 import { projectClockBaseline } from "@/lib/clock-authority";
 import {
+  projectPublicGameTimeline,
+  type PublicAudienceTimelineEntry,
+} from "@/lib/game-timeline-projection";
+import {
   projectLiveEventGameDerivedState,
   type LiveEventGameDerivedState,
 } from "@/lib/live-event-game-control";
@@ -122,6 +126,7 @@ export type PublicAudienceGameProjection = PublicAudienceGameOperationalProjecti
     displayedTeamColors: { sideA: string | null; sideB: string | null };
   };
   canonicalPath: string;
+  timeline: readonly PublicAudienceTimelineEntry[];
 };
 
 /** Allowlisted, server-side input for one public Audience Projection. */
@@ -392,6 +397,7 @@ function projectAudienceGameFromInput(
       },
     },
     canonicalPath: `/events/${encodeURIComponent(event.eventId)}/games/${encodeURIComponent(game.eventGameId)}`,
+    timeline: projectAudienceGameTimeline(snapshot, game),
   };
 }
 
@@ -502,6 +508,83 @@ function readAudienceProjectionGameInputFromCatalog(
     winnerGameSideId: derived?.winnerGameSideId ?? null,
     catchingGameSideId: derived?.catch?.catchingGameSideId ?? null,
     locked: root?.lifecycle.lockedAtMs !== null && root?.lifecycle.lockedAtMs !== undefined,
+  };
+}
+
+function projectAudienceGameTimeline(
+  snapshot: EventCatalogStorageSnapshot,
+  game: ProjectedEventGame,
+): readonly PublicAudienceTimelineEntry[] {
+  const root = snapshot.findRootByEventGameId(game.eventGameId);
+  if (root === null) return [];
+  const derived = readDerivedState(snapshot, root);
+  const sideAssignments = publicTimelineSideAssignments(snapshot, game, root);
+  return projectPublicGameTimeline({
+    facts: derived.gameFacts,
+    sideA: sideAssignments.sideA,
+    sideB: sideAssignments.sideB,
+    lookupRosterName: (eventTeamId, playerNumber) => {
+      const team = snapshot.findEventTeam(eventTeamId);
+      if (team === null || team.eventId !== game.eventId) return null;
+      const entry = snapshot.findRosterEntry(eventTeamId, playerNumber);
+      return entry?.eventId === game.eventId ? entry.publicName : null;
+    },
+    derived,
+  });
+}
+
+function publicTimelineSideAssignments(
+  snapshot: EventCatalogStorageSnapshot,
+  game: ProjectedEventGame,
+  root: ReturnType<EventCatalogStorageSnapshot["findRootByEventGameId"]>,
+) {
+  const sideA = root?.gameSides[0];
+  const sideB = root?.gameSides[1];
+  const sideAUsesCatalogAssignment = game.sideA.eventTeamId !== null;
+  const sideBUsesCatalogAssignment = game.sideB.eventTeamId !== null;
+  return {
+    sideA: timelineSide(
+      snapshot,
+      game.eventId,
+      sideA?.id ?? game.sideA.sideId,
+      sideAUsesCatalogAssignment
+        ? game.sideA.eventTeamId
+        : (sideA?.eventTeamId ?? game.sideA.eventTeamId),
+      sideAUsesCatalogAssignment
+        ? (game.sideA.eventTeamName ?? game.sideA.sourceLabel)
+        : sideA === undefined
+          ? (game.sideA.eventTeamName ?? game.sideA.sourceLabel)
+          : undefined,
+    ),
+    sideB: timelineSide(
+      snapshot,
+      game.eventId,
+      sideB?.id ?? game.sideB.sideId,
+      sideBUsesCatalogAssignment
+        ? game.sideB.eventTeamId
+        : (sideB?.eventTeamId ?? game.sideB.eventTeamId),
+      sideBUsesCatalogAssignment
+        ? (game.sideB.eventTeamName ?? game.sideB.sourceLabel)
+        : sideB === undefined
+          ? (game.sideB.eventTeamName ?? game.sideB.sourceLabel)
+          : undefined,
+    ),
+  };
+}
+
+function timelineSide(
+  snapshot: EventCatalogStorageSnapshot,
+  eventId: string,
+  sideId: string,
+  eventTeamId: string | null,
+  fallbackName?: string | null,
+) {
+  const candidate = eventTeamId === null ? null : snapshot.findEventTeam(eventTeamId);
+  const team = candidate?.eventId === eventId ? candidate : null;
+  return {
+    sideId,
+    eventTeamId,
+    teamName: fallbackName ?? team?.name ?? null,
   };
 }
 

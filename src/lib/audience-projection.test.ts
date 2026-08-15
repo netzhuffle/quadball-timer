@@ -15,6 +15,8 @@ import {
   type EventGame,
   type GameplaySlot,
   type PitchSlot,
+  type StoredEventTeam,
+  type StoredRosterEntry,
   type StoredEvent,
 } from "@/lib/event-catalog";
 import type { EventGameRecordRoot } from "@/lib/foundation-record-types";
@@ -109,6 +111,138 @@ describe("Audience Publication Projection", () => {
     if (result.status !== "accepted") return;
     expect(result.value).not.toHaveProperty("auditTrail");
     expect(result.value).not.toHaveProperty("reason");
+  });
+
+  test("embeds a roster-resolved Timeline and isolates roster reads by Event", async () => {
+    const game = createScheduleGame("timeline", "2026-08-14T08:00:00.000Z", "Pitch 1");
+    game.sideA = {
+      ...game.sideA,
+      eventTeamId: "team-corrected",
+      eventTeamName: "Correction-time Blue",
+    };
+    const root = createScheduleRoot("timeline", "finished");
+    const snapshot = createScheduleSnapshot({
+      pitches: ["Pitch 1"],
+      games: [game],
+      roots: new Map([[game.eventGameId, root]]),
+      actions: () => [createGoalAction(root)],
+      eventTeams: [
+        eventTeam("team-a", "event-schedule", "Original Team"),
+        eventTeam("team-corrected", "event-schedule", "Renamed After Correction"),
+        eventTeam("team-other-event", "other-event", "Wrong Event Team"),
+      ],
+      roster: [
+        rosterEntry("roster-original", "event-schedule", "team-a", 3, "Wrong Original Player"),
+        rosterEntry(
+          "roster-corrected",
+          "event-schedule",
+          "team-corrected",
+          3,
+          "Current Goal Player",
+        ),
+        rosterEntry(
+          "roster-other",
+          "other-event",
+          "team-other-event",
+          3,
+          "Private Other Event Name",
+        ),
+      ],
+    });
+    const audience = createAudienceProjection(
+      { snapshot: async () => snapshot } as unknown as EventCatalogFoundationStorage,
+      {
+        now: () => Date.parse("2026-08-14T10:00:00.000Z"),
+        gameInput: {
+          read: async () => ({
+            status: "accepted" as const,
+            value: {
+              gameSideIds: [root.gameSides[0]!.id, root.gameSides[1]!.id] as const,
+              phase: "seeker-floor" as const,
+              operationalStatus: "finished" as const,
+              scoreByGameSide: {},
+              clock: null,
+              presentation: null,
+              overtimeTarget: null,
+              teamTimeout: { status: "inactive" as const, gameSideId: null, remainingMs: null },
+              heatStoppage: {
+                status: "inactive" as const,
+                mode: null,
+                pending: false,
+                allowedDurationMs: null,
+                actualDurationMs: null,
+                remainingMs: null,
+              },
+              winnerGameSideId: null,
+              catchingGameSideId: null,
+              locked: true,
+            },
+          }),
+        },
+      },
+    );
+
+    const result = await audience.read("event-schedule");
+    expect(result).toMatchObject({ status: "accepted" });
+    if (result.status !== "accepted") return;
+    const timeline = result.value.schedule.scheduleGames[0]?.timeline ?? [];
+    expect(timeline).toContainEqual(
+      expect.objectContaining({
+        kind: "goal",
+        teamName: "Correction-time Blue",
+        player: { number: 3, name: "Current Goal Player" },
+      }),
+    );
+    expect(JSON.stringify(timeline)).not.toContain("Private Other Event Name");
+
+    const dedicatedGame = await audience.readGame("event-schedule", game.eventGameId);
+    expect(dedicatedGame).toMatchObject({ status: "accepted" });
+    if (dedicatedGame.status !== "accepted") return;
+    expect(dedicatedGame.value.timeline).toContainEqual(
+      expect.objectContaining({
+        kind: "goal",
+        teamName: "Correction-time Blue",
+        player: { number: 3, name: "Current Goal Player" },
+      }),
+    );
+  });
+
+  test("projects concession, forfeit, and double-forfeit outcomes", async () => {
+    const games = [
+      createScheduleGame("concession", "2026-08-14T08:00:00.000Z", "Pitch 1"),
+      createScheduleGame("forfeit", "2026-08-14T08:01:00.000Z", "Pitch 1"),
+      createScheduleGame("double-forfeit", "2026-08-14T08:02:00.000Z", "Pitch 1"),
+    ];
+    const roots = new Map(
+      games.map((game) => [game.eventGameId, createScheduleRoot(game.eventGameId, "finished")]),
+    );
+    const outcomeByGame: Record<string, "concession" | "forfeit" | "double-forfeit"> = {
+      concession: "concession",
+      forfeit: "forfeit",
+      "double-forfeit": "double-forfeit",
+    };
+    const snapshot = createScheduleSnapshot({
+      pitches: ["Pitch 1"],
+      games,
+      roots,
+      actions: (root) => [createOutcomeAction(root, outcomeByGame[root.eventGameId]!)],
+    });
+    const audience = createAudienceProjection(
+      { snapshot: async () => snapshot } as unknown as EventCatalogFoundationStorage,
+      { now: () => Date.parse("2026-08-14T10:00:00.000Z") },
+    );
+
+    const result = await audience.read("event-schedule");
+    expect(result).toMatchObject({ status: "accepted" });
+    if (result.status !== "accepted") return;
+    expect(
+      result.value.schedule.scheduleGames.map(
+        (game) => game.timeline.find((entry) => entry.kind === "finish")?.outcome,
+      ),
+    ).toEqual(["concession", "forfeit", "double-forfeit"]);
+    expect(result.value.schedule.scheduleGames[2]?.timeline).toContainEqual(
+      expect.objectContaining({ kind: "finish", lane: "center", teamName: null }),
+    );
   });
 
   test("groups every running Game, uses a half-open one-hour horizon, and orders the schedule", async () => {
@@ -629,6 +763,7 @@ describe("Audience Publication Projection", () => {
     const snapshot = {
       findEvent: (eventId: string) => (eventId === event.eventId ? event : null),
       findEventGame: (eventGameId: string) => (eventGameId === game.eventGameId ? game : null),
+      findRootByEventGameId: () => null,
       findGameplaySlot: () => ({
         gameplaySlotId: "slot-public",
         eventId: event.eventId,
@@ -1096,6 +1231,8 @@ function createScheduleSnapshot(input: {
   expectedDelay?: () => number;
   placement?: (game: EventGame) => { pitchSlotId?: string; gameplaySlotId?: string };
   actions?: (root: EventGameRecordRoot) => ReturnType<typeof createFinishedAction>[];
+  eventTeams?: StoredEventTeam[];
+  roster?: StoredRosterEntry[];
 }): EventCatalogStorageSnapshot {
   const event: StoredEvent = {
     eventId: "event-schedule",
@@ -1168,10 +1305,16 @@ function createScheduleSnapshot(input: {
     findEvent: (eventId: string) => (eventId === event.eventId ? event : null),
     listEvents: () => [event],
     listGameDays: () => [gameDay],
-    findEventTeam: () => null,
-    listEventTeams: () => [],
-    listRoster: () => [],
-    findRosterEntry: () => null,
+    findEventTeam: (eventTeamId: string) =>
+      input.eventTeams?.find((team) => team.eventTeamId === eventTeamId) ?? null,
+    listEventTeams: (eventId: string) =>
+      input.eventTeams?.filter((team) => team.eventId === eventId) ?? [],
+    listRoster: (eventTeamId: string) =>
+      input.roster?.filter((entry) => entry.eventTeamId === eventTeamId) ?? [],
+    findRosterEntry: (eventTeamId: string, playerNumber: number) =>
+      input.roster?.find(
+        (entry) => entry.eventTeamId === eventTeamId && entry.playerNumber === playerNumber,
+      ) ?? null,
     findPitch: (pitchId: string) => pitchRows.find((pitch) => pitch.pitchId === pitchId) ?? null,
     listPitches: () => pitchRows,
     findGameplaySlot: (slotId: string): GameplaySlot | null => {
@@ -1215,8 +1358,30 @@ function createGoalAction(
     factType: "goal",
     gameSideId,
     gameTimeMs: 1,
-    data: { points: 10, sportingOrder: 1 },
+    data: { points: 10, playerNumber: 3, sportingOrder: 1 },
   });
+}
+
+function eventTeam(eventTeamId: string, eventId: string, name: string): StoredEventTeam {
+  return { eventTeamId, eventId, name, defaultColor: "#112233", createdAtMs: 1, updatedAtMs: 1 };
+}
+
+function rosterEntry(
+  rosterEntryId: string,
+  eventId: string,
+  eventTeamId: string,
+  playerNumber: number,
+  publicName: string,
+): StoredRosterEntry {
+  return {
+    rosterEntryId,
+    eventId,
+    eventTeamId,
+    playerNumber,
+    publicName,
+    createdAtMs: 1,
+    updatedAtMs: 1,
+  };
 }
 
 function createClockAction(root: EventGameRecordRoot) {
@@ -1251,6 +1416,19 @@ function createFinishedAction(root: EventGameRecordRoot) {
     gameSideId: root.gameSides[0]?.id ?? "side-a",
     gameTimeMs: 0,
     data: { resultKind: "concession", sportingOrder: 0 },
+  });
+}
+
+function createOutcomeAction(
+  root: EventGameRecordRoot,
+  factType: "concession" | "forfeit" | "double-forfeit",
+) {
+  return createStoredAction(root, `${factType}-${root.eventGameId}`, {
+    factId: `${factType}-fact-${root.eventGameId}`,
+    factType,
+    gameSideId: factType === "double-forfeit" ? null : (root.gameSides[0]?.id ?? "side-a"),
+    gameTimeMs: 0,
+    data: { resultKind: factType, sportingOrder: 0 },
   });
 }
 
