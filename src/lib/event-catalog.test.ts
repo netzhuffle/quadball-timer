@@ -66,6 +66,379 @@ describe("Event operations catalog", () => {
     });
   });
 
+  test("covers eligibility and representative references for every catalog removal target kind", async () => {
+    const fixture = createFixture();
+    const emptyEvent = await fixture.catalog.createEvent(
+      { name: "Empty removal Event", timeZone: "UTC" },
+      authority,
+    );
+    expect(emptyEvent).toMatchObject({ status: "accepted" });
+    if (emptyEvent.status !== "accepted") return;
+    expect(
+      await fixture.catalog.previewEventCatalogRemoval(
+        { kind: "event", eventId: emptyEvent.value.eventId, targetId: emptyEvent.value.eventId },
+        authority,
+      ),
+    ).toMatchObject({ status: "accepted", value: { eligible: true } });
+    const event = await fixture.catalog.createEvent(
+      { name: "Removal Matrix", timeZone: "UTC" },
+      authority,
+    );
+    expect(event.status).toBe("accepted");
+    if (event.status !== "accepted") return;
+    const foreignEvent = await fixture.catalog.createEvent(
+      { name: "Foreign removal Event", timeZone: "UTC" },
+      authority,
+    );
+    if (foreignEvent.status !== "accepted") return;
+    const foreignTeam = await fixture.catalog.createEventTeam(
+      foreignEvent.value.eventId,
+      { name: "Foreign Team" },
+      authority,
+    );
+    if (foreignTeam.status !== "accepted") return;
+    expect(
+      await fixture.catalog.previewEventCatalogRemoval(
+        {
+          kind: "event-team",
+          eventId: event.value.eventId,
+          targetId: foreignTeam.value.eventTeamId,
+        },
+        authority,
+      ),
+    ).toMatchObject({ status: "rejected", reason: "not-found" });
+    const scheduledDay = await fixture.catalog.addGameDay(
+      event.value.eventId,
+      { date: "2026-08-14" },
+      authority,
+    );
+    const emptyDay = await fixture.catalog.addGameDay(
+      event.value.eventId,
+      { date: "2026-08-15" },
+      authority,
+    );
+    const slotOnlyDay = await fixture.catalog.addGameDay(
+      event.value.eventId,
+      { date: "2026-08-16" },
+      authority,
+    );
+    if (
+      scheduledDay.status !== "accepted" ||
+      emptyDay.status !== "accepted" ||
+      slotOnlyDay.status !== "accepted"
+    )
+      return;
+    const rosteredTeam = await fixture.catalog.createEventTeam(
+      event.value.eventId,
+      { name: "Rostered" },
+      authority,
+    );
+    const emptyTeam = await fixture.catalog.createEventTeam(
+      event.value.eventId,
+      { name: "Empty Team" },
+      authority,
+    );
+    if (rosteredTeam.status !== "accepted" || emptyTeam.status !== "accepted") return;
+    await fixture.catalog.upsertEventTeamRoster(
+      event.value.eventId,
+      rosteredTeam.value.eventTeamId,
+      { playerNumber: 1, publicName: "Player" },
+      authority,
+    );
+    expect(
+      await fixture.catalog.previewEventCatalogRemoval(
+        {
+          kind: "event-team",
+          eventId: event.value.eventId,
+          targetId: rosteredTeam.value.eventTeamId,
+        },
+        authority,
+      ),
+    ).toMatchObject({
+      status: "accepted",
+      value: { eligible: false, rejectionCategory: "referenced" },
+    });
+    expect(
+      await fixture.catalog.previewEventCatalogRemoval(
+        { kind: "event-team", eventId: event.value.eventId, targetId: emptyTeam.value.eventTeamId },
+        authority,
+      ),
+    ).toMatchObject({ status: "accepted", value: { eligible: true } });
+
+    const scheduledPitch = await fixture.catalog.createPitch(
+      event.value.eventId,
+      { name: "Scheduled Pitch" },
+      authority,
+    );
+    const sparePitch = await fixture.catalog.createPitch(
+      event.value.eventId,
+      { name: "Spare Pitch" },
+      authority,
+    );
+    if (scheduledPitch.status !== "accepted") return;
+    const scheduledSlot = await fixture.catalog.createGameplaySlot(
+      event.value.eventId,
+      scheduledDay.value.gameDayId,
+      { sequence: 1, scheduledStart: "2026-08-14T10:00" },
+      authority,
+    );
+    const slotOnlyEvent = await fixture.catalog.createEvent(
+      { name: "Gameplay-only removal Event", timeZone: "UTC" },
+      authority,
+    );
+    if (slotOnlyEvent.status !== "accepted") return;
+    const slotOnlyEventDay = await fixture.catalog.addGameDay(
+      slotOnlyEvent.value.eventId,
+      { date: "2026-08-16" },
+      authority,
+    );
+    if (slotOnlyEventDay.status !== "accepted") return;
+    const eligibleGameplaySlot = await fixture.catalog.createGameplaySlot(
+      slotOnlyEvent.value.eventId,
+      slotOnlyEventDay.value.gameDayId,
+      { sequence: 1, scheduledStart: "2026-08-16T10:00" },
+      authority,
+    );
+    if (
+      scheduledSlot.status !== "accepted" ||
+      eligibleGameplaySlot.status !== "accepted" ||
+      sparePitch.status !== "accepted"
+    )
+      return;
+    const pitchSlots = await fixture.storage.snapshot();
+    const scheduledPitchSlot = pitchSlots.listPitchSlots(
+      scheduledDay.value.gameDayId,
+      scheduledPitch.value.pitchId,
+    )[0];
+    const emptyPitchSlot = pitchSlots.listPitchSlots(
+      scheduledDay.value.gameDayId,
+      sparePitch.value.pitchId,
+    )[0];
+    if (scheduledPitchSlot === undefined || emptyPitchSlot === undefined) return;
+    const eventGame = await fixture.catalog.createEventGame(
+      event.value.eventId,
+      scheduledDay.value.gameDayId,
+      {
+        gameplaySlotId: scheduledSlot.value.gameplaySlotId,
+        pitchSlotId: scheduledPitchSlot.pitchSlotId,
+        sideA: { sourceLabel: "A" },
+        sideB: { sourceLabel: "B" },
+      },
+      authority,
+    );
+    if (eventGame.status !== "accepted") return;
+
+    const preview = async (
+      kind: "game-day" | "pitch" | "gameplay-slot" | "pitch-slot" | "event-game",
+      targetId: string,
+    ) =>
+      fixture.catalog.previewEventCatalogRemoval(
+        { kind, eventId: event.value.eventId, targetId },
+        authority,
+      );
+    expect(await preview("game-day", emptyDay.value.gameDayId)).toMatchObject({
+      status: "accepted",
+      value: { eligible: true },
+    });
+    expect(await preview("game-day", scheduledDay.value.gameDayId)).toMatchObject({
+      status: "accepted",
+      value: { eligible: false, rejectionCategory: "referenced" },
+    });
+    const pitchOnlyEvent = await fixture.catalog.createEvent(
+      { name: "Pitch-only removal Event", timeZone: "UTC" },
+      authority,
+    );
+    if (pitchOnlyEvent.status !== "accepted") return;
+    const emptyPitch = await fixture.catalog.createPitch(
+      pitchOnlyEvent.value.eventId,
+      { name: "Empty Pitch" },
+      authority,
+    );
+    if (emptyPitch.status !== "accepted") return;
+    expect(
+      await fixture.catalog.previewEventCatalogRemoval(
+        {
+          kind: "pitch",
+          eventId: pitchOnlyEvent.value.eventId,
+          targetId: emptyPitch.value.pitchId,
+        },
+        authority,
+      ),
+    ).toMatchObject({
+      status: "accepted",
+      value: { eligible: true },
+    });
+    expect(await preview("pitch", scheduledPitch.value.pitchId)).toMatchObject({
+      status: "accepted",
+      value: { eligible: false, rejectionCategory: "referenced" },
+    });
+    expect(
+      await fixture.catalog.previewEventCatalogRemoval(
+        {
+          kind: "gameplay-slot",
+          eventId: slotOnlyEvent.value.eventId,
+          targetId: eligibleGameplaySlot.value.gameplaySlotId,
+        },
+        authority,
+      ),
+    ).toMatchObject({ status: "accepted", value: { eligible: true } });
+    expect(await preview("gameplay-slot", scheduledSlot.value.gameplaySlotId)).toMatchObject({
+      status: "accepted",
+      value: { eligible: false, rejectionCategory: "referenced" },
+    });
+    expect(await preview("pitch-slot", emptyPitchSlot.pitchSlotId)).toMatchObject({
+      status: "accepted",
+      value: { eligible: true },
+    });
+    expect(await preview("pitch-slot", scheduledPitchSlot.pitchSlotId)).toMatchObject({
+      status: "accepted",
+      value: { eligible: false, rejectionCategory: "referenced" },
+    });
+    expect(await preview("event-game", eventGame.value.eventGameId)).toMatchObject({
+      status: "accepted",
+      value: {
+        eligible: true,
+        impact: { retainedEventGameCount: 0, retainedControlActionCount: 0 },
+      },
+    });
+  });
+
+  test("fails closed for commenced and accepted-action Event Game roots", async () => {
+    const foundation = createInMemoryFoundationStorage();
+    const catalog = createEventCatalog(createFoundationEventCatalogStorage(foundation), {
+      clock: { nowMs: () => Date.UTC(2026, 7, 14, 12) },
+    });
+    const event = await catalog.createEvent(
+      { name: "Lifecycle removal", timeZone: "UTC" },
+      authority,
+    );
+    if (event.status !== "accepted") return;
+    const day = await catalog.addGameDay(event.value.eventId, { date: "2026-08-14" }, authority);
+    const pitchA = await catalog.createPitch(event.value.eventId, { name: "A" }, authority);
+    const pitchB = await catalog.createPitch(event.value.eventId, { name: "B" }, authority);
+    if (day.status !== "accepted" || pitchA.status !== "accepted" || pitchB.status !== "accepted")
+      return;
+    const slot = await catalog.createGameplaySlot(
+      event.value.eventId,
+      day.value.gameDayId,
+      { sequence: 1, scheduledStart: "2026-08-14T10:00" },
+      authority,
+    );
+    if (slot.status !== "accepted") return;
+    const pitchSlots = await foundation.transaction((transaction) => ({
+      a: transaction.listPitchSlots(day.value.gameDayId, pitchA.value.pitchId)[0],
+      b: transaction.listPitchSlots(day.value.gameDayId, pitchB.value.pitchId)[0],
+    }));
+    if (pitchSlots.a === undefined || pitchSlots.b === undefined) return;
+    const commencedGame = await catalog.createEventGame(
+      event.value.eventId,
+      day.value.gameDayId,
+      {
+        gameplaySlotId: slot.value.gameplaySlotId,
+        pitchSlotId: pitchSlots.a.pitchSlotId,
+        sideA: { sourceLabel: "A" },
+        sideB: { sourceLabel: "B" },
+      },
+      authority,
+    );
+    const actionGame = await catalog.createEventGame(
+      event.value.eventId,
+      day.value.gameDayId,
+      {
+        gameplaySlotId: slot.value.gameplaySlotId,
+        pitchSlotId: pitchSlots.b.pitchSlotId,
+        sideA: { sourceLabel: "C" },
+        sideB: { sourceLabel: "D" },
+      },
+      authority,
+    );
+    if (commencedGame.status !== "accepted" || actionGame.status !== "accepted") return;
+    await foundation.transaction((transaction) => {
+      for (const [recordId, eventGameId, pitchId, pitchSlotId, commencedAtMs] of [
+        [
+          "commenced-record",
+          commencedGame.value.eventGameId,
+          pitchA.value.pitchId,
+          pitchSlots.a!.pitchSlotId,
+          1_500,
+        ],
+        [
+          "action-record",
+          actionGame.value.eventGameId,
+          pitchB.value.pitchId,
+          pitchSlots.b!.pitchSlotId,
+          null,
+        ],
+      ] as const) {
+        const root = {
+          recordId,
+          eventId: event.value.eventId,
+          eventGameId,
+          ownership: { eventId: event.value.eventId, eventGameId },
+          externalScope: {
+            eventId: event.value.eventId,
+            gameDayId: day.value.gameDayId,
+            pitchId,
+            pitchSlotId,
+          },
+          gameSides: [],
+          lifecycle: {
+            phase: commencedAtMs === null ? "scheduled" : "in-progress",
+            commencedAtMs,
+            finishedAtMs: null,
+            lockedAtMs: null,
+            lockReason: null,
+          },
+          compatibility: { recordVersion: "v1", schemaVersion: "v1", interpreterVersion: "v1" },
+          creationEvidence: {
+            operationId: `operation-${recordId}`,
+            actorReference: "test",
+            source: "event-game-registration",
+            createdAtMs: 1_000,
+          },
+        } as never;
+        transaction.insertRoot({ root, canonicalContent: "{}" });
+        if (commencedAtMs === null)
+          transaction.insertAction({
+            action: { recordId, eventGameId, operationId: "accepted" } as never,
+            canonicalContent: "{}",
+            contentFingerprint: "accepted-action",
+          });
+      }
+    });
+    expect(
+      await catalog.previewEventCatalogRemoval(
+        {
+          kind: "event-game",
+          eventId: event.value.eventId,
+          targetId: commencedGame.value.eventGameId,
+        },
+        authority,
+      ),
+    ).toMatchObject({
+      status: "accepted",
+      value: { eligible: false, rejectionCategory: "commenced" },
+    });
+    expect(
+      await catalog.previewEventCatalogRemoval(
+        {
+          kind: "event-game",
+          eventId: event.value.eventId,
+          targetId: actionGame.value.eventGameId,
+        },
+        authority,
+      ),
+    ).toMatchObject({
+      status: "accepted",
+      value: {
+        eligible: false,
+        rejectionCategory: "accepted-control-action",
+        impact: { retainedEventGameCount: 1, retainedControlActionCount: 1 },
+      },
+    });
+    foundation.close();
+  });
+
   test("creates a blank Unpublished Event and classifies Game Days in the Event timezone", async () => {
     const fixture = createFixture();
     const created = await fixture.catalog.createEvent(
@@ -524,37 +897,6 @@ describe("Event operations catalog", () => {
     if (after.status !== "accepted") return;
     expect(after.value.gameDays).toHaveLength(0);
     expect(after.value.auditTrail).toHaveLength(1);
-  });
-
-  test("removes only an empty Event and retains audit evidence", async () => {
-    const fixture = createFixture();
-    const created = await fixture.catalog.createEvent(
-      { name: "Remove me", timeZone: "UTC" },
-      authority,
-    );
-    if (created.status !== "accepted") throw new Error("Expected Event creation.");
-    const day = await fixture.catalog.addGameDay(
-      created.value.eventId,
-      { date: "2026-08-14" },
-      authority,
-    );
-    if (day.status !== "accepted") throw new Error("Expected Game Day.");
-    expect(await fixture.catalog.removeEvent(created.value.eventId, authority)).toMatchObject({
-      status: "rejected",
-      reason: "in-use",
-    });
-    expect(
-      await fixture.catalog.removeGameDay(created.value.eventId, day.value.gameDayId, authority),
-    ).toMatchObject({
-      status: "accepted",
-    });
-    expect(await fixture.catalog.removeEvent(created.value.eventId, authority)).toMatchObject({
-      status: "accepted",
-    });
-    expect(await fixture.catalog.inspectEvent(created.value.eventId, authority)).toMatchObject({
-      status: "rejected",
-      reason: "not-found",
-    });
   });
 
   test("configures stable Teams, current public rosters, and Pitches atomically", async () => {

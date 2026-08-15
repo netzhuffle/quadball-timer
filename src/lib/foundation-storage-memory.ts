@@ -531,8 +531,8 @@ class InMemoryFoundationStorage implements FoundationStorage {
   eventCatalogStorageCapability() {
     return {
       name: "event-catalog-storage",
-      version: 1,
-      implementation: "event-teams-rosters-pitches-transaction-v1",
+      version: 2,
+      implementation: "event-catalog-removal-transaction-v2",
       transaction: [
         "findEventTeam",
         "listEventTeams",
@@ -542,10 +542,12 @@ class InMemoryFoundationStorage implements FoundationStorage {
         "listPitches",
         "insertEventTeam",
         "updateEventTeam",
+        "deleteEventTeam",
         "insertRosterEntry",
         "updateRosterEntry",
         "insertPitch",
         "updatePitch",
+        "deletePitch",
         "findGameplaySlot",
         "listGameplaySlots",
         "findPitchSlot",
@@ -556,8 +558,11 @@ class InMemoryFoundationStorage implements FoundationStorage {
         "insertPitchSlot",
         "updateGameplaySlot",
         "updatePitchSlot",
+        "deleteGameplaySlot",
+        "deletePitchSlot",
         "insertEventGame",
         "updateEventGame",
+        "deleteEventGame",
       ],
     } as const;
   }
@@ -1391,6 +1396,19 @@ function createTransaction(
       state.eventTeams.set(team.eventTeamId, structuredClone(team));
       undo.push(() => state.eventTeams.set(team.eventTeamId, previous));
     },
+    deleteEventTeam(eventTeamId) {
+      const previous = state.eventTeams.get(eventTeamId);
+      if (previous === undefined) throw new FoundationStorageConstraintError("event-team-id");
+      const roster = [...state.rosterEntries.values()].filter(
+        (entry) => entry.eventTeamId === eventTeamId,
+      );
+      state.eventTeams.delete(eventTeamId);
+      for (const entry of roster) state.rosterEntries.delete(entry.rosterEntryId);
+      undo.push(() => {
+        state.eventTeams.set(eventTeamId, previous);
+        for (const entry of roster) state.rosterEntries.set(entry.rosterEntryId, entry);
+      });
+    },
     insertRosterEntry(entry) {
       if (!state.eventTeams.has(entry.eventTeamId) || !state.events.has(entry.eventId))
         throw new FoundationStorageConstraintError("event-team-id");
@@ -1448,6 +1466,12 @@ function createTransaction(
         throw new FoundationStorageConstraintError("pitch-name");
       state.pitches.set(pitch.pitchId, structuredClone(pitch));
       undo.push(() => state.pitches.set(pitch.pitchId, previous));
+    },
+    deletePitch(pitchId) {
+      const previous = state.pitches.get(pitchId);
+      if (previous === undefined) throw new FoundationStorageConstraintError("pitch-id");
+      state.pitches.delete(pitchId);
+      undo.push(() => state.pitches.set(pitchId, previous));
     },
     appendEventAudit(entry) {
       if (state.eventAudits.has(entry.auditId)) {
@@ -1595,6 +1619,12 @@ function createTransaction(
       state.gameplaySlots.set(slot.gameplaySlotId, structuredClone(slot));
       undo.push(() => state.gameplaySlots.set(slot.gameplaySlotId, previous));
     },
+    deleteGameplaySlot(gameplaySlotId) {
+      const previous = state.gameplaySlots.get(gameplaySlotId);
+      if (previous === undefined) throw new FoundationStorageConstraintError("gameplay-slot-id");
+      state.gameplaySlots.delete(gameplaySlotId);
+      undo.push(() => state.gameplaySlots.set(gameplaySlotId, previous));
+    },
     insertPitchSlot(slot) {
       if (!state.events.has(slot.eventId)) throw new FoundationStorageConstraintError("event-id");
       const gameDay = state.gameDays.get(slot.gameDayId);
@@ -1634,6 +1664,12 @@ function createTransaction(
         throw new FoundationStorageConstraintError("pitch-slot-identity");
       state.pitchSlots.set(slot.pitchSlotId, structuredClone(slot));
       undo.push(() => state.pitchSlots.set(slot.pitchSlotId, previous));
+    },
+    deletePitchSlot(pitchSlotId) {
+      const previous = state.pitchSlots.get(pitchSlotId);
+      if (previous === undefined) throw new FoundationStorageConstraintError("pitch-slot-id");
+      state.pitchSlots.delete(pitchSlotId);
+      undo.push(() => state.pitchSlots.set(pitchSlotId, previous));
     },
     insertEventGame(game) {
       if (!state.events.has(game.eventId)) throw new FoundationStorageConstraintError("event-id");
@@ -1741,6 +1777,12 @@ function createTransaction(
       }
       state.eventGames.set(game.eventGameId, structuredClone(game));
       undo.push(() => state.eventGames.set(game.eventGameId, previous));
+    },
+    deleteEventGame(eventGameId) {
+      const previous = state.eventGames.get(eventGameId);
+      if (previous === undefined) throw new FoundationStorageConstraintError("event-game-id");
+      state.eventGames.delete(eventGameId);
+      undo.push(() => state.eventGames.set(eventGameId, previous));
     },
     appendAuditEntry(entry) {
       let audits = state.controlAudits.get(entry.recordId);

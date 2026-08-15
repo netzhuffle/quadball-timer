@@ -207,11 +207,65 @@ try {
     (event) => event.name === "Browser Event Updated",
   )?.eventId;
   if (!eventId) throw new Error("Browser Event was not returned by the catalog.");
-
   const currentCsrfToken = (await context.cookies()).find(
     (cookie) => cookie.name === "__Host-technical-admin-csrf",
   )?.value;
   if (!currentCsrfToken) throw new Error("Technical Admin CSRF cookie was not retained.");
+
+  assert(
+    (await page.getByRole("button", { name: "Remove", exact: true }).count()) === 0 &&
+      (await page.getByRole("button", { name: "Remove empty Event", exact: true }).count()) === 1,
+    "Technical Admin exposed child-structure removal UI",
+  );
+  const eventProjectionResponse = await context.request.get(
+    `${origin}/api/admin/events/${eventId}`,
+  );
+  const eventProjectionPayload = (await eventProjectionResponse.json()) as {
+    value?: { gameDays?: Array<{ gameDayId: string }> };
+  };
+  const technicalGameDayId = eventProjectionPayload.value?.gameDays?.[0]?.gameDayId;
+  if (!technicalGameDayId) throw new Error("Technical browser Event has no Game Day.");
+  const technicalChildPreview = await context.request.post(
+    `${origin}/api/admin/events/${eventId}/catalog-removal/preview`,
+    { data: { kind: "game-day", targetId: technicalGameDayId } },
+  );
+  assert(
+    technicalChildPreview.status() === 401,
+    "Technical Admin child-removal preview was not unauthorized",
+  );
+  const technicalChildRemoval = await context.request.delete(
+    `${origin}/api/admin/events/${eventId}/catalog-removal`,
+    {
+      data: {
+        kind: "game-day",
+        targetId: technicalGameDayId,
+        previewFingerprint: "event-catalog-removal-v1:" + "0".repeat(64),
+      },
+      headers: { "x-technical-admin-csrf": currentCsrfToken ?? "" },
+    },
+  );
+  assert(
+    technicalChildRemoval.status() === 401,
+    "Technical Admin child-removal acceptance was not unauthorized",
+  );
+
+  const removalDayResponse = await context.request.post(
+    `${origin}/api/admin/events/${eventId}/game-days`,
+    {
+      data: { date: "2026-08-16" },
+      headers: { origin, "x-technical-admin-csrf": currentCsrfToken },
+    },
+  );
+  const removalDayPayload = (await removalDayResponse.json()) as {
+    status: string;
+    value?: { gameDayId?: string };
+  };
+  const removalGameDayId = removalDayPayload.value?.gameDayId;
+  assert(
+    removalDayResponse.status() === 201 && removalGameDayId !== undefined,
+    "removal browser Game Day creation failed",
+  );
+
   const zeroDayResponse = await context.request.post(`${origin}/api/admin/events`, {
     data: { name: "Zero Day Browser Event", timeZone: "UTC" },
     headers: { origin, "x-technical-admin-csrf": currentCsrfToken },
@@ -314,6 +368,119 @@ try {
   await secondDayHubResponsePromise;
   const secondSelectedGameDay = await expectSelectValue(eventAdminGameDaySelector, 2);
   assert(firstSelectedGameDay !== secondSelectedGameDay, "Game Day selector reused one option");
+  const removalPreviewResponsePromise = eventAdminPage.waitForResponse(
+    (response) =>
+      response.url().endsWith("/catalog-removal/preview") && response.request().method() === "POST",
+  );
+  const removalDayHubResponsePromise = eventAdminPage.waitForResponse(
+    (response) =>
+      response.url().includes("/api/event-admin/hub?") && response.request().method() === "GET",
+  );
+  await eventAdminGameDaySelector.selectOption({ index: 3 });
+  await removalDayHubResponsePromise;
+  await eventAdminPage.getByLabel("Preview removal Game Day 2026-08-16").click();
+  const removalPreviewResponse = await removalPreviewResponsePromise;
+  const removalPreviewPayload = (await removalPreviewResponse.json()) as {
+    status: string;
+    value?: {
+      eligible: boolean;
+      fingerprint?: string;
+      impact?: {
+        descendantCount: number;
+        retainedEventGameCount: number;
+        retainedControlActionCount: number;
+        retiredAuthorityCount: number;
+        retiredAuthorityCategories: {
+          eventAdmin: number;
+          pitchManager: number;
+          control: number;
+        };
+      };
+    };
+  };
+  assert(
+    removalPreviewResponse.status() === 200 &&
+      removalPreviewPayload.status === "accepted" &&
+      removalPreviewPayload.value?.eligible === true &&
+      removalPreviewPayload.value.fingerprint?.startsWith("event-catalog-removal-v1:") === true,
+    "Event Admin Game Day removal preview failed",
+  );
+  const removalStatusText = await eventAdminPage.getByRole("status").innerText();
+  assert(
+    removalStatusText.includes("catalog descendants 0") &&
+      removalStatusText.includes("retained Event Game Records 0") &&
+      removalStatusText.includes("accepted Control Actions 0") &&
+      removalStatusText.includes("retiring 0 authority item") &&
+      removalStatusText.includes("Authority categories") &&
+      !/grantId|session|credential|secret|code/iu.test(removalStatusText),
+    "removal preview did not show only bounded safe impact",
+  );
+  const eventAdminCookieBeforeRemoval = (await eventAdminContext.cookies()).find(
+    (cookie) => cookie.name === "__Host-event-admin-session",
+  );
+  const missingFingerprintResponse = await eventAdminContext.request.delete(
+    `${origin}/api/event-admin/events/${eventId}/catalog-removal`,
+    { data: { kind: "game-day", targetId: removalGameDayId } },
+  );
+  assert(
+    missingFingerprintResponse.status() === 400 &&
+      missingFingerprintResponse.headers()["set-cookie"] === undefined,
+    "missing removal fingerprint was accepted or refreshed the Event Admin session",
+  );
+  const eventAdminCookieAfterRejectedRemoval = (await eventAdminContext.cookies()).find(
+    (cookie) => cookie.name === "__Host-event-admin-session",
+  );
+  assert(
+    eventAdminCookieBeforeRemoval?.value === eventAdminCookieAfterRejectedRemoval?.value &&
+      eventAdminCookieBeforeRemoval?.expires === eventAdminCookieAfterRejectedRemoval?.expires,
+    "rejected removal changed the Event Admin session",
+  );
+  const removalAcceptedResponsePromise = eventAdminPage.waitForResponse(
+    (response) =>
+      response.url().endsWith("/catalog-removal") && response.request().method() === "DELETE",
+  );
+  const repairedGameDayHubResponsePromise = eventAdminPage.waitForResponse(
+    (response) =>
+      response.url().includes("/api/event-admin/hub?") &&
+      response.url().includes("gameDayId=") &&
+      response.request().method() === "GET",
+  );
+  await eventAdminPage.getByRole("button", { name: "Confirm", exact: true }).click();
+  const removalAcceptedResponse = await removalAcceptedResponsePromise;
+  await repairedGameDayHubResponsePromise;
+  const removalAcceptedPayload = (await removalAcceptedResponse.json()) as {
+    status: string;
+    sessionExpiresAtMs?: number;
+  };
+  assert(
+    removalAcceptedResponse.status() === 200 &&
+      removalAcceptedPayload.status === "accepted" &&
+      typeof removalAcceptedPayload.sessionExpiresAtMs === "number",
+    "Event Admin Game Day removal was not accepted with session activity",
+  );
+  const refreshedEventAdminCookie = (await eventAdminContext.cookies()).find(
+    (cookie) => cookie.name === "__Host-event-admin-session",
+  );
+  assert(
+    refreshedEventAdminCookie !== undefined &&
+      refreshedEventAdminCookie.expires > 0 &&
+      Math.abs(
+        refreshedEventAdminCookie.expires * 1_000 -
+          (removalAcceptedPayload.sessionExpiresAtMs ?? 0),
+      ) < 2_000,
+    "Event Admin removal cookie expiry did not match the returned capped expiry",
+  );
+  await eventAdminPage.getByText("Event Hub", { exact: true }).waitFor();
+  const repairedGameDayValue = await eventAdminGameDaySelector.inputValue();
+  const repairedGameDayOptions = await eventAdminGameDaySelector
+    .locator("option")
+    .allTextContents();
+  assert(
+    repairedGameDayValue.length > 0 &&
+      repairedGameDayValue !== removalGameDayId &&
+      repairedGameDayOptions.includes("2026-08-14 · past"),
+    `selected Game Day was not repaired to a surviving scope (value=${repairedGameDayValue}, options=${repairedGameDayOptions.join("|")})`,
+  );
   await eventAdminPage.getByLabel("New Event Team name").fill("Blue");
   await eventAdminPage.getByRole("button", { name: "Add Team" }).click();
   await eventAdminPage.getByText("Blue", { exact: true }).first().waitFor();
@@ -339,6 +506,81 @@ try {
   await eventAdminPage.getByLabel("Pitch Pitch One name").fill("Pitch Main");
   await eventAdminPage.getByRole("button", { name: "Save Pitch" }).click();
   await eventAdminPage.getByLabel("Pitch Pitch Main name").waitFor();
+  await eventAdminPage.getByLabel("New Pitch name").fill("Pitch Temporary");
+  const temporaryPitchResponsePromise = eventAdminPage.waitForResponse(
+    (response) =>
+      response.url().includes(`/api/event-admin/events/${eventId}/pitches`) &&
+      response.request().method() === "POST",
+  );
+  await eventAdminPage.getByRole("button", { name: "Add Pitch" }).click();
+  assert(
+    (await temporaryPitchResponsePromise).status() === 201,
+    "temporary removal Pitch creation failed",
+  );
+  await eventAdminPage.getByLabel("Pitch Pitch Temporary name").waitFor();
+  const removalHubPayload = (await (
+    await eventAdminContext.request.get(`${origin}/api/event-admin/hub?eventId=${eventId}`)
+  ).json()) as {
+    status: string;
+    value?: { event?: { pitches?: Array<{ pitchId: string; name: string }> } };
+  };
+  const removalPitchId = removalHubPayload.value?.event?.pitches?.find(
+    (pitch) => pitch.name === "Pitch Temporary",
+  )?.pitchId;
+  assert(removalPitchId !== undefined, "temporary removal Pitch was not projected");
+  const temporaryPitchViewResponsePromise = eventAdminPage.waitForResponse(
+    (response) =>
+      response.url().includes("/api/event-admin/pitch-view?") &&
+      response.request().method() === "GET",
+  );
+  await eventAdminPage.getByRole("button", { name: "Pitch Temporary", exact: true }).click();
+  await temporaryPitchViewResponsePromise;
+  await eventAdminPage.getByLabel("Preview removal Pitch Pitch Temporary").click();
+  await eventAdminPage.getByRole("status").filter({ hasText: "catalog descendants 0" }).waitFor();
+  const pitchRemovalResponsePromise = eventAdminPage.waitForResponse(
+    (response) =>
+      response.url().endsWith("/catalog-removal") && response.request().method() === "DELETE",
+  );
+  const survivingPitchViewResponsePromise = eventAdminPage.waitForResponse(
+    (response) =>
+      response.url().includes("/api/event-admin/pitch-view?") &&
+      response.request().method() === "GET",
+  );
+  await eventAdminPage.getByRole("button", { name: "Confirm", exact: true }).click();
+  const pitchRemovalResponse = await pitchRemovalResponsePromise;
+  const pitchRemovalPayload = (await pitchRemovalResponse.json()) as {
+    status: string;
+    sessionExpiresAtMs?: number;
+  };
+  assert(
+    pitchRemovalResponse.status() === 200 &&
+      pitchRemovalPayload.status === "accepted" &&
+      typeof pitchRemovalPayload.sessionExpiresAtMs === "number",
+    "Event Admin Pitch removal was not accepted with session activity",
+  );
+  const refreshedPitchEventAdminCookie = (await eventAdminContext.cookies()).find(
+    (cookie) => cookie.name === "__Host-event-admin-session",
+  );
+  assert(
+    refreshedPitchEventAdminCookie !== undefined &&
+      refreshedPitchEventAdminCookie.expires > 0 &&
+      Math.abs(
+        refreshedPitchEventAdminCookie.expires * 1_000 -
+          (pitchRemovalPayload.sessionExpiresAtMs ?? 0),
+      ) < 2_000,
+    "Pitch removal did not refresh the Event Admin session cookie",
+  );
+  const survivingPitchViewResponse = await survivingPitchViewResponsePromise;
+  assert(
+    !survivingPitchViewResponse.url().includes(removalPitchId),
+    "Pitch removal refetched the deleted Pitch view",
+  );
+  await eventAdminPage.getByRole("button", { name: "Pitch Main", exact: true }).waitFor();
+  assert(
+    (await eventAdminPage.getByRole("button", { name: "Pitch Temporary", exact: true }).count()) ===
+      0,
+    "removed Pitch remained selected or visible",
+  );
   const firstDayScheduleHubResponsePromise = eventAdminPage.waitForResponse(
     (response) =>
       response.url().includes("/api/event-admin/hub?") && response.request().method() === "GET",
@@ -1069,7 +1311,7 @@ try {
     .getByText(/Expected Delay 1m/u)
     .last()
     .waitFor();
-  await eventAdminPage.getByRole("button", { name: "Pitch Main" }).click();
+  await eventAdminPage.getByRole("button", { name: "Pitch Main", exact: true }).click();
   await eventAdminPage.getByLabel("Pitch Slot 1 Expected Delay minutes").waitFor();
   await eventAdminPage.getByLabel("Pitch Slot 1 Expected Delay minutes").fill("3");
   const pitchPreviewResponsePromise = eventAdminPage.waitForResponse(
@@ -1117,7 +1359,7 @@ try {
   assert((await thirdGameResponsePromise).status() === 201, "third Event Game creation failed");
   await eventAdminPage.getByRole("button", { name: "Refresh Slot setup" }).click();
   await eventAdminPage.getByText("Third", { exact: true }).waitFor();
-  await eventAdminPage.getByRole("button", { name: "Pitch Main" }).click();
+  await eventAdminPage.getByRole("button", { name: "Pitch Main", exact: true }).click();
   await eventAdminPage.getByLabel("Pitch Slot 1 Expected Delay minutes").waitFor();
   const lastTargetSelector = eventAdminPage
     .locator('select[aria-label$="target Pitch Slot"]')
@@ -1372,11 +1614,113 @@ try {
     "explicitly revoked live Event Admin session remained live",
   );
   await pitchManagerCodeContext.close();
+  const finalRemovalEventResponse = await context.request.post(`${origin}/api/admin/events`, {
+    data: { name: "Final Removal Browser Event", timeZone: "UTC" },
+    headers: { origin, "x-technical-admin-csrf": currentCsrfToken },
+  });
+  const finalRemovalEventPayload = (await finalRemovalEventResponse.json()) as {
+    status: string;
+    value?: { eventId?: string };
+  };
+  const finalRemovalEventId = finalRemovalEventPayload.value?.eventId;
+  assert(
+    finalRemovalEventResponse.status() === 201 && finalRemovalEventId !== undefined,
+    "final removal browser Event creation failed",
+  );
+  for (const date of ["2026-08-17", "2026-08-18"]) {
+    const finalRemovalDayResponse = await context.request.post(
+      `${origin}/api/admin/events/${finalRemovalEventId}/game-days`,
+      {
+        data: { date },
+        headers: { origin, "x-technical-admin-csrf": currentCsrfToken },
+      },
+    );
+    assert(finalRemovalDayResponse.status() === 201, `final removal Game Day ${date} failed`);
+  }
+  await page.goto(`${origin}/admin`);
+  await page.getByText("Technical Admin administration").waitFor();
+  await page.getByRole("button", { name: /Final Removal Browser Event/ }).click();
+  await page.getByRole("button", { name: "Create Grant" }).click();
+  const finalRevealResponsePromise = page.waitForResponse(
+    (response) =>
+      response
+        .url()
+        .includes(`/api/admin/events/${finalRemovalEventId}/event-admin-grant/reveal`) &&
+      response.request().method() === "POST",
+  );
+  await page.getByRole("button", { name: "Reveal QR credential" }).click();
+  const finalRevealResponse = await finalRevealResponsePromise;
+  const finalRevealPayload = (await finalRevealResponse.json()) as {
+    status: string;
+    value?: { qrCredential?: string };
+  };
+  const finalCredential = finalRevealPayload.value?.qrCredential ?? "";
+  assert(
+    finalRevealResponse.status() === 200 && finalCredential.length > 0,
+    "final QR reveal failed",
+  );
+  const finalRemovalContext = await browser.newContext({ ignoreHTTPSErrors: true });
+  const finalRemovalPage = await finalRemovalContext.newPage();
+  finalRemovalPage.setDefaultTimeout(5_000);
+  await finalRemovalPage.goto(`${origin}/event-admin?eventId=${finalRemovalEventId}`);
+  await finalRemovalPage.getByLabel("Scanned Event Admin QR value").fill(finalCredential);
+  await finalRemovalPage.getByRole("button", { name: "Admit Event Admin" }).click();
+  await finalRemovalPage.getByText(/event-admin/u).waitFor();
+  const finalRemovalSelector = finalRemovalPage.getByLabel("Game Day", { exact: true });
+  const finalFirstDayHubResponsePromise = finalRemovalPage.waitForResponse(
+    (response) =>
+      response.url().includes("/api/event-admin/hub?") && response.request().method() === "GET",
+  );
+  await finalRemovalSelector.selectOption({ index: 1 });
+  await finalFirstDayHubResponsePromise;
+  assert(
+    (await finalRemovalSelector.inputValue()).length > 0,
+    "final removal Game Day was not selected",
+  );
+  await finalRemovalPage.getByLabel("New Pitch name").fill("Final Pitch");
+  await finalRemovalPage.getByRole("button", { name: "Add Pitch" }).click();
+  await finalRemovalPage.getByRole("button", { name: "Final Pitch", exact: true }).waitFor();
+  await finalRemovalPage.getByLabel("Preview removal Pitch Final Pitch").click();
+  const finalPitchHubResponsePromise = finalRemovalPage.waitForResponse(
+    (response) =>
+      response.url().includes("/api/event-admin/hub?") &&
+      response.url().includes("gameDayId=") &&
+      response.request().method() === "GET",
+  );
+  await finalRemovalPage.getByRole("button", { name: "Confirm", exact: true }).click();
+  await finalRemovalPage.getByRole("button", { name: "Final Pitch", exact: true }).waitFor({
+    state: "detached",
+  });
+  await finalPitchHubResponsePromise;
+  assert(
+    (await finalRemovalPage.getByRole("button", { name: "Final Pitch", exact: true }).count()) ===
+      0,
+    "final Pitch removal did not leave the UI in an empty state",
+  );
+  const firstFinalDayValue = await finalRemovalSelector.inputValue();
+  await finalRemovalPage.getByLabel(/Preview removal Game Day 2026-08-17/u).click();
+  const survivingFinalDayHubResponsePromise = finalRemovalPage.waitForResponse(
+    (response) =>
+      response.url().includes("/api/event-admin/hub?") &&
+      response.url().includes("gameDayId=") &&
+      response.request().method() === "GET",
+  );
+  await finalRemovalPage.getByRole("button", { name: "Confirm", exact: true }).click();
+  await survivingFinalDayHubResponsePromise;
+  assert(
+    (await finalRemovalSelector.inputValue()) !== firstFinalDayValue,
+    "selected Game Day was not changed after removing it",
+  );
+  await finalRemovalPage.getByLabel(/Preview removal Game Day 2026-08-18/u).click();
+  await finalRemovalPage.getByRole("button", { name: "Confirm", exact: true }).click();
+  await expectValue(finalRemovalSelector, "");
+  await finalRemovalPage
+    .getByText("Choose a Game Day to schedule Games.", { exact: true })
+    .waitFor();
+  await finalRemovalContext.close();
   await pitchManagerContext.close();
   await eventAdminContext.close();
   await revokedEventAdminContext.close();
-  const removeButtons = page.getByRole("button", { name: "Remove", exact: true });
-  await removeButtons.nth(0).click();
   const attachedGrantRemoval = await page.evaluate(async (url) => {
     const csrf = document.cookie
       .split(";")

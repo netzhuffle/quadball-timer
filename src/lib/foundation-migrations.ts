@@ -1952,6 +1952,28 @@ export const FOUNDATION_PRESENTATION_INTEGRITY_MIGRATION_SQL = `
     BEGIN SELECT RAISE(ABORT, 'Game Presentation evidence anchors are immutable.'); END;
 `;
 
+/** Schema-28 adds the durable Event Catalog removal audit action. */
+export const FOUNDATION_EVENT_CATALOG_REMOVAL_MIGRATION_SQL = `
+  CREATE TABLE foundation_event_catalog_audit_v28 AS SELECT * FROM foundation_event_catalog_audit;
+  DROP TABLE foundation_event_catalog_audit;
+  ${FOUNDATION_EVENT_CATALOG_AUDIT_TABLE_V3_SQL.replace(
+    "CREATE TABLE foundation_event_catalog_audit",
+    "CREATE TABLE foundation_event_catalog_audit_rebuilt",
+  ).replace(
+    "'event-game-teams-confirmed'",
+    "'event-game-teams-confirmed', 'event-publication-changed', 'event-catalog-entry-removed'",
+  )};
+  INSERT INTO foundation_event_catalog_audit_rebuilt
+    (audit_id, operation_id, action, event_id, game_day_id, actor_reference,
+     occurred_at_ms, before_json, after_json)
+  SELECT audit_id, operation_id, action, event_id, game_day_id, actor_reference,
+         occurred_at_ms, before_json, after_json
+  FROM foundation_event_catalog_audit_v28;
+  DROP TABLE foundation_event_catalog_audit_v28;
+  ALTER TABLE foundation_event_catalog_audit_rebuilt RENAME TO foundation_event_catalog_audit;
+  ${FOUNDATION_EVENT_CATALOG_AUDIT_EVENT_INDEX_SQL};
+`;
+
 export const FOUNDATION_MIGRATIONS: readonly FoundationMigration[] = Object.freeze([
   createMigration({
     id: "001-foundation-event-game-record-roots",
@@ -2114,6 +2136,12 @@ export const FOUNDATION_MIGRATIONS: readonly FoundationMigration[] = Object.free
     ordinal: 27,
     schemaVersion: 27,
     sql: FOUNDATION_PRESENTATION_INTEGRITY_MIGRATION_SQL,
+  }),
+  createMigration({
+    id: "028-event-catalog-removal-audit",
+    ordinal: 28,
+    schemaVersion: 28,
+    sql: FOUNDATION_EVENT_CATALOG_REMOVAL_MIGRATION_SQL,
   }),
 ]);
 

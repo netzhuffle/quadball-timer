@@ -140,6 +140,12 @@ export type TypedGrantMutation =
       detail?: string;
     };
 
+export type GrantRetirementInput = {
+  grantId: string;
+  actorReference: string;
+  reason: "event-catalog-removal";
+};
+
 export type TypedGrantReveal =
   | {
       status: "revealed";
@@ -304,6 +310,10 @@ export type TypedGrantAuthority = {
     grantId: string,
     sessionReference: string,
     authority: GrantManagementAuthority,
+  ): TypedGrantMutation;
+  retireGrantInTransaction(
+    transaction: FoundationStorageTransaction,
+    input: GrantRetirementInput,
   ): TypedGrantMutation;
   leaveGrantSession(sessionBearer: string): Promise<TypedGrantMutation>;
   listGrantSessions(

@@ -15,17 +15,7 @@ import { readRuntimeConfig } from "@/lib/runtime-config";
 
 const args = process.argv.slice(2);
 const databasePath = option("--db") ?? process.env.EVENT_CATALOG_DATABASE?.trim() ?? null;
-const commands = new Set([
-  "list",
-  "inspect",
-  "create",
-  "update",
-  "add-day",
-  "update-day",
-  "remove-day",
-  "remove-event",
-  "audit",
-]);
+const commands = new Set(["list", "inspect", "create", "update", "add-day", "update-day", "audit"]);
 const command = args.find((arg) => commands.has(arg)) ?? "help";
 let foundationStorage: ReturnType<typeof openSqliteFoundationStorage> | null = null;
 let hostAuth: ReturnType<typeof createTechnicalAdminAuth> | null = null;
@@ -95,10 +85,6 @@ async function run(
         { date: required("date") },
         authority,
       );
-    case "remove-day":
-      return catalog.removeGameDay(required("event-id"), required("game-day-id"), authority);
-    case "remove-event":
-      return catalog.removeEvent(required("event-id"), authority);
     case "audit":
       return catalog.listAuditTrail(required("event-id"), authority);
     default:
@@ -106,7 +92,7 @@ async function run(
         status: "rejected",
         reason: "invalid-input",
         detail:
-          "Usage: list | inspect --event-id ID | create --name NAME --timezone ZONE | update --event-id ID [--name NAME] [--timezone ZONE] | add-day --event-id ID --date YYYY-MM-DD | update-day --event-id ID --game-day-id ID --date YYYY-MM-DD | remove-day --event-id ID --game-day-id ID | remove-event --event-id ID | audit --event-id ID",
+          "Usage: list | inspect --event-id ID | create --name NAME --timezone ZONE | update --event-id ID [--name NAME] [--timezone ZONE] | add-day --event-id ID --date YYYY-MM-DD | update-day --event-id ID --game-day-id ID --date YYYY-MM-DD | audit --event-id ID",
       };
   }
 }

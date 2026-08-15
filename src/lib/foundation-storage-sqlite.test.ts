@@ -564,7 +564,7 @@ describe("SQLite foundation storage", () => {
       expect(await reopenedRecord.registerRoot(root)).toMatchObject({ status: "idempotent" });
       expect(await reopened.readiness()).toMatchObject({
         ok: true,
-        schemaVersion: "27",
+        schemaVersion: "28",
         evidence: { replay: { result: "passed", rootCount: 1, durationMs: expect.any(Number) } },
       });
       reopened.close();
@@ -612,14 +612,145 @@ describe("SQLite foundation storage", () => {
       const storage = openSqliteFoundationStorage(databasePath);
       const candidate = await storage.validateCandidate();
       expect(candidate.ready).toBe(true);
-      expect(candidate.readiness).toMatchObject({ ok: true, schemaVersion: "27" });
+      expect(candidate.readiness).toMatchObject({ ok: true, schemaVersion: "28" });
       expect(existsSync(candidate.candidatePath)).toBe(false);
       expect(await storage.readiness()).toMatchObject({ ok: false, status: "pending" });
 
       const migration = await storage.applyMigrations({ requireCandidate: true });
-      expect(migration.schemaVersion).toBe(27);
+      expect(migration.schemaVersion).toBe(28);
       expect(await storage.readiness()).toMatchObject({ ok: true });
       storage.close();
+    });
+  });
+
+  test("preserves prior Event Catalog audit rows, shape, ordering, index, and FK behavior through removal migration", async () => {
+    await withDatabase(async (databasePath) => {
+      const prior = openSqliteFoundationStorage(databasePath, {
+        migrations: FOUNDATION_MIGRATIONS.slice(0, 27),
+      });
+      await prior.applyMigrations({ requireCandidate: false });
+      prior.close();
+
+      const before = new Database(databasePath);
+      const insert = before.query(
+        `INSERT INTO foundation_event_catalog_audit
+           (audit_id, operation_id, action, event_id, game_day_id, actor_reference,
+            occurred_at_ms, before_json, after_json)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      );
+      for (const auditId of ["audit-b", "audit-a"]) {
+        insert.run(
+          auditId,
+          `operation-${auditId}`,
+          "event-publication-changed",
+          "event-prior",
+          null,
+          "actor-prior",
+          10_000,
+          JSON.stringify({ publicationStatus: "draft" }),
+          JSON.stringify({ publicationStatus: "public" }),
+        );
+      }
+      const priorColumns = (
+        before.query("PRAGMA table_info(foundation_event_catalog_audit)").all() as Array<{
+          name: string;
+          type: string;
+          notnull: number;
+          pk: number;
+        }>
+      ).map((row) => ({
+        name: row.name,
+        type: row.type,
+        notnull: row.notnull,
+        pk: row.pk,
+      }));
+      const priorForeignKeys = before
+        .query("PRAGMA foreign_key_list(foundation_event_catalog_audit)")
+        .all();
+      const priorIndexes = before
+        .query("PRAGMA index_list(foundation_event_catalog_audit)")
+        .all() as Array<{
+        name: string;
+      }>;
+      before.close();
+
+      const current = openSqliteFoundationStorage(databasePath);
+      await current.applyMigrations({ requireCandidate: false });
+      current.close();
+
+      const after = new Database(databasePath);
+      const currentColumns = (
+        after.query("PRAGMA table_info(foundation_event_catalog_audit)").all() as Array<{
+          name: string;
+          type: string;
+          notnull: number;
+          pk: number;
+        }>
+      ).map((row) => ({
+        name: row.name,
+        type: row.type,
+        notnull: row.notnull,
+        pk: row.pk,
+      }));
+      const currentForeignKeys = after
+        .query("PRAGMA foreign_key_list(foundation_event_catalog_audit)")
+        .all();
+      const currentIndexes = after
+        .query("PRAGMA index_list(foundation_event_catalog_audit)")
+        .all() as Array<{
+        name: string;
+      }>;
+      const indexColumns = (
+        after.query("PRAGMA index_info(foundation_event_catalog_audit_event_id)").all() as Array<{
+          name: string;
+        }>
+      ).map((row) => row.name);
+      after
+        .query(
+          `INSERT INTO foundation_event_catalog_audit
+             (audit_id, operation_id, action, event_id, game_day_id, actor_reference,
+              occurred_at_ms, before_json, after_json)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          "audit-removal",
+          "operation-removal",
+          "event-catalog-entry-removed",
+          "event-missing-parent-is-allowed",
+          null,
+          "actor-redacted",
+          10_001,
+          JSON.stringify({ kind: "event", eventId: "event-missing-parent-is-allowed" }),
+          JSON.stringify(null),
+        );
+      const rows = after
+        .query(
+          `SELECT audit_id AS auditId, action, event_id AS eventId, occurred_at_ms AS occurredAtMs
+             FROM foundation_event_catalog_audit
+            WHERE event_id = ?
+            ORDER BY occurred_at_ms, audit_id`,
+        )
+        .all("event-prior");
+      after.close();
+
+      expect(currentColumns).toEqual(priorColumns);
+      expect(currentForeignKeys).toEqual(priorForeignKeys);
+      expect(currentIndexes.map((row) => row.name)).toEqual(priorIndexes.map((row) => row.name));
+      expect(indexColumns).toEqual(["event_id", "occurred_at_ms", "audit_id"]);
+      expect(rows).toEqual([
+        {
+          auditId: "audit-a",
+          action: "event-publication-changed",
+          eventId: "event-prior",
+          occurredAtMs: 10_000,
+        },
+        {
+          auditId: "audit-b",
+          action: "event-publication-changed",
+          eventId: "event-prior",
+          occurredAtMs: 10_000,
+        },
+      ]);
     });
   });
 
@@ -648,6 +779,7 @@ describe("SQLite foundation storage", () => {
       const grantCodeLockMigration = FOUNDATION_MIGRATIONS[20];
       const controlSessionStayMigration = FOUNDATION_MIGRATIONS[21];
       const eventTeamsMigration = FOUNDATION_MIGRATIONS[22];
+      const removalAuditMigration = FOUNDATION_MIGRATIONS[27];
       if (
         initialMigration === undefined ||
         repairMigration === undefined ||
@@ -671,7 +803,8 @@ describe("SQLite foundation storage", () => {
         grantCodeMigration === undefined ||
         grantCodeLockMigration === undefined ||
         controlSessionStayMigration === undefined ||
-        eventTeamsMigration === undefined
+        eventTeamsMigration === undefined ||
+        removalAuditMigration === undefined
       ) {
         throw new Error("Expected the foundation migrations.");
       }
@@ -711,8 +844,9 @@ describe("SQLite foundation storage", () => {
         "025-event-publication-status",
         "026-event-schedule-expected-delays-and-conflicts",
         "027-event-game-presentation-integrity",
+        removalAuditMigration.id,
       ]);
-      expect(await current.readiness()).toMatchObject({ ok: true, schemaVersion: "27" });
+      expect(await current.readiness()).toMatchObject({ ok: true, schemaVersion: "28" });
       current.close();
     });
   });
@@ -721,9 +855,9 @@ describe("SQLite foundation storage", () => {
     await withDatabase(async (databasePath) => {
       const baseMigrations = FOUNDATION_MIGRATIONS;
       const failingMigration = createMigration(
-        "027-failing-test-migration",
-        27,
-        27,
+        "029-failing-test-migration",
+        29,
+        29,
         "CREATE TABLE migration_failure_probe (id TEXT) STRICT; THIS IS NOT SQL;",
       );
       const store = openSqliteFoundationStorage(databasePath, {
@@ -743,7 +877,7 @@ describe("SQLite foundation storage", () => {
       });
       expect(await priorBinary.readiness()).toMatchObject({
         ok: true,
-        schemaVersion: "27",
+        schemaVersion: "28",
       });
       priorBinary.close();
 
@@ -815,7 +949,7 @@ describe("SQLite foundation storage", () => {
         .query(
           "INSERT INTO foundation_migration_ledger (migration_id, ordinal, schema_version, checksum, status, applied_at_ms) VALUES (?, ?, ?, ?, ?, ?)",
         )
-        .run("future-999", 28, 28, "future-checksum", "complete", 2_000);
+        .run("future-999", 29, 29, "future-checksum", "complete", 2_000);
       futureDatabase.close();
       const future = openSqliteFoundationStorage(databasePath);
       expect(await future.readiness()).toMatchObject({ ok: false });

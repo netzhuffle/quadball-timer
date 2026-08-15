@@ -6,6 +6,9 @@ import {
   projectEventProjection,
   type CatalogOutcome,
   type EventCatalog,
+  type EventCatalogRemovalPreview,
+  type EventCatalogRemovalResult,
+  type EventCatalogRemovalTargetInput,
   type EventCatalogMutationOperations,
   type EventTeamProjection,
   type EventProjection,
@@ -40,9 +43,11 @@ import {
   type PitchManagerGrantScope,
   type StoredGrant,
   validateControlGrantScope,
+  validateEventAdminGrantScope,
   validatePitchManagerGrantScope,
 } from "@/lib/grant-types";
 import { isTechnicalAdminAuthority } from "@/lib/technical-admin-auth";
+import { canonicalizeJson, sha256 } from "@/lib/event-game-action-json";
 import { validateOpaqueIdentifier } from "@/lib/validation-policy";
 
 export const GENERIC_EVENT_HUB_AUTHORIZATION_FAILURE = Object.freeze({
@@ -152,7 +157,11 @@ export type PitchManagerViewProjection = {
 
 export type EventAdministrationOutcome<T> =
   | { status: "accepted"; value: T }
-  | { status: "rejected"; reason: "invalid-input" | "unauthorized" | "not-found"; detail: string }
+  | {
+      status: "rejected";
+      reason: "invalid-input" | "unauthorized" | "not-found" | "in-use";
+      detail: string;
+    }
   | { status: "retryable-failure"; detail: string };
 
 export type EventAdministrationMutationOutcome<T> = EventAdministrationOutcome<T> & {
@@ -165,9 +174,19 @@ export type EventAdministrationOptions = {
   catalog?: EventCatalog;
   nowMs?: () => number;
   controlScopeResolver?: ControlGrantScopeResolver;
+  /** Test-only composition seam for proving rollback after typed retirement. */
+  removalFailureInjector?: () => void;
 };
 
 export type EventAdministration = {
+  previewEventCatalogRemoval(
+    target: EventCatalogRemovalTargetInput,
+    authority: EventAdministrationAuthority,
+  ): Promise<EventAdministrationOutcome<EventCatalogRemovalPreview>>;
+  removeEventCatalogEntry(
+    target: EventCatalogRemovalTargetInput & { previewFingerprint?: unknown },
+    authority: EventAdministrationAuthority,
+  ): Promise<EventAdministrationMutationOutcome<EventCatalogRemovalResult>>;
   createEventAdminGrant(
     eventId: unknown,
     authority: TechnicalAdminAuthority,
@@ -513,6 +532,95 @@ export function createEventAdministration(
     });
 
   return {
+    async previewEventCatalogRemoval(target, authority) {
+      const eventId = validateEventId(target.eventId);
+      if (!eventId.ok) return invalid(eventId.error);
+      if (!removalAllowedForAuthority(target.kind, authority)) return unauthorized();
+      try {
+        return await options.storage.transaction((transaction) => {
+          const authorized = authorizeEventScopeInTransaction(
+            options,
+            transaction,
+            eventId.value,
+            authority,
+            true,
+          );
+          if (authorized === null) return unauthorized();
+          const result = catalog.runMutationInTransaction(
+            transaction,
+            eventId.value,
+            authorized.actorReference,
+            (operations) => operations.previewEventCatalogRemoval(target),
+          );
+          if (result.status !== "accepted") return catalogOutcomeToAdministration(result);
+          return accepted(addAuthorityImpact(transaction, result.value));
+        });
+      } catch {
+        return unavailable();
+      }
+    },
+
+    async removeEventCatalogEntry(target, authority) {
+      const eventId = validateEventId(target.eventId);
+      if (!eventId.ok) return invalid(eventId.error);
+      if (!removalAllowedForAuthority(target.kind, authority)) return unauthorized();
+      if (!isValidRemovalFingerprint(target.previewFingerprint))
+        return invalid("Event Catalog removal preview is invalid.");
+      try {
+        return await options.storage.transaction((transaction) => {
+          const authorized = authorizeEventScopeInTransaction(
+            options,
+            transaction,
+            eventId.value,
+            authority,
+          );
+          if (authorized === null) return rollbackRemovalMutation(unauthorized());
+          const preview = catalog.runMutationInTransaction(
+            transaction,
+            eventId.value,
+            authorized.actorReference,
+            (operations) => operations.previewEventCatalogRemoval(target),
+          );
+          if (preview.status !== "accepted")
+            return rollbackRemovalMutation(catalogOutcomeToAdministration(preview));
+          const impacted = addAuthorityImpact(transaction, preview.value);
+          if (target.previewFingerprint !== impacted.fingerprint)
+            return rollbackRemovalMutation(invalid("Event Catalog removal preview is stale."));
+          if (!impacted.eligible)
+            return rollbackRemovalMutation({
+              status: "rejected" as const,
+              reason: "in-use" as const,
+              detail: impacted.repairWorkflow ?? "Event Catalog removal is not eligible.",
+            });
+          const grants = grantsOwnedByRemovalTarget(transaction, impacted.target);
+          for (const grant of grants) {
+            const retired = options.grants.retireGrantInTransaction(transaction, {
+              grantId: grant.grantId,
+              actorReference: authorized.actorReference,
+              reason: "event-catalog-removal",
+            });
+            if (retired.status !== "updated")
+              return rollbackRemovalMutation(grantRetirementRejection(retired));
+          }
+          options.removalFailureInjector?.();
+          const result = catalog.runMutationInTransaction(
+            transaction,
+            eventId.value,
+            authorized.actorReference,
+            (operations) =>
+              operations.removeEventCatalogEntry(target, preview.value.fingerprint, grants.length),
+          );
+          if (result.status !== "accepted")
+            return rollbackRemovalMutation(catalogOutcomeToAdministration(result));
+          return { ...accepted(result.value), sessionExpiresAtMs: authorized.sessionExpiresAtMs };
+        });
+      } catch (error) {
+        if (error instanceof EventAdministrationRollback)
+          return error.outcome as EventAdministrationMutationOutcome<EventCatalogRemovalResult>;
+        return unavailable();
+      }
+    },
+
     async createEventAdminGrant(eventIdInput, authority) {
       if (!isTechnicalAdminAuthority(authority)) return unauthorized();
       const eventId = validateEventId(eventIdInput);
@@ -1475,6 +1583,279 @@ function authorizeEventScopeInTransaction(
     sessionExpiresAtMs: result.sessionExpiresAtMs ?? null,
     actorReference: `event-admin:${result.grantSessionId}`,
   };
+}
+
+function removalAllowedForAuthority(
+  kind: unknown,
+  authority: EventAdministrationAuthority,
+): boolean {
+  const isEventRemoval = kind === "event";
+  return isTechnicalAdminAuthority(authority) ? isEventRemoval : !isEventRemoval;
+}
+
+function addAuthorityImpact(
+  transaction: FoundationStorageTransaction,
+  preview: EventCatalogRemovalPreview,
+): EventCatalogRemovalPreview {
+  const authorityImpact = readRemovalAuthorityImpact(transaction, preview.target);
+  const malformed = authorityImpact.state !== "available";
+  return {
+    ...preview,
+    eligible: preview.eligible && !malformed,
+    rejectionCategory: malformed ? null : preview.rejectionCategory,
+    repairWorkflow: malformed ? "Event Catalog removal is unavailable." : preview.repairWorkflow,
+    impact: {
+      ...preview.impact,
+      retiredAuthorityCount: authorityImpact.grants.length,
+      retiredAuthorityCategories: authorityImpact.categories,
+    },
+    fingerprint: removalFingerprint(preview, authorityImpact),
+  };
+}
+
+type RemovalAuthorityDescriptor = {
+  grantId: string;
+  grantType: string;
+  grantVersion: string;
+  status: string;
+  expiresAtMs: number | null;
+  scopeState: "valid" | "malformed";
+  scope: unknown;
+  credentialMaterialState: string;
+  credentialFingerprint: string;
+  codeState: string | null;
+  codeFingerprint: string | null;
+  sessions: Array<{
+    sessionId: string;
+    grantVersion: string;
+    status: string;
+    bearerMaterialState: string;
+    revokedAtMs: number | null;
+  }>;
+};
+
+type RemovalAuthorityImpact = {
+  state: "available" | "malformed" | "unavailable";
+  descriptors: RemovalAuthorityDescriptor[];
+  grants: StoredGrant[];
+  categories: {
+    eventAdmin: number;
+    pitchManager: number;
+    control: number;
+  };
+};
+
+function readRemovalAuthorityImpact(
+  transaction: FoundationStorageTransaction,
+  target: EventCatalogRemovalPreview["target"],
+): RemovalAuthorityImpact {
+  const descriptors: RemovalAuthorityDescriptor[] = [];
+  const grants: StoredGrant[] = [];
+  try {
+    let malformed = false;
+    for (const grant of transaction.listGrants()) {
+      const ownership = classifyRemovalGrant(grant, target);
+      if (ownership === null) continue;
+      const scopeState = ownership === "malformed" ? "malformed" : "valid";
+      if (scopeState === "malformed") malformed = true;
+      else if (!hasReadableRemovalCredentialMaterial(grant)) malformed = true;
+      else grants.push(grant);
+      descriptors.push(removalGrantDescriptor(transaction, grant, scopeState));
+    }
+    descriptors.sort((left, right) => left.grantId.localeCompare(right.grantId));
+    const retiringGrants = grants.filter((grant) => grant.status !== "expired");
+    return {
+      state: malformed ? "malformed" : "available",
+      descriptors,
+      grants: retiringGrants,
+      categories: {
+        eventAdmin: retiringGrants.filter((grant) => grant.grantType === EVENT_ADMIN_GRANT_TYPE)
+          .length,
+        pitchManager: retiringGrants.filter((grant) => grant.grantType === PITCH_MANAGER_GRANT_TYPE)
+          .length,
+        control: retiringGrants.filter((grant) => grant.grantType === GRANT_TYPE).length,
+      },
+    };
+  } catch {
+    return {
+      state: "unavailable",
+      descriptors: [],
+      grants: [],
+      categories: { eventAdmin: 0, pitchManager: 0, control: 0 },
+    };
+  }
+}
+
+function hasReadableRemovalCredentialMaterial(grant: StoredGrant): boolean {
+  if (
+    typeof grant.credential?.fingerprint !== "string" ||
+    grant.credential.fingerprint.length === 0
+  )
+    return false;
+  if (grant.code === undefined || grant.code === null) return true;
+  return typeof grant.code.fingerprint === "string" && grant.code.fingerprint.length > 0;
+}
+
+function rawScopeMatchesRemovalTarget(
+  grant: StoredGrant,
+  target: EventCatalogRemovalPreview["target"],
+): boolean {
+  if (target.kind === "event") return true;
+  const rawScope = grant.scope as Record<string, unknown>;
+  if (target.kind === "game-day") return rawScope.gameDayId === target.targetId;
+  if (target.kind === "pitch") return rawScope.pitchId === target.targetId;
+  if (target.kind === "pitch-slot") return rawScope.pitchSlotId === target.targetId;
+  return false;
+}
+
+function classifyRemovalGrant(
+  grant: StoredGrant,
+  target: EventCatalogRemovalPreview["target"],
+): "valid" | "malformed" | null {
+  if (!isRecord(grant.scope)) return null;
+  const rawScope = grant.scope;
+  if (rawScope.eventId !== target.eventId || !rawScopeMatchesRemovalTarget(grant, target))
+    return null;
+  const scope =
+    target.kind === "event" && grant.grantType === EVENT_ADMIN_GRANT_TYPE
+      ? validateEventAdminGrantScope(grant.scope)
+      : grant.grantType === PITCH_MANAGER_GRANT_TYPE
+        ? validatePitchManagerGrantScope(grant.scope)
+        : grant.grantType === GRANT_TYPE
+          ? validateControlGrantScope(grant.scope)
+          : null;
+  if (scope !== null && scope.ok && scope.value.eventId === target.eventId) {
+    const scopeValue = scope.value as {
+      eventId: string;
+      gameDayId?: string;
+      pitchId?: string;
+      pitchSlotId?: string;
+    };
+    if (target.kind === "event") return "valid";
+    if (target.kind === "game-day" && scopeValue.gameDayId === target.targetId) return "valid";
+    if (target.kind === "pitch" && scopeValue.pitchId === target.targetId) return "valid";
+    if (target.kind === "pitch-slot" && scopeValue.pitchSlotId === target.targetId) return "valid";
+  }
+  return "malformed";
+}
+
+function removalGrantDescriptor(
+  transaction: FoundationStorageTransaction,
+  grant: StoredGrant,
+  scopeState: "valid" | "malformed",
+): RemovalAuthorityDescriptor {
+  const sessions = transaction
+    .listGrantSessions(grant.grantId)
+    .map((session) => ({
+      sessionId: session.sessionId,
+      grantVersion: session.grantVersion,
+      status: session.status,
+      bearerMaterialState: session.bearerMaterialState,
+      revokedAtMs: session.revokedAtMs,
+    }))
+    .sort((left, right) => left.sessionId.localeCompare(right.sessionId));
+  return {
+    grantId: grant.grantId,
+    grantType: grant.grantType,
+    grantVersion: grant.grantVersion,
+    status: grant.status,
+    expiresAtMs: grant.expiresAtMs,
+    scopeState,
+    scope: scopeState === "valid" ? grant.scope : null,
+    credentialMaterialState: grant.credential.materialState,
+    credentialFingerprint: grant.credential.fingerprint,
+    codeState: grant.code?.state ?? null,
+    codeFingerprint: grant.code?.fingerprint ?? null,
+    sessions,
+  };
+}
+
+function removalFingerprint(
+  preview: EventCatalogRemovalPreview,
+  authorityImpact: RemovalAuthorityImpact,
+): string {
+  return `event-catalog-removal-v1:${sha256(
+    canonicalizeJson({
+      catalogFingerprint: preview.fingerprint,
+      authorityImpact: {
+        state: authorityImpact.state,
+        descriptors: authorityImpact.descriptors,
+      },
+    }),
+  )}`;
+}
+
+function isValidRemovalFingerprint(value: unknown): value is string {
+  return typeof value === "string" && /^event-catalog-removal-v1:[0-9a-f]{64}$/u.test(value);
+}
+
+function grantsOwnedByRemovalTarget(
+  transaction: FoundationStorageTransaction,
+  target: EventCatalogRemovalPreview["target"],
+): StoredGrant[] {
+  return transaction.listGrants().filter((grant) => {
+    if (grant.status === "expired") return false;
+    const scope =
+      target.kind === "event" && grant.grantType === EVENT_ADMIN_GRANT_TYPE
+        ? validateEventAdminGrantScope(grant.scope)
+        : grant.grantType === PITCH_MANAGER_GRANT_TYPE
+          ? validatePitchManagerGrantScope(grant.scope)
+          : grant.grantType === GRANT_TYPE
+            ? validateControlGrantScope(grant.scope)
+            : null;
+    if (scope === null || !scope.ok || scope.value.eventId !== target.eventId) return false;
+    const scopeValue = scope.value as {
+      eventId: string;
+      gameDayId?: string;
+      pitchId?: string;
+      pitchSlotId?: string;
+    };
+    if (target.kind === "event") return true;
+    if (target.kind === "game-day")
+      return (
+        (grant.grantType === PITCH_MANAGER_GRANT_TYPE &&
+          scopeValue.gameDayId === target.targetId) ||
+        (grant.grantType === GRANT_TYPE && scopeValue.gameDayId === target.targetId)
+      );
+    if (target.kind === "pitch")
+      return (
+        (grant.grantType === PITCH_MANAGER_GRANT_TYPE && scopeValue.pitchId === target.targetId) ||
+        (grant.grantType === GRANT_TYPE && scopeValue.pitchId === target.targetId)
+      );
+    if (target.kind === "pitch-slot")
+      return grant.grantType === GRANT_TYPE && scopeValue.pitchSlotId === target.targetId;
+    return false;
+  });
+}
+
+function catalogOutcomeToAdministration<T>(
+  result: CatalogOutcome<T>,
+): EventAdministrationOutcome<T> {
+  if (result.status === "accepted") return accepted(result.value);
+  if (result.status === "retryable-failure") return unavailable();
+  if (result.reason === "unauthorized") return unauthorized();
+  if (result.reason === "not-found") return notFound(result.detail);
+  if (result.reason === "in-use")
+    return { status: "rejected", reason: "in-use", detail: result.detail };
+  return invalid(result.detail);
+}
+
+function grantRetirementRejection(result: TypedGrantMutation): EventAdministrationOutcome<never> {
+  if (result.status === "updated") return invalid("Grant retirement returned an invalid outcome.");
+  if (result.reason === "unauthorized") return unauthorized();
+  if (result.reason === "not-found") return notFound(result.detail ?? "Grant was not found.");
+  if (result.reason === "unavailable") return unavailable();
+  return invalid(result.detail ?? "Grant retirement was rejected.");
+}
+
+class EventAdministrationRollback extends Error {
+  constructor(readonly outcome: EventAdministrationOutcome<never>) {
+    super("Event Administration mutation rolled back.");
+  }
+}
+
+function rollbackRemovalMutation<T>(outcome: EventAdministrationOutcome<T>): never {
+  throw new EventAdministrationRollback(outcome as EventAdministrationOutcome<never>);
 }
 
 async function openScheduleProjection<T extends SlotSetupProjection | PitchViewProjection>(
