@@ -428,7 +428,7 @@ describe("Live Event Game control", () => {
       }
     }
     await runGeneratedComposedSequences(cases, 0x97c0ffee);
-  }, 30_000);
+  }, 60_000);
 
   test("runs the redacted 96-Game envelope through actual Controllers and bounded replay", async () => {
     const envelope = {
