@@ -136,18 +136,22 @@ privileged mutation remain fail-closed until the selected recovery authority acc
 Grant recovery and Technical Admin authentication must not be accidentally normalized into one
 generic restore rule:
 
-- a full restore invalidates every Grant Session; affected Grants are reissued, and a stale backup
-  must not silently revive a revoked Grant;
-- Technical Admin WebAuthn state is deliberately restored as ordinary data, including the sole
-  credential, sessions, challenges, enrollment authorizations, logs, and generation marker. Jannis
-  explicitly accepted that a sufficiently recent older snapshot can resurrect authority that had
-  been replaced, revoked, or consumed.
+- a full restore reevaluates each Grant Session against current lifecycle facts: exact-current,
+  pinned, and switchable sessions are preserved, while only sessions whose exact resolved Event
+  Game is terminal for Game Lock or past Game Day are terminated. A stale backup must not silently
+  revive a revoked or terminal authority;
+- Technical Admin authentication remains a separate live store and is never imported from the
+  Foundation snapshot. A normal restore preserves the live, validated, environment/RP-compatible
+  sole credential through the semantic adapter while invalidating sessions, challenges, enrollment
+  authorizations, and fresh-verification state. Missing, invalid, incompatible, or explicitly
+  reset state requires separate re-enrollment; sanitation failure aborts before Foundation
+  replacement.
 
-The second rule is an accepted security exception, not a recommendation to silently “fix” the
-decision. Delivery must name it in restore previews and runbooks, identify the snapshot time and
-restored security-state generation, emit the selected redacted operational evidence, and test the
-resurrection behavior without claiming that ordinary project gates prove it. Production and
-rehearsal remain isolated by database, origin, RP ID, credential, and environment-bound secrets.
+The live-store rule is an explicit ownership boundary, not a generic reset operation. Delivery must
+name the selected auth outcome and any allowlisted re-enrollment reason in redacted restore
+evidence, without exposing credential, RP/origin, session/challenge, path/schema, or raw error
+details. Production and rehearsal remain isolated by database, origin, RP ID, credential, and
+environment-bound secrets.
 [Choose capability grant format, lifecycle, and recovery](https://github.com/netzhuffle/quadball-timer/issues/20#issuecomment-5246643038),
 [Choose durable storage and migration strategy](https://github.com/netzhuffle/quadball-timer/issues/45#issuecomment-5254581794),
 [Define Technical Admin passkey authentication](https://github.com/netzhuffle/quadball-timer/issues/46#issuecomment-5253530941),

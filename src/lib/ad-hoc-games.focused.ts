@@ -798,7 +798,15 @@ describe("Ad Hoc SQLite focused integration", () => {
           clock: () => 10,
           interpreter: readinessContext.interpreter,
         },
-        technicalAdminAuth: { databasePath: technicalAdminPath, async quiesce() {} },
+        technicalAdminAuth: {
+          databasePath: technicalAdminPath,
+          async quiesce() {},
+          adapter: {
+            async prepareForFoundationRestore() {
+              return { outcome: "preserved-transients-invalidated" as const };
+            },
+          },
+        },
         nowMs: () => 10,
       };
       let recovery = createFoundationRecovery(foundationStorage, {

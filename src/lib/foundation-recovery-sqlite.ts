@@ -1,12 +1,11 @@
 import { createHash } from "node:crypto";
 import { Database } from "bun:sqlite";
 
-export const FOUNDATION_BACKUP_POLICY_VERSION = "foundation-backup-policy-v1" as const;
+export const FOUNDATION_BACKUP_POLICY_VERSION = "foundation-backup-policy-v2" as const;
 
 export type FoundationBackupPolicy = {
   version: typeof FOUNDATION_BACKUP_POLICY_VERSION;
   includedRelations: readonly string[];
-  excludedRelations: readonly string[];
 };
 
 const INCLUDED_RELATIONS = Object.freeze([
@@ -48,28 +47,15 @@ const INCLUDED_RELATIONS = Object.freeze([
   "foundation_replay_reservations",
 ] as const);
 
-const EXCLUDED_RELATIONS = Object.freeze([
-  "technical_admin_alerts",
-  "technical_admin_challenges",
-  "technical_admin_credentials",
-  "technical_admin_enrollment",
-  "technical_admin_operational_logs",
-  "technical_admin_sessions",
-  "technical_admin_state",
-  "technical_admin_storage_identity",
-] as const);
-
 export const FOUNDATION_BACKUP_POLICY: FoundationBackupPolicy = Object.freeze({
   version: FOUNDATION_BACKUP_POLICY_VERSION,
   includedRelations: INCLUDED_RELATIONS,
-  excludedRelations: EXCLUDED_RELATIONS,
 });
 
 export type RecoverySnapshotFacts = {
   logicalDigest: string;
   actionCount: number;
   grantVersions: readonly { grantId: string; grantType: string; grantVersion: string }[];
-  excludedRelations: readonly string[];
 };
 
 export type RepresentedKeyVersions = {
@@ -96,10 +82,9 @@ export function inspectRecoveryDatabase(
     throw new Error("Unsupported SQLite backup inclusion policy.");
   }
   const included = new Set(policy.includedRelations);
-  const excluded = new Set(policy.excludedRelations);
   const relations = listRelations(database);
   for (const relation of relations) {
-    if (!included.has(relation) && !excluded.has(relation)) {
+    if (!included.has(relation)) {
       throw new FoundationBackupPolicyError(relation);
     }
   }
@@ -133,29 +118,7 @@ export function inspectRecoveryDatabase(
     logicalDigest: logicalDigest.digest("hex"),
     actionCount,
     grantVersions,
-    excludedRelations: relations.filter((relation) => excluded.has(relation)),
   };
-}
-
-export function removeExcludedRelations(
-  database: Database,
-  policy: FoundationBackupPolicy = FOUNDATION_BACKUP_POLICY,
-): void {
-  const facts = inspectRecoveryDatabase(database, policy);
-  database.exec("PRAGMA foreign_keys = OFF; BEGIN IMMEDIATE;");
-  try {
-    for (const relation of facts.excludedRelations) {
-      database.exec(`DROP TABLE ${quoteIdentifier(relation)};`);
-    }
-    database.exec("COMMIT; PRAGMA foreign_keys = ON;");
-  } catch (error) {
-    try {
-      database.exec("ROLLBACK; PRAGMA foreign_keys = ON;");
-    } catch {
-      // The original sanitization failure is the useful boundary.
-    }
-    throw error;
-  }
 }
 
 export function readRepresentedKeyVersions(database: Database): RepresentedKeyVersions {

@@ -933,7 +933,7 @@ export class SqliteFoundationStorage implements FoundationStorage {
         process.umask(previousUmask);
       }
       // The destination lives in the recovery-owned 0700 workspace. Tighten
-      // and verify the raw unsanitized image before yielding the writer queue.
+      // and verify the raw Foundation image before yielding the writer queue.
       chmodSync(destinationPath, 0o600);
       return facts;
     });
