@@ -10,11 +10,12 @@ import {
 import {
   revealGrant,
   revealGrantInTransaction,
+  resolveAccessSheetQrCredentialInTransaction,
   rotateGrant,
   rotateGrantInTransaction,
   rotateGrantCredentialKeys,
 } from "@/lib/grant-management-credentials";
-import { recalculateExpiry } from "@/lib/grant-management-lifecycle";
+import { recalculateExpiry, retireGrantInTransaction } from "@/lib/grant-management-lifecycle";
 import { listAudit, listSessions, listSessionsInTransaction } from "@/lib/grant-management-queries";
 import { admitGrantCode, createGrantCode, disableGrantCode } from "@/lib/grant-management-code";
 import {
@@ -40,6 +41,7 @@ export type {
   TypedGrantReplayAuthorization,
   TypedGrantMutation,
   TypedGrantReveal,
+  TypedAccessSheetQrCredentialResolution,
   TypedGrantRotated,
   TypedGrantAdmissionThrottled,
   TypedGrantCodeCreated,
@@ -127,6 +129,8 @@ export function createTypedGrantAuthority(
     revealGrant: (grantId, authority) => revealGrant(storage, options, grantId, authority),
     revealGrantInTransaction: (transaction, grantId, authority) =>
       revealGrantInTransaction(transaction, options, grantId, authority),
+    resolveAccessSheetQrCredentialInTransaction: (transaction, input) =>
+      resolveAccessSheetQrCredentialInTransaction(transaction, options, input),
     disableGrant: (grantId, authority) =>
       notifyLifecycleChange(
         updateGrantStatus(storage, options, grantId, authority, "disabled", "grant-disabled"),
@@ -151,6 +155,8 @@ export function createTypedGrantAuthority(
       ),
     revokeGrantSessionInTransaction: (transaction, grantId, sessionReference, authority) =>
       revokeGrantSessionInTransaction(transaction, options, grantId, sessionReference, authority),
+    retireGrantInTransaction: (transaction, input) =>
+      retireGrantInTransaction(transaction, options, input),
     leaveGrantSession: (sessionBearer) =>
       notifyLifecycleChange(leaveGrantSession(storage, options, sessionBearer)),
     listGrantSessions: (grantId, authority) => listSessions(storage, options, grantId, authority),

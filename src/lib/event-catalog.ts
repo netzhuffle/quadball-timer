@@ -32,9 +32,11 @@ import type {
   StoredPitchSlot,
   StoredEventCatalogGame,
   StoredEventGameSide,
+  StoredControlAction,
 } from "@/lib/foundation-storage";
 import type { EventGameRecordRoot } from "@/lib/foundation-record-types";
 import { createInMemoryFoundationStorage } from "@/lib/foundation-storage-memory";
+import { canonicalizeJson, sha256 } from "@/lib/event-game-action-json";
 
 export type EventPublicationStatus = "unpublished" | "published" | "cancelled";
 export type EventPublicationWarning =
@@ -151,6 +153,56 @@ export type CatalogRejectedReason =
   | "no-change"
   | "in-use";
 
+export type EventCatalogRemovalKind =
+  | "event"
+  | "event-team"
+  | "game-day"
+  | "pitch"
+  | "gameplay-slot"
+  | "pitch-slot"
+  | "event-game";
+
+export type EventCatalogRemovalTargetInput = {
+  kind: unknown;
+  eventId: unknown;
+  targetId: unknown;
+};
+
+export type EventCatalogRemovalTarget = {
+  kind: EventCatalogRemovalKind;
+  eventId: string;
+  targetId: string;
+};
+
+export type EventCatalogRemovalImpact = {
+  descendantCount: number;
+  retiredAuthorityCount: number;
+  retiredAuthorityCategories: {
+    eventAdmin: number;
+    pitchManager: number;
+    control: number;
+  };
+  retainedEventGameCount: number;
+  retainedControlActionCount: number;
+};
+
+export type EventCatalogRemovalPreview = {
+  target: EventCatalogRemovalTarget;
+  eligible: boolean;
+  rejectionCategory: "referenced" | "commenced" | "accepted-control-action" | null;
+  repairWorkflow: string | null;
+  impact: EventCatalogRemovalImpact;
+  fingerprint: string;
+};
+
+export type EventCatalogRemovalResult = {
+  removed: true;
+  target: EventCatalogRemovalTarget;
+  retiredAuthorityCount: number;
+  retainedEventGameCount: number;
+  retainedControlActionCount: number;
+};
+
 export type CatalogOutcome<T> =
   | { status: "accepted"; value: T }
   | { status: "rejected"; reason: CatalogRejectedReason; detail: string }
@@ -180,6 +232,14 @@ export type EventCatalogOptions = {
 };
 
 export type EventCatalogMutationOperations = {
+  previewEventCatalogRemoval(
+    target: EventCatalogRemovalTargetInput,
+  ): CatalogOutcome<EventCatalogRemovalPreview>;
+  removeEventCatalogEntry(
+    target: EventCatalogRemovalTargetInput,
+    previewFingerprint: unknown,
+    retiredAuthorityCount: number,
+  ): CatalogOutcome<EventCatalogRemovalResult>;
   changePublicationStatus(
     eventId: unknown,
     input: { status: unknown; impactConfirmed?: unknown },
@@ -308,11 +368,11 @@ export type EventCatalogStorageSnapshot = {
   findEventGame(eventGameId: string): EventGame | null;
   listEventGames(gameDayId: string): EventGame[];
   findRootByEventGameId(eventGameId: string): EventGameRecordRoot | null;
+  listActions(recordId: string): StoredControlAction[];
   listAuditTrail(eventId: string): EventAdministrationAuditEntry[];
 };
 
 export type EventCatalogStorageTransaction = EventCatalogStorageSnapshot & {
-  hasAttachedEventAdminGrant(eventId: string): boolean;
   insertEvent(event: StoredEvent): void;
   updateEvent(event: StoredEvent): void;
   deleteEvent(eventId: string): void;
@@ -321,16 +381,21 @@ export type EventCatalogStorageTransaction = EventCatalogStorageSnapshot & {
   deleteGameDay(gameDayId: string): void;
   insertEventTeam(team: StoredEventTeam): void;
   updateEventTeam(team: StoredEventTeam): void;
+  deleteEventTeam(eventTeamId: string): void;
   insertRosterEntry(entry: StoredRosterEntry): void;
   updateRosterEntry(entry: StoredRosterEntry): void;
   insertPitch(pitch: StoredPitch): void;
   updatePitch(pitch: StoredPitch): void;
+  deletePitch(pitchId: string): void;
   insertGameplaySlot(slot: GameplaySlot): void;
   insertPitchSlot(slot: PitchSlot): void;
   updateGameplaySlot(slot: GameplaySlot): void;
   updatePitchSlot(slot: PitchSlot): void;
+  deleteGameplaySlot(gameplaySlotId: string): void;
+  deletePitchSlot(pitchSlotId: string): void;
   insertEventGame(game: EventGame): void;
   updateEventGame(game: EventGame): void;
+  deleteEventGame(eventGameId: string): void;
   appendAudit(entry: EventAdministrationAuditEntry): void;
 };
 
@@ -485,15 +550,10 @@ export type EventCatalog = {
     actorReference: string,
     work: (operations: EventCatalogMutationOperations) => CatalogOutcome<T>,
   ): CatalogOutcome<T>;
-  removeGameDay(
-    eventId: unknown,
-    gameDayId: unknown,
+  previewEventCatalogRemoval(
+    target: EventCatalogRemovalTargetInput,
     authority: TechnicalAdminAuthority,
-  ): Promise<CatalogOutcome<{ gameDayId: string }>>;
-  removeEvent(
-    eventId: unknown,
-    authority: TechnicalAdminAuthority,
-  ): Promise<CatalogOutcome<{ eventId: string }>>;
+  ): Promise<CatalogOutcome<EventCatalogRemovalPreview>>;
   listAuditTrail(
     eventId: unknown,
     authority: TechnicalAdminAuthority,
@@ -999,85 +1059,14 @@ export function createEventCatalog(
       );
     },
 
-    async removeGameDay(eventIdInput, gameDayIdInput, authority) {
+    async previewEventCatalogRemoval(target, authority) {
       if (!isTechnicalAdminAuthority(authority)) return unauthorized();
-      const actor = authorityActor(authority);
-      const eventId = validateId(eventIdInput, "eventId");
-      if (!eventId.ok) return invalid(eventId.error);
-      const gameDayId = validateId(gameDayIdInput, "gameDayId");
-      if (!gameDayId.ok) return invalid(gameDayId.error);
-      const nowMs = validNow(clock);
-      if (nowMs === null) return invalid("Event clock returned an invalid timestamp.");
-      return commit(storage, (transaction) => {
-        const event = transaction.findEvent(eventId.value);
-        if (event === null) return notFound("Event was not found.");
-        const gameDay = transaction
-          .listGameDays(event.eventId)
-          .find((day) => day.gameDayId === gameDayId.value);
-        if (gameDay === undefined) {
-          const elsewhere = transaction
-            .listEvents()
-            .some((candidate) =>
-              transaction
-                .listGameDays(candidate.eventId)
-                .some((day) => day.gameDayId === gameDayId.value),
-            );
-          return elsewhere
-            ? crossEvent("Game Day belongs to another Event.")
-            : notFound("Game Day was not found.");
-        }
-        const audit = createAudit(
-          ids,
-          "game-day-removed",
-          event.eventId,
-          gameDay.gameDayId,
-          actor,
-          nowMs,
-          gameDay,
-          null,
-        );
-        transaction.deleteGameDay(gameDay.gameDayId);
-        transaction.appendAudit(audit);
-        return accepted({ gameDayId: gameDay.gameDayId });
-      });
-    },
-
-    async removeEvent(eventIdInput, authority) {
-      if (!isTechnicalAdminAuthority(authority)) return unauthorized();
-      const actor = authorityActor(authority);
-      const eventId = validateId(eventIdInput, "eventId");
-      if (!eventId.ok) return invalid(eventId.error);
-      const nowMs = validNow(clock);
-      if (nowMs === null) return invalid("Event clock returned an invalid timestamp.");
-      return commit(storage, (transaction) => {
-        const event = transaction.findEvent(eventId.value);
-        if (event === null) return notFound("Event was not found.");
-        if (transaction.listGameDays(event.eventId).length > 0) {
-          return inUse("Event still contains Game Days.");
-        }
-        if (
-          transaction.listEventTeams(event.eventId).length > 0 ||
-          transaction.listPitches(event.eventId).length > 0
-        ) {
-          return inUse("Event still contains Teams or Pitches.");
-        }
-        if (transaction.hasAttachedEventAdminGrant(event.eventId)) {
-          return inUse("Event has an attached Event Admin Grant.");
-        }
-        const audit = createAudit(
-          ids,
-          "event-removed",
-          event.eventId,
-          null,
-          actor,
-          nowMs,
-          event,
-          null,
-        );
-        transaction.deleteEvent(event.eventId);
-        transaction.appendAudit(audit);
-        return accepted({ eventId: event.eventId });
-      });
+      try {
+        const snapshot = await storage.snapshot();
+        return previewEventCatalogRemovalOperation(snapshot, target);
+      } catch {
+        return unavailable();
+      }
     },
 
     async listAuditTrail(eventIdInput, authority) {
@@ -1387,6 +1376,18 @@ function createMutationOperations(
   actorReference: string,
 ): EventCatalogMutationOperations {
   return {
+    previewEventCatalogRemoval: (target) =>
+      previewEventCatalogRemovalOperation(transaction, target),
+    removeEventCatalogEntry: (target, previewFingerprint, retiredAuthorityCount) =>
+      removeEventCatalogEntryOperation(
+        transaction,
+        clock,
+        ids,
+        actorReference,
+        target,
+        previewFingerprint,
+        retiredAuthorityCount,
+      ),
     changePublicationStatus: (eventId, input) =>
       changePublicationStatusOperation(transaction, clock, ids, eventId, input, actorReference),
     createEventTeam: (eventId, input) =>
@@ -1474,6 +1475,302 @@ function createMutationOperations(
         actorReference,
       ),
   };
+}
+
+function previewEventCatalogRemovalOperation(
+  transaction: EventCatalogStorageSnapshot,
+  input: EventCatalogRemovalTargetInput,
+): CatalogOutcome<EventCatalogRemovalPreview> {
+  const target = parseRemovalTarget(input);
+  if (!target.ok) return invalid(target.error);
+  const event = transaction.findEvent(target.value.eventId);
+  if (event === null) return notFound("Event Catalog removal target was not found.");
+  const targetRecord = readRemovalTarget(transaction, target.value);
+  if (targetRecord === null) return notFound("Event Catalog removal target was not found.");
+
+  let eligible = true;
+  let rejectionCategory: EventCatalogRemovalPreview["rejectionCategory"] = null;
+  let repairWorkflow: string | null = null;
+  let descendantCount = 0;
+  let retainedEventGameCount = 0;
+  let retainedControlActionCount = 0;
+
+  if (target.value.kind === "event") {
+    descendantCount =
+      transaction.listGameDays(event.eventId).length +
+      transaction.listEventTeams(event.eventId).length +
+      transaction.listPitches(event.eventId).length;
+    for (const day of transaction.listGameDays(event.eventId)) {
+      descendantCount +=
+        transaction.listGameplaySlots(day.gameDayId).length +
+        transaction.listPitchSlots(day.gameDayId).length +
+        transaction.listEventGames(day.gameDayId).length;
+    }
+    if (descendantCount > 0) {
+      eligible = false;
+      rejectionCategory = "referenced";
+      repairWorkflow = "Remove or repair the remaining Event Catalog structure first.";
+    }
+  } else if (target.value.kind === "event-team") {
+    const team = transaction.findEventTeam(target.value.targetId);
+    if (team === null || team.eventId !== event.eventId)
+      return notFound("Event Catalog removal target was not found.");
+    descendantCount = transaction.listRoster(team.eventTeamId).length;
+    const referenced = transaction
+      .listGameDays(event.eventId)
+      .flatMap((day) => transaction.listEventGames(day.gameDayId))
+      .some(
+        (game) =>
+          game.sideA.eventTeamId === team.eventTeamId ||
+          game.sideB.eventTeamId === team.eventTeamId,
+      );
+    if (descendantCount > 0 || referenced) {
+      eligible = false;
+      rejectionCategory = "referenced";
+      repairWorkflow =
+        descendantCount > 0
+          ? "Remove the Event Team roster entries before removing the Event Team."
+          : "Use Event Team Assignment Correction or the ordinary schedule repair workflow.";
+    }
+  } else if (target.value.kind === "game-day") {
+    const day = transaction
+      .listGameDays(event.eventId)
+      .find((candidate) => candidate.gameDayId === target.value.targetId);
+    if (day === undefined) return notFound("Event Catalog removal target was not found.");
+    const childCount =
+      transaction.listGameplaySlots(day.gameDayId).length +
+      transaction.listPitchSlots(day.gameDayId).length +
+      transaction.listEventGames(day.gameDayId).length;
+    descendantCount = childCount;
+    if (childCount > 0) {
+      eligible = false;
+      rejectionCategory = "referenced";
+      repairWorkflow = "Repair or remove the Game Day's schedule structure first.";
+    }
+  } else if (target.value.kind === "pitch") {
+    const pitch = transaction.findPitch(target.value.targetId);
+    if (pitch === null || pitch.eventId !== event.eventId)
+      return notFound("Event Catalog removal target was not found.");
+    const slots = transaction
+      .listGameDays(event.eventId)
+      .flatMap((day) => transaction.listPitchSlots(day.gameDayId, pitch.pitchId));
+    descendantCount = slots.length;
+    if (slots.length > 0) {
+      eligible = false;
+      rejectionCategory = "referenced";
+      repairWorkflow = "Repair or remove the Pitch Schedule structure first.";
+    }
+  } else if (target.value.kind === "gameplay-slot") {
+    const slot = transaction.findGameplaySlot(target.value.targetId);
+    if (slot === null || slot.eventId !== event.eventId)
+      return notFound("Event Catalog removal target was not found.");
+    const pitchSlots = transaction
+      .listPitchSlots(slot.gameDayId)
+      .filter((pitchSlot) => pitchSlot.gameplaySlotId === slot.gameplaySlotId);
+    const games = transaction
+      .listEventGames(slot.gameDayId)
+      .filter((game) => game.gameplaySlotId === slot.gameplaySlotId);
+    descendantCount = pitchSlots.length + games.length;
+    if (descendantCount > 0) {
+      eligible = false;
+      rejectionCategory = "referenced";
+      repairWorkflow = "Repair or remove the Gameplay Slot's schedule structure first.";
+    }
+  } else if (target.value.kind === "pitch-slot") {
+    const slot = transaction.findPitchSlot(target.value.targetId);
+    if (slot === null || slot.eventId !== event.eventId)
+      return notFound("Event Catalog removal target was not found.");
+    const games = transaction
+      .listEventGames(slot.gameDayId)
+      .filter((game) => game.pitchSlotId === slot.pitchSlotId);
+    descendantCount = games.length;
+    if (games.length > 0) {
+      eligible = false;
+      rejectionCategory = "referenced";
+      repairWorkflow = "Use Pitch Reassignment or the ordinary Event Game repair workflow.";
+    }
+  } else {
+    const game = transaction.findEventGame(target.value.targetId);
+    if (game === null || game.eventId !== event.eventId)
+      return notFound("Event Catalog removal target was not found.");
+    const root = transaction.findRootByEventGameId(game.eventGameId);
+    retainedEventGameCount = root === null ? 0 : 1;
+    retainedControlActionCount = root === null ? 0 : transaction.listActions(root.recordId).length;
+    if (root?.lifecycle.commencedAtMs !== null && root !== null) {
+      eligible = false;
+      rejectionCategory = "commenced";
+      repairWorkflow = "Use the ordinary Event Game correction or reopening workflow.";
+    } else if (retainedControlActionCount > 0) {
+      eligible = false;
+      rejectionCategory = "accepted-control-action";
+      repairWorkflow =
+        "Use the ordinary Event Game correction workflow; accepted Control Actions remain durable.";
+    }
+  }
+
+  return accepted({
+    target: target.value,
+    eligible,
+    rejectionCategory,
+    repairWorkflow,
+    impact: {
+      descendantCount,
+      retiredAuthorityCount: 0,
+      retiredAuthorityCategories: { eventAdmin: 0, pitchManager: 0, control: 0 },
+      retainedEventGameCount,
+      retainedControlActionCount,
+    },
+    fingerprint: removalFingerprint(
+      target.value,
+      {
+        descendantCount,
+        retainedEventGameCount,
+        retainedControlActionCount,
+      },
+      targetRecord,
+    ),
+  });
+}
+
+function removeEventCatalogEntryOperation(
+  transaction: EventCatalogStorageTransaction,
+  clock: EventCatalogClock,
+  ids: EventCatalogIds,
+  actorReference: string,
+  input: EventCatalogRemovalTargetInput,
+  previewFingerprint: unknown,
+  retiredAuthorityCount: number,
+): CatalogOutcome<EventCatalogRemovalResult> {
+  if (typeof previewFingerprint !== "string")
+    return invalid("Event Catalog removal preview is required.");
+  const preview = previewEventCatalogRemovalOperation(transaction, input);
+  if (preview.status !== "accepted") return preview;
+  if (preview.value.fingerprint !== previewFingerprint)
+    return invalid("Event Catalog removal preview is stale.");
+  if (!preview.value.eligible)
+    return inUse(preview.value.repairWorkflow ?? "Event Catalog removal is not eligible.");
+  if (!Number.isSafeInteger(retiredAuthorityCount) || retiredAuthorityCount < 0)
+    return invalid("Event Catalog authority impact is invalid.");
+  const nowMs = validNow(clock);
+  if (nowMs === null) return invalid("Event clock returned an invalid timestamp.");
+  const target = preview.value.target;
+  const before = readRemovalTarget(transaction, target);
+  if (before === null) return notFound("Event Catalog removal target was not found.");
+  switch (target.kind) {
+    case "event":
+      transaction.deleteEvent(target.eventId);
+      break;
+    case "event-team":
+      transaction.deleteEventTeam(target.targetId);
+      break;
+    case "game-day":
+      transaction.deleteGameDay(target.targetId);
+      break;
+    case "pitch":
+      transaction.deletePitch(target.targetId);
+      break;
+    case "gameplay-slot":
+      transaction.deleteGameplaySlot(target.targetId);
+      break;
+    case "pitch-slot":
+      transaction.deletePitchSlot(target.targetId);
+      break;
+    case "event-game":
+      transaction.deleteEventGame(target.targetId);
+      break;
+  }
+  transaction.appendAudit(
+    createAudit(
+      ids,
+      "event-catalog-entry-removed",
+      target.eventId,
+      target.kind === "game-day" ? target.targetId : null,
+      actorReference,
+      nowMs,
+      removalAuditPayload(target),
+      null,
+    ),
+  );
+  return accepted({
+    removed: true,
+    target,
+    retiredAuthorityCount,
+    retainedEventGameCount: preview.value.impact.retainedEventGameCount,
+    retainedControlActionCount: preview.value.impact.retainedControlActionCount,
+  });
+}
+
+function removalAuditPayload(target: EventCatalogRemovalTarget): {
+  kind: EventCatalogRemovalKind;
+  eventId: string;
+  targetId: string;
+} {
+  return {
+    kind: target.kind,
+    eventId: target.eventId,
+    targetId: target.targetId,
+  };
+}
+
+function parseRemovalTarget(
+  input: EventCatalogRemovalTargetInput,
+): { ok: true; value: EventCatalogRemovalTarget } | { ok: false; error: string } {
+  if (!isRecord(input)) return { ok: false, error: "Event Catalog removal target is invalid." };
+  const kinds: readonly EventCatalogRemovalKind[] = [
+    "event",
+    "event-team",
+    "game-day",
+    "pitch",
+    "gameplay-slot",
+    "pitch-slot",
+    "event-game",
+  ];
+  if (!kinds.includes(input.kind as EventCatalogRemovalKind))
+    return { ok: false, error: "Event Catalog removal target is invalid." };
+  const eventId = validateId(input.eventId, "eventId");
+  const targetId = validateId(input.targetId, "targetId");
+  if (!eventId.ok || !targetId.ok)
+    return { ok: false, error: "Event Catalog removal target is invalid." };
+  if (input.kind === "event" && eventId.value !== targetId.value)
+    return { ok: false, error: "Event Catalog removal target is invalid." };
+  return {
+    ok: true,
+    value: {
+      kind: input.kind as EventCatalogRemovalKind,
+      eventId: eventId.value,
+      targetId: targetId.value,
+    },
+  };
+}
+
+function readRemovalTarget(
+  transaction: EventCatalogStorageSnapshot,
+  target: EventCatalogRemovalTarget,
+): unknown {
+  if (target.kind === "event") return transaction.findEvent(target.eventId);
+  if (target.kind === "event-team") return transaction.findEventTeam(target.targetId);
+  if (target.kind === "game-day")
+    return (
+      transaction.listGameDays(target.eventId).find((day) => day.gameDayId === target.targetId) ??
+      null
+    );
+  if (target.kind === "pitch") return transaction.findPitch(target.targetId);
+  if (target.kind === "gameplay-slot") return transaction.findGameplaySlot(target.targetId);
+  if (target.kind === "pitch-slot") return transaction.findPitchSlot(target.targetId);
+  return transaction.findEventGame(target.targetId);
+}
+
+function removalFingerprint(
+  target: EventCatalogRemovalTarget,
+  impact: Pick<
+    EventCatalogRemovalImpact,
+    "descendantCount" | "retainedEventGameCount" | "retainedControlActionCount"
+  >,
+  targetRecord: unknown,
+): string {
+  return `event-catalog-target-v1:${sha256(
+    canonicalizeJson({ version: 1, target, targetRecord, ...impact }),
+  )}`;
 }
 
 function changePublicationStatusOperation(
@@ -2864,6 +3161,7 @@ function eventCatalogSnapshot(transaction: FoundationStorageSnapshot): EventCata
     findEventGame: (eventGameId) => transaction.findEventGame?.(eventGameId) ?? null,
     listEventGames: (gameDayId) => transaction.listEventGames?.(gameDayId) ?? [],
     findRootByEventGameId: (eventGameId) => transaction.findRootByEventGameId(eventGameId),
+    listActions: (recordId) => transaction.listActions(recordId),
     listAuditTrail: (eventId) => transaction.listEventAuditTrail(eventId),
   };
 }
@@ -2873,10 +3171,6 @@ function eventCatalogTransaction(
 ): EventCatalogStorageTransaction {
   return {
     ...eventCatalogSnapshot(transaction),
-    hasAttachedEventAdminGrant: (eventId) =>
-      transaction
-        .listGrants()
-        .some((grant) => grant.grantType === "event-admin" && grant.scope.eventId === eventId),
     insertEvent: (event) => transaction.insertEvent(event),
     updateEvent: (event) => transaction.updateEvent(event),
     deleteEvent: (eventId) => transaction.deleteEvent(eventId),
@@ -2885,16 +3179,21 @@ function eventCatalogTransaction(
     deleteGameDay: (gameDayId) => transaction.deleteGameDay(gameDayId),
     insertEventTeam: (team) => transaction.insertEventTeam(team),
     updateEventTeam: (team) => transaction.updateEventTeam(team),
+    deleteEventTeam: (eventTeamId) => transaction.deleteEventTeam(eventTeamId),
     insertRosterEntry: (entry) => transaction.insertRosterEntry(entry),
     updateRosterEntry: (entry) => transaction.updateRosterEntry(entry),
     insertPitch: (pitch) => transaction.insertPitch(pitch),
     updatePitch: (pitch) => transaction.updatePitch(pitch),
+    deletePitch: (pitchId) => transaction.deletePitch(pitchId),
     insertGameplaySlot: (slot) => transaction.insertGameplaySlot(slot),
     insertPitchSlot: (slot) => transaction.insertPitchSlot(slot),
     updateGameplaySlot: (slot) => transaction.updateGameplaySlot(slot),
     updatePitchSlot: (slot) => transaction.updatePitchSlot(slot),
+    deleteGameplaySlot: (gameplaySlotId) => transaction.deleteGameplaySlot(gameplaySlotId),
+    deletePitchSlot: (pitchSlotId) => transaction.deletePitchSlot(pitchSlotId),
     insertEventGame: (game) => transaction.insertEventGame(game),
     updateEventGame: (game) => transaction.updateEventGame(game),
+    deleteEventGame: (eventGameId) => transaction.deleteEventGame(eventGameId),
     appendAudit: (entry) => transaction.appendEventAudit(entry),
   };
 }

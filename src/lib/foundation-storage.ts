@@ -67,9 +67,9 @@ export const REQUIRED_GRANT_STORAGE_ANCHOR_METHODS = Object.freeze([
 ] as const);
 
 export const EVENT_CATALOG_STORAGE_CAPABILITY_NAME = "event-catalog-storage" as const;
-export const EVENT_CATALOG_STORAGE_CAPABILITY_VERSION = 1 as const;
+export const EVENT_CATALOG_STORAGE_CAPABILITY_VERSION = 2 as const;
 export const EVENT_CATALOG_STORAGE_CAPABILITY_IMPLEMENTATION =
-  "event-teams-rosters-pitches-transaction-v1" as const;
+  "event-catalog-removal-transaction-v2" as const;
 export type EventCatalogStorageCapability = {
   name: typeof EVENT_CATALOG_STORAGE_CAPABILITY_NAME;
   version: typeof EVENT_CATALOG_STORAGE_CAPABILITY_VERSION;
@@ -85,10 +85,12 @@ export const REQUIRED_EVENT_CATALOG_STORAGE_TRANSACTION_METHODS = Object.freeze(
   "listPitches",
   "insertEventTeam",
   "updateEventTeam",
+  "deleteEventTeam",
   "insertRosterEntry",
   "updateRosterEntry",
   "insertPitch",
   "updatePitch",
+  "deletePitch",
   "findGameplaySlot",
   "listGameplaySlots",
   "findPitchSlot",
@@ -99,8 +101,11 @@ export const REQUIRED_EVENT_CATALOG_STORAGE_TRANSACTION_METHODS = Object.freeze(
   "insertPitchSlot",
   "updateGameplaySlot",
   "updatePitchSlot",
+  "deleteGameplaySlot",
+  "deletePitchSlot",
   "insertEventGame",
   "updateEventGame",
+  "deleteEventGame",
 ] as const);
 
 export const DURABLE_EVIDENCE_PROVENANCE = Symbol("durable-evidence-provenance");
@@ -238,7 +243,9 @@ export type EventCatalogAuditEntry = {
     | "pitch-slot-created"
     | "event-game-created"
     | "event-game-teams-confirmed"
-    | "event-publication-changed";
+    | "event-publication-changed"
+    | "event-catalog-entry-removed"
+    | "access-sheet-generated";
   eventId: string;
   gameDayId: string | null;
   actorReference: string;
@@ -503,16 +510,21 @@ export type FoundationStorageTransaction = FoundationStorageSnapshot & {
   deleteGameDay(gameDayId: string): void;
   insertEventTeam(team: StoredEventCatalogTeam): void;
   updateEventTeam(team: StoredEventCatalogTeam): void;
+  deleteEventTeam(eventTeamId: string): void;
   insertRosterEntry(entry: StoredEventCatalogRosterEntry): void;
   updateRosterEntry(entry: StoredEventCatalogRosterEntry): void;
   insertPitch(pitch: StoredEventCatalogPitch): void;
   updatePitch(pitch: StoredEventCatalogPitch): void;
+  deletePitch(pitchId: string): void;
   insertGameplaySlot(slot: StoredGameplaySlot): void;
   insertPitchSlot(slot: StoredPitchSlot): void;
   updateGameplaySlot(slot: StoredGameplaySlot): void;
   updatePitchSlot(slot: StoredPitchSlot): void;
+  deleteGameplaySlot(gameplaySlotId: string): void;
+  deletePitchSlot(pitchSlotId: string): void;
   insertEventGame(game: StoredEventCatalogGame): void;
   updateEventGame(game: StoredEventCatalogGame): void;
+  deleteEventGame(eventGameId: string): void;
   appendEventAudit(entry: EventCatalogAuditEntry): void;
   writeGrantAdmissionTelemetry?(value: GrantAdmissionTelemetry): void;
   writeGrantAdmissionGlobalWindow?(value: GrantAdmissionGlobalWindow): void;

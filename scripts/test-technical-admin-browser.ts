@@ -207,11 +207,113 @@ try {
     (event) => event.name === "Browser Event Updated",
   )?.eventId;
   if (!eventId) throw new Error("Browser Event was not returned by the catalog.");
-
   const currentCsrfToken = (await context.cookies()).find(
     (cookie) => cookie.name === "__Host-technical-admin-csrf",
   )?.value;
   if (!currentCsrfToken) throw new Error("Technical Admin CSRF cookie was not retained.");
+  assert(
+    (await page.getByRole("button", { name: "Remove", exact: true }).count()) === 0 &&
+      (await page.getByRole("button", { name: "Remove empty Event", exact: true }).count()) === 1,
+    "Technical Admin exposed child-structure removal UI",
+  );
+  const eventProjectionResponse = await context.request.get(
+    `${origin}/api/admin/events/${eventId}`,
+  );
+  const eventProjectionPayload = (await eventProjectionResponse.json()) as {
+    value?: { gameDays?: Array<{ gameDayId: string }> };
+  };
+  const technicalGameDayId = eventProjectionPayload.value?.gameDays?.[0]?.gameDayId;
+  if (!technicalGameDayId) throw new Error("Technical browser Event has no Game Day.");
+  const technicalChildPreview = await context.request.post(
+    `${origin}/api/admin/events/${eventId}/catalog-removal/preview`,
+    { data: { kind: "game-day", targetId: technicalGameDayId } },
+  );
+  assert(
+    technicalChildPreview.status() === 401,
+    "Technical Admin child-removal preview was not unauthorized",
+  );
+  const technicalChildRemoval = await context.request.delete(
+    `${origin}/api/admin/events/${eventId}/catalog-removal`,
+    {
+      data: {
+        kind: "game-day",
+        targetId: technicalGameDayId,
+        previewFingerprint: "event-catalog-removal-v1:" + "0".repeat(64),
+      },
+      headers: { "x-technical-admin-csrf": currentCsrfToken ?? "" },
+    },
+  );
+  assert(
+    technicalChildRemoval.status() === 401,
+    "Technical Admin child-removal acceptance was not unauthorized",
+  );
+
+  const removalDayResponse = await context.request.post(
+    `${origin}/api/admin/events/${eventId}/game-days`,
+    {
+      data: { date: "2026-08-16" },
+      headers: { origin, "x-technical-admin-csrf": currentCsrfToken },
+    },
+  );
+  const removalDayPayload = (await removalDayResponse.json()) as {
+    status: string;
+    value?: { gameDayId?: string };
+  };
+  const removalGameDayId = removalDayPayload.value?.gameDayId;
+  assert(
+    removalDayResponse.status() === 201 && removalGameDayId !== undefined,
+    "removal browser Game Day creation failed",
+  );
+
+  const futureEventResponse = await postJsonWithHeadersFromPage(
+    page,
+    `${origin}/api/admin/events`,
+    { name: "Future Sheet Event", timeZone: "UTC" },
+    { origin, "x-technical-admin-csrf": currentCsrfToken },
+  );
+  const futureEventPayload = JSON.parse(futureEventResponse.body) as {
+    value?: { eventId?: string };
+  };
+  const futureEventId = futureEventPayload.value?.eventId;
+  assert(
+    futureEventResponse.status === 201 && futureEventId !== undefined,
+    "future Event creation failed",
+  );
+  const futureGameDayResponse = await postJsonWithHeadersFromPage(
+    page,
+    `${origin}/api/admin/events/${futureEventId}/game-days`,
+    { date: "2026-08-16" },
+    { origin, "x-technical-admin-csrf": currentCsrfToken },
+  );
+  const futureGameDayPayload = JSON.parse(futureGameDayResponse.body) as {
+    value?: { gameDayId?: string };
+  };
+  const futureGameDayId = futureGameDayPayload.value?.gameDayId;
+  assert(
+    futureGameDayResponse.status === 201 && futureGameDayId !== undefined,
+    "future Game Day creation failed",
+  );
+  const futureEventGrantCreateResponse = await postJsonWithHeadersFromPage(
+    page,
+    `${origin}/api/admin/events/${futureEventId}/event-admin-grant`,
+    {},
+    { origin, "x-technical-admin-csrf": currentCsrfToken },
+  );
+  assert(futureEventGrantCreateResponse.status === 201, "future Event Admin Grant creation failed");
+  const futureEventGrantRevealResponse = await postJsonWithHeadersFromPage(
+    page,
+    `${origin}/api/admin/events/${futureEventId}/event-admin-grant/reveal`,
+    {},
+    { origin, "x-technical-admin-csrf": currentCsrfToken },
+  );
+  const futureEventGrantRevealPayload = JSON.parse(futureEventGrantRevealResponse.body) as {
+    value?: { qrCredential?: string };
+  };
+  const futureEventCredential = futureEventGrantRevealPayload.value?.qrCredential;
+  assert(
+    futureEventGrantRevealResponse.status === 200 && futureEventCredential !== undefined,
+    "future Event Admin QR reveal failed",
+  );
   const zeroDayResponse = await context.request.post(`${origin}/api/admin/events`, {
     data: { name: "Zero Day Browser Event", timeZone: "UTC" },
     headers: { origin, "x-technical-admin-csrf": currentCsrfToken },
@@ -298,6 +400,163 @@ try {
   );
   assert(anonymousAuditResponse.status() === 401, "anonymous audit enumeration was accepted");
   await anonymousContext.close();
+  await eventAdminPage.getByText(/event-admin/u).waitFor();
+  const accessSheetResponsePromise = eventAdminPage.waitForResponse(
+    (response) =>
+      response.url().endsWith(`/api/event-admin/events/${eventId}/access-sheets`) &&
+      response.request().method() === "POST",
+  );
+  await eventAdminPage.getByLabel("Access Sheet type").selectOption("event-admin");
+  await eventAdminPage.getByRole("button", { name: "Generate Access Sheet" }).click();
+  const accessSheetResponse = await accessSheetResponsePromise;
+  const accessSheetPayload = (await accessSheetResponse.json()) as {
+    status?: string;
+    value?: { body?: string; version?: { testMark?: boolean } };
+  };
+  assert(
+    accessSheetResponse.status() === 200 &&
+      accessSheetPayload.status === "accepted" &&
+      accessSheetPayload.value?.version?.testMark === true &&
+      accessSheetPayload.value.body?.includes("TEST ENVIRONMENT") === true &&
+      accessSheetPayload.value.body.includes(revealedCredential) === false,
+    "Access Sheet generation did not return a marked, redacted printable artifact",
+  );
+  const accessSheetPreview = eventAdminPage.locator(
+    'iframe[title="Generated Grant Access Sheet preview"]',
+  );
+  await accessSheetPreview.waitFor();
+  await expect(accessSheetPreview).toHaveCount(1);
+  await eventAdminPage.addScriptTag({
+    path: join(process.cwd(), "node_modules/@zxing/browser/umd/zxing-browser.min.js"),
+  });
+  const decodedAccessSheetCredential = await accessSheetPreview.evaluate(async (iframe) => {
+    const preview = iframe as HTMLIFrameElement;
+    const svg = preview.contentDocument?.querySelector("svg.qr");
+    if (svg === null || svg === undefined) throw new Error("Access Sheet QR SVG was not rendered.");
+    const image = new Image();
+    image.src = `data:image/svg+xml;base64,${btoa(new XMLSerializer().serializeToString(svg))}`;
+    await new Promise<void>((resolve, reject) => {
+      image.addEventListener("load", () => resolve(), { once: true });
+      image.addEventListener("error", () => reject(new Error("Access Sheet QR image failed.")), {
+        once: true,
+      });
+    });
+    const browserWindow = window as typeof window & {
+      ZXingBrowser: {
+        BrowserQRCodeReader: new () => {
+          decodeFromImageElement(source: HTMLImageElement): Promise<{ getText(): string }>;
+        };
+      };
+    };
+    const result =
+      await new browserWindow.ZXingBrowser.BrowserQRCodeReader().decodeFromImageElement(image);
+    return result.getText();
+  });
+  assert(
+    decodedAccessSheetCredential === revealedCredential,
+    "independent browser QR decode did not recover the canonical Event Admin credential",
+  );
+  await eventAdminPage.evaluate(() => {
+    const frame = document.getElementById(
+      "generated-access-sheet-preview",
+    ) as HTMLIFrameElement | null;
+    if (frame?.contentWindow === null)
+      throw new Error("Access Sheet print frame was not available.");
+    if (frame?.contentWindow !== undefined)
+      frame.contentWindow.print = () => {
+        document.body.dataset.accessSheetPrintInvoked = "true";
+      };
+  });
+  await eventAdminPage.getByRole("button", { name: "Print Access Sheet" }).focus();
+  await eventAdminPage.getByRole("button", { name: "Print Access Sheet" }).press("Enter");
+  await expect(eventAdminPage.locator("body")).toHaveAttribute(
+    "data-access-sheet-print-invoked",
+    "true",
+  );
+  await eventAdminPage.setViewportSize({ width: 360, height: 900 });
+  const narrowPrintableStructure = await accessSheetPreview.evaluate((iframe) => {
+    const preview = iframe as HTMLIFrameElement;
+    const document = preview.contentDocument;
+    if (document === null) throw new Error("Access Sheet preview document was not available.");
+    return {
+      title: document.title,
+      main: document.querySelector("main[aria-labelledby='access-sheet-title']") !== null,
+      qrLabels: document.querySelectorAll("svg[aria-label='QR credential']").length,
+      fits: document.documentElement.scrollWidth <= document.documentElement.clientWidth,
+      printCss: Array.from(document.styleSheets as StyleSheetList).some((sheet) => {
+        try {
+          return Array.from((sheet as CSSStyleSheet).cssRules).some((rule) =>
+            rule.cssText.includes("@media print"),
+          );
+        } catch {
+          return false;
+        }
+      }),
+    };
+  });
+  assert(
+    narrowPrintableStructure.title.includes("Event Admin Access Sheet") &&
+      narrowPrintableStructure.main &&
+      narrowPrintableStructure.qrLabels === 1 &&
+      narrowPrintableStructure.fits &&
+      narrowPrintableStructure.printCss,
+    `Access Sheet printable structure was not accessible and 360px-safe: ${JSON.stringify(narrowPrintableStructure)}`,
+  );
+  await eventAdminPage.setViewportSize({ width: 1280, height: 900 });
+  assert(
+    (await accessSheetPreview.getAttribute("srcdoc"))?.includes("TEST ENVIRONMENT") === true,
+    "Access Sheet preview did not preserve the visible TEST marking",
+  );
+  const assertAccessSheetAbsent = async (detail: string) => {
+    await expect(accessSheetPreview, detail).toHaveCount(0);
+  };
+  const inFlightAccessSheetGate = Promise.withResolvers<void>();
+  const inFlightAccessSheet = inFlightAccessSheetGate.promise;
+  await eventAdminPage.route(
+    `${origin}/api/event-admin/events/${eventId}/access-sheets`,
+    async (route) => {
+      await inFlightAccessSheet;
+      await route.continue();
+    },
+  );
+  const inFlightAccessSheetRequestPromise = eventAdminPage.waitForRequest(
+    (request) =>
+      request.url().endsWith(`/api/event-admin/events/${eventId}/access-sheets`) &&
+      request.method() === "POST",
+  );
+  const inFlightAccessSheetResponsePromise = eventAdminPage.waitForResponse(
+    (response) =>
+      response.url().endsWith(`/api/event-admin/events/${eventId}/access-sheets`) &&
+      response.request().method() === "POST",
+  );
+  await eventAdminPage.getByRole("button", { name: "Generate Access Sheet" }).click();
+  await inFlightAccessSheetRequestPromise;
+  await eventAdminPage.getByLabel("Event ID").fill(zeroDayEventId);
+  await assertAccessSheetAbsent("Event transition did not clear the live Access Sheet artifact");
+  inFlightAccessSheetGate.resolve();
+  const inFlightAccessSheetResponse = await inFlightAccessSheetResponsePromise;
+  assert(inFlightAccessSheetResponse.status() === 200, "in-flight Access Sheet generation failed");
+  await assertAccessSheetAbsent("stale in-flight Access Sheet response was displayed");
+  await eventAdminPage.unroute(`${origin}/api/event-admin/events/${eventId}/access-sheets`);
+  await eventAdminPage.getByLabel("Event ID").fill(eventId);
+
+  const currentEventHubResponsePromise = eventAdminPage.waitForResponse(
+    (response) =>
+      response.url().includes(`/api/event-admin/hub?eventId=${eventId}`) &&
+      response.request().method() === "GET",
+  );
+  await eventAdminPage.getByRole("button", { name: "Open as Technical Admin" }).click();
+  const currentEventHubResponse = await currentEventHubResponsePromise;
+  assert(currentEventHubResponse.status() === 200, "current Event Hub reload failed");
+  await eventAdminPage.getByText("Event Hub", { exact: true }).waitFor();
+  await eventAdminPage.getByText("Administrative audit evidence", { exact: true }).waitFor();
+  await eventAdminPage.getByText("Event Administration", { exact: true }).waitFor();
+  await eventAdminPage.getByText("Grant Audit", { exact: true }).waitFor();
+  await eventAdminPage.getByRole("button", { name: "Change authority" }).click();
+  await assertAccessSheetAbsent("authority transition did not clear the Access Sheet artifact");
+  await eventAdminPage.getByLabel("Scanned Event Admin QR value").fill(revealedCredential);
+  await eventAdminPage.getByRole("button", { name: "Admit Event Admin" }).click();
+  await eventAdminPage.getByText("Europe/Zurich · event-admin", { exact: false }).first().waitFor();
   const eventAdminGameDaySelector = eventAdminPage.getByLabel("Game Day", { exact: true });
   const firstDayHubResponsePromise = eventAdminPage.waitForResponse(
     (response) =>
@@ -305,6 +564,7 @@ try {
   );
   await eventAdminGameDaySelector.selectOption({ index: 1 });
   await firstDayHubResponsePromise;
+  await assertAccessSheetAbsent("Game Day transition did not clear the Access Sheet artifact");
   const firstSelectedGameDay = await expectSelectValue(eventAdminGameDaySelector, 1);
   const secondDayHubResponsePromise = eventAdminPage.waitForResponse(
     (response) =>
@@ -314,6 +574,119 @@ try {
   await secondDayHubResponsePromise;
   const secondSelectedGameDay = await expectSelectValue(eventAdminGameDaySelector, 2);
   assert(firstSelectedGameDay !== secondSelectedGameDay, "Game Day selector reused one option");
+  const removalPreviewResponsePromise = eventAdminPage.waitForResponse(
+    (response) =>
+      response.url().endsWith("/catalog-removal/preview") && response.request().method() === "POST",
+  );
+  const removalDayHubResponsePromise = eventAdminPage.waitForResponse(
+    (response) =>
+      response.url().includes("/api/event-admin/hub?") && response.request().method() === "GET",
+  );
+  await eventAdminGameDaySelector.selectOption({ index: 3 });
+  await removalDayHubResponsePromise;
+  await eventAdminPage.getByLabel("Preview removal Game Day 2026-08-16").click();
+  const removalPreviewResponse = await removalPreviewResponsePromise;
+  const removalPreviewPayload = (await removalPreviewResponse.json()) as {
+    status: string;
+    value?: {
+      eligible: boolean;
+      fingerprint?: string;
+      impact?: {
+        descendantCount: number;
+        retainedEventGameCount: number;
+        retainedControlActionCount: number;
+        retiredAuthorityCount: number;
+        retiredAuthorityCategories: {
+          eventAdmin: number;
+          pitchManager: number;
+          control: number;
+        };
+      };
+    };
+  };
+  assert(
+    removalPreviewResponse.status() === 200 &&
+      removalPreviewPayload.status === "accepted" &&
+      removalPreviewPayload.value?.eligible === true &&
+      removalPreviewPayload.value.fingerprint?.startsWith("event-catalog-removal-v1:") === true,
+    "Event Admin Game Day removal preview failed",
+  );
+  const removalStatusText = await eventAdminPage.getByRole("status").innerText();
+  assert(
+    removalStatusText.includes("catalog descendants 0") &&
+      removalStatusText.includes("retained Event Game Records 0") &&
+      removalStatusText.includes("accepted Control Actions 0") &&
+      removalStatusText.includes("retiring 0 authority item") &&
+      removalStatusText.includes("Authority categories") &&
+      !/grantId|session|credential|secret|code/iu.test(removalStatusText),
+    "removal preview did not show only bounded safe impact",
+  );
+  const eventAdminCookieBeforeRemoval = (await eventAdminContext.cookies()).find(
+    (cookie) => cookie.name === "__Host-event-admin-session",
+  );
+  const missingFingerprintResponse = await eventAdminContext.request.delete(
+    `${origin}/api/event-admin/events/${eventId}/catalog-removal`,
+    { data: { kind: "game-day", targetId: removalGameDayId } },
+  );
+  assert(
+    missingFingerprintResponse.status() === 400 &&
+      missingFingerprintResponse.headers()["set-cookie"] === undefined,
+    "missing removal fingerprint was accepted or refreshed the Event Admin session",
+  );
+  const eventAdminCookieAfterRejectedRemoval = (await eventAdminContext.cookies()).find(
+    (cookie) => cookie.name === "__Host-event-admin-session",
+  );
+  assert(
+    eventAdminCookieBeforeRemoval?.value === eventAdminCookieAfterRejectedRemoval?.value &&
+      eventAdminCookieBeforeRemoval?.expires === eventAdminCookieAfterRejectedRemoval?.expires,
+    "rejected removal changed the Event Admin session",
+  );
+  const removalAcceptedResponsePromise = eventAdminPage.waitForResponse(
+    (response) =>
+      response.url().endsWith("/catalog-removal") && response.request().method() === "DELETE",
+  );
+  const repairedGameDayHubResponsePromise = eventAdminPage.waitForResponse(
+    (response) =>
+      response.url().includes("/api/event-admin/hub?") &&
+      response.url().includes("gameDayId=") &&
+      response.request().method() === "GET",
+  );
+  await eventAdminPage.getByRole("button", { name: "Confirm", exact: true }).click();
+  const removalAcceptedResponse = await removalAcceptedResponsePromise;
+  await repairedGameDayHubResponsePromise;
+  const removalAcceptedPayload = (await removalAcceptedResponse.json()) as {
+    status: string;
+    sessionExpiresAtMs?: number;
+  };
+  assert(
+    removalAcceptedResponse.status() === 200 &&
+      removalAcceptedPayload.status === "accepted" &&
+      typeof removalAcceptedPayload.sessionExpiresAtMs === "number",
+    "Event Admin Game Day removal was not accepted with session activity",
+  );
+  const refreshedEventAdminCookie = (await eventAdminContext.cookies()).find(
+    (cookie) => cookie.name === "__Host-event-admin-session",
+  );
+  assert(
+    refreshedEventAdminCookie !== undefined &&
+      refreshedEventAdminCookie.expires > 0 &&
+      Math.abs(
+        refreshedEventAdminCookie.expires * 1_000 -
+          (removalAcceptedPayload.sessionExpiresAtMs ?? 0),
+      ) < 2_000,
+    "Event Admin removal cookie expiry did not match the returned capped expiry",
+  );
+  await eventAdminPage.getByText("Event Hub", { exact: true }).waitFor();
+  const repairedGameDayValue = await eventAdminGameDaySelector.inputValue();
+  const repairedGameDayOptions = await eventAdminGameDaySelector
+    .locator("option")
+    .allTextContents();
+  assert(
+    repairedGameDayValue.length > 0 &&
+      repairedGameDayValue !== removalGameDayId &&
+      repairedGameDayOptions.includes("2026-08-14 · past"),
+    `selected Game Day was not repaired to a surviving scope (value=${repairedGameDayValue}, options=${repairedGameDayOptions.join("|")})`,
+  );
   await eventAdminPage.getByLabel("New Event Team name").fill("Blue");
   await eventAdminPage.getByRole("button", { name: "Add Team" }).click();
   await eventAdminPage.getByText("Blue", { exact: true }).first().waitFor();
@@ -339,6 +712,91 @@ try {
   await eventAdminPage.getByLabel("Pitch Pitch One name").fill("Pitch Main");
   await eventAdminPage.getByRole("button", { name: "Save Pitch" }).click();
   await eventAdminPage.getByLabel("Pitch Pitch Main name").waitFor();
+  await eventAdminPage.getByLabel("New Pitch name").fill("Pitch Temporary");
+  const temporaryPitchResponsePromise = eventAdminPage.waitForResponse(
+    (response) =>
+      response.url().includes(`/api/event-admin/events/${eventId}/pitches`) &&
+      response.request().method() === "POST",
+  );
+  await eventAdminPage.getByRole("button", { name: "Add Pitch" }).click();
+  assert(
+    (await temporaryPitchResponsePromise).status() === 201,
+    "temporary removal Pitch creation failed",
+  );
+  await eventAdminPage.getByLabel("Pitch Pitch Temporary name").waitFor();
+  const removalHubPayload = (await (
+    await eventAdminContext.request.get(`${origin}/api/event-admin/hub?eventId=${eventId}`)
+  ).json()) as {
+    status: string;
+    value?: { event?: { pitches?: Array<{ pitchId: string; name: string }> } };
+  };
+  const removalPitchId = removalHubPayload.value?.event?.pitches?.find(
+    (pitch) => pitch.name === "Pitch Temporary",
+  )?.pitchId;
+  assert(removalPitchId !== undefined, "temporary removal Pitch was not projected");
+  const temporaryPitchViewResponsePromise = eventAdminPage.waitForResponse(
+    (response) =>
+      response.url().includes("/api/event-admin/pitch-view?") &&
+      response.request().method() === "GET",
+  );
+  await eventAdminPage.getByRole("button", { name: "Pitch Temporary", exact: true }).click();
+  await temporaryPitchViewResponsePromise;
+  await eventAdminPage.getByLabel("Preview removal Pitch Pitch Temporary").click();
+  await eventAdminPage.getByRole("status").filter({ hasText: "catalog descendants 0" }).waitFor();
+  const pitchRemovalResponsePromise = eventAdminPage.waitForResponse(
+    (response) =>
+      response.url().endsWith("/catalog-removal") && response.request().method() === "DELETE",
+  );
+  const survivingPitchViewResponsePromise = eventAdminPage.waitForResponse(
+    (response) =>
+      response.url().includes("/api/event-admin/pitch-view?") &&
+      response.request().method() === "GET",
+  );
+  await eventAdminPage.getByRole("button", { name: "Confirm", exact: true }).click();
+  const pitchRemovalResponse = await pitchRemovalResponsePromise;
+  const pitchRemovalPayload = (await pitchRemovalResponse.json()) as {
+    status: string;
+    sessionExpiresAtMs?: number;
+  };
+  assert(
+    pitchRemovalResponse.status() === 200 &&
+      pitchRemovalPayload.status === "accepted" &&
+      typeof pitchRemovalPayload.sessionExpiresAtMs === "number",
+    "Event Admin Pitch removal was not accepted with session activity",
+  );
+  const refreshedPitchEventAdminCookie = (await eventAdminContext.cookies()).find(
+    (cookie) => cookie.name === "__Host-event-admin-session",
+  );
+  assert(
+    refreshedPitchEventAdminCookie !== undefined &&
+      refreshedPitchEventAdminCookie.expires > 0 &&
+      Math.abs(
+        refreshedPitchEventAdminCookie.expires * 1_000 -
+          (pitchRemovalPayload.sessionExpiresAtMs ?? 0),
+      ) < 2_000,
+    "Pitch removal did not refresh the Event Admin session cookie",
+  );
+  const survivingPitchViewResponse = await survivingPitchViewResponsePromise;
+  assert(
+    !survivingPitchViewResponse.url().includes(removalPitchId),
+    "Pitch removal refetched the deleted Pitch view",
+  );
+  await eventAdminPage.getByRole("button", { name: "Pitch Main", exact: true }).waitFor();
+  assert(
+    (await eventAdminPage.getByRole("button", { name: "Pitch Temporary", exact: true }).count()) ===
+      0,
+    "removed Pitch remained selected or visible",
+  );
+  const pitchViewResponsePromise = eventAdminPage.waitForResponse(
+    (response) =>
+      response.url().includes("/api/event-admin/pitch-view?") &&
+      response.request().method() === "GET",
+  );
+  await eventAdminPage.getByRole("button", { name: "Pitch Main", exact: true }).click();
+  assert((await pitchViewResponsePromise).status() === 200, "Pitch view transition failed");
+  await assertAccessSheetAbsent("Pitch transition did not clear the Access Sheet artifact");
+  await eventAdminPage.getByLabel("Access Sheet type").selectOption("control-grant");
+  await assertAccessSheetAbsent("sheet-type transition did not clear the Access Sheet artifact");
   const firstDayScheduleHubResponsePromise = eventAdminPage.waitForResponse(
     (response) =>
       response.url().includes("/api/event-admin/hub?") && response.request().method() === "GET",
@@ -362,6 +820,18 @@ try {
     .getByText(/Slot 1.*10:00/u)
     .last()
     .waitFor();
+  const failedReplacementResponsePromise = eventAdminPage.waitForResponse(
+    (response) =>
+      response.url().endsWith(`/api/event-admin/events/${eventId}/access-sheets`) &&
+      response.request().method() === "POST",
+  );
+  await eventAdminPage.getByRole("button", { name: "Generate Access Sheet" }).click();
+  const failedReplacementResponse = await failedReplacementResponsePromise;
+  assert(
+    failedReplacementResponse.status() === 404,
+    "failed Access Sheet replacement unexpectedly succeeded",
+  );
+  await assertAccessSheetAbsent("failed Access Sheet replacement restored an old artifact");
   await eventAdminPage.getByLabel("Gameplay Slot 1 Expected Delay minutes").fill("2");
   const firstDayPreviewResponsePromise = eventAdminPage.waitForResponse(
     (response) =>
@@ -499,21 +969,6 @@ try {
     `${origin}/api/audience/events/${eventId}`,
   );
   assert(unpublishedAudience.status() === 404, "unpublished Event remained anonymously available");
-  await eventAdminPage.getByRole("button", { name: "Published Event", exact: true }).click();
-  await eventAdminPage.getByLabel("Confirm leaving Published").check();
-  await eventAdminPage.getByRole("button", { name: "Cancel Event", exact: true }).click();
-  const cancelledAudience = await eventAdminContext.request.get(
-    `${origin}/api/audience/events/${eventId}`,
-  );
-  assert(cancelledAudience.status() === 404, "cancelled Event remained anonymously available");
-  const unknownAudience = await eventAdminContext.request.get(
-    `${origin}/api/audience/events/unknown-event`,
-  );
-  assert(
-    unknownAudience.status() === cancelledAudience.status() &&
-      (await unknownAudience.text()) === (await cancelledAudience.text()),
-    "unknown Event did not use the same anonymous absence response",
-  );
   await eventAdminPage
     .getByText(/Slot 1.*10:00/u)
     .last()
@@ -642,6 +1097,95 @@ try {
     .first()
     .waitFor();
 
+  const futureEventAdminContext = await browser.newContext({ ignoreHTTPSErrors: true });
+  const futureEventAdminPage = await futureEventAdminContext.newPage();
+  futureEventAdminPage.setDefaultTimeout(5_000);
+  browserPage = futureEventAdminPage;
+  await futureEventAdminPage.goto(`${origin}/event-admin?eventId=${futureEventId}`, {
+    waitUntil: "domcontentloaded",
+    timeout: 5_000,
+  });
+  const futureAdmissionResponsePromise = futureEventAdminPage.waitForResponse(
+    (response) =>
+      response.url().endsWith("/api/event-admin/admit") && response.request().method() === "POST",
+  );
+  await futureEventAdminPage.getByLabel("Scanned Event Admin QR value").fill(futureEventCredential);
+  await futureEventAdminPage.getByRole("button", { name: "Admit Event Admin" }).click();
+  const futureAdmissionResponse = await futureAdmissionResponsePromise;
+  assert(
+    futureAdmissionResponse.status() === 200,
+    `future Event Admin admission failed (${futureAdmissionResponse.status()})`,
+  );
+  await futureEventAdminPage.goto(`${origin}/event-admin?eventId=${futureEventId}`, {
+    waitUntil: "domcontentloaded",
+    timeout: 5_000,
+  });
+  await futureEventAdminPage.getByText("Event Hub", { exact: true }).waitFor();
+  const futurePitchCreateResponse = await postJsonBodyFromPage(
+    futureEventAdminPage,
+    `${origin}/api/event-admin/events/${futureEventId}/pitches`,
+    { name: "Future Pitch" },
+  );
+  const futurePitchPayload = JSON.parse(futurePitchCreateResponse.body) as {
+    value?: { pitchId?: string };
+  };
+  const futurePitchId = futurePitchPayload.value?.pitchId;
+  assert(
+    futurePitchCreateResponse.status === 201 && futurePitchId !== undefined,
+    "future Pitch creation failed",
+  );
+  await futureEventAdminPage.reload();
+  await futureEventAdminPage.getByRole("button", { name: "Future Pitch", exact: true }).waitFor();
+  const futurePitchManagerCreateResponse = await postJsonBodyFromPage(
+    futureEventAdminPage,
+    `${origin}/api/event-admin/events/${futureEventId}/game-days/${futureGameDayId}/pitches/${futurePitchId}/pitch-manager-grant`,
+    {},
+  );
+  assert(
+    futurePitchManagerCreateResponse.status === 201,
+    "future Pitch Manager Grant creation failed",
+  );
+  const futureAccessSheetResponsePromise = futureEventAdminPage.waitForResponse(
+    (response) =>
+      response.url().endsWith(`/api/event-admin/events/${futureEventId}/access-sheets`) &&
+      response.request().method() === "POST",
+  );
+  await futureEventAdminPage.getByLabel("Access Sheet type").selectOption("pitch-manager");
+  await futureEventAdminPage.getByRole("button", { name: "Generate Access Sheet" }).click();
+  const futureAccessSheetResponse = await futureAccessSheetResponsePromise;
+  const futureAccessSheetPayload = (await futureAccessSheetResponse.json()) as {
+    status?: string;
+    value?: { body?: string; version?: { type?: string } };
+  };
+  const futureAccessSheetBody = futureAccessSheetPayload.value?.body ?? "";
+  assert(
+    futureAccessSheetResponse.status() === 200 &&
+      futureAccessSheetPayload.status === "accepted" &&
+      futureAccessSheetPayload.value?.version?.type === "pitch-manager" &&
+      (futureAccessSheetBody.match(/class="entry"/gu) ?? []).length === 1 &&
+      futureAccessSheetBody.includes("TEST ENVIRONMENT") &&
+      futureAccessSheetBody.includes("Grant Code") === false,
+    "Pitch Manager Access Sheet generation did not return the complete printable artifact",
+  );
+  await futureEventAdminPage
+    .locator('iframe[title="Generated Grant Access Sheet preview"]')
+    .waitFor();
+  await futureEventAdminContext.close();
+  browserPage = eventAdminPage;
+
+  const currentGameDayHubResponsePromise = eventAdminPage.waitForResponse(
+    (response) =>
+      response.url().includes(`/api/event-admin/hub?eventId=${eventId}`) &&
+      response.url().includes("gameDayId=") &&
+      response.request().method() === "GET",
+  );
+  await eventAdminPage
+    .getByLabel("Game Day", { exact: true })
+    .selectOption({ value: pitchManagerGameDayId });
+  assert(
+    (await currentGameDayHubResponsePromise).status() === 200,
+    "current Game Day reload failed",
+  );
   const controlSetupResponse = await eventAdminContext.request.get(
     `${origin}/api/event-admin/slot-setup?eventId=${eventId}&gameDayId=${pitchManagerGameDayId}`,
   );
@@ -718,6 +1262,137 @@ try {
       pitchManagerControlCreateCookie?.includes("__Host-pitch-manager-session=") === true &&
       pitchManagerControlCreateCookie?.includes("__Host-event-admin-session=") !== true,
     "Pitch Manager Control Grant creation did not refresh only its own cookie",
+  );
+  const controlGameDayResponsePromise = eventAdminPage.waitForResponse(
+    (response) =>
+      response.url().includes(`/api/event-admin/hub?eventId=${eventId}`) &&
+      response.url().includes(`gameDayId=${pitchManagerGameDayId}`) &&
+      response.request().method() === "GET",
+  );
+  await eventAdminPage.getByLabel("Game Day", { exact: true }).selectOption(pitchManagerGameDayId);
+  assert(
+    (await controlGameDayResponsePromise).status() === 200,
+    "Control Game Day selection failed",
+  );
+  const controlPitchViewResponsePromise = eventAdminPage.waitForResponse(
+    (response) =>
+      response.url().includes("/api/event-admin/pitch-view?") &&
+      response.request().method() === "GET",
+  );
+  await eventAdminPage.getByRole("button", { name: "Pitch Main", exact: true }).click();
+  assert(
+    (await controlPitchViewResponsePromise).status() === 200,
+    "Control Pitch selection failed",
+  );
+  const controlGrantInspectForSheet = await eventAdminContext.request.get(
+    `${origin}${controlGrantPath}`,
+  );
+  const pitchManagerControlInspectForSheet = await pitchManagerContext.request.get(
+    `${origin}${pitchManagerControlPath}`,
+  );
+  const controlGrantInspectForSheetPayload = (await controlGrantInspectForSheet.json()) as {
+    value?: {
+      status?: string;
+      eligibility?: string;
+      grantVersion?: string;
+      expiresAtMs?: number | null;
+    };
+  };
+  const pitchManagerControlInspectForSheetPayload =
+    (await pitchManagerControlInspectForSheet.json()) as {
+      value?: {
+        status?: string;
+        eligibility?: string;
+        grantVersion?: string;
+        expiresAtMs?: number | null;
+      };
+    };
+  assert(
+    controlGrantInspectForSheetPayload.value?.eligibility === "empty" &&
+      pitchManagerControlInspectForSheetPayload.value?.eligibility === "empty",
+    "Control Grant unavailable-state fixture did not remain safely unavailable before registration",
+  );
+  await eventAdminPage.getByLabel("Access Sheet type").selectOption("control-grant");
+  const controlAccessSheetResponsePromise = eventAdminPage.waitForResponse(
+    (response) =>
+      response.url().endsWith(`/api/event-admin/events/${eventId}/access-sheets`) &&
+      response.request().method() === "POST",
+  );
+  await eventAdminPage.getByRole("button", { name: "Generate Access Sheet" }).click();
+  const controlAccessSheetResponse = await controlAccessSheetResponsePromise;
+  const controlAccessSheetPayload = (await controlAccessSheetResponse.json()) as {
+    status?: string;
+    value?: { body?: string; version?: { type?: string; scope?: Record<string, unknown> } };
+  };
+  assert(
+    controlAccessSheetResponse.status() === 200 &&
+      controlAccessSheetPayload.status === "accepted" &&
+      controlAccessSheetPayload.value?.version?.type === "control-grant" &&
+      controlAccessSheetPayload.value.body?.includes("control-grant") === true &&
+      controlAccessSheetPayload.value.body.includes("Grant Code") === false,
+    `new-scope Control Access Sheet generation did not return the new artifact (${controlAccessSheetResponse.status()}, grants=${controlGrantInspectForSheet.status()}/${pitchManagerControlInspectForSheet.status()}, states=${controlGrantInspectForSheetPayload.value?.status}/${pitchManagerControlInspectForSheetPayload.value?.status}, eligibility=${controlGrantInspectForSheetPayload.value?.eligibility}/${pitchManagerControlInspectForSheetPayload.value?.eligibility}): ${JSON.stringify(controlAccessSheetPayload).slice(0, 300)}`,
+  );
+  await accessSheetPreview.waitFor();
+  await expect(accessSheetPreview).toHaveCount(1);
+  const decodedControlCredentials = await accessSheetPreview.evaluate(async (iframe) => {
+    const preview = iframe as HTMLIFrameElement;
+    const document = preview.contentDocument;
+    if (document === null) throw new Error("Control Access Sheet preview was not available.");
+    const browserWindow = window as typeof window & {
+      ZXingBrowser: {
+        BrowserQRCodeReader: new () => {
+          decodeFromImageElement(source: HTMLImageElement): Promise<{ getText(): string }>;
+        };
+      };
+    };
+    const reader = new browserWindow.ZXingBrowser.BrowserQRCodeReader();
+    return Promise.all(
+      Array.from(document.querySelectorAll("svg.qr")).map(async (svg) => {
+        const image = new Image();
+        image.src = `data:image/svg+xml;base64,${btoa(new XMLSerializer().serializeToString(svg))}`;
+        await new Promise<void>((resolve, reject) => {
+          image.addEventListener("load", () => resolve(), { once: true });
+          image.addEventListener(
+            "error",
+            () => reject(new Error("Control Access Sheet QR failed.")),
+            {
+              once: true,
+            },
+          );
+        });
+        return (await reader.decodeFromImageElement(image)).getText();
+      }),
+    );
+  });
+  const controlSheetEntryCount = (
+    controlAccessSheetPayload.value.body?.match(/class="entry"/gu) ?? []
+  ).length;
+  assert(
+    decodedControlCredentials.length === controlSheetEntryCount &&
+      decodedControlCredentials.length === 2 &&
+      decodedControlCredentials.every(
+        (credential) => credential.length > 0 && credential.includes("Grant Code") === false,
+      ),
+    `independent browser QR decode did not recover every Control credential (${decodedControlCredentials.length}/${controlSheetEntryCount})`,
+  );
+  assert(
+    (await accessSheetPreview.getAttribute("srcdoc"))?.includes("control-grant") === true,
+    "new-scope Access Sheet preview did not display only the new artifact",
+  );
+  await eventAdminPage.getByRole("button", { name: "Published Event", exact: true }).click();
+  await eventAdminPage.getByLabel("Confirm leaving Published").check();
+  await eventAdminPage.getByRole("button", { name: "Cancel Event", exact: true }).click();
+  const cancelledAudience = await eventAdminContext.request.get(
+    `${origin}/api/audience/events/${eventId}`,
+  );
+  assert(cancelledAudience.status() === 404, "cancelled Event remained anonymously available");
+  const unknownAudience = await eventAdminContext.request.get(
+    `${origin}/api/audience/events/unknown-event`,
+  );
+  assert(
+    unknownAudience.status() === cancelledAudience.status() &&
+      (await unknownAudience.text()) === (await cancelledAudience.text()),
+    "unknown Event did not use the same anonymous absence response",
   );
   const eventAdminCookieAfterPitchManagerMutation = (await pitchManagerContext.cookies()).find(
     (cookie) => cookie.name === "__Host-event-admin-session",
@@ -1069,7 +1744,7 @@ try {
     .getByText(/Expected Delay 1m/u)
     .last()
     .waitFor();
-  await eventAdminPage.getByRole("button", { name: "Pitch Main" }).click();
+  await eventAdminPage.getByRole("button", { name: "Pitch Main", exact: true }).click();
   await eventAdminPage.getByLabel("Pitch Slot 1 Expected Delay minutes").waitFor();
   await eventAdminPage.getByLabel("Pitch Slot 1 Expected Delay minutes").fill("3");
   const pitchPreviewResponsePromise = eventAdminPage.waitForResponse(
@@ -1117,7 +1792,7 @@ try {
   assert((await thirdGameResponsePromise).status() === 201, "third Event Game creation failed");
   await eventAdminPage.getByRole("button", { name: "Refresh Slot setup" }).click();
   await eventAdminPage.getByText("Third", { exact: true }).waitFor();
-  await eventAdminPage.getByRole("button", { name: "Pitch Main" }).click();
+  await eventAdminPage.getByRole("button", { name: "Pitch Main", exact: true }).click();
   await eventAdminPage.getByLabel("Pitch Slot 1 Expected Delay minutes").waitFor();
   const lastTargetSelector = eventAdminPage
     .locator('select[aria-label$="target Pitch Slot"]')
@@ -1372,11 +2047,113 @@ try {
     "explicitly revoked live Event Admin session remained live",
   );
   await pitchManagerCodeContext.close();
+  const finalRemovalEventResponse = await context.request.post(`${origin}/api/admin/events`, {
+    data: { name: "Final Removal Browser Event", timeZone: "UTC" },
+    headers: { origin, "x-technical-admin-csrf": currentCsrfToken },
+  });
+  const finalRemovalEventPayload = (await finalRemovalEventResponse.json()) as {
+    status: string;
+    value?: { eventId?: string };
+  };
+  const finalRemovalEventId = finalRemovalEventPayload.value?.eventId;
+  assert(
+    finalRemovalEventResponse.status() === 201 && finalRemovalEventId !== undefined,
+    "final removal browser Event creation failed",
+  );
+  for (const date of ["2026-08-17", "2026-08-18"]) {
+    const finalRemovalDayResponse = await context.request.post(
+      `${origin}/api/admin/events/${finalRemovalEventId}/game-days`,
+      {
+        data: { date },
+        headers: { origin, "x-technical-admin-csrf": currentCsrfToken },
+      },
+    );
+    assert(finalRemovalDayResponse.status() === 201, `final removal Game Day ${date} failed`);
+  }
+  await page.goto(`${origin}/admin`);
+  await page.getByText("Technical Admin administration").waitFor();
+  await page.getByRole("button", { name: /Final Removal Browser Event/ }).click();
+  await page.getByRole("button", { name: "Create Grant" }).click();
+  const finalRevealResponsePromise = page.waitForResponse(
+    (response) =>
+      response
+        .url()
+        .includes(`/api/admin/events/${finalRemovalEventId}/event-admin-grant/reveal`) &&
+      response.request().method() === "POST",
+  );
+  await page.getByRole("button", { name: "Reveal QR credential" }).click();
+  const finalRevealResponse = await finalRevealResponsePromise;
+  const finalRevealPayload = (await finalRevealResponse.json()) as {
+    status: string;
+    value?: { qrCredential?: string };
+  };
+  const finalCredential = finalRevealPayload.value?.qrCredential ?? "";
+  assert(
+    finalRevealResponse.status() === 200 && finalCredential.length > 0,
+    "final QR reveal failed",
+  );
+  const finalRemovalContext = await browser.newContext({ ignoreHTTPSErrors: true });
+  const finalRemovalPage = await finalRemovalContext.newPage();
+  finalRemovalPage.setDefaultTimeout(5_000);
+  await finalRemovalPage.goto(`${origin}/event-admin?eventId=${finalRemovalEventId}`);
+  await finalRemovalPage.getByLabel("Scanned Event Admin QR value").fill(finalCredential);
+  await finalRemovalPage.getByRole("button", { name: "Admit Event Admin" }).click();
+  await finalRemovalPage.getByText(/event-admin/u).waitFor();
+  const finalRemovalSelector = finalRemovalPage.getByLabel("Game Day", { exact: true });
+  const finalFirstDayHubResponsePromise = finalRemovalPage.waitForResponse(
+    (response) =>
+      response.url().includes("/api/event-admin/hub?") && response.request().method() === "GET",
+  );
+  await finalRemovalSelector.selectOption({ index: 1 });
+  await finalFirstDayHubResponsePromise;
+  assert(
+    (await finalRemovalSelector.inputValue()).length > 0,
+    "final removal Game Day was not selected",
+  );
+  await finalRemovalPage.getByLabel("New Pitch name").fill("Final Pitch");
+  await finalRemovalPage.getByRole("button", { name: "Add Pitch" }).click();
+  await finalRemovalPage.getByRole("button", { name: "Final Pitch", exact: true }).waitFor();
+  await finalRemovalPage.getByLabel("Preview removal Pitch Final Pitch").click();
+  const finalPitchHubResponsePromise = finalRemovalPage.waitForResponse(
+    (response) =>
+      response.url().includes("/api/event-admin/hub?") &&
+      response.url().includes("gameDayId=") &&
+      response.request().method() === "GET",
+  );
+  await finalRemovalPage.getByRole("button", { name: "Confirm", exact: true }).click();
+  await finalRemovalPage.getByRole("button", { name: "Final Pitch", exact: true }).waitFor({
+    state: "detached",
+  });
+  await finalPitchHubResponsePromise;
+  assert(
+    (await finalRemovalPage.getByRole("button", { name: "Final Pitch", exact: true }).count()) ===
+      0,
+    "final Pitch removal did not leave the UI in an empty state",
+  );
+  const firstFinalDayValue = await finalRemovalSelector.inputValue();
+  await finalRemovalPage.getByLabel(/Preview removal Game Day 2026-08-17/u).click();
+  const survivingFinalDayHubResponsePromise = finalRemovalPage.waitForResponse(
+    (response) =>
+      response.url().includes("/api/event-admin/hub?") &&
+      response.url().includes("gameDayId=") &&
+      response.request().method() === "GET",
+  );
+  await finalRemovalPage.getByRole("button", { name: "Confirm", exact: true }).click();
+  await survivingFinalDayHubResponsePromise;
+  assert(
+    (await finalRemovalSelector.inputValue()) !== firstFinalDayValue,
+    "selected Game Day was not changed after removing it",
+  );
+  await finalRemovalPage.getByLabel(/Preview removal Game Day 2026-08-18/u).click();
+  await finalRemovalPage.getByRole("button", { name: "Confirm", exact: true }).click();
+  await expectValue(finalRemovalSelector, "");
+  await finalRemovalPage
+    .getByText("Choose a Game Day to schedule Games.", { exact: true })
+    .waitFor();
+  await finalRemovalContext.close();
   await pitchManagerContext.close();
   await eventAdminContext.close();
   await revokedEventAdminContext.close();
-  const removeButtons = page.getByRole("button", { name: "Remove", exact: true });
-  await removeButtons.nth(0).click();
   const attachedGrantRemoval = await page.evaluate(async (url) => {
     const csrf = document.cookie
       .split(";")
@@ -1571,6 +2348,25 @@ async function postJsonBodyFromPage(page: Page, url: string, body: Record<string
       };
     },
     { requestUrl: url, requestBody: body },
+  );
+}
+
+async function postJsonWithHeadersFromPage(
+  page: Page,
+  url: string,
+  body: Record<string, string>,
+  headers: Record<string, string>,
+) {
+  return page.evaluate(
+    async ({ requestUrl, requestBody, requestHeaders }) => {
+      const response = await fetch(requestUrl, {
+        method: "POST",
+        headers: { ...requestHeaders, "content-type": "application/json" },
+        body: JSON.stringify(requestBody),
+      });
+      return { status: response.status, body: await response.text() };
+    },
+    { requestUrl: url, requestBody: body, requestHeaders: headers },
   );
 }
 

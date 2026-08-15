@@ -140,9 +140,31 @@ export type TypedGrantMutation =
       detail?: string;
     };
 
+export type GrantRetirementInput = {
+  grantId: string;
+  actorReference: string;
+  reason: "event-catalog-removal";
+};
+
 export type TypedGrantReveal =
   | {
       status: "revealed";
+      grantId: string;
+      grantVersion: string;
+      grantType: GrantType;
+      qrCredential: string;
+      credentialFormatVersion: typeof GRANT_CREDENTIAL_FORMAT_VERSION;
+    }
+  | { status: "rejected"; reason: "not-found" | "unauthorized" | "unavailable"; detail: string };
+
+/**
+ * The Access Sheet composition may resolve only the current QR material for a
+ * Grant it already selected in the surrounding Foundation transaction. This
+ * deliberately has no Grant Code or session fields.
+ */
+export type TypedAccessSheetQrCredentialResolution =
+  | {
+      status: "resolved";
       grantId: string;
       grantVersion: string;
       grantType: GrantType;
@@ -270,6 +292,15 @@ export type TypedGrantAuthority = {
     grantId: string,
     authority: GrantManagementAuthority,
   ): TypedGrantReveal;
+  resolveAccessSheetQrCredentialInTransaction(
+    transaction: FoundationStorageTransaction,
+    input: {
+      grantId: string;
+      grantType: GrantType;
+      scope: GrantScope;
+      authority: GrantManagementAuthority;
+    },
+  ): TypedAccessSheetQrCredentialResolution;
   disableGrant(grantId: string, authority: GrantManagementAuthority): Promise<TypedGrantMutation>;
   revokeGrant(grantId: string, authority: GrantManagementAuthority): Promise<TypedGrantMutation>;
   reactivateGrant(
@@ -304,6 +335,10 @@ export type TypedGrantAuthority = {
     grantId: string,
     sessionReference: string,
     authority: GrantManagementAuthority,
+  ): TypedGrantMutation;
+  retireGrantInTransaction(
+    transaction: FoundationStorageTransaction,
+    input: GrantRetirementInput,
   ): TypedGrantMutation;
   leaveGrantSession(sessionBearer: string): Promise<TypedGrantMutation>;
   listGrantSessions(

@@ -181,7 +181,9 @@ export function validateGrantState(
     if (completenessFailure !== null) return completenessFailure;
     if (grantAudits.filter((audit) => audit.action === "grant-created").length !== 1)
       return "Stored Grant Audit Trail is missing exactly one Grant creation record.";
-    const expiryCount = grantAudits.filter((audit) => audit.action === "grant-expired").length;
+    const expiryCount = grantAudits.filter(
+      (audit) => audit.action === "grant-expired" || audit.action === "grant-retired",
+    ).length;
     if (expiryCount !== (grant.status === "expired" ? 1 : 0))
       return "Stored Grant Audit Trail terminal expiry evidence is incomplete.";
   }
@@ -276,6 +278,7 @@ function validateGrantAuditCompleteness(
   const stateActions = new Set<StoredGrantAuditEntry["action"]>([
     "grant-disabled",
     "grant-revoked",
+    "grant-retired",
     "grant-reactivated",
     "grant-metadata-updated",
     "credential-rotated",
@@ -308,7 +311,8 @@ function validateGrantAuditCompleteness(
       }
       expectedExpiresAtMs = audit.afterExpiresAtMs;
     }
-    if (audit.action === "grant-expired") expiredEvidence = true;
+    if (audit.action === "grant-expired" || audit.action === "grant-retired")
+      expiredEvidence = true;
   }
   for (const audit of ordered) {
     if (
@@ -318,6 +322,7 @@ function validateGrantAuditCompleteness(
       audit.action === "grant-code-replaced" ||
       audit.action === "grant-code-disabled" ||
       audit.action === "grant-code-erased-expiry" ||
+      audit.action === "grant-code-erased-removal" ||
       audit.action === "grant-code-erased-game-lock" ||
       audit.action === "grant-code-admitted"
     )
@@ -388,7 +393,9 @@ function validateGrantAuditCompleteness(
       audit.codeState !== undefined ||
       audit.previousCodeFingerprint !== undefined;
     const isCodeErasure =
-      audit.action === "grant-code-erased-expiry" || audit.action === "grant-code-erased-game-lock";
+      audit.action === "grant-code-erased-expiry" ||
+      audit.action === "grant-code-erased-removal" ||
+      audit.action === "grant-code-erased-game-lock";
     if (isCodeAction) {
       if (audit.credentialKind !== GRANT_CODE_KIND)
         return "Stored Grant-Code Audit Trail credential kind is invalid.";
@@ -587,6 +594,7 @@ function validateGrantAuditCompleteness(
       if (
         audit.action === "grant-expired" ||
         audit.action === "grant-revoked" ||
+        audit.action === "grant-retired" ||
         audit.action === "grant-reactivated" ||
         audit.action === "grant-metadata-updated"
       )
@@ -1151,6 +1159,7 @@ function validateAudit(
     "grant-expired",
     "grant-disabled",
     "grant-revoked",
+    "grant-retired",
     "grant-reactivated",
     "grant-metadata-updated",
     "session-admitted",
@@ -1168,6 +1177,7 @@ function validateAudit(
     "grant-code-replaced",
     "grant-code-disabled",
     "grant-code-erased-expiry",
+    "grant-code-erased-removal",
     "grant-code-erased-game-lock",
     "grant-code-admitted",
   ];
@@ -1211,6 +1221,7 @@ function validateAudit(
     audit.action === "grant-code-replaced" ||
     audit.action === "grant-code-disabled" ||
     audit.action === "grant-code-erased-expiry" ||
+    audit.action === "grant-code-erased-removal" ||
     audit.action === "grant-code-erased-game-lock" ||
     audit.action === "grant-code-admitted";
   if (codeAction !== (audit.credentialKind === GRANT_CODE_KIND))
