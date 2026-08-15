@@ -5,6 +5,15 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { openSqliteFoundationStorage } from "@/lib/foundation-storage-sqlite";
+import { createEventGameRecord, type ExternalScopeResolver } from "@/lib/event-game-record";
+import {
+  canonicalizeEventGameRecordRoot,
+  type EventGameRecordRoot,
+} from "@/lib/foundation-record-types";
+import type { FoundationStorageTransaction } from "@/lib/foundation-storage";
+import { createLiveEventGameIqaInterpreter } from "@/lib/live-event-game-control";
+import { createControlScopeResolver } from "@/lib/live-event-game-runtime";
+import { lockControlGrantEventGame } from "@/lib/grant-management-sessions";
 import { createGrantKeyRingDocument, writeGrantKeyRingFile } from "@/lib/grant-key-ring-custody";
 import { readGrantAuthorityOptions } from "@/lib/grant-runtime";
 import {
@@ -20,6 +29,24 @@ const databasePath = join(directory, "technical-admin.sqlite");
 const grantKeyRingPath = join(directory, "grant-key-ring.json");
 const port = 38_000 + Math.floor(Math.random() * 1_000);
 const origin = `https://localhost:${port}`;
+const baseGrantKeyRingDocument = createGrantKeyRingDocument("test");
+const grantKeyRingDocument = {
+  ...baseGrantKeyRingDocument,
+  encryption: {
+    currentVersion: "encryption-v1",
+    keys: { "encryption-v1": baseGrantKeyRingDocument.encryption.keys.v1! },
+  },
+  lookup: {
+    currentVersion: "lookup-v1",
+    keys: { "lookup-v1": baseGrantKeyRingDocument.lookup.keys.v1! },
+  },
+  audit: {
+    currentVersion: "audit-v1",
+    keys: { "audit-v1": baseGrantKeyRingDocument.audit.keys.v1! },
+  },
+};
+const currentGrantKey = (set: { currentVersion: string; keys: Record<string, string> }) =>
+  set.keys[set.currentVersion]!;
 const environment = {
   ...process.env,
   NODE_ENV: "test",
@@ -28,7 +55,11 @@ const environment = {
   WEBAUTHN_RP_ID: "localhost",
   TECHNICAL_ADMIN_DATABASE: databasePath,
   FOUNDATION_DATABASE: join(directory, "foundation.sqlite"),
+  EVENT_GAME_DATABASE: join(directory, "foundation.sqlite"),
   GRANT_KEY_RING_FILE: grantKeyRingPath,
+  EVENT_GAME_ENCRYPTION_KEY: currentGrantKey(grantKeyRingDocument.encryption),
+  EVENT_GAME_LOOKUP_KEY: currentGrantKey(grantKeyRingDocument.lookup),
+  EVENT_GAME_AUDIT_KEY: currentGrantKey(grantKeyRingDocument.audit),
   TLS_CERT_FILE: certificatePath,
   TLS_KEY_FILE: keyPath,
   PORT: String(port),
@@ -60,7 +91,7 @@ try {
   ]);
   if (certificate.exitCode !== 0)
     throw new Error("openssl could not create a temporary certificate.");
-  writeGrantKeyRingFile(grantKeyRingPath, createGrantKeyRingDocument("test"));
+  writeGrantKeyRingFile(grantKeyRingPath, grantKeyRingDocument);
 
   const grantOptions = readGrantAuthorityOptions("test", environment);
   const foundation = openSqliteFoundationStorage(join(directory, "foundation.sqlite"), {
@@ -1073,7 +1104,9 @@ try {
   await eventAdminPage.getByRole("button", { name: "Add unresolved Event Game" }).click();
   assert((await secondGameResponsePromise).status() === 201, "second Event Game creation failed");
   await eventAdminPage.getByRole("button", { name: "Refresh Slot setup" }).click();
-  await eventAdminPage.getByText("Opening", { exact: true }).waitFor();
+  await eventAdminPage
+    .getByRole("option", { name: "Opening", exact: true })
+    .waitFor({ state: "attached" });
   await eventAdminPage.getByRole("button", { name: "Published Event", exact: true }).click();
   const publicationWarning = eventAdminPage.getByText(/Published with incomplete schedule:/u);
   await publicationWarning.waitFor();
@@ -1957,7 +1990,9 @@ try {
   await eventAdminPage.getByRole("button", { name: "Add unresolved Event Game" }).click();
   assert((await thirdGameResponsePromise).status() === 201, "third Event Game creation failed");
   await eventAdminPage.getByRole("button", { name: "Refresh Slot setup" }).click();
-  await eventAdminPage.getByText("Third", { exact: true }).waitFor();
+  await eventAdminPage
+    .getByRole("option", { name: "Third", exact: true })
+    .waitFor({ state: "attached" });
   await eventAdminPage.getByRole("button", { name: "Pitch Main", exact: true }).click();
   await eventAdminPage.getByLabel("Pitch Slot 1 Expected Delay minutes").waitFor();
   const lastTargetSelector = eventAdminPage
@@ -1973,9 +2008,6 @@ try {
   assert(
     multiOccupantSwapResponse.status() === 400,
     `multi-occupant swap returned ${multiOccupantSwapResponse.status()}`,
-  );
-  const sessionCookieBeforeRefresh = (await eventAdminContext.cookies()).find(
-    (cookie) => cookie.name === "__Host-event-admin-session",
   );
   const projectionResponse = await eventAdminContext.request.get(
     `${origin}/api/event-admin/hub?eventId=${eventId}`,
@@ -2037,14 +2069,308 @@ try {
   );
   await eventAdminPage.getByLabel("Audit action filter").fill("event-created");
   assert((await eventFilterResponsePromise).status() === 200, "Event Admin filter change failed");
+
+  const lockedSlotResponse = await postJsonValueFromPage(
+    eventAdminPage,
+    `${origin}/api/event-admin/events/${eventId}/game-days/${pitchManagerGameDayId}/gameplay-slots`,
+    { sequence: 4, scheduledStart: "2026-08-15T12:00" },
+  );
+  const lockedSlotPayload = JSON.parse(lockedSlotResponse.body) as {
+    value?: { gameplaySlotId?: string };
+  };
+  const lockedGameplaySlotId = lockedSlotPayload.value?.gameplaySlotId;
+  assert(
+    lockedSlotResponse.status === 201 && lockedGameplaySlotId !== undefined,
+    "browser locked-game Gameplay Slot creation failed",
+  );
+  const lockedTeamAResponse = await postJsonValueFromPage(
+    eventAdminPage,
+    `${origin}/api/event-admin/events/${eventId}/teams`,
+    { name: "Browser Blue", defaultColor: "#112233" },
+  );
+  const lockedTeamAPayload = JSON.parse(lockedTeamAResponse.body) as {
+    value?: { eventTeamId?: string };
+  };
+  const lockedTeamAId = lockedTeamAPayload.value?.eventTeamId;
+  const lockedTeamBResponse = await postJsonValueFromPage(
+    eventAdminPage,
+    `${origin}/api/event-admin/events/${eventId}/teams`,
+    { name: "Browser Red", defaultColor: "#445566" },
+  );
+  const lockedTeamBPayload = JSON.parse(lockedTeamBResponse.body) as {
+    value?: { eventTeamId?: string };
+  };
+  const lockedTeamBId = lockedTeamBPayload.value?.eventTeamId;
+  assert(
+    lockedTeamAResponse.status === 201 &&
+      lockedTeamBResponse.status === 201 &&
+      lockedTeamAId !== undefined &&
+      lockedTeamBId !== undefined,
+    "browser locked-game Event Team creation failed",
+  );
+  const lockedSetupResponse = await eventAdminContext.request.get(
+    `${origin}/api/event-admin/slot-setup?eventId=${eventId}&gameDayId=${pitchManagerGameDayId}`,
+  );
+  const lockedSetupPayload = (await lockedSetupResponse.json()) as {
+    value?: {
+      pitchSlots?: Array<{ pitchSlotId: string; pitchId: string; gameplaySlotId: string }>;
+    };
+  };
+  const lockedPitchSlot = lockedSetupPayload.value?.pitchSlots?.find(
+    (slot) => slot.pitchId === pitchManagerPitchId && slot.gameplaySlotId === lockedGameplaySlotId,
+  );
+  assert(lockedPitchSlot !== undefined, "browser locked-game Pitch Slot was not created");
+  const lockedGameResponse = await postJsonValueFromPage(
+    eventAdminPage,
+    `${origin}/api/event-admin/events/${eventId}/game-days/${pitchManagerGameDayId}/event-games`,
+    {
+      gameplaySlotId: lockedGameplaySlotId,
+      pitchSlotId: lockedPitchSlot.pitchSlotId,
+      gameCode: "LOCKED-01",
+      gameDesignation: "Locked Opening",
+      sideA: { sourceLabel: "Blue" },
+      sideB: { sourceLabel: "Red" },
+    },
+  );
+  const lockedGamePayload = JSON.parse(lockedGameResponse.body) as {
+    value?: { eventGameId?: string };
+  };
+  const lockedEventGameId = lockedGamePayload.value?.eventGameId;
+  assert(
+    lockedGameResponse.status === 201 && lockedEventGameId !== undefined,
+    "browser locked Event Game creation failed",
+  );
+  const lockedConfirmTeamsResponse = await postJsonValueFromPage(
+    eventAdminPage,
+    `${origin}/api/event-admin/events/${eventId}/game-days/${pitchManagerGameDayId}/gameplay-slots/${lockedGameplaySlotId}/confirm-teams`,
+    {
+      games: [
+        {
+          eventGameId: lockedEventGameId,
+          sideAEventTeamId: lockedTeamAId,
+          sideBEventTeamId: lockedTeamBId,
+        },
+      ],
+    },
+  );
+  assert(
+    lockedConfirmTeamsResponse.status === 200,
+    `browser locked-game team confirmation failed: ${lockedConfirmTeamsResponse.body}`,
+  );
+  const lockedGameSides = await seedLockedBrowserGame({
+    eventId,
+    gameDayId: pitchManagerGameDayId,
+    eventGameId: lockedEventGameId,
+    pitchId: pitchManagerPitchId,
+    pitchSlotId: lockedPitchSlot.pitchSlotId,
+  });
+  const lockedControlGrantPath = `/api/event-admin/events/${eventId}/game-days/${pitchManagerGameDayId}/pitches/${pitchManagerPitchId}/pitch-slots/${lockedPitchSlot.pitchSlotId}/control-grant`;
+  const lockedControlCreate = await postJsonBodyFromPage(
+    eventAdminPage,
+    `${origin}${lockedControlGrantPath}`,
+    {},
+  );
+  assert(lockedControlCreate.status === 201, "browser locked-game Control Grant creation failed");
+  const lockedControlReveal = await postJsonBodyFromPage(
+    eventAdminPage,
+    `${origin}${lockedControlGrantPath}/reveal`,
+    {},
+  );
+  const lockedControlRevealPayload = JSON.parse(lockedControlReveal.body) as {
+    value?: { qrCredential?: string };
+  };
+  const lockedQrCredential = lockedControlRevealPayload.value?.qrCredential;
+  assert(
+    lockedControlReveal.status === 200 && lockedQrCredential !== undefined,
+    "browser locked-game QR reveal failed",
+  );
+  const lockedCodeCreate = await postJsonBodyFromPage(
+    eventAdminPage,
+    `${origin}${lockedControlGrantPath}/code`,
+    {},
+  );
+  const lockedCodePayload = JSON.parse(lockedCodeCreate.body) as { value?: { code?: string } };
+  const lockedOldCode = lockedCodePayload.value?.code;
+  assert(
+    lockedCodeCreate.status === 200 && lockedOldCode !== undefined,
+    `browser locked-game Grant Code creation failed (${lockedCodeCreate.status}): ${lockedCodeCreate.body}`,
+  );
+  const lockedControlPage = await eventAdminContext.newPage();
+  lockedControlPage.setDefaultTimeout(5_000);
+  await lockedControlPage.goto(`${origin}/event-control`);
+  const oldQrOpen = JSON.parse(
+    (
+      await postJsonBodyFromPage(lockedControlPage, `${origin}/api/event-control/open`, {
+        qrCredential: lockedQrCredential,
+        browserContext: "browser-locked-old-qr",
+      })
+    ).body,
+  ) as { session?: { sessionBearer?: string } };
+  const oldQrSessionBearer = oldQrOpen.session?.sessionBearer;
+  assert(
+    oldQrSessionBearer !== undefined,
+    `browser locked-game old QR admission failed: ${JSON.stringify(oldQrOpen)}`,
+  );
+  const oldCodeContext = await browser.newContext({ ignoreHTTPSErrors: true });
+  const oldCodePage = await oldCodeContext.newPage();
+  await oldCodePage.goto(`${origin}/event-control`);
+  const oldCodeOpen = await postJsonBodyFromPage(oldCodePage, `${origin}/api/event-control/open`, {
+    grantCode: lockedOldCode,
+    browserContext: "browser-locked-old-code",
+  });
+  assert(oldCodeOpen.status === 200, "browser locked-game old code admission failed");
+  await lockSeededBrowserGame({ eventGameId: lockedEventGameId, lockedAtMs: Date.now() });
+  const oldCodeAfterLock = await postJsonBodyFromPage(
+    oldCodePage,
+    `${origin}/api/event-control/open`,
+    {
+      grantCode: lockedOldCode,
+      browserContext: "browser-locked-old-code-after-lock",
+    },
+  );
+  assert(oldCodeAfterLock.status !== 200, "locked-game old Grant Code was revived");
+  const oldSessionAfterLock = await oldCodePage.evaluate(
+    async ({ bearer, eventGameId }) => {
+      const response = await fetch("/api/event-control/refresh", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ sessionBearer: bearer, eventGameId }),
+      });
+      return response.status;
+    },
+    { bearer: oldQrSessionBearer, eventGameId: lockedEventGameId },
+  );
+  assert(oldSessionAfterLock !== 200, "locked-game old session was revived");
+
+  const lockedDaySelector = eventAdminPage.getByLabel("Game Day", { exact: true });
+  const lockedFirstDayHub = eventAdminPage.waitForResponse(
+    (response) =>
+      response.url().includes("/api/event-admin/hub?") && response.request().method() === "GET",
+  );
+  await lockedDaySelector.selectOption({ value: firstSelectedGameDay });
+  await lockedFirstDayHub;
+  const lockedCurrentDayHub = eventAdminPage.waitForResponse(
+    (response) =>
+      response.url().includes("/api/event-admin/hub?") && response.request().method() === "GET",
+  );
+  await lockedDaySelector.selectOption({ value: pitchManagerGameDayId });
+  await lockedCurrentDayHub;
+  await eventAdminPage.locator("#locked-game-id").selectOption(lockedEventGameId);
+  await eventAdminPage.locator("#locked-operation-id").fill("browser-correction-1");
+  await eventAdminPage.locator("#locked-end-state").fill(
+    JSON.stringify({
+      scoreByGameSide: {
+        [lockedGameSides.sideAId]: 1,
+        [lockedGameSides.sideBId]: 0,
+      },
+      winnerGameSideId: lockedGameSides.sideAId,
+      flagCatchingGameSideId: null,
+      catchTimeMs: null,
+      endTimeMs: 1_000,
+      gameTimeMs: 0,
+    }),
+  );
+  const lockedCorrectionPreviewResponse = eventAdminPage.waitForResponse(
+    (response) =>
+      response.url().endsWith("/locked-correction/preview") &&
+      response.request().method() === "POST",
+  );
+  await eventAdminPage.getByRole("button", { name: "Preview Locked Game Correction" }).click();
+  assert(
+    (await lockedCorrectionPreviewResponse).status() === 200,
+    "browser locked correction preview failed",
+  );
+  await eventAdminPage.getByText(/Preview ready/u).waitFor();
+  const lockedCorrectionResponse = eventAdminPage.waitForResponse(
+    (response) =>
+      response.url().endsWith("/locked-correction") && response.request().method() === "POST",
+  );
+  await eventAdminPage.getByRole("button", { name: "Confirm Official Override" }).click();
+  const lockedCorrectionResponseValue = await lockedCorrectionResponse;
+  assert(
+    lockedCorrectionResponseValue.status() === 200,
+    `browser locked correction confirmation failed: ${await lockedCorrectionResponseValue.text()}`,
+  );
+  await eventAdminPage.locator("#locked-operation-id").fill("browser-reopen-1");
+  const lockedReopenPreviewResponse = eventAdminPage.waitForResponse(
+    (response) =>
+      response.url().endsWith("/reopen/preview") && response.request().method() === "POST",
+  );
+  await eventAdminPage.getByRole("button", { name: "Preview Game Reopening" }).click();
+  const lockedReopenPreviewResponseValue = await lockedReopenPreviewResponse;
+  assert(
+    lockedReopenPreviewResponseValue.status() === 200,
+    `browser Game Reopening preview failed: ${await lockedReopenPreviewResponseValue.text()}`,
+  );
+  await eventAdminPage.getByText(/Preview ready/u).waitFor();
+  const lockedReopenResponse = eventAdminPage.waitForResponse(
+    (response) => response.url().endsWith("/reopen") && response.request().method() === "POST",
+  );
+  await eventAdminPage.getByRole("button", { name: "Confirm Game Reopening" }).click();
+  const lockedReopenResponseValue = await lockedReopenResponse;
+  assert(
+    lockedReopenResponseValue.status() === 200,
+    `browser Game Reopening confirmation failed: ${await lockedReopenResponseValue.text()}`,
+  );
+  const freshQrOpen = await postJsonBodyFromPage(
+    lockedControlPage,
+    `${origin}/api/event-control/open`,
+    {
+      qrCredential: lockedQrCredential,
+      browserContext: "browser-locked-fresh-qr",
+    },
+  );
+  assert(freshQrOpen.status === 200, "reopened browser Game did not admit through existing QR");
+  const freshCodeCreate = await postJsonBodyFromPage(
+    eventAdminPage,
+    `${origin}${lockedControlGrantPath}/code`,
+    {},
+  );
+  const freshCodePayload = JSON.parse(freshCodeCreate.body) as { value?: { code?: string } };
+  assert(
+    freshCodeCreate.status === 200 && freshCodePayload.value?.code !== undefined,
+    "reopened browser Game did not create a fresh code",
+  );
+  const freshCodeOpen = await postJsonBodyFromPage(
+    lockedControlPage,
+    `${origin}/api/event-control/open`,
+    {
+      grantCode: freshCodePayload.value?.code ?? "",
+      browserContext: "browser-locked-fresh-code",
+    },
+  );
+  assert(freshCodeOpen.status === 200, "reopened browser Game fresh code admission failed");
+  const sessionCookieBeforeAuditRead = (await eventAdminContext.cookies()).find(
+    (cookie) => cookie.name === "__Host-event-admin-session",
+  );
+  const linkedEventAudit = await eventAdminContext.request.get(
+    `${origin}/api/event-admin/audit?eventId=${eventId}&projection=event-administration&limit=100`,
+  );
+  const linkedGrantAudit = await eventAdminContext.request.get(
+    `${origin}/api/event-admin/audit?eventId=${eventId}&projection=grant&limit=100`,
+  );
+  const linkedEventAuditText = await linkedEventAudit.text();
+  const linkedGrantAuditText = await linkedGrantAudit.text();
+  assert(
+    linkedEventAudit.status() === 200 &&
+      linkedEventAuditText.includes("locked-game-corrected") &&
+      linkedEventAuditText.includes("game-reopened") &&
+      !linkedEventAuditText.includes("beforeValue") &&
+      linkedGrantAudit.status() === 200 &&
+      linkedGrantAuditText.includes("control-action-accepted") &&
+      !linkedGrantAuditText.includes("beforeValue"),
+    "browser locked-game linked audit evidence was not redacted",
+  );
+  await oldCodeContext.close();
+  await lockedControlPage.close();
   const sessionCookieAfterRefresh = (await eventAdminContext.cookies()).find(
     (cookie) => cookie.name === "__Host-event-admin-session",
   );
   assert(
-    sessionCookieBeforeRefresh !== undefined &&
+    sessionCookieBeforeAuditRead !== undefined &&
       sessionCookieAfterRefresh !== undefined &&
-      sessionCookieAfterRefresh.expires === sessionCookieBeforeRefresh.expires &&
-      sessionCookieAfterRefresh.value === sessionCookieBeforeRefresh.value,
+      sessionCookieAfterRefresh.expires === sessionCookieBeforeAuditRead.expires &&
+      sessionCookieAfterRefresh.value === sessionCookieBeforeAuditRead.value,
     "Event Admin projection changed the rolling session cookie",
   );
   const wrongEventResponse = await fetchFromPage(
@@ -2545,6 +2871,213 @@ async function postJsonBodyFromPage(page: Page, url: string, body: Record<string
     },
     { requestUrl: url, requestBody: body },
   );
+}
+
+async function postJsonValueFromPage(page: Page, url: string, body: unknown) {
+  return page.evaluate(
+    async ({ requestUrl, requestBody }) => {
+      const response = await fetch(requestUrl, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(requestBody),
+      });
+      return { status: response.status, body: await response.text() };
+    },
+    { requestUrl: url, requestBody: body },
+  );
+}
+
+async function seedLockedBrowserGame(input: {
+  eventId: string;
+  gameDayId: string;
+  eventGameId: string;
+  pitchId: string;
+  pitchSlotId: string;
+}) {
+  const storage = openSqliteFoundationStorage(environment.FOUNDATION_DATABASE!, {
+    grantKeyRing: readGrantAuthorityOptions("test", environment).keyRing,
+  });
+  createEventGameRecord(storage, {
+    externalScopeResolver: {
+      resolve(scope, snapshot) {
+        const root = snapshot.findRootByPitchSlotId(scope.pitchSlotId);
+        return root === null
+          ? { status: "mismatch", detail: "Browser locked Event Game scope is unavailable." }
+          : { status: "resolved", scope };
+      },
+      resolveEventTeam() {
+        return { status: "resolved" };
+      },
+    },
+    interpreter: createLiveEventGameIqaInterpreter(),
+  });
+  const catalogGame = await storage.transaction((transaction) =>
+    transaction.findEventGame(input.eventGameId),
+  );
+  if (
+    catalogGame === null ||
+    catalogGame.sideA.eventTeamId === null ||
+    catalogGame.sideB.eventTeamId === null
+  )
+    throw new Error("Browser locked Event Game team confirmation was not durable.");
+  const createdAtMs = Date.now() - 60_000;
+  const root: EventGameRecordRoot = {
+    recordId: `browser-locked-record-${input.eventGameId}`,
+    eventId: input.eventId,
+    eventGameId: input.eventGameId,
+    ownership: { eventId: input.eventId, eventGameId: input.eventGameId },
+    externalScope: {
+      eventId: input.eventId,
+      gameDayId: input.gameDayId,
+      pitchId: input.pitchId,
+      pitchSlotId: input.pitchSlotId,
+    },
+    gameSides: [
+      {
+        id: catalogGame.sideA.sideId,
+        eventTeamId: catalogGame.sideA.eventTeamId,
+        teamInterpretationRef: catalogGame.sideA.eventTeamId,
+      },
+      {
+        id: catalogGame.sideB.sideId,
+        eventTeamId: catalogGame.sideB.eventTeamId,
+        teamInterpretationRef: catalogGame.sideB.eventTeamId,
+      },
+    ],
+    lifecycle: {
+      phase: "in-progress",
+      commencedAtMs: createdAtMs,
+      finishedAtMs: null,
+      lockedAtMs: null,
+      lockReason: null,
+    },
+    compatibility: {
+      recordVersion: "event-game-record-v1",
+      schemaVersion: "event-game-record-v1",
+      interpreterVersion: "live-event-iqa-v1",
+    },
+    creationEvidence: {
+      operationId: `browser-locked-create-${input.eventGameId}`,
+      actorReference: "technical-admin-browser",
+      source: "event-game-registration",
+      createdAtMs,
+    },
+  };
+  const resolver: ExternalScopeResolver = {
+    resolve(scope, snapshot) {
+      const pitchSlot = snapshot.findPitchSlot?.(scope.pitchSlotId);
+      return pitchSlot?.eventId === scope.eventId &&
+        pitchSlot.gameDayId === scope.gameDayId &&
+        pitchSlot.pitchId === scope.pitchId
+        ? { status: "resolved", scope }
+        : { status: "mismatch", detail: "Browser locked Event Game scope is unavailable." };
+    },
+    resolveEventTeam() {
+      return { status: "resolved" };
+    },
+  };
+  try {
+    const record = createEventGameRecord(storage, {
+      externalScopeResolver: resolver,
+      interpreter: createLiveEventGameIqaInterpreter(),
+      clock: () => Date.now(),
+    });
+    const registered = await record.registerRoot(root);
+    if (registered.status !== "registered")
+      throw new Error("Browser locked root registration failed.");
+    const forfeit = await record.acceptAction({
+      recordId: root.recordId,
+      eventGameId: root.eventGameId,
+      operationId: `browser-locked-forfeit-${input.eventGameId}`,
+      kind: { id: "game-fact", version: "1" },
+      payload: {
+        factId: `browser-locked-forfeit-${input.eventGameId}`,
+        factType: "forfeit",
+        gameSideId: catalogGame.sideB.sideId,
+        gameTimeMs: 0,
+        data: { resultKind: "forfeit", sportingOrder: 0 },
+      },
+      causalPredecessorIds: [],
+      occurrence: {
+        trustedAtMs: createdAtMs + 1_000,
+        clientOriginAtMs: createdAtMs + 1_000,
+        source: "online",
+      },
+      grant: { sessionId: "browser-seed", versionId: "browser-seed-v1" },
+      lifecycle: root.lifecycle,
+    });
+    if (forfeit.status !== "accepted") throw new Error("Browser locked forfeit seed failed.");
+    const finished = await record.transitionLifecycle({
+      ...root.lifecycle,
+      phase: "finished",
+      finishedAtMs: createdAtMs + 1_000,
+    });
+    if (finished.status !== "updated") throw new Error("Browser locked finish seed failed.");
+  } finally {
+    storage.close();
+  }
+  return { sideAId: catalogGame.sideA.sideId, sideBId: catalogGame.sideB.sideId };
+}
+
+async function lockSeededBrowserGame(input: { eventGameId: string; lockedAtMs: number }) {
+  const grantOptions = readGrantAuthorityOptions("test", environment);
+  const storage = openSqliteFoundationStorage(environment.FOUNDATION_DATABASE!, {
+    grantKeyRing: grantOptions.keyRing,
+    grantValidationContext: { environmentId: "test", keyRing: grantOptions.keyRing },
+  });
+  createEventGameRecord(storage, {
+    externalScopeResolver: {
+      resolve(scope) {
+        return { status: "resolved", scope };
+      },
+      resolveEventTeam() {
+        return { status: "resolved" };
+      },
+    },
+    interpreter: createLiveEventGameIqaInterpreter(),
+  });
+  const options = {
+    ...grantOptions,
+    controlScopeResolver: createControlScopeResolver(() => input.lockedAtMs, false),
+    controlGrantLifecycle: {
+      resolveEventGameLock(evidence: unknown) {
+        if (
+          typeof evidence !== "object" ||
+          evidence === null ||
+          (evidence as { kind?: unknown }).kind !== "event-game-lock" ||
+          (evidence as { eventGameId?: unknown }).eventGameId !== input.eventGameId
+        )
+          return null;
+        return {
+          eventGameId: input.eventGameId,
+          apply(transaction: FoundationStorageTransaction) {
+            const current = transaction.findRootByEventGameId(input.eventGameId);
+            if (current === null) throw new Error("Browser locked root disappeared.");
+            const lockedRoot: EventGameRecordRoot = {
+              ...current,
+              lifecycle: {
+                ...current.lifecycle,
+                lockedAtMs: input.lockedAtMs,
+                lockReason: "finished-inactivity",
+              },
+            };
+            transaction.updateRoot({
+              root: lockedRoot,
+              canonicalContent: canonicalizeEventGameRecordRoot(lockedRoot),
+            });
+          },
+        };
+      },
+    },
+  };
+  const result = await lockControlGrantEventGame(storage, options, {
+    kind: "event-game-lock",
+    eventGameId: input.eventGameId,
+    lockedAtMs: input.lockedAtMs,
+  });
+  if (result.status !== "locked")
+    throw new Error(`Browser locked Event Game transition failed: ${JSON.stringify(result)}`);
+  storage.close();
 }
 
 async function postJsonWithHeadersFromPage(

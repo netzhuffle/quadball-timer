@@ -14,6 +14,7 @@ import {
   type ControlActionCodecRegistry,
   type ControlActionInput,
   type ControlActionInterpretation,
+  type ActionJsonValue,
   type ControlAuditEntry,
   type PreparedControlAction,
 } from "@/lib/event-game-actions";
@@ -642,6 +643,7 @@ export function createAuditEntry(
   context: {
     interpretation?: ControlActionInterpretation;
     relatedOperationIds?: readonly string[];
+    valueChange?: { before: ActionJsonValue; after: ActionJsonValue };
     collision?: {
       acceptedAction: ControlAction;
       acceptedContentFingerprint: string;
@@ -689,6 +691,9 @@ export function createAuditEntry(
       relatedOperationIds: [
         ...(context.collision !== undefined ? [] : (context.relatedOperationIds ?? [])),
       ],
+      ...(context.valueChange === undefined
+        ? {}
+        : { valueChange: structuredClone(context.valueChange) }),
       ordering: {
         trustedAtMs: (acceptedAction ?? input).occurrence.trustedAtMs,
         operationId: (acceptedAction ?? input).operationId,

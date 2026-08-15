@@ -190,6 +190,28 @@ type AccessSheetGenerationAttempt = {
   scopeKey: string;
 };
 
+type LockedGameRequestToken = {
+  eventId: string;
+  gameDayId: string;
+  authority: HubResponse["value"]["authority"] | "none";
+  generation: number;
+  grantToken: GrantSecretToken;
+};
+
+type LockedGamePreview = {
+  operation: "locked-game-correction" | "game-reopening";
+  fingerprint: string;
+  impact: {
+    facts: string;
+    lifecycle: { from: string; to: string; lock: string };
+    timer: string;
+    authority: { controlGrant: string; qr: string; grantVersion: string };
+    sessions: { category: string; count: number };
+    code: { category: string; count: number };
+    queuedDiscard: { category: string; count: number };
+  };
+};
+
 function useAccessSheetArtifactOwner(scope: AccessSheetArtifactScope) {
   const scopeKey = JSON.stringify(scope);
   const sequenceRef = useRef(0);
@@ -278,6 +300,12 @@ export function EventAdminPage({
   const [pitchManagerGameDayId, setPitchManagerGameDayId] = useState("");
   const [message, setMessage] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [lockedGameId, setLockedGameId] = useState("");
+  const [lockedOperationId, setLockedOperationId] = useState("");
+  const [lockedEndState, setLockedEndState] = useState(
+    '{\n  "scoreByGameSide": {},\n  "winnerGameSideId": null,\n  "flagCatchingGameSideId": null,\n  "catchTimeMs": null,\n  "endTimeMs": null\n}',
+  );
+  const [lockedGamePreview, setLockedGamePreview] = useState<LockedGamePreview | null>(null);
   const [teamName, setTeamName] = useState("");
   const [teamColor, setTeamColor] = useState("#00afe8");
   const [pitchName, setPitchName] = useState("");
@@ -344,6 +372,8 @@ export function EventAdminPage({
     type: accessSheetType,
   });
   const [secretOwner] = useState(createGrantSecretOwner);
+  const lockedGameRequestGeneration = useRef(0);
+  const lockedGameRequestToken = useRef<LockedGameRequestToken | null>(null);
 
   const secretScopeKey = (
     nextEventId = eventId,
@@ -355,6 +385,38 @@ export function EventAdminPage({
 
   const gameDayScopeKey = (nextEventId = eventId, nextGameDayId = selectedGameDayId) =>
     `event-admin-game-day:${nextEventId}:${nextGameDayId ?? "none"}`;
+
+  const invalidateLockedGameRequest = () => {
+    lockedGameRequestGeneration.current += 1;
+    const current = lockedGameRequestToken.current;
+    if (current !== null) secretOwner.invalidate(current.grantToken.scopeKey);
+    lockedGameRequestToken.current = null;
+    setLockedGamePreview(null);
+  };
+
+  const captureLockedGameRequest = (): LockedGameRequestToken | null => {
+    const currentEventId = eventId.trim();
+    if (currentEventId.length === 0 || selectedGameDayId === null) return null;
+    const existing = lockedGameRequestToken.current;
+    if (existing !== null && secretOwner.current(existing.grantToken)) return existing;
+    const grantToken = secretOwner.capture(hubScopeKey());
+    const next: LockedGameRequestToken = {
+      eventId: currentEventId,
+      gameDayId: selectedGameDayId,
+      authority: (hub?.authority ?? "none") as LockedGameRequestToken["authority"],
+      generation: lockedGameRequestGeneration.current,
+      grantToken,
+    };
+    lockedGameRequestToken.current = next;
+    return next;
+  };
+
+  const lockedGameRequestCurrent = (token: LockedGameRequestToken) =>
+    token.generation === lockedGameRequestGeneration.current &&
+    token.eventId === eventId.trim() &&
+    token.gameDayId === selectedGameDayId &&
+    token.authority === (hub?.authority ?? "none") &&
+    secretOwner.current(token.grantToken);
 
   const clearGrantSecrets = () => {
     setCredential("");
@@ -372,6 +434,7 @@ export function EventAdminPage({
   };
 
   const invalidateGrantSecrets = () => {
+    invalidateLockedGameRequest();
     accessSheetOwner.invalidate();
     secretOwner.invalidate(secretScopeKey());
     secretOwner.invalidate(gameDayScopeKey());
@@ -380,6 +443,7 @@ export function EventAdminPage({
   };
 
   const changeEventId = (nextEventId: string) => {
+    invalidateLockedGameRequest();
     invalidateGrantSecrets();
     setHub(null);
     setSelectedGameDayId(null);
@@ -417,6 +481,8 @@ export function EventAdminPage({
     setGameDesignation("");
     setSideASource("");
     setSideBSource("");
+    setLockedGameId("");
+    setLockedOperationId("");
     setPublicationImpactConfirmed(false);
     setEventId(nextEventId);
   };
@@ -461,6 +527,10 @@ export function EventAdminPage({
     },
     [secretOwner],
   );
+
+  useEffect(() => {
+    invalidateLockedGameRequest();
+  }, [eventId, selectedGameDayId, hub?.authority]);
 
   const loadHub = async (nextGameDayId = selectedGameDayId, providedToken?: GrantSecretToken) => {
     accessSheetOwner.invalidate();
@@ -1385,6 +1455,130 @@ export function EventAdminPage({
     await loadHub(selectedGameDayId, token);
   };
 
+  const previewLockedGame = async (operation: LockedGamePreview["operation"]) => {
+    if (lockedGameId.trim().length === 0) throw new Error("Choose an Event Game.");
+    if (lockedOperationId.trim().length === 0) throw new Error("Enter an operation ID.");
+    if (selectedGameDayId === null) throw new Error("Choose a Game Day.");
+    let endState: unknown = undefined;
+    if (operation === "locked-game-correction") {
+      try {
+        endState = JSON.parse(lockedEndState);
+      } catch {
+        throw new Error("End state must be valid JSON.");
+      }
+    }
+    const token = captureLockedGameRequest();
+    if (token === null) return;
+    try {
+      const previewPath =
+        operation === "locked-game-correction" ? "locked-correction/preview" : "reopen/preview";
+      const response = await fetch(
+        `/api/event-admin/events/${token.eventId}/game-days/${token.gameDayId}/event-games/${lockedGameId}/${previewPath}`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            operationId: lockedOperationId,
+            ...(operation === "locked-game-correction" ? { endState } : {}),
+          }),
+        },
+      );
+      const payload = (await response.json()) as {
+        status?: string;
+        value?: LockedGamePreview;
+        detail?: string;
+        message?: string;
+      };
+      if (!lockedGameRequestCurrent(token)) return;
+      if (!response.ok || payload.status !== "accepted" || payload.value === undefined)
+        throw new Error(payload.detail ?? payload.message ?? "Locked Game preview failed.");
+      setLockedGamePreview(payload.value);
+    } catch (error) {
+      if (lockedGameRequestCurrent(token)) throw error;
+    }
+  };
+
+  const correctLockedGame = async (overrideConfirmed: boolean) => {
+    if (lockedGamePreview?.operation !== "locked-game-correction")
+      throw new Error("Preview the Locked Game Correction before confirming it.");
+    if (lockedGameId.trim().length === 0) throw new Error("Choose an Event Game.");
+    if (lockedOperationId.trim().length === 0) throw new Error("Enter an operation ID.");
+    let endState: unknown;
+    try {
+      endState = JSON.parse(lockedEndState);
+    } catch {
+      throw new Error("End state must be valid JSON.");
+    }
+    const token = captureLockedGameRequest();
+    if (token === null) return;
+    try {
+      const response = await fetch(
+        `/api/event-admin/events/${token.eventId}/game-days/${token.gameDayId}/event-games/${lockedGameId}/locked-correction`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            operationId: lockedOperationId,
+            endState,
+            overrideConfirmed,
+            previewFingerprint: lockedGamePreview.fingerprint,
+          }),
+        },
+      );
+      const payload = (await response.json()) as {
+        status?: string;
+        detail?: string;
+        message?: string;
+      };
+      if (!lockedGameRequestCurrent(token)) return;
+      if (!response.ok || payload.status !== "accepted")
+        throw new Error(payload.detail ?? payload.message ?? "Locked Game correction failed.");
+      if (!lockedGameRequestCurrent(token)) return;
+      await loadHub(token.gameDayId, token.grantToken);
+      if (!lockedGameRequestCurrent(token)) return;
+      setLockedGamePreview(null);
+    } catch (error) {
+      if (lockedGameRequestCurrent(token)) throw error;
+    }
+  };
+
+  const reopenLockedGame = async () => {
+    if (lockedGamePreview?.operation !== "game-reopening")
+      throw new Error("Preview Game Reopening before confirming it.");
+    if (lockedGameId.trim().length === 0) throw new Error("Choose an Event Game.");
+    if (lockedOperationId.trim().length === 0) throw new Error("Enter an operation ID.");
+    if (selectedGameDayId === null) throw new Error("Choose a Game Day.");
+    const token = captureLockedGameRequest();
+    if (token === null) return;
+    try {
+      const response = await fetch(
+        `/api/event-admin/events/${token.eventId}/game-days/${token.gameDayId}/event-games/${lockedGameId}/reopen`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            operationId: lockedOperationId,
+            previewFingerprint: lockedGamePreview.fingerprint,
+          }),
+        },
+      );
+      const payload = (await response.json()) as {
+        status?: string;
+        detail?: string;
+        message?: string;
+      };
+      if (!lockedGameRequestCurrent(token)) return;
+      if (!response.ok || payload.status !== "accepted")
+        throw new Error(payload.detail ?? payload.message ?? "Game Reopening failed.");
+      if (!lockedGameRequestCurrent(token)) return;
+      await loadHub(token.gameDayId, token.grantToken);
+      if (!lockedGameRequestCurrent(token)) return;
+      setLockedGamePreview(null);
+    } catch (error) {
+      if (lockedGameRequestCurrent(token)) throw error;
+    }
+  };
+
   useEffect(() => {
     if (eventId.length > 0) void loadHub().catch(() => undefined);
   }, []);
@@ -1507,6 +1701,127 @@ export function EventAdminPage({
                 </p>
               </div>
               <AdministrativeAuditBrowser eventId={hub.event.eventId} route="event-admin" />
+              <div className="space-y-3 rounded-lg border p-3">
+                <div>
+                  <p className="font-semibold">Locked Event Game administration</p>
+                  <p className="text-xs text-muted-foreground">
+                    Correct settled facts while retaining the lock, or reopen the game for fresh
+                    control admission. One confirmation is required when the end state is
+                    inconsistent with ordinary scoring rules.
+                  </p>
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="locked-game-id">Event Game</Label>
+                  <select
+                    id="locked-game-id"
+                    className="border-input bg-background h-10 w-full rounded-md border px-3 text-sm"
+                    value={lockedGameId}
+                    onChange={(event) => {
+                      setLockedGameId(event.currentTarget.value);
+                      setLockedGamePreview(null);
+                    }}
+                  >
+                    <option value="">Choose an Event Game</option>
+                    {hub.event.eventGames.map((game) => (
+                      <option key={game.eventGameId} value={game.eventGameId}>
+                        {game.gameDesignation ?? game.gameCode ?? game.eventGameId}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="locked-operation-id">Operation ID</Label>
+                  <Input
+                    id="locked-operation-id"
+                    value={lockedOperationId}
+                    onChange={(event) => {
+                      setLockedOperationId(event.currentTarget.value);
+                      setLockedGamePreview(null);
+                    }}
+                    onInput={(event) => {
+                      setLockedOperationId(event.currentTarget.value);
+                      setLockedGamePreview(null);
+                    }}
+                    placeholder="unique correction or reopening ID"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="locked-end-state">Corrected end state (JSON)</Label>
+                  <textarea
+                    id="locked-end-state"
+                    className="border-input bg-background min-h-36 w-full rounded-md border p-3 font-mono text-xs"
+                    value={lockedEndState}
+                    onChange={(event) => {
+                      setLockedEndState(event.currentTarget.value);
+                      setLockedGamePreview(null);
+                    }}
+                    onInput={(event) => {
+                      setLockedEndState(event.currentTarget.value);
+                      setLockedGamePreview(null);
+                    }}
+                  />
+                </div>
+                {lockedGamePreview !== null ? (
+                  <div className="space-y-1 rounded-md bg-muted p-3 text-xs">
+                    <p className="font-semibold">
+                      Preview ready ·{" "}
+                      {lockedGamePreview.operation === "game-reopening" ? "reopen" : "correction"}
+                    </p>
+                    <p>
+                      Facts: {lockedGamePreview.impact.facts}; lifecycle:{" "}
+                      {lockedGamePreview.impact.lifecycle.from} →{" "}
+                      {lockedGamePreview.impact.lifecycle.to}; lock:{" "}
+                      {lockedGamePreview.impact.lifecycle.lock}.
+                    </p>
+                    <p>
+                      Timer: {lockedGamePreview.impact.timer}; terminated sessions:{" "}
+                      {lockedGamePreview.impact.sessions.count}; queued discard evidence:{" "}
+                      {lockedGamePreview.impact.queuedDiscard.count}.
+                    </p>
+                  </div>
+                ) : null}
+                <div className="flex flex-wrap gap-2">
+                  <Button
+                    type="button"
+                    disabled={busy}
+                    onClick={() => void run(() => previewLockedGame("locked-game-correction"))}
+                  >
+                    Preview Locked Game Correction
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    disabled={busy || lockedGamePreview?.operation !== "locked-game-correction"}
+                    onClick={() => void run(() => correctLockedGame(true))}
+                  >
+                    Confirm Official Override
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    disabled={busy || lockedGamePreview?.operation !== "locked-game-correction"}
+                    onClick={() => void run(() => correctLockedGame(false))}
+                  >
+                    Confirm Locked Game Correction
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    disabled={busy}
+                    onClick={() => void run(() => previewLockedGame("game-reopening"))}
+                  >
+                    Preview Game Reopening
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    disabled={busy || lockedGamePreview?.operation !== "game-reopening"}
+                    onClick={() => void run(reopenLockedGame)}
+                  >
+                    Confirm Game Reopening
+                  </Button>
+                </div>
+              </div>
               <div className="space-y-3 rounded-lg border p-3">
                 <div>
                   <p className="font-semibold">Unused catalog removal</p>
@@ -1649,6 +1964,7 @@ export function EventAdminPage({
                   value={selectedGameDayId ?? ""}
                   onChange={(event) => {
                     const next = event.target.value || null;
+                    invalidateLockedGameRequest();
                     invalidateGrantSecrets();
                     setSelectedGameDayId(next);
                     void run(async () => {

@@ -62,7 +62,7 @@ export const SYSTEM_TIMEOUT_COMPLETION_GRANT: Readonly<{
   versionId: "system-v1",
 });
 
-export type ControlActionOrigin = "controller" | "system-heat-stoppage";
+export type ControlActionOrigin = "controller" | "system-heat-stoppage" | "event-admin";
 
 export type ControlActionLifecycleContext = {
   phase: EventGameLifecyclePhase;
@@ -169,6 +169,7 @@ export type ControlAuditLinkage = {
     operationId: string;
   } | null;
   grantAuditId?: string | null;
+  valueChange?: { before: ActionJsonValue; after: ActionJsonValue };
   acceptanceId?: string | null;
   /** Acceptance-owned candidate identity, paired independently from Grant evidence. */
   contentFingerprint?: string;
@@ -350,11 +351,14 @@ export function validateControlActionEnvelope(
   const originResult: ValidationResult<ControlActionOrigin | undefined> =
     input.origin === undefined
       ? valid(undefined)
-      : input.origin === "controller" || input.origin === "system-heat-stoppage"
+      : input.origin === "controller" ||
+          input.origin === "system-heat-stoppage" ||
+          input.origin === "event-admin"
         ? valid(input.origin)
         : invalid("origin is unsupported.");
   const grant =
-    input.origin === "system-heat-stoppage" && input.grant === null
+    (input.origin === "system-heat-stoppage" || input.origin === "event-admin") &&
+    input.grant === null
       ? valid(null)
       : validateGrant(input.grant);
   const lifecycle = validateLifecycle(input.lifecycle);
@@ -492,12 +496,15 @@ export function prepareControlAction(
   const originResult: ValidationResult<ControlActionOrigin | undefined> =
     input.origin === undefined
       ? valid(undefined)
-      : input.origin === "controller" || input.origin === "system-heat-stoppage"
+      : input.origin === "controller" ||
+          input.origin === "system-heat-stoppage" ||
+          input.origin === "event-admin"
         ? valid(input.origin)
         : invalid("origin is unsupported.");
   if (!originResult.ok) return originResult;
   const grantResult =
-    input.origin === "system-heat-stoppage" && input.grant === null
+    (input.origin === "system-heat-stoppage" || input.origin === "event-admin") &&
+    input.grant === null
       ? valid(null)
       : validateGrant(input.grant);
   if (!grantResult.ok) return grantResult;

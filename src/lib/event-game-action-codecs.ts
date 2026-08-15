@@ -596,11 +596,14 @@ export function validateStoredInput(
   const origin: ValidationResult<ControlActionOrigin | undefined> =
     value.origin === undefined
       ? valid(undefined)
-      : value.origin === "controller" || value.origin === "system-heat-stoppage"
+      : value.origin === "controller" ||
+          value.origin === "system-heat-stoppage" ||
+          value.origin === "event-admin"
         ? valid(value.origin)
         : invalid("origin is unsupported.");
   const grant =
-    value.origin === "system-heat-stoppage" && value.grant === null
+    (value.origin === "system-heat-stoppage" || value.origin === "event-admin") &&
+    value.grant === null
       ? valid(null)
       : validateGrant(value.grant);
   const lifecycle = validateLifecycle(value.lifecycle);

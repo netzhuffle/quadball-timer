@@ -1295,6 +1295,86 @@ async function startServer() {
             );
           },
         },
+        "/api/event-admin/events/:eventId/game-days/:gameDayId/event-games/:eventGameId/locked-correction":
+          {
+            async POST(req: Request) {
+              if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
+              const authority = resolveEventAdministrationAuthority(req, technicalAdminAuth);
+              if (authority === null) return sensitiveGenericAuthFailure(401);
+              const body = await readJsonRecord(req);
+              if (body === null) return sensitiveEventAdministrationResponse(invalidEventBody());
+              const path = new URL(req.url).pathname.split("/");
+              const result = await eventAdministration.correctLockedEventGame(
+                path[4] ?? "",
+                path[8] ?? "",
+                {
+                  operationId: body.operationId,
+                  endState: body.endState,
+                  overrideConfirmed: body.overrideConfirmed,
+                  previewFingerprint: body.previewFingerprint,
+                },
+                authority,
+              );
+              await liveEventRuntime?.control.reconcileActiveControllerSessions();
+              return sensitiveEventAdministrationMutationResponse(result, authority);
+            },
+          },
+        "/api/event-admin/events/:eventId/game-days/:gameDayId/event-games/:eventGameId/locked-correction/preview":
+          {
+            async POST(req: Request) {
+              if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
+              const authority = resolveEventAdministrationAuthority(req, technicalAdminAuth);
+              if (authority === null) return sensitiveGenericAuthFailure(401);
+              const body = await readJsonRecord(req);
+              if (body === null) return sensitiveEventAdministrationResponse(invalidEventBody());
+              const path = new URL(req.url).pathname.split("/");
+              return sensitiveEventAdministrationResponse(
+                await eventAdministration.previewLockedEventGameCorrection(
+                  path[4] ?? "",
+                  path[8] ?? "",
+                  { operationId: body.operationId, endState: body.endState },
+                  authority,
+                ),
+              );
+            },
+          },
+        "/api/event-admin/events/:eventId/game-days/:gameDayId/event-games/:eventGameId/reopen": {
+          async POST(req: Request) {
+            if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
+            const authority = resolveEventAdministrationAuthority(req, technicalAdminAuth);
+            if (authority === null) return sensitiveGenericAuthFailure(401);
+            const body = await readJsonRecord(req);
+            if (body === null) return sensitiveEventAdministrationResponse(invalidEventBody());
+            const path = new URL(req.url).pathname.split("/");
+            const result = await eventAdministration.reopenEventGame(
+              path[4] ?? "",
+              path[8] ?? "",
+              { operationId: body.operationId, previewFingerprint: body.previewFingerprint },
+              authority,
+            );
+            await liveEventRuntime?.control.reconcileActiveControllerSessions();
+            return sensitiveEventAdministrationMutationResponse(result, authority);
+          },
+        },
+        "/api/event-admin/events/:eventId/game-days/:gameDayId/event-games/:eventGameId/reopen/preview":
+          {
+            async POST(req: Request) {
+              if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
+              const authority = resolveEventAdministrationAuthority(req, technicalAdminAuth);
+              if (authority === null) return sensitiveGenericAuthFailure(401);
+              const body = await readJsonRecord(req);
+              if (body === null) return sensitiveEventAdministrationResponse(invalidEventBody());
+              const path = new URL(req.url).pathname.split("/");
+              return sensitiveEventAdministrationResponse(
+                await eventAdministration.previewEventGameReopening(
+                  path[4] ?? "",
+                  path[8] ?? "",
+                  { operationId: body.operationId },
+                  authority,
+                ),
+              );
+            },
+          },
         "/api/event-admin/events/:eventId/game-days/:gameDayId/pitches/:pitchId/pitch-manager-grant":
           {
             async GET(req: Request) {

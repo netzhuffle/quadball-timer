@@ -139,6 +139,10 @@ describe("foundation migration ledger compatibility", () => {
         id: "031-heat-stoppage-audit-action",
         checksum: "f11ca907b67bb8cefb1866314513166d0b993e44fa9ccd00bb146d76798d81c8",
       },
+      {
+        id: "032-locked-event-game-administration-audit",
+        checksum: "74a854e145a707a19289ffad838d8428cd0771836f693813fd74a559ad4a4f1e",
+      },
     ]);
   });
 

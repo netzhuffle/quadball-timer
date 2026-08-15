@@ -157,6 +157,19 @@ const eventBHub = {
   },
 };
 
+const lockedGameHub = {
+  ...twoDayEventHub,
+  event: {
+    ...twoDayEventHub.event,
+    eventGames: [
+      {
+        ...identityEventHub.event.eventGames[0]!,
+        gameDesignation: "Opening",
+      },
+    ],
+  },
+};
+
 const eventPitchView = {
   pitch: { pitchId: "pitch", name: "Pitch Main" },
   gameplaySlots: eventHub.event.gameplaySlots,
@@ -444,6 +457,236 @@ describe("Grant secret UI lifecycle", () => {
     expect(container.textContent).not.toContain("Slot 1 ·");
     expect(container.textContent).not.toContain("stale Day A network failure");
     expect(hubGameDays).toEqual([null, "day-two"]);
+  });
+
+  test("Event Admin previews and confirms correction and reopening with separate override", async () => {
+    const requests: { url: string; body: Record<string, unknown> }[] = [];
+    let hubCalls = 0;
+    const correctionPreview = {
+      operation: "locked-game-correction",
+      fingerprint: "correction-preview-v1",
+      impact: {
+        facts: "corrected",
+        lifecycle: { from: "finished", to: "finished", lock: "retained" },
+        timer: "unchanged",
+        authority: { controlGrant: "preserved", qr: "preserved", grantVersion: "preserved" },
+        sessions: { category: "terminated", count: 1 },
+        code: { category: "expired", count: 1 },
+        queuedDiscard: { category: "locked-replay", count: 1 },
+      },
+    };
+    const reopeningPreview = {
+      ...correctionPreview,
+      operation: "game-reopening",
+      fingerprint: "reopening-preview-v1",
+      impact: { ...correctionPreview.impact, facts: "preserved", timer: "restarted" },
+    };
+    fetchHandler = async (input, init) => {
+      const url =
+        typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      const method = init?.method ?? "GET";
+      if (url.endsWith("/api/event-admin/admit"))
+        return json({ status: "admitted", sessionExpiresAtMs: 123_000 });
+      if (url.includes("/api/event-admin/hub")) {
+        hubCalls += 1;
+        if (hubCalls === 1) return json({ status: "rejected" }, 401);
+        return json({ status: "accepted", value: { ...lockedGameHub, selectedGameDayId: "day" } });
+      }
+      if (method === "POST" && url.endsWith("/locked-correction/preview"))
+        return json({ status: "accepted", value: correctionPreview });
+      if (method === "POST" && url.endsWith("/locked-correction")) {
+        requests.push({
+          url,
+          body: JSON.parse(typeof init?.body === "string" ? init.body : "{}") as Record<
+            string,
+            unknown
+          >,
+        });
+        return json({ status: "accepted" });
+      }
+      if (method === "POST" && url.endsWith("/reopen/preview"))
+        return json({ status: "accepted", value: reopeningPreview });
+      if (method === "POST" && url.endsWith("/reopen")) {
+        requests.push({
+          url,
+          body: JSON.parse(typeof init?.body === "string" ? init.body : "{}") as Record<
+            string,
+            unknown
+          >,
+        });
+        return json({ status: "accepted" });
+      }
+      throw new Error(`Unexpected locked-game request: ${method} ${url}`);
+    };
+
+    await render(<EventAdminPage />);
+    await admitEventAdmin();
+    expect((container.querySelector("select#game-day-selector") as HTMLSelectElement).value).toBe(
+      "day",
+    );
+    const gameSelect = container.querySelector("select#locked-game-id") as HTMLSelectElement;
+    await act(async () => {
+      setSelectValue(gameSelect, "game-identity");
+      await flush();
+    });
+    expect(gameSelect.value).toBe("game-identity");
+    await act(async () => {
+      setInputValue(
+        container.querySelector("input#locked-operation-id") as HTMLInputElement,
+        "correct-1",
+      );
+      await flush();
+    });
+    expect((container.querySelector("input#locked-operation-id") as HTMLInputElement).value).toBe(
+      "correct-1",
+    );
+    await act(async () => {
+      setTextareaValue(
+        container.querySelector("textarea#locked-end-state") as HTMLTextAreaElement,
+        JSON.stringify({ scoreByGameSide: { "side-a": 31, "side-b": 20 } }),
+      );
+      await flush();
+    });
+    expect((container.querySelector("select#game-day-selector") as HTMLSelectElement).value).toBe(
+      "day",
+    );
+    await clickButton("Preview Locked Game Correction");
+    await flushAct();
+    expect(container.textContent).toContain("Preview ready · correction");
+    await clickButton("Confirm Official Override");
+    expect(requests[0]).toMatchObject({
+      url: "/api/event-admin/events/event/game-days/day/event-games/game-identity/locked-correction",
+      body: {
+        operationId: "correct-1",
+        previewFingerprint: "correction-preview-v1",
+        overrideConfirmed: true,
+      },
+    });
+
+    await act(async () => {
+      setInputValue(
+        container.querySelector("input#locked-operation-id") as HTMLInputElement,
+        "reopen-1",
+      );
+      await flush();
+    });
+    await clickButton("Preview Game Reopening");
+    expect(container.textContent).toContain("Preview ready · reopen");
+    await clickButton("Confirm Game Reopening");
+    expect(requests[1]).toMatchObject({
+      url: "/api/event-admin/events/event/game-days/day/event-games/game-identity/reopen",
+      body: { operationId: "reopen-1", previewFingerprint: "reopening-preview-v1" },
+    });
+    expect(hubCalls).toBe(4);
+  });
+
+  test("Event Admin suppresses stale correction rejection and reopening network failure across Day and authority", async () => {
+    const pendingCorrection = deferred<Response>();
+    const pendingReopening = deferred<Response>();
+    let hubCalls = 0;
+    fetchHandler = async (input, init) => {
+      const url =
+        typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      const method = init?.method ?? "GET";
+      if (url.includes("/api/event-admin/hub")) {
+        hubCalls += 1;
+        if (hubCalls === 1) return json({ status: "rejected" }, 401);
+        return json({
+          status: "accepted",
+          value: { ...lockedGameHub, selectedGameDayId: hubCalls > 1 ? "day-two" : "day" },
+        });
+      }
+      if (url.endsWith("/api/event-admin/admit"))
+        return json({ status: "admitted", sessionExpiresAtMs: 123_000 });
+      if (method === "POST" && url.endsWith("/locked-correction/preview"))
+        return json({
+          status: "accepted",
+          value: {
+            operation: "locked-game-correction",
+            fingerprint: "stale-correction",
+            impact: {
+              facts: "corrected",
+              lifecycle: { from: "finished", to: "finished", lock: "retained" },
+              timer: "unchanged",
+              authority: { controlGrant: "preserved", qr: "preserved", grantVersion: "preserved" },
+              sessions: { category: "terminated", count: 0 },
+              code: { category: "expired", count: 0 },
+              queuedDiscard: { category: "locked-replay", count: 0 },
+            },
+          },
+        });
+      if (method === "POST" && url.endsWith("/locked-correction")) return pendingCorrection.promise;
+      if (method === "POST" && url.endsWith("/reopen/preview"))
+        return json({
+          status: "accepted",
+          value: {
+            operation: "game-reopening",
+            fingerprint: "stale-reopening",
+            impact: {
+              facts: "preserved",
+              lifecycle: { from: "finished", to: "finished", lock: "removed" },
+              timer: "restarted",
+              authority: { controlGrant: "preserved", qr: "preserved", grantVersion: "preserved" },
+              sessions: { category: "terminated", count: 0 },
+              code: { category: "create-after-reopen", count: 0 },
+              queuedDiscard: { category: "locked-replay", count: 0 },
+            },
+          },
+        });
+      if (method === "POST" && url.endsWith("/reopen")) return pendingReopening.promise;
+      throw new Error(`Unexpected stale locked-game request: ${method} ${url}`);
+    };
+
+    await render(<EventAdminPage />);
+    await admitEventAdmin();
+    const gameSelect = container.querySelector("select#locked-game-id") as HTMLSelectElement;
+    await act(async () => {
+      setSelectValue(gameSelect, "game-identity");
+      await flush();
+    });
+    await act(async () => {
+      setInputValue(
+        container.querySelector("input#locked-operation-id") as HTMLInputElement,
+        "stale-correction",
+      );
+      await flush();
+    });
+    expect((container.querySelector("input#locked-operation-id") as HTMLInputElement).value).toBe(
+      "stale-correction",
+    );
+    await act(async () => {
+      setTextareaValue(
+        container.querySelector("textarea#locked-end-state") as HTMLTextAreaElement,
+        JSON.stringify({ scoreByGameSide: { "side-a": 31 } }),
+      );
+      await flush();
+    });
+    await clickButton("Preview Locked Game Correction");
+    await flushAct();
+    await clickButton("Confirm Locked Game Correction");
+    const daySelector = container.querySelector("select#game-day-selector") as HTMLSelectElement;
+    await act(async () => {
+      setSelectValue(daySelector, "day-two");
+      await flush();
+    });
+    pendingCorrection.resolve(json({ status: "rejected", detail: "stale correction" }, 409));
+    await flushAct();
+    expect(container.textContent).not.toContain("stale correction");
+
+    await act(async () => {
+      setInputValue(
+        container.querySelector("input#locked-operation-id") as HTMLInputElement,
+        "stale-reopening",
+      );
+      await flush();
+    });
+    await clickButton("Preview Game Reopening");
+    await flushAct();
+    await clickButton("Confirm Game Reopening");
+    await clickButton("Change authority");
+    pendingReopening.reject(new Error("stale reopening network"));
+    await flushAct();
+    expect(container.textContent).not.toContain("stale reopening network");
   });
 
   afterEach(async () => {
@@ -1881,6 +2124,16 @@ describe("Grant secret UI lifecycle", () => {
     )?.set;
     setter?.call(select, value);
     select.dispatchEvent(new testWindow.Event("change", { bubbles: true }) as unknown as Event);
+  }
+
+  function setTextareaValue(textarea: HTMLTextAreaElement, value: string) {
+    const setter = Object.getOwnPropertyDescriptor(
+      testWindow.HTMLTextAreaElement.prototype,
+      "value",
+    )?.set;
+    setter?.call(textarea, value);
+    textarea.dispatchEvent(new testWindow.Event("input", { bubbles: true }) as unknown as Event);
+    textarea.dispatchEvent(new testWindow.Event("change", { bubbles: true }) as unknown as Event);
   }
 
   function pitchManagerCodeHandler(
