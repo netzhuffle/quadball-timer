@@ -19,6 +19,7 @@ import {
   createTechnicalAdminAuth,
   type TechnicalAdminAuthority,
 } from "@/lib/technical-admin-auth";
+import type { PublicAudienceClockProjection } from "@/lib/audience-projection";
 
 const directory = mkdtempSync(join(tmpdir(), "quadball-timer-public-browser-"));
 const foundationDatabase = join(directory, "foundation.sqlite");
@@ -127,6 +128,102 @@ try {
       () => document.documentElement.scrollWidth <= document.documentElement.clientWidth,
     ),
     "phone-sized Event schedule overflows horizontally",
+  );
+
+  const spectatorGamePath = `/events/${encodeURIComponent(current.eventId)}/games/browser-fixture`;
+  let browserClockFreshness: PublicAudienceClockProjection["synchronization"] = "stale";
+  await page.route(
+    `${origin}/api/audience/events/${encodeURIComponent(current.eventId)}/games/browser-fixture`,
+    async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          status: "accepted",
+          value: publicGameFixture(current.eventId, browserClockFreshness),
+        }),
+      });
+    },
+  );
+  await page.goto(`${origin}${spectatorGamePath}`);
+  await page.getByRole("heading", { name: "Live Final" }).waitFor();
+  await page.locator("[data-scoreboard-expanded]").waitFor();
+  await page.getByText("Last synchronized:").waitFor();
+  await page.getByText("Target 40").waitFor();
+  await page.getByText("Suspended").first().waitFor();
+  await page.getByText("started · 0:30 remaining · decision pending").waitFor();
+  await page.getByText("Team Timeout").waitFor();
+  await page.getByText("Game Suspension").waitFor();
+  await page.getByText("Heat Stoppage").waitFor();
+  await page.getByText("Winner Side A · Locked").waitFor();
+  const expandedSides = page.locator("[data-scoreboard-expanded] [data-side-id]");
+  assert((await expandedSides.count()) === 2, "expanded scoreboard did not render two sides");
+  assert(
+    (await expandedSides.nth(0).getAttribute("data-side-id")) === "side-b" &&
+      (await expandedSides.nth(1).getAttribute("data-side-id")) === "side-a",
+    "expanded scoreboard reordered sides without stable IDs",
+  );
+  assert(
+    (await expandedSides.nth(0).innerText()).includes("FLAG CATCH") &&
+      !(await expandedSides.nth(1).innerText()).includes("FLAG CATCH"),
+    "expanded scoreboard marked the wrong catching side",
+  );
+  assert(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth <= document.documentElement.clientWidth,
+    ),
+    "phone-sized spectator Game overflows horizontally",
+  );
+  assert(
+    !(await page.locator("[data-scoreboard-expanded]").getAttribute("class"))?.includes("sticky"),
+    "expanded spectator scoreboard remained sticky",
+  );
+  await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+  await page.locator("[data-scoreboard-compact]").waitFor();
+  const compactText = await page.locator("[data-scoreboard-compact]").innerText();
+  for (const value of [
+    "A Very Long Team Name That Must Wrap On A Phone",
+    "Another Very Long Team Name For A Narrow Phone",
+    "40",
+    "30",
+    "2:05",
+    "Stale clock",
+    "Game Phase: Overtime",
+    "Operational status: Suspended",
+    "Schedule: Past",
+    "FLAG CATCH",
+  ]) {
+    assert(compactText.includes(value), `compact scoreboard omitted ${value}`);
+  }
+  assert(
+    (await page.locator("[data-scoreboard-compact]").getAttribute("class"))?.includes("sticky") ===
+      true,
+    "compact spectator scoreboard did not become sticky after scrolling",
+  );
+  const compactSides = page.locator("[data-scoreboard-compact] [data-side-id]");
+  assert((await compactSides.count()) === 2, "compact scoreboard did not render two sides");
+  assert(
+    (await compactSides.nth(0).getAttribute("data-side-id")) === "side-b" &&
+      (await compactSides.nth(1).getAttribute("data-side-id")) === "side-a",
+    "compact scoreboard reordered sides without stable IDs",
+  );
+  assert(
+    (await compactSides.nth(0).innerText()).includes("FLAG CATCH") &&
+      !(await compactSides.nth(1).innerText()).includes("FLAG CATCH"),
+    "compact scoreboard marked the wrong catching side",
+  );
+  for (const [status, label] of [
+    ["synchronized", "Synchronized clock"],
+    ["estimated", "Estimated clock"],
+    ["stale", "Stale clock"],
+    ["unavailable", "Clock unavailable"],
+  ] as const) {
+    browserClockFreshness = status;
+    await page.reload();
+    await page.getByText(label).first().waitFor();
+  }
+  await page.unroute(
+    `${origin}/api/audience/events/${encodeURIComponent(current.eventId)}/games/browser-fixture`,
   );
   const canonicalResponse = await page.goto(`${origin}${current.canonicalPath}`);
   await page.getByRole("heading", { name: "Published Current" }).waitFor();
@@ -245,6 +342,9 @@ try {
       oneCurrentAutoOpen: true,
       multipleCurrentDiscovery: true,
       busyPhoneSchedule: true,
+      spectatorGamePhone: true,
+      spectatorScoreboardCompaction: true,
+      spectatorSportingProjection: true,
       canonicalNavigation: true,
       unavailableHiddenUnknown: true,
       unavailableDatabaseFailure: true,
@@ -279,6 +379,65 @@ type PublicEventFixture = {
   gameDays: string[];
   canonicalPath: string;
 };
+
+function publicGameFixture(
+  eventId: string,
+  synchronization: PublicAudienceClockProjection["synchronization"] = "stale",
+) {
+  return {
+    eventId,
+    gameCode: "BROWSER-1",
+    gameDesignation: "Live Final",
+    scheduledStartMs: Date.now() - 20 * 60_000,
+    expectedStartMs: Date.now() - 18 * 60_000,
+    scheduleStatus: "past",
+    phase: "overtime",
+    operationalStatus: "suspended",
+    pitch: "Pitch 1",
+    sideA: {
+      name: "A Very Long Team Name That Must Wrap On A Phone",
+      color: "#112233",
+      score: 40,
+    },
+    sideB: {
+      name: "Another Very Long Team Name For A Narrow Phone",
+      color: "#445566",
+      score: 30,
+    },
+    overtimeTarget: 40,
+    clock: {
+      gameTimeMs: 125_000,
+      activePenaltyTimeMs: 0,
+      running: false,
+      projectedAtMs: Date.now(),
+      synchronization,
+      lastSynchronizedAtMs: synchronization === "unavailable" ? null : Date.now() - 30_000,
+      cues: {
+        flagRunnerEntry: "passed",
+        seekerWarning: "passed",
+        seekerCountdownMs: null,
+        seekerRelease: "released",
+      },
+    },
+    teamTimeout: { status: "started", side: "side-a", remainingMs: 30_000 },
+    gameSuspension: "suspended",
+    heatStoppage: {
+      status: "started",
+      mode: "enabled",
+      pending: true,
+      allowedDurationMs: 120_000,
+      actualDurationMs: 90_000,
+      remainingMs: 30_000,
+    },
+    flagState: { catchingSide: "side-b" },
+    result: { status: "finished", winner: "side-a", locked: true },
+    presentation: {
+      pitchOrientation: "side-b-left",
+      displayedTeamColors: { sideA: "#112233", sideB: "#445566" },
+    },
+    canonicalPath: `/events/${encodeURIComponent(eventId)}/games/browser-fixture`,
+  };
+}
 
 async function seedDatabase() {
   const foundation = openSqliteFoundationStorage(foundationDatabase, {

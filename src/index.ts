@@ -87,6 +87,10 @@ import {
 } from "@/lib/ad-hoc-games";
 import { readBuiltRuntimeIdentity, readRunningReleaseIdentity } from "@/lib/release-identity";
 import {
+  availableNonControllerCapacity,
+  type ControllerCapacityInput,
+} from "@/lib/controller-capacity";
+import {
   AD_HOC_EVENT_RESERVED_CONNECTION_CAPACITY,
   AD_HOC_EVENT_TOTAL_CONNECTION_CAPACITY,
   AD_HOC_MAX_CONNECTED_CONTROLLERS,
@@ -240,7 +244,7 @@ async function startServer() {
           process.env.EVENT_RESERVED_CONNECTION_CAPACITY,
           AD_HOC_EVENT_RESERVED_CONNECTION_CAPACITY,
         ),
-        activeConnections: () => eventCapacitySource(),
+        activeControllerSessions: () => eventCapacitySource(),
       },
       store:
         environment === "test" && !process.env.AD_HOC_DATABASE?.trim()
@@ -321,7 +325,16 @@ async function startServer() {
     }
 
     const eventCatalog = createEventCatalog(eventCatalogStorage, {});
-    const audienceProjection = createAudienceProjection(eventCatalogStorage);
+    let liveEventRuntime: LiveEventGameRuntime | null = null;
+    const audienceProjection = createAudienceProjection(eventCatalogStorage, {
+      gameInput: {
+        async read(eventGameId) {
+          return liveEventRuntime === null
+            ? { status: "unavailable" as const }
+            : await liveEventRuntime.readAudienceProjectionGameInput(eventGameId);
+        },
+      },
+    });
     let eventAdministration: EventAdministration | null = null;
     let administrativeAuditProjection: AdministrativeAuditProjection | null = null;
     if (foundationStorage !== undefined) {
@@ -347,7 +360,6 @@ async function startServer() {
         eventAdministration = null;
       }
     }
-    let liveEventRuntime: LiveEventGameRuntime | null = null;
     const liveEventDatabasePath = storagePaths.eventGameDatabase;
     const liveEventKeyRing = readLiveEventGrantKeyRing();
     if (liveEventKeyRing !== null) {
@@ -595,16 +607,16 @@ async function startServer() {
 
           const socketId = crypto.randomUUID();
           const totalSocketCapacity = calculateAdHocUpgradeCapacity({
-            eventTotalConnections: readRuntimeCapacity(
+            totalConnections: readRuntimeCapacity(
               process.env.EVENT_TOTAL_CONNECTION_CAPACITY,
               AD_HOC_EVENT_TOTAL_CONNECTION_CAPACITY,
             ),
-            eventReservedConnections: readRuntimeCapacity(
+            reservedConnections: readRuntimeCapacity(
               process.env.EVENT_RESERVED_CONNECTION_CAPACITY,
               AD_HOC_EVENT_RESERVED_CONNECTION_CAPACITY,
             ),
-            activeEventConnections: eventCapacitySource(),
-            adHocSocketCeiling: readRuntimeCapacity(
+            activeControllerSessions: eventCapacitySource(),
+            maxConnectedSockets: readRuntimeCapacity(
               process.env.AD_HOC_MAX_CONNECTED_SOCKETS,
               AD_HOC_MAX_CONNECTED_CONTROLLERS,
             ),
@@ -659,6 +671,11 @@ async function startServer() {
         "/api/audience/events/:eventId": {
           GET(req: Request) {
             return readAudienceEvent(req, audienceProjection);
+          },
+        },
+        "/api/audience/events/:eventId/games/:eventGameId": {
+          GET(req: Request) {
+            return readAudienceGame(req, audienceProjection);
           },
         },
         "/api/audience/events": {
@@ -2538,6 +2555,18 @@ export async function readAudienceEvent(
   return publicAudienceUnavailableResponse();
 }
 
+export async function readAudienceGame(
+  req: Request,
+  projection: Pick<AudienceProjectionReader, "readGame">,
+): Promise<Response> {
+  const segments = new URL(req.url).pathname.split("/");
+  const eventId = decodePathSegment(segments.at(-3));
+  const eventGameId = decodePathSegment(segments.at(-1));
+  const result = await projection.readGame(eventId, eventGameId);
+  if (result.status === "accepted") return sensitiveJson(result);
+  return publicAudienceUnavailableResponse();
+}
+
 export async function readPublicAudienceEventPage(
   req: Request,
   projection: Pick<AudienceProjectionReader, "read">,
@@ -2769,8 +2798,12 @@ function isPublicEventPath(pathname: string): boolean {
 
 function readPathSegment(url: string): string {
   const segment = new URL(url).pathname.split("/").at(-1) ?? "";
+  return decodePathSegment(segment);
+}
+
+function decodePathSegment(segment: string | undefined): string {
   try {
-    return decodeURIComponent(segment);
+    return decodeURIComponent(segment ?? "");
   } catch {
     return "";
   }
@@ -3150,17 +3183,10 @@ function readRuntimeCapacity(value: string | undefined, fallback: number): numbe
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
 }
 
-export function calculateAdHocUpgradeCapacity(input: {
-  eventTotalConnections: number;
-  eventReservedConnections: number;
-  activeEventConnections: number;
-  adHocSocketCeiling: number;
-}): number {
-  const eventTotal = Math.max(0, input.eventTotalConnections);
-  const eventReserve = Math.max(0, input.eventReservedConnections);
-  const activeEvent = Math.max(0, input.activeEventConnections);
-  const adHocCeiling = Math.max(0, input.adHocSocketCeiling);
-  return Math.max(0, Math.min(adHocCeiling, eventTotal - Math.max(eventReserve, activeEvent)));
+export function calculateAdHocUpgradeCapacity(
+  input: ControllerCapacityInput & { maxConnectedSockets: number },
+): number {
+  return availableNonControllerCapacity(input, input.maxConnectedSockets);
 }
 
 function releasePendingSocketReservation(socketId: string) {

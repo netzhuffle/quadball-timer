@@ -717,7 +717,11 @@ describe("Live Event Game control", () => {
     const adHoc = createAdHocGamesService({
       now: () => 1_000,
       maxConnectedSockets: 1,
-      eventCapacity: { totalConnections: 2, reservedConnections: 1, activeConnections: () => 0 },
+      eventCapacity: {
+        totalConnections: 2,
+        reservedConnections: 1,
+        activeControllerSessions: () => 0,
+      },
     });
     const created = await adHoc.create({
       homeName: "Ad Hoc",

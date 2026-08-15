@@ -16,6 +16,10 @@ import {
 } from "@/lib/controller-synchronization";
 import { parseHexColor, DEFAULT_AWAY_TEAM_COLOR, DEFAULT_HOME_TEAM_COLOR } from "@/lib/team-colors";
 import {
+  availableNonControllerCapacity,
+  type ControllerCapacityInput,
+} from "@/lib/controller-capacity";
+import {
   normalizeBoundedText,
   SHARED_LIMITS,
   validateOpaqueIdentifier,
@@ -455,7 +459,7 @@ export type AdHocGamesServiceOptions = {
   eventCapacity?: {
     totalConnections?: number;
     reservedConnections?: number;
-    activeConnections?: () => number;
+    activeControllerSessions?: () => number;
   };
   schedule?: (delayMs: number, task: () => void) => unknown;
 };
@@ -480,7 +484,7 @@ export function createAdHocGamesService(options: AdHocGamesServiceOptions = {}) 
       options.eventCapacity?.totalConnections ?? AD_HOC_EVENT_TOTAL_CONNECTION_CAPACITY,
     reservedConnections:
       options.eventCapacity?.reservedConnections ?? AD_HOC_EVENT_RESERVED_CONNECTION_CAPACITY,
-    activeConnections: options.eventCapacity?.activeConnections ?? (() => 0),
+    activeControllerSessions: options.eventCapacity?.activeControllerSessions ?? (() => 0),
   };
   const schedule =
     options.schedule ??
@@ -531,14 +535,15 @@ export function createAdHocGamesService(options: AdHocGamesServiceOptions = {}) 
         const session = game.sessions.find((candidate) => candidate.sessionHash === sessionKey);
         if (session === undefined) return false;
         if (input.connected && !connections.has(input.connectionId)) {
-          const activeEventConnections = Math.max(0, eventCapacity.activeConnections());
-          const availableForAdHoc = Math.max(
-            0,
-            Math.min(
-              maxConnectedSockets,
-              eventCapacity.totalConnections -
-                Math.max(eventCapacity.reservedConnections, activeEventConnections),
-            ),
+          const activeControllerSessions = Math.max(0, eventCapacity.activeControllerSessions());
+          const capacityInput: ControllerCapacityInput = {
+            totalConnections: eventCapacity.totalConnections,
+            reservedConnections: eventCapacity.reservedConnections,
+            activeControllerSessions,
+          };
+          const availableForAdHoc = availableNonControllerCapacity(
+            capacityInput,
+            maxConnectedSockets,
           );
           if (connections.size >= availableForAdHoc) {
             return { capacity: true, rollback: true } as const;
@@ -1306,18 +1311,16 @@ export function createAdHocGamesService(options: AdHocGamesServiceOptions = {}) 
     genericUnavailableMessage: GENERIC_UNAVAILABLE,
     getResourceMetrics(): AdHocResourceMetrics {
       metrics.connectedControllers = connections.size;
-      const activeEventConnections = Math.max(0, eventCapacity.activeConnections());
+      const activeControllerSessions = Math.max(0, eventCapacity.activeControllerSessions());
+      const capacityInput: ControllerCapacityInput = {
+        totalConnections: eventCapacity.totalConnections,
+        reservedConnections: eventCapacity.reservedConnections,
+        activeControllerSessions,
+      };
       metrics.eventReservedCapacity = {
         configured: eventCapacity.reservedConnections,
-        active: activeEventConnections,
-        availableForAdHoc: Math.max(
-          0,
-          Math.min(
-            maxConnectedSockets,
-            eventCapacity.totalConnections -
-              Math.max(eventCapacity.reservedConnections, activeEventConnections),
-          ),
-        ),
+        active: activeControllerSessions,
+        availableForAdHoc: availableNonControllerCapacity(capacityInput, maxConnectedSockets),
       };
       return { ...metrics };
     },

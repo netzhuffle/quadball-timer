@@ -19,11 +19,21 @@ import {
 } from "@/lib/event-catalog";
 import type { EventGameRecordRoot } from "@/lib/foundation-record-types";
 import { createInMemoryFoundationStorage } from "@/lib/foundation-storage-memory";
+import type { ControllerProjection } from "@/lib/live-event-game-control";
+import { readAudienceProjectionGameInput } from "@/lib/live-event-game-runtime";
 import {
   MemoryTechnicalAdminAuthRepository,
   createTechnicalAdminAuth,
 } from "@/lib/technical-admin-auth";
-import { readAudienceEvent, readAudienceEvents, readAudienceSitemap } from "@/index";
+import {
+  readAudienceEvent,
+  readAudienceEvents,
+  readAudienceGame,
+  readAudienceSitemap,
+} from "@/index";
+import { createInitialClockBaseline, projectClockBaseline } from "@/lib/clock-authority";
+import type { ClockProjection } from "@/lib/clock-authority";
+import { createInitialGamePresentation } from "@/lib/game-presentation-projection";
 
 const authority = createTechnicalAdminAuth(
   { environment: "test", origin: "https://timer.example", rpId: "timer.example" },
@@ -78,6 +88,10 @@ describe("Audience Publication Projection", () => {
       "future",
       "future",
     ]);
+    expect(schedule.scheduleGames.find((game) => game.gameCode === "awaiting")).toMatchObject({
+      scheduleStatus: "awaiting-start",
+      operationalStatus: "scheduled",
+    });
     expect(schedule.focusIndex).toBe(1);
     expect(schedule.runningGames[0]?.pitch).toBe("Pitch 1");
     expect(schedule.runningGames[1]?.pitch).toBe("Pitch 2");
@@ -185,7 +199,7 @@ describe("Audience Publication Projection", () => {
     });
   });
 
-  test("regenerates committed Game State and Pitch reassignment", async () => {
+  test("regenerates committed sporting input and Pitch reassignment", async () => {
     let includeGoal = false;
     let reassigned = false;
     const game = createScheduleGame("mutable", "2026-08-14T10:30:00.000Z", "Pitch 1");
@@ -507,7 +521,503 @@ describe("Audience Publication Projection", () => {
     expect(failureBody).toBe(await absenceResponse.text());
     expect(failureBody).not.toContain("private storage detail");
   });
+
+  test("projects one Published Event Game through the strict public allowlist", async () => {
+    const event = {
+      eventId: "event-public",
+      name: "Public Event",
+      timeZone: "UTC",
+      publicationStatus: "published" as const,
+      createdAtMs: 1,
+      updatedAtMs: 1,
+    };
+    const game = {
+      eventGameId: "event-game-public",
+      eventId: event.eventId,
+      gameDayId: "day-public",
+      gameplaySlotId: "slot-public",
+      pitchSlotId: "pitch-slot-public",
+      gameCode: "A1",
+      gameDesignation: "Semi-final",
+      sideA: {
+        sideId: "catalog-side-a",
+        eventTeamId: "team-a",
+        eventTeamName: "Very Long Home Team Name",
+        sourceLabel: null,
+        confirmedAtMs: 1,
+      },
+      sideB: {
+        sideId: "catalog-side-b",
+        eventTeamId: "team-b",
+        eventTeamName: "Very Long Away Team Name",
+        sourceLabel: null,
+        confirmedAtMs: 1,
+      },
+      createdAtMs: 1,
+      updatedAtMs: 1,
+    };
+    const snapshot = {
+      findEvent: (eventId: string) => (eventId === event.eventId ? event : null),
+      findEventGame: (eventGameId: string) => (eventGameId === game.eventGameId ? game : null),
+      findGameplaySlot: () => ({
+        gameplaySlotId: "slot-public",
+        eventId: event.eventId,
+        gameDayId: "day-public",
+        sequence: 1,
+        scheduledStartMs: 10_000,
+        expectedDelayMs: 2_000,
+        createdAtMs: 1,
+        updatedAtMs: 1,
+      }),
+      findPitchSlot: () => ({
+        pitchSlotId: "pitch-slot-public",
+        eventId: event.eventId,
+        gameDayId: "day-public",
+        pitchId: "pitch-public",
+        gameplaySlotId: "slot-public",
+        sequence: 1,
+        expectedDelayMs: 5_000,
+        createdAtMs: 1,
+        updatedAtMs: 1,
+      }),
+      findPitch: () => ({
+        pitchId: "pitch-public",
+        eventId: event.eventId,
+        name: "Pitch A",
+        createdAtMs: 1,
+        updatedAtMs: 1,
+      }),
+      listPitches: () => [
+        {
+          pitchId: "pitch-public",
+          eventId: event.eventId,
+          name: "Pitch A",
+          createdAtMs: 1,
+          updatedAtMs: 1,
+        },
+        {
+          pitchId: "pitch-public-b",
+          eventId: event.eventId,
+          name: "Pitch B",
+          createdAtMs: 1,
+          updatedAtMs: 1,
+        },
+      ],
+      findEventTeam: (eventTeamId: string) => ({
+        eventTeamId,
+        eventId: event.eventId,
+        name: eventTeamId === "team-a" ? "Very Long Home Team Name" : "Very Long Away Team Name",
+        defaultColor: eventTeamId === "team-a" ? "#112233" : "#445566",
+        createdAtMs: 1,
+        updatedAtMs: 1,
+      }),
+    } as unknown as EventCatalogStorageSnapshot;
+    const clock = projectClockBaseline(
+      { ...createInitialClockBaseline(), gameTimeMs: 12_000, lastAcceptedAtMs: 12_000 },
+      12_000,
+    );
+    const audience = createAudienceProjection(
+      { snapshot: async () => snapshot } as unknown as EventCatalogFoundationStorage,
+      {
+        now: () => 12_000,
+        gameInput: {
+          read: async () => ({
+            status: "accepted" as const,
+            value: {
+              gameSideIds: ["stable-side-a", "stable-side-b"] as const,
+              phase: "seekers-released" as const,
+              operationalStatus: "paused" as const,
+              scoreByGameSide: { "stable-side-a": 10, "stable-side-b": 20 },
+              clock,
+              presentation: {
+                ...createInitialGamePresentation(["stable-side-a", "stable-side-b"], {
+                  "stable-side-a": "#abcdef",
+                  "stable-side-b": "#fedcba",
+                }),
+                pitchOrientation: "side-b-left" as const,
+              },
+              overtimeTarget: null,
+              teamTimeout: { status: "inactive" as const, gameSideId: null, remainingMs: null },
+              heatStoppage: {
+                status: "started" as const,
+                mode: "enabled" as const,
+                pending: true,
+                allowedDurationMs: 120_000,
+                actualDurationMs: 90_000,
+                remainingMs: 30_000,
+              },
+              winnerGameSideId: null,
+              catchingGameSideId: null,
+              locked: false,
+            },
+          }),
+        },
+      },
+    );
+
+    const result = await audience.readGame(event.eventId, game.eventGameId);
+    expect(result).toMatchObject({
+      status: "accepted",
+      value: {
+        eventId: event.eventId,
+        gameCode: "A1",
+        operationalStatus: "paused",
+        phase: "seekers-released",
+        scheduledStartMs: 10_000,
+        expectedStartMs: 15_000,
+        pitch: "Pitch A",
+        sideA: { name: "Very Long Home Team Name", color: "#abcdef", score: 10 },
+        sideB: { name: "Very Long Away Team Name", color: "#fedcba", score: 20 },
+        presentation: {
+          pitchOrientation: "side-b-left",
+          displayedTeamColors: { sideA: "#abcdef", sideB: "#fedcba" },
+        },
+        teamTimeout: { status: "inactive", side: null, remainingMs: null },
+        heatStoppage: {
+          status: "started",
+          mode: "enabled",
+          pending: true,
+          allowedDurationMs: 120_000,
+          actualDurationMs: 90_000,
+          remainingMs: 30_000,
+        },
+        flagState: { catchingSide: null },
+        result: { status: "unfinished", winner: null, locked: false },
+      },
+    });
+    if (result.status !== "accepted") return;
+    const serialized = JSON.stringify(result.value);
+    expect(Object.keys(result.value)).not.toContain("timeout");
+    expect(Object.keys(result.value)).not.toContain("suspension");
+    expect(Object.keys(result.value)).not.toContain("stoppage");
+    expect(Object.keys(result.value)).not.toContain("heat");
+    expect(Object.keys(result.value)).not.toContain("winner");
+    expect(serialized).not.toContain('"caught"');
+    expect(serialized).not.toContain('"flagCatch"');
+    expect(serialized).not.toContain("grant");
+    expect(serialized).not.toContain("session");
+    expect(serialized).not.toContain("action");
+    expect(serialized).not.toContain("audit");
+    expect(serialized).not.toContain("correction");
+    expect(serialized).not.toContain("provenance");
+    expect(serialized).not.toContain("authority");
+    const httpResponse = await readAudienceGame(
+      new Request(
+        `https://timer.example/api/audience/events/${event.eventId}/games/${game.eventGameId}`,
+      ),
+      audience,
+    );
+    expect(httpResponse.status).toBe(200);
+    expect(httpResponse.headers.get("cache-control")).toBe("no-store");
+    expect(await httpResponse.text()).toContain('"status":"accepted"');
+  });
+
+  test("keeps hidden and unknown Event Game routes anonymously absent", async () => {
+    const projection = {
+      readGame: async () => ({ status: "unavailable" as const }),
+    };
+    const responses = await Promise.all(
+      ["hidden", "unknown"].map((eventId) =>
+        readAudienceGame(
+          new Request(`https://timer.example/api/audience/events/${eventId}/games/game-1`),
+          projection,
+        ),
+      ),
+    );
+    expect(responses.map((response) => response.status)).toEqual([404, 404]);
+    const bodies = await Promise.all(responses.map((response) => response.text()));
+    expect(bodies[0]).toBe(bodies[1]);
+    expect(bodies[0]).toBe('{"status":"unavailable"}');
+  });
+
+  test("table-drives the runtime adapter through the one public projector", async () => {
+    const nowMs = Date.parse("2026-08-14T10:00:00.000Z");
+    const game = createScheduleGame("adapter", "2026-08-14T09:30:00.000Z", "Pitch 1");
+    const baseRoot = createScheduleRoot("adapter", "in-progress");
+    const baseSnapshot = createScheduleSnapshot({
+      pitches: ["Pitch 1"],
+      games: [game],
+      roots: new Map([["adapter", baseRoot]]),
+    });
+    const sentinel = {
+      grant: "PRIVATE_GRANT_SENTINEL_135",
+      session: "PRIVATE_SESSION_SENTINEL_135",
+      action: "PRIVATE_ACTION_SENTINEL_135",
+      audit: "PRIVATE_AUDIT_SENTINEL_135",
+      correction: "PRIVATE_CORRECTION_SENTINEL_135",
+      authority: "PRIVATE_AUTHORITY_SENTINEL_135",
+      provenance: "PRIVATE_PROVENANCE_SENTINEL_135",
+    } as const;
+    const cases: readonly {
+      name: string;
+      root?: EventGameRecordRoot;
+      projection: ControllerProjection;
+      expected: Record<string, unknown>;
+      sentinels?: readonly string[];
+    }[] = [
+      {
+        name: "awaiting-start",
+        root: { ...baseRoot, lifecycle: { ...baseRoot.lifecycle, phase: "scheduled" } },
+        projection: createAudienceControllerProjection({ phase: "scheduled" }),
+        expected: { scheduleStatus: "awaiting-start", operationalStatus: "scheduled" },
+      },
+      {
+        name: "running",
+        projection: createAudienceControllerProjection({
+          clock: createAudienceClock({ running: true, synchronization: "synchronized" }),
+        }),
+        expected: { scheduleStatus: "running", operationalStatus: "running" },
+      },
+      {
+        name: "paused-stale",
+        projection: createAudienceControllerProjection({
+          clock: createAudienceClock({ synchronization: "stale" }),
+        }),
+        expected: { operationalStatus: "paused", clock: { synchronization: "stale" } },
+      },
+      {
+        name: "paused-estimated",
+        projection: createAudienceControllerProjection({
+          clock: createAudienceClock({ synchronization: "estimated" }),
+        }),
+        expected: { operationalStatus: "paused", clock: { synchronization: "estimated" } },
+      },
+      {
+        name: "disconnected-clock",
+        projection: createAudienceControllerProjection({
+          clock: createAudienceClock({
+            synchronization: "unavailable",
+            lastSynchronizedAtMs: null,
+          }),
+        }),
+        expected: {
+          operationalStatus: "paused",
+          clock: { synchronization: "unavailable", lastSynchronizedAtMs: null },
+        },
+      },
+      {
+        name: "overtime-target",
+        projection: createAudienceControllerProjection({
+          overtime: true,
+          overtimeTarget: 60,
+        }),
+        expected: { phase: "overtime", overtimeTarget: 60 },
+      },
+      {
+        name: "flag-catch",
+        projection: createAudienceControllerProjection({
+          scoreByGameSide: { "adapter-a": 30, "adapter-b": 20 },
+          winnerGameSideId: "adapter-a",
+          catch: {
+            factId: "catch-fact",
+            catchingGameSideId: "adapter-a",
+            nonCatchingGameSideId: "adapter-b",
+            gameTimeMs: 20 * 60 * 1000,
+            targetScore: 40,
+          },
+        }),
+        expected: {
+          sideA: { score: 30 },
+          sideB: { score: 20 },
+          flagState: { catchingSide: "side-a" },
+          result: { winner: "side-a" },
+        },
+      },
+      {
+        name: "team-timeout",
+        projection: createAudienceControllerProjection({
+          timeout: {
+            status: "started",
+            factId: "timeout-fact",
+            gameSideId: "adapter-b",
+            remainingMs: 15_000,
+          },
+        }),
+        expected: { teamTimeout: { status: "started", side: "side-b", remainingMs: 15_000 } },
+      },
+      {
+        name: "game-suspension",
+        projection: createAudienceControllerProjection({ phase: "suspended" }),
+        expected: {
+          operationalStatus: "suspended",
+          gameSuspension: "suspended",
+        },
+      },
+      {
+        name: "heat-stoppage",
+        projection: createAudienceControllerProjection({
+          heat: {
+            status: "started",
+            factId: "heat-fact",
+            startedAtGameTimeMs: 90_000,
+            nominalDurationMs: 120_000,
+            allowedDurationMs: 120_000,
+            actualDurationMs: 90_000,
+            completionAtTrustedAtMs: nowMs + 30_000,
+            mode: "enabled",
+            pendingTriggerGameTimeMs: null,
+          },
+        }),
+        expected: {
+          heatStoppage: { status: "started", remainingMs: 30_000 },
+        },
+      },
+      {
+        name: "finished-locked",
+        root: {
+          ...baseRoot,
+          lifecycle: { ...baseRoot.lifecycle, phase: "finished", lockedAtMs: nowMs },
+        },
+        projection: createAudienceControllerProjection({
+          phase: "finished",
+          winnerGameSideId: "adapter-b",
+          result: {
+            factId: "result-fact",
+            data: { resultKind: "concession", private: sentinel.correction },
+          },
+        }),
+        expected: {
+          operationalStatus: "finished",
+          result: { status: "finished", winner: "side-b", locked: true },
+        },
+      },
+      {
+        name: "private-source-sentinels",
+        projection: createAudienceControllerProjection({
+          clock: createAudienceClock({
+            baseline: {
+              ...createInitialClockBaseline(),
+              holderGrantSessionId: sentinel.session,
+              lastTransitionOperationId: sentinel.action,
+              staleGenerationOperationIds: [sentinel.authority],
+            },
+          }),
+          timeout: {
+            status: "started",
+            factId: sentinel.grant,
+            gameSideId: "adapter-a",
+            remainingMs: 10_000,
+          },
+          suspension: { status: "suspended", factId: sentinel.correction, snapshot: null },
+          stoppage: { status: "suspension", factId: sentinel.provenance },
+          heat: {
+            status: "started",
+            factId: sentinel.action,
+            startedAtGameTimeMs: 1,
+            nominalDurationMs: 120_000,
+            allowedDurationMs: 120_000,
+            actualDurationMs: 90_000,
+            completionAtTrustedAtMs: nowMs + 30_000,
+            mode: "enabled",
+            pendingTriggerGameTimeMs: null,
+          },
+          result: { factId: sentinel.audit, data: { private: sentinel.authority } },
+          catch: {
+            factId: sentinel.action,
+            catchingGameSideId: "adapter-a",
+            nonCatchingGameSideId: "adapter-b",
+            gameTimeMs: 1,
+            targetScore: 40,
+          },
+          gameFacts: [
+            {
+              factId: sentinel.audit,
+              factType: "private",
+              gameSideId: null,
+              gameTimeMs: null,
+              sportingOrder: 0,
+              synchronizationOrder: 0,
+              effective: true,
+              data: { private: sentinel.session },
+            },
+          ],
+        }),
+        expected: {
+          operationalStatus: "paused",
+          heatStoppage: { remainingMs: 30_000 },
+        },
+        sentinels: Object.values(sentinel),
+      },
+    ];
+
+    for (const scenario of cases) {
+      const input = readAudienceProjectionGameInput(scenario.root ?? baseRoot, scenario.projection);
+      expect(input.status, scenario.name).toBe("accepted");
+      if (input.status !== "accepted") continue;
+      const audience = createAudienceProjection(
+        { snapshot: async () => baseSnapshot } as unknown as EventCatalogFoundationStorage,
+        {
+          now: () => nowMs,
+          gameInput: { read: async () => input },
+        },
+      );
+      const result = await audience.readGame("event-schedule", "adapter");
+      expect(result.status, scenario.name).toBe("accepted");
+      if (result.status !== "accepted") continue;
+      expect(result.value, scenario.name).toMatchObject(scenario.expected);
+      for (const privateSentinel of scenario.sentinels ?? []) {
+        expect(JSON.stringify(scenario.projection)).toContain(privateSentinel);
+        expect(JSON.stringify(result.value)).not.toContain(privateSentinel);
+      }
+    }
+  });
 });
+
+function createAudienceClock(overrides: Partial<ClockProjection> = {}): ClockProjection {
+  const baseline = createInitialClockBaseline();
+  const projection = projectClockBaseline(baseline, 12_000);
+  return {
+    ...projection,
+    ...overrides,
+    baseline: { ...projection.baseline, ...overrides.baseline },
+    cues: { ...projection.cues, ...overrides.cues },
+  };
+}
+
+function createAudienceControllerProjection(
+  overrides: Partial<ControllerProjection> = {},
+): ControllerProjection {
+  return {
+    eventGameId: "adapter",
+    phase: "in-progress",
+    scoreByGameSide: { "adapter-a": 0, "adapter-b": 0 },
+    goalCount: 0,
+    timeout: {
+      status: "inactive",
+      factId: null,
+      gameSideId: null,
+      remainingMs: null,
+    },
+    suspension: { status: "none", factId: null, snapshot: null },
+    stoppage: { status: "none", factId: null },
+    heat: {
+      status: "inactive",
+      factId: null,
+      startedAtGameTimeMs: null,
+      nominalDurationMs: null,
+      mode: "enabled",
+      pendingTriggerGameTimeMs: null,
+    },
+    result: null,
+    overtime: false,
+    overtimeTarget: null,
+    winnerGameSideId: null,
+    catch: null,
+    commencement: {
+      status: "commenced",
+      commencedAtMs: 1,
+      provisionalRunningSinceMs: null,
+      provisionalElapsedMs: 0,
+    },
+    clock: createAudienceClock(),
+    presentation: {
+      gameSideIds: ["adapter-a", "adapter-b"],
+      pitchOrientation: "side-a-left",
+      displayedTeamColors: { "adapter-a": "#112233", "adapter-b": "#445566" },
+    },
+    ...overrides,
+  };
+}
 
 function createScheduleSnapshot(input: {
   pitches: string[];

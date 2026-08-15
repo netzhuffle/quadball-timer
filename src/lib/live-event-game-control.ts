@@ -3330,6 +3330,21 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
     };
   }
 
+  async function readControllerProjection(
+    eventGameId: string,
+  ): Promise<ControllerProjection | null> {
+    try {
+      const owner = await options.resolveEventGameRecord(eventGameId);
+      if (owner === null) return null;
+      const root = await owner.record.readRoot(owner.recordId);
+      return root === null || root.eventGameId !== eventGameId
+        ? null
+        : await readProjection(owner.record, root);
+    } catch {
+      return null;
+    }
+  }
+
   return {
     openController,
     refreshController,
@@ -3361,6 +3376,7 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
     replayControlActions: replayControllerActions,
     submitGamePresentationChange,
     replayGamePresentationChanges,
+    readControllerProjection,
   };
 }
 

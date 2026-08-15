@@ -48,26 +48,26 @@ describe("Ad Hoc HTTP and WebSocket authority boundaries", () => {
   test("caps pre-upgrade Ad Hoc capacity below the configured Event reserve", () => {
     expect(
       calculateAdHocUpgradeCapacity({
-        eventTotalConnections: 5,
-        eventReservedConnections: 2,
-        activeEventConnections: 0,
-        adHocSocketCeiling: 10,
+        totalConnections: 5,
+        reservedConnections: 2,
+        activeControllerSessions: 0,
+        maxConnectedSockets: 10,
       }),
     ).toBe(3);
     expect(
       calculateAdHocUpgradeCapacity({
-        eventTotalConnections: 5,
-        eventReservedConnections: 2,
-        activeEventConnections: 4,
-        adHocSocketCeiling: 10,
+        totalConnections: 5,
+        reservedConnections: 2,
+        activeControllerSessions: 4,
+        maxConnectedSockets: 10,
       }),
     ).toBe(1);
     expect(
       calculateAdHocUpgradeCapacity({
-        eventTotalConnections: 5,
-        eventReservedConnections: 8,
-        activeEventConnections: 0,
-        adHocSocketCeiling: 10,
+        totalConnections: 5,
+        reservedConnections: 8,
+        activeControllerSessions: 0,
+        maxConnectedSockets: 10,
       }),
     ).toBe(0);
   });

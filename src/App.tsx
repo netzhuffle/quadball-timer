@@ -13,7 +13,11 @@ import {
   parseAdHocHandoffHash,
   type AdHocHandoff,
 } from "@/lib/ad-hoc-handoff";
-import { PublicEventHomePage, PublicEventPage } from "@/pages/public-event-page";
+import {
+  PublicEventGamePage,
+  PublicEventHomePage,
+  PublicEventPage,
+} from "@/pages/public-event-page";
 import { TechnicalAdminPage } from "@/pages/technical-admin-page";
 import "./index.css";
 
@@ -25,6 +29,11 @@ type Route =
   | {
       type: "event";
       eventId: string;
+    }
+  | {
+      type: "event-game";
+      eventId: string;
+      eventGameId: string;
     }
   | {
       type: "color-test";
@@ -73,6 +82,10 @@ export function App({
 
   if (route.type === "event") {
     return <PublicEventPage eventId={route.eventId} />;
+  }
+
+  if (route.type === "event-game") {
+    return <PublicEventGamePage eventId={route.eventId} eventGameId={route.eventGameId} />;
   }
 
   if (route.type === "color-test") {
@@ -202,6 +215,19 @@ export function parseRoute(pathname: string, search: string, hash = ""): Route {
       type: "home",
       ...(new URLSearchParams(search).get("view") === "all" ? { showAll: true } : {}),
     };
+  }
+
+  const eventGameMatch = pathname.match(/^\/events\/([^/]+)\/games\/([^/]+)$/);
+  if (eventGameMatch !== null) {
+    try {
+      return {
+        type: "event-game",
+        eventId: decodeURIComponent(eventGameMatch[1] ?? ""),
+        eventGameId: decodeURIComponent(eventGameMatch[2] ?? ""),
+      };
+    } catch {
+      return { type: "home" };
+    }
   }
 
   const eventMatch = pathname.match(/^\/events\/([^/]+)$/);
