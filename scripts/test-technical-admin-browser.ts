@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
 import { chromium, type Page } from "playwright";
+import { expect } from "playwright/test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -263,9 +264,19 @@ try {
   await eventAdminPage.getByRole("button", { name: "Admit Event Admin" }).click();
   await eventAdminPage.getByText(/event-admin/u).waitFor();
   const eventAdminGameDaySelector = eventAdminPage.getByLabel("Game Day", { exact: true });
+  const firstDayHubResponsePromise = eventAdminPage.waitForResponse(
+    (response) =>
+      response.url().includes("/api/event-admin/hub?") && response.request().method() === "GET",
+  );
   await eventAdminGameDaySelector.selectOption({ index: 1 });
+  await firstDayHubResponsePromise;
   const firstSelectedGameDay = await expectSelectValue(eventAdminGameDaySelector, 1);
+  const secondDayHubResponsePromise = eventAdminPage.waitForResponse(
+    (response) =>
+      response.url().includes("/api/event-admin/hub?") && response.request().method() === "GET",
+  );
   await eventAdminGameDaySelector.selectOption({ index: 2 });
+  await secondDayHubResponsePromise;
   const secondSelectedGameDay = await expectSelectValue(eventAdminGameDaySelector, 2);
   assert(firstSelectedGameDay !== secondSelectedGameDay, "Game Day selector reused one option");
   await eventAdminPage.getByLabel("New Event Team name").fill("Blue");
@@ -293,6 +304,56 @@ try {
   await eventAdminPage.getByLabel("Pitch Pitch One name").fill("Pitch Main");
   await eventAdminPage.getByRole("button", { name: "Save Pitch" }).click();
   await eventAdminPage.getByLabel("Pitch Pitch Main name").waitFor();
+  const firstDayScheduleHubResponsePromise = eventAdminPage.waitForResponse(
+    (response) =>
+      response.url().includes("/api/event-admin/hub?") && response.request().method() === "GET",
+  );
+  await eventAdminGameDaySelector.selectOption({ index: 1 });
+  await firstDayScheduleHubResponsePromise;
+  await eventAdminPage.getByLabel("Gameplay Slot sequence").fill("1");
+  await eventAdminPage.getByLabel("Gameplay Slot scheduled start").fill("2026-08-14T10:00");
+  const firstDaySlotResponsePromise = eventAdminPage.waitForResponse(
+    (response) =>
+      response.url().includes(`/api/event-admin/events/${eventId}/game-days/`) &&
+      response.url().endsWith("/gameplay-slots") &&
+      response.request().method() === "POST",
+  );
+  await eventAdminPage.getByRole("button", { name: "Add Gameplay Slot" }).click();
+  assert(
+    (await firstDaySlotResponsePromise).status() === 201,
+    "first Game Day slot creation failed",
+  );
+  await eventAdminPage
+    .getByText(/Slot 1.*10:00/u)
+    .last()
+    .waitFor();
+  await eventAdminPage.getByLabel("Gameplay Slot 1 Expected Delay minutes").fill("2");
+  const firstDayPreviewResponsePromise = eventAdminPage.waitForResponse(
+    (response) =>
+      response.url().endsWith("/expected-delay/preview") && response.request().method() === "POST",
+  );
+  await eventAdminPage.getByRole("button", { name: "Preview Delay" }).click();
+  const firstDayPreviewResponse = await firstDayPreviewResponsePromise;
+  assert(
+    firstDayPreviewResponse.status() === 200 &&
+      firstDayPreviewResponse.headers()["set-cookie"] === undefined,
+    "first Game Day preview was not a read-only response",
+  );
+  await eventAdminPage
+    .getByText(/Slot .*→/u)
+    .last()
+    .waitFor();
+  await eventAdminPage.getByRole("button", { name: "Apply Delay" }).click();
+  await eventAdminPage
+    .getByText(/Expected Delay 2m/u)
+    .last()
+    .waitFor();
+  const secondDayScheduleHubResponsePromise = eventAdminPage.waitForResponse(
+    (response) =>
+      response.url().includes("/api/event-admin/hub?") && response.request().method() === "GET",
+  );
+  await eventAdminGameDaySelector.selectOption({ index: 2 });
+  await secondDayScheduleHubResponsePromise;
   await eventAdminPage.getByLabel("New Event Team name").fill("Red");
   await eventAdminPage.getByRole("button", { name: "Add Team" }).click();
   await eventAdminPage.getByText("Red", { exact: true }).first().waitFor();
@@ -338,6 +399,37 @@ try {
     (await confirmGameplaySlotResponsePromise).status() === 200,
     "Gameplay Slot confirmation failed",
   );
+  await eventAdminPage.getByLabel("Gameplay Slot sequence").fill("2");
+  await eventAdminPage.getByLabel("Gameplay Slot scheduled start").fill("2026-08-15T10:30");
+  const secondDaySlotResponsePromise = eventAdminPage.waitForResponse(
+    (response) =>
+      response.url().includes(`/api/event-admin/events/${eventId}/game-days/`) &&
+      response.url().endsWith("/gameplay-slots") &&
+      response.request().method() === "POST",
+  );
+  await eventAdminPage.getByRole("button", { name: "Add Gameplay Slot" }).click();
+  assert(
+    (await secondDaySlotResponsePromise).status() === 201,
+    "second Gameplay Slot creation failed",
+  );
+  await eventAdminPage
+    .getByText(/Slot 2.*10:30/u)
+    .last()
+    .waitFor();
+  await eventAdminPage.getByLabel("Gameplay Slot for Event Game").selectOption({ index: 2 });
+  await eventAdminPage.getByLabel("Pitch Slot for Event Game").selectOption({ index: 2 });
+  await eventAdminPage.getByLabel("Game Code").fill("G-02");
+  await eventAdminPage.getByLabel("Game Designation").fill("Second");
+  await eventAdminPage.getByLabel("Side A source label").fill("Winner C");
+  await eventAdminPage.getByLabel("Side B source label").fill("Winner D");
+  const secondGameResponsePromise = eventAdminPage.waitForResponse(
+    (response) =>
+      response.url().includes(`/api/event-admin/events/${eventId}/game-days/`) &&
+      response.url().endsWith("/event-games") &&
+      response.request().method() === "POST",
+  );
+  await eventAdminPage.getByRole("button", { name: "Add unresolved Event Game" }).click();
+  assert((await secondGameResponsePromise).status() === 201, "second Event Game creation failed");
   await eventAdminPage.getByRole("button", { name: "Refresh Slot setup" }).click();
   await eventAdminPage.getByText("Opening", { exact: true }).waitFor();
   await eventAdminPage.getByRole("button", { name: "Published Event", exact: true }).click();
@@ -345,10 +437,9 @@ try {
   await publicationWarning.waitFor();
   const publicationWarningText = await publicationWarning.innerText();
   assert(
-    publicationWarningText.includes("Gameplay Slots") &&
-      publicationWarningText.includes("Pitch Slots") &&
-      publicationWarningText.includes("Event Games"),
-    "publication warning did not identify incomplete schedule categories",
+    publicationWarningText.includes("Event Games") &&
+      publicationWarningText.includes("unresolved matchups"),
+    "publication warning did not identify incomplete Event Game content",
   );
   const publishedAudience = await eventAdminContext.request.get(
     `${origin}/api/audience/events/${eventId}`,
@@ -392,13 +483,31 @@ try {
     .getByText(/Slot 1.*10:00/u)
     .last()
     .waitFor();
-  await eventAdminPage.getByRole("button", { name: "Pitch Main" }).click();
+  const sessionCookieBeforeDelayPreview = (await eventAdminContext.cookies()).find(
+    (cookie) => cookie.name === "__Host-event-admin-session",
+  );
+  await eventAdminPage.getByLabel("Gameplay Slot 1 Expected Delay minutes").fill("1");
+  const secondDayPreviewResponsePromise = eventAdminPage.waitForResponse(
+    (response) =>
+      response.url().endsWith("/expected-delay/preview") && response.request().method() === "POST",
+  );
+  await eventAdminPage.getByRole("button", { name: "Preview Delay" }).first().click();
+  const secondDayPreviewResponse = await secondDayPreviewResponsePromise;
+  assert(
+    secondDayPreviewResponse.status() === 200 &&
+      secondDayPreviewResponse.headers()["set-cookie"] === undefined,
+    "second Game Day preview emitted a session refresh header",
+  );
   await eventAdminPage
-    .getByText(/Slot 1/)
+    .getByText(/Slot .*→/u)
     .last()
     .waitFor();
   await eventAdminPage.getByLabel("Pitch Manager Game Day").selectOption({ index: 2 });
   await eventAdminPage.getByLabel("Pitch Manager Pitch").selectOption({ label: "Pitch Main" });
+  const pitchManagerGameDayId = await eventAdminPage
+    .getByLabel("Pitch Manager Game Day")
+    .inputValue();
+  const pitchManagerPitchId = await eventAdminPage.getByLabel("Pitch Manager Pitch").inputValue();
   const pitchManagerCreateResponsePromise = eventAdminPage.waitForResponse(
     (response) =>
       response.url().includes("/pitch-manager-grant") && response.request().method() === "POST",
@@ -492,6 +601,25 @@ try {
   await pitchManagerPage.reload();
   await pitchManagerPage.getByText("Pitch Main", { exact: true }).waitFor();
   await pitchManagerPage.getByText(/2026-08-15 10:00 Europe\/Zurich/u).waitFor();
+  await eventAdminPage.reload();
+  await eventAdminPage.getByLabel("Pitch Manager Game Day").waitFor();
+  await eventAdminPage
+    .getByLabel("Pitch Manager Game Day")
+    .selectOption({ value: pitchManagerGameDayId });
+  await eventAdminPage
+    .getByLabel("Pitch Manager Pitch")
+    .selectOption({ value: pitchManagerPitchId });
+  const pitchManagerInspectAfterRestartResponsePromise = eventAdminPage.waitForResponse(
+    (response) =>
+      response.url() ===
+        `${origin}/api/event-admin/events/${eventId}/game-days/${pitchManagerGameDayId}/pitches/${pitchManagerPitchId}/pitch-manager-grant` &&
+      response.request().method() === "GET",
+  );
+  await eventAdminPage.getByRole("button", { name: "Inspect Grant" }).click();
+  assert(
+    (await pitchManagerInspectAfterRestartResponsePromise).status() === 200,
+    "Pitch Manager Grant inspection failed after server restart",
+  );
   await restartServerProcess(origin, environment);
   const currentAfterRestart = await fetchFromPage(
     pitchManagerPage,
@@ -551,10 +679,30 @@ try {
       response.url().includes("/pitch-manager-grant/disable") &&
       response.request().method() === "POST",
   );
+  const pitchManagerDisableInspectResponsePromise = eventAdminPage.waitForResponse(
+    (response) =>
+      response.url() ===
+        `${origin}/api/event-admin/events/${eventId}/game-days/${pitchManagerGameDayId}/pitches/${pitchManagerPitchId}/pitch-manager-grant` &&
+      response.request().method() === "GET",
+  );
   await eventAdminPage.getByRole("button", { name: "Disable Pitch Manager Grant" }).click();
   assert(
     (await pitchManagerDisableResponsePromise).status() === 200,
     "Pitch Manager Grant disable failed",
+  );
+  assert(
+    (await pitchManagerDisableInspectResponsePromise).status() === 200,
+    "Pitch Manager Grant disable inspection failed",
+  );
+  await expect(eventAdminPage.getByText(/disabled.*expires/u)).toBeVisible();
+  await expect(
+    eventAdminPage.getByRole("button", { name: "Reactivate Pitch Manager Grant" }),
+  ).toBeEnabled();
+  const pitchManagerReactivateInspectResponsePromise = eventAdminPage.waitForResponse(
+    (response) =>
+      response.url() ===
+        `${origin}/api/event-admin/events/${eventId}/game-days/${pitchManagerGameDayId}/pitches/${pitchManagerPitchId}/pitch-manager-grant` &&
+      response.request().method() === "GET",
   );
   const pitchManagerReactivateResponsePromise = eventAdminPage.waitForResponse(
     (response) =>
@@ -566,24 +714,29 @@ try {
     (await pitchManagerReactivateResponsePromise).status() === 200,
     "Pitch Manager Grant reactivation failed",
   );
-  const reactivatedPitchManagerInspect = await eventAdminContext.request.get(
-    `${origin}/api/event-admin/events/${eventId}/game-days/${await eventAdminPage.getByLabel("Pitch Manager Game Day").inputValue()}/pitches/${await eventAdminPage.getByLabel("Pitch Manager Pitch").inputValue()}/pitch-manager-grant`,
-  );
-  const reactivatedPitchManagerPayload = (await reactivatedPitchManagerInspect.json()) as {
-    status: string;
-    value?: { grantVersion?: string };
-  };
-  const reactivatedPitchManagerVersion = reactivatedPitchManagerPayload.value?.grantVersion ?? "";
+  const pitchManagerReactivateInspectResponse = await pitchManagerReactivateInspectResponsePromise;
+  const pitchManagerReactivateInspectPayload =
+    (await pitchManagerReactivateInspectResponse.json()) as {
+      status: string;
+      value?: { grantVersion?: string; status?: string };
+    };
+  const reactivatedPitchManagerVersion =
+    pitchManagerReactivateInspectPayload.value?.grantVersion ?? "";
   assert(
-    reactivatedPitchManagerVersion.length > 0 &&
+    pitchManagerReactivateInspectResponse.status() === 200 &&
+      pitchManagerReactivateInspectPayload.status === "accepted" &&
+      pitchManagerReactivateInspectPayload.value?.status === "active" &&
+      reactivatedPitchManagerVersion.length > 0 &&
       reactivatedPitchManagerVersion !== rotatedPitchManagerVersion,
-    "Pitch Manager reactivation did not create a new Grant version",
+    "Pitch Manager reactivation did not settle an active new Grant version",
   );
+  await expect(eventAdminPage.getByText(/active.*expires/u)).toBeVisible();
   const reactivatedPitchManagerRevealResponsePromise = eventAdminPage.waitForResponse(
     (response) =>
       response.url().includes("/pitch-manager-grant/reveal") &&
       response.request().method() === "POST",
   );
+  await expect(eventAdminPage.getByRole("button", { name: "Reveal QR" })).toBeEnabled();
   await eventAdminPage.getByRole("button", { name: "Reveal QR" }).click();
   const reactivatedPitchManagerReveal = await reactivatedPitchManagerRevealResponsePromise;
   const reactivatedPitchManagerRevealPayload = (await reactivatedPitchManagerReveal.json()) as {
@@ -620,6 +773,86 @@ try {
   assert(
     reactivatedPitchManagerCurrent.cacheControl === "no-store",
     "reactivated Pitch Manager projection was cacheable",
+  );
+  const sessionCookieAfterDelayPreview = (await eventAdminContext.cookies()).find(
+    (cookie) => cookie.name === "__Host-event-admin-session",
+  );
+  assert(
+    sessionCookieBeforeDelayPreview !== undefined &&
+      sessionCookieAfterDelayPreview !== undefined &&
+      sessionCookieAfterDelayPreview.value === sessionCookieBeforeDelayPreview.value,
+    "delay preview changed the persisted browser session",
+  );
+  await eventAdminGameDaySelector.selectOption({ index: 2 });
+  await eventAdminPage.getByLabel("Gameplay Slot 1 Expected Delay minutes").fill("1");
+  await eventAdminPage.getByRole("button", { name: "Apply Delay" }).first().click();
+  await eventAdminPage
+    .getByText(/Expected Delay 1m/u)
+    .last()
+    .waitFor();
+  await eventAdminPage.getByRole("button", { name: "Pitch Main" }).click();
+  await eventAdminPage.getByLabel("Pitch Slot 1 Expected Delay minutes").waitFor();
+  await eventAdminPage.getByLabel("Pitch Slot 1 Expected Delay minutes").fill("3");
+  const pitchPreviewResponsePromise = eventAdminPage.waitForResponse(
+    (response) =>
+      response.url().endsWith("/expected-delay/preview") && response.request().method() === "POST",
+  );
+  await eventAdminPage.getByRole("button", { name: "Preview Pitch Delay" }).first().click();
+  const pitchPreviewResponse = await pitchPreviewResponsePromise;
+  assert(
+    pitchPreviewResponse.status() === 200 &&
+      pitchPreviewResponse.headers()["set-cookie"] === undefined,
+    "Pitch Slot preview emitted a session refresh header",
+  );
+  await eventAdminPage.getByText(/Preview · Pitch/u).waitFor();
+  await eventAdminPage
+    .getByRole("button", { name: "Apply Pitch Delay" })
+    .first()
+    .click({ force: true });
+  await expectValue(eventAdminPage.getByLabel("Pitch Slot 1 Expected Delay minutes"), "3");
+  const targetSelectors = eventAdminPage.locator('select[aria-label$="target Pitch Slot"]');
+  await targetSelectors.first().selectOption({ index: 2 });
+  await eventAdminPage.locator('select[aria-label$="mode"]').first().selectOption("move");
+  const moveResponsePromise = eventAdminPage.waitForResponse(
+    (response) => response.url().endsWith("/reassign") && response.request().method() === "POST",
+  );
+  await eventAdminPage.getByRole("button", { name: "Reassign Game" }).first().click();
+  assert((await moveResponsePromise).status() === 200, "Pitch move request failed");
+  await eventAdminPage
+    .getByText(/Schedule Conflict/u)
+    .first()
+    .waitFor();
+  await eventAdminPage.getByLabel("Gameplay Slot for Event Game").selectOption({ index: 1 });
+  await eventAdminPage.getByLabel("Pitch Slot for Event Game").selectOption({ index: 1 });
+  await eventAdminPage.getByLabel("Game Code").fill("G-03");
+  await eventAdminPage.getByLabel("Game Designation").fill("Third");
+  await eventAdminPage.getByLabel("Side A source label").fill("Winner E");
+  await eventAdminPage.getByLabel("Side B source label").fill("Winner F");
+  const thirdGameResponsePromise = eventAdminPage.waitForResponse(
+    (response) =>
+      response.url().includes(`/api/event-admin/events/${eventId}/game-days/`) &&
+      response.url().endsWith("/event-games") &&
+      response.request().method() === "POST",
+  );
+  await eventAdminPage.getByRole("button", { name: "Add unresolved Event Game" }).click();
+  assert((await thirdGameResponsePromise).status() === 201, "third Event Game creation failed");
+  await eventAdminPage.getByRole("button", { name: "Refresh Slot setup" }).click();
+  await eventAdminPage.getByText("Third", { exact: true }).waitFor();
+  await eventAdminPage.getByRole("button", { name: "Pitch Main" }).click();
+  await eventAdminPage.getByLabel("Pitch Slot 1 Expected Delay minutes").waitFor();
+  const lastTargetSelector = eventAdminPage
+    .locator('select[aria-label$="target Pitch Slot"]')
+    .last();
+  await lastTargetSelector.selectOption({ index: 2 });
+  await eventAdminPage.locator('select[aria-label$="mode"]').last().selectOption("swap");
+  const multiOccupantSwapResponsePromise = eventAdminPage.waitForResponse(
+    (response) => response.url().endsWith("/reassign") && response.request().method() === "POST",
+  );
+  await eventAdminPage.getByRole("button", { name: "Reassign Game" }).last().click();
+  const multiOccupantSwapResponse = await multiOccupantSwapResponsePromise;
+  assert(
+    multiOccupantSwapResponse.status() === 400,
+    `multi-occupant swap returned ${multiOccupantSwapResponse.status()}`,
   );
   const sessionCookieBeforeRefresh = (await eventAdminContext.cookies()).find(
     (cookie) => cookie.name === "__Host-event-admin-session",

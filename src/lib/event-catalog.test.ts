@@ -1181,4 +1181,404 @@ describe("Event operations catalog", () => {
       expect(after.value.length).toBe(before.value.length);
     foundation.close();
   });
+
+  test("applies independent Expected Delays, cascades later slots, and moves stable games", async () => {
+    const fixture = createFixture();
+    const event = await fixture.catalog.createEvent({ name: "Shift", timeZone: "UTC" }, authority);
+    if (event.status !== "accepted") throw new Error("Expected Event.");
+    const day = await fixture.catalog.addGameDay(
+      event.value.eventId,
+      { date: "2026-08-14" },
+      authority,
+    );
+    if (day.status !== "accepted") throw new Error("Expected Game Day.");
+    const pitch = await fixture.catalog.createPitch(
+      event.value.eventId,
+      { name: "Pitch A" },
+      authority,
+    );
+    if (pitch.status !== "accepted") throw new Error("Expected Pitch.");
+    const firstSlot = await fixture.catalog.createGameplaySlot(
+      event.value.eventId,
+      day.value.gameDayId,
+      { sequence: 1, scheduledStart: "2026-08-14T10:00" },
+      authority,
+    );
+    const secondSlot = await fixture.catalog.createGameplaySlot(
+      event.value.eventId,
+      day.value.gameDayId,
+      { sequence: 2, scheduledStart: "2026-08-14T10:20" },
+      authority,
+    );
+    if (firstSlot.status !== "accepted" || secondSlot.status !== "accepted")
+      throw new Error("Expected Gameplay Slots.");
+    const snapshot = await fixture.storage.snapshot();
+    const pitchSlots = snapshot.listPitchSlots(day.value.gameDayId, pitch.value.pitchId);
+    const firstPitchSlot = pitchSlots.find(
+      (slot) => slot.gameplaySlotId === firstSlot.value.gameplaySlotId,
+    );
+    const secondPitchSlot = pitchSlots.find(
+      (slot) => slot.gameplaySlotId === secondSlot.value.gameplaySlotId,
+    );
+    if (firstPitchSlot === undefined || secondPitchSlot === undefined)
+      throw new Error("Expected Pitch Slots.");
+    const firstGame = await fixture.catalog.createEventGame(
+      event.value.eventId,
+      day.value.gameDayId,
+      {
+        gameplaySlotId: firstSlot.value.gameplaySlotId,
+        pitchSlotId: firstPitchSlot.pitchSlotId,
+        sideA: { sourceLabel: "A" },
+        sideB: { sourceLabel: "B" },
+      },
+      authority,
+    );
+    const secondGame = await fixture.catalog.createEventGame(
+      event.value.eventId,
+      day.value.gameDayId,
+      {
+        gameplaySlotId: secondSlot.value.gameplaySlotId,
+        pitchSlotId: secondPitchSlot.pitchSlotId,
+        sideA: { sourceLabel: "C" },
+        sideB: { sourceLabel: "D" },
+      },
+      authority,
+    );
+    if (firstGame.status !== "accepted" || secondGame.status !== "accepted")
+      throw new Error("Expected Event Games.");
+    const blue = await fixture.catalog.createEventTeam(
+      event.value.eventId,
+      { name: "Blue" },
+      authority,
+    );
+    const red = await fixture.catalog.createEventTeam(
+      event.value.eventId,
+      { name: "Red" },
+      authority,
+    );
+    if (blue.status !== "accepted" || red.status !== "accepted")
+      throw new Error("Expected Event Teams.");
+    expect(
+      await fixture.catalog.confirmGameplaySlotTeams(
+        event.value.eventId,
+        day.value.gameDayId,
+        firstSlot.value.gameplaySlotId,
+        {
+          games: [
+            {
+              eventGameId: firstGame.value.eventGameId,
+              sideAEventTeamId: blue.value.eventTeamId,
+              sideBEventTeamId: red.value.eventTeamId,
+            },
+          ],
+        },
+        authority,
+      ),
+    ).toMatchObject({ status: "accepted" });
+    expect(
+      await fixture.catalog.confirmGameplaySlotTeams(
+        event.value.eventId,
+        day.value.gameDayId,
+        secondSlot.value.gameplaySlotId,
+        {
+          games: [
+            {
+              eventGameId: secondGame.value.eventGameId,
+              sideAEventTeamId: blue.value.eventTeamId,
+              sideBEventTeamId: red.value.eventTeamId,
+            },
+          ],
+        },
+        authority,
+      ),
+    ).toMatchObject({ status: "accepted" });
+    const staggeredOverlap = await fixture.catalog.inspectEvent(event.value.eventId, authority);
+    expect(staggeredOverlap.status).toBe("accepted");
+    if (staggeredOverlap.status === "accepted") {
+      const firstProjected = staggeredOverlap.value.eventGames.find(
+        (game) => game.eventGameId === firstGame.value.eventGameId,
+      );
+      const secondProjected = staggeredOverlap.value.eventGames.find(
+        (game) => game.eventGameId === secondGame.value.eventGameId,
+      );
+      expect(firstProjected?.teamScheduleConflict).toBe(true);
+      expect(secondProjected?.teamScheduleConflict).toBe(true);
+    }
+    expect(
+      await fixture.catalog.setGameplaySlotExpectedDelay(
+        event.value.eventId,
+        day.value.gameDayId,
+        secondSlot.value.gameplaySlotId,
+        { expectedDelayMs: 20 * 60_000 },
+        authority,
+      ),
+    ).toMatchObject({ status: "accepted" });
+    const staggeredNonOverlap = await fixture.catalog.inspectEvent(event.value.eventId, authority);
+    expect(staggeredNonOverlap.status).toBe("accepted");
+    if (staggeredNonOverlap.status === "accepted") {
+      const firstProjected = staggeredNonOverlap.value.eventGames.find(
+        (game) => game.eventGameId === firstGame.value.eventGameId,
+      );
+      const secondProjected = staggeredNonOverlap.value.eventGames.find(
+        (game) => game.eventGameId === secondGame.value.eventGameId,
+      );
+      expect(firstProjected?.teamScheduleConflict).toBe(false);
+      expect(secondProjected?.teamScheduleConflict).toBe(false);
+    }
+    expect(
+      await fixture.catalog.previewGameplaySlotExpectedDelay(
+        event.value.eventId,
+        day.value.gameDayId,
+        firstSlot.value.gameplaySlotId,
+        { expectedDelayMs: 20 * 60_000, cascade: true },
+        authority,
+      ),
+    ).toMatchObject({
+      status: "accepted",
+      value: { changes: [{ beforeDelayMs: 0, afterDelayMs: 20 * 60_000 }] },
+    });
+    expect(
+      await fixture.catalog.previewGameplaySlotExpectedDelay(
+        event.value.eventId,
+        day.value.gameDayId,
+        firstSlot.value.gameplaySlotId,
+        { expectedDelayMs: 60_000, cascade: true },
+        authority,
+      ),
+    ).toMatchObject({
+      status: "accepted",
+      value: { changes: [{ beforeDelayMs: 0 }, { beforeDelayMs: 20 * 60_000 }] },
+    });
+    expect(
+      (await fixture.storage.snapshot()).findGameplaySlot(firstSlot.value.gameplaySlotId),
+    ).toMatchObject({ expectedDelayMs: 0 });
+    fixture.storage.failNextTransaction(new Error("schedule unavailable"));
+    expect(
+      await fixture.catalog.setGameplaySlotExpectedDelay(
+        event.value.eventId,
+        day.value.gameDayId,
+        firstSlot.value.gameplaySlotId,
+        { expectedDelayMs: 60_000, cascade: true },
+        authority,
+      ),
+    ).toMatchObject({ status: "retryable-failure" });
+    expect(
+      (await fixture.storage.snapshot()).findGameplaySlot(firstSlot.value.gameplaySlotId),
+    ).toMatchObject({ expectedDelayMs: 0 });
+    expect(
+      await fixture.catalog.setGameplaySlotExpectedDelay(
+        event.value.eventId,
+        day.value.gameDayId,
+        firstSlot.value.gameplaySlotId,
+        { expectedDelayMs: 60_000, cascade: true },
+        authority,
+      ),
+    ).toMatchObject({
+      status: "accepted",
+      value: { changes: [{ afterDelayMs: 60_000 }, { afterDelayMs: 60_000 }] },
+    });
+    expect(
+      await fixture.catalog.setPitchSlotExpectedDelay(
+        event.value.eventId,
+        day.value.gameDayId,
+        firstPitchSlot.pitchSlotId,
+        { expectedDelayMs: 120_000 },
+        authority,
+      ),
+    ).toMatchObject({ status: "accepted", value: { changes: [{ afterDelayMs: 120_000 }] } });
+    const gameplayDominatedByPitch = await fixture.catalog.previewGameplaySlotExpectedDelay(
+      event.value.eventId,
+      day.value.gameDayId,
+      firstSlot.value.gameplaySlotId,
+      { expectedDelayMs: 30_000 },
+      authority,
+    );
+    expect(gameplayDominatedByPitch).toMatchObject({
+      status: "accepted",
+      value: {
+        changes: [
+          {
+            beforeDelayMs: 60_000,
+            afterDelayMs: 30_000,
+          },
+        ],
+      },
+    });
+    if (gameplayDominatedByPitch.status === "accepted") {
+      const gamePreview = gameplayDominatedByPitch.value.changes[0]?.eventGames[0];
+      if (gamePreview === undefined) throw new Error("Expected delayed Game preview.");
+      expect(typeof gamePreview.beforeExpectedStartMs).toBe("number");
+      expect(typeof gamePreview.afterExpectedStartMs).toBe("number");
+      expect(gamePreview.afterExpectedStartMs - gamePreview.beforeExpectedStartMs).toBe(0);
+    }
+    const pitchDominatedByGameplay = await fixture.catalog.previewPitchSlotExpectedDelay(
+      event.value.eventId,
+      day.value.gameDayId,
+      secondPitchSlot.pitchSlotId,
+      { expectedDelayMs: 30_000 },
+      authority,
+    );
+    expect(pitchDominatedByGameplay).toMatchObject({
+      status: "accepted",
+      value: {
+        changes: [{}],
+      },
+    });
+    if (pitchDominatedByGameplay.status === "accepted") {
+      const gamePreview = pitchDominatedByGameplay.value.changes[0]?.eventGames[0];
+      if (gamePreview === undefined) throw new Error("Expected Pitch Slot Game preview.");
+      expect(typeof gamePreview.beforeExpectedStartMs).toBe("number");
+      expect(typeof gamePreview.afterExpectedStartMs).toBe("number");
+      expect(gamePreview.afterExpectedStartMs - gamePreview.beforeExpectedStartMs).toBe(0);
+    }
+    const auditBeforeNoChange = await fixture.catalog.listAuditTrail(
+      event.value.eventId,
+      authority,
+    );
+    expect(
+      await fixture.catalog.previewGameplaySlotExpectedDelay(
+        event.value.eventId,
+        day.value.gameDayId,
+        firstSlot.value.gameplaySlotId,
+        { expectedDelayMs: 60_000, cascade: true },
+        authority,
+      ),
+    ).toMatchObject({ status: "rejected", reason: "no-change" });
+    expect(
+      await fixture.catalog.setGameplaySlotExpectedDelay(
+        event.value.eventId,
+        day.value.gameDayId,
+        firstSlot.value.gameplaySlotId,
+        { expectedDelayMs: 60_000, cascade: true },
+        authority,
+      ),
+    ).toMatchObject({ status: "rejected", reason: "no-change" });
+    const auditAfterNoChange = await fixture.catalog.listAuditTrail(event.value.eventId, authority);
+    if (auditBeforeNoChange.status === "accepted" && auditAfterNoChange.status === "accepted")
+      expect(auditAfterNoChange.value.length).toBe(auditBeforeNoChange.value.length);
+    if (firstGame.status !== "accepted" || secondGame.status !== "accepted") return;
+    expect(
+      await fixture.catalog.reassignEventGame(
+        event.value.eventId,
+        day.value.gameDayId,
+        firstGame.value.eventGameId,
+        { targetPitchSlotId: secondPitchSlot.pitchSlotId, mode: "swap" },
+        authority,
+      ),
+    ).toMatchObject({
+      status: "accepted",
+      value: {
+        scheduleConflict: false,
+        eventGame: {
+          eventGameId: firstGame.value.eventGameId,
+          pitchSlotId: secondPitchSlot.pitchSlotId,
+        },
+        swappedEventGame: {
+          eventGameId: secondGame.value.eventGameId,
+          pitchSlotId: firstPitchSlot.pitchSlotId,
+        },
+      },
+    });
+    expect(
+      await fixture.catalog.reassignEventGame(
+        event.value.eventId,
+        day.value.gameDayId,
+        firstGame.value.eventGameId,
+        { targetPitchSlotId: firstPitchSlot.pitchSlotId, mode: "move" },
+        authority,
+      ),
+    ).toMatchObject({ status: "accepted", value: { scheduleConflict: true } });
+    expect(await fixture.catalog.inspectEvent(event.value.eventId, authority)).toMatchObject({
+      status: "accepted",
+      value: {
+        eventGames: [
+          { eventGameId: firstGame.value.eventGameId, expectedStartMs: expect.any(Number) },
+          { eventGameId: secondGame.value.eventGameId, expectedStartMs: expect.any(Number) },
+        ],
+      },
+    });
+    const thirdGame = await fixture.catalog.createEventGame(
+      event.value.eventId,
+      day.value.gameDayId,
+      {
+        gameplaySlotId: secondSlot.value.gameplaySlotId,
+        pitchSlotId: secondPitchSlot.pitchSlotId,
+        sideA: { sourceLabel: "E" },
+        sideB: { sourceLabel: "F" },
+      },
+      authority,
+    );
+    if (thirdGame.status !== "accepted") throw new Error("Expected third Event Game.");
+    const auditBeforeMultiOccupantSwap = await fixture.catalog.listAuditTrail(
+      event.value.eventId,
+      authority,
+    );
+    expect(
+      await fixture.catalog.reassignEventGame(
+        event.value.eventId,
+        day.value.gameDayId,
+        thirdGame.value.eventGameId,
+        { targetPitchSlotId: firstPitchSlot.pitchSlotId, mode: "swap" },
+        authority,
+      ),
+    ).toMatchObject({ status: "rejected", reason: "invalid-input" });
+    const unchangedAfterMultiOccupantSwap = await fixture.catalog.inspectEvent(
+      event.value.eventId,
+      authority,
+    );
+    expect(unchangedAfterMultiOccupantSwap.status).toBe("accepted");
+    if (unchangedAfterMultiOccupantSwap.status === "accepted") {
+      const unchangedThird = unchangedAfterMultiOccupantSwap.value.eventGames.find(
+        (game) => game.eventGameId === thirdGame.value.eventGameId,
+      );
+      expect(unchangedThird).toMatchObject({ pitchSlotId: secondPitchSlot.pitchSlotId });
+    }
+    const auditAfterMultiOccupantSwap = await fixture.catalog.listAuditTrail(
+      event.value.eventId,
+      authority,
+    );
+    if (
+      auditBeforeMultiOccupantSwap.status === "accepted" &&
+      auditAfterMultiOccupantSwap.status === "accepted"
+    )
+      expect(auditAfterMultiOccupantSwap.value.length).toBe(
+        auditBeforeMultiOccupantSwap.value.length,
+      );
+    const auditBeforeFailedReassignment = await fixture.catalog.listAuditTrail(
+      event.value.eventId,
+      authority,
+    );
+    fixture.storage.failNextTransaction(new Error("reassignment unavailable"));
+    expect(
+      await fixture.catalog.reassignEventGame(
+        event.value.eventId,
+        day.value.gameDayId,
+        thirdGame.value.eventGameId,
+        { targetPitchSlotId: firstPitchSlot.pitchSlotId, mode: "move" },
+        authority,
+      ),
+    ).toMatchObject({ status: "retryable-failure" });
+    const unchangedAfterFailedReassignment = await fixture.catalog.inspectEvent(
+      event.value.eventId,
+      authority,
+    );
+    expect(unchangedAfterFailedReassignment.status).toBe("accepted");
+    if (unchangedAfterFailedReassignment.status === "accepted") {
+      const unchangedThird = unchangedAfterFailedReassignment.value.eventGames.find(
+        (game) => game.eventGameId === thirdGame.value.eventGameId,
+      );
+      expect(unchangedThird).toMatchObject({ pitchSlotId: secondPitchSlot.pitchSlotId });
+    }
+    const auditAfterFailedReassignment = await fixture.catalog.listAuditTrail(
+      event.value.eventId,
+      authority,
+    );
+    if (
+      auditBeforeFailedReassignment.status === "accepted" &&
+      auditAfterFailedReassignment.status === "accepted"
+    )
+      expect(auditAfterFailedReassignment.value.length).toBe(
+        auditBeforeFailedReassignment.value.length,
+      );
+  });
 });

@@ -92,6 +92,8 @@ export const REQUIRED_EVENT_CATALOG_STORAGE_TRANSACTION_METHODS = Object.freeze(
   "listEventGames",
   "insertGameplaySlot",
   "insertPitchSlot",
+  "updateGameplaySlot",
+  "updatePitchSlot",
   "insertEventGame",
   "updateEventGame",
 ] as const);
@@ -173,8 +175,7 @@ export type StoredGameplaySlot = {
   gameDayId: string;
   sequence: number;
   scheduledStartMs: number;
-  /** Optional until the schedule-delay projection is persisted by the catalog. */
-  expectedDelayMs?: number;
+  expectedDelayMs: number;
   createdAtMs: number;
   updatedAtMs: number;
 };
@@ -186,8 +187,7 @@ export type StoredPitchSlot = {
   pitchId: string;
   gameplaySlotId: string;
   sequence: number;
-  /** Optional until the schedule-delay projection is persisted by the catalog. */
-  expectedDelayMs?: number;
+  expectedDelayMs: number;
   createdAtMs: number;
   updatedAtMs: number;
 };
@@ -492,6 +492,8 @@ export type FoundationStorageTransaction = FoundationStorageSnapshot & {
   updatePitch(pitch: StoredEventCatalogPitch): void;
   insertGameplaySlot(slot: StoredGameplaySlot): void;
   insertPitchSlot(slot: StoredPitchSlot): void;
+  updateGameplaySlot(slot: StoredGameplaySlot): void;
+  updatePitchSlot(slot: StoredPitchSlot): void;
   insertEventGame(game: StoredEventCatalogGame): void;
   updateEventGame(game: StoredEventCatalogGame): void;
   appendEventAudit(entry: EventCatalogAuditEntry): void;

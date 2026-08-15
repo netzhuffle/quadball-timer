@@ -336,6 +336,7 @@ function readGameplaySlot(value: unknown): StoredGameplaySlot {
     gameDayId: String(row.gameDayId),
     sequence: Number(row.sequence),
     scheduledStartMs: Number(row.scheduledStartMs),
+    expectedDelayMs: Number(row.expectedDelayMs ?? 0),
     createdAtMs: Number(row.createdAtMs),
     updatedAtMs: Number(row.updatedAtMs),
   };
@@ -350,6 +351,7 @@ function readPitchSlot(value: unknown): StoredPitchSlot {
     pitchId: String(row.pitchId),
     gameplaySlotId: String(row.gameplaySlotId),
     sequence: Number(row.sequence),
+    expectedDelayMs: Number(row.expectedDelayMs ?? 0),
     createdAtMs: Number(row.createdAtMs),
     updatedAtMs: Number(row.updatedAtMs),
   };
@@ -467,6 +469,8 @@ type RootStatements = {
   updatePitch: SqlStatement;
   insertGameplaySlot: SqlStatement;
   insertPitchSlot: SqlStatement;
+  updateGameplaySlot: SqlStatement;
+  updatePitchSlot: SqlStatement;
   insertEventGame: SqlStatement;
   updateEventGame: SqlStatement;
 };
@@ -966,6 +970,8 @@ export class SqliteFoundationStorage implements FoundationStorage {
         "listEventGames",
         "insertGameplaySlot",
         "insertPitchSlot",
+        "updateGameplaySlot",
+        "updatePitchSlot",
         "insertEventGame",
         "updateEventGame",
       ],
@@ -1481,6 +1487,7 @@ export class SqliteFoundationStorage implements FoundationStorage {
           slot.gameDayId,
           slot.sequence,
           slot.scheduledStartMs,
+          slot.expectedDelayMs,
           slot.createdAtMs,
           slot.updatedAtMs,
         );
@@ -1494,9 +1501,20 @@ export class SqliteFoundationStorage implements FoundationStorage {
           slot.pitchId,
           slot.gameplaySlotId,
           slot.sequence,
+          slot.expectedDelayMs,
           slot.createdAtMs,
           slot.updatedAtMs,
         );
+      },
+      updateGameplaySlot: (slot) => {
+        statements.updateGameplaySlot.run(
+          slot.expectedDelayMs,
+          slot.updatedAtMs,
+          slot.gameplaySlotId,
+        );
+      },
+      updatePitchSlot: (slot) => {
+        statements.updatePitchSlot.run(slot.expectedDelayMs, slot.updatedAtMs, slot.pitchSlotId);
       },
       insertEventGame: (game) => {
         assertEventGameMembership(statements, game);
@@ -1525,6 +1543,8 @@ export class SqliteFoundationStorage implements FoundationStorage {
       updateEventGame: (game) => {
         assertEventGameMembership(statements, game);
         statements.updateEventGame.run(
+          game.gameplaySlotId,
+          game.pitchSlotId,
           game.gameCode,
           game.gameDesignation,
           game.sideA.sideId,
@@ -1904,12 +1924,14 @@ export class SqliteFoundationStorage implements FoundationStorage {
       gameplaySlotById: this.database.query(`
         SELECT gameplay_slot_id AS gameplaySlotId, event_id AS eventId, game_day_id AS gameDayId,
                sequence_number AS sequence, scheduled_start_ms AS scheduledStartMs,
+               expected_delay_ms AS expectedDelayMs,
                created_at_ms AS createdAtMs, updated_at_ms AS updatedAtMs
         FROM foundation_event_catalog_gameplay_slots WHERE gameplay_slot_id = ?
       `),
       gameplaySlotsByGameDay: this.database.query(`
         SELECT gameplay_slot_id AS gameplaySlotId, event_id AS eventId, game_day_id AS gameDayId,
                sequence_number AS sequence, scheduled_start_ms AS scheduledStartMs,
+               expected_delay_ms AS expectedDelayMs,
                created_at_ms AS createdAtMs, updated_at_ms AS updatedAtMs
         FROM foundation_event_catalog_gameplay_slots WHERE game_day_id = ?
         ORDER BY sequence_number, gameplay_slot_id
@@ -1917,12 +1939,14 @@ export class SqliteFoundationStorage implements FoundationStorage {
       pitchSlotById: this.database.query(`
         SELECT pitch_slot_id AS pitchSlotId, event_id AS eventId, game_day_id AS gameDayId,
                pitch_id AS pitchId, gameplay_slot_id AS gameplaySlotId, sequence_number AS sequence,
+               expected_delay_ms AS expectedDelayMs,
                created_at_ms AS createdAtMs, updated_at_ms AS updatedAtMs
         FROM foundation_event_catalog_pitch_slots WHERE pitch_slot_id = ?
       `),
       pitchSlotsByGameDay: this.database.query(`
         SELECT pitch_slot_id AS pitchSlotId, event_id AS eventId, game_day_id AS gameDayId,
                pitch_id AS pitchId, gameplay_slot_id AS gameplaySlotId, sequence_number AS sequence,
+               expected_delay_ms AS expectedDelayMs,
                created_at_ms AS createdAtMs, updated_at_ms AS updatedAtMs
         FROM foundation_event_catalog_pitch_slots
         WHERE game_day_id = ? AND (? IS NULL OR pitch_id = ?)
@@ -2027,13 +2051,21 @@ export class SqliteFoundationStorage implements FoundationStorage {
       `),
       insertGameplaySlot: this.database.query(`
         INSERT INTO foundation_event_catalog_gameplay_slots
-          (gameplay_slot_id, event_id, game_day_id, sequence_number, scheduled_start_ms, created_at_ms, updated_at_ms)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+          (gameplay_slot_id, event_id, game_day_id, sequence_number, scheduled_start_ms, expected_delay_ms, created_at_ms, updated_at_ms)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
       `),
       insertPitchSlot: this.database.query(`
         INSERT INTO foundation_event_catalog_pitch_slots
-          (pitch_slot_id, event_id, game_day_id, pitch_id, gameplay_slot_id, sequence_number, created_at_ms, updated_at_ms)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+          (pitch_slot_id, event_id, game_day_id, pitch_id, gameplay_slot_id, sequence_number, expected_delay_ms, created_at_ms, updated_at_ms)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `),
+      updateGameplaySlot: this.database.query(`
+        UPDATE foundation_event_catalog_gameplay_slots SET expected_delay_ms = ?, updated_at_ms = ?
+        WHERE gameplay_slot_id = ?
+      `),
+      updatePitchSlot: this.database.query(`
+        UPDATE foundation_event_catalog_pitch_slots SET expected_delay_ms = ?, updated_at_ms = ?
+        WHERE pitch_slot_id = ?
       `),
       insertEventGame: this.database.query(`
         INSERT INTO foundation_event_catalog_games
@@ -2045,7 +2077,7 @@ export class SqliteFoundationStorage implements FoundationStorage {
       `),
       updateEventGame: this.database.query(`
         UPDATE foundation_event_catalog_games SET
-          game_code = ?, game_designation = ?, side_a_id = ?, side_a_event_team_id = ?,
+          gameplay_slot_id = ?, pitch_slot_id = ?, game_code = ?, game_designation = ?, side_a_id = ?, side_a_event_team_id = ?,
           side_a_event_team_name = ?, side_a_source_label = ?, side_a_confirmed_at_ms = ?, side_b_id = ?,
           side_b_event_team_id = ?, side_b_event_team_name = ?, side_b_source_label = ?, side_b_confirmed_at_ms = ?,
           updated_at_ms = ? WHERE event_game_id = ?

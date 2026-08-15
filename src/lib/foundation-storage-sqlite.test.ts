@@ -546,7 +546,7 @@ describe("SQLite foundation storage", () => {
       expect(await reopenedRecord.registerRoot(root)).toMatchObject({ status: "idempotent" });
       expect(await reopened.readiness()).toMatchObject({
         ok: true,
-        schemaVersion: "25",
+        schemaVersion: "26",
         evidence: { replay: { result: "passed", rootCount: 1, durationMs: expect.any(Number) } },
       });
       reopened.close();
@@ -594,12 +594,12 @@ describe("SQLite foundation storage", () => {
       const storage = openSqliteFoundationStorage(databasePath);
       const candidate = await storage.validateCandidate();
       expect(candidate.ready).toBe(true);
-      expect(candidate.readiness).toMatchObject({ ok: true, schemaVersion: "25" });
+      expect(candidate.readiness).toMatchObject({ ok: true, schemaVersion: "26" });
       expect(existsSync(candidate.candidatePath)).toBe(false);
       expect(await storage.readiness()).toMatchObject({ ok: false, status: "pending" });
 
       const migration = await storage.applyMigrations({ requireCandidate: true });
-      expect(migration.schemaVersion).toBe(25);
+      expect(migration.schemaVersion).toBe(26);
       expect(await storage.readiness()).toMatchObject({ ok: true });
       storage.close();
     });
@@ -691,8 +691,9 @@ describe("SQLite foundation storage", () => {
         eventTeamsMigration.id,
         "024-event-schedule-slots-and-games",
         "025-event-publication-status",
+        "026-event-schedule-expected-delays-and-conflicts",
       ]);
-      expect(await current.readiness()).toMatchObject({ ok: true, schemaVersion: "25" });
+      expect(await current.readiness()).toMatchObject({ ok: true, schemaVersion: "26" });
       current.close();
     });
   });
@@ -701,9 +702,9 @@ describe("SQLite foundation storage", () => {
     await withDatabase(async (databasePath) => {
       const baseMigrations = FOUNDATION_MIGRATIONS;
       const failingMigration = createMigration(
-        "026-failing-test-migration",
-        26,
-        26,
+        "027-failing-test-migration",
+        27,
+        27,
         "CREATE TABLE migration_failure_probe (id TEXT) STRICT; THIS IS NOT SQL;",
       );
       const store = openSqliteFoundationStorage(databasePath, {
@@ -723,7 +724,7 @@ describe("SQLite foundation storage", () => {
       });
       expect(await priorBinary.readiness()).toMatchObject({
         ok: true,
-        schemaVersion: "25",
+        schemaVersion: "26",
       });
       priorBinary.close();
 
@@ -795,7 +796,7 @@ describe("SQLite foundation storage", () => {
         .query(
           "INSERT INTO foundation_migration_ledger (migration_id, ordinal, schema_version, checksum, status, applied_at_ms) VALUES (?, ?, ?, ?, ?, ?)",
         )
-        .run("future-999", 26, 26, "future-checksum", "complete", 2_000);
+        .run("future-999", 27, 27, "future-checksum", "complete", 2_000);
       futureDatabase.close();
       const future = openSqliteFoundationStorage(databasePath);
       expect(await future.readiness()).toMatchObject({ ok: false });

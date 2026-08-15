@@ -1707,6 +1707,19 @@ export const FOUNDATION_EVENT_CATALOG_GAMES_TABLE_SQL = `
     CHECK (side_a_event_team_id IS NULL OR side_a_event_team_id <> side_b_event_team_id)
   ) STRICT;
 `;
+
+export const FOUNDATION_EVENT_CATALOG_GAMEPLAY_SLOTS_TABLE_V25_SQL =
+  FOUNDATION_EVENT_CATALOG_GAMEPLAY_SLOTS_TABLE_SQL.replace(
+    "scheduled_start_ms INTEGER NOT NULL CHECK (scheduled_start_ms >= 0),",
+    "scheduled_start_ms INTEGER NOT NULL CHECK (scheduled_start_ms >= 0),\n    expected_delay_ms INTEGER NOT NULL DEFAULT 0 CHECK (expected_delay_ms >= 0),",
+  );
+export const FOUNDATION_EVENT_CATALOG_PITCH_SLOTS_TABLE_V25_SQL =
+  FOUNDATION_EVENT_CATALOG_PITCH_SLOTS_TABLE_SQL.replace(
+    "sequence_number INTEGER NOT NULL CHECK (sequence_number > 0),",
+    "sequence_number INTEGER NOT NULL CHECK (sequence_number > 0),\n    expected_delay_ms INTEGER NOT NULL DEFAULT 0 CHECK (expected_delay_ms >= 0),",
+  );
+export const FOUNDATION_EVENT_CATALOG_GAMES_TABLE_V25_SQL =
+  FOUNDATION_EVENT_CATALOG_GAMES_TABLE_SQL.replace("    UNIQUE (pitch_slot_id),\n", "");
 export const FOUNDATION_EVENT_CATALOG_GAMES_INDEX_SQL = `
   CREATE INDEX foundation_event_catalog_games_game_day_id
     ON foundation_event_catalog_games (game_day_id, gameplay_slot_id, event_game_id)
@@ -1828,6 +1841,46 @@ const FOUNDATION_EVENT_PUBLICATION_MIGRATION_SQL = `
   DROP TABLE foundation_event_catalog_audit_v25;
   ALTER TABLE foundation_event_catalog_audit_rebuilt RENAME TO foundation_event_catalog_audit;
   ${FOUNDATION_EVENT_CATALOG_AUDIT_EVENT_INDEX_SQL};
+`;
+
+/** Schema-25 adds independent Expected Delay offsets and permits deliberate schedule conflicts. */
+export const FOUNDATION_EVENT_SCHEDULE_EXPECTED_DELAYS_MIGRATION_SQL = `
+  ALTER TABLE foundation_event_catalog_gameplay_slots
+    ADD COLUMN expected_delay_ms INTEGER NOT NULL DEFAULT 0 CHECK (expected_delay_ms >= 0);
+  ALTER TABLE foundation_event_catalog_pitch_slots
+    ADD COLUMN expected_delay_ms INTEGER NOT NULL DEFAULT 0 CHECK (expected_delay_ms >= 0);
+  CREATE TABLE foundation_event_catalog_games_shift_copy AS
+    SELECT * FROM foundation_event_catalog_games;
+  DROP TABLE foundation_event_catalog_games;
+  CREATE TABLE foundation_event_catalog_games (
+    event_game_id TEXT PRIMARY KEY,
+    event_id TEXT NOT NULL REFERENCES foundation_event_catalog_events(event_id) ON DELETE CASCADE,
+    game_day_id TEXT NOT NULL REFERENCES foundation_event_catalog_game_days(game_day_id) ON DELETE CASCADE,
+    gameplay_slot_id TEXT NOT NULL REFERENCES foundation_event_catalog_gameplay_slots(gameplay_slot_id) ON DELETE CASCADE,
+    pitch_slot_id TEXT NOT NULL REFERENCES foundation_event_catalog_pitch_slots(pitch_slot_id) ON DELETE CASCADE,
+    game_code TEXT,
+    game_designation TEXT,
+    side_a_id TEXT NOT NULL UNIQUE,
+    side_a_event_team_id TEXT REFERENCES foundation_event_catalog_teams(event_team_id),
+    side_a_event_team_name TEXT,
+    side_a_source_label TEXT,
+    side_a_confirmed_at_ms INTEGER,
+    side_b_id TEXT NOT NULL UNIQUE,
+    side_b_event_team_id TEXT REFERENCES foundation_event_catalog_teams(event_team_id),
+    side_b_event_team_name TEXT,
+    side_b_source_label TEXT,
+    side_b_confirmed_at_ms INTEGER,
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    UNIQUE (event_id, game_code),
+    CHECK ((side_a_event_team_id IS NOT NULL AND side_a_event_team_name IS NOT NULL AND side_a_source_label IS NULL AND side_a_confirmed_at_ms IS NOT NULL) OR (side_a_event_team_id IS NULL AND side_a_event_team_name IS NULL AND side_a_source_label IS NOT NULL AND side_a_confirmed_at_ms IS NULL)),
+    CHECK ((side_b_event_team_id IS NOT NULL AND side_b_event_team_name IS NOT NULL AND side_b_source_label IS NULL AND side_b_confirmed_at_ms IS NOT NULL) OR (side_b_event_team_id IS NULL AND side_b_event_team_name IS NULL AND side_b_source_label IS NOT NULL AND side_b_confirmed_at_ms IS NULL)),
+    CHECK (side_a_event_team_id IS NULL OR side_a_event_team_id <> side_b_event_team_id)
+  ) STRICT;
+  INSERT INTO foundation_event_catalog_games
+    SELECT * FROM foundation_event_catalog_games_shift_copy;
+  DROP TABLE foundation_event_catalog_games_shift_copy;
+  ${FOUNDATION_EVENT_CATALOG_GAMES_INDEX_SQL};
 `;
 
 export const FOUNDATION_MIGRATIONS: readonly FoundationMigration[] = Object.freeze([
@@ -1980,6 +2033,12 @@ export const FOUNDATION_MIGRATIONS: readonly FoundationMigration[] = Object.free
     ordinal: 25,
     schemaVersion: 25,
     sql: FOUNDATION_EVENT_PUBLICATION_MIGRATION_SQL,
+  }),
+  createMigration({
+    id: "026-event-schedule-expected-delays-and-conflicts",
+    ordinal: 26,
+    schemaVersion: 26,
+    sql: FOUNDATION_EVENT_SCHEDULE_EXPECTED_DELAYS_MIGRATION_SQL,
   }),
 ]);
 

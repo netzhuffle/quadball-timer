@@ -123,6 +123,108 @@ describe("Event Administration handoff", () => {
     });
   });
 
+  test("keeps delay previews read-only while revalidating the persisted Event Admin session", async () => {
+    const fixture = createFixture();
+    const event = await fixture.catalog.createEvent(
+      { name: "Preview Event", timeZone: "UTC" },
+      fixture.technical,
+    );
+    if (event.status !== "accepted") throw new Error("Expected Event.");
+    const day = await fixture.catalog.addGameDay(
+      event.value.eventId,
+      { date: "2026-08-14" },
+      fixture.technical,
+    );
+    const pitch = await fixture.catalog.createPitch(
+      event.value.eventId,
+      { name: "Pitch A" },
+      fixture.technical,
+    );
+    if (day.status !== "accepted" || pitch.status !== "accepted")
+      throw new Error("Expected schedule setup.");
+    const slot = await fixture.catalog.createGameplaySlot(
+      event.value.eventId,
+      day.value.gameDayId,
+      { sequence: 1, scheduledStart: "2026-08-14T10:00" },
+      fixture.technical,
+    );
+    if (slot.status !== "accepted") throw new Error("Expected Gameplay Slot.");
+    const pitchSlot = await fixture.storage.transaction(
+      (transaction) => transaction.listPitchSlots(day.value.gameDayId, pitch.value.pitchId)[0],
+    );
+    if (pitchSlot === undefined) throw new Error("Expected Pitch Slot.");
+    const game = await fixture.catalog.createEventGame(
+      event.value.eventId,
+      day.value.gameDayId,
+      {
+        gameplaySlotId: slot.value.gameplaySlotId,
+        pitchSlotId: pitchSlot.pitchSlotId,
+        sideA: { sourceLabel: "A" },
+        sideB: { sourceLabel: "B" },
+      },
+      fixture.technical,
+    );
+    if (game.status !== "accepted") throw new Error("Expected Event Game.");
+    const created = await fixture.administration.createEventAdminGrant(
+      event.value.eventId,
+      fixture.technical,
+    );
+    if (created.status !== "accepted") throw new Error("Expected Grant.");
+    const revealed = await fixture.grants.revealGrant(created.value.grantId, fixture.technical);
+    if (revealed.status !== "revealed") throw new Error("Expected Grant reveal.");
+    const admitted = await fixture.administration.admitEventAdmin({
+      qrCredential: revealed.qrCredential,
+      browserContext: "preview-browser",
+      deviceClass: "desktop",
+      browserClass: "chromium",
+    });
+    if (admitted.status !== "admitted") throw new Error("Expected Event Admin admission.");
+    const authority = { kind: "grant-session" as const, sessionBearer: admitted.sessionBearer };
+    const beforeSession = await fixture.storage.transaction(
+      (transaction) => transaction.listGrantSessions(created.value.grantId)[0],
+    );
+    const beforeAudit = await fixture.catalog.listAuditTrail(
+      event.value.eventId,
+      fixture.technical,
+    );
+    expect(
+      await fixture.administration.previewGameplaySlotExpectedDelay(
+        event.value.eventId,
+        day.value.gameDayId,
+        slot.value.gameplaySlotId,
+        { expectedDelayMs: 5 * 60_000 },
+        authority,
+      ),
+    ).toMatchObject({
+      status: "accepted",
+      value: {
+        changes: [
+          {
+            eventGames: [
+              { eventGameId: game.value.eventGameId, beforeExpectedStartMs: expect.any(Number) },
+            ],
+          },
+        ],
+      },
+    });
+    const afterSession = await fixture.storage.transaction(
+      (transaction) => transaction.listGrantSessions(created.value.grantId)[0],
+    );
+    const afterAudit = await fixture.catalog.listAuditTrail(event.value.eventId, fixture.technical);
+    expect(afterSession).toEqual(beforeSession);
+    if (beforeAudit.status === "accepted" && afterAudit.status === "accepted")
+      expect(afterAudit.value.length).toBe(beforeAudit.value.length);
+    expect(
+      await fixture.administration.previewPitchSlotExpectedDelay(
+        event.value.eventId,
+        day.value.gameDayId,
+        pitchSlot.pitchSlotId,
+        { expectedDelayMs: 3 * 60_000 },
+        authority,
+      ),
+    ).toMatchObject({ status: "accepted", value: { changes: [{ afterDelayMs: 3 * 60_000 }] } });
+  });
+
   test("rejects duplicate Event Admin creation without creating another authority", async () => {
     const fixture = createFixture();
     const event = await fixture.catalog.createEvent(

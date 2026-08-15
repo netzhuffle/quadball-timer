@@ -1139,6 +1139,103 @@ async function startServer() {
               );
             },
           },
+        "/api/event-admin/events/:eventId/game-days/:gameDayId/gameplay-slots/:gameplaySlotId/expected-delay":
+          {
+            async POST(req: Request) {
+              if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
+              const authority = resolveEventAdministrationAuthority(req, technicalAdminAuth);
+              const body = await readJsonRecord(req);
+              const path = new URL(req.url).pathname.split("/");
+              if (authority === null || body === null) return sensitiveGenericAuthFailure(401);
+              return sensitiveEventAdministrationMutationResponse(
+                await eventAdministration.setGameplaySlotExpectedDelay(
+                  path.at(-6) ?? "",
+                  path.at(-4) ?? "",
+                  path.at(-2) ?? "",
+                  { expectedDelayMs: body.expectedDelayMs, cascade: body.cascade },
+                  authority,
+                ),
+                authority,
+              );
+            },
+          },
+        "/api/event-admin/events/:eventId/game-days/:gameDayId/gameplay-slots/:gameplaySlotId/expected-delay/preview":
+          {
+            async POST(req: Request) {
+              if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
+              const authority = resolveEventAdministrationAuthority(req, technicalAdminAuth);
+              const body = await readJsonRecord(req);
+              const path = new URL(req.url).pathname.split("/");
+              if (authority === null || body === null) return sensitiveGenericAuthFailure(401);
+              return sensitiveEventAdministrationResponse(
+                await eventAdministration.previewGameplaySlotExpectedDelay(
+                  path.at(-7) ?? "",
+                  path.at(-5) ?? "",
+                  path.at(-3) ?? "",
+                  { expectedDelayMs: body.expectedDelayMs, cascade: body.cascade },
+                  authority,
+                ),
+              );
+            },
+          },
+        "/api/event-admin/events/:eventId/game-days/:gameDayId/pitch-slots/:pitchSlotId/expected-delay":
+          {
+            async POST(req: Request) {
+              if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
+              const authority = resolveEventAdministrationAuthority(req, technicalAdminAuth);
+              const body = await readJsonRecord(req);
+              const path = new URL(req.url).pathname.split("/");
+              if (authority === null || body === null) return sensitiveGenericAuthFailure(401);
+              return sensitiveEventAdministrationMutationResponse(
+                await eventAdministration.setPitchSlotExpectedDelay(
+                  path.at(-6) ?? "",
+                  path.at(-4) ?? "",
+                  path.at(-2) ?? "",
+                  { expectedDelayMs: body.expectedDelayMs, cascade: body.cascade },
+                  authority,
+                ),
+                authority,
+              );
+            },
+          },
+        "/api/event-admin/events/:eventId/game-days/:gameDayId/pitch-slots/:pitchSlotId/expected-delay/preview":
+          {
+            async POST(req: Request) {
+              if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
+              const authority = resolveEventAdministrationAuthority(req, technicalAdminAuth);
+              const body = await readJsonRecord(req);
+              const path = new URL(req.url).pathname.split("/");
+              if (authority === null || body === null) return sensitiveGenericAuthFailure(401);
+              return sensitiveEventAdministrationResponse(
+                await eventAdministration.previewPitchSlotExpectedDelay(
+                  path.at(-7) ?? "",
+                  path.at(-5) ?? "",
+                  path.at(-3) ?? "",
+                  { expectedDelayMs: body.expectedDelayMs, cascade: body.cascade },
+                  authority,
+                ),
+              );
+            },
+          },
+        "/api/event-admin/events/:eventId/game-days/:gameDayId/event-games/:eventGameId/reassign": {
+          async POST(req: Request) {
+            if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
+            const authority = resolveEventAdministrationAuthority(req, technicalAdminAuth);
+            const body = await readJsonRecord(req);
+            const path = new URL(req.url).pathname.split("/");
+            if (authority === null || body === null) return sensitiveGenericAuthFailure(401);
+            return sensitiveEventAdministrationMutationResponse(
+              await eventAdministration.reassignEventGame(
+                path.at(-6) ?? "",
+                path.at(-4) ?? "",
+                path.at(-2) ?? "",
+                { targetPitchSlotId: body.targetPitchSlotId, mode: body.mode },
+                authority,
+              ),
+              authority,
+            );
+          },
+        },
         "/api/event-admin/slot-setup": {
           async GET(req: Request) {
             if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
@@ -1236,10 +1333,11 @@ async function startServer() {
         "/api/games/*": () => adHocUnavailableResponse(),
         "/*": htmlRoute,
       },
-      development: process.env.NODE_ENV !== "production" && {
-        hmr: true,
-        console: true,
-      },
+      development: process.env.NODE_ENV !== "production" &&
+        process.env.NODE_ENV !== "test" && {
+          hmr: true,
+          console: true,
+        },
       websocket: {
         open(ws) {
           sockets.add(ws);

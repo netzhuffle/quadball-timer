@@ -27,6 +27,7 @@ type HubResponse = {
         gameDayId: string;
         sequence: number;
         scheduledStartMs: number;
+        expectedDelayMs: number;
       }>;
       pitchSlots: Array<{
         pitchSlotId: string;
@@ -34,6 +35,7 @@ type HubResponse = {
         pitchId: string;
         gameplaySlotId: string;
         sequence: number;
+        expectedDelayMs: number;
       }>;
       eventGames: Array<{
         eventGameId: string;
@@ -44,6 +46,10 @@ type HubResponse = {
         gameDesignation: string | null;
         sideA: { eventTeamId: string | null; sourceLabel: string | null };
         sideB: { eventTeamId: string | null; sourceLabel: string | null };
+        expectedStartMs: number;
+        expectedPlayingPeriod: { startMs: number; endMs: number };
+        scheduleConflict: boolean;
+        teamScheduleConflict: boolean;
       }>;
     };
     selectedGameDayId: string | null;
@@ -86,12 +92,31 @@ const publicationWarningLabels: Record<string, string> = {
   "unresolved-matchups": "unresolved matchups or confirmed sides",
 };
 
+type ScheduleDelayPreview = {
+  dimension: "gameplay-slot" | "pitch-slot";
+  targetSlotId: string;
+  cascade: boolean;
+  changes: Array<{
+    slotId: string;
+    beforeExpectedStartMs: number;
+    afterExpectedStartMs: number;
+    eventGames: Array<{
+      eventGameId: string;
+      beforeExpectedStartMs: number;
+      afterExpectedStartMs: number;
+      beforeExpectedPlayingPeriod: { startMs: number; endMs: number };
+      afterExpectedPlayingPeriod: { startMs: number; endMs: number };
+    }>;
+  }>;
+};
+
 export function EventAdminPage() {
   const queryEventId = new URLSearchParams(window.location.search).get("eventId") ?? "";
   const [eventId, setEventId] = useState(queryEventId);
   const [credential, setCredential] = useState("");
   const [hub, setHub] = useState<HubResponse["value"] | null>(null);
   const [selectedGameDayId, setSelectedGameDayId] = useState<string | null>(null);
+  const [pitchManagerGameDayId, setPitchManagerGameDayId] = useState("");
   const [message, setMessage] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [teamName, setTeamName] = useState("");
@@ -114,6 +139,11 @@ export function EventAdminPage() {
     {},
   );
   const [schedule, setSchedule] = useState<ScheduleResponse["value"] | null>(null);
+  const [delayDrafts, setDelayDrafts] = useState<Record<string, string>>({});
+  const [cascadeDrafts, setCascadeDrafts] = useState<Record<string, boolean>>({});
+  const [delayPreviews, setDelayPreviews] = useState<Record<string, ScheduleDelayPreview>>({});
+  const [reassignmentTargets, setReassignmentTargets] = useState<Record<string, string>>({});
+  const [reassignmentModes, setReassignmentModes] = useState<Record<string, "move" | "swap">>({});
   const [selectedPitchId, setSelectedPitchId] = useState("");
   const [pitchView, setPitchView] = useState<{
     pitch: { pitchId: string; name: string };
@@ -205,9 +235,9 @@ export function EventAdminPage() {
   };
 
   const loadPitchManagerGrant = async () => {
-    if (selectedGameDayId === null || pitchManagerPitchId.length === 0) return;
+    if (pitchManagerGameDayId.length === 0 || pitchManagerPitchId.length === 0) return;
     const response = await fetch(
-      `/api/event-admin/events/${eventId}/game-days/${selectedGameDayId}/pitches/${pitchManagerPitchId}/pitch-manager-grant`,
+      `/api/event-admin/events/${eventId}/game-days/${pitchManagerGameDayId}/pitches/${pitchManagerPitchId}/pitch-manager-grant`,
     );
     const payload = (await response.json()) as PitchManagerGrantResponse | { status: string };
     if (!response.ok || payload.status !== "accepted") throw new Error("Grant lookup failed.");
@@ -256,13 +286,126 @@ export function EventAdminPage() {
   const managePitchManagerGrant = async (
     operation: "rotate" | "disable" | "revoke" | "reactivate",
   ) => {
-    if (selectedGameDayId === null || pitchManagerPitchId.length === 0) return;
+    if (pitchManagerGameDayId.length === 0 || pitchManagerPitchId.length === 0) return;
     const response = await fetch(
-      `/api/event-admin/events/${eventId}/game-days/${selectedGameDayId}/pitches/${pitchManagerPitchId}/pitch-manager-grant/${operation}`,
+      `/api/event-admin/events/${eventId}/game-days/${pitchManagerGameDayId}/pitches/${pitchManagerPitchId}/pitch-manager-grant/${operation}`,
       { method: "POST" },
     );
     if (!response.ok) throw new Error("Pitch Manager Grant lifecycle change failed.");
     await loadPitchManagerGrant();
+  };
+
+  const delayMsFor = (slotId: string) => {
+    const minutes = Number(delayDrafts[slotId] ?? "0");
+    if (!Number.isSafeInteger(minutes) || minutes < 0)
+      throw new Error("Expected Delay is invalid.");
+    return minutes * 60_000;
+  };
+
+  const previewGameplayDelay = async (slotId: string) => {
+    if (selectedGameDayId === null) return;
+    const response = await fetch(
+      `/api/event-admin/events/${eventId}/game-days/${selectedGameDayId}/gameplay-slots/${slotId}/expected-delay/preview`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          expectedDelayMs: delayMsFor(slotId),
+          cascade: cascadeDrafts[slotId] === true,
+        }),
+      },
+    );
+    if (!response.ok) throw new Error(await responseError(response, "Delay preview failed."));
+    const payload = (await response.json()) as { status: string; value?: ScheduleDelayPreview };
+    if (payload.status !== "accepted" || payload.value === undefined)
+      throw new Error("Delay preview failed.");
+    setDelayPreviews((current) => ({ ...current, [slotId]: payload.value! }));
+  };
+
+  const applyGameplayDelay = async (slotId: string) => {
+    if (selectedGameDayId === null) return;
+    const response = await fetch(
+      `/api/event-admin/events/${eventId}/game-days/${selectedGameDayId}/gameplay-slots/${slotId}/expected-delay`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          expectedDelayMs: delayMsFor(slotId),
+          cascade: cascadeDrafts[slotId] === true,
+        }),
+      },
+    );
+    if (!response.ok) throw new Error(await responseError(response, "Delay apply failed."));
+    await loadSchedule();
+    setDelayPreviews((current) => {
+      const next = { ...current };
+      delete next[slotId];
+      return next;
+    });
+  };
+
+  const previewPitchDelay = async (slotId: string) => {
+    if (selectedGameDayId === null) return;
+    const response = await fetch(
+      `/api/event-admin/events/${eventId}/game-days/${selectedGameDayId}/pitch-slots/${slotId}/expected-delay/preview`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          expectedDelayMs: delayMsFor(slotId),
+          cascade: cascadeDrafts[slotId] === true,
+        }),
+      },
+    );
+    if (!response.ok) throw new Error(await responseError(response, "Delay preview failed."));
+    const payload = (await response.json()) as { status: string; value?: ScheduleDelayPreview };
+    if (payload.status !== "accepted" || payload.value === undefined)
+      throw new Error("Delay preview failed.");
+    setDelayPreviews((current) => ({ ...current, [slotId]: payload.value! }));
+  };
+
+  const applyPitchDelay = async (slotId: string) => {
+    if (selectedGameDayId === null) return;
+    const response = await fetch(
+      `/api/event-admin/events/${eventId}/game-days/${selectedGameDayId}/pitch-slots/${slotId}/expected-delay`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          expectedDelayMs: delayMsFor(slotId),
+          cascade: cascadeDrafts[slotId] === true,
+        }),
+      },
+    );
+    if (!response.ok) throw new Error(await responseError(response, "Delay apply failed."));
+    await loadSchedule();
+    if (selectedPitchId.length > 0) await loadPitchView(selectedPitchId);
+    setDelayPreviews((current) => {
+      const next = { ...current };
+      delete next[slotId];
+      return next;
+    });
+  };
+
+  const reassignEventGame = async (eventGameId: string) => {
+    if (selectedGameDayId === null) return;
+    const targetPitchSlotId = reassignmentTargets[eventGameId];
+    if (targetPitchSlotId === undefined || targetPitchSlotId.length === 0)
+      throw new Error("Choose a target Pitch Slot.");
+    const response = await fetch(
+      `/api/event-admin/events/${eventId}/game-days/${selectedGameDayId}/event-games/${eventGameId}/reassign`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          targetPitchSlotId,
+          mode: reassignmentModes[eventGameId] ?? "move",
+        }),
+      },
+    );
+    if (!response.ok) throw new Error(await responseError(response, "Pitch Reassignment failed."));
+    await loadSchedule();
+    if (selectedPitchId.length > 0) await loadPitchView(selectedPitchId);
   };
 
   const confirmGameplaySlot = async (
@@ -301,7 +444,9 @@ export function EventAdminPage() {
       setMessage(
         error instanceof EventPublicationValidationError
           ? error.message
-          : "Unable to authorize the Event Hub.",
+          : error instanceof Error
+            ? error.message
+            : "Unable to authorize the Event Hub.",
       );
     } finally {
       setBusy(false);
@@ -738,9 +883,66 @@ export function EventAdminPage() {
                                 }).format(new Date(slot.scheduledStartMs))}
                               </span>
                               <span className="text-xs text-muted-foreground">
-                                {slotGames.length} Games
+                                {slotGames.length} Games · Expected Delay{" "}
+                                {slot.expectedDelayMs / 60_000}m
                               </span>
                             </div>
+                            <div className="mt-2 grid gap-2 sm:grid-cols-[auto_auto_1fr_auto_auto]">
+                              <Label htmlFor={`gameplay-delay-${slot.gameplaySlotId}`}>
+                                Delay (min)
+                              </Label>
+                              <Input
+                                id={`gameplay-delay-${slot.gameplaySlotId}`}
+                                aria-label={`Gameplay Slot ${slot.sequence} Expected Delay minutes`}
+                                inputMode="numeric"
+                                value={
+                                  delayDrafts[slot.gameplaySlotId] ??
+                                  String(slot.expectedDelayMs / 60_000)
+                                }
+                                onChange={(event) =>
+                                  setDelayDrafts((current) => ({
+                                    ...current,
+                                    [slot.gameplaySlotId]: event.target.value,
+                                  }))
+                                }
+                              />
+                              <label className="flex items-center gap-2 text-sm">
+                                <input
+                                  type="checkbox"
+                                  checked={cascadeDrafts[slot.gameplaySlotId] === true}
+                                  onChange={(event) =>
+                                    setCascadeDrafts((current) => ({
+                                      ...current,
+                                      [slot.gameplaySlotId]: event.target.checked,
+                                    }))
+                                  }
+                                />
+                                Cascade later Gameplay Slots
+                              </label>
+                              <Button
+                                variant="outline"
+                                disabled={busy}
+                                onClick={() =>
+                                  void run(() => previewGameplayDelay(slot.gameplaySlotId))
+                                }
+                              >
+                                Preview Delay
+                              </Button>
+                              <Button
+                                disabled={busy}
+                                onClick={() =>
+                                  void run(() => applyGameplayDelay(slot.gameplaySlotId))
+                                }
+                              >
+                                Apply Delay
+                              </Button>
+                            </div>
+                            {delayPreviews[slot.gameplaySlotId] ? (
+                              <DelayPreviewView
+                                preview={delayPreviews[slot.gameplaySlotId]!}
+                                timeZone={hub.event.timeZone}
+                              />
+                            ) : null}
                             <div className="mt-2 grid gap-1 text-sm sm:grid-cols-2">
                               {slotGames.map((game) => {
                                 const draft = confirmationDrafts[game.eventGameId] ?? {
@@ -949,22 +1151,127 @@ export function EventAdminPage() {
                       const gameplaySlot = pitchView.gameplaySlots.find(
                         (candidate) => candidate.gameplaySlotId === slot.gameplaySlotId,
                       );
-                      const game = pitchView.eventGames.find(
+                      const games = pitchView.eventGames.filter(
                         (candidate) => candidate.pitchSlotId === slot.pitchSlotId,
                       );
                       return (
                         <div className="rounded border p-2 text-sm" key={slot.pitchSlotId}>
-                          <span className="font-medium">
-                            Slot {slot.sequence}
-                            {gameplaySlot
-                              ? ` · ${new Intl.DateTimeFormat(undefined, { timeZone: hub.event.timeZone, hour: "2-digit", minute: "2-digit" }).format(new Date(gameplaySlot.scheduledStartMs))}`
-                              : ""}
-                          </span>
-                          <span className="ml-2 text-muted-foreground">
-                            {game
-                              ? `${game.sideA.eventTeamId ?? game.sideA.sourceLabel} vs ${game.sideB.eventTeamId ?? game.sideB.sourceLabel}`
-                              : "Empty"}
-                          </span>
+                          <div className="flex flex-wrap justify-between gap-2">
+                            <span className="font-medium">
+                              Slot {slot.sequence}
+                              {gameplaySlot
+                                ? ` · ${new Intl.DateTimeFormat(undefined, { timeZone: hub.event.timeZone, hour: "2-digit", minute: "2-digit" }).format(new Date(gameplaySlot.scheduledStartMs))}`
+                                : ""}
+                            </span>
+                            <span className="text-xs text-muted-foreground">
+                              Expected Delay {slot.expectedDelayMs / 60_000}m
+                            </span>
+                          </div>
+                          <div className="mt-2 grid gap-2 sm:grid-cols-[auto_1fr_auto_auto]">
+                            <Label htmlFor={`pitch-delay-${slot.pitchSlotId}`}>Delay (min)</Label>
+                            <Input
+                              id={`pitch-delay-${slot.pitchSlotId}`}
+                              aria-label={`Pitch Slot ${slot.sequence} Expected Delay minutes`}
+                              inputMode="numeric"
+                              value={
+                                delayDrafts[slot.pitchSlotId] ??
+                                String(slot.expectedDelayMs / 60_000)
+                              }
+                              onChange={(event) =>
+                                setDelayDrafts((current) => ({
+                                  ...current,
+                                  [slot.pitchSlotId]: event.target.value,
+                                }))
+                              }
+                            />
+                            <Button
+                              variant="outline"
+                              disabled={busy}
+                              onClick={() => void run(() => previewPitchDelay(slot.pitchSlotId))}
+                            >
+                              Preview Pitch Delay
+                            </Button>
+                            <Button
+                              disabled={busy}
+                              onClick={() => void run(() => applyPitchDelay(slot.pitchSlotId))}
+                            >
+                              Apply Pitch Delay
+                            </Button>
+                          </div>
+                          {delayPreviews[slot.pitchSlotId] ? (
+                            <DelayPreviewView
+                              preview={delayPreviews[slot.pitchSlotId]!}
+                              timeZone={hub.event.timeZone}
+                            />
+                          ) : null}
+                          {games.length === 0 ? (
+                            <p className="mt-2 text-muted-foreground">Empty</p>
+                          ) : (
+                            games.map((game) => (
+                              <div className="mt-2 rounded bg-muted/50 p-2" key={game.eventGameId}>
+                                <div>
+                                  <span className="font-medium">
+                                    {game.gameCode ?? game.eventGameId}
+                                  </span>
+                                  <span className="ml-2 text-muted-foreground">
+                                    {game.sideA.eventTeamId ?? game.sideA.sourceLabel} vs{" "}
+                                    {game.sideB.eventTeamId ?? game.sideB.sourceLabel}
+                                  </span>
+                                </div>
+                                <div className="mt-1 text-xs">
+                                  Expected Start{" "}
+                                  {formatScheduleTime(game.expectedStartMs, hub.event.timeZone)}
+                                  {game.scheduleConflict ? " · Schedule Conflict" : ""}
+                                  {game.teamScheduleConflict ? " · Team Schedule Conflict" : ""}
+                                </div>
+                                <div className="mt-2 grid gap-2 sm:grid-cols-[1fr_auto_auto]">
+                                  <select
+                                    aria-label={`Reassign ${game.eventGameId} target Pitch Slot`}
+                                    className="h-9 rounded-md border bg-background px-2 text-sm"
+                                    value={reassignmentTargets[game.eventGameId] ?? ""}
+                                    onChange={(event) =>
+                                      setReassignmentTargets((current) => ({
+                                        ...current,
+                                        [game.eventGameId]: event.target.value,
+                                      }))
+                                    }
+                                  >
+                                    <option value="">Target Pitch Slot</option>
+                                    {(schedule?.pitchSlots ?? hub.event.pitchSlots).map(
+                                      (target) => (
+                                        <option key={target.pitchSlotId} value={target.pitchSlotId}>
+                                          {target.pitchSlotId} · Slot {target.sequence}
+                                        </option>
+                                      ),
+                                    )}
+                                  </select>
+                                  <select
+                                    aria-label={`Reassign ${game.eventGameId} mode`}
+                                    className="h-9 rounded-md border bg-background px-2 text-sm"
+                                    value={reassignmentModes[game.eventGameId] ?? "move"}
+                                    onChange={(event) =>
+                                      setReassignmentModes((current) => ({
+                                        ...current,
+                                        [game.eventGameId]: event.target.value as "move" | "swap",
+                                      }))
+                                    }
+                                  >
+                                    <option value="move">Move</option>
+                                    <option value="swap">Swap</option>
+                                  </select>
+                                  <Button
+                                    variant="outline"
+                                    disabled={busy}
+                                    onClick={() =>
+                                      void run(() => reassignEventGame(game.eventGameId))
+                                    }
+                                  >
+                                    Reassign Game
+                                  </Button>
+                                </div>
+                              </div>
+                            ))
+                          )}
                         </div>
                       );
                     })}
@@ -983,9 +1290,9 @@ export function EventAdminPage() {
                   <select
                     aria-label="Pitch Manager Game Day"
                     className="h-10 rounded-md border bg-background px-3 text-sm"
-                    value={selectedGameDayId ?? ""}
+                    value={pitchManagerGameDayId}
                     onChange={(event) => {
-                      setSelectedGameDayId(event.target.value);
+                      setPitchManagerGameDayId(event.target.value);
                       setPitchManagerGrant(null);
                       setPitchManagerQrDataUrl(null);
                     }}
@@ -1017,22 +1324,24 @@ export function EventAdminPage() {
                 </div>
                 <div className="flex flex-wrap gap-2">
                   <Button
+                    type="button"
                     variant="outline"
                     disabled={
-                      busy || selectedGameDayId === null || pitchManagerPitchId.length === 0
+                      busy || pitchManagerGameDayId.length === 0 || pitchManagerPitchId.length === 0
                     }
                     onClick={() => void run(loadPitchManagerGrant)}
                   >
                     Inspect Grant
                   </Button>
                   <Button
+                    type="button"
                     disabled={
-                      busy || selectedGameDayId === null || pitchManagerPitchId.length === 0
+                      busy || pitchManagerGameDayId.length === 0 || pitchManagerPitchId.length === 0
                     }
                     onClick={() =>
                       void run(async () => {
                         const response = await fetch(
-                          `/api/event-admin/events/${eventId}/game-days/${selectedGameDayId}/pitches/${pitchManagerPitchId}/pitch-manager-grant`,
+                          `/api/event-admin/events/${eventId}/game-days/${pitchManagerGameDayId}/pitches/${pitchManagerPitchId}/pitch-manager-grant`,
                           { method: "POST" },
                         );
                         if (!response.ok) throw new Error("Pitch Manager Grant creation failed.");
@@ -1043,12 +1352,13 @@ export function EventAdminPage() {
                     Create Grant
                   </Button>
                   <Button
+                    type="button"
                     variant="outline"
                     disabled={busy || pitchManagerGrant === null}
                     onClick={() =>
                       void run(async () => {
                         const response = await fetch(
-                          `/api/event-admin/events/${eventId}/game-days/${selectedGameDayId}/pitches/${pitchManagerPitchId}/pitch-manager-grant/reveal`,
+                          `/api/event-admin/events/${eventId}/game-days/${pitchManagerGameDayId}/pitches/${pitchManagerPitchId}/pitch-manager-grant/reveal`,
                           { method: "POST" },
                         );
                         const payload = (await response.json()) as {
@@ -1070,6 +1380,7 @@ export function EventAdminPage() {
                     Reveal QR
                   </Button>
                   <Button
+                    type="button"
                     variant="outline"
                     aria-label="Rotate Pitch Manager Grant"
                     disabled={busy || pitchManagerGrant === null}
@@ -1078,6 +1389,7 @@ export function EventAdminPage() {
                     Rotate Grant
                   </Button>
                   <Button
+                    type="button"
                     variant="outline"
                     aria-label="Disable Pitch Manager Grant"
                     disabled={busy || pitchManagerGrant === null}
@@ -1086,6 +1398,7 @@ export function EventAdminPage() {
                     Disable Grant
                   </Button>
                   <Button
+                    type="button"
                     variant="outline"
                     aria-label="Revoke Pitch Manager Grant"
                     disabled={busy || pitchManagerGrant === null}
@@ -1094,6 +1407,7 @@ export function EventAdminPage() {
                     Revoke Grant
                   </Button>
                   <Button
+                    type="button"
                     variant="outline"
                     aria-label="Reactivate Pitch Manager Grant"
                     disabled={busy || pitchManagerGrant === null}
@@ -1128,4 +1442,56 @@ export function EventAdminPage() {
       </Card>
     </main>
   );
+}
+
+function DelayPreviewView({
+  preview,
+  timeZone,
+}: {
+  preview: ScheduleDelayPreview;
+  timeZone: string;
+}) {
+  return (
+    <div className="mt-2 rounded bg-blue-50 p-2 text-xs dark:bg-blue-950/30">
+      <p className="font-medium">
+        Preview · {preview.dimension === "gameplay-slot" ? "Gameplay" : "Pitch"} ·{" "}
+        {preview.cascade ? "cascaded" : "single slot"}
+      </p>
+      {preview.changes.length === 0 ? (
+        <p>No slots change; applying this value will be rejected as no change.</p>
+      ) : (
+        preview.changes.map((change) => (
+          <div key={change.slotId}>
+            Slot {change.slotId}: {formatScheduleTime(change.beforeExpectedStartMs, timeZone)} →{" "}
+            {formatScheduleTime(change.afterExpectedStartMs, timeZone)}
+            {change.eventGames.map((game) => (
+              <div className="ml-3" key={game.eventGameId}>
+                {game.eventGameId}: {formatScheduleTime(game.beforeExpectedStartMs, timeZone)} →{" "}
+                {formatScheduleTime(game.afterExpectedStartMs, timeZone)}
+              </div>
+            ))}
+          </div>
+        ))
+      )}
+    </div>
+  );
+}
+
+function formatScheduleTime(value: number, timeZone: string): string {
+  return new Intl.DateTimeFormat(undefined, {
+    timeZone,
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(new Date(value));
+}
+
+async function responseError(response: Response, fallback: string): Promise<string> {
+  try {
+    const payload = (await response.json()) as { detail?: unknown; message?: unknown };
+    if (typeof payload.detail === "string") return payload.detail;
+    if (typeof payload.message === "string") return payload.message;
+  } catch {
+    // Keep the bounded generic UI message.
+  }
+  return fallback;
 }

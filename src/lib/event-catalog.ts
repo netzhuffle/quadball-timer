@@ -58,6 +58,14 @@ export type EventGame = StoredEventCatalogGame;
 export type EventGameSide = StoredEventGameSide;
 export type EventAdministrationAuditEntry = EventCatalogAuditEntry;
 
+/** Bounded scheduled playing period used until a commenced Game supplies actual timing. */
+export const DEFAULT_EVENT_GAME_PLAYING_DURATION_MS = 30 * 60 * 1000;
+
+export type EventGamePlayingPeriod = {
+  startMs: number;
+  endMs: number;
+};
+
 /** Canonical Expected Start projection shared by schedule and handoff views. */
 export function projectExpectedStartMs(
   gameplaySlot: Pick<GameplaySlot, "scheduledStartMs" | "expectedDelayMs"> | null,
@@ -66,11 +74,15 @@ export function projectExpectedStartMs(
   const scheduledStartMs = gameplaySlot?.scheduledStartMs ?? 0;
   const gameplayDelayMs = gameplaySlot?.expectedDelayMs ?? 0;
   const pitchDelayMs = pitchSlot?.expectedDelayMs ?? 0;
-  return Math.max(
-    scheduledStartMs + gameplayDelayMs,
-    scheduledStartMs + Math.max(gameplayDelayMs, pitchDelayMs),
-  );
+  return scheduledStartMs + Math.max(gameplayDelayMs, pitchDelayMs);
 }
+
+export type ProjectedEventGame = EventGame & {
+  expectedStartMs: number;
+  expectedPlayingPeriod: EventGamePlayingPeriod;
+  scheduleConflict: boolean;
+  teamScheduleConflict: boolean;
+};
 
 export type EventGameDay = StoredGameDay & {
   classification: GameDayClassification;
@@ -92,7 +104,7 @@ export type EventProjection = StoredEvent & {
   pitches: readonly StoredPitch[];
   gameplaySlots: readonly GameplaySlot[];
   pitchSlots: readonly PitchSlot[];
-  eventGames: readonly EventGame[];
+  eventGames: readonly ProjectedEventGame[];
   auditTrail: readonly EventAdministrationAuditEntry[];
 };
 
@@ -217,6 +229,66 @@ export type EventCatalogMutationOperations = {
       games: unknown;
     },
   ): CatalogOutcome<readonly EventGame[]>;
+  previewGameplaySlotExpectedDelay(
+    eventId: unknown,
+    gameDayId: unknown,
+    gameplaySlotId: unknown,
+    input: { expectedDelayMs: unknown; cascade?: unknown },
+  ): CatalogOutcome<ScheduleDelayPreview>;
+  previewPitchSlotExpectedDelay(
+    eventId: unknown,
+    gameDayId: unknown,
+    pitchSlotId: unknown,
+    input: { expectedDelayMs: unknown; cascade?: unknown },
+  ): CatalogOutcome<ScheduleDelayPreview>;
+  setGameplaySlotExpectedDelay(
+    eventId: unknown,
+    gameDayId: unknown,
+    gameplaySlotId: unknown,
+    input: { expectedDelayMs: unknown; cascade?: unknown },
+  ): CatalogOutcome<ScheduleDelayPreview>;
+  setPitchSlotExpectedDelay(
+    eventId: unknown,
+    gameDayId: unknown,
+    pitchSlotId: unknown,
+    input: { expectedDelayMs: unknown; cascade?: unknown },
+  ): CatalogOutcome<ScheduleDelayPreview>;
+  reassignEventGame(
+    eventId: unknown,
+    gameDayId: unknown,
+    eventGameId: unknown,
+    input: { targetPitchSlotId: unknown; mode?: unknown },
+  ): CatalogOutcome<PitchReassignmentResult>;
+};
+
+export type ScheduleDelayChange = {
+  slotId: string;
+  beforeDelayMs: number;
+  afterDelayMs: number;
+  beforeExpectedStartMs: number;
+  afterExpectedStartMs: number;
+  eventGames: readonly {
+    eventGameId: string;
+    beforeExpectedStartMs: number;
+    afterExpectedStartMs: number;
+    beforeExpectedPlayingPeriod: EventGamePlayingPeriod;
+    afterExpectedPlayingPeriod: EventGamePlayingPeriod;
+  }[];
+};
+
+export type ScheduleDelayPreview = {
+  dimension: "gameplay-slot" | "pitch-slot";
+  targetSlotId: string;
+  cascade: boolean;
+  changes: readonly ScheduleDelayChange[];
+};
+
+export type PitchReassignmentResult = {
+  mode: "move" | "swap";
+  eventGame: EventGame;
+  swappedEventGame: EventGame | null;
+  scheduleConflict: boolean;
+  teamScheduleConflicts: readonly string[];
 };
 
 export type EventCatalogStorageSnapshot = {
@@ -255,6 +327,8 @@ export type EventCatalogStorageTransaction = EventCatalogStorageSnapshot & {
   updatePitch(pitch: StoredPitch): void;
   insertGameplaySlot(slot: GameplaySlot): void;
   insertPitchSlot(slot: PitchSlot): void;
+  updateGameplaySlot(slot: GameplaySlot): void;
+  updatePitchSlot(slot: PitchSlot): void;
   insertEventGame(game: EventGame): void;
   updateEventGame(game: EventGame): void;
   appendAudit(entry: EventAdministrationAuditEntry): void;
@@ -365,6 +439,41 @@ export type EventCatalog = {
     input: { games: unknown },
     authority: TechnicalAdminAuthority,
   ): Promise<CatalogOutcome<readonly EventGame[]>>;
+  setGameplaySlotExpectedDelay(
+    eventId: unknown,
+    gameDayId: unknown,
+    gameplaySlotId: unknown,
+    input: { expectedDelayMs: unknown; cascade?: unknown },
+    authority: TechnicalAdminAuthority,
+  ): Promise<CatalogOutcome<ScheduleDelayPreview>>;
+  previewGameplaySlotExpectedDelay(
+    eventId: unknown,
+    gameDayId: unknown,
+    gameplaySlotId: unknown,
+    input: { expectedDelayMs: unknown; cascade?: unknown },
+    authority: TechnicalAdminAuthority,
+  ): Promise<CatalogOutcome<ScheduleDelayPreview>>;
+  setPitchSlotExpectedDelay(
+    eventId: unknown,
+    gameDayId: unknown,
+    pitchSlotId: unknown,
+    input: { expectedDelayMs: unknown; cascade?: unknown },
+    authority: TechnicalAdminAuthority,
+  ): Promise<CatalogOutcome<ScheduleDelayPreview>>;
+  previewPitchSlotExpectedDelay(
+    eventId: unknown,
+    gameDayId: unknown,
+    pitchSlotId: unknown,
+    input: { expectedDelayMs: unknown; cascade?: unknown },
+    authority: TechnicalAdminAuthority,
+  ): Promise<CatalogOutcome<ScheduleDelayPreview>>;
+  reassignEventGame(
+    eventId: unknown,
+    gameDayId: unknown,
+    eventGameId: unknown,
+    input: { targetPitchSlotId: unknown; mode?: unknown },
+    authority: TechnicalAdminAuthority,
+  ): Promise<CatalogOutcome<PitchReassignmentResult>>;
   lookupAudienceRoster(
     eventId: unknown,
     eventTeamId: unknown,
@@ -791,6 +900,74 @@ export function createEventCatalog(
       );
     },
 
+    async setGameplaySlotExpectedDelay(eventId, gameDayId, gameplaySlotId, input, authority) {
+      if (!isTechnicalAdminAuthority(authority)) return unauthorized();
+      return commit(storage, (transaction) =>
+        setGameplaySlotExpectedDelayOperation(
+          transaction,
+          clock,
+          ids,
+          eventId,
+          gameDayId,
+          gameplaySlotId,
+          input,
+          authorityActor(authority),
+        ),
+      );
+    },
+
+    async previewGameplaySlotExpectedDelay(eventId, gameDayId, gameplaySlotId, input, authority) {
+      if (!isTechnicalAdminAuthority(authority)) return unauthorized();
+      return commit(storage, (transaction) =>
+        previewGameplaySlotExpectedDelayOperation(
+          transaction,
+          eventId,
+          gameDayId,
+          gameplaySlotId,
+          input,
+        ),
+      );
+    },
+
+    async setPitchSlotExpectedDelay(eventId, gameDayId, pitchSlotId, input, authority) {
+      if (!isTechnicalAdminAuthority(authority)) return unauthorized();
+      return commit(storage, (transaction) =>
+        setPitchSlotExpectedDelayOperation(
+          transaction,
+          clock,
+          ids,
+          eventId,
+          gameDayId,
+          pitchSlotId,
+          input,
+          authorityActor(authority),
+        ),
+      );
+    },
+
+    async previewPitchSlotExpectedDelay(eventId, gameDayId, pitchSlotId, input, authority) {
+      if (!isTechnicalAdminAuthority(authority)) return unauthorized();
+      return commit(storage, (transaction) =>
+        previewPitchSlotExpectedDelayOperation(transaction, eventId, gameDayId, pitchSlotId, input),
+      );
+    },
+
+    async reassignEventGame(eventId, gameDayId, eventGameId, input, authority) {
+      if (!isTechnicalAdminAuthority(authority)) return unauthorized();
+      return commit(storage, (transaction) =>
+        reassignEventGameOperation(
+          transaction,
+          clock,
+          ids,
+          eventId,
+          gameDayId,
+          eventGameId,
+          input,
+          authorityActor(authority),
+        ),
+      );
+    },
+
     async lookupAudienceRoster(eventIdInput, eventTeamIdInput, playerNumberInput) {
       const eventId = validateId(eventIdInput, "eventId");
       const eventTeamId = validateId(eventTeamIdInput, "eventTeamId");
@@ -1120,9 +1297,15 @@ function project(
             : left.pitchId.localeCompare(right.pitchId)
           : left.gameDayId.localeCompare(right.gameDayId),
       ),
-    eventGames: eventGames
-      .map((game) => structuredClone(game))
-      .sort((left, right) => left.eventGameId.localeCompare(right.eventGameId)),
+    eventGames: projectScheduleGames(
+      {
+        findGameplaySlot: (gameplaySlotId) =>
+          gameplaySlots.find((slot) => slot.gameplaySlotId === gameplaySlotId) ?? null,
+        findPitchSlot: (pitchSlotId) =>
+          pitchSlots.find((slot) => slot.pitchSlotId === pitchSlotId) ?? null,
+      },
+      eventGames,
+    ).sort((left, right) => left.eventGameId.localeCompare(right.eventGameId)),
     auditTrail: [...structuredClone(auditTrail)].sort((left, right) =>
       left.occurredAtMs === right.occurredAtMs
         ? left.auditId.localeCompare(right.auditId)
@@ -1244,6 +1427,49 @@ function createMutationOperations(
         eventId,
         gameDayId,
         gameplaySlotId,
+        input,
+        actorReference,
+      ),
+    previewGameplaySlotExpectedDelay: (eventId, gameDayId, gameplaySlotId, input) =>
+      previewGameplaySlotExpectedDelayOperation(
+        transaction,
+        eventId,
+        gameDayId,
+        gameplaySlotId,
+        input,
+      ),
+    setGameplaySlotExpectedDelay: (eventId, gameDayId, gameplaySlotId, input) =>
+      setGameplaySlotExpectedDelayOperation(
+        transaction,
+        clock,
+        ids,
+        eventId,
+        gameDayId,
+        gameplaySlotId,
+        input,
+        actorReference,
+      ),
+    previewPitchSlotExpectedDelay: (eventId, gameDayId, pitchSlotId, input) =>
+      previewPitchSlotExpectedDelayOperation(transaction, eventId, gameDayId, pitchSlotId, input),
+    setPitchSlotExpectedDelay: (eventId, gameDayId, pitchSlotId, input) =>
+      setPitchSlotExpectedDelayOperation(
+        transaction,
+        clock,
+        ids,
+        eventId,
+        gameDayId,
+        pitchSlotId,
+        input,
+        actorReference,
+      ),
+    reassignEventGame: (eventId, gameDayId, eventGameId, input) =>
+      reassignEventGameOperation(
+        transaction,
+        clock,
+        ids,
+        eventId,
+        gameDayId,
+        eventGameId,
         input,
         actorReference,
       ),
@@ -1541,6 +1767,7 @@ function createPitchOperation(
         pitchId: pitch.pitchId,
         gameplaySlotId: gameplaySlot.gameplaySlotId,
         sequence: gameplaySlot.sequence,
+        expectedDelayMs: 0,
         createdAtMs: nowMs,
         updatedAtMs: nowMs,
       };
@@ -1611,6 +1838,7 @@ function createGameplaySlotOperation(
     gameDayId: day.gameDayId,
     sequence: sequence.value,
     scheduledStartMs: scheduledStartMs.value,
+    expectedDelayMs: 0,
     createdAtMs: nowMs,
     updatedAtMs: nowMs,
   };
@@ -1623,6 +1851,7 @@ function createGameplaySlotOperation(
       pitchId: pitch.pitchId,
       gameplaySlotId: slot.gameplaySlotId,
       sequence: slot.sequence,
+      expectedDelayMs: 0,
       createdAtMs: nowMs,
       updatedAtMs: nowMs,
     };
@@ -1897,6 +2126,455 @@ function confirmGameplaySlotTeamsOperation(
       );
   }
   return changed ? accepted(updated) : noChange("Gameplay Slot teams are already confirmed.");
+}
+
+function setGameplaySlotExpectedDelayOperation(
+  transaction: EventCatalogStorageTransaction,
+  clock: EventCatalogClock,
+  ids: EventCatalogIds,
+  eventIdInput: unknown,
+  gameDayIdInput: unknown,
+  gameplaySlotIdInput: unknown,
+  input: { expectedDelayMs: unknown; cascade?: unknown },
+  actorReference: string,
+): CatalogOutcome<ScheduleDelayPreview> {
+  const eventId = validateId(eventIdInput, "eventId");
+  const gameDayId = validateId(gameDayIdInput, "gameDayId");
+  const slotId = validateId(gameplaySlotIdInput, "gameplaySlotId");
+  const delay = validateDelay(input.expectedDelayMs);
+  if (!eventId.ok || !gameDayId.ok || !slotId.ok)
+    return invalid("Schedule Slot identifier is invalid.");
+  if (!delay.ok) return invalid(delay.error);
+  const event = transaction.findEvent(eventId.value);
+  const slot = transaction.findGameplaySlot(slotId.value);
+  if (event === null || slot === null) return notFound("Gameplay Slot was not found.");
+  if (slot.eventId !== event.eventId || slot.gameDayId !== gameDayId.value)
+    return crossEvent("Gameplay Slot does not belong to the selected Event and Game Day.");
+  const cascade = input.cascade === true;
+  const slots = transaction
+    .listGameplaySlots(gameDayId.value)
+    .filter(
+      (candidate) =>
+        candidate.sequence >= slot.sequence && (cascade || candidate.sequence === slot.sequence),
+    );
+  const changedSlots = slots.filter((candidate) => candidate.expectedDelayMs !== delay.value);
+  if (changedSlots.length === 0)
+    return noChange("Gameplay Slot Expected Delay is already applied.");
+  const preview = createDelayPreview(
+    transaction,
+    "gameplay-slot",
+    slot.gameplaySlotId,
+    changedSlots,
+    delay.value,
+    cascade,
+  );
+  const nowMs = validNow(clock);
+  if (nowMs === null) return invalid("Event clock returned an invalid timestamp.");
+  for (const candidate of changedSlots) {
+    transaction.updateGameplaySlot({
+      ...candidate,
+      expectedDelayMs: delay.value,
+      updatedAtMs: nowMs,
+    });
+  }
+  transaction.appendAudit(
+    createAudit(
+      ids,
+      "event-updated",
+      event.eventId,
+      gameDayId.value,
+      actorReference,
+      nowMs,
+      null,
+      preview,
+    ),
+  );
+  return accepted(preview);
+}
+
+function previewGameplaySlotExpectedDelayOperation(
+  transaction: EventCatalogStorageTransaction,
+  eventIdInput: unknown,
+  gameDayIdInput: unknown,
+  gameplaySlotIdInput: unknown,
+  input: { expectedDelayMs: unknown; cascade?: unknown },
+): CatalogOutcome<ScheduleDelayPreview> {
+  const eventId = validateId(eventIdInput, "eventId");
+  const gameDayId = validateId(gameDayIdInput, "gameDayId");
+  const slotId = validateId(gameplaySlotIdInput, "gameplaySlotId");
+  const delay = validateDelay(input.expectedDelayMs);
+  if (!eventId.ok || !gameDayId.ok || !slotId.ok)
+    return invalid("Schedule Slot identifier is invalid.");
+  if (!delay.ok) return invalid(delay.error);
+  const event = transaction.findEvent(eventId.value);
+  const slot = transaction.findGameplaySlot(slotId.value);
+  if (event === null || slot === null) return notFound("Gameplay Slot was not found.");
+  if (slot.eventId !== event.eventId || slot.gameDayId !== gameDayId.value)
+    return crossEvent("Gameplay Slot does not belong to the selected Event and Game Day.");
+  const cascade = input.cascade === true;
+  const slots = transaction
+    .listGameplaySlots(gameDayId.value)
+    .filter(
+      (candidate) =>
+        candidate.sequence >= slot.sequence && (cascade || candidate.sequence === slot.sequence),
+    );
+  if (slots.every((candidate) => candidate.expectedDelayMs === delay.value))
+    return noChange("Gameplay Slot Expected Delay is already applied.");
+  return accepted(
+    createDelayPreview(
+      transaction,
+      "gameplay-slot",
+      slot.gameplaySlotId,
+      slots,
+      delay.value,
+      cascade,
+    ),
+  );
+}
+
+function setPitchSlotExpectedDelayOperation(
+  transaction: EventCatalogStorageTransaction,
+  clock: EventCatalogClock,
+  ids: EventCatalogIds,
+  eventIdInput: unknown,
+  gameDayIdInput: unknown,
+  pitchSlotIdInput: unknown,
+  input: { expectedDelayMs: unknown; cascade?: unknown },
+  actorReference: string,
+): CatalogOutcome<ScheduleDelayPreview> {
+  const eventId = validateId(eventIdInput, "eventId");
+  const gameDayId = validateId(gameDayIdInput, "gameDayId");
+  const slotId = validateId(pitchSlotIdInput, "pitchSlotId");
+  const delay = validateDelay(input.expectedDelayMs);
+  if (!eventId.ok || !gameDayId.ok || !slotId.ok)
+    return invalid("Schedule Slot identifier is invalid.");
+  if (!delay.ok) return invalid(delay.error);
+  const event = transaction.findEvent(eventId.value);
+  const slot = transaction.findPitchSlot(slotId.value);
+  if (event === null || slot === null) return notFound("Pitch Slot was not found.");
+  if (slot.eventId !== event.eventId || slot.gameDayId !== gameDayId.value)
+    return crossEvent("Pitch Slot does not belong to the selected Event and Game Day.");
+  const cascade = input.cascade === true;
+  const slots = transaction
+    .listPitchSlots(gameDayId.value, slot.pitchId)
+    .filter(
+      (candidate) =>
+        candidate.sequence >= slot.sequence && (cascade || candidate.sequence === slot.sequence),
+    );
+  const changedSlots = slots.filter((candidate) => candidate.expectedDelayMs !== delay.value);
+  if (changedSlots.length === 0) return noChange("Pitch Slot Expected Delay is already applied.");
+  const preview = createDelayPreview(
+    transaction,
+    "pitch-slot",
+    slot.pitchSlotId,
+    changedSlots,
+    delay.value,
+    cascade,
+  );
+  const nowMs = validNow(clock);
+  if (nowMs === null) return invalid("Event clock returned an invalid timestamp.");
+  for (const candidate of changedSlots) {
+    transaction.updatePitchSlot({ ...candidate, expectedDelayMs: delay.value, updatedAtMs: nowMs });
+  }
+  transaction.appendAudit(
+    createAudit(
+      ids,
+      "event-updated",
+      event.eventId,
+      gameDayId.value,
+      actorReference,
+      nowMs,
+      null,
+      preview,
+    ),
+  );
+  return accepted(preview);
+}
+
+function previewPitchSlotExpectedDelayOperation(
+  transaction: EventCatalogStorageTransaction,
+  eventIdInput: unknown,
+  gameDayIdInput: unknown,
+  pitchSlotIdInput: unknown,
+  input: { expectedDelayMs: unknown; cascade?: unknown },
+): CatalogOutcome<ScheduleDelayPreview> {
+  const eventId = validateId(eventIdInput, "eventId");
+  const gameDayId = validateId(gameDayIdInput, "gameDayId");
+  const slotId = validateId(pitchSlotIdInput, "pitchSlotId");
+  const delay = validateDelay(input.expectedDelayMs);
+  if (!eventId.ok || !gameDayId.ok || !slotId.ok)
+    return invalid("Schedule Slot identifier is invalid.");
+  if (!delay.ok) return invalid(delay.error);
+  const event = transaction.findEvent(eventId.value);
+  const slot = transaction.findPitchSlot(slotId.value);
+  if (event === null || slot === null) return notFound("Pitch Slot was not found.");
+  if (slot.eventId !== event.eventId || slot.gameDayId !== gameDayId.value)
+    return crossEvent("Pitch Slot does not belong to the selected Event and Game Day.");
+  const cascade = input.cascade === true;
+  const slots = transaction
+    .listPitchSlots(gameDayId.value, slot.pitchId)
+    .filter(
+      (candidate) =>
+        candidate.sequence >= slot.sequence && (cascade || candidate.sequence === slot.sequence),
+    );
+  if (slots.every((candidate) => candidate.expectedDelayMs === delay.value))
+    return noChange("Pitch Slot Expected Delay is already applied.");
+  return accepted(
+    createDelayPreview(transaction, "pitch-slot", slot.pitchSlotId, slots, delay.value, cascade),
+  );
+}
+
+function reassignEventGameOperation(
+  transaction: EventCatalogStorageTransaction,
+  clock: EventCatalogClock,
+  ids: EventCatalogIds,
+  eventIdInput: unknown,
+  gameDayIdInput: unknown,
+  eventGameIdInput: unknown,
+  input: { targetPitchSlotId: unknown; mode?: unknown },
+  actorReference: string,
+): CatalogOutcome<PitchReassignmentResult> {
+  const eventId = validateId(eventIdInput, "eventId");
+  const gameDayId = validateId(gameDayIdInput, "gameDayId");
+  const gameId = validateId(eventGameIdInput, "eventGameId");
+  const targetId = validateId(input.targetPitchSlotId, "targetPitchSlotId");
+  if (!eventId.ok || !gameDayId.ok || !gameId.ok || !targetId.ok)
+    return invalid("Pitch Reassignment identifier is invalid.");
+  const mode = input.mode === undefined ? "move" : input.mode;
+  if (mode !== "move" && mode !== "swap") return invalid("Pitch Reassignment mode is invalid.");
+  const event = transaction.findEvent(eventId.value);
+  const game = transaction.findEventGame(gameId.value);
+  const target = transaction.findPitchSlot(targetId.value);
+  if (event === null || game === null || target === null)
+    return notFound("Schedule item was not found.");
+  if (
+    game.eventId !== event.eventId ||
+    target.eventId !== event.eventId ||
+    game.gameDayId !== gameDayId.value ||
+    target.gameDayId !== gameDayId.value
+  )
+    return crossEvent("Pitch Reassignment belongs to another Event or Game Day.");
+  if (game.pitchSlotId === target.pitchSlotId)
+    return noChange("Event Game is already on this Pitch Slot.");
+  const occupants = transaction
+    .listEventGames(gameDayId.value)
+    .filter(
+      (candidate) =>
+        candidate.pitchSlotId === target.pitchSlotId && candidate.eventGameId !== game.eventGameId,
+    );
+  if (mode === "swap" && occupants.length !== 1)
+    return invalid(
+      occupants.length === 0
+        ? "Swap requires exactly one occupied target Pitch Slot."
+        : "Swap requires exactly one target occupant; the target is already conflicted.",
+    );
+  const occupant = occupants[0] ?? null;
+  const source = transaction.findPitchSlot(game.pitchSlotId);
+  if (source === null) return notFound("Current Pitch Slot was not found.");
+  const nowMs = validNow(clock);
+  if (nowMs === null) return invalid("Event clock returned an invalid timestamp.");
+  const updatedGame: EventGame = {
+    ...game,
+    gameplaySlotId: target.gameplaySlotId,
+    pitchSlotId: target.pitchSlotId,
+    updatedAtMs: nowMs,
+  };
+  let updatedOccupant: EventGame | null = null;
+  if (occupant !== null && mode === "swap") {
+    updatedOccupant = {
+      ...occupant,
+      gameplaySlotId: source.gameplaySlotId,
+      pitchSlotId: source.pitchSlotId,
+      updatedAtMs: nowMs,
+    };
+    transaction.updateEventGame(updatedOccupant);
+  }
+  transaction.updateEventGame(updatedGame);
+  const projectedGames = projectScheduleGames(
+    transaction,
+    transaction.listEventGames(gameDayId.value),
+  );
+  const updatedProjection = projectedGames.find(
+    (candidate) => candidate.eventGameId === updatedGame.eventGameId,
+  );
+  const result: PitchReassignmentResult = {
+    mode,
+    eventGame: updatedGame,
+    swappedEventGame: updatedOccupant,
+    scheduleConflict: updatedProjection?.scheduleConflict ?? false,
+    teamScheduleConflicts: projectedGames
+      .filter((candidate) => candidate.teamScheduleConflict)
+      .map((candidate) => candidate.eventGameId),
+  };
+  transaction.appendAudit(
+    createAudit(
+      ids,
+      "event-updated",
+      event.eventId,
+      gameDayId.value,
+      actorReference,
+      nowMs,
+      { game, occupant },
+      result,
+    ),
+  );
+  return accepted(result);
+}
+
+function createDelayPreview(
+  transaction: EventCatalogStorageTransaction,
+  dimension: ScheduleDelayPreview["dimension"],
+  targetSlotId: string,
+  slots: readonly (GameplaySlot | PitchSlot)[],
+  nextDelayMs: number,
+  cascade: boolean,
+): ScheduleDelayPreview {
+  const changedSlots = slots.filter((slot) => slot.expectedDelayMs !== nextDelayMs);
+  const changedIds = new Set(
+    changedSlots.map((slot) =>
+      dimension === "gameplay-slot"
+        ? (slot as GameplaySlot).gameplaySlotId
+        : (slot as PitchSlot).pitchSlotId,
+    ),
+  );
+  const dayId = changedSlots[0]?.gameDayId ?? slots[0]?.gameDayId ?? "";
+  const affectedGames = transaction
+    .listEventGames(dayId)
+    .filter((game) =>
+      dimension === "gameplay-slot"
+        ? changedIds.has(game.gameplaySlotId)
+        : changedIds.has(game.pitchSlotId),
+    );
+  const afterTransaction = {
+    findGameplaySlot: (gameplaySlotId: string) => {
+      const current = transaction.findGameplaySlot(gameplaySlotId);
+      return current !== null && dimension === "gameplay-slot" && changedIds.has(gameplaySlotId)
+        ? { ...current, expectedDelayMs: nextDelayMs }
+        : current;
+    },
+    findPitchSlot: (pitchSlotId: string) => {
+      const current = transaction.findPitchSlot(pitchSlotId);
+      return current !== null && dimension === "pitch-slot" && changedIds.has(pitchSlotId)
+        ? { ...current, expectedDelayMs: nextDelayMs }
+        : current;
+    },
+  };
+  const beforeGames = projectScheduleGames(transaction, affectedGames);
+  const afterGames = projectScheduleGames(afterTransaction, affectedGames);
+  const beforeById = new Map(beforeGames.map((game) => [game.eventGameId, game]));
+  const afterById = new Map(afterGames.map((game) => [game.eventGameId, game]));
+  return {
+    dimension,
+    targetSlotId,
+    cascade,
+    changes: changedSlots.map((slot) => {
+      const slotId =
+        dimension === "gameplay-slot"
+          ? (slot as GameplaySlot).gameplaySlotId
+          : (slot as PitchSlot).pitchSlotId;
+      return {
+        slotId,
+        beforeDelayMs: slot.expectedDelayMs,
+        afterDelayMs: nextDelayMs,
+        beforeExpectedStartMs: expectedStartForSlot(transaction, slot),
+        afterExpectedStartMs: expectedStartForSlot(afterTransaction, {
+          ...slot,
+          expectedDelayMs: nextDelayMs,
+        }),
+        eventGames: affectedGames
+          .filter((game) =>
+            dimension === "gameplay-slot"
+              ? game.gameplaySlotId === slotId
+              : game.pitchSlotId === slotId,
+          )
+          .flatMap((game) => {
+            const before = beforeById.get(game.eventGameId);
+            const after = afterById.get(game.eventGameId);
+            return before === undefined || after === undefined
+              ? []
+              : [
+                  {
+                    eventGameId: game.eventGameId,
+                    beforeExpectedStartMs: before.expectedStartMs,
+                    afterExpectedStartMs: after.expectedStartMs,
+                    beforeExpectedPlayingPeriod: before.expectedPlayingPeriod,
+                    afterExpectedPlayingPeriod: after.expectedPlayingPeriod,
+                  },
+                ];
+          }),
+      };
+    }),
+  };
+}
+
+function expectedStartForSlot(
+  transaction: Pick<EventCatalogStorageSnapshot, "findGameplaySlot" | "findPitchSlot">,
+  slot: GameplaySlot | PitchSlot,
+): number {
+  if ("scheduledStartMs" in slot) return slot.scheduledStartMs + slot.expectedDelayMs;
+  const gameplaySlot = transaction.findGameplaySlot(slot.gameplaySlotId);
+  return (
+    (gameplaySlot?.scheduledStartMs ?? 0) +
+    Math.max(gameplaySlot?.expectedDelayMs ?? 0, slot.expectedDelayMs)
+  );
+}
+
+function validateDelay(value: unknown): { ok: true; value: number } | { ok: false; error: string } {
+  if (
+    !Number.isSafeInteger(value) ||
+    (value as number) < 0 ||
+    (value as number) > 24 * 60 * 60 * 1000
+  )
+    return {
+      ok: false,
+      error: "Expected Delay must be a non-negative duration of at most 24 hours.",
+    };
+  return { ok: true, value: value as number };
+}
+
+export function projectScheduleGames(
+  transaction: Pick<EventCatalogStorageSnapshot, "findGameplaySlot" | "findPitchSlot">,
+  games: readonly EventGame[],
+): ProjectedEventGame[] {
+  const projected = games.map((game) => {
+    const gameplay = transaction.findGameplaySlot(game.gameplaySlotId);
+    const pitch = transaction.findPitchSlot(game.pitchSlotId);
+    const pitchGameplay =
+      pitch === null ? null : transaction.findGameplaySlot(pitch.gameplaySlotId);
+    const expectedStartMs = Math.max(
+      (gameplay?.scheduledStartMs ?? 0) + (gameplay?.expectedDelayMs ?? 0),
+      (pitchGameplay?.scheduledStartMs ?? gameplay?.scheduledStartMs ?? 0) +
+        Math.max(gameplay?.expectedDelayMs ?? 0, pitch?.expectedDelayMs ?? 0),
+    );
+    const expectedPlayingPeriod = {
+      startMs: expectedStartMs,
+      endMs: expectedStartMs + DEFAULT_EVENT_GAME_PLAYING_DURATION_MS,
+    };
+    const scheduleConflict = games.some(
+      (other) => other.eventGameId !== game.eventGameId && other.pitchSlotId === game.pitchSlotId,
+    );
+    const teamIds = [game.sideA.eventTeamId, game.sideB.eventTeamId].filter(
+      (id): id is string => id !== null,
+    );
+    return {
+      ...structuredClone(game),
+      expectedStartMs,
+      expectedPlayingPeriod,
+      scheduleConflict,
+      teamIds,
+    };
+  });
+  return projected.map(({ teamIds, ...game }) => ({
+    ...game,
+    teamScheduleConflict: projected.some(
+      (other) =>
+        other.eventGameId !== game.eventGameId &&
+        other.gameDayId === game.gameDayId &&
+        other.teamIds.some((otherTeamId) => teamIds.includes(otherTeamId)) &&
+        other.expectedPlayingPeriod.startMs < game.expectedPlayingPeriod.endMs &&
+        game.expectedPlayingPeriod.startMs < other.expectedPlayingPeriod.endMs,
+    ),
+  }));
 }
 
 function parseEventGameSide(
@@ -2213,6 +2891,8 @@ function eventCatalogTransaction(
     updatePitch: (pitch) => transaction.updatePitch(pitch),
     insertGameplaySlot: (slot) => transaction.insertGameplaySlot(slot),
     insertPitchSlot: (slot) => transaction.insertPitchSlot(slot),
+    updateGameplaySlot: (slot) => transaction.updateGameplaySlot(slot),
+    updatePitchSlot: (slot) => transaction.updatePitchSlot(slot),
     insertEventGame: (game) => transaction.insertEventGame(game),
     updateEventGame: (game) => transaction.updateEventGame(game),
     appendAudit: (entry) => transaction.appendEventAudit(entry),

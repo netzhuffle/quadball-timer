@@ -15,6 +15,10 @@ import {
   type GameplaySlot,
   type EventGame,
   type PitchSlot,
+  type ProjectedEventGame,
+  type ScheduleDelayPreview,
+  type PitchReassignmentResult,
+  projectScheduleGames,
 } from "@/lib/event-catalog";
 import type { TechnicalAdminAuthority } from "@/lib/technical-admin-auth";
 import type {
@@ -80,7 +84,7 @@ export type SlotSetupProjection = {
   gameDayId: string;
   gameplaySlots: readonly GameplaySlot[];
   pitchSlots: readonly PitchSlot[];
-  eventGames: readonly EventGame[];
+  eventGames: readonly ProjectedEventGame[];
   pitches: readonly { pitchId: string; name: string }[];
 };
 
@@ -90,7 +94,7 @@ export type PitchViewProjection = {
   pitch: { pitchId: string; name: string };
   gameplaySlots: readonly GameplaySlot[];
   pitchSlots: readonly PitchSlot[];
-  eventGames: readonly EventGame[];
+  eventGames: readonly ProjectedEventGame[];
 };
 
 export type PitchManagerViewProjection = {
@@ -283,6 +287,41 @@ export type EventAdministration = {
     input: { games: unknown },
     authority: EventAdministrationAuthority,
   ): Promise<EventAdministrationMutationOutcome<readonly EventGame[]>>;
+  setGameplaySlotExpectedDelay(
+    eventId: unknown,
+    gameDayId: unknown,
+    gameplaySlotId: unknown,
+    input: { expectedDelayMs: unknown; cascade?: unknown },
+    authority: EventAdministrationAuthority,
+  ): Promise<EventAdministrationMutationOutcome<ScheduleDelayPreview>>;
+  previewGameplaySlotExpectedDelay(
+    eventId: unknown,
+    gameDayId: unknown,
+    gameplaySlotId: unknown,
+    input: { expectedDelayMs: unknown; cascade?: unknown },
+    authority: EventAdministrationAuthority,
+  ): Promise<EventAdministrationOutcome<ScheduleDelayPreview>>;
+  setPitchSlotExpectedDelay(
+    eventId: unknown,
+    gameDayId: unknown,
+    pitchSlotId: unknown,
+    input: { expectedDelayMs: unknown; cascade?: unknown },
+    authority: EventAdministrationAuthority,
+  ): Promise<EventAdministrationMutationOutcome<ScheduleDelayPreview>>;
+  previewPitchSlotExpectedDelay(
+    eventId: unknown,
+    gameDayId: unknown,
+    pitchSlotId: unknown,
+    input: { expectedDelayMs: unknown; cascade?: unknown },
+    authority: EventAdministrationAuthority,
+  ): Promise<EventAdministrationOutcome<ScheduleDelayPreview>>;
+  reassignEventGame(
+    eventId: unknown,
+    gameDayId: unknown,
+    eventGameId: unknown,
+    input: { targetPitchSlotId: unknown; mode?: unknown },
+    authority: EventAdministrationAuthority,
+  ): Promise<EventAdministrationMutationOutcome<PitchReassignmentResult>>;
   openSlotSetup(
     eventId: unknown,
     gameDayId: unknown,
@@ -681,6 +720,36 @@ export function createEventAdministration(
       );
     },
 
+    async setGameplaySlotExpectedDelay(eventId, gameDayId, gameplaySlotId, input, authority) {
+      return runCatalogMutation(catalog, options, eventId, authority, (operations) =>
+        operations.setGameplaySlotExpectedDelay(eventId, gameDayId, gameplaySlotId, input),
+      );
+    },
+
+    async previewGameplaySlotExpectedDelay(eventId, gameDayId, gameplaySlotId, input, authority) {
+      return runCatalogPreview(catalog, options, eventId, authority, (operations) =>
+        operations.previewGameplaySlotExpectedDelay(eventId, gameDayId, gameplaySlotId, input),
+      );
+    },
+
+    async setPitchSlotExpectedDelay(eventId, gameDayId, pitchSlotId, input, authority) {
+      return runCatalogMutation(catalog, options, eventId, authority, (operations) =>
+        operations.setPitchSlotExpectedDelay(eventId, gameDayId, pitchSlotId, input),
+      );
+    },
+
+    async previewPitchSlotExpectedDelay(eventId, gameDayId, pitchSlotId, input, authority) {
+      return runCatalogPreview(catalog, options, eventId, authority, (operations) =>
+        operations.previewPitchSlotExpectedDelay(eventId, gameDayId, pitchSlotId, input),
+      );
+    },
+
+    async reassignEventGame(eventId, gameDayId, eventGameId, input, authority) {
+      return runCatalogMutation(catalog, options, eventId, authority, (operations) =>
+        operations.reassignEventGame(eventId, gameDayId, eventGameId, input),
+      );
+    },
+
     async openSlotSetup(eventIdInput, gameDayIdInput, authority) {
       return openScheduleProjection<SlotSetupProjection>(
         options,
@@ -787,7 +856,7 @@ async function openScheduleProjection<T extends SlotSetupProjection | PitchViewP
           gameDayId: day.gameDayId,
           gameplaySlots: transaction.listGameplaySlots(day.gameDayId),
           pitchSlots: transaction.listPitchSlots(day.gameDayId),
-          eventGames: games,
+          eventGames: projectScheduleGames(transaction, games),
           pitches: transaction
             .listPitches(event.eventId)
             .map(({ pitchId: id, name }) => ({ pitchId: id, name })),
@@ -801,7 +870,7 @@ async function openScheduleProjection<T extends SlotSetupProjection | PitchViewP
         pitch: { pitchId: pitch.pitchId, name: pitch.name },
         gameplaySlots: transaction.listGameplaySlots(day.gameDayId),
         pitchSlots: transaction.listPitchSlots(day.gameDayId, pitch.pitchId),
-        eventGames: games.filter(
+        eventGames: projectScheduleGames(transaction, games).filter(
           (game) => transaction.findPitchSlot(game.pitchSlotId)?.pitchId === pitch.pitchId,
         ),
       } as unknown as T);
@@ -1033,6 +1102,42 @@ async function openPitchManagerProjection(
         result.sessionExpiresAtMs ?? null,
         scope.value,
       );
+    });
+  } catch {
+    return unavailable();
+  }
+}
+
+async function runCatalogPreview<T>(
+  catalog: EventCatalog,
+  options: EventAdministrationOptions,
+  eventIdInput: unknown,
+  authority: EventAdministrationAuthority,
+  operation: (operations: EventCatalogMutationOperations) => CatalogOutcome<T>,
+): Promise<EventAdministrationOutcome<T>> {
+  const eventId = validateEventId(eventIdInput);
+  if (!eventId.ok) return invalid(eventId.error);
+  try {
+    return await options.storage.transaction((transaction) => {
+      const authorized = authorizeEventScopeInTransaction(
+        options,
+        transaction,
+        eventId.value,
+        authority,
+        true,
+      );
+      if (authorized === null) return unauthorized();
+      const result = catalog.runMutationInTransaction(
+        transaction,
+        eventId.value,
+        authorized.actorReference,
+        operation,
+      );
+      if (result.status === "accepted") return accepted(result.value);
+      if (result.status === "retryable-failure") return unavailable();
+      if (result.reason === "unauthorized") return unauthorized();
+      if (result.reason === "not-found") return notFound(result.detail);
+      return invalid(result.detail);
     });
   } catch {
     return unavailable();

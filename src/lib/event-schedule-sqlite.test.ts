@@ -96,6 +96,75 @@ describe("SQLite Event schedule adapter", () => {
           authority,
         ),
       ).toMatchObject({ status: "accepted" });
+      const laterSlot = await catalog.createGameplaySlot(
+        event.value.eventId,
+        day.value.gameDayId,
+        { sequence: 2, scheduledStart: "2026-08-14T11:00" },
+        authority,
+      );
+      if (laterSlot.status !== "accepted") throw new Error("Expected later Gameplay Slot.");
+      const laterPitchSlot = (
+        await storage.transaction((transaction) =>
+          transaction.listPitchSlots(day.value.gameDayId, pitch.value.pitchId),
+        )
+      ).find((candidate) => candidate.gameplaySlotId === laterSlot.value.gameplaySlotId);
+      if (laterPitchSlot === undefined) throw new Error("Expected later Pitch Slot.");
+      const laterGame = await catalog.createEventGame(
+        event.value.eventId,
+        day.value.gameDayId,
+        {
+          gameplaySlotId: laterSlot.value.gameplaySlotId,
+          pitchSlotId: laterPitchSlot.pitchSlotId,
+          sideA: { sourceLabel: "Later A" },
+          sideB: { sourceLabel: "Later B" },
+        },
+        authority,
+      );
+      if (laterGame.status !== "accepted") throw new Error("Expected later Event Game.");
+      expect(
+        await catalog.confirmGameplaySlotTeams(
+          event.value.eventId,
+          day.value.gameDayId,
+          laterSlot.value.gameplaySlotId,
+          {
+            games: [
+              {
+                eventGameId: laterGame.value.eventGameId,
+                sideAEventTeamId: firstTeam.value.eventTeamId,
+                sideBEventTeamId: secondTeam.value.eventTeamId,
+              },
+            ],
+          },
+          authority,
+        ),
+      ).toMatchObject({ status: "accepted" });
+      expect(
+        await catalog.setGameplaySlotExpectedDelay(
+          event.value.eventId,
+          day.value.gameDayId,
+          slot.value.gameplaySlotId,
+          { expectedDelayMs: 60_000 },
+          authority,
+        ),
+      ).toMatchObject({ status: "accepted" });
+      expect(
+        await catalog.setPitchSlotExpectedDelay(
+          event.value.eventId,
+          day.value.gameDayId,
+          pitchSlot.pitchSlotId,
+          { expectedDelayMs: 120_000 },
+          authority,
+        ),
+      ).toMatchObject({ status: "accepted" });
+      expect(
+        await catalog.reassignEventGame(
+          event.value.eventId,
+          day.value.gameDayId,
+          laterGame.value.eventGameId,
+          { targetPitchSlotId: pitchSlot.pitchSlotId, mode: "move" },
+          authority,
+        ),
+      ).toMatchObject({ status: "accepted", value: { scheduleConflict: true } });
       storage.close();
       const reopened = openSqliteFoundationStorage(join(directory, "foundation.sqlite"));
       try {
@@ -103,14 +172,25 @@ describe("SQLite Event schedule adapter", () => {
           clock: { nowMs: () => 2_000 },
         });
         const restarted = await restartedCatalog.inspectEvent(event.value.eventId, authority);
-        expect(restarted).toMatchObject({
-          status: "accepted",
-          value: {
-            eventGames: [
-              { sideA: { eventTeamName: "Blue", eventTeamId: firstTeam.value.eventTeamId } },
-            ],
-          },
-        });
+        expect(restarted).toMatchObject({ status: "accepted" });
+        if (restarted.status === "accepted") {
+          const restartedFirstSlot = restarted.value.gameplaySlots.find(
+            (candidate) => candidate.gameplaySlotId === slot.value.gameplaySlotId,
+          );
+          const restartedFirstPitchSlot = restarted.value.pitchSlots.find(
+            (candidate) => candidate.pitchSlotId === pitchSlot.pitchSlotId,
+          );
+          const restartedLater = restarted.value.eventGames.find(
+            (candidate) => candidate.eventGameId === laterGame.value.eventGameId,
+          );
+          expect(restartedFirstSlot).toMatchObject({ expectedDelayMs: 60_000 });
+          expect(restartedFirstPitchSlot).toMatchObject({ expectedDelayMs: 120_000 });
+          expect(restartedLater).toMatchObject({
+            pitchSlotId: pitchSlot.pitchSlotId,
+            scheduleConflict: true,
+            teamScheduleConflict: true,
+          });
+        }
       } finally {
         reopened.close();
       }

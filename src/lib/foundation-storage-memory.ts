@@ -502,6 +502,8 @@ class InMemoryFoundationStorage implements FoundationStorage {
         "listEventGames",
         "insertGameplaySlot",
         "insertPitchSlot",
+        "updateGameplaySlot",
+        "updatePitchSlot",
         "insertEventGame",
         "updateEventGame",
       ],
@@ -1466,6 +1468,23 @@ function createTransaction(
       state.gameplaySlots.set(slot.gameplaySlotId, structuredClone(slot));
       undo.push(() => state.gameplaySlots.delete(slot.gameplaySlotId));
     },
+    updateGameplaySlot(slot) {
+      const previous = state.gameplaySlots.get(slot.gameplaySlotId);
+      if (previous === undefined) throw new FoundationStorageConstraintError("gameplay-slot-id");
+      if (previous.eventId !== slot.eventId || previous.gameDayId !== slot.gameDayId)
+        throw new FoundationStorageConstraintError("gameplay-slot-id");
+      if (
+        [...state.gameplaySlots.values()].some(
+          (candidate) =>
+            candidate.gameplaySlotId !== slot.gameplaySlotId &&
+            candidate.gameDayId === slot.gameDayId &&
+            candidate.sequence === slot.sequence,
+        )
+      )
+        throw new FoundationStorageConstraintError("gameplay-slot-sequence");
+      state.gameplaySlots.set(slot.gameplaySlotId, structuredClone(slot));
+      undo.push(() => state.gameplaySlots.set(slot.gameplaySlotId, previous));
+    },
     insertPitchSlot(slot) {
       if (!state.events.has(slot.eventId)) throw new FoundationStorageConstraintError("event-id");
       const gameDay = state.gameDays.get(slot.gameDayId);
@@ -1492,6 +1511,19 @@ function createTransaction(
         throw new FoundationStorageConstraintError("pitch-slot-identity");
       state.pitchSlots.set(slot.pitchSlotId, structuredClone(slot));
       undo.push(() => state.pitchSlots.delete(slot.pitchSlotId));
+    },
+    updatePitchSlot(slot) {
+      const previous = state.pitchSlots.get(slot.pitchSlotId);
+      if (previous === undefined) throw new FoundationStorageConstraintError("pitch-slot-id");
+      if (
+        previous.eventId !== slot.eventId ||
+        previous.gameDayId !== slot.gameDayId ||
+        previous.pitchId !== slot.pitchId ||
+        previous.gameplaySlotId !== slot.gameplaySlotId
+      )
+        throw new FoundationStorageConstraintError("pitch-slot-identity");
+      state.pitchSlots.set(slot.pitchSlotId, structuredClone(slot));
+      undo.push(() => state.pitchSlots.set(slot.pitchSlotId, previous));
     },
     insertEventGame(game) {
       if (!state.events.has(game.eventId)) throw new FoundationStorageConstraintError("event-id");
@@ -1548,12 +1580,6 @@ function createTransaction(
         )
           throw new FoundationStorageConstraintError("event-team-name-snapshot");
       }
-      if (
-        [...state.eventGames.values()].some(
-          (candidate) => candidate.pitchSlotId === game.pitchSlotId,
-        )
-      )
-        throw new FoundationStorageConstraintError("pitch-slot-game");
       state.eventGames.set(game.eventGameId, structuredClone(game));
       undo.push(() => state.eventGames.delete(game.eventGameId));
     },
@@ -1603,14 +1629,6 @@ function createTransaction(
         )
           throw new FoundationStorageConstraintError("event-team-name-snapshot");
       }
-      if (
-        [...state.eventGames.values()].some(
-          (candidate) =>
-            candidate.eventGameId !== game.eventGameId &&
-            candidate.pitchSlotId === game.pitchSlotId,
-        )
-      )
-        throw new FoundationStorageConstraintError("pitch-slot-game");
       state.eventGames.set(game.eventGameId, structuredClone(game));
       undo.push(() => state.eventGames.set(game.eventGameId, previous));
     },
