@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { Window } from "happy-dom";
-import { App } from "./App";
+import { App, parseRoute } from "./App";
 import { createInitialGameState, projectGameView } from "@/lib/game-engine";
 import { DEFAULT_AWAY_TEAM_COLOR, DEFAULT_HOME_TEAM_COLOR } from "@/lib/team-colors";
 
@@ -65,6 +65,14 @@ describe("App", () => {
   let testWindow: Window;
   let container: HTMLDivElement;
   let root: Root;
+
+  test("accepts underscore-containing generated Ad Hoc Game IDs", () => {
+    expect(parseRoute("/game/adhoc-id_with_underscore", "")).toEqual({
+      type: "game",
+      gameId: "adhoc-id_with_underscore",
+      role: "controller",
+    });
+  });
 
   beforeEach(() => {
     testWindow = new Window({

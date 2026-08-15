@@ -1,4 +1,4 @@
-import type { ControllerRole, GameCommand, GameSummary, GameView } from "@/lib/game-types";
+import type { GameCommand, GameSummary, GameView } from "@/lib/game-types";
 import {
   SHARED_LIMITS,
   validateClockAdjustmentMs,
@@ -24,7 +24,6 @@ export type SubscribeLobbyMessage = {
 export type SubscribeGameMessage = {
   type: "subscribe-game";
   gameId: string;
-  role: ControllerRole;
 };
 
 export type ApplyCommandsMessage = {
@@ -51,7 +50,11 @@ export type ServerWsMessage =
     }
   | {
       type: "game-snapshot";
-      game: GameView;
+      game: GameView & {
+        gameId?: string;
+        sessionId?: string | null;
+        controlQr?: string | null;
+      };
       serverNowMs: number;
       ackedCommandIds: string[];
     };
@@ -112,10 +115,10 @@ export function parseClientWsMessage(
       };
     }
 
-    if (payload.role !== "controller" && payload.role !== "spectator") {
+    if ("role" in payload) {
       return {
         ok: false,
-        error: "subscribe-game requires role controller or spectator.",
+        error: "subscribe-game does not accept a role.",
       };
     }
 
@@ -124,7 +127,6 @@ export function parseClientWsMessage(
       message: {
         type: "subscribe-game",
         gameId: gameId.value,
-        role: payload.role,
       },
     };
   }
@@ -230,7 +232,7 @@ export function parseClientWsMessage(
   };
 }
 
-function parseGameCommand(payload: Record<string, unknown>):
+export function parseGameCommand(payload: Record<string, unknown>):
   | {
       ok: true;
       command: GameCommand;
