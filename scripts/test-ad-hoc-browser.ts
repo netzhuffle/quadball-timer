@@ -90,6 +90,67 @@ async function run() {
 
         const gameId = new URL(first.url()).pathname.split("/").at(-1);
         if (gameId === undefined) throw new Error("Game route did not contain a Game ID.");
+        for (let index = 0; index < 4; index += 1) {
+          await first.goto(origin);
+          await first.getByRole("button", { name: /Start an Ad Hoc Game/ }).click();
+          await first.waitForURL(/\/game\/adhoc-/u);
+        }
+        await first.goto(origin);
+        await first.getByRole("button", { name: /Start an Ad Hoc Game/ }).click();
+        await first
+          .getByRole("status")
+          .filter({ hasText: /Retrying in/u })
+          .waitFor();
+        await first.waitForURL(/\/game\/adhoc-/u);
+        const creationRetryGameId = new URL(first.url()).pathname.split("/").at(-1);
+        if (creationRetryGameId === undefined)
+          throw new Error("Rendered creation retry did not navigate to a Game.");
+        await first.goto(`${origin}/game/${gameId}`);
+        await waitForGameRoute(first, gameId);
+        const replayRetryEvidence = await first.evaluate(async (id) => {
+          const wsUrl = `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`;
+          const ws = new WebSocket(wsUrl);
+          const messages: unknown[] = [];
+          let notify: (() => void) | null = null;
+          ws.onmessage = (event) => {
+            messages.push(JSON.parse(String(event.data)) as unknown);
+            notify?.();
+          };
+          const nextMessage = async () => {
+            while (messages.length === 0) await new Promise<void>((resolve) => (notify = resolve));
+            notify = null;
+            return messages.shift() as {
+              type?: string;
+              retryAfterMs?: number;
+              ackedCommandIds?: string[];
+            };
+          };
+          await new Promise<void>((resolve, reject) => {
+            ws.onopen = () => resolve();
+            ws.onerror = () => reject(new Error("Replay evidence WebSocket failed to open."));
+          });
+          ws.send(JSON.stringify({ type: "subscribe-game", gameId: id }));
+          while ((await nextMessage()).type !== "game-snapshot") {}
+          const batch = Array.from({ length: 100 }, (_, index) => ({
+            id: `browser-replay-${index}`,
+            clientSentAtMs: Date.now(),
+            command: { type: "set-running", running: index % 2 === 0 },
+          }));
+          ws.send(JSON.stringify({ type: "apply-commands", gameId: id, commands: batch }));
+          let acknowledged = false;
+          for (;;) {
+            const message = await nextMessage();
+            if (message.type === "game-snapshot") {
+              acknowledged = message.ackedCommandIds?.includes("browser-replay-99") ?? false;
+              if (acknowledged) break;
+            }
+          }
+          ws.close();
+          if (!acknowledged) throw new Error("Scheduled replay was not eventually acknowledged.");
+          return { batchSize: batch.length };
+        }, creationRetryGameId);
+        if (replayRetryEvidence.batchSize !== 100)
+          throw new Error("Browser replay evidence did not use the full batch envelope.");
         const snapshot = (await first.evaluate(async (id) => {
           const response = await fetch(`/api/games/${id}`);
           return (await response.json()) as { game?: { controlQr?: string | null } };
@@ -145,17 +206,35 @@ async function run() {
         if (new URL(second.url()).pathname !== "/") await second.waitForURL(`${origin}/`);
         await first.getByText("Paused", { exact: true }).waitFor();
 
-        await second.goto(handoffUrl);
-        await waitForGameRoute(second, gameId);
-        await assertAccessibleQr(second, "readmitted second browser");
+        environment.AD_HOC_MAX_CONNECTED_SOCKETS = "1";
+        await stopServer();
+        await startServer();
+        await first.reload();
+        await waitForGameRoute(first, gameId);
+        await first.getByText("Live", { exact: true }).waitFor();
+        await first.waitForTimeout(250);
+        const retryContext = await browser!.newContext({
+          ignoreHTTPSErrors: true,
+          storageState: secondStorageState,
+        });
+        const retryPage = await retryContext.newPage();
+        retryPage.setDefaultTimeout(15_000);
+        await retryPage.goto(handoffUrl);
+        await waitForGameRoute(retryPage, gameId);
+        await retryPage.getByText(/Ad Hoc connection busy/u).waitFor();
+        await first.close();
+        await retryPage.getByText("Live", { exact: true }).waitFor();
 
         await stopServer();
         rmSync(databasePath, { force: true });
         await startServer();
-        await second.reload();
-        await waitForGameRoute(second, gameId);
-        await second.getByText("Local", { exact: true }).waitFor();
-        await second.getByText("Server does not know this game", { exact: false }).waitFor();
+        await retryPage.reload();
+        await waitForGameRoute(retryPage, gameId);
+        await retryPage.getByText("Local", { exact: true }).waitFor();
+        await retryPage
+          .getByText("Server does not know this game", { exact: false })
+          .first()
+          .waitFor();
       })(),
       lifecycleController.signal,
     );
@@ -368,7 +447,10 @@ async function assertAccessibleQr(page: Page, stage: string) {
       throw new Error("Close did not restore focus to the QR trigger");
     }
   } catch (error) {
-    throw new Error(`${stage} QR display failed at ${page.url()}.`, { cause: error });
+    throw new Error(
+      `${stage} QR display failed at ${page.url()}: ${error instanceof Error ? error.message : String(error)}`,
+      { cause: error },
+    );
   }
 }
 

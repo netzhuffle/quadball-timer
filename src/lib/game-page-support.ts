@@ -50,6 +50,8 @@ export function useGameConnection({ gameId, role }: { gameId: string; role: Cont
   const pendingRef = useRef<AdHocPendingOperation[]>([]);
   const outcomesRef = useRef<AdHocControllerOutcomes>({});
   const reconnectTimeoutRef = useRef<number | null>(null);
+  const replayRetryTimeoutRef = useRef<number | null>(null);
+  const replayInFlightRef = useRef(false);
   const wsRef = useRef<WebSocket | null>(null);
   const commandCounterRef = useRef(0);
   const clientInstanceId = useRef(crypto.randomUUID());
@@ -94,14 +96,16 @@ export function useGameConnection({ gameId, role }: { gameId: string; role: Cont
       localOnlyModeRef.current ||
       !subscribedToServerGameRef.current ||
       wsRef.current?.readyState !== WebSocket.OPEN ||
+      replayInFlightRef.current ||
       pendingRef.current.length === 0
     )
       return;
+    replayInFlightRef.current = true;
     wsRef.current.send(
       JSON.stringify({
         type: "apply-commands",
         gameId,
-        commands: pendingRef.current,
+        commands: pendingRef.current.slice(0, 100),
       }),
     );
   }, [gameId, role]);
@@ -205,16 +209,39 @@ export function useGameConnection({ gameId, role }: { gameId: string; role: Cont
         const parsed = parseServerMessage(event.data);
         if (parsed === null) return;
         if (parsed.type === "error") {
+          replayInFlightRef.current = false;
           if (role === "controller" && isServerGameUnavailableError(parsed.message)) {
             subscribedToServerGameRef.current = false;
             setLocalOnlyState(true);
             setConnectionState("local-only");
             setError(LOCAL_ONLY_MESSAGE);
             ws.close();
+          } else if (parsed.retryAfterMs !== undefined) {
+            const delayMs = Math.min(30_000, Math.max(1, parsed.retryAfterMs));
+            replayInFlightRef.current = false;
+            if (!subscribedToServerGameRef.current) {
+              if (reconnectTimeoutRef.current !== null)
+                window.clearTimeout(reconnectTimeoutRef.current);
+              reconnectTimeoutRef.current = window.setTimeout(() => {
+                reconnectTimeoutRef.current = null;
+                connect();
+              }, delayMs);
+              setError(`Ad Hoc connection busy. Retrying in ${Math.ceil(delayMs / 1_000)}s.`);
+              ws.close(1013, "Ad Hoc subscription retry.");
+              return;
+            }
+            if (replayRetryTimeoutRef.current !== null)
+              window.clearTimeout(replayRetryTimeoutRef.current);
+            setError(`Ad Hoc busy. Retrying in ${Math.ceil(delayMs / 1_000)}s.`);
+            replayRetryTimeoutRef.current = window.setTimeout(() => {
+              replayRetryTimeoutRef.current = null;
+              flushPendingCommands();
+            }, delayMs);
           } else setError(parsed.message);
           return;
         }
         if (parsed.type === "game-snapshot") {
+          replayInFlightRef.current = false;
           subscribedToServerGameRef.current = true;
           setLocalOnlyState(false);
           setConnectionState("online");
@@ -229,18 +256,24 @@ export function useGameConnection({ gameId, role }: { gameId: string; role: Cont
           flushPendingCommands();
         }
       };
-      ws.onclose = () => {
+      ws.onclose = (event) => {
+        replayInFlightRef.current = false;
         setConnectionState(localOnlyModeRef.current ? "local-only" : "offline");
         wsRef.current = null;
         subscribedToServerGameRef.current = false;
-        if (!cancelled) {
+        if (event.code === 1013 && !cancelled) setError("Ad Hoc connection busy. Retrying in 1s.");
+        if (!cancelled && reconnectTimeoutRef.current === null) {
           reconnectTimeoutRef.current = window.setTimeout(
             connect,
             localOnlyModeRef.current ? LOCAL_ONLY_RETRY_DELAY_MS : NORMAL_RECONNECT_DELAY_MS,
           );
         }
       };
-      ws.onerror = () => ws.close();
+      ws.onerror = () => {
+        if (!cancelled && !localOnlyModeRef.current)
+          setError("Ad Hoc connection busy. Retrying in 1s.");
+        ws.close();
+      };
     };
     void fetchInitialSnapshot();
     connect();
@@ -249,6 +282,8 @@ export function useGameConnection({ gameId, role }: { gameId: string; role: Cont
       subscribedToServerGameRef.current = false;
       wsRef.current?.close();
       if (reconnectTimeoutRef.current !== null) window.clearTimeout(reconnectTimeoutRef.current);
+      if (replayRetryTimeoutRef.current !== null)
+        window.clearTimeout(replayRetryTimeoutRef.current);
     };
   }, [
     flushPendingCommands,

@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { getAdHocBrowserId } from "@/lib/ad-hoc-handoff";
 import type { PublicAudienceEventProjection } from "@/lib/audience-projection";
 import { DEFAULT_AWAY_TEAM_COLOR, DEFAULT_HOME_TEAM_COLOR } from "@/lib/team-colors";
 
@@ -235,32 +236,104 @@ function StartAdHocGame() {
   const [awayName, setAwayName] = useState("Away");
   const [homeColor, setHomeColor] = useState(DEFAULT_HOME_TEAM_COLOR);
   const [awayColor, setAwayColor] = useState(DEFAULT_AWAY_TEAM_COLOR);
+  const [creationStatus, setCreationStatus] = useState<string | null>(null);
+  const [creationPending, setCreationPending] = useState(false);
+  const creationPendingRef = useRef(false);
+  const creationRetryTimerRef = useRef<number | null>(null);
+  const mountedRef = useRef(true);
 
-  const handleCreateGame = useCallback(async () => {
-    const response = await fetch("/api/games", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        homeName,
-        awayName,
-        homeColor,
-        awayColor,
-      }),
-    });
+  useEffect(
+    () => () => {
+      mountedRef.current = false;
+      if (creationRetryTimerRef.current !== null)
+        window.clearTimeout(creationRetryTimerRef.current);
+      creationRetryTimerRef.current = null;
+      creationPendingRef.current = false;
+    },
+    [],
+  );
 
-    if (!response.ok) return;
+  const handleCreateGame = useCallback(
+    async (attempt = 0) => {
+      if (!mountedRef.current) return;
+      if (attempt === 0) {
+        if (creationPendingRef.current) return;
+        creationPendingRef.current = true;
+        setCreationPending(true);
+      }
+      setCreationStatus(attempt === 0 ? "Creating Ad Hoc Game…" : "Retrying Ad Hoc Game…");
 
-    const payload = (await response.json()) as { gameId?: string };
-    if (typeof payload.gameId === "string") navigateTo(`/game/${payload.gameId}`);
-  }, [awayColor, awayName, homeColor, homeName]);
+      let response: Response;
+      try {
+        response = await fetch("/api/games", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            homeName,
+            awayName,
+            homeColor,
+            awayColor,
+            browserId: getAdHocBrowserId(),
+          }),
+        });
+      } catch {
+        if (mountedRef.current) setCreationStatus("Ad Hoc Game unavailable. Try again later.");
+        creationPendingRef.current = false;
+        setCreationPending(false);
+        return;
+      }
+      if (!mountedRef.current) return;
+
+      if (!response.ok) {
+        if (response.status === 429 && attempt < 3) {
+          const payload = (await response.json().catch(() => null)) as {
+            retryAfterMs?: unknown;
+          } | null;
+          const headerDelayMs = Number(response.headers.get("retry-after")) * 1_000;
+          const retryAfterMs = Math.min(
+            30_000,
+            Math.max(
+              1_000,
+              typeof payload?.retryAfterMs === "number" ? payload.retryAfterMs : headerDelayMs,
+            ),
+          );
+          setCreationStatus(
+            `Ad Hoc creation busy. Retrying in ${Math.ceil(retryAfterMs / 1_000)}s.`,
+          );
+          if (creationRetryTimerRef.current !== null)
+            window.clearTimeout(creationRetryTimerRef.current);
+          creationRetryTimerRef.current = window.setTimeout(() => {
+            creationRetryTimerRef.current = null;
+            void handleCreateGame(attempt + 1);
+          }, retryAfterMs);
+          return;
+        }
+        setCreationStatus("Ad Hoc Game unavailable. Try again later.");
+        creationPendingRef.current = false;
+        setCreationPending(false);
+        return;
+      }
+
+      const payload = (await response.json()) as { gameId?: string };
+      if (typeof payload.gameId === "string") {
+        creationPendingRef.current = false;
+        setCreationPending(false);
+        navigateTo(`/game/${payload.gameId}`);
+        return;
+      }
+      setCreationStatus("Ad Hoc Game unavailable. Try again later.");
+      creationPendingRef.current = false;
+      setCreationPending(false);
+    },
+    [awayColor, awayName, homeColor, homeName],
+  );
 
   return (
     <Card>
       <CardHeader>
         <CardTitle>Start Ad Hoc Game</CardTitle>
         <CardDescription>
-          Need an unscheduled Game? Start one here. You are admitted as the initially admitted Ad
-          Hoc Controller.
+          Need an unscheduled Game? Start one here as an equal Ad Hoc Controller.
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-3">
@@ -302,9 +375,18 @@ function StartAdHocGame() {
             />
           </div>
         </div>
-        <Button className="w-full" onClick={handleCreateGame}>
+        <Button
+          className="w-full"
+          disabled={creationPending}
+          onClick={() => void handleCreateGame()}
+        >
           Start an Ad Hoc Game <span className="sr-only">Create new game</span>
         </Button>
+        {creationStatus !== null ? (
+          <p className="text-sm text-muted-foreground" role="status" aria-live="polite">
+            {creationStatus}
+          </p>
+        ) : null}
       </CardContent>
     </Card>
   );

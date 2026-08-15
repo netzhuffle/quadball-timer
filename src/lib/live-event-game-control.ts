@@ -566,6 +566,85 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
   }
   const goalCodec = gameFactCodec;
   const replayingSessions = new Set<string>();
+  const activeControllerSessions = new Map<
+    string,
+    { eventGameId: string; expiresAtMs: number | null }
+  >();
+  let reconcilingActiveControllerSessions = false;
+  let reconciliationDirty = false;
+  let reconciliationGeneration = 0;
+  let reconciliationCompletion: Promise<number> | null = null;
+  let closed = false;
+
+  const trackActiveControllerSession = (
+    sessionBearer: string,
+    eventGameId: string,
+    expiresAtMs?: number | null,
+  ) => {
+    activeControllerSessions.set(sessionBearer, {
+      eventGameId,
+      expiresAtMs: expiresAtMs ?? activeControllerSessions.get(sessionBearer)?.expiresAtMs ?? null,
+    });
+  };
+
+  async function reconcileActiveControllerSessions(): Promise<number> {
+    if (closed) return 0;
+    if (reconcilingActiveControllerSessions) {
+      reconciliationDirty = true;
+      return reconciliationCompletion ?? activeControllerSessions.size;
+    }
+    reconcilingActiveControllerSessions = true;
+    const generation = reconciliationGeneration;
+    const completion = (async () => {
+      try {
+        do {
+          reconciliationDirty = false;
+          for (const [sessionBearer, session] of activeControllerSessions) {
+            if (closed || generation !== reconciliationGeneration) return 0;
+            let authorized: Awaited<ReturnType<typeof options.grantAuthority.authorizeGrant>>;
+            try {
+              authorized = await options.grantAuthority.authorizeGrant({
+                sessionBearer,
+                eventGameId: session.eventGameId,
+                readOnly: true,
+              });
+            } catch {
+              continue;
+            }
+            if (closed || generation !== reconciliationGeneration) return 0;
+            if (authorized.status === "authorized" && authorized.grantType === "control") {
+              if (authorized.eventGameId !== null) {
+                trackActiveControllerSession(
+                  sessionBearer,
+                  authorized.eventGameId,
+                  authorized.sessionExpiresAtMs,
+                );
+              }
+            } else if (authorized.status === "switch-required") {
+              trackActiveControllerSession(
+                sessionBearer,
+                authorized.currentEventGameId,
+                session.expiresAtMs,
+              );
+            } else {
+              activeControllerSessions.delete(sessionBearer);
+            }
+          }
+        } while (reconciliationDirty && !closed && generation === reconciliationGeneration);
+        if (closed || generation !== reconciliationGeneration) return 0;
+        return activeControllerSessions.size;
+      } finally {
+        reconcilingActiveControllerSessions = false;
+        reconciliationDirty = false;
+      }
+    })();
+    reconciliationCompletion = completion;
+    try {
+      return await completion;
+    } finally {
+      if (reconciliationCompletion === completion) reconciliationCompletion = null;
+    }
+  }
 
   async function openController(input: {
     qrCredential: string;
@@ -606,6 +685,11 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
     }
 
     const projection = await readProjection(owner.record, commenced.root);
+    trackActiveControllerSession(
+      admitted.sessionBearer,
+      commenced.root.eventGameId,
+      authorized.sessionExpiresAtMs,
+    );
     return {
       status: "opened",
       eventGameId: commenced.root.eventGameId,
@@ -653,6 +737,11 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
             const root = owner === null ? null : await owner.record.readRoot(owner.recordId);
             if (owner !== null && root !== null) {
               const projection = await readProjection(owner.record, root);
+              trackActiveControllerSession(
+                input.sessionBearer,
+                root.eventGameId,
+                pinned.sessionExpiresAtMs,
+              );
               return {
                 status: "authorized",
                 session: {
@@ -694,6 +783,11 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
       return { status: "rejected", message: "Unable to refresh Controller session." };
     }
     const projection = await readProjection(owner.record, commenced.root);
+    trackActiveControllerSession(
+      input.sessionBearer,
+      commenced.root.eventGameId,
+      authorized.sessionExpiresAtMs,
+    );
     return {
       status: "authorized",
       session: {
@@ -725,6 +819,11 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
       return { status: "rejected", message: "Unable to refresh Controller session." };
     }
     const projection = await readProjection(owner.record, commenced.root);
+    trackActiveControllerSession(
+      input.sessionBearer,
+      commenced.root.eventGameId,
+      switched.sessionExpiresAtMs,
+    );
     return {
       status: "authorized",
       session: {
@@ -763,6 +862,11 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
       return { status: "rejected", message: "Unable to refresh Controller session." };
     }
     const projection = await readProjection(owner.record, commenced.root);
+    trackActiveControllerSession(
+      input.sessionBearer,
+      commenced.root.eventGameId,
+      authorized.sessionExpiresAtMs,
+    );
     return {
       status: "authorized",
       session: {
@@ -806,6 +910,7 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
 
   async function leaveController(input: { sessionBearer: string }): Promise<ControllerLeaveResult> {
     const left = await options.grantAuthority.leaveGrantSession(input.sessionBearer);
+    if (left.status === "updated") activeControllerSessions.delete(input.sessionBearer);
     return left.status === "updated"
       ? { status: "left" }
       : { status: "rejected", message: "Unable to leave Controller session." };
@@ -1308,6 +1413,23 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
     stayController,
     revealControllerQr,
     leaveController,
+    activeControllerSessions: () => {
+      if (closed) return 0;
+      const nowMs = clock();
+      for (const [sessionBearer, session] of activeControllerSessions) {
+        if (session.expiresAtMs !== null && nowMs >= session.expiresAtMs) {
+          activeControllerSessions.delete(sessionBearer);
+        }
+      }
+      return activeControllerSessions.size;
+    },
+    reconcileActiveControllerSessions,
+    close() {
+      closed = true;
+      reconciliationGeneration += 1;
+      reconciliationDirty = false;
+      activeControllerSessions.clear();
+    },
     submitControllerIntent,
     replayControllerActions,
   };

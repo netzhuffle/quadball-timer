@@ -386,6 +386,32 @@ describe("Ad Hoc Games service", () => {
     ).toBe("accepted");
   });
 
+  test("does not remove connected resource accounting when leave durability fails", async () => {
+    const base = createInMemoryAdHocStore();
+    let failMutations = false;
+    const store: AdHocStore = {
+      close: () => base.close(),
+      listGames: () => base.listGames(),
+      readGame: (gameId) => base.readGame(gameId),
+      createGame: (input) => base.createGame(input),
+      mutateGame: (gameId, mutation) => (failMutations ? null : base.mutateGame(gameId, mutation)),
+    };
+    const games = createAdHocGamesService({ store, now: () => 1_000 });
+    const created = await games.create({ homeName: "Home", awayName: "Away" });
+    if (created.status !== "accepted") throw new Error("creation failed");
+    expect(
+      await games.setConnection({
+        gameId: created.gameId,
+        sessionId: created.sessionId,
+        connected: true,
+        connectionId: "socket-leave",
+      }),
+    ).toBe(true);
+    failMutations = true;
+    expect(await games.leave({ gameId: created.gameId, sessionId: created.sessionId })).toBe(false);
+    expect(games.getResourceMetrics().connectedControllers).toBe(1);
+  });
+
   test("rejects malformed commands without changing current state", async () => {
     const games = service();
     const created = await games.create({ homeName: "Home", awayName: "Away" });

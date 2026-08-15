@@ -7,6 +7,7 @@ import {
 import {
   adHocFallbackRoute,
   admitGame,
+  calculateAdHocUpgradeCapacity,
   createGame,
   leaveGame,
   readAdHocSession,
@@ -43,6 +44,33 @@ async function createViaHttp(games: AdHocGamesService, homeName: string, browser
 }
 
 describe("Ad Hoc HTTP and WebSocket authority boundaries", () => {
+  test("caps pre-upgrade Ad Hoc capacity below the configured Event reserve", () => {
+    expect(
+      calculateAdHocUpgradeCapacity({
+        eventTotalConnections: 5,
+        eventReservedConnections: 2,
+        activeEventConnections: 0,
+        adHocSocketCeiling: 10,
+      }),
+    ).toBe(3);
+    expect(
+      calculateAdHocUpgradeCapacity({
+        eventTotalConnections: 5,
+        eventReservedConnections: 2,
+        activeEventConnections: 4,
+        adHocSocketCeiling: 10,
+      }),
+    ).toBe(1);
+    expect(
+      calculateAdHocUpgradeCapacity({
+        eventTotalConnections: 5,
+        eventReservedConnections: 8,
+        activeEventConnections: 0,
+        adHocSocketCeiling: 10,
+      }),
+    ).toBe(0);
+  });
+
   test("retains two Games in one browser authority set and leaving one preserves the other", async () => {
     const games = service();
     const first = await createViaHttp(games, "First");
@@ -376,6 +404,104 @@ describe("Ad Hoc HTTP and WebSocket authority boundaries", () => {
     const result = await games.create({ homeName: "Home", awayName: "Away" });
     expect(result).toMatchObject({ status: "rejected", reason: "unavailable" });
     expect(store.listGames()).toHaveLength(0);
+  });
+
+  test("presents delayed anonymous creation with bounded generic retry guidance", async () => {
+    const games = service();
+    for (let index = 0; index < 5; index += 1) {
+      const response = await createGame(
+        new Request("http://localhost/api/games", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ homeName: `Home ${index}`, awayName: "Away" }),
+        }),
+        games,
+        "stable-anonymous-source",
+      );
+      expect(response.status).toBe(201);
+    }
+    const delayed = await createGame(
+      new Request("http://localhost/api/games", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ homeName: "Delayed", awayName: "Away" }),
+      }),
+      games,
+      "stable-anonymous-source",
+    );
+    expect(delayed.status).toBe(429);
+    expect(Number(delayed.headers.get("retry-after"))).toBeGreaterThan(0);
+    expect(Number(delayed.headers.get("retry-after"))).toBeLessThanOrEqual(30);
+    expect(await delayed.json()).toEqual({
+      error: "Try again later.",
+      retryAfterMs: 1_000,
+    });
+    expect(games.store.listGames()).toHaveLength(5);
+  });
+
+  test("uses a private browser source cookie instead of venue request material", async () => {
+    const games = service();
+    const first = await createGame(
+      new Request("http://localhost/api/games", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "user-agent": "same-browser-material",
+          "x-forwarded-for": "198.51.100.10",
+        },
+        body: JSON.stringify({ homeName: "First", awayName: "Away" }),
+      }),
+      games,
+    );
+    expect(first.status).toBe(201);
+    const setCookie = first.headers.get("set-cookie") ?? "";
+    const sourceCookie = setCookie.match(/adhoc_source=[^;, ]+/u)?.[0];
+    expect(sourceCookie).toBeDefined();
+    if (sourceCookie === undefined) return;
+    for (let index = 1; index < 5; index += 1) {
+      const response = await createGame(
+        new Request("http://localhost/api/games", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            cookie: sourceCookie,
+            "user-agent": "same-browser-material",
+            "x-forwarded-for": "198.51.100.10",
+          },
+          body: JSON.stringify({ homeName: `Same source ${index}`, awayName: "Away" }),
+        }),
+        games,
+      );
+      expect(response.status).toBe(201);
+    }
+    const delayed = await createGame(
+      new Request("http://localhost/api/games", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          cookie: sourceCookie,
+          "user-agent": "same-browser-material",
+          "x-forwarded-for": "198.51.100.10",
+        },
+        body: JSON.stringify({ homeName: "Delayed", awayName: "Away" }),
+      }),
+      games,
+    );
+    expect(delayed.status).toBe(429);
+    const differentSource = await createGame(
+      new Request("http://localhost/api/games", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          cookie: "adhoc_source=different-private-browser-source-1234567890123456",
+          "user-agent": "same-browser-material",
+          "x-forwarded-for": "198.51.100.10",
+        },
+        body: JSON.stringify({ homeName: "Different source", awayName: "Away" }),
+      }),
+      games,
+    );
+    expect(differentSource.status).toBe(201);
   });
 });
 

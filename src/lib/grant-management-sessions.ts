@@ -195,7 +195,7 @@ export async function admitGrant(
         sessionExpiresAtMs:
           current.grantType === EVENT_ADMIN_GRANT_TYPE
             ? Math.min(current.expiresAtMs ?? Number.MAX_SAFE_INTEGER, nowMs + 30 * DAY_MS)
-            : current.grantType === "pitch-manager"
+            : current.grantType === PITCH_MANAGER_GRANT_TYPE || current.grantType === GRANT_TYPE
               ? current.expiresAtMs
               : null,
       };
@@ -376,7 +376,7 @@ export function authorizeGrantInTransaction(
             grant.expiresAtMs ?? Number.MAX_SAFE_INTEGER,
             effectiveActivityAtMs + 30 * DAY_MS,
           )
-        : grant.grantType === "pitch-manager"
+        : grant.grantType === PITCH_MANAGER_GRANT_TYPE || grant.grantType === GRANT_TYPE
           ? grant.expiresAtMs
           : null,
   };
@@ -443,6 +443,7 @@ export async function acceptControlGrantSessionSwitch(
         grantSessionId: session.sessionId,
         previousEventGameId: relationship.previousEventGameId,
         eventGameId: relationship.currentEventGameId,
+        ...(grant.expiresAtMs === null ? {} : { sessionExpiresAtMs: grant.expiresAtMs }),
       } satisfies TypedControlGrantSwitch;
     });
   } catch {

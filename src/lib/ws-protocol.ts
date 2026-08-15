@@ -44,6 +44,7 @@ export type ServerWsMessage =
   | {
       type: "error";
       message: string;
+      retryAfterMs?: number;
     }
   | {
       type: "lobby-snapshot";

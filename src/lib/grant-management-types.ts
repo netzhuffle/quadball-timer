@@ -111,6 +111,7 @@ export type TypedControlGrantSwitch =
       grantSessionId: string;
       previousEventGameId: string;
       eventGameId: string;
+      sessionExpiresAtMs?: number | null;
     }
   | typeof GENERIC_GRANT_AUTHORIZATION_FAILURE;
 

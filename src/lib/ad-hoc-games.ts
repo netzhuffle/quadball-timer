@@ -20,6 +20,24 @@ import {
   SHARED_LIMITS,
   validateOpaqueIdentifier,
 } from "@/lib/validation-policy";
+import {
+  AD_HOC_CONTROLLER_BURST,
+  AD_HOC_CONTROLLER_SUSTAINED_PER_SECOND,
+  AD_HOC_GAME_BURST,
+  AD_HOC_GAME_SUSTAINED_PER_SECOND,
+  AD_HOC_EVENT_RESERVED_CONNECTION_CAPACITY,
+  AD_HOC_EVENT_TOTAL_CONNECTION_CAPACITY,
+  AD_HOC_MAX_CONNECTED_CONTROLLERS,
+  AD_HOC_REPLAY_BURST,
+  AD_HOC_REPLAY_MAX_OPERATIONS_PER_BATCH,
+  AD_HOC_REPLAY_SUSTAINED_PER_SECOND,
+  adHocCreationDelayMs,
+  consumeAdHocTokens,
+  emptyAdHocResourceMetrics,
+  type AdHocResourceMetric,
+  type AdHocResourceMetrics,
+  type AdHocTokenBucket,
+} from "@/lib/ad-hoc-resource-budgets";
 
 export const AD_HOC_MAX_RETAINED_GAMES = 50;
 export const AD_HOC_DISCONNECTED_GRACE_MS = 5 * 60_000;
@@ -27,10 +45,10 @@ export const AD_HOC_CREATION_SOURCE_WINDOW_MS = 10 * 60_000;
 export const AD_HOC_CREATION_GLOBAL_WINDOW_MS = 60 * 60_000;
 export const AD_HOC_MAX_CREATIONS_PER_SOURCE = 5;
 export const AD_HOC_MAX_CREATIONS_PER_HOUR = 30;
-export const AD_HOC_MAX_OPERATIONS_PER_SECOND_PER_CONTROLLER = 40;
-export const AD_HOC_MAX_OPERATIONS_PER_SECOND_PER_GAME = 100;
+export const AD_HOC_MAX_OPERATIONS_PER_SECOND_PER_CONTROLLER = AD_HOC_CONTROLLER_BURST;
+export const AD_HOC_MAX_OPERATIONS_PER_SECOND_PER_GAME = AD_HOC_GAME_BURST;
 
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
 const GENERIC_UNAVAILABLE = "Ad Hoc Game unavailable.";
 
 export type AdHocGameView = GameView & {
@@ -78,11 +96,13 @@ export type AdHocActionResult =
       game: AdHocGameView;
       ackedOperationIds: string[];
       outcomes: readonly ControllerOperationOutcome[];
+      replayId?: string;
     }
   | {
       status: "rejected";
       reason: "unavailable" | "invalid-operation" | "conflict" | "rate-limited";
       detail?: string;
+      retryAfterMs?: number;
       outcomes?: readonly ControllerOperationOutcome[];
     };
 
@@ -125,12 +145,18 @@ type AdHocApplyMutationResult =
   | false
   | { invalid: true; rollback: true }
   | { conflict: true; operationId: string }
-  | { rateLimited: true }
+  | { rateLimited: true; retryAfterMs: number }
   | {
       acknowledged: string[];
       duplicate: boolean;
       outcomes: readonly ControllerOperationOutcome[];
     };
+
+type PreparedReplayEntry = {
+  operation: ControllerSynchronizationOperation<GameCommand>;
+  status: "accepted" | "rejected" | "causally-blocked" | "duplicate";
+  detail?: string;
+};
 
 export type AdHocStore = {
   close(): void;
@@ -140,7 +166,12 @@ export type AdHocStore = {
     game: StoredAdHocGame;
     sourceHash: string;
     nowMs: number;
-  }): "accepted" | "rate-limited" | "capacity" | "unavailable";
+  }):
+    | "accepted"
+    | "rate-limited"
+    | "capacity"
+    | "unavailable"
+    | { status: "rate-limited"; retryAfterMs: number };
   mutateGame<T>(gameId: string, mutation: (game: StoredAdHocGame) => T): T | null;
 };
 
@@ -150,6 +181,14 @@ export type AdHocGamesServiceOptions = {
   random?: () => string;
   environmentIdentity?: string;
   iqaRules?: AdHocIqaGameRules;
+  deferReplayAcknowledgement?: boolean;
+  maxConnectedSockets?: number;
+  eventCapacity?: {
+    totalConnections?: number;
+    reservedConnections?: number;
+    activeConnections?: () => number;
+  };
+  schedule?: (delayMs: number, task: () => void) => unknown;
 };
 
 /** Shared sporting interpretation consumed by both Controller workflows. */
@@ -165,8 +204,47 @@ export function createAdHocGamesService(options: AdHocGamesServiceOptions = {}) 
   const random = options.random ?? (() => randomBytes(32).toString("base64url"));
   const environmentIdentity = options.environmentIdentity?.trim() || "test";
   const iqaRules = options.iqaRules ?? DEFAULT_AD_HOC_IQA_RULES;
-  const controllerActionTimes = new Map<string, number[]>();
-  const gameActionTimes = new Map<string, number[]>();
+  const deferReplayAcknowledgement = options.deferReplayAcknowledgement ?? false;
+  const maxConnectedSockets = options.maxConnectedSockets ?? AD_HOC_MAX_CONNECTED_CONTROLLERS;
+  const eventCapacity = {
+    totalConnections:
+      options.eventCapacity?.totalConnections ?? AD_HOC_EVENT_TOTAL_CONNECTION_CAPACITY,
+    reservedConnections:
+      options.eventCapacity?.reservedConnections ?? AD_HOC_EVENT_RESERVED_CONNECTION_CAPACITY,
+    activeConnections: options.eventCapacity?.activeConnections ?? (() => 0),
+  };
+  const schedule =
+    options.schedule ??
+    ((delayMs: number, task: () => void) => {
+      const timer = setTimeout(task, delayMs);
+      return () => clearTimeout(timer);
+    });
+  const controllerActionBuckets = new Map<string, AdHocTokenBucket>();
+  const gameActionBuckets = new Map<string, AdHocTokenBucket>();
+  const replayBuckets = new Map<string, AdHocTokenBucket>();
+  const replayInFlight = new Set<string>();
+  const pendingReplays = new Map<string, string>();
+  const replayJobs = new Map<
+    string,
+    { cancel: () => void; resolve: (result: AdHocActionResult) => void }
+  >();
+  const connections = new Map<string, string>();
+  const metrics = emptyAdHocResourceMetrics();
+  let closed = false;
+  const preparedReplayChunk = Symbol("preparedReplayChunk");
+  const scheduleReplayTask = (delayMs: number, task: () => void) => {
+    let active = true;
+    let cancelUnderlying: (() => void) | undefined;
+    const cancel = () => {
+      active = false;
+      cancelUnderlying?.();
+    };
+    const scheduled = schedule(delayMs, () => {
+      if (active) task();
+    });
+    if (typeof scheduled === "function") cancelUnderlying = scheduled as () => void;
+    return cancel;
+  };
 
   return {
     async create(input: AdHocCreationInput): Promise<AdHocCreateResult> {
@@ -233,11 +311,15 @@ export function createAdHocGamesService(options: AdHocGamesServiceOptions = {}) 
       } catch {
         return { status: "rejected", reason: "unavailable" };
       }
-      if (outcome === "rate-limited") {
+      if (outcome === "rate-limited" || typeof outcome === "object") {
+        const retryAfterMs = typeof outcome === "object" ? outcome.retryAfterMs : 60 * 60_000;
+        metrics.creationDelay += retryAfterMs <= 30_000 ? 1 : 0;
+        metrics.creationRateExhausted += retryAfterMs > 30_000 ? 1 : 0;
         return {
           status: "rejected",
           reason: "rate-limited",
-          retryAfterMs: 60 * 60_000,
+          detail: "Try again later.",
+          retryAfterMs,
         };
       }
       if (outcome === "capacity") {
@@ -341,6 +423,182 @@ export function createAdHocGamesService(options: AdHocGamesServiceOptions = {}) 
       operations: AdHocOperation[];
       nowMs?: number;
     }): Promise<AdHocActionResult> {
+      if (closed) return { status: "rejected", reason: "unavailable" };
+      const preparedChunk = (
+        input as typeof input & {
+          [preparedReplayChunk]?: readonly PreparedReplayEntry[];
+        }
+      )[preparedReplayChunk];
+      if (deferReplayAcknowledgement && preparedChunk === undefined) {
+        const sessionId = validateBearer(input.sessionId);
+        const gameId = validateGameId(input.gameId);
+        const nowMs = input.nowMs ?? now();
+        if (
+          sessionId !== null &&
+          gameId !== null &&
+          isSafeTimestamp(nowMs) &&
+          Array.isArray(input.operations) &&
+          input.operations.length > 0 &&
+          input.operations.length <= AD_HOC_REPLAY_MAX_OPERATIONS_PER_BATCH
+        ) {
+          const sessionKey = digest(sessionId);
+          if (pendingReplays.has(sessionKey)) {
+            metrics.replayPressure += 1;
+            return {
+              status: "rejected",
+              reason: "rate-limited",
+              detail: "Try again later.",
+              retryAfterMs: 1_000,
+            };
+          }
+          let game: StoredAdHocGame | null;
+          try {
+            game = store.readGame(gameId);
+          } catch {
+            return { status: "rejected", reason: "unavailable" };
+          }
+          if (game === null || game.environmentIdentity !== environmentIdentity) {
+            return { status: "rejected", reason: "unavailable" };
+          }
+          if (!hasSession(game, sessionId)) return { status: "rejected", reason: "unavailable" };
+          const parsed = parseAdHocOperations(input.operations);
+          if (!parsed.ok) return { status: "rejected", reason: "invalid-operation" };
+          for (const operation of parsed.operations) {
+            const existing = game.operations[operation.operationId];
+            if (
+              existing !== undefined &&
+              existing.fingerprint !== operationFingerprint(operation)
+            ) {
+              return {
+                status: "rejected",
+                reason: "conflict",
+                outcomes: [
+                  {
+                    operationId: operation.operationId,
+                    workflow: "ad-hoc",
+                    status: "rejected",
+                    detail: "The operation identity is already bound to different content.",
+                  },
+                ],
+              };
+            }
+          }
+          const retainedStatuses = new Map(
+            Object.entries(game.operations).map(
+              ([operationId, operation]) => [operationId, operation.status] as const,
+            ),
+          );
+          const incoming = parsed.operations;
+          const resolution = resolveControllerBatch({
+            operations: incoming.filter(
+              (operation) => game.operations[operation.operationId] === undefined,
+            ),
+            retainedStatuses,
+          });
+          const plannedEntries: PreparedReplayEntry[] = orderReplayPlan(incoming).map(
+            (operation) => {
+              const existing = game.operations[operation.operationId];
+              if (existing !== undefined) {
+                return {
+                  operation,
+                  status: existing.status === "accepted" ? "duplicate" : existing.status,
+                  ...(existing.detail === undefined ? {} : { detail: existing.detail }),
+                };
+              }
+              return {
+                operation,
+                status: resolution.statuses.get(operation.operationId) ?? "rejected",
+                ...(resolution.details.has(operation.operationId)
+                  ? { detail: resolution.details.get(operation.operationId) }
+                  : {}),
+              };
+            },
+          );
+          const replayId = random();
+          pendingReplays.set(sessionKey, replayId);
+          const chunks = Array.from({ length: Math.ceil(plannedEntries.length / 20) }, (_, index) =>
+            plannedEntries.slice(index * 20, (index + 1) * 20),
+          );
+          return new Promise<AdHocActionResult>((resolve) => {
+            const acknowledgedOperationIds: string[] = [];
+            const outcomes: ControllerOperationOutcome[] = [];
+            let projectedGame: AdHocGameView | null = null;
+            let duplicate = true;
+            let retryCount = 0;
+            const deadlineMs = nowMs + 30_000;
+            const isCurrentJob = () => !closed && replayJobs.get(sessionKey)?.resolve === resolve;
+            const rejectJob = (result: AdHocActionResult) => {
+              pendingReplays.delete(sessionKey);
+              replayJobs.delete(sessionKey);
+              resolve(result);
+            };
+            const runChunk = (index: number, scheduledAtMs: number) => {
+              if (!isCurrentJob()) {
+                rejectJob({ status: "rejected", reason: "unavailable" });
+                return;
+              }
+              void this.apply({
+                gameId,
+                sessionId,
+                operations: chunks[index]!.map((entry) => fromControllerOperation(entry.operation)),
+                nowMs: scheduledAtMs,
+                [preparedReplayChunk]: chunks[index]!,
+              } as typeof input & { [preparedReplayChunk]: readonly PreparedReplayEntry[] }).then(
+                (result) => {
+                  if (!isCurrentJob()) return;
+                  if (result.status === "rejected") {
+                    if (result.reason === "rate-limited") {
+                      const delayMs = Math.max(1, result.retryAfterMs ?? 1_000);
+                      retryCount += 1;
+                      if (retryCount > 5 || scheduledAtMs + delayMs > deadlineMs) {
+                        rejectJob({
+                          status: "rejected",
+                          reason: "rate-limited",
+                          retryAfterMs: delayMs,
+                        });
+                        return;
+                      }
+                      if (!isCurrentJob()) return;
+                      const cancel = scheduleReplayTask(delayMs, () =>
+                        runChunk(index, scheduledAtMs + delayMs),
+                      );
+                      const job = replayJobs.get(sessionKey);
+                      if (job !== undefined) job.cancel = cancel;
+                      return;
+                    }
+                    rejectJob(result);
+                    return;
+                  }
+                  acknowledgedOperationIds.push(...result.ackedOperationIds);
+                  outcomes.push(...result.outcomes);
+                  projectedGame = result.game;
+                  duplicate &&= result.status === "duplicate";
+                  if (index + 1 < chunks.length) {
+                    if (!isCurrentJob()) return;
+                    const cancel = scheduleReplayTask(1_000, () =>
+                      runChunk(index + 1, scheduledAtMs + 1_000),
+                    );
+                    const job = replayJobs.get(sessionKey);
+                    if (job !== undefined) job.cancel = cancel;
+                    return;
+                  }
+                  replayJobs.delete(sessionKey);
+                  resolve({
+                    status: duplicate ? "duplicate" : "accepted",
+                    game: projectedGame,
+                    ackedOperationIds: acknowledgedOperationIds,
+                    outcomes,
+                    replayId,
+                  });
+                },
+              );
+            };
+            const job = { cancel: () => {}, resolve };
+            replayJobs.set(sessionKey, job);
+            job.cancel = scheduleReplayTask(0, () => runChunk(0, nowMs));
+          });
+        }
+      }
       const gameId = validateGameId(input.gameId);
       const sessionId = validateBearer(input.sessionId);
       if (
@@ -348,13 +606,30 @@ export function createAdHocGamesService(options: AdHocGamesServiceOptions = {}) 
         sessionId === null ||
         !Array.isArray(input.operations) ||
         input.operations.length === 0 ||
-        input.operations.length > SHARED_LIMITS.replay.maxControlActions
+        input.operations.length > AD_HOC_REPLAY_MAX_OPERATIONS_PER_BATCH
       ) {
         return { status: "rejected", reason: "invalid-operation" };
       }
       const nowMs = input.nowMs ?? now();
       if (!isSafeTimestamp(nowMs)) return { status: "rejected", reason: "invalid-operation" };
       let outcome: AdHocApplyMutationResult | null;
+      const sessionKey = digest(sessionId);
+      if (
+        preparedChunk === undefined &&
+        (replayInFlight.has(sessionKey) || pendingReplays.has(sessionKey))
+      ) {
+        metrics.replayPressure += 1;
+        return {
+          status: "rejected",
+          reason: "rate-limited",
+          detail: "Try again later.",
+          retryAfterMs: 1_000,
+        };
+      }
+      replayInFlight.add(sessionKey);
+      let nextControllerBucket: AdHocTokenBucket | undefined;
+      let nextGameBucket: AdHocTokenBucket | undefined;
+      let nextReplayBucket: AdHocTokenBucket | undefined;
       try {
         outcome = store.mutateGame<AdHocApplyMutationResult>(gameId, (game) => {
           if (game.environmentIdentity !== environmentIdentity || !hasSession(game, sessionId))
@@ -362,26 +637,13 @@ export function createAdHocGamesService(options: AdHocGamesServiceOptions = {}) 
           const next = structuredClone(game) as StoredAdHocGame;
           const acknowledged: string[] = [];
           let duplicate = false;
-          const parsed = parseAdHocOperations(input.operations);
-          if (!parsed.ok) return { invalid: true, rollback: true } as const;
-          const incoming = parsed.operations;
-          const newOperationCount = incoming.filter(
-            (operation) => next.operations[operation.operationId] === undefined,
-          ).length;
-          const sessionKey = digest(sessionId);
-          const sessionTimes = (controllerActionTimes.get(sessionKey) ?? []).filter(
-            (timestamp) => timestamp > nowMs - 1_000,
-          );
-          const gameTimes = (gameActionTimes.get(gameId) ?? []).filter(
-            (timestamp) => timestamp > nowMs - 1_000,
-          );
-          if (
-            sessionTimes.length + newOperationCount >
-              AD_HOC_MAX_OPERATIONS_PER_SECOND_PER_CONTROLLER ||
-            gameTimes.length + newOperationCount > AD_HOC_MAX_OPERATIONS_PER_SECOND_PER_GAME
-          ) {
-            return { rateLimited: true } as const;
-          }
+          const parsed =
+            preparedChunk === undefined ? parseAdHocOperations(input.operations) : null;
+          if (preparedChunk === undefined && (parsed === null || !parsed.ok))
+            return { invalid: true, rollback: true } as const;
+          const incoming =
+            preparedChunk?.map((entry) => entry.operation) ??
+            (parsed as Extract<typeof parsed, { ok: true }>).operations;
           const outcomes: ControllerOperationOutcome[] = [];
           for (const operation of incoming) {
             const existing = next.operations[operation.operationId];
@@ -400,72 +662,157 @@ export function createAdHocGamesService(options: AdHocGamesServiceOptions = {}) 
               continue;
             }
           }
-          const retainedStatuses = new Map(
-            Object.entries(next.operations).map(
-              ([operationId, operation]) => [operationId, operation.status] as const,
-            ),
-          );
-          const resolution = resolveControllerBatch({
-            operations: incoming.filter(
-              (operation) => next.operations[operation.operationId] === undefined,
-            ),
-            retainedStatuses,
-          });
-          for (const operation of resolution.ordered) {
-            const status = resolution.statuses.get(operation.operationId) ?? "rejected";
-            const detail = resolution.details.get(operation.operationId);
-            next.operations[operation.operationId] =
-              status === "accepted"
-                ? {
-                    fingerprint: operationFingerprint(operation),
-                    command: structuredClone(operation.payload),
-                    acceptedAtMs: nowMs,
-                    clientSentAtMs: operation.clientOriginAtMs,
-                    causalPredecessorIds: [...operation.causalPredecessorIds],
-                    status: "accepted",
-                  }
-                : rejectedOperation(operation, nowMs, detail ?? "Causal cycle.", status);
-            outcomes.push({
-              operationId: operation.operationId,
-              workflow: "ad-hoc",
-              status,
-              ...(detail === undefined ? {} : { detail }),
-            });
-            acknowledged.push(operation.operationId);
-          }
-          for (const operation of incoming) {
-            if (
-              next.operations[operation.operationId] !== undefined &&
-              acknowledged.includes(operation.operationId)
-            )
-              continue;
-            if (next.operations[operation.operationId] === undefined) {
-              const status = resolution.statuses.get(operation.operationId) ?? "rejected";
-              const detail = resolution.details.get(operation.operationId) ?? "Causal cycle.";
-              next.operations[operation.operationId] = rejectedOperation(
-                operation,
-                nowMs,
-                detail,
-                status === "accepted" ? "rejected" : status,
+          const reconciledPreparedChunk =
+            preparedChunk === undefined
+              ? undefined
+              : reconcilePreparedReplayChunk(preparedChunk, next.operations);
+          const acceptedNewOperationCount =
+            preparedChunk === undefined
+              ? (() => {
+                  const retainedStatuses = new Map(
+                    Object.entries(next.operations).map(
+                      ([operationId, operation]) => [operationId, operation.status] as const,
+                    ),
+                  );
+                  const resolution = resolveControllerBatch({
+                    operations: incoming.filter(
+                      (operation) => next.operations[operation.operationId] === undefined,
+                    ),
+                    retainedStatuses,
+                  });
+                  return resolution.ordered.filter(
+                    (operation) => resolution.statuses.get(operation.operationId) === "accepted",
+                  ).length;
+                })()
+              : reconciledPreparedChunk!.filter(
+                  (entry) =>
+                    entry.status === "accepted" &&
+                    next.operations[entry.operation.operationId] === undefined,
+                ).length;
+          if (acceptedNewOperationCount > 0) {
+            const controller = consumeAdHocTokens(
+              controllerActionBuckets.get(sessionKey),
+              nowMs,
+              AD_HOC_CONTROLLER_BURST,
+              AD_HOC_CONTROLLER_SUSTAINED_PER_SECOND,
+              acceptedNewOperationCount,
+            );
+            const gameBucket = consumeAdHocTokens(
+              gameActionBuckets.get(gameId),
+              nowMs,
+              AD_HOC_GAME_BURST,
+              AD_HOC_GAME_SUSTAINED_PER_SECOND,
+              acceptedNewOperationCount,
+            );
+            const replay = consumeAdHocTokens(
+              replayBuckets.get(sessionKey),
+              nowMs,
+              deferReplayAcknowledgement
+                ? AD_HOC_REPLAY_BURST
+                : AD_HOC_REPLAY_MAX_OPERATIONS_PER_BATCH,
+              AD_HOC_REPLAY_SUSTAINED_PER_SECOND,
+              acceptedNewOperationCount,
+            );
+            if (!controller.accepted || !gameBucket.accepted || !replay.accepted) {
+              const retryAfterMs = Math.max(
+                controller.accepted ? 0 : controller.retryAfterMs,
+                gameBucket.accepted ? 0 : gameBucket.retryAfterMs,
+                replay.accepted ? 0 : replay.retryAfterMs,
               );
+              return { rateLimited: true, retryAfterMs } as const;
+            }
+            nextControllerBucket = controller.bucket;
+            nextGameBucket = gameBucket.bucket;
+            nextReplayBucket = replay.bucket;
+          }
+          if (preparedChunk !== undefined) {
+            for (const entry of reconciledPreparedChunk!) {
+              const operation = entry.operation;
+              if (next.operations[operation.operationId] !== undefined) continue;
+              const status = entry.status === "duplicate" ? "rejected" : entry.status;
+              const detail = entry.detail;
+              next.operations[operation.operationId] =
+                status === "accepted"
+                  ? {
+                      fingerprint: operationFingerprint(operation),
+                      command: structuredClone(operation.payload),
+                      acceptedAtMs: nowMs,
+                      clientSentAtMs: operation.clientOriginAtMs,
+                      causalPredecessorIds: [...operation.causalPredecessorIds],
+                      status: "accepted",
+                    }
+                  : rejectedOperation(operation, nowMs, detail ?? "Causal cycle.", status);
               outcomes.push({
                 operationId: operation.operationId,
                 workflow: "ad-hoc",
                 status,
-                detail,
+                ...(detail === undefined ? {} : { detail }),
               });
               acknowledged.push(operation.operationId);
+            }
+          } else {
+            const retainedStatuses = new Map(
+              Object.entries(next.operations).map(
+                ([operationId, operation]) => [operationId, operation.status] as const,
+              ),
+            );
+            const resolution = resolveControllerBatch({
+              operations: incoming.filter(
+                (operation) => next.operations[operation.operationId] === undefined,
+              ),
+              retainedStatuses,
+            });
+            for (const operation of resolution.ordered) {
+              const status = resolution.statuses.get(operation.operationId) ?? "rejected";
+              const detail = resolution.details.get(operation.operationId);
+              next.operations[operation.operationId] =
+                status === "accepted"
+                  ? {
+                      fingerprint: operationFingerprint(operation),
+                      command: structuredClone(operation.payload),
+                      acceptedAtMs: nowMs,
+                      clientSentAtMs: operation.clientOriginAtMs,
+                      causalPredecessorIds: [...operation.causalPredecessorIds],
+                      status: "accepted",
+                    }
+                  : rejectedOperation(operation, nowMs, detail ?? "Causal cycle.", status);
+              outcomes.push({
+                operationId: operation.operationId,
+                workflow: "ad-hoc",
+                status,
+                ...(detail === undefined ? {} : { detail }),
+              });
+              acknowledged.push(operation.operationId);
+            }
+            for (const operation of incoming) {
+              if (
+                next.operations[operation.operationId] !== undefined &&
+                acknowledged.includes(operation.operationId)
+              )
+                continue;
+              if (next.operations[operation.operationId] === undefined) {
+                const status = resolution.statuses.get(operation.operationId) ?? "rejected";
+                const detail = resolution.details.get(operation.operationId) ?? "Causal cycle.";
+                next.operations[operation.operationId] = rejectedOperation(
+                  operation,
+                  nowMs,
+                  detail,
+                  status === "accepted" ? "rejected" : status,
+                );
+                outcomes.push({
+                  operationId: operation.operationId,
+                  workflow: "ad-hoc",
+                  status,
+                  detail,
+                });
+                acknowledged.push(operation.operationId);
+              }
             }
           }
           const rebuilt = rebuildAdHocState(next, iqaRules);
           if (rebuilt === null) return { invalid: true, rollback: true } as const;
           next.state = rebuilt;
           next.state.updatedAtMs = nowMs;
-          if (newOperationCount > 0) {
-            const acceptedTimes = Array.from({ length: newOperationCount }, () => nowMs);
-            controllerActionTimes.set(sessionKey, [...sessionTimes, ...acceptedTimes]);
-            gameActionTimes.set(gameId, [...gameTimes, ...acceptedTimes]);
-          }
           Object.assign(game, next);
           const acknowledgement = createControllerReplayAcknowledgement({
             workflow: "ad-hoc",
@@ -480,10 +827,21 @@ export function createAdHocGamesService(options: AdHocGamesServiceOptions = {}) 
         });
       } catch {
         return { status: "rejected", reason: "unavailable" };
+      } finally {
+        replayInFlight.delete(sessionKey);
       }
       if (outcome === null || outcome === false)
         return { status: "rejected", reason: "unavailable" };
-      if ("rateLimited" in outcome) return { status: "rejected", reason: "rate-limited" };
+      if ("rateLimited" in outcome) {
+        metrics.actionRateExhausted += 1;
+        metrics.replayPressure += outcome.retryAfterMs > 0 ? 1 : 0;
+        return {
+          status: "rejected",
+          reason: "rate-limited",
+          detail: "Try again later.",
+          retryAfterMs: outcome.retryAfterMs,
+        };
+      }
       if ("conflict" in outcome) {
         return {
           status: "rejected",
@@ -506,6 +864,10 @@ export function createAdHocGamesService(options: AdHocGamesServiceOptions = {}) 
         return { status: "rejected", reason: "unavailable" };
       }
       if (game === null) return { status: "rejected", reason: "unavailable" };
+      if (nextControllerBucket !== undefined)
+        controllerActionBuckets.set(sessionKey, nextControllerBucket);
+      if (nextGameBucket !== undefined) gameActionBuckets.set(gameId, nextGameBucket);
+      if (nextReplayBucket !== undefined) replayBuckets.set(sessionKey, nextReplayBucket);
       return {
         status: outcome.duplicate ? "duplicate" : "accepted",
         ackedOperationIds: outcome.acknowledged,
@@ -514,10 +876,27 @@ export function createAdHocGamesService(options: AdHocGamesServiceOptions = {}) 
       };
     },
 
+    async acknowledgeReplay(input: {
+      sessionId: unknown;
+      replayId: unknown;
+      delivered: boolean;
+    }): Promise<boolean> {
+      const sessionId = validateBearer(input.sessionId);
+      const replayId = validateBearer(input.replayId);
+      if (sessionId === null || replayId === null) return false;
+      const sessionKey = digest(sessionId);
+      if (pendingReplays.get(sessionKey) !== replayId) return false;
+      // A failed transport delivery releases the reservation without
+      // acknowledging operations; the browser can safely resend them.
+      pendingReplays.delete(sessionKey);
+      return true;
+    },
+
     async setConnection(input: {
       gameId: unknown;
       sessionId: unknown;
       connected: boolean;
+      connectionId?: string;
       nowMs?: number;
     }): Promise<boolean> {
       const gameId = validateGameId(input.gameId);
@@ -525,20 +904,47 @@ export function createAdHocGamesService(options: AdHocGamesServiceOptions = {}) 
       if (gameId === null || sessionId === null) return false;
       const nowMs = input.nowMs ?? now();
       if (!isSafeTimestamp(nowMs)) return false;
+      const sessionKey = digest(sessionId);
+      const connectionId = input.connectionId?.trim() || sessionKey;
+      let connectionChange: "add" | "remove" | null = null;
       try {
-        return (
-          store.mutateGame(gameId, (game) => {
-            if (game.environmentIdentity !== environmentIdentity) return false;
-            const session = game.sessions.find(
-              (candidate) => candidate.sessionHash === digest(sessionId),
+        const changed = store.mutateGame(gameId, (game) => {
+          if (game.environmentIdentity !== environmentIdentity) return false;
+          const session = game.sessions.find(
+            (candidate) => candidate.sessionHash === digest(sessionId),
+          );
+          if (session === undefined) return false;
+          if (input.connected && !connections.has(connectionId)) {
+            const activeEventConnections = Math.max(0, eventCapacity.activeConnections());
+            const availableForAdHoc = Math.max(
+              0,
+              Math.min(
+                maxConnectedSockets,
+                eventCapacity.totalConnections -
+                  Math.max(eventCapacity.reservedConnections, activeEventConnections),
+              ),
             );
-            if (session === undefined) return false;
-            session.connected = input.connected;
-            if (input.connected) session.lastConnectedAtMs = nowMs;
-            else session.lastDisconnectedAtMs = nowMs;
-            return true;
-          }) === true
-        );
+            if (connections.size >= availableForAdHoc) {
+              metrics.connectionShed += 1;
+              return false;
+            }
+            connectionChange = "add";
+          }
+          if (!input.connected && connections.has(connectionId)) connectionChange = "remove";
+          const hasOtherConnection = [...connections].some(
+            ([candidateId, candidateSessionKey]) =>
+              candidateId !== connectionId && candidateSessionKey === sessionKey,
+          );
+          session.connected = input.connected;
+          if (input.connected) session.lastConnectedAtMs = nowMs;
+          else if (!hasOtherConnection) session.lastDisconnectedAtMs = nowMs;
+          if (!input.connected && hasOtherConnection) session.connected = true;
+          return true;
+        });
+        if (changed === true && connectionChange === "add")
+          connections.set(connectionId, sessionKey);
+        if (changed === true && connectionChange === "remove") connections.delete(connectionId);
+        return changed === true;
       } catch {
         return false;
       }
@@ -549,7 +955,7 @@ export function createAdHocGamesService(options: AdHocGamesServiceOptions = {}) 
       const sessionId = validateBearer(input.sessionId);
       if (gameId === null || sessionId === null) return false;
       try {
-        return (
+        const changed =
           store.mutateGame(gameId, (game) => {
             if (game.environmentIdentity !== environmentIdentity) return false;
             const before = game.sessions.length;
@@ -557,16 +963,56 @@ export function createAdHocGamesService(options: AdHocGamesServiceOptions = {}) 
               (session) => session.sessionHash !== digest(sessionId),
             );
             return game.sessions.length !== before;
-          }) === true
-        );
+          }) === true;
+        if (changed) {
+          for (const [connectionId, connectionSessionKey] of connections) {
+            if (connectionSessionKey === digest(sessionId)) connections.delete(connectionId);
+          }
+        }
+        return changed;
       } catch {
         return false;
       }
     },
 
     genericUnavailableMessage: GENERIC_UNAVAILABLE,
+    getResourceMetrics(): AdHocResourceMetrics {
+      metrics.connectedControllers = connections.size;
+      const activeEventConnections = Math.max(0, eventCapacity.activeConnections());
+      metrics.eventReservedCapacity = {
+        configured: eventCapacity.reservedConnections,
+        active: activeEventConnections,
+        availableForAdHoc: Math.max(
+          0,
+          Math.min(
+            maxConnectedSockets,
+            eventCapacity.totalConnections -
+              Math.max(eventCapacity.reservedConnections, activeEventConnections),
+          ),
+        ),
+      };
+      return { ...metrics };
+    },
+    recordResourcePressure(metric: AdHocResourceMetric) {
+      if (metric === "creation-delay") metrics.creationDelay += 1;
+      if (metric === "creation-rate-exhausted") metrics.creationRateExhausted += 1;
+      if (metric === "action-rate-exhausted") metrics.actionRateExhausted += 1;
+      if (metric === "replay-pressure") metrics.replayPressure += 1;
+      if (metric === "connection-shed") metrics.connectionShed += 1;
+      if (metric === "queue-pressure") metrics.queuePressure += 1;
+    },
     store,
     close() {
+      if (closed) return;
+      closed = true;
+      for (const job of replayJobs.values()) {
+        job.cancel();
+        job.resolve({ status: "rejected", reason: "unavailable" });
+      }
+      replayJobs.clear();
+      pendingReplays.clear();
+      replayInFlight.clear();
+      connections.clear();
       store.close();
     },
   };
@@ -574,7 +1020,10 @@ export function createAdHocGamesService(options: AdHocGamesServiceOptions = {}) 
 
 export function createInMemoryAdHocStore(): AdHocStore {
   const games = new Map<string, StoredAdHocGame>();
-  const attempts = new Map<string, number[]>();
+  const attempts = new Map<
+    string,
+    { occurredAtMs: number; successful: boolean; retryUntilMs?: number }[]
+  >();
   const successes: number[] = [];
   return {
     close() {},
@@ -585,13 +1034,45 @@ export function createInMemoryAdHocStore(): AdHocStore {
     },
     createGame({ game, sourceHash, nowMs }) {
       const sourceAttempts = (attempts.get(sourceHash) ?? []).filter(
-        (value) => value > nowMs - AD_HOC_CREATION_SOURCE_WINDOW_MS,
+        (attempt) => attempt.occurredAtMs > nowMs - AD_HOC_CREATION_SOURCE_WINDOW_MS,
       );
-      if (sourceAttempts.length >= AD_HOC_MAX_CREATIONS_PER_SOURCE) return "rate-limited";
+      const latest = sourceAttempts.at(-1);
+      if (latest?.successful === false && (latest.retryUntilMs ?? 0) > nowMs) {
+        return {
+          status: "rate-limited",
+          retryAfterMs: (latest.retryUntilMs ?? nowMs) - nowMs,
+        };
+      }
+      const sourceSuccesses = sourceAttempts.filter((attempt) => attempt.successful);
+      const expiredDelay = latest?.successful === false && (latest.retryUntilMs ?? 0) <= nowMs;
+      if (sourceSuccesses.length >= AD_HOC_MAX_CREATIONS_PER_SOURCE && !expiredDelay) {
+        const retryAfterMs = adHocCreationDelayMs(sourceSuccesses.length);
+        attempts.set(sourceHash, [
+          ...sourceAttempts,
+          { occurredAtMs: nowMs, successful: false, retryUntilMs: nowMs + retryAfterMs },
+        ]);
+        return {
+          status: "rate-limited",
+          retryAfterMs,
+        };
+      }
       const recentSuccesses = successes.filter(
         (value) => value > nowMs - AD_HOC_CREATION_GLOBAL_WINDOW_MS,
       );
-      if (recentSuccesses.length >= AD_HOC_MAX_CREATIONS_PER_HOUR) return "rate-limited";
+      if (recentSuccesses.length >= AD_HOC_MAX_CREATIONS_PER_HOUR) {
+        const retryAfterMs = Math.max(
+          1_000,
+          (recentSuccesses[0] ?? nowMs) + AD_HOC_CREATION_GLOBAL_WINDOW_MS - nowMs,
+        );
+        attempts.set(sourceHash, [
+          ...sourceAttempts,
+          { occurredAtMs: nowMs, successful: false, retryUntilMs: nowMs + retryAfterMs },
+        ]);
+        return {
+          status: "rate-limited",
+          retryAfterMs,
+        };
+      }
       if (games.size >= AD_HOC_MAX_RETAINED_GAMES) {
         const victim = [...games.values()]
           .filter((candidate) =>
@@ -607,8 +1088,8 @@ export function createInMemoryAdHocStore(): AdHocStore {
         games.delete(victim.gameId);
       }
       games.set(game.gameId, cloneStoredGame(game));
-      attempts.set(sourceHash, [...sourceAttempts, nowMs]);
       successes.push(nowMs);
+      attempts.set(sourceHash, [...sourceAttempts, { occurredAtMs: nowMs, successful: true }]);
       return "accepted";
     },
     mutateGame(gameId, mutation) {
@@ -694,8 +1175,14 @@ export function openSqliteAdHocStore(
     migrate();
   }
   db.run(
-    "CREATE TABLE IF NOT EXISTS adhoc_creation_events (source_hash TEXT NOT NULL, successful INTEGER NOT NULL, occurred_at_ms INTEGER NOT NULL)",
+    "CREATE TABLE IF NOT EXISTS adhoc_creation_events (source_hash TEXT NOT NULL, successful INTEGER NOT NULL, occurred_at_ms INTEGER NOT NULL, retry_until_ms INTEGER)",
   );
+  const creationEventColumns = db.query("PRAGMA table_info(adhoc_creation_events)").all() as {
+    name?: string;
+  }[];
+  if (!creationEventColumns.some((column) => column.name === "retry_until_ms")) {
+    db.run("ALTER TABLE adhoc_creation_events ADD COLUMN retry_until_ms INTEGER");
+  }
 
   const read = (gameId: string): StoredAdHocGame | null => {
     const row = db.query("SELECT * FROM adhoc_games WHERE game_id = ?").get(gameId) as Record<
@@ -723,20 +1210,60 @@ export function openSqliteAdHocStore(
         db.run("DELETE FROM adhoc_creation_events WHERE occurred_at_ms <= ?", [
           nowMs - AD_HOC_CREATION_GLOBAL_WINDOW_MS,
         ]);
+        const pendingRow = db
+          .query(
+            "SELECT retry_until_ms FROM adhoc_creation_events WHERE source_hash = ? AND successful = 0 AND retry_until_ms IS NOT NULL ORDER BY occurred_at_ms DESC LIMIT 1",
+          )
+          .get(sourceHash) as { retry_until_ms?: number | string } | null;
+        const pendingUntilMs = Number(pendingRow?.retry_until_ms ?? 0);
+        if (pendingUntilMs > nowMs) {
+          return { status: "rate-limited", retryAfterMs: pendingUntilMs - nowMs } as const;
+        }
         const sourceCountRow = db
           .query(
-            "SELECT COUNT(*) AS count FROM adhoc_creation_events WHERE source_hash = ? AND occurred_at_ms > ?",
+            "SELECT COUNT(*) AS count FROM adhoc_creation_events WHERE source_hash = ? AND successful = 1 AND occurred_at_ms > ?",
           )
           .get(sourceHash, nowMs - AD_HOC_CREATION_SOURCE_WINDOW_MS) as {
           count?: number | string;
         } | null;
         const sourceCount = Number(sourceCountRow?.count ?? 0);
-        if (sourceCount >= AD_HOC_MAX_CREATIONS_PER_SOURCE) return "rate-limited" as const;
+        const expiredPendingDelay = pendingUntilMs > 0 && pendingUntilMs <= nowMs;
+        if (sourceCount >= AD_HOC_MAX_CREATIONS_PER_SOURCE && !expiredPendingDelay) {
+          const retryAfterMs = adHocCreationDelayMs(sourceCount);
+          db.run(
+            "INSERT INTO adhoc_creation_events (source_hash, successful, occurred_at_ms, retry_until_ms) VALUES (?, 0, ?, ?)",
+            [sourceHash, nowMs, nowMs + retryAfterMs],
+          );
+          return {
+            status: "rate-limited",
+            retryAfterMs,
+          } as const;
+        }
         const globalCountRow = db
           .query("SELECT COUNT(*) AS count FROM adhoc_creation_events WHERE successful = 1")
           .get() as { count?: number | string } | null;
         const globalCount = Number(globalCountRow?.count ?? 0);
-        if (globalCount >= AD_HOC_MAX_CREATIONS_PER_HOUR) return "rate-limited" as const;
+        if (globalCount >= AD_HOC_MAX_CREATIONS_PER_HOUR) {
+          const firstSuccessRow = db
+            .query(
+              "SELECT MIN(occurred_at_ms) AS occurred_at_ms FROM adhoc_creation_events WHERE successful = 1",
+            )
+            .get() as { occurred_at_ms?: number | string } | null;
+          const retryAfterMs = Math.max(
+            1_000,
+            Number(firstSuccessRow?.occurred_at_ms ?? nowMs) +
+              AD_HOC_CREATION_GLOBAL_WINDOW_MS -
+              nowMs,
+          );
+          db.run(
+            "INSERT INTO adhoc_creation_events (source_hash, successful, occurred_at_ms, retry_until_ms) VALUES (?, 0, ?, ?)",
+            [sourceHash, nowMs, nowMs + retryAfterMs],
+          );
+          return {
+            status: "rate-limited",
+            retryAfterMs,
+          } as const;
+        }
         const countRow = db.query("SELECT COUNT(*) AS count FROM adhoc_games").get() as {
           count?: number | string;
         } | null;
@@ -769,11 +1296,16 @@ export function openSqliteAdHocStore(
           ],
         );
         db.run(
-          "INSERT INTO adhoc_creation_events (source_hash, successful, occurred_at_ms) VALUES (?, 1, ?)",
+          "INSERT INTO adhoc_creation_events (source_hash, successful, occurred_at_ms, retry_until_ms) VALUES (?, 1, ?, NULL)",
           [sourceHash, nowMs],
         );
         return "accepted" as const;
-      }) as "accepted" | "rate-limited" | "capacity" | "unavailable";
+      }) as
+        | "accepted"
+        | "rate-limited"
+        | "capacity"
+        | "unavailable"
+        | { status: "rate-limited"; retryAfterMs: number };
     },
     mutateGame<T>(gameId: string, mutation: (game: StoredAdHocGame) => T): T | null {
       return transaction(() => {
@@ -1236,6 +1768,92 @@ function operationFingerprint(operation: ControllerSynchronizationOperation<Game
     command: operation.payload,
     workflow: "ad-hoc",
     causalPredecessorIds: operation.causalPredecessorIds,
+  });
+}
+
+function fromControllerOperation(
+  operation: ControllerSynchronizationOperation<GameCommand>,
+): AdHocOperation {
+  return {
+    id: operation.operationId,
+    workflow: "ad-hoc",
+    clientSentAtMs: operation.clientOriginAtMs,
+    causalPredecessorIds: [...operation.causalPredecessorIds],
+    command: operation.payload,
+  };
+}
+
+function orderReplayPlan(
+  operations: readonly ControllerSynchronizationOperation<GameCommand>[],
+): readonly ControllerSynchronizationOperation<GameCommand>[] {
+  const byId = new Map(operations.map((operation) => [operation.operationId, operation]));
+  const indegree = new Map<string, number>();
+  const dependents = new Map<string, string[]>();
+  for (const operation of operations) {
+    const retainedPredecessors = operation.causalPredecessorIds.filter((id) => byId.has(id));
+    indegree.set(operation.operationId, retainedPredecessors.length);
+    for (const predecessor of retainedPredecessors) {
+      dependents.set(predecessor, [...(dependents.get(predecessor) ?? []), operation.operationId]);
+    }
+  }
+  const compare = (
+    left: ControllerSynchronizationOperation<GameCommand>,
+    right: ControllerSynchronizationOperation<GameCommand>,
+  ) =>
+    left.clientOriginAtMs - right.clientOriginAtMs ||
+    left.operationId.localeCompare(right.operationId);
+  const ready = operations
+    .filter((operation) => indegree.get(operation.operationId) === 0)
+    .sort(compare);
+  const ordered: ControllerSynchronizationOperation<GameCommand>[] = [];
+  while (ready.length > 0) {
+    const operation = ready.shift();
+    if (operation === undefined) break;
+    ordered.push(operation);
+    for (const dependentId of dependents.get(operation.operationId) ?? []) {
+      const nextIndegree = (indegree.get(dependentId) ?? 0) - 1;
+      indegree.set(dependentId, nextIndegree);
+      if (nextIndegree === 0) {
+        const dependent = byId.get(dependentId);
+        if (dependent !== undefined) ready.push(dependent);
+        ready.sort(compare);
+      }
+    }
+  }
+  const orderedIds = new Set(ordered.map((operation) => operation.operationId));
+  return [...ordered, ...operations.filter((operation) => !orderedIds.has(operation.operationId))];
+}
+
+function reconcilePreparedReplayChunk(
+  entries: readonly PreparedReplayEntry[],
+  retainedOperations: Readonly<Record<string, StoredOperation>>,
+): PreparedReplayEntry[] {
+  const statuses = new Map(
+    Object.entries(retainedOperations).map(([operationId, operation]) => [
+      operationId,
+      operation.status,
+    ]),
+  );
+  return entries.map((entry) => {
+    const existing = retainedOperations[entry.operation.operationId];
+    if (existing !== undefined) {
+      statuses.set(entry.operation.operationId, existing.status);
+      return entry;
+    }
+    let status = entry.status;
+    let detail = entry.detail;
+    if (
+      status === "accepted" &&
+      entry.operation.causalPredecessorIds.some(
+        (predecessorId) =>
+          statuses.get(predecessorId) !== undefined && statuses.get(predecessorId) !== "accepted",
+      )
+    ) {
+      status = "causally-blocked";
+      detail = "Causal predecessor was rejected.";
+    }
+    statuses.set(entry.operation.operationId, status === "duplicate" ? "rejected" : status);
+    return { ...entry, status, ...(detail === undefined ? {} : { detail }) };
   });
 }
 

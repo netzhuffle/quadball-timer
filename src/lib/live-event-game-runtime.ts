@@ -45,7 +45,10 @@ export async function openLiveEventGameRuntime(input: {
   const storage = openSqliteFoundationStorage(input.databasePath, { grantKeyRing: input.keyRing });
   try {
     const clock = input.clock ?? (() => Date.now());
-    const grantOptions = createGrantOptions(input.environmentId, input.keyRing, clock);
+    let refreshEventCapacitySnapshot = () => {};
+    const grantOptions = createGrantOptions(input.environmentId, input.keyRing, clock, () =>
+      refreshEventCapacitySnapshot(),
+    );
     const authority = createTypedGrantAuthority(storage, grantOptions);
     const scopeResolver = createExternalScopeResolver();
     const acceptance = createFoundationAcceptance(storage, {
@@ -80,14 +83,19 @@ export async function openLiveEventGameRuntime(input: {
       }
       return { recordId: root.recordId, record };
     };
+    const control = createLiveEventGameControl({
+      resolveEventGameRecord,
+      acceptance,
+      grantAuthority: authority,
+      clock,
+    });
+    refreshEventCapacitySnapshot = () => {
+      void control.reconcileActiveControllerSessions();
+    };
     return {
-      control: createLiveEventGameControl({
-        resolveEventGameRecord,
-        acceptance,
-        grantAuthority: authority,
-        clock,
-      }),
+      control,
       close() {
+        control.close();
         storage.close();
       },
     };
@@ -115,6 +123,7 @@ function createGrantOptions(
   environmentId: string,
   keyRing: GrantKeyRing,
   clock: () => number,
+  onLifecycleChange?: () => void,
 ): GrantAuthorityOptions {
   return {
     environmentId,
@@ -123,6 +132,7 @@ function createGrantOptions(
     keyRing,
     controlScopeResolver: createControlScopeResolver(clock),
     privilegedAuthorityVerifier: { verify: () => null },
+    onLifecycleChange,
   };
 }
 
