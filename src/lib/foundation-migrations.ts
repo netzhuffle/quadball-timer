@@ -1974,6 +1974,28 @@ export const FOUNDATION_EVENT_CATALOG_REMOVAL_MIGRATION_SQL = `
   ${FOUNDATION_EVENT_CATALOG_AUDIT_EVENT_INDEX_SQL};
 `;
 
+/** Schema-29 adds the redacted Event Administration Access Sheet audit action. */
+export const FOUNDATION_ACCESS_SHEET_AUDIT_MIGRATION_SQL = `
+  CREATE TABLE foundation_event_catalog_audit_v29 AS SELECT * FROM foundation_event_catalog_audit;
+  DROP TABLE foundation_event_catalog_audit;
+  ${FOUNDATION_EVENT_CATALOG_AUDIT_TABLE_V3_SQL.replace(
+    "CREATE TABLE foundation_event_catalog_audit",
+    "CREATE TABLE foundation_event_catalog_audit_rebuilt",
+  ).replace(
+    "'event-game-teams-confirmed'",
+    "'event-game-teams-confirmed', 'event-publication-changed', 'event-catalog-entry-removed', 'access-sheet-generated'",
+  )};
+  INSERT INTO foundation_event_catalog_audit_rebuilt
+    (audit_id, operation_id, action, event_id, game_day_id, actor_reference,
+     occurred_at_ms, before_json, after_json)
+  SELECT audit_id, operation_id, action, event_id, game_day_id, actor_reference,
+         occurred_at_ms, before_json, after_json
+  FROM foundation_event_catalog_audit_v29;
+  DROP TABLE foundation_event_catalog_audit_v29;
+  ALTER TABLE foundation_event_catalog_audit_rebuilt RENAME TO foundation_event_catalog_audit;
+  ${FOUNDATION_EVENT_CATALOG_AUDIT_EVENT_INDEX_SQL};
+`;
+
 export const FOUNDATION_MIGRATIONS: readonly FoundationMigration[] = Object.freeze([
   createMigration({
     id: "001-foundation-event-game-record-roots",
@@ -2142,6 +2164,12 @@ export const FOUNDATION_MIGRATIONS: readonly FoundationMigration[] = Object.free
     ordinal: 28,
     schemaVersion: 28,
     sql: FOUNDATION_EVENT_CATALOG_REMOVAL_MIGRATION_SQL,
+  }),
+  createMigration({
+    id: "029-access-sheet-generated-audit-action",
+    ordinal: 29,
+    schemaVersion: 29,
+    sql: FOUNDATION_ACCESS_SHEET_AUDIT_MIGRATION_SQL,
   }),
 ]);
 

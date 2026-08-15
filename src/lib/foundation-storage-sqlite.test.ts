@@ -564,7 +564,7 @@ describe("SQLite foundation storage", () => {
       expect(await reopenedRecord.registerRoot(root)).toMatchObject({ status: "idempotent" });
       expect(await reopened.readiness()).toMatchObject({
         ok: true,
-        schemaVersion: "28",
+        schemaVersion: "29",
         evidence: { replay: { result: "passed", rootCount: 1, durationMs: expect.any(Number) } },
       });
       reopened.close();
@@ -612,18 +612,18 @@ describe("SQLite foundation storage", () => {
       const storage = openSqliteFoundationStorage(databasePath);
       const candidate = await storage.validateCandidate();
       expect(candidate.ready).toBe(true);
-      expect(candidate.readiness).toMatchObject({ ok: true, schemaVersion: "28" });
+      expect(candidate.readiness).toMatchObject({ ok: true, schemaVersion: "29" });
       expect(existsSync(candidate.candidatePath)).toBe(false);
       expect(await storage.readiness()).toMatchObject({ ok: false, status: "pending" });
 
       const migration = await storage.applyMigrations({ requireCandidate: true });
-      expect(migration.schemaVersion).toBe(28);
+      expect(migration.schemaVersion).toBe(29);
       expect(await storage.readiness()).toMatchObject({ ok: true });
       storage.close();
     });
   });
 
-  test("preserves prior Event Catalog audit rows, shape, ordering, index, and FK behavior through removal migration", async () => {
+  test("preserves prior Event Catalog audit rows, shape, ordering, index, and FK behavior through Access Sheet migration", async () => {
     await withDatabase(async (databasePath) => {
       const prior = openSqliteFoundationStorage(databasePath, {
         migrations: FOUNDATION_MIGRATIONS.slice(0, 27),
@@ -845,9 +845,106 @@ describe("SQLite foundation storage", () => {
         "026-event-schedule-expected-delays-and-conflicts",
         "027-event-game-presentation-integrity",
         removalAuditMigration.id,
+        "029-access-sheet-generated-audit-action",
       ]);
-      expect(await current.readiness()).toMatchObject({ ok: true, schemaVersion: "28" });
+      expect(await current.readiness()).toMatchObject({ ok: true, schemaVersion: "29" });
       current.close();
+    });
+  });
+
+  test("adds the Access Sheet audit action while preserving prior audit rows and shape", async () => {
+    await withDatabase(async (databasePath) => {
+      const priorMigrations = FOUNDATION_MIGRATIONS.slice(0, -1);
+      const prior = openSqliteFoundationStorage(databasePath, { migrations: priorMigrations });
+      await prior.applyMigrations({ requireCandidate: false });
+      prior.close();
+
+      const database = new Database(databasePath);
+      const priorColumns = database
+        .query("PRAGMA table_info(foundation_event_catalog_audit)")
+        .all();
+      database
+        .query(
+          `INSERT INTO foundation_event_catalog_audit
+             (audit_id, operation_id, action, event_id, game_day_id, actor_reference,
+              occurred_at_ms, before_json, after_json)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          "audit-before-access-sheet-migration",
+          "operation-before-access-sheet-migration",
+          "event-created",
+          "event-before-access-sheet-migration",
+          null,
+          "actor-before-access-sheet-migration",
+          1_000,
+          null,
+          JSON.stringify({ name: "Before migration" }),
+        );
+      const priorIndexes = database
+        .query("PRAGMA index_list(foundation_event_catalog_audit)")
+        .all();
+      database.close();
+
+      const current = openSqliteFoundationStorage(databasePath);
+      expect(await current.applyMigrations({ requireCandidate: false })).toMatchObject({
+        appliedMigrationIds: ["029-access-sheet-generated-audit-action"],
+        schemaVersion: 29,
+      });
+      current.close();
+
+      const upgraded = new Database(databasePath);
+      expect(upgraded.query("PRAGMA table_info(foundation_event_catalog_audit)").all()).toEqual(
+        priorColumns,
+      );
+      expect(upgraded.query("PRAGMA index_list(foundation_event_catalog_audit)").all()).toEqual(
+        priorIndexes,
+      );
+      expect(
+        upgraded
+          .query(
+            `SELECT audit_id, operation_id, action, event_id, game_day_id, actor_reference,
+                    occurred_at_ms, before_json, after_json
+             FROM foundation_event_catalog_audit`,
+          )
+          .all(),
+      ).toEqual([
+        {
+          audit_id: "audit-before-access-sheet-migration",
+          operation_id: "operation-before-access-sheet-migration",
+          action: "event-created",
+          event_id: "event-before-access-sheet-migration",
+          game_day_id: null,
+          actor_reference: "actor-before-access-sheet-migration",
+          occurred_at_ms: 1_000,
+          before_json: null,
+          after_json: JSON.stringify({ name: "Before migration" }),
+        },
+      ]);
+      upgraded
+        .query(
+          `INSERT INTO foundation_event_catalog_audit
+             (audit_id, operation_id, action, event_id, game_day_id, actor_reference,
+              occurred_at_ms, before_json, after_json)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          "audit-after-access-sheet-migration",
+          "operation-after-access-sheet-migration",
+          "access-sheet-generated",
+          "event-after-access-sheet-migration",
+          null,
+          "actor-after-access-sheet-migration",
+          2_000,
+          null,
+          JSON.stringify({ versionId: "version-redacted" }),
+        );
+      expect(
+        upgraded
+          .query("SELECT action FROM foundation_event_catalog_audit WHERE audit_id = ?")
+          .get("audit-after-access-sheet-migration"),
+      ).toEqual({ action: "access-sheet-generated" });
+      upgraded.close();
     });
   });
 
@@ -855,9 +952,9 @@ describe("SQLite foundation storage", () => {
     await withDatabase(async (databasePath) => {
       const baseMigrations = FOUNDATION_MIGRATIONS;
       const failingMigration = createMigration(
-        "029-failing-test-migration",
-        29,
-        29,
+        "030-failing-test-migration",
+        30,
+        30,
         "CREATE TABLE migration_failure_probe (id TEXT) STRICT; THIS IS NOT SQL;",
       );
       const store = openSqliteFoundationStorage(databasePath, {
@@ -877,7 +974,7 @@ describe("SQLite foundation storage", () => {
       });
       expect(await priorBinary.readiness()).toMatchObject({
         ok: true,
-        schemaVersion: "28",
+        schemaVersion: "29",
       });
       priorBinary.close();
 
@@ -949,7 +1046,7 @@ describe("SQLite foundation storage", () => {
         .query(
           "INSERT INTO foundation_migration_ledger (migration_id, ordinal, schema_version, checksum, status, applied_at_ms) VALUES (?, ?, ?, ?, ?, ?)",
         )
-        .run("future-999", 29, 29, "future-checksum", "complete", 2_000);
+        .run("future-999", 30, 30, "future-checksum", "complete", 2_000);
       futureDatabase.close();
       const future = openSqliteFoundationStorage(databasePath);
       expect(await future.readiness()).toMatchObject({ ok: false });

@@ -20,6 +20,7 @@ import { createAuditEntry, expireGrantIfDue } from "@/lib/grant-lifecycle";
 import {
   bindingFor,
   canManageInTransaction,
+  canResolveAccessSheetCredentialInTransaction,
   credentialMatches,
   hasCurrentAdmissionEligibility,
   refreshEventAdminSession,
@@ -37,6 +38,7 @@ import {
 import { auditInput } from "@/lib/grant-management-audit";
 import type {
   GrantManagementAuthority,
+  TypedAccessSheetQrCredentialResolution,
   TypedGrantMutation,
   TypedGrantReveal,
   TypedGrantRotated,
@@ -111,6 +113,89 @@ export function revealGrantInTransaction(
     qrCredential: token,
     credentialFormatVersion: GRANT_CREDENTIAL_FORMAT_VERSION,
   };
+}
+
+/**
+ * Resolve the current QR material for Access Sheet rendering inside its
+ * Foundation transaction. Unlike ordinary Grant reveal/admission, this does
+ * not require a Control Grant to have a live Event Game root: an Access Sheet
+ * intentionally includes empty and conflicted Pitch Slots. Admission keeps
+ * using the canonical live resolver separately.
+ */
+export function resolveAccessSheetQrCredentialInTransaction(
+  transaction: FoundationStorageTransaction,
+  options: GrantAuthorityOptions,
+  input: {
+    grantId: string;
+    grantType: StoredGrant["grantType"];
+    scope: StoredGrant["scope"];
+    authority: GrantManagementAuthority;
+  },
+): TypedAccessSheetQrCredentialResolution {
+  const trustedAuthority = verifyGrantAuthority(
+    options.privilegedAuthorityVerifier,
+    input.authority,
+  );
+  if (trustedAuthority === null)
+    return {
+      status: "rejected",
+      reason: "unauthorized",
+      detail: "The Access Sheet credential cannot be resolved.",
+    };
+  const grantTransaction = requireGrantStorageTransaction(transaction);
+  const stored = grantTransaction.findGrantById(input.grantId);
+  if (stored === null)
+    return {
+      status: "rejected",
+      reason: "not-found",
+      detail: "The Access Sheet credential cannot be resolved.",
+    };
+  const grant = expireGrantIfDue(transaction, options, stored);
+  const resolvedAuthority = resolveManagementAuthority(transaction, options, trustedAuthority);
+  if (
+    grant.grantId !== input.grantId ||
+    grant.grantType !== input.grantType ||
+    !sameGrantScope(grant.scope, input.scope) ||
+    grant.status !== "active" ||
+    resolvedAuthority === null ||
+    !canResolveAccessSheetCredentialInTransaction(transaction, options, grant, resolvedAuthority)
+  )
+    return {
+      status: "rejected",
+      reason: "unauthorized",
+      detail: "The Access Sheet credential cannot be resolved.",
+    };
+  const token = decryptCredential(grant.credential, bindingFor(options, grant), options.keyRing);
+  if (token === null || !credentialMatches(grant, options, token))
+    return {
+      status: "rejected",
+      reason: "unavailable",
+      detail: "The Access Sheet credential cannot be resolved.",
+    };
+  grantTransaction.appendGrantAudit(
+    createAuditEntry(
+      options,
+      auditInput("credential-revealed", grant, resolvedAuthority, grant.status),
+    ),
+  );
+  refreshGrantManagementSession(transaction, options, resolvedAuthority);
+  return {
+    status: "resolved",
+    grantId: grant.grantId,
+    grantVersion: grant.grantVersion,
+    grantType: grant.grantType,
+    qrCredential: token,
+    credentialFormatVersion: GRANT_CREDENTIAL_FORMAT_VERSION,
+  };
+}
+
+function sameGrantScope(left: StoredGrant["scope"], right: StoredGrant["scope"]): boolean {
+  const leftEntries = Object.entries(left);
+  const rightEntries = Object.entries(right);
+  return (
+    leftEntries.length === rightEntries.length &&
+    leftEntries.every(([key, value]) => (right as Record<string, unknown>)[key] === value)
+  );
 }
 
 export async function rotateGrant(

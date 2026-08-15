@@ -210,7 +210,7 @@ describe("Grant cryptographic erasure migration", () => {
 
       const current = openSqliteFoundationStorage(databasePath);
       await current.applyMigrations({ requireCandidate: false });
-      expect(await current.readiness()).toMatchObject({ ok: true, schemaVersion: "28" });
+      expect(await current.readiness()).toMatchObject({ ok: true, schemaVersion: "29" });
       current.close();
 
       const raw = new Database(databasePath);
@@ -330,7 +330,7 @@ describe("Grant cryptographic erasure migration", () => {
       raw.close();
 
       const reopened = openSqliteFoundationStorage(databasePath);
-      expect(await reopened.readiness()).toMatchObject({ ok: true, schemaVersion: "28" });
+      expect(await reopened.readiness()).toMatchObject({ ok: true, schemaVersion: "29" });
       const restartedAudit = await reopened.transaction((transaction) =>
         transaction.listGrantAudit("grant-expired"),
       );
