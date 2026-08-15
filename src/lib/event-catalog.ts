@@ -32,6 +32,7 @@ import type {
   StoredPitchSlot,
   StoredEventCatalogGame,
   StoredEventGameSide,
+  StoredControlAction,
 } from "@/lib/foundation-storage";
 import type { EventGameRecordRoot } from "@/lib/foundation-record-types";
 import { createInMemoryFoundationStorage } from "@/lib/foundation-storage-memory";
@@ -308,6 +309,7 @@ export type EventCatalogStorageSnapshot = {
   findEventGame(eventGameId: string): EventGame | null;
   listEventGames(gameDayId: string): EventGame[];
   findRootByEventGameId(eventGameId: string): EventGameRecordRoot | null;
+  listActions(recordId: string): StoredControlAction[];
   listAuditTrail(eventId: string): EventAdministrationAuditEntry[];
 };
 
@@ -2864,6 +2866,7 @@ function eventCatalogSnapshot(transaction: FoundationStorageSnapshot): EventCata
     findEventGame: (eventGameId) => transaction.findEventGame?.(eventGameId) ?? null,
     listEventGames: (gameDayId) => transaction.listEventGames?.(gameDayId) ?? [],
     findRootByEventGameId: (eventGameId) => transaction.findRootByEventGameId(eventGameId),
+    listActions: (recordId) => transaction.listActions(recordId),
     listAuditTrail: (eventId) => transaction.listEventAuditTrail(eventId),
   };
 }

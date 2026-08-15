@@ -208,6 +208,21 @@ export type LiveEventGameDerivedState = {
   penalties: LivePenaltyProjection;
 };
 
+/**
+ * Rebuild the public-safe sporting state from the committed Event Game Record inputs.
+ * Audience projections use this instead of reimplementing scoring or correction semantics.
+ */
+export function projectLiveEventGameDerivedState(
+  root: EventGameRecordRoot,
+  storedActions: readonly {
+    action: ControlAction;
+    canonicalContent: string;
+    contentFingerprint: string;
+  }[],
+): LiveEventGameDerivedState | null {
+  return rebuildLiveDerivedState(root, storedActions);
+}
+
 export type LiveTimeoutState = {
   status: "inactive" | "started";
   factId: string | null;

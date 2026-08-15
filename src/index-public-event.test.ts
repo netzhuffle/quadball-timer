@@ -11,6 +11,13 @@ const publishedEvent = {
   canonicalPath: "/events/event-published",
   teams: [],
   pitches: [],
+  schedule: {
+    asOfMs: 0,
+    runningGames: [],
+    upcomingGames: [],
+    scheduleGames: [],
+    focusIndex: null,
+  },
 };
 
 describe("public Event browser responses", () => {

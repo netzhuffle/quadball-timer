@@ -61,6 +61,8 @@ import {
 } from "@/lib/administrative-audit";
 import { createGrantAuthority } from "@/lib/grant-authority";
 import { readGrantAuthorityOptions } from "@/lib/grant-runtime";
+import { createControlActionCodecRegistry } from "@/lib/event-game-actions";
+import { createLiveEventGameIqaInterpreter } from "@/lib/live-event-game-control";
 import type {
   TypedGrantMutation,
   TypedGrantReveal,
@@ -236,6 +238,10 @@ async function startServer() {
           : openSqliteFoundationStorage(foundationDatabasePath, {
               grantKeyRing: grantAuthorityOptions.keyRing,
             });
+      candidateFoundation.setReadinessContext?.({
+        actionCodecRegistry: createControlActionCodecRegistry(),
+        interpreter: createLiveEventGameIqaInterpreter(),
+      });
       const readiness = await candidateFoundation.readiness();
       if ((readiness.evidence?.keys?.missingCount ?? 0) > 0) {
         throw new GrantKeyRingCustodyError("missing-key-version");

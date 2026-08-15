@@ -1209,6 +1209,13 @@ describe("App", () => {
               canonicalPath: "/events/visible-event",
               teams: [],
               pitches: [],
+              schedule: {
+                asOfMs: 0,
+                runningGames: [],
+                upcomingGames: [],
+                scheduleGames: [],
+                focusIndex: null,
+              },
             },
           }),
           { status: 200, headers: { "content-type": "application/json" } },

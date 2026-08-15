@@ -2,8 +2,18 @@ import { chromium, type Page } from "playwright";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { createEventCatalog, createFoundationEventCatalogStorage } from "@/lib/event-catalog";
+import {
+  createEventCatalog,
+  createFoundationEventCatalogStorage,
+  type EventGame,
+} from "@/lib/event-catalog";
+import { createEventGameRecord, type ExternalScopeResolver } from "@/lib/event-game-record";
+import type { ControlActionInput } from "@/lib/event-game-actions";
+import type { EventGameRecordRoot } from "@/lib/foundation-record-types";
+import { createGrantKeyRingDocument, writeGrantKeyRingFile } from "@/lib/grant-key-ring-custody";
 import { openSqliteFoundationStorage } from "@/lib/foundation-storage-sqlite";
+import { readGrantAuthorityOptions } from "@/lib/grant-runtime";
+import { createLiveEventGameIqaInterpreter } from "@/lib/live-event-game-control";
 import {
   MemoryTechnicalAdminAuthRepository,
   createTechnicalAdminAuth,
@@ -13,6 +23,8 @@ import {
 const directory = mkdtempSync(join(tmpdir(), "quadball-timer-public-browser-"));
 const foundationDatabase = join(directory, "foundation.sqlite");
 const technicalAdminDatabase = join(directory, "technical-admin.sqlite");
+const grantKeyRingFile = join(directory, "grant-key-ring.json");
+writeGrantKeyRingFile(grantKeyRingFile, createGrantKeyRingDocument("test"));
 const port = 38_000 + Math.floor(Math.random() * 1_000);
 const origin = `http://127.0.0.1:${port}`;
 const environment = {
@@ -22,6 +34,7 @@ const environment = {
   PUBLIC_ORIGIN: "https://timer.example",
   FOUNDATION_DATABASE: foundationDatabase,
   TECHNICAL_ADMIN_DATABASE: technicalAdminDatabase,
+  GRANT_KEY_RING_FILE: grantKeyRingFile,
   PORT: String(port),
   HOST: "127.0.0.1",
 };
@@ -41,9 +54,10 @@ try {
   });
   serverStderr = new Response(server.stderr as unknown as BodyInit).text();
   await waitForServer(`${origin}/internal/healthz`);
+  await seedCommittedGameRecords(seeded);
 
   browser = await chromium.launch({ headless: true });
-  const context = await browser.newContext();
+  const context = await browser.newContext({ viewport: { width: 390, height: 844 } });
   const page = await context.newPage();
   page.setDefaultTimeout(5_000);
   browserPage = page;
@@ -68,7 +82,52 @@ try {
   await page.goto(`${origin}/events`);
   await page.waitForURL(`${origin}${current.canonicalPath}`);
   await page.getByRole("heading", { name: "Published Current" }).waitFor();
-
+  await page.getByRole("heading", { name: "Coming up" }).waitFor();
+  await page.getByRole("heading", { name: "Event schedule" }).waitFor();
+  const liveNow = page.locator('[data-schedule-group="live-now"]');
+  await liveNow.locator('[data-game-code="BUSY-2"]').waitFor();
+  await liveNow.locator('[data-game-code="BUSY-3"]').waitFor();
+  assert(
+    (await liveNow.locator('[data-schedule-card][data-schedule-status="running"]').count()) === 2,
+    "both committed running Games were not shown in Live now",
+  );
+  const liveCardClasses = await liveNow
+    .locator("[data-schedule-card]")
+    .evaluateAll((cards) =>
+      cards.map((card) => card.firstElementChild?.getAttribute("class") ?? ""),
+    );
+  assert(new Set(liveCardClasses).size === 1, "running Games did not receive equal card treatment");
+  const schedule = page.locator('[data-schedule-group="event-schedule"]');
+  for (const [code, status] of [
+    ["BUSY-1", "past"],
+    ["BUSY-2", "running"],
+    ["BUSY-4", "awaiting-start"],
+    ["BUSY-5", "future"],
+  ] as const) {
+    assert(
+      (await schedule
+        .locator(`[data-game-code="${code}"][data-schedule-status="${status}"]`)
+        .count()) === 1,
+      `${code} did not retain chronological status ${status}`,
+    );
+  }
+  assert(
+    (await page.locator('[data-schedule-group="coming-up"] h3').count()) === 1,
+    "Coming up Games were not grouped by Expected Start",
+  );
+  await page.getByText("Pitch Pitch 1").first().waitFor();
+  await page.getByText("Pitch Pitch 2").first().waitFor();
+  await page.getByText("Scheduled Start").first().waitFor();
+  assert(
+    (await page.locator("body").innerText()).includes("Expected Start"),
+    "Expected Start was not rendered",
+  );
+  assert(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth <= document.documentElement.clientWidth,
+    ),
+    "phone-sized Event schedule overflows horizontally",
+  );
   const canonicalResponse = await page.goto(`${origin}${current.canonicalPath}`);
   await page.getByRole("heading", { name: "Published Current" }).waitFor();
   assert(
@@ -185,6 +244,7 @@ try {
       zeroCurrent: true,
       oneCurrentAutoOpen: true,
       multipleCurrentDiscovery: true,
+      busyPhoneSchedule: true,
       canonicalNavigation: true,
       unavailableHiddenUnknown: true,
       unavailableDatabaseFailure: true,
@@ -221,7 +281,9 @@ type PublicEventFixture = {
 };
 
 async function seedDatabase() {
-  const foundation = openSqliteFoundationStorage(foundationDatabase);
+  const foundation = openSqliteFoundationStorage(foundationDatabase, {
+    grantKeyRing: readGrantAuthorityOptions("test", environment).keyRing,
+  });
   await foundation.applyMigrations();
   const catalog = createEventCatalog(createFoundationEventCatalogStorage(foundation), {});
   const hostAuth = createTechnicalAdminAuth(
@@ -230,12 +292,17 @@ async function seedDatabase() {
   );
   const authority = hostAuth.resolveHostLocalAuthority();
   try {
-    const current = await createPublishedEvent(catalog, authority, "Published Current", 0);
+    const current = await createPublishedEvent(catalog, authority, "Published Current", 0, true);
     await createPublishedEvent(catalog, authority, "Published Future", 1);
     await createPublishedEvent(catalog, authority, "Published Past", -1);
     const hidden = await catalog.createEvent({ name: "Hidden Event", timeZone: "UTC" }, authority);
     if (hidden.status !== "accepted") throw new Error("hidden Event creation failed");
-    return { currentId: current, hiddenId: hidden.value.eventId };
+    return {
+      currentId: current.eventId,
+      currentGameDayId: current.gameDayId,
+      currentGames: current.games,
+      hiddenId: hidden.value.eventId,
+    };
   } finally {
     hostAuth.close();
     foundation.close();
@@ -247,6 +314,7 @@ async function createPublishedEvent(
   authority: TechnicalAdminAuthority,
   name: string,
   dayOffset: number,
+  withSchedule = false,
 ) {
   const event = await catalog.createEvent({ name, timeZone: "UTC" }, authority);
   if (event.status !== "accepted") throw new Error(`${name} creation failed`);
@@ -256,13 +324,244 @@ async function createPublishedEvent(
     authority,
   );
   if (day.status !== "accepted") throw new Error(`${name} Game Day creation failed`);
+  const games = withSchedule
+    ? await createBusySchedule(catalog, authority, event.value.eventId, day.value.gameDayId)
+    : [];
   const published = await catalog.changePublicationStatus(
     event.value.eventId,
     { status: "published", impactConfirmed: true },
     authority,
   );
   if (published.status !== "accepted") throw new Error(`${name} publication failed`);
-  return event.value.eventId;
+  return { eventId: event.value.eventId, gameDayId: day.value.gameDayId, games };
+}
+
+async function createBusySchedule(
+  catalog: ReturnType<typeof createEventCatalog>,
+  authority: TechnicalAdminAuthority,
+  eventId: string,
+  gameDayId: string,
+) {
+  const firstPitch = await catalog.createPitch(eventId, { name: "Pitch 1" }, authority);
+  const secondPitch = await catalog.createPitch(eventId, { name: "Pitch 2" }, authority);
+  if (firstPitch.status !== "accepted" || secondPitch.status !== "accepted") {
+    throw new Error("busy Event Pitch creation failed");
+  }
+  const now = Date.now();
+  const starts = [
+    now - 90 * 60_000,
+    now - 30 * 60_000,
+    now - 30 * 60_000,
+    now - 5 * 60_000,
+    now + 20 * 60_000,
+    now + 90 * 60_000,
+  ];
+  const created: Array<{ game: EventGame; pitchId: string; pitchSlotId: string }> = [];
+  for (const [index, startMs] of starts.entries()) {
+    const slot = await catalog.createGameplaySlot(
+      eventId,
+      gameDayId,
+      { sequence: index + 1, scheduledStart: new Date(startMs).toISOString().slice(0, 16) },
+      authority,
+    );
+    if (slot.status !== "accepted") throw new Error("busy Event Gameplay Slot creation failed");
+    if (index === 2) {
+      const delayed = await catalog.setGameplaySlotExpectedDelay(
+        eventId,
+        gameDayId,
+        slot.value.gameplaySlotId,
+        { expectedDelayMs: 5 * 60_000 },
+        authority,
+      );
+      if (delayed.status !== "accepted") throw new Error("busy Event delay change failed");
+    }
+    const inspected = await catalog.inspectEvent(eventId, authority);
+    if (inspected.status !== "accepted") throw new Error("busy Event inspection failed");
+    const pitchSlots = inspected.value.pitchSlots.filter(
+      (candidate) => candidate.gameplaySlotId === slot.value.gameplaySlotId,
+    );
+    const pitchSlot = pitchSlots[index % pitchSlots.length];
+    if (pitchSlot === undefined) throw new Error("busy Event Pitch Slot creation failed");
+    const game = await catalog.createEventGame(
+      eventId,
+      gameDayId,
+      {
+        gameplaySlotId: slot.value.gameplaySlotId,
+        pitchSlotId: pitchSlot.pitchSlotId,
+        gameCode: `BUSY-${index + 1}`,
+        gameDesignation: `Busy Game ${index + 1}`,
+        sideA: { sourceLabel: `Blue ${index + 1}` },
+        sideB: { sourceLabel: `Red ${index + 1}` },
+      },
+      authority,
+    );
+    if (game.status !== "accepted") throw new Error("busy Event Game creation failed");
+    created.push({
+      game: game.value,
+      pitchId: pitchSlot.pitchId,
+      pitchSlotId: pitchSlot.pitchSlotId,
+    });
+  }
+
+  return created;
+}
+
+async function seedCommittedGameRecords(seeded: {
+  currentId: string;
+  currentGameDayId: string;
+  currentGames: readonly { game: EventGame; pitchId: string; pitchSlotId: string }[];
+}) {
+  const foundation = openSqliteFoundationStorage(foundationDatabase, {
+    grantKeyRing: readGrantAuthorityOptions("test", environment).keyRing,
+  });
+  const resolver = createSeedScopeResolver();
+  for (const [index, entry] of seeded.currentGames.entries()) {
+    if (index > 2) continue;
+    const root = createSeedRoot(
+      seeded.currentId,
+      seeded.currentGameDayId,
+      entry.game.eventGameId,
+      entry.pitchId,
+      entry.pitchSlotId,
+    );
+    const record = createEventGameRecord(foundation, {
+      externalScopeResolver: resolver,
+      interpreter: createLiveEventGameIqaInterpreter(),
+      clock: () => Date.now(),
+    });
+    const registered = await record.registerRoot(root);
+    if (registered.status !== "registered") throw new Error("busy Event root registration failed");
+    const action = await record.acceptAction(
+      index === 0 ? createSeedForfeitAction(root) : createSeedClockAction(root),
+    );
+    if (action.status !== "accepted") throw new Error("busy Event action commit failed");
+    if (index === 0) {
+      const finished = await record.transitionLifecycle({
+        ...root.lifecycle,
+        phase: "finished",
+        finishedAtMs: Date.now(),
+      });
+      if (finished.status !== "updated") throw new Error("busy Event finish commit failed");
+    }
+  }
+  foundation.close();
+}
+
+function createSeedScopeResolver(): ExternalScopeResolver {
+  return {
+    resolve(scope, snapshot) {
+      const pitchSlot = snapshot.findPitchSlot?.(scope.pitchSlotId) ?? null;
+      return pitchSlot !== null &&
+        pitchSlot.eventId === scope.eventId &&
+        pitchSlot.gameDayId === scope.gameDayId &&
+        pitchSlot.pitchId === scope.pitchId
+        ? { status: "resolved", scope: structuredClone(scope) }
+        : { status: "mismatch", detail: "Seed Event Game Pitch Slot is unavailable." };
+    },
+    resolveEventTeam(eventId, eventTeamId) {
+      return eventId.length > 0 && eventTeamId.length > 0
+        ? { status: "resolved" }
+        : { status: "missing", detail: "Seed Event Team is unavailable." };
+    },
+  };
+}
+
+function createSeedRoot(
+  eventId: string,
+  gameDayId: string,
+  eventGameId: string,
+  pitchId: string,
+  pitchSlotId: string,
+): EventGameRecordRoot {
+  const createdAtMs = Date.now();
+  return {
+    recordId: `seed-record-${eventGameId}`,
+    eventId,
+    eventGameId,
+    ownership: { eventId, eventGameId },
+    externalScope: {
+      eventId,
+      gameDayId,
+      pitchId,
+      pitchSlotId,
+    },
+    gameSides: [
+      {
+        id: `seed-side-${eventGameId}-a`,
+        eventTeamId: `seed-team-${eventGameId}-a`,
+        teamInterpretationRef: "seed-team-a-v1",
+      },
+      {
+        id: `seed-side-${eventGameId}-b`,
+        eventTeamId: `seed-team-${eventGameId}-b`,
+        teamInterpretationRef: "seed-team-b-v1",
+      },
+    ],
+    lifecycle: {
+      phase: "in-progress",
+      commencedAtMs: createdAtMs,
+      finishedAtMs: null,
+      lockedAtMs: null,
+      lockReason: null,
+    },
+    compatibility: {
+      recordVersion: "event-game-record-v1",
+      schemaVersion: "event-game-record-v1",
+      interpreterVersion: "live-event-iqa-v1",
+    },
+    creationEvidence: {
+      operationId: `seed-create-${eventGameId}`,
+      actorReference: "public-browser-test",
+      source: "event-game-registration",
+      createdAtMs,
+    },
+  };
+}
+
+function createSeedClockAction(root: EventGameRecordRoot): ControlActionInput {
+  return createSeedAction(root, `seed-clock-${root.eventGameId}`, "clock", null, {
+    command: "set-running",
+    running: true,
+    gameTimeMs: 0,
+    sportingOrder: 0,
+  });
+}
+
+function createSeedForfeitAction(root: EventGameRecordRoot): ControlActionInput {
+  return createSeedAction(
+    root,
+    `seed-forfeit-${root.eventGameId}`,
+    "forfeit",
+    root.gameSides[1].id,
+    { resultKind: "forfeit", sportingOrder: 0 },
+  );
+}
+
+function createSeedAction(
+  root: EventGameRecordRoot,
+  operationId: string,
+  factType: string,
+  gameSideId: string | null,
+  data: Record<string, unknown>,
+): ControlActionInput {
+  const trustedAtMs = Date.now();
+  return {
+    recordId: root.recordId,
+    eventGameId: root.eventGameId,
+    operationId,
+    kind: { id: "game-fact", version: "1" },
+    payload: {
+      factId: operationId,
+      factType,
+      gameSideId,
+      gameTimeMs: 0,
+      data,
+    },
+    causalPredecessorIds: [],
+    occurrence: { trustedAtMs, clientOriginAtMs: trustedAtMs, source: "online" },
+    grant: { sessionId: "public-browser-seed", versionId: "public-browser-seed-v1" },
+    lifecycle: structuredClone(root.lifecycle),
+  };
 }
 
 function dateOffset(offset: number) {

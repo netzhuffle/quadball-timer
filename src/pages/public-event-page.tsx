@@ -4,7 +4,11 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { getAdHocBrowserId } from "@/lib/ad-hoc-handoff";
-import type { PublicAudienceEventProjection } from "@/lib/audience-projection";
+import type {
+  PublicAudienceEventProjection,
+  PublicAudienceGameProjection,
+  PublicAudienceScheduleProjection,
+} from "@/lib/audience-projection";
 import { DEFAULT_AWAY_TEAM_COLOR, DEFAULT_HOME_TEAM_COLOR } from "@/lib/team-colors";
 
 export function PublicEventHomePage({ showAll = false }: { showAll?: boolean }) {
@@ -98,6 +102,8 @@ export function PublicEventPage({ eventId }: { eventId: string }) {
     );
   }
 
+  const schedule = event.schedule;
+
   return (
     <PublicShell title={event.name} description={`Published Event · ${event.timeZone}`}>
       <div className="space-y-4">
@@ -107,6 +113,7 @@ export function PublicEventPage({ eventId }: { eventId: string }) {
             All events
           </Button>
         </div>
+        <ScheduleBoard schedule={schedule} timeZone={event.timeZone} />
         <Card>
           <CardHeader>
             <CardTitle>Game Days</CardTitle>
@@ -141,7 +148,7 @@ export function PublicEventPage({ eventId }: { eventId: string }) {
                 </ul>
               </div>
             )}
-            {event.pitches.length > 0 && (
+            {event.pitches.length > 1 && (
               <div>
                 <h2 className="text-sm font-semibold">Pitches</h2>
                 <ul className="mt-2 flex flex-wrap gap-2">
@@ -158,6 +165,329 @@ export function PublicEventPage({ eventId }: { eventId: string }) {
       </div>
     </PublicShell>
   );
+}
+
+function ScheduleBoard({
+  schedule,
+  timeZone,
+}: {
+  schedule: PublicAudienceScheduleProjection;
+  timeZone: string;
+}) {
+  const focusRef = useRef<HTMLLIElement | null>(null);
+
+  useEffect(() => {
+    if (schedule.focusIndex === null) return;
+    focusRef.current?.scrollIntoView({ block: "nearest", inline: "nearest" });
+  }, [schedule.asOfMs, schedule.focusIndex]);
+
+  return (
+    <div className="space-y-6">
+      <ScheduleGroup
+        title="Live now"
+        description="Every running Game has equal prominence."
+        games={schedule.runningGames}
+        timeZone={timeZone}
+        empty="No Games are running now."
+        dataGroup="live-now"
+      />
+      <ScheduleGroup
+        title="Coming up"
+        description="Games with an Expected Start in the next hour."
+        games={schedule.upcomingGames}
+        timeZone={timeZone}
+        empty="No Games are expected in the next hour."
+        dataGroup="coming-up"
+        groupByExpectedStart
+      />
+      <section
+        aria-labelledby="event-schedule-heading"
+        className="space-y-3"
+        data-schedule-group="event-schedule"
+      >
+        <div>
+          <h2 id="event-schedule-heading" className="text-xl font-semibold">
+            Event schedule
+          </h2>
+          <p className="text-sm text-muted-foreground">
+            Chronological schedule positioned around the Event&apos;s current time.
+          </p>
+        </div>
+        {schedule.scheduleGames.length === 0 ? (
+          <p className="rounded-2xl border border-dashed p-4 text-sm text-muted-foreground">
+            No Games have been scheduled.
+          </p>
+        ) : (
+          <ol className="space-y-3">
+            {schedule.scheduleGames.map((game, index) => (
+              <li
+                key={scheduleGameKey(game, index)}
+                ref={index === schedule.focusIndex ? focusRef : undefined}
+                data-schedule-card
+                data-game-code={game.gameCode ?? undefined}
+                data-schedule-status={game.scheduleStatus}
+              >
+                <GameCard game={game} timeZone={timeZone} compact />
+              </li>
+            ))}
+          </ol>
+        )}
+      </section>
+    </div>
+  );
+}
+
+function ScheduleGroup({
+  title,
+  description,
+  games,
+  timeZone,
+  empty,
+  dataGroup,
+  groupByExpectedStart = false,
+}: {
+  title: string;
+  description: string;
+  games: readonly PublicAudienceGameProjection[];
+  timeZone: string;
+  empty: string;
+  dataGroup: string;
+  groupByExpectedStart?: boolean;
+}) {
+  return (
+    <section
+      aria-labelledby={title.toLowerCase().replaceAll(" ", "-")}
+      className="space-y-3"
+      data-schedule-group={dataGroup}
+    >
+      <div>
+        <h2 id={title.toLowerCase().replaceAll(" ", "-")} className="text-xl font-semibold">
+          {title}
+        </h2>
+        <p className="text-sm text-muted-foreground">{description}</p>
+      </div>
+      {games.length === 0 ? (
+        <p className="rounded-2xl border border-dashed p-4 text-sm text-muted-foreground">
+          {empty}
+        </p>
+      ) : groupByExpectedStart ? (
+        <div className="space-y-4">
+          {groupGamesByExpectedStart(games).map((group) => (
+            <section
+              key={group.expectedStartMs}
+              aria-labelledby={`expected-${group.expectedStartMs}`}
+            >
+              <h3
+                id={`expected-${group.expectedStartMs}`}
+                className="text-sm font-semibold text-muted-foreground"
+              >
+                Expected Start {formatScheduleTime(group.expectedStartMs, timeZone)}
+              </h3>
+              <div className="mt-2 grid gap-3 md:grid-cols-2">
+                {group.games.map((game, index) => (
+                  <div
+                    key={scheduleGameKey(game, index)}
+                    data-schedule-card
+                    data-game-code={game.gameCode ?? undefined}
+                    data-schedule-status={game.scheduleStatus}
+                  >
+                    <GameCard game={game} timeZone={timeZone} />
+                  </div>
+                ))}
+              </div>
+            </section>
+          ))}
+        </div>
+      ) : (
+        <div className="grid gap-3 md:grid-cols-2">
+          {games.map((game, index) => (
+            <div
+              key={scheduleGameKey(game, index)}
+              data-schedule-card
+              data-game-code={game.gameCode ?? undefined}
+              data-schedule-status={game.scheduleStatus}
+            >
+              <GameCard game={game} timeZone={timeZone} />
+            </div>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function GameCard({
+  game,
+  timeZone,
+  compact = false,
+}: {
+  game: PublicAudienceGameProjection;
+  timeZone: string;
+  compact?: boolean;
+}) {
+  const winnerName =
+    game.winner === "side-a" ? game.sideA.name : game.winner === "side-b" ? game.sideB.name : null;
+  return (
+    <Card className={compact ? "bg-card/70" : "border-primary/40 bg-card shadow-md"}>
+      <CardHeader className={compact ? "pb-3" : undefined}>
+        <div className="flex flex-wrap items-start justify-between gap-2">
+          <div>
+            <CardTitle className={compact ? "text-base" : "text-lg"}>
+              {game.gameDesignation ?? game.gameCode ?? "Scheduled Game"}
+            </CardTitle>
+            {game.gameDesignation !== null && game.gameCode !== null ? (
+              <CardDescription>Game {game.gameCode}</CardDescription>
+            ) : null}
+          </div>
+          <span
+            className={`rounded-full px-2.5 py-1 text-xs font-semibold ${scheduleStatusClass(game.scheduleStatus)}`}
+          >
+            {scheduleStatusLabel(game.scheduleStatus)}
+          </span>
+        </div>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        <div className="grid grid-cols-[1fr_auto] items-center gap-x-3 gap-y-2">
+          <GameSideRow side={game.sideA} label="Side A" />
+          <GameSideRow side={game.sideB} label="Side B" />
+        </div>
+        <div className="flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
+          <span>Scheduled Start {formatScheduleTime(game.scheduledStartMs, timeZone)}</span>
+          {game.expectedStartMs !== game.scheduledStartMs ? (
+            <span>Expected Start {formatScheduleTime(game.expectedStartMs, timeZone)}</span>
+          ) : null}
+          {game.pitch !== null ? <span>Pitch {game.pitch}</span> : null}
+        </div>
+        <div className="flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
+          <span>Game Phase: {gamePhaseLabel(game.phase)}</span>
+          <span>Operational status: {operationalStatusLabel(game.operationalStatus)}</span>
+          {game.overtimeTarget !== null ? (
+            <span>Overtime target: {game.overtimeTarget}</span>
+          ) : null}
+          {winnerName !== null ? <span>Winner: {winnerName}</span> : null}
+          {game.clock !== null ? (
+            game.clock.synchronization === "unavailable" ? (
+              <span>Clock unavailable · manual timing required</span>
+            ) : (
+              <span>
+                Clock {formatClock(game.clock.gameTimeMs)} ·{" "}
+                {clockStatusLabel(game.clock.synchronization)}
+              </span>
+            )
+          ) : null}
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+function GameSideRow({
+  side,
+  label,
+}: {
+  side: PublicAudienceGameProjection["sideA"];
+  label: string;
+}) {
+  return (
+    <>
+      <span
+        className="min-w-0 truncate"
+        style={
+          side.color === null
+            ? undefined
+            : { borderInlineStart: `0.3rem solid ${side.color}`, paddingInlineStart: "0.5rem" }
+        }
+      >
+        <span className="sr-only">{label}: </span>
+        {side.name ?? "TBD"}
+        {side.flagCatch ? <span className="ml-2 text-xs font-semibold">Flag catch</span> : null}
+      </span>
+      <span
+        className="text-right text-2xl font-semibold tabular-nums"
+        aria-label={`${label} score`}
+      >
+        {side.score ?? "—"}
+      </span>
+    </>
+  );
+}
+
+function scheduleGameKey(game: PublicAudienceGameProjection, index: number) {
+  return `${game.gameCode ?? game.gameDesignation ?? "game"}-${index}`;
+}
+
+function groupGamesByExpectedStart(games: readonly PublicAudienceGameProjection[]) {
+  const groups = new Map<number, PublicAudienceGameProjection[]>();
+  for (const game of games) {
+    const group = groups.get(game.expectedStartMs) ?? [];
+    group.push(game);
+    groups.set(game.expectedStartMs, group);
+  }
+  return [...groups.entries()].map(([expectedStartMs, groupedGames]) => ({
+    expectedStartMs,
+    games: groupedGames,
+  }));
+}
+
+function scheduleStatusClass(status: PublicAudienceGameProjection["scheduleStatus"]) {
+  return GAME_SCHEDULE_STATUS_META[status].className;
+}
+
+function scheduleStatusLabel(status: PublicAudienceGameProjection["scheduleStatus"]) {
+  return GAME_SCHEDULE_STATUS_META[status].label;
+}
+
+function gamePhaseLabel(phase: PublicAudienceGameProjection["phase"]) {
+  return phase === "seeker-floor"
+    ? "Seeker Floor"
+    : phase === "seekers-released"
+      ? "Seekers Released"
+      : "Overtime";
+}
+
+function operationalStatusLabel(status: PublicAudienceGameProjection["operationalStatus"]) {
+  return status === "paused"
+    ? "Paused"
+    : status === "suspended"
+      ? "Suspended"
+      : status === "finished"
+        ? "Finished"
+        : status === "running"
+          ? "Running"
+          : "Scheduled";
+}
+
+const GAME_SCHEDULE_STATUS_META = {
+  running: { label: "Running", className: "bg-primary text-primary-foreground" },
+  "awaiting-start": {
+    label: "Awaiting start",
+    className: "bg-amber-100 text-amber-950 dark:bg-amber-950 dark:text-amber-100",
+  },
+  past: { label: "Past", className: "bg-muted text-muted-foreground" },
+  future: { label: "Future", className: "bg-secondary text-secondary-foreground" },
+} satisfies Record<
+  PublicAudienceGameProjection["scheduleStatus"],
+  { label: string; className: string }
+>;
+
+function formatScheduleTime(milliseconds: number, timeZone: string) {
+  return new Intl.DateTimeFormat(undefined, {
+    timeZone,
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(new Date(milliseconds));
+}
+
+function formatClock(milliseconds: number) {
+  const minutes = Math.floor(milliseconds / 60_000);
+  const seconds = Math.floor((milliseconds % 60_000) / 1_000);
+  return `${minutes}:${String(seconds).padStart(2, "0")}`;
+}
+
+function clockStatusLabel(
+  status: NonNullable<PublicAudienceGameProjection["clock"]>["synchronization"],
+) {
+  return status === "synchronized" ? "synced" : status;
 }
 
 function EventDiscovery({ events }: { events: readonly PublicAudienceEventProjection[] }) {

@@ -1,8 +1,16 @@
 import type {
   EventCatalogFoundationStorage,
   EventCatalogStorageSnapshot,
+  EventGame,
+  ProjectedEventGame,
   StoredEvent,
 } from "@/lib/event-catalog";
+import { projectScheduleGames } from "@/lib/event-catalog";
+import { projectClockBaseline } from "@/lib/clock-authority";
+import {
+  projectLiveEventGameDerivedState,
+  type LiveEventGameDerivedState,
+} from "@/lib/live-event-game-control";
 
 export type PublicAudienceEventLifecycle = "unscheduled" | "current" | "future" | "past";
 
@@ -13,6 +21,58 @@ export type PublicAudienceEventTeam = {
 
 export type PublicAudiencePitch = {
   name: string;
+};
+
+export type PublicAudienceGameScheduleStatus = "past" | "running" | "awaiting-start" | "future";
+
+export type PublicAudienceGamePhase = "seeker-floor" | "seekers-released" | "overtime";
+
+export type PublicAudienceGameOperationalStatus =
+  | "scheduled"
+  | "running"
+  | "paused"
+  | "suspended"
+  | "finished";
+
+export type PublicAudienceGameSide = {
+  name: string | null;
+  color: string | null;
+  score: number | null;
+  flagCatch: boolean;
+};
+
+export type PublicAudienceClockProjection = {
+  gameTimeMs: number;
+  activePenaltyTimeMs: number;
+  running: boolean;
+  projectedAtMs: number;
+  synchronization: "synchronized" | "estimated" | "stale" | "unavailable";
+  lastSynchronizedAtMs: number | null;
+  cues: LiveEventGameDerivedState["clock"]["cues"];
+};
+
+export type PublicAudienceGameProjection = {
+  gameCode: string | null;
+  gameDesignation: string | null;
+  scheduledStartMs: number;
+  expectedStartMs: number;
+  scheduleStatus: PublicAudienceGameScheduleStatus;
+  phase: PublicAudienceGamePhase;
+  operationalStatus: PublicAudienceGameOperationalStatus;
+  pitch: string | null;
+  sideA: PublicAudienceGameSide;
+  sideB: PublicAudienceGameSide;
+  winner: "side-a" | "side-b" | null;
+  overtimeTarget: number | null;
+  clock: PublicAudienceClockProjection | null;
+};
+
+export type PublicAudienceScheduleProjection = {
+  asOfMs: number;
+  runningGames: readonly PublicAudienceGameProjection[];
+  upcomingGames: readonly PublicAudienceGameProjection[];
+  scheduleGames: readonly PublicAudienceGameProjection[];
+  focusIndex: number | null;
 };
 
 /** The narrow publication contract consumed by the future public Event experience. */
@@ -26,6 +86,7 @@ export type PublicAudienceEventProjection = {
   canonicalPath: string;
   teams: readonly PublicAudienceEventTeam[];
   pitches: readonly PublicAudiencePitch[];
+  schedule: PublicAudienceScheduleProjection;
 };
 
 export type PublicAudienceEventList = {
@@ -118,7 +179,205 @@ function projectPublicEvent(
       color: defaultColor,
     })),
     pitches: snapshot.listPitches(event.eventId).map(({ name }) => ({ name })),
+    schedule: projectSchedule(snapshot, event.eventId, nowMs),
   };
+}
+
+function projectSchedule(
+  snapshot: EventCatalogStorageSnapshot,
+  eventId: string,
+  nowMs: number,
+): PublicAudienceScheduleProjection {
+  const gamesById = new Map<string, EventGame>();
+  for (const gameDay of snapshot.listGameDays(eventId)) {
+    for (const game of snapshot.listEventGames(gameDay.gameDayId)) {
+      if (game.eventId !== eventId || gamesById.has(game.eventGameId)) continue;
+      gamesById.set(game.eventGameId, game);
+    }
+  }
+
+  const multiplePitches = snapshot.listPitches(eventId).length > 1;
+  const projected = projectScheduleGames(snapshot, [...gamesById.values()])
+    .map((game) => projectAudienceGame(snapshot, game, nowMs, multiplePitches))
+    .sort(compareAudienceGames);
+  const runningGames = projected.filter((game) => game.scheduleStatus === "running");
+  const upcomingGames = projected.filter(
+    (game) =>
+      game.scheduleStatus === "future" &&
+      game.expectedStartMs >= nowMs &&
+      game.expectedStartMs < nowMs + 60 * 60 * 1000,
+  );
+  const focusIndex = findScheduleFocusIndex(projected);
+
+  return {
+    asOfMs: nowMs,
+    runningGames,
+    upcomingGames,
+    scheduleGames: projected,
+    focusIndex,
+  };
+}
+
+function projectAudienceGame(
+  snapshot: EventCatalogStorageSnapshot,
+  game: ProjectedEventGame,
+  nowMs: number,
+  multiplePitches: boolean,
+): PublicAudienceGameProjection {
+  const root = snapshot.findRootByEventGameId(game.eventGameId);
+  const derived = root === null ? null : readDerivedState(snapshot, root);
+  const lifecyclePhase = derived?.phase ?? root?.lifecycle.phase ?? "scheduled";
+  const phase = projectGamePhase(derived);
+  const pitchSlot = snapshot.findPitchSlot(game.pitchSlotId);
+  const pitch = pitchSlot === null ? null : (snapshot.findPitch(pitchSlot.pitchId)?.name ?? null);
+  const sideA = projectAudienceGameSide(snapshot, game.sideA, derived, root, "a");
+  const sideB = projectAudienceGameSide(snapshot, game.sideB, derived, root, "b");
+  const winner = winnerSide(derived, root);
+
+  return {
+    gameCode: game.gameCode,
+    gameDesignation: game.gameDesignation,
+    scheduledStartMs: scheduledStartForGame(snapshot, game),
+    expectedStartMs: game.expectedStartMs,
+    scheduleStatus: classifyScheduleStatus(lifecyclePhase, game.expectedStartMs, nowMs),
+    phase,
+    operationalStatus: operationalStatus(lifecyclePhase, derived),
+    pitch: multiplePitches ? pitch : null,
+    sideA,
+    sideB,
+    winner,
+    overtimeTarget: derived?.overtimeTarget ?? null,
+    clock: projectClock(
+      derived === null ? null : projectClockBaseline(derived.clock.baseline, nowMs),
+    ),
+  };
+}
+
+function readDerivedState(
+  snapshot: EventCatalogStorageSnapshot,
+  root: NonNullable<ReturnType<EventCatalogStorageSnapshot["findRootByEventGameId"]>>,
+): LiveEventGameDerivedState {
+  const derived = projectLiveEventGameDerivedState(root, snapshot.listActions(root.recordId));
+  if (derived === null) {
+    throw new Error("Committed Event Game state cannot be rebuilt.");
+  }
+  return derived;
+}
+
+function projectAudienceGameSide(
+  snapshot: EventCatalogStorageSnapshot,
+  side: EventGame["sideA"],
+  derived: LiveEventGameDerivedState | null,
+  root: ReturnType<EventCatalogStorageSnapshot["findRootByEventGameId"]>,
+  sideLabel: "a" | "b",
+): PublicAudienceGameSide {
+  const color =
+    side.eventTeamId === null
+      ? null
+      : (snapshot.findEventTeam(side.eventTeamId)?.defaultColor ?? null);
+  const rootSide = root?.gameSides[sideLabel === "a" ? 0 : 1];
+  const score =
+    derived === null || rootSide === undefined
+      ? null
+      : (derived.scoreByGameSide[rootSide.id] ?? null);
+  const flagCatch =
+    derived?.catch !== null &&
+    derived?.catch !== undefined &&
+    rootSide !== undefined &&
+    derived.catch.catchingGameSideId === rootSide.id;
+  return {
+    name: side.eventTeamName ?? side.sourceLabel,
+    color,
+    score,
+    flagCatch,
+  };
+}
+
+function scheduledStartForGame(snapshot: EventCatalogStorageSnapshot, game: ProjectedEventGame) {
+  return snapshot.findGameplaySlot(game.gameplaySlotId)?.scheduledStartMs ?? game.expectedStartMs;
+}
+
+function projectGamePhase(derived: LiveEventGameDerivedState | null): PublicAudienceGamePhase {
+  if (derived?.overtime === true) return "overtime";
+  return derived?.clock.cues.seekerRelease === "released" ? "seekers-released" : "seeker-floor";
+}
+
+function classifyScheduleStatus(
+  phase: LiveEventGameDerivedState["phase"] | "scheduled",
+  expectedStartMs: number,
+  nowMs: number,
+): PublicAudienceGameScheduleStatus {
+  if (phase === "finished") return "past";
+  if (phase === "in-progress" || phase === "suspended") return "running";
+  return expectedStartMs <= nowMs ? "awaiting-start" : "future";
+}
+
+function operationalStatus(
+  phase: LiveEventGameDerivedState["phase"] | "scheduled",
+  derived: LiveEventGameDerivedState | null,
+): PublicAudienceGameOperationalStatus {
+  return phase === "in-progress"
+    ? derived?.clock.running === false
+      ? "paused"
+      : "running"
+    : phase === "suspended"
+      ? "suspended"
+      : phase === "finished"
+        ? "finished"
+        : "scheduled";
+}
+
+function winnerSide(
+  derived: LiveEventGameDerivedState | null,
+  root: ReturnType<EventCatalogStorageSnapshot["findRootByEventGameId"]>,
+): "side-a" | "side-b" | null {
+  if (
+    derived?.winnerGameSideId === null ||
+    derived?.winnerGameSideId === undefined ||
+    root === null
+  )
+    return null;
+  if (root.gameSides[0]?.id === derived.winnerGameSideId) return "side-a";
+  if (root.gameSides[1]?.id === derived.winnerGameSideId) return "side-b";
+  return null;
+}
+
+function projectClock(
+  clock: LiveEventGameDerivedState["clock"] | null,
+): PublicAudienceClockProjection | null {
+  if (clock === null) return null;
+  return {
+    gameTimeMs: clock.gameTimeMs,
+    activePenaltyTimeMs: clock.activePenaltyTimeMs,
+    running: clock.running,
+    projectedAtMs: clock.projectedAtMs,
+    synchronization: clock.synchronization,
+    lastSynchronizedAtMs: clock.lastSynchronizedAtMs,
+    cues: structuredClone(clock.cues),
+  };
+}
+
+function compareAudienceGames(
+  left: PublicAudienceGameProjection,
+  right: PublicAudienceGameProjection,
+): number {
+  return (
+    left.expectedStartMs - right.expectedStartMs ||
+    left.scheduledStartMs - right.scheduledStartMs ||
+    (left.gameCode ?? left.gameDesignation ?? "").localeCompare(
+      right.gameCode ?? right.gameDesignation ?? "",
+    )
+  );
+}
+
+function findScheduleFocusIndex(games: readonly PublicAudienceGameProjection[]): number | null {
+  if (games.length === 0) return null;
+  const active = games.findIndex(
+    (game) => game.scheduleStatus === "running" || game.scheduleStatus === "awaiting-start",
+  );
+  if (active >= 0) return active;
+  const future = games.findIndex((game) => game.scheduleStatus === "future");
+  return future >= 0 ? future : games.length - 1;
 }
 
 function classifyLifecycle(
