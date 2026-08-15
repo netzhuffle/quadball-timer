@@ -53,7 +53,7 @@ describe("Event Game Controller reconnect browser seam", () => {
     openGrantSessionId = "session";
     openGrantVersion = "version";
     openBearer = "bearer";
-    openProjection = projection();
+    openProjection = null;
     refreshProjection = projection();
     refreshRejected = false;
     switchRequested = false;
@@ -82,7 +82,7 @@ describe("Event Game Controller reconnect browser seam", () => {
                 grantSessionId: openGrantSessionId,
                 grantVersion: openGrantVersion,
               },
-              projection: openProjection ?? projection(),
+              projection: openProjection ?? refreshProjection ?? projection(),
               projectionStatus: "available",
             }),
             { status: 200, headers: { "content-type": "application/json" } },
@@ -745,6 +745,47 @@ describe("Event Game Controller reconnect browser seam", () => {
       type: "resolve-penalty-expiration",
       scoreFactId: scoreAction.intent.factId,
     });
+  });
+  test("projects a natural Heat cue and sends the distinct Controller override-skip path", async () => {
+    refreshProjection = browserHeatProjection("pending");
+    await enterAndOpen();
+    expect(container.textContent).toContain("Pending cue at 15:00");
+    const override = container.querySelector('input[type="checkbox"]') as HTMLInputElement;
+    await act(async () => {
+      override.click();
+      override.dispatchEvent(new testWindow.Event("input", { bubbles: true }) as unknown as Event);
+      override.dispatchEvent(new testWindow.Event("change", { bubbles: true }) as unknown as Event);
+      await Promise.resolve();
+    });
+    const skipButton = Array.from(container.getElementsByTagName("button")).find((button) =>
+      button.textContent?.includes("Skip (Official Override)"),
+    );
+    expect(skipButton).not.toBeNull();
+    expect((skipButton as HTMLButtonElement).disabled).toBe(false);
+    await act(async () => {
+      Array.from(container.getElementsByTagName("button"))
+        .find((button) => button.textContent?.includes("Skip (Official Override)"))
+        ?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const submittedHeat = [
+      ...intentBodies,
+      ...replayBodies.flatMap((body) => body.actions ?? []),
+    ].at(-1)?.intent;
+    expect(submittedHeat).toMatchObject({
+      trigger: "heat-stoppage",
+      heatAction: "skip",
+      heatTriggerId: "heat-trigger-900000",
+      override: { guardrail: "heat-stoppage-rule-deviation" },
+    });
+  });
+
+  test("projects the active Heat timer in the Controller browser seam", async () => {
+    refreshProjection = browserHeatProjection("started");
+    await enterAndOpen();
+    expect(container.textContent).toContain("Timer: 00:00 elapsed");
   });
 
   test("renders stable fact identity and sends a contextual Correction from the browser seam", async () => {
@@ -1595,6 +1636,51 @@ function projection(
       commencedAtMs: defaultProjection ? 10_000 : options.commenced === true ? 0 : null,
       provisionalRunningSinceMs: null,
       provisionalElapsedMs: 0,
+    },
+  };
+}
+
+function browserHeatProjection(kind: "pending" | "started"): ControllerProjection {
+  const base = projection();
+  const startFact = {
+    factId: "browser-heat-start",
+    factType: "heat-stoppage",
+    gameSideId: null,
+    gameTimeMs: 900_000,
+    sportingOrder: 900_000,
+    synchronizationOrder: 1,
+    trustedAtMs: 1_000,
+    effective: true,
+    data: {
+      heatAction: "start",
+      heatTriggerId: "heat-trigger-900000",
+      triggerGameTimeMs: 900_000,
+      heatSequence: 1,
+    },
+  };
+  return {
+    ...base,
+    phase: "in-progress",
+    scoreByGameSide: { "side-a": kind === "pending" ? 30 : 0, "side-b": 0 },
+    goalCount: kind === "pending" ? 3 : 0,
+    gameFacts: kind === "started" ? [startFact] : [],
+    clock: { ...base.clock, gameTimeMs: 900_000, projectedAtMs: 1_000 },
+    heat: {
+      status: "inactive",
+      factId: null,
+      startedAtGameTimeMs: null,
+      nominalDurationMs: null,
+      allowedDurationMs: null,
+      actualDurationMs: null,
+      mode: "enabled",
+      pendingTrigger: null,
+      pendingTriggerId: null,
+      pendingTriggerGameTimeMs: null,
+      nextTriggerGameTimeMs: 1_500_000,
+      trigger: null,
+      permittedExtensionTriggerId: null,
+      activeTriggerId: null,
+      triggerDecision: null,
     },
   };
 }

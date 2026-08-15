@@ -27,8 +27,12 @@ import {
 import type { EventGameLifecyclePhase, EventGameRecordRoot } from "@/lib/foundation-record-types";
 import type { EventGameRecord } from "@/lib/event-game-record";
 import type { FoundationAcceptance } from "@/lib/foundation-acceptance";
-import type { ControlAction } from "@/lib/event-game-actions";
+import type { ControlAction, ControlActionInput } from "@/lib/event-game-actions";
 import type { TypedGrantAuthority } from "@/lib/grant-management-types";
+import type {
+  HeatStoppageConfiguration,
+  HeatStoppageConfigurationScope,
+} from "@/lib/heat-stoppage-configuration";
 import {
   compareLivePenaltyFactOrder,
   deriveLivePenaltyProjection,
@@ -61,6 +65,26 @@ export type SportingOrderAdjudication = {
   relation: "before" | "after";
 };
 
+export const HEAT_STOPPAGE_FIRST_TRIGGER_GAME_TIME_MS = 15 * 60 * 1000;
+export const HEAT_STOPPAGE_SECOND_TRIGGER_GAME_TIME_MS = 25 * 60 * 1000;
+export const HEAT_STOPPAGE_TRIGGER_INTERVAL_MS = 5 * 60 * 1000;
+export const HEAT_STOPPAGE_FIRST_NOMINAL_DURATION_MS = 4 * 60 * 1000;
+export const HEAT_STOPPAGE_LATER_NOMINAL_DURATION_MS = 2 * 60 * 1000;
+
+export type LiveHeatAction =
+  | "start"
+  | "end"
+  | "skip-required"
+  | "extend-permitted"
+  | "extend"
+  | "end-of-drive"
+  | "dead-volleyball"
+  | "other-stoppage"
+  | "skip"
+  | "suppress"
+  | "enable"
+  | "disable";
+
 type ControllerIntentBase = {
   version: typeof LIVE_EVENT_CONTROL_INTENT_VERSION;
   operationId: string;
@@ -74,6 +98,7 @@ type ControllerIntentBase = {
     source?: "online" | "offline";
   };
   clockGeneration?: number;
+  heatTriggerId?: string;
   override?: OfficialOverrideMetadata;
 };
 
@@ -147,7 +172,7 @@ export type LiveEventControllerIntent =
       gameSideId?: string;
       penaltyCardType?: "blue" | "yellow" | "red" | "ejection";
       penaltyPlayerKey?: string;
-      heatAction?: "start" | "end" | "skip-required" | "extend-permitted";
+      heatAction?: LiveHeatAction;
       timeoutAction?: "stoppage" | "start" | "complete";
       timeoutGameSideId?: string;
       suspensionAction?: "start" | "resume";
@@ -283,10 +308,37 @@ export type LiveStoppageState = {
 };
 
 export type LiveHeatState = {
-  status: "inactive" | "started" | "ended" | "skipped" | "extended";
+  status:
+    | "inactive"
+    | "started"
+    | "ended"
+    | "skipped"
+    | "required-skip"
+    | "suppressed"
+    | "extended";
   factId: string | null;
   startedAtGameTimeMs: number | null;
   nominalDurationMs: number | null;
+  allowedDurationMs?: number | null;
+  actualDurationMs?: number | null;
+  completedAtAllowed?: boolean;
+  rawActualDurationMs?: number | null;
+  completionAtTrustedAtMs?: number | null;
+  mode?: "enabled" | "disabled";
+  pendingTrigger?: { gameTimeMs: number; index: number } | null;
+  pendingTriggerId?: string | null;
+  pendingTriggerGameTimeMs?: number | null;
+  nextTriggerGameTimeMs?: number | null;
+  trigger?: { id: string; gameTimeMs: number; index: number } | null;
+  permittedExtensionTriggerId?: string | null;
+  activeTriggerId?: string | null;
+  triggerDecision?:
+    | "end-of-drive"
+    | "dead-volleyball"
+    | "other-stoppage"
+    | "skip"
+    | "skip-required"
+    | null;
 };
 
 export type LiveResultState = {
@@ -309,6 +361,8 @@ export type ControllerGameFact = {
   gameTimeMs: number | null;
   sportingOrder: number;
   synchronizationOrder: number;
+  trustedAtMs?: number;
+  acceptedAtMs?: number;
   effective: boolean;
   data: ActionJsonValue;
 };
@@ -436,6 +490,7 @@ export type LiveEventGameControlOptions = {
     eventGameId: string;
     grantSessionId: string;
     grantVersion: string;
+    evidence?: string;
   }) => Promise<boolean>;
   lockEventGame?: (
     eventGameId: string,
@@ -449,6 +504,12 @@ export type LiveEventGameControlOptions = {
   knownDodgeballIdsForEventGame?: (eventGameId: string) => readonly string[] | undefined;
   /** Test-only seam for proving the post-commit projection response. */
   projectionFailure?: () => boolean;
+  /** Production composition seam backed by the Event Admin catalog snapshot. */
+  readHeatStoppageConfiguration?: (
+    scope: HeatStoppageConfigurationScope,
+  ) => HeatStoppageConfiguration | null | Promise<HeatStoppageConfiguration | null>;
+  /** Fixed configuration shortcut for deterministic callers and tests. */
+  heatStoppageConfiguration?: boolean;
 };
 
 export type ControllerReplayOutcome = {
@@ -717,6 +778,12 @@ export function parseLiveEventControllerIntent(
       clockGeneration = generation.value;
     }
   }
+  let heatTriggerId: string | undefined;
+  if (value.heatTriggerId !== undefined) {
+    const parsedTriggerId = validateOpaqueIdentifier(value.heatTriggerId, "heatTriggerId");
+    if (!parsedTriggerId.ok) return invalid(parsedTriggerId.error);
+    heatTriggerId = parsedTriggerId.value;
+  }
   let trigger:
     | "card"
     | "timeout"
@@ -730,7 +797,7 @@ export function parseLiveEventControllerIntent(
     | undefined;
   let penaltyCardType: "blue" | "yellow" | "red" | "ejection" | undefined;
   let penaltyPlayerKey: string | undefined;
-  let heatAction: "start" | "end" | "skip-required" | "extend-permitted" | undefined;
+  let heatAction: LiveHeatAction | undefined;
   let timeoutAction: "stoppage" | "start" | "complete" | undefined;
   let timeoutGameSideId: string | undefined;
   let suspensionAction: "start" | "resume" | undefined;
@@ -768,13 +835,10 @@ export function parseLiveEventControllerIntent(
       }
     }
     if (trigger === "heat-stoppage") {
-      if (
-        value.heatAction !== undefined &&
-        value.heatAction !== "start" &&
-        value.heatAction !== "end" &&
-        value.heatAction !== "skip-required" &&
-        value.heatAction !== "extend-permitted"
-      ) {
+      if (value.heatAction === undefined) {
+        return invalid("heatAction is required for Heat Stoppage operations.");
+      }
+      if (!isLiveHeatAction(value.heatAction)) {
         return invalid("heatAction is unsupported.");
       }
       heatAction = value.heatAction;
@@ -889,6 +953,7 @@ export function parseLiveEventControllerIntent(
       ...(authorityGeneration === undefined ? {} : { authorityGeneration }),
       ...(confirmation === undefined ? {} : { confirmation }),
       ...(clockGeneration === undefined ? {} : { clockGeneration }),
+      ...(heatTriggerId === undefined ? {} : { heatTriggerId }),
       ...(trigger === undefined ? {} : { trigger }),
       ...(penaltyCardType === undefined ? {} : { penaltyCardType }),
       ...(penaltyPlayerKey === undefined ? {} : { penaltyPlayerKey }),
@@ -906,6 +971,7 @@ export function parseLiveEventControllerIntent(
 export function explainLiveEventGuardrail(intent: {
   type: LiveEventControllerIntent["type"];
   trigger?: Extract<LiveEventControllerIntent, { type: "substantive" }>["trigger"];
+  heatAction?: LiveHeatAction;
   gameTimeMs?: number;
   sportingOrder?: number;
 }): LiveEventGuardrailExplanation {
@@ -944,6 +1010,18 @@ export function explainLiveEventGuardrail(intent: {
     return {
       guardrail: "flag-catch-requires-seeker-release-and-stopped-play",
       normalBehavior: "A flag catch is recorded after seeker release and while play is stopped.",
+      overrideAllowed: true,
+      fixedReason: "head-referee-direction",
+    };
+  }
+  if (
+    intent.type === "substantive" &&
+    intent.trigger === "heat-stoppage" &&
+    (intent.heatAction === "enable" || intent.heatAction === "disable")
+  ) {
+    return {
+      guardrail: "heat-stoppage-mode-change",
+      normalBehavior: "Heat Stoppage Mode is fixed at Game Commencement.",
       overrideAllowed: true,
       fixedReason: "head-referee-direction",
     };
@@ -1377,7 +1455,11 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
     if (root === null || root.eventGameId !== authorized.eventGameId) {
       return rejectedOpen();
     }
-    const commenced = await ensureClockCommencement(owner, root, clock());
+    const commenced = await ensureClockCommencement(owner, root, {
+      sessionBearer: admitted.sessionBearer,
+      sessionId: authorized.grantSessionId,
+      grantVersion: authorized.grantVersion,
+    });
     if (commenced.status === "rejected") {
       return rejectedOpen();
     }
@@ -1426,7 +1508,11 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
       const previousRoot =
         previousOwner === null ? null : await previousOwner.record.readRoot(previousOwner.recordId);
       if (previousOwner !== null && previousRoot !== null) {
-        const commenced = await ensureClockCommencement(previousOwner, previousRoot, clock());
+        const commenced = await ensureClockCommencement(previousOwner, previousRoot, {
+          sessionBearer: input.sessionBearer,
+          sessionId: authorized.grantSessionId,
+          grantVersion: authorized.grantVersion,
+        });
         if (commenced.status === "rejected") {
           return { status: "rejected", message: "Unable to refresh Controller session." };
         }
@@ -1497,7 +1583,11 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
     if (owner === null || root === null) {
       return { status: "rejected", message: "Unable to refresh Controller session." };
     }
-    const commenced = await ensureClockCommencement(owner, root, clock());
+    const commenced = await ensureClockCommencement(owner, root, {
+      sessionBearer: input.sessionBearer,
+      sessionId: authorized.grantSessionId,
+      grantVersion: authorized.grantVersion,
+    });
     if (commenced.status === "rejected") {
       return { status: "rejected", message: "Unable to refresh Controller session." };
     }
@@ -1545,7 +1635,11 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
     if (owner === null || root === null || root.eventGameId !== switched.eventGameId) {
       return { status: "rejected", message: "Unable to refresh Controller session." };
     }
-    const commenced = await ensureClockCommencement(owner, root, clock());
+    const commenced = await ensureClockCommencement(owner, root, {
+      sessionBearer: input.sessionBearer,
+      sessionId: switched.grantSessionId,
+      grantVersion: switched.grantVersion,
+    });
     if (commenced.status === "rejected") {
       return { status: "rejected", message: "Unable to refresh Controller session." };
     }
@@ -1598,7 +1692,11 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
     if (owner === null || root === null) {
       return { status: "rejected", message: "Unable to refresh Controller session." };
     }
-    const commenced = await ensureClockCommencement(owner, root, clock());
+    const commenced = await ensureClockCommencement(owner, root, {
+      sessionBearer: input.sessionBearer,
+      sessionId: authorized.grantSessionId,
+      grantVersion: authorized.grantVersion,
+    });
     if (commenced.status === "rejected") {
       return { status: "rejected", message: "Unable to refresh Controller session." };
     }
@@ -1785,7 +1883,11 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
     if (owner === null || root === null) {
       return rejectedAction(parsed.value.operationId);
     }
-    const commenced = await ensureClockCommencement(owner, root, clock());
+    const commenced = await ensureClockCommencement(owner, root, {
+      sessionBearer: input.sessionBearer,
+      sessionId: authorized.grantSessionId,
+      grantVersion: authorized.grantVersion,
+    });
     if (commenced.status === "rejected") return retryableAction(parsed.value.operationId);
     const materialized = input.deferTimeoutMaterialization
       ? { status: "ready" as const, root: commenced.root }
@@ -1818,7 +1920,32 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
     const existingAction = actionsBefore.find(
       (stored) => stored.action.operationId === parsed.value.operationId,
     );
-    const effectiveStateBefore = rebuildLiveDerivedState(activeRoot, actionsBefore);
+    const nowMs = clock();
+    const stateWithFrozenMode = rebuildLiveDerivedState(
+      activeRoot,
+      actionsBefore,
+      nowMs,
+      false,
+      nowMs,
+    );
+    if (stateWithFrozenMode === null) {
+      return retryableAction(parsed.value.operationId);
+    }
+    let configuredHeatMode: boolean;
+    try {
+      const reserveNonHeatReplay =
+        input.replay?.reserveOnly === true &&
+        !(parsed.value.type === "substantive" && parsed.value.trigger === "heat-stoppage");
+      configuredHeatMode = reserveNonHeatReplay
+        ? false
+        : await readConfiguredHeatMode(activeRoot, stateWithFrozenMode.gameFacts);
+    } catch {
+      return retryableAction(parsed.value.operationId);
+    }
+    const effectiveStateBefore =
+      configuredHeatMode === false
+        ? stateWithFrozenMode
+        : rebuildLiveDerivedState(activeRoot, actionsBefore, nowMs, true, nowMs);
     if (effectiveStateBefore === null) {
       return retryableAction(parsed.value.operationId);
     }
@@ -1839,7 +1966,6 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
     ) {
       return rejectedAction(parsed.value.operationId);
     }
-    const nowMs = clock();
     const previousClockStartMs = latestRunningClockStart(effectiveStateBefore.gameFacts);
     const clockAuthorityActionsBefore = readClockAuthorityActions(actionsBefore);
     const clockBefore = projectClockBaseline(
@@ -1949,6 +2075,65 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
       if (predecessor !== undefined) causalPredecessorIds.add(predecessor.action.operationId);
     }
 
+    const heatAction =
+      parsed.value.type === "substantive" && parsed.value.trigger === "heat-stoppage"
+        ? parsed.value.heatAction
+        : undefined;
+    const resolvesHeatTrigger =
+      heatAction === "start" ||
+      heatAction === "end-of-drive" ||
+      heatAction === "dead-volleyball" ||
+      heatAction === "other-stoppage" ||
+      heatAction === "skip-required" ||
+      heatAction === "skip" ||
+      heatAction === "suppress";
+    const requiresHeatTrigger =
+      heatAction !== undefined && heatAction !== "enable" && heatAction !== "disable";
+    const activeHeatTriggerId =
+      heatAction === "extend-permitted"
+        ? effectiveStateBefore.heat.permittedExtensionTriggerId
+        : heatAction === "extend"
+          ? (effectiveStateBefore.heat.activeTriggerId ?? null)
+          : heatAction === "end"
+            ? (effectiveStateBefore.heat.activeTriggerId ?? null)
+            : null;
+    const requestedHeatTriggerId =
+      parsed.value.heatTriggerId ??
+      (resolvesHeatTrigger &&
+      effectiveStateBefore.heat.pendingTriggerId !== null &&
+      effectiveStateBefore.heat.pendingTriggerGameTimeMs === parsed.value.gameTimeMs
+        ? effectiveStateBefore.heat.pendingTriggerId
+        : activeHeatTriggerId);
+    const enforceHeatAdmission = hasHeatStoppageConfiguration() || requestedHeatTriggerId === null;
+    if (
+      enforceHeatAdmission &&
+      requiresHeatTrigger &&
+      (effectiveStateBefore.heat.mode !== "enabled" ||
+        requestedHeatTriggerId === null ||
+        (resolvesHeatTrigger &&
+          (requestedHeatTriggerId !== effectiveStateBefore.heat.pendingTriggerId ||
+            effectiveStateBefore.heat.pendingTriggerGameTimeMs !== parsed.value.gameTimeMs)) ||
+        (heatAction === "end" &&
+          requestedHeatTriggerId !== effectiveStateBefore.heat.activeTriggerId) ||
+        (heatAction === "extend" &&
+          requestedHeatTriggerId !== effectiveStateBefore.heat.activeTriggerId) ||
+        (heatAction === "extend-permitted" &&
+          requestedHeatTriggerId !== effectiveStateBefore.heat.permittedExtensionTriggerId))
+    ) {
+      return rejectedAction(parsed.value.operationId);
+    }
+    const heatTriggerGameTimeMs =
+      requestedHeatTriggerId === effectiveStateBefore.heat.pendingTriggerId
+        ? effectiveStateBefore.heat.pendingTriggerGameTimeMs
+        : undefined;
+    const heatSequence =
+      heatAction === undefined
+        ? undefined
+        : actionsBefore.filter(
+            ({ action }) =>
+              action.interpretation.type === "fact" &&
+              action.interpretation.factType === "heat-stoppage",
+          ).length + 1;
     const action = {
       recordId: owner.recordId,
       eventGameId: activeRoot.eventGameId,
@@ -2068,6 +2253,26 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
                                     ...(parsed.value.heatAction === undefined
                                       ? {}
                                       : { heatAction: parsed.value.heatAction }),
+                                    ...(heatSequence === undefined ? {} : { heatSequence }),
+                                    ...(requestedHeatTriggerId === null ||
+                                    requestedHeatTriggerId === undefined
+                                      ? {}
+                                      : { heatTriggerId: requestedHeatTriggerId }),
+                                    ...(heatTriggerGameTimeMs === undefined
+                                      ? {}
+                                      : { triggerGameTimeMs: heatTriggerGameTimeMs }),
+                                    ...((heatAction === "end" || heatAction === "extend") &&
+                                    typeof effectiveStateBefore.heat.actualDurationMs === "number"
+                                      ? {
+                                          actualDurationMs:
+                                            effectiveStateBefore.heat.actualDurationMs,
+                                        }
+                                      : {}),
+                                    ...(heatAction === "end" &&
+                                    effectiveStateBefore.heat.completedAtAllowed === true &&
+                                    override === undefined
+                                      ? { completionAtAllowed: true }
+                                      : {}),
                                     ...(parsed.value.penaltyCardType === undefined
                                       ? {}
                                       : { penaltyCardType: parsed.value.penaltyCardType }),
@@ -2097,7 +2302,11 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
             },
       causalPredecessorIds: [...causalPredecessorIds],
       occurrence: {
-        trustedAtMs: nowMs,
+        trustedAtMs:
+          parsed.value.occurrence.source === "offline" &&
+          parsed.value.occurrence.clientOriginAtMs !== null
+            ? parsed.value.occurrence.clientOriginAtMs
+            : nowMs,
         clientOriginAtMs: parsed.value.occurrence.clientOriginAtMs,
         source: parsed.value.occurrence.source ?? "online",
       },
@@ -2181,6 +2390,36 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
           }
         : undefined);
 
+    const heatModeSnapshot = hasHeatStoppageConfiguration()
+      ? createHeatModeSnapshotAction({
+          root: activeRoot,
+          nowMs,
+          enabled: configuredHeatMode,
+          gameTimeMs: clockBefore.gameTimeMs,
+          shouldCommence: shouldCommence?.atMs ?? activeRoot.lifecycle.commencedAtMs,
+          existingActions: actionsBefore,
+          causalPredecessorIds: [action.operationId],
+        })
+      : null;
+    const modeTimeline = deriveHeatModeTimeline(effectiveStateBefore.gameFacts, configuredHeatMode);
+    const heatTriggerActions = createHeatTriggerActions({
+      root: activeRoot,
+      nowMs,
+      currentGameTimeMs: clockBefore.gameTimeMs,
+      targetGameTimeMs:
+        typeof clockData.value?.gameTimeMs === "number"
+          ? clockData.value.gameTimeMs
+          : clockBefore.gameTimeMs,
+      enabledAtGameTimeMs: modeTimeline.enabled ? modeTimeline.enabledAtGameTimeMs : null,
+      existingActions: actionsBefore,
+      causalPredecessorIds: [action.operationId],
+    });
+    const batchActions = [
+      ...actions,
+      ...heatTriggerActions,
+      ...(heatModeSnapshot === null ? [] : [heatModeSnapshot]),
+    ];
+
     let accepted;
     try {
       accepted = await options.acceptance.submitBatch({
@@ -2189,13 +2428,13 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
         ...(input.replay === undefined ? { sessionBearer: input.sessionBearer } : {}),
         ...(input.replay === undefined ? {} : { mode: "replay", replay: input.replay }),
         lifecycleTransition,
-        actions,
         reconcileDerivedLifecycle: derivedLifecycle !== undefined,
+        atomic: lifecycleTransition !== undefined && heatModeSnapshot !== null,
+        actions: batchActions,
       });
     } catch {
       return retryableAction(parsed.value.operationId);
     }
-
     const result = accepted.results[0];
     const consequenceResult = accepted.results[1];
     if (accepted.status === "partial" || result?.status === "retry-later") {
@@ -2281,7 +2520,9 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
         grantSessionId: input.expectedGrantSessionId,
         grantVersion: input.expectedGrantVersion,
       });
-      if (!authorized) return replayRejected(input.actions, replayContext);
+      if (!authorized) {
+        return replayRejected(input.actions, replayContext);
+      }
       options.lockedReplayCapability?.authorize(replayDigest);
     }
     await lockEventGameIfDue(input.eventGameId);
@@ -2664,11 +2905,24 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
       if (rebuild.status !== "ready") return null;
       const derived = readDerivedState(rebuild.derivedGameState);
       if (derived === null) return null;
+      const configuredHeatMode = await readConfiguredHeatMode(root, derived.gameFacts);
       const projectedClock = projectClockBaseline(derived.clock.baseline, clock());
       const projectedFacts = derived.gameFacts.map((fact) => ({
         ...fact,
         data: structuredClone(fact.data),
       }));
+      const projectedHeat = deriveHeatStoppageState(
+        derived.gameFacts,
+        projectedClock.gameTimeMs,
+        configuredHeatMode,
+        clock(),
+      );
+      const projectedStoppage: LiveStoppageState =
+        derived.stoppage.status === "suspension"
+          ? derived.stoppage
+          : projectedHeat.status === "started" || projectedHeat.status === "extended"
+            ? { status: "heat-stoppage", factId: projectedHeat.factId }
+            : { status: "none", factId: null };
       const runningSinceMs =
         root.lifecycle.commencedAtMs === null ? latestRunningClockStart(derived.gameFacts) : null;
       const controllerProjection: ControllerProjection = {
@@ -2683,8 +2937,6 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
         ].sort(),
         timeout: projectLiveTimeout(derived.timeout, clock()),
         suspension: structuredClone(derived.suspension),
-        stoppage: structuredClone(derived.stoppage),
-        heat: structuredClone(derived.heat),
         result: structuredClone(derived.result),
         overtime: derived.overtime,
         overtimeTarget: derived.overtimeTarget,
@@ -2693,6 +2945,8 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
         catch: structuredClone(derived.catch),
         gameFacts: projectedFacts,
         penalties: deriveLivePenaltyProjection(projectedFacts, projectedClock.gameTimeMs),
+        stoppage: structuredClone(projectedStoppage),
+        heat: structuredClone(projectedHeat),
         guardrails: [
           explainLiveEventGuardrail({ type: "substantive", trigger: "timeout" }),
           explainLiveEventGuardrail({ type: "substantive", trigger: "suspension" }),
@@ -2711,6 +2965,97 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
     } catch {
       return null;
     }
+  }
+
+  async function ensureClockCommencement(
+    owner: { recordId: string; record: EventGameRecord },
+    root: EventGameRecordRoot,
+    authority: { sessionBearer: string; sessionId: string; grantVersion: string },
+  ): Promise<{ status: "ready"; root: EventGameRecordRoot } | { status: "rejected" }> {
+    if (root.lifecycle.commencedAtMs !== null || root.lifecycle.phase !== "scheduled") {
+      return { status: "ready", root };
+    }
+    const actions = await owner.record.readActions();
+    const nowMs = clock();
+    const fallbackState = rebuildLiveDerivedState(root, actions, nowMs, false, nowMs);
+    if (fallbackState === null) return { status: "rejected" };
+    const runningSinceMs = latestRunningClockStart(fallbackState.gameFacts);
+    if (runningSinceMs === null || nowMs - runningSinceMs < 10_000) {
+      return { status: "ready", root };
+    }
+    const commencementAtMs = runningSinceMs + 10_000;
+    const lifecycleTransition = {
+      ...root.lifecycle,
+      phase: "in-progress" as const,
+      commencedAtMs: commencementAtMs,
+    };
+    let configuredHeatMode: boolean;
+    try {
+      configuredHeatMode = await readConfiguredHeatMode(root, fallbackState.gameFacts);
+    } catch {
+      return { status: "rejected" };
+    }
+    const snapshot = hasHeatStoppageConfiguration()
+      ? createHeatModeSnapshotAction({
+          root,
+          nowMs,
+          enabled: configuredHeatMode,
+          gameTimeMs: fallbackState.clock.gameTimeMs,
+          shouldCommence: commencementAtMs,
+          existingActions: actions,
+          causalPredecessorIds: [],
+        })
+      : null;
+    if (snapshot === null) {
+      const transition = await owner.record.transitionLifecycle(lifecycleTransition);
+      return transition.status === "rejected"
+        ? { status: "rejected" }
+        : { status: "ready", root: transition.root };
+    }
+    const accepted = await options.acceptance.submitBatch({
+      recordId: root.recordId,
+      eventGameId: root.eventGameId,
+      sessionBearer: authority.sessionBearer,
+      lifecycleTransition,
+      atomic: true,
+      actions: [snapshot],
+    });
+    if (
+      accepted.status !== "committed" ||
+      (accepted.results[0]?.status !== "accepted" &&
+        accepted.results[0]?.status !== "duplicate-accepted")
+    ) {
+      return { status: "rejected" };
+    }
+    const updatedRoot = await owner.record.readRoot(owner.recordId);
+    return updatedRoot === null ? { status: "rejected" } : { status: "ready", root: updatedRoot };
+  }
+
+  async function readConfiguredHeatMode(
+    root: EventGameRecordRoot,
+    facts: readonly ControllerGameFact[],
+  ): Promise<boolean> {
+    const snapshot = facts.find((fact) => fact.factType === "heat-mode" && isRecord(fact.data));
+    if (snapshot !== undefined && isRecord(snapshot.data)) {
+      return snapshot.data.enabled === true;
+    }
+    if (options.readHeatStoppageConfiguration !== undefined) {
+      const configured = await options.readHeatStoppageConfiguration({
+        eventId: root.externalScope.eventId,
+        gameDayId: root.externalScope.gameDayId,
+        eventGameId: root.eventGameId,
+      });
+      if (configured === null) throw new Error("Heat Stoppage Configuration is unavailable.");
+      return configured === "enabled";
+    }
+    return options.heatStoppageConfiguration ?? false;
+  }
+
+  function hasHeatStoppageConfiguration(): boolean {
+    return (
+      options.readHeatStoppageConfiguration !== undefined ||
+      options.heatStoppageConfiguration !== undefined
+    );
   }
 
   return {
@@ -2906,6 +3251,8 @@ function deriveLiveEventGameState(
   effectiveFacts: readonly EffectiveGameFact[],
   version: string,
   projectedAtMs = 0,
+  configuredHeatMode = false,
+  nowMs = 0,
 ): LiveEventGameDerivedState {
   const scoreByGameSide: Record<string, number> = Object.fromEntries(
     root.gameSides.map((side) => [side.id, 0]),
@@ -2934,6 +3281,8 @@ function deriveLiveEventGameState(
             gameTimeMs,
             sportingOrder,
             synchronizationOrder: synchronizationOrderByOperationId.get(action.operationId) ?? 0,
+            trustedAtMs: action.occurrence.trustedAtMs,
+            acceptedAtMs: action.acceptedAtMs,
             effective: effectiveFactIds.has(action.interpretation.factId),
             data: isActionJsonValue(data) ? structuredClone(data) : null,
           } satisfies ControllerGameFact,
@@ -3141,69 +3490,20 @@ function deriveLiveEventGameState(
     suspension = { status: "suspended", factId: fact.factId, snapshot };
   }
 
-  const suspensionFact =
-    suspension.status === "suspended" && suspension.factId !== null
-      ? (gameFacts.find((fact) => fact.factId === suspension.factId) ?? null)
-      : null;
-  const heatFact = latestEffectiveFact("heat-stoppage");
   const latestResultFact = latestEffectiveFact("result");
-  const heatAction =
-    isRecord(heatFact?.data) &&
-    (heatFact.data.heatAction === "start" ||
-      heatFact.data.heatAction === "end" ||
-      heatFact.data.heatAction === "skip-required" ||
-      heatFact.data.heatAction === "extend-permitted")
-      ? heatFact.data.heatAction
-      : heatFact === null
-        ? null
-        : "start";
-  const heatStatus: LiveHeatState["status"] =
-    heatFact === null
-      ? "inactive"
-      : heatAction === "end"
-        ? "ended"
-        : heatAction === "skip-required"
-          ? "skipped"
-          : heatAction === "extend-permitted"
-            ? "extended"
-            : "started";
-  const effectiveHeatStarts = gameFacts.filter(
-    (fact) =>
-      fact.effective &&
-      fact.factType === "heat-stoppage" &&
-      (!isRecord(fact.data) ||
-        (fact.data.heatAction !== "end" &&
-          fact.data.heatAction !== "skip-required" &&
-          fact.data.heatAction !== "extend-permitted")),
-  );
-  const heatNominalDurationMs =
-    heatStatus === "started" || heatStatus === "extended"
-      ? effectiveHeatStarts.length <= 1
-        ? 4 * 60 * 1000
-        : 2 * 60 * 1000
-      : null;
-  const heatStartedAtGameTimeMs =
-    heatNominalDurationMs === null || heatFact?.gameTimeMs === null
-      ? null
-      : (heatFact?.gameTimeMs ?? null);
-  const heat: LiveHeatState = {
-    status: heatStatus,
-    factId: heatFact?.factId ?? null,
-    startedAtGameTimeMs: heatStartedAtGameTimeMs,
-    nominalDurationMs: heatNominalDurationMs,
-  };
   const clock = projectClockBaseline(
     deriveClockAuthority(
       readClockAuthorityActions(effectiveFacts.map((fact) => ({ action: fact.action }))),
     ),
     projectedAtMs,
   );
+  const heat = deriveHeatStoppageState(gameFacts, clock.gameTimeMs, configuredHeatMode, nowMs);
   if (suspension.status === "suspended" && clock.running) {
     throw new Error("Effective suspension cannot coexist with a running Game Clock.");
   }
   const stoppage: LiveStoppageState =
-    suspensionFact !== null
-      ? { status: "suspension", factId: suspensionFact.factId }
+    suspension.status === "suspended"
+      ? { status: "suspension", factId: suspension.factId }
       : heat.status === "started" || heat.status === "extended"
         ? { status: "heat-stoppage", factId: heat.factId }
         : { status: "none", factId: null };
@@ -3256,6 +3556,392 @@ function readTimeoutAction(
     data?.timeoutAction === "complete"
     ? data.timeoutAction
     : null;
+}
+export function deriveHeatStoppageState(
+  facts: readonly ControllerGameFact[],
+  gameTimeMs: number,
+  configuredHeatMode: boolean,
+  nowMs = 0,
+): LiveHeatState {
+  const effectiveFacts = facts.filter((fact) => fact.effective);
+  const modeTimeline = deriveHeatModeTimeline(effectiveFacts, configuredHeatMode);
+  const { enabled, configured, enabledAtGameTimeMs, segments } = modeTimeline;
+  const currentIntervalFirstTrigger = enabled ? firstHeatTriggerAfter(enabledAtGameTimeMs) : null;
+  const triggerFacts = effectiveFacts.filter((fact) => fact.factType === "heat-trigger");
+  const triggerById = new Map<string, { id: string; gameTimeMs: number; durable: boolean }>();
+  for (const fact of triggerFacts) {
+    const data = isRecord(fact.data) ? fact.data : null;
+    const triggerGameTimeMs =
+      typeof data?.triggerGameTimeMs === "number" ? data.triggerGameTimeMs : fact.gameTimeMs;
+    const triggerId = typeof data?.triggerId === "string" ? data.triggerId : null;
+    if (triggerId !== null && triggerGameTimeMs !== null) {
+      triggerById.set(triggerId, { id: triggerId, gameTimeMs: triggerGameTimeMs, durable: true });
+    }
+  }
+  const derivedTriggerTimes = new Set<number>();
+  for (const segment of segments) {
+    if (segment.end !== null) continue;
+    const end = Math.max(gameTimeMs, ...effectiveFacts.map((fact) => fact.gameTimeMs ?? 0));
+    for (
+      let trigger = firstHeatTriggerAfter(segment.start);
+      trigger <= end;
+      trigger = nextHeatTrigger(trigger)
+    ) {
+      derivedTriggerTimes.add(trigger);
+    }
+  }
+  for (const triggerGameTimeMs of derivedTriggerTimes) {
+    const triggerId = heatTriggerId(triggerGameTimeMs);
+    if (!triggerById.has(triggerId)) {
+      triggerById.set(triggerId, { id: triggerId, gameTimeMs: triggerGameTimeMs, durable: false });
+    }
+  }
+  const orderedTriggers = [...triggerById.values()].sort(
+    (left, right) => left.gameTimeMs - right.gameTimeMs || left.id.localeCompare(right.id),
+  );
+  const resolvedTriggerIds = new Set<string>();
+  const heatFacts = effectiveFacts.filter((fact) => fact.factType === "heat-stoppage");
+  for (const fact of heatFacts) {
+    const data = isRecord(fact.data) ? fact.data : null;
+    const action = data?.heatAction;
+    if (
+      action === "enable" ||
+      action === "disable" ||
+      action === "end" ||
+      action === "extend-permitted" ||
+      action === "extend"
+    )
+      continue;
+    const triggerTime = typeof data?.triggerGameTimeMs === "number" ? data.triggerGameTimeMs : null;
+    const triggerId =
+      typeof data?.heatTriggerId === "string"
+        ? data.heatTriggerId
+        : typeof data?.triggerId === "string"
+          ? data.triggerId
+          : triggerTime === null
+            ? null
+            : heatTriggerId(triggerTime);
+    if (triggerId !== null) resolvedTriggerIds.add(triggerId);
+  }
+  const pendingTrigger =
+    configured && enabled && currentIntervalFirstTrigger !== null
+      ? (orderedTriggers.find(
+          (trigger) =>
+            trigger.gameTimeMs >= currentIntervalFirstTrigger &&
+            (trigger.durable || trigger.gameTimeMs <= gameTimeMs) &&
+            !resolvedTriggerIds.has(trigger.id),
+        ) ?? null)
+      : null;
+  const nextTrigger =
+    configured && enabled
+      ? (orderedTriggers.find(
+          (trigger) =>
+            trigger.gameTimeMs >= (currentIntervalFirstTrigger ?? 0) &&
+            trigger.gameTimeMs > gameTimeMs &&
+            !resolvedTriggerIds.has(trigger.id),
+        ) ?? {
+          id: heatTriggerId(firstHeatTriggerAfter(Math.max(gameTimeMs, enabledAtGameTimeMs))),
+          gameTimeMs: firstHeatTriggerAfter(Math.max(gameTimeMs, enabledAtGameTimeMs)),
+          durable: false,
+        })
+      : null;
+
+  const starts = heatFacts.filter((fact) => {
+    const action = isRecord(fact.data) ? fact.data.heatAction : null;
+    return (
+      action === "start" ||
+      action === "end-of-drive" ||
+      action === "dead-volleyball" ||
+      action === "other-stoppage"
+    );
+  });
+  const orderedHeatFacts = [...heatFacts].sort(
+    (left, right) =>
+      heatFactSequence(left) - heatFactSequence(right) ||
+      (left.gameTimeMs ?? 0) - (right.gameTimeMs ?? 0) ||
+      left.synchronizationOrder - right.synchronizationOrder,
+  );
+  const latestHeatFact = orderedHeatFacts.at(-1) ?? null;
+  const latestData =
+    latestHeatFact !== null && isRecord(latestHeatFact.data) ? latestHeatFact.data : null;
+  const latestAction = latestData?.heatAction;
+  const latestStart =
+    [...starts]
+      .sort(
+        (left, right) =>
+          heatFactSequence(left) - heatFactSequence(right) ||
+          (left.gameTimeMs ?? 0) - (right.gameTimeMs ?? 0) ||
+          left.synchronizationOrder - right.synchronizationOrder,
+      )
+      .at(-1) ?? null;
+  const latestStartTime = latestStart?.gameTimeMs ?? null;
+  const latestStartData =
+    latestStart !== null && isRecord(latestStart.data) ? latestStart.data : null;
+  const activeTriggerId =
+    typeof latestStartData?.heatTriggerId === "string"
+      ? latestStartData.heatTriggerId
+      : typeof latestStartData?.triggerId === "string"
+        ? latestStartData.triggerId
+        : typeof latestStartData?.triggerGameTimeMs === "number"
+          ? heatTriggerId(latestStartData.triggerGameTimeMs)
+          : null;
+  const nominalDurationMs =
+    latestStart === null
+      ? null
+      : starts.length === 1
+        ? HEAT_STOPPAGE_FIRST_NOMINAL_DURATION_MS
+        : HEAT_STOPPAGE_LATER_NOMINAL_DURATION_MS;
+  const endedBy =
+    latestHeatFact !== null &&
+    (latestAction === "end" || latestAction === "disable") &&
+    latestStart !== null &&
+    (latestHeatFact.gameTimeMs ?? 0) >= (latestStart.gameTimeMs ?? 0) &&
+    latestHeatFact.synchronizationOrder !== latestStart.synchronizationOrder
+      ? latestHeatFact
+      : null;
+  const startTrustedAtMs = latestStart?.trustedAtMs ?? null;
+  const endTrustedAtMs = endedBy?.trustedAtMs ?? null;
+  const rawActualDurationMs =
+    startTrustedAtMs === null
+      ? null
+      : Math.max(0, (endTrustedAtMs ?? (nowMs > 0 ? nowMs : startTrustedAtMs)) - startTrustedAtMs);
+  const decision =
+    latestAction === "end-of-drive" ||
+    latestAction === "dead-volleyball" ||
+    latestAction === "other-stoppage" ||
+    latestAction === "skip" ||
+    latestAction === "skip-required"
+      ? latestAction
+      : null;
+  const pendingIndex = pendingTrigger === null ? -1 : orderedTriggers.indexOf(pendingTrigger);
+  let permittedExtensionTriggerId: string | null = null;
+  let followingExtensionActive = false;
+  let followingExtensionConsumed = false;
+  for (const fact of orderedHeatFacts) {
+    const data = isRecord(fact.data) ? fact.data : null;
+    const action = data?.heatAction;
+    const triggerTime =
+      typeof data?.triggerGameTimeMs === "number"
+        ? data.triggerGameTimeMs
+        : typeof data?.heatTriggerId === "string"
+          ? orderedTriggers.find((trigger) => trigger.id === data.heatTriggerId)?.gameTimeMs
+          : fact.gameTimeMs;
+    const triggerId =
+      typeof data?.heatTriggerId === "string"
+        ? data.heatTriggerId
+        : typeof triggerTime === "number"
+          ? heatTriggerId(triggerTime)
+          : null;
+    if (action === "skip" || action === "skip-required") {
+      permittedExtensionTriggerId =
+        typeof triggerTime === "number" ? heatTriggerId(nextHeatTrigger(triggerTime)) : null;
+      followingExtensionActive = false;
+      followingExtensionConsumed = false;
+    } else if (
+      action === "start" ||
+      action === "end-of-drive" ||
+      action === "dead-volleyball" ||
+      action === "other-stoppage"
+    ) {
+      if (permittedExtensionTriggerId !== null && triggerId !== permittedExtensionTriggerId) {
+        permittedExtensionTriggerId = null;
+        followingExtensionActive = false;
+        followingExtensionConsumed = false;
+      } else if (
+        permittedExtensionTriggerId !== null &&
+        triggerId === permittedExtensionTriggerId
+      ) {
+        followingExtensionActive = true;
+      }
+    } else if (action === "extend-permitted") {
+      if (triggerId === permittedExtensionTriggerId && followingExtensionActive) {
+        followingExtensionConsumed = true;
+        permittedExtensionTriggerId = null;
+      }
+    } else if (action === "extend") {
+      followingExtensionActive = false;
+      followingExtensionConsumed = false;
+      permittedExtensionTriggerId = null;
+    }
+  }
+  const allowedDurationMs =
+    nominalDurationMs === null
+      ? null
+      : followingExtensionActive || followingExtensionConsumed
+        ? HEAT_STOPPAGE_FIRST_NOMINAL_DURATION_MS
+        : nominalDurationMs;
+  const completionRecordedAtAllowed = latestData?.completionAtAllowed === true;
+  const completedAtAllowed =
+    latestStart !== null &&
+    latestAction !== "extend" &&
+    (endedBy === null || completionRecordedAtAllowed) &&
+    allowedDurationMs !== null &&
+    (rawActualDurationMs ?? 0) >= allowedDurationMs;
+  const actualDurationMs =
+    (completedAtAllowed || completionRecordedAtAllowed) && allowedDurationMs !== null
+      ? allowedDurationMs
+      : rawActualDurationMs;
+  const completionAtTrustedAtMs =
+    startTrustedAtMs !== null && allowedDurationMs !== null
+      ? startTrustedAtMs + allowedDurationMs
+      : null;
+  const status: LiveHeatState["status"] =
+    latestHeatFact === null || latestStart === null
+      ? latestAction === "extend-permitted" || latestAction === "extend"
+        ? "extended"
+        : latestAction === "skip-required"
+          ? "required-skip"
+          : latestAction === "skip"
+            ? "skipped"
+            : latestAction === "suppress"
+              ? "suppressed"
+              : "inactive"
+      : latestAction === "skip-required"
+        ? "required-skip"
+        : latestAction === "skip"
+          ? "skipped"
+          : latestAction === "suppress"
+            ? "suppressed"
+            : latestAction === "extend-permitted" || latestAction === "extend"
+              ? completedAtAllowed
+                ? "ended"
+                : "extended"
+              : latestAction === "end" || (configured && !enabled) || endedBy !== null
+                ? "ended"
+                : completedAtAllowed
+                  ? "ended"
+                  : "started";
+  return {
+    status,
+    factId: latestHeatFact?.factId ?? null,
+    startedAtGameTimeMs: latestStartTime,
+    nominalDurationMs,
+    allowedDurationMs,
+    actualDurationMs,
+    completedAtAllowed,
+    rawActualDurationMs,
+    completionAtTrustedAtMs,
+    mode: enabled ? "enabled" : "disabled",
+    pendingTrigger:
+      pendingTrigger === null
+        ? null
+        : {
+            gameTimeMs: pendingTrigger.gameTimeMs,
+            index: pendingIndex,
+          },
+    pendingTriggerId: pendingTrigger?.id ?? null,
+    pendingTriggerGameTimeMs: pendingTrigger?.gameTimeMs ?? null,
+    nextTriggerGameTimeMs: nextTrigger?.gameTimeMs ?? null,
+    trigger:
+      pendingTrigger === null
+        ? null
+        : { id: pendingTrigger.id, gameTimeMs: pendingTrigger.gameTimeMs, index: pendingIndex },
+    permittedExtensionTriggerId,
+    activeTriggerId,
+    triggerDecision: decision,
+  };
+}
+
+/**
+ * Project the Controller's local Heat Stoppage view from its last trusted
+ * projection. Durable admission still validates stable trigger identity on
+ * the server; this helper only updates the browser cue and timer between
+ * server round trips.
+ */
+export function projectLiveHeatState(
+  facts: readonly ControllerGameFact[],
+  currentMode: LiveHeatState["mode"] | undefined,
+  gameTimeMs: number,
+  nowMs: number,
+): LiveHeatState {
+  return deriveHeatStoppageState(facts, gameTimeMs, currentMode === "enabled", nowMs);
+}
+
+function deriveHeatModeTimeline(
+  facts: readonly ControllerGameFact[],
+  configuredHeatMode: boolean,
+): {
+  enabled: boolean;
+  configured: boolean;
+  enabledAtGameTimeMs: number;
+  segments: Array<{ start: number; end: number | null }>;
+} {
+  const effectiveFacts = facts.filter((fact) => fact.effective);
+  const heatModeFacts = effectiveFacts.filter((fact) => fact.factType === "heat-mode");
+  const modeChanges = effectiveFacts
+    .filter((fact) => {
+      if (fact.factType !== "heat-stoppage" || !isRecord(fact.data)) return false;
+      return fact.data.heatAction === "enable" || fact.data.heatAction === "disable";
+    })
+    .sort(
+      (left, right) =>
+        heatFactSequence(left) - heatFactSequence(right) ||
+        (left.gameTimeMs ?? 0) - (right.gameTimeMs ?? 0) ||
+        left.synchronizationOrder - right.synchronizationOrder,
+    );
+  let enabled = configuredHeatMode;
+  let configured = configuredHeatMode || heatModeFacts.length > 0;
+  let enabledAtGameTimeMs = 0;
+  const segments: Array<{ start: number; end: number | null }> = [];
+  const firstModeFact = heatModeFacts[0];
+  if (firstModeFact !== undefined && isRecord(firstModeFact.data)) {
+    configured = true;
+    enabled = firstModeFact.data.enabled === true;
+    enabledAtGameTimeMs = firstModeFact.gameTimeMs ?? 0;
+  }
+  if (enabled) segments.push({ start: enabledAtGameTimeMs, end: null });
+  for (const fact of modeChanges) {
+    const action = isRecord(fact.data) ? fact.data.heatAction : null;
+    const at = fact.gameTimeMs ?? 0;
+    if (action === "enable") {
+      configured = true;
+      if (!enabled) {
+        enabled = true;
+        enabledAtGameTimeMs = at;
+        segments.push({ start: at, end: null });
+      }
+    } else if (action === "disable") {
+      configured = true;
+      if (enabled) {
+        enabled = false;
+        const currentSegment = segments.at(-1);
+        if (currentSegment?.end === null) currentSegment.end = at;
+      }
+    }
+  }
+  return { enabled, configured, enabledAtGameTimeMs, segments };
+}
+
+function heatTriggerId(gameTimeMs: number): string {
+  return `heat-trigger-${gameTimeMs}`;
+}
+
+function heatFactSequence(fact: ControllerGameFact): number {
+  const data = isRecord(fact.data) ? fact.data : null;
+  return typeof data?.heatSequence === "number" ? data.heatSequence : Number.MAX_SAFE_INTEGER;
+}
+
+function firstHeatTriggerAfter(gameTimeMs: number): number {
+  if (gameTimeMs < HEAT_STOPPAGE_FIRST_TRIGGER_GAME_TIME_MS) {
+    return HEAT_STOPPAGE_FIRST_TRIGGER_GAME_TIME_MS;
+  }
+  if (gameTimeMs < HEAT_STOPPAGE_SECOND_TRIGGER_GAME_TIME_MS) {
+    return HEAT_STOPPAGE_SECOND_TRIGGER_GAME_TIME_MS;
+  }
+  return (
+    HEAT_STOPPAGE_SECOND_TRIGGER_GAME_TIME_MS +
+    (Math.floor(
+      (gameTimeMs - HEAT_STOPPAGE_SECOND_TRIGGER_GAME_TIME_MS) / HEAT_STOPPAGE_TRIGGER_INTERVAL_MS,
+    ) +
+      1) *
+      HEAT_STOPPAGE_TRIGGER_INTERVAL_MS
+  );
+}
+
+function nextHeatTrigger(gameTimeMs: number): number {
+  return gameTimeMs < HEAT_STOPPAGE_SECOND_TRIGGER_GAME_TIME_MS
+    ? HEAT_STOPPAGE_SECOND_TRIGGER_GAME_TIME_MS
+    : gameTimeMs + HEAT_STOPPAGE_TRIGGER_INTERVAL_MS;
 }
 
 function controllerFactType(intent: LiveEventControllerIntent): string {
@@ -3478,6 +4164,112 @@ async function ensureClockCommencement(
   });
   if (transition.status === "rejected") return { status: "rejected" };
   return { status: "ready", root: transition.root };
+}
+
+function createHeatModeSnapshotAction(input: {
+  root: EventGameRecordRoot;
+  nowMs: number;
+  enabled: boolean;
+  gameTimeMs: number;
+  shouldCommence: number | null;
+  existingActions: readonly { action: ControlAction }[];
+  causalPredecessorIds: readonly string[];
+}): ControlActionInput | null {
+  if (input.shouldCommence === null) return null;
+  if (
+    input.existingActions.some(
+      ({ action }) =>
+        action.interpretation.type === "fact" && action.interpretation.factType === "heat-mode",
+    )
+  )
+    return null;
+  const operationId = `heat-mode-snapshot-${input.root.eventGameId}`;
+  return {
+    recordId: input.root.recordId,
+    eventGameId: input.root.eventGameId,
+    operationId,
+    kind: { id: "game-fact", version: "1" },
+    payload: {
+      factId: `heat-mode-${input.root.eventGameId}`,
+      factType: "heat-mode",
+      gameSideId: null,
+      gameTimeMs: input.gameTimeMs,
+      data: {
+        enabled: input.enabled,
+        source: "game-day",
+        frozenAtCommencementMs: input.shouldCommence,
+        sportingOrder: input.gameTimeMs,
+      },
+    },
+    causalPredecessorIds: [...input.causalPredecessorIds],
+    occurrence: {
+      trustedAtMs: input.nowMs,
+      clientOriginAtMs: null,
+      source: "online",
+    },
+    grant: null,
+    origin: "system-heat-stoppage",
+    lifecycle: structuredClone(input.root.lifecycle),
+  };
+}
+
+function createHeatTriggerActions(input: {
+  root: EventGameRecordRoot;
+  nowMs: number;
+  currentGameTimeMs: number;
+  targetGameTimeMs: number;
+  enabledAtGameTimeMs: number | null;
+  existingActions: readonly { action: ControlAction }[];
+  causalPredecessorIds: readonly string[];
+}): ControlActionInput[] {
+  if (input.enabledAtGameTimeMs === null) return [];
+  const existingTriggerTimes = new Set<number>();
+  for (const { action } of input.existingActions) {
+    if (
+      action.interpretation.type !== "fact" ||
+      action.interpretation.factType !== "heat-trigger"
+    ) {
+      continue;
+    }
+    const payload = action.interpretation.payload;
+    const data = isRecord(payload) && isRecord(payload.data) ? payload.data : null;
+    if (typeof data?.triggerGameTimeMs === "number")
+      existingTriggerTimes.add(data.triggerGameTimeMs);
+  }
+  const upperBound = Math.max(input.currentGameTimeMs, input.targetGameTimeMs);
+  const triggerTimes: number[] = [];
+  for (
+    let trigger = firstHeatTriggerAfter(input.enabledAtGameTimeMs);
+    trigger <= upperBound;
+    trigger = nextHeatTrigger(trigger)
+  ) {
+    if (!existingTriggerTimes.has(trigger)) triggerTimes.push(trigger);
+  }
+  return triggerTimes.map((triggerGameTimeMs) => {
+    const triggerId = heatTriggerId(triggerGameTimeMs);
+    return {
+      recordId: input.root.recordId,
+      eventGameId: input.root.eventGameId,
+      operationId: `materialize-${triggerId}`,
+      kind: { id: "game-fact", version: "1" },
+      payload: {
+        factId: triggerId,
+        factType: "heat-trigger",
+        gameSideId: null,
+        gameTimeMs: triggerGameTimeMs,
+        data: {
+          triggerId,
+          triggerGameTimeMs,
+          sportingOrder: triggerGameTimeMs,
+        },
+      },
+      causalPredecessorIds: [...input.causalPredecessorIds],
+      occurrence: { trustedAtMs: input.nowMs, clientOriginAtMs: null, source: "online" },
+      grant: null,
+      origin: "system-heat-stoppage",
+      lifecycle: structuredClone(input.root.lifecycle),
+    };
+  });
 }
 
 function latestRunningClockStart(facts: readonly ControllerGameFact[]): number | null {
@@ -3808,6 +4600,14 @@ function readControllerGameFacts(value: unknown): ControllerGameFact[] | null {
       gameTimeMs: gameTimeMsResult.value,
       sportingOrder: sportingOrder.value,
       synchronizationOrder: synchronizationOrder.value,
+      trustedAtMs:
+        typeof candidate.trustedAtMs === "number" && Number.isSafeInteger(candidate.trustedAtMs)
+          ? candidate.trustedAtMs
+          : 0,
+      acceptedAtMs:
+        typeof candidate.acceptedAtMs === "number" && Number.isSafeInteger(candidate.acceptedAtMs)
+          ? candidate.acceptedAtMs
+          : 0,
       effective: candidate.effective,
       data: data.value,
     });
@@ -3919,6 +4719,8 @@ function readLiveHeatState(value: unknown): LiveHeatState {
     value.status !== "started" &&
     value.status !== "ended" &&
     value.status !== "skipped" &&
+    value.status !== "required-skip" &&
+    value.status !== "suppressed" &&
     value.status !== "extended"
   ) {
     throw new Error("Derived heat status is invalid.");
@@ -3944,9 +4746,112 @@ function readLiveHeatState(value: unknown): LiveHeatState {
           SHARED_LIMITS.clock.maxMs,
           "heat.nominalDurationMs",
         );
+  const allowedDurationMs =
+    value.allowedDurationMs === undefined || value.allowedDurationMs === null
+      ? ({ ok: true, value: null } as const)
+      : validateIntegerInRange(
+          value.allowedDurationMs,
+          0,
+          SHARED_LIMITS.clock.maxMs,
+          "heat.allowedDurationMs",
+        );
+  const actualDurationMs =
+    value.actualDurationMs === undefined || value.actualDurationMs === null
+      ? ({ ok: true, value: null } as const)
+      : validateIntegerInRange(
+          value.actualDurationMs,
+          0,
+          SHARED_LIMITS.clock.maxMs,
+          "heat.actualDurationMs",
+        );
+  const rawActualDurationMs =
+    value.rawActualDurationMs === undefined || value.rawActualDurationMs === null
+      ? ({ ok: true, value: null } as const)
+      : validateIntegerInRange(
+          value.rawActualDurationMs,
+          0,
+          SHARED_LIMITS.clock.maxMs,
+          "heat.rawActualDurationMs",
+        );
+  const completionAtTrustedAtMs =
+    value.completionAtTrustedAtMs === undefined || value.completionAtTrustedAtMs === null
+      ? ({ ok: true, value: null } as const)
+      : validateIntegerInRange(
+          value.completionAtTrustedAtMs,
+          0,
+          Number.MAX_SAFE_INTEGER,
+          "heat.completionAtTrustedAtMs",
+        );
+  const mode =
+    value.mode === undefined
+      ? ({ ok: true, value: undefined } as const)
+      : value.mode === "enabled" || value.mode === "disabled"
+        ? ({ ok: true, value: value.mode } as const)
+        : ({ ok: false, error: "heat.mode is invalid." } as const);
+  const completedAtAllowed =
+    value.completedAtAllowed === undefined
+      ? ({ ok: true, value: false } as const)
+      : typeof value.completedAtAllowed === "boolean"
+        ? ({ ok: true, value: value.completedAtAllowed } as const)
+        : ({ ok: false, error: "heat.completedAtAllowed is invalid." } as const);
+  const pendingTriggerGameTimeMs =
+    value.pendingTriggerGameTimeMs === undefined || value.pendingTriggerGameTimeMs === null
+      ? ({ ok: true, value: null } as const)
+      : validateIntegerInRange(
+          value.pendingTriggerGameTimeMs,
+          0,
+          SHARED_LIMITS.clock.maxMs,
+          "heat.pendingTriggerGameTimeMs",
+        );
+  const nextTriggerGameTimeMs =
+    value.nextTriggerGameTimeMs === undefined || value.nextTriggerGameTimeMs === null
+      ? ({ ok: true, value: null } as const)
+      : validateIntegerInRange(
+          value.nextTriggerGameTimeMs,
+          0,
+          SHARED_LIMITS.clock.maxMs,
+          "heat.nextTriggerGameTimeMs",
+        );
+  const pendingTrigger =
+    value.pendingTrigger === undefined || value.pendingTrigger === null
+      ? ({ ok: true, value: null } as const)
+      : isRecord(value.pendingTrigger) &&
+          typeof value.pendingTrigger.index === "number" &&
+          Number.isSafeInteger(value.pendingTrigger.index) &&
+          value.pendingTrigger.index >= 0 &&
+          pendingTriggerGameTimeMs.ok &&
+          pendingTriggerGameTimeMs.value !== null
+        ? ({
+            ok: true,
+            value: {
+              gameTimeMs: pendingTriggerGameTimeMs.value,
+              index: value.pendingTrigger.index,
+            },
+          } as const)
+        : ({ ok: false, error: "heat.pendingTrigger is invalid." } as const);
+  const triggerDecision =
+    value.triggerDecision === undefined || value.triggerDecision === null
+      ? ({ ok: true, value: null } as const)
+      : value.triggerDecision === "end-of-drive" ||
+          value.triggerDecision === "dead-volleyball" ||
+          value.triggerDecision === "other-stoppage" ||
+          value.triggerDecision === "skip" ||
+          value.triggerDecision === "skip-required"
+        ? ({ ok: true, value: value.triggerDecision } as const)
+        : ({ ok: false, error: "heat.triggerDecision is invalid." } as const);
   if (
     !startedAtGameTimeMs.ok ||
     !nominalDurationMs.ok ||
+    !allowedDurationMs.ok ||
+    !actualDurationMs.ok ||
+    !rawActualDurationMs.ok ||
+    !completionAtTrustedAtMs.ok ||
+    !mode.ok ||
+    !completedAtAllowed.ok ||
+    !pendingTriggerGameTimeMs.ok ||
+    !nextTriggerGameTimeMs.ok ||
+    !pendingTrigger.ok ||
+    !triggerDecision.ok ||
     (value.status === "inactive" &&
       (startedAtGameTimeMs.value !== null || nominalDurationMs.value !== null))
   ) {
@@ -3957,7 +4862,49 @@ function readLiveHeatState(value: unknown): LiveHeatState {
     factId: factId === null ? null : factId.value,
     startedAtGameTimeMs: startedAtGameTimeMs.value,
     nominalDurationMs: nominalDurationMs.value,
+    allowedDurationMs: allowedDurationMs.value,
+    actualDurationMs: actualDurationMs.value,
+    completedAtAllowed: completedAtAllowed.value,
+    rawActualDurationMs: rawActualDurationMs.value,
+    completionAtTrustedAtMs: completionAtTrustedAtMs.value,
+    ...(mode.value === undefined ? {} : { mode: mode.value }),
+    pendingTriggerId: readOptionalIdentifier(value.pendingTriggerId, "heat.pendingTriggerId"),
+    pendingTriggerGameTimeMs: pendingTriggerGameTimeMs.value,
+    nextTriggerGameTimeMs: nextTriggerGameTimeMs.value,
+    pendingTrigger: pendingTrigger.value,
+    trigger:
+      value.trigger === undefined || value.trigger === null
+        ? null
+        : isRecord(value.trigger) &&
+            typeof value.trigger.id === "string" &&
+            validateOpaqueIdentifier(value.trigger.id, "heat.trigger.id").ok &&
+            typeof value.trigger.gameTimeMs === "number" &&
+            Number.isSafeInteger(value.trigger.gameTimeMs) &&
+            typeof value.trigger.index === "number" &&
+            Number.isSafeInteger(value.trigger.index) &&
+            value.trigger.index >= 0
+          ? {
+              id: String(value.trigger.id),
+              gameTimeMs: value.trigger.gameTimeMs,
+              index: value.trigger.index,
+            }
+          : (() => {
+              throw new Error("Derived heat trigger is invalid.");
+            })(),
+    permittedExtensionTriggerId: readOptionalIdentifier(
+      value.permittedExtensionTriggerId,
+      "heat.permittedExtensionTriggerId",
+    ),
+    activeTriggerId: readOptionalIdentifier(value.activeTriggerId, "heat.activeTriggerId"),
+    triggerDecision: triggerDecision.value,
   };
+}
+
+function readOptionalIdentifier(value: unknown, field: string): string | null {
+  if (value === undefined || value === null) return null;
+  const parsed = validateOpaqueIdentifier(value, field);
+  if (!parsed.ok) throw new Error(parsed.error);
+  return parsed.value;
 }
 
 function readLiveResultState(value: unknown): LiveResultState {
@@ -4074,6 +5021,8 @@ function rebuildLiveDerivedState(
     contentFingerprint: string;
   }[],
   projectedAtMs = 0,
+  configuredHeatMode = false,
+  nowMs = 0,
 ): LiveEventGameDerivedState | null {
   try {
     const rebuilt = rebuildControlActionHistory(
@@ -4089,6 +5038,8 @@ function rebuildLiveDerivedState(
       rebuilt.effectiveFacts,
       LIVE_EVENT_IQA_INTERPRETER_VERSION,
       projectedAtMs,
+      configuredHeatMode,
+      nowMs,
     );
   } catch {
     return null;
@@ -4229,7 +5180,13 @@ export function validateLiveEventGameActionInTransaction(
   const clockValidation = validateLiveEventClockActionInTransaction(actions, candidate);
   if (clockValidation.status === "rejected") return clockValidation;
 
-  const current = rebuildLiveDerivedState(root, actions);
+  const current = rebuildLiveDerivedState(
+    root,
+    actions,
+    candidate.occurrence.trustedAtMs,
+    false,
+    candidate.occurrence.trustedAtMs,
+  );
   if (current === null) {
     return {
       status: "rejected",
@@ -4399,6 +5356,125 @@ export function validateLiveEventGameActionInTransaction(
       return rejectedLiveAction("The Penalty Release choice is no longer valid.");
     }
   }
+  if (candidate.interpretation.factType === "heat-stoppage") {
+    const heatAction = data?.heatAction;
+    if (!isLiveHeatAction(heatAction)) {
+      return rejectedLiveAction("heatAction is required for Heat Stoppage operations.");
+    }
+    const hasFrozenMode = current.gameFacts.some((fact) => fact.factType === "heat-mode");
+    if (heatAction === "enable" || heatAction === "disable") {
+      if (root.lifecycle.commencedAtMs === null) {
+        return rejectedLiveAction(
+          "Heat Stoppage Mode follows Game Day configuration before commencement.",
+        );
+      }
+    }
+    const requiresTrigger = heatAction !== "enable" && heatAction !== "disable";
+    const resolvesTrigger =
+      heatAction === "start" ||
+      heatAction === "end-of-drive" ||
+      heatAction === "dead-volleyball" ||
+      heatAction === "other-stoppage" ||
+      heatAction === "skip" ||
+      heatAction === "skip-required" ||
+      heatAction === "suppress";
+    if (hasFrozenMode && requiresTrigger && current.heat.mode !== "enabled") {
+      return rejectedLiveAction("Heat Stoppage Mode is disabled.");
+    }
+    if (hasFrozenMode && resolvesTrigger && current.heat.pendingTriggerGameTimeMs === null) {
+      return rejectedLiveAction("A Heat Stoppage Trigger is not pending.");
+    }
+    const suppliedTriggerId =
+      typeof data?.heatTriggerId === "string"
+        ? data.heatTriggerId
+        : typeof data?.triggerId === "string"
+          ? data.triggerId
+          : null;
+    if (hasFrozenMode && resolvesTrigger && suppliedTriggerId !== current.heat.pendingTriggerId) {
+      return rejectedLiveAction("The Heat Stoppage Trigger identity is stale or mismatched.");
+    }
+    if (hasFrozenMode && resolvesTrigger && current.heat.pendingTriggerGameTimeMs !== gameTimeMs) {
+      return rejectedLiveAction("The Heat Stoppage Trigger game time is stale or mismatched.");
+    }
+    if (
+      hasFrozenMode &&
+      heatAction === "end" &&
+      suppliedTriggerId !== current.heat.activeTriggerId
+    ) {
+      return rejectedLiveAction("The Heat Stoppage end is not linked to the active trigger.");
+    }
+    if (
+      hasFrozenMode &&
+      heatAction === "extend" &&
+      ((current.heat.status === "ended" &&
+        !(current.heat.completedAtAllowed === true && candidate.override !== undefined)) ||
+        suppliedTriggerId !== current.heat.activeTriggerId)
+    ) {
+      return rejectedLiveAction(
+        current.heat.status === "ended" && current.heat.completedAtAllowed !== true
+          ? "An ended Heat Stoppage cannot be extended."
+          : "The Heat Stoppage extension is not linked to the active trigger.",
+      );
+    }
+    if (
+      hasFrozenMode &&
+      heatAction === "extend-permitted" &&
+      suppliedTriggerId !== current.heat.permittedExtensionTriggerId
+    ) {
+      return rejectedLiveAction(
+        "The permitted Heat Stoppage extension is linked to another trigger.",
+      );
+    }
+    if (
+      (heatAction === "start" ||
+        heatAction === "end-of-drive" ||
+        heatAction === "dead-volleyball" ||
+        heatAction === "other-stoppage") &&
+      Math.abs(
+        (Object.values(current.scoreByGameSide)[0] ?? 0) -
+          (Object.values(current.scoreByGameSide)[1] ?? 0),
+      ) <= 10 &&
+      candidate.override === undefined
+    ) {
+      return rejectedLiveAction("The within-one-goal Heat Stoppage requires an ordinary skip.");
+    }
+    if (heatAction === "skip" || heatAction === "skip-required") {
+      const scores = Object.values(current.scoreByGameSide);
+      const scoreDifference = Math.abs((scores[0] ?? 0) - (scores[1] ?? 0));
+      if (heatAction === "skip" && scoreDifference <= 10 && candidate.override === undefined) {
+        return rejectedLiveAction("A within-one-goal Heat Stoppage requires skip-required.");
+      }
+      if (scoreDifference > 10 && candidate.override === undefined) {
+        return rejectedLiveAction("A within-one-goal Heat Stoppage skip is not eligible.");
+      }
+    }
+    if (
+      heatAction === "extend-permitted" &&
+      (current.heat.factId === null ||
+        current.heat.startedAtGameTimeMs === null ||
+        (current.heat.status !== "started" &&
+          current.heat.status !== "extended" &&
+          current.heat.status !== "required-skip"))
+    ) {
+      return rejectedLiveAction("A permitted Heat Stoppage extension requires an active timer.");
+    }
+    if (heatAction === "extend-permitted" && current.heat.permittedExtensionTriggerId === null) {
+      if (candidate.override === undefined) {
+        return rejectedLiveAction(
+          "A permitted Heat Stoppage extension must follow the linked required skip.",
+        );
+      }
+    }
+    if (
+      heatAction === "extend-permitted" &&
+      current.heat.permittedExtensionTriggerId !== null &&
+      suppliedTriggerId !== current.heat.permittedExtensionTriggerId
+    ) {
+      return rejectedLiveAction(
+        "The permitted Heat Stoppage extension is linked to another trigger.",
+      );
+    }
+  }
   const sportingOrder =
     data !== null && typeof data.sportingOrder === "number" ? data.sportingOrder : gameTimeMs;
   const sportingOrderDiffers =
@@ -4448,6 +5524,7 @@ export function validateLiveEventGameActionInTransaction(
         false,
         gameTimeMs,
         data,
+        root,
       );
       if (candidate.override === undefined || expectedBoundaryOverride === null) {
         return rejectedLiveAction("A flag catch requires released seekers and stopped play.");
@@ -4558,7 +5635,7 @@ export function validateLiveEventGameActionInTransaction(
       ? null
       : closePair.fact !== null && sportingOrderAdjudication !== null
         ? expectedClosePlayOverride(closePair.fact, gameTimeMs, sportingOrderAdjudication)
-        : expectedLiveOverride(candidate, current, sportingOrderDiffers, gameTimeMs, data);
+        : expectedLiveOverride(candidate, current, sportingOrderDiffers, gameTimeMs, data, root);
   if (sportingOrderOverride !== undefined) {
     return rejectedLiveAction(
       "A separate Sporting Order override is only valid with a flag-catch boundary override.",
@@ -4592,6 +5669,7 @@ function expectedLiveOverride(
   sportingOrderDiffers: boolean,
   gameTimeMs: number | null,
   data: Record<string, unknown> | null,
+  root: EventGameRecordRoot,
 ): LiveOverrideExpectation | null {
   if (gameTimeMs === null) return null;
   if (candidate.interpretation.type !== "fact") return null;
@@ -4638,29 +5716,180 @@ function expectedLiveOverride(
   }
   if (factType === "heat-stoppage") {
     const heatAction = data?.heatAction;
+    if (heatAction === "enable" || heatAction === "disable") {
+      if (root.lifecycle.commencedAtMs === null) return null;
+      return {
+        required: true,
+        guardrail: "heat-stoppage-mode-change",
+        direction: "head-referee-directed-heat-mode-change",
+        beforeValue: { heatMode: current.heat.mode === "enabled" },
+        afterValue: { heatMode: heatAction === "enable" },
+        gameTimeMs,
+      };
+    }
+    if (heatAction === "suppress") {
+      const pendingTriggerGameTimeMs = current.heat.pendingTriggerGameTimeMs;
+      if (typeof pendingTriggerGameTimeMs !== "number") return null;
+      return {
+        required: true,
+        guardrail: "heat-stoppage-rule-deviation",
+        direction: "head-referee-directed-heat-stoppage",
+        beforeValue: { pendingTriggerGameTimeMs },
+        afterValue: { trigger: "suppressed" },
+        gameTimeMs,
+      };
+    }
+    if (
+      heatAction === "start" ||
+      heatAction === "end-of-drive" ||
+      heatAction === "dead-volleyball" ||
+      heatAction === "other-stoppage"
+    ) {
+      const scores = Object.values(current.scoreByGameSide);
+      const scoreDifference = Math.abs((scores[0] ?? 0) - (scores[1] ?? 0));
+      if (scoreDifference <= 10) {
+        return {
+          required: true,
+          guardrail: "heat-stoppage-rule-deviation",
+          direction: "head-referee-directed-heat-stoppage",
+          beforeValue: { heat: "pending", requiredDecision: "skip" },
+          afterValue: { heat: heatAction },
+          gameTimeMs,
+        };
+      }
+    }
+    if (heatAction === "skip" || heatAction === "skip-required") {
+      const scores = Object.values(current.scoreByGameSide);
+      const scoreDifference = Math.abs((scores[0] ?? 0) - (scores[1] ?? 0));
+      if (scoreDifference > 10 || heatAction === "skip") {
+        return {
+          required: true,
+          guardrail: "heat-stoppage-rule-deviation",
+          direction: "head-referee-directed-heat-stoppage",
+          beforeValue: { scoreDifference },
+          afterValue: { heat: "skipped" },
+          gameTimeMs,
+        };
+      }
+    }
+    if (
+      heatAction === "extend-permitted" &&
+      current.heat.nominalDurationMs !== null &&
+      current.heat.allowedDurationMs !== null &&
+      current.heat.allowedDurationMs !== undefined &&
+      (current.heat.actualDurationMs ?? 0) > current.heat.allowedDurationMs
+    ) {
+      return {
+        required: true,
+        guardrail: "heat-stoppage-rule-deviation",
+        direction: "head-referee-directed-heat-stoppage",
+        beforeValue: {
+          heat: current.heat.status,
+          nominalDurationMs: current.heat.nominalDurationMs,
+          actualDurationMs: current.heat.actualDurationMs ?? 0,
+        },
+        afterValue: { heat: "extended" },
+        gameTimeMs,
+      };
+    }
+    if (heatAction === "extend-permitted" && current.heat.permittedExtensionTriggerId === null) {
+      return {
+        required: true,
+        guardrail: "heat-stoppage-rule-deviation",
+        direction: "head-referee-directed-heat-stoppage",
+        beforeValue: { permittedExtensionTriggerId: null },
+        afterValue: { heat: "extended" },
+        gameTimeMs,
+      };
+    }
+    if (heatAction === "extend") {
+      if (
+        (current.heat.status !== "started" &&
+          current.heat.status !== "extended" &&
+          !(current.heat.status === "ended" && current.heat.completedAtAllowed === true)) ||
+        current.heat.startedAtGameTimeMs === null ||
+        current.heat.nominalDurationMs === null
+      ) {
+        return null;
+      }
+      return {
+        required: true,
+        guardrail: "heat-stoppage-rule-deviation",
+        direction: "head-referee-directed-heat-stoppage",
+        beforeValue:
+          typeof current.heat.actualDurationMs === "number" &&
+          current.heat.actualDurationMs >= current.heat.nominalDurationMs
+            ? {
+                heat: current.heat.status,
+                nominalDurationMs: current.heat.nominalDurationMs,
+                actualDurationMs: current.heat.actualDurationMs,
+              }
+            : { heat: current.heat.status },
+        afterValue: { heat: "extended" },
+        gameTimeMs,
+      };
+    }
+    const offlineLateCompletion =
+      current.heat.completedAtAllowed === true &&
+      candidate.occurrence.source === "offline" &&
+      typeof current.heat.completionAtTrustedAtMs === "number" &&
+      candidate.occurrence.trustedAtMs > current.heat.completionAtTrustedAtMs;
     if (
       heatAction !== "end" ||
-      current.heat.status !== "started" ||
+      (current.heat.status !== "started" &&
+        current.heat.status !== "extended" &&
+        !offlineLateCompletion) ||
       current.heat.startedAtGameTimeMs === null ||
       current.heat.nominalDurationMs === null ||
-      gameTimeMs >= current.heat.startedAtGameTimeMs + current.heat.nominalDurationMs
+      current.heat.allowedDurationMs === null ||
+      current.heat.allowedDurationMs === undefined
     ) {
       return null;
     }
-    const afterValue =
-      heatAction === "end"
-        ? "ended"
-        : heatAction === "skip-required"
-          ? "skipped"
-          : heatAction === "extend-permitted"
-            ? "extended"
-            : "started";
+    const actualDurationMs =
+      (offlineLateCompletion ? current.heat.rawActualDurationMs : current.heat.actualDurationMs) ??
+      0;
+    if (current.heat.completedAtAllowed === true && !offlineLateCompletion) {
+      if (candidate.override === undefined) return null;
+      return {
+        required: false,
+        guardrail: "heat-stoppage-rule-deviation",
+        direction: "head-referee-directed-heat-stoppage",
+        beforeValue: {
+          heat: current.heat.status,
+          nominalDurationMs: current.heat.nominalDurationMs,
+          actualDurationMs: current.heat.actualDurationMs ?? current.heat.allowedDurationMs,
+        },
+        afterValue: { heat: "ended" },
+        gameTimeMs,
+      };
+    }
+    if (actualDurationMs < current.heat.allowedDurationMs) {
+      return {
+        required: true,
+        guardrail: "heat-stoppage-rule-deviation",
+        direction: "head-referee-directed-heat-stoppage",
+        beforeValue: { heat: current.heat.status },
+        afterValue: { heat: "ended" },
+        gameTimeMs,
+      };
+    }
+    if (actualDurationMs === current.heat.allowedDurationMs) {
+      return null;
+    }
     return {
       required: true,
       guardrail: "heat-stoppage-rule-deviation",
       direction: "head-referee-directed-heat-stoppage",
-      beforeValue: { heat: current.heat.status },
-      afterValue: { heat: afterValue },
+      beforeValue:
+        actualDurationMs > current.heat.allowedDurationMs
+          ? {
+              heat: current.heat.status,
+              nominalDurationMs: current.heat.nominalDurationMs,
+              actualDurationMs,
+            }
+          : { heat: current.heat.status },
+      afterValue: { heat: "ended" },
       gameTimeMs,
     };
   }
@@ -4711,12 +5940,32 @@ function validateOfficialOverrideEvidence(
     override.gameTimeMs !== expected.gameTimeMs ||
     override.beforeValue === undefined ||
     override.afterValue === undefined ||
-    canonicalizeJson(override.beforeValue) !== canonicalizeJson(expected.beforeValue) ||
+    !matchesLiveOverrideBeforeValue(override.beforeValue, expected) ||
     canonicalizeJson(override.afterValue) !== canonicalizeJson(expected.afterValue)
   ) {
     return rejectedLiveAction("Official Override evidence does not match effective state.");
   }
   return { status: "accepted" };
+}
+
+function matchesLiveOverrideBeforeValue(
+  supplied: ActionJsonValue,
+  expected: LiveOverrideExpectation,
+): boolean {
+  if (canonicalizeJson(supplied) === canonicalizeJson(expected.beforeValue)) return true;
+  if (expected.guardrail !== "heat-stoppage-rule-deviation") return false;
+  if (!isRecord(supplied) || !isRecord(expected.beforeValue)) return false;
+  if (
+    typeof supplied.actualDurationMs !== "number" ||
+    !Number.isFinite(supplied.actualDurationMs) ||
+    supplied.actualDurationMs < 0 ||
+    typeof expected.beforeValue.actualDurationMs !== "number"
+  ) {
+    return false;
+  }
+  const { actualDurationMs: _suppliedActual, ...suppliedGuardrail } = supplied;
+  const { actualDurationMs: _expectedActual, ...expectedGuardrail } = expected.beforeValue;
+  return canonicalizeJson(suppliedGuardrail) === canonicalizeJson(expectedGuardrail);
 }
 
 function rejectedLiveAction(detail: string): {
@@ -5023,13 +6272,13 @@ function readClockAuthorityActions(
       operationId: string;
       occurrence: { trustedAtMs: number; source: "online" | "offline" };
       acceptedAtMs: number;
-      grant: { sessionId: string };
+      grant: { sessionId: string } | null;
       interpretation: unknown;
     };
     operationId?: string;
     occurrence?: { trustedAtMs: number; source: "online" | "offline" };
     acceptedAtMs?: number;
-    grant?: { sessionId: string };
+    grant?: { sessionId: string } | null;
     interpretation?: unknown;
   }[],
 ): ClockAuthorityAction[] {
@@ -5041,6 +6290,7 @@ function readClockAuthorityActions(
       storedAction.occurrence === undefined ||
       storedAction.acceptedAtMs === undefined ||
       storedAction.grant === undefined ||
+      storedAction.grant === null ||
       storedAction.interpretation === undefined
     )
       continue;
@@ -5269,6 +6519,23 @@ function isActionJsonValue(value: unknown): value is ActionJsonValue {
   return isRecord(value) && Object.values(value).every((item) => isActionJsonValue(item));
 }
 
+function isLiveHeatAction(value: unknown): value is LiveHeatAction {
+  return (
+    value === "start" ||
+    value === "end" ||
+    value === "skip-required" ||
+    value === "extend-permitted" ||
+    value === "extend" ||
+    value === "end-of-drive" ||
+    value === "dead-volleyball" ||
+    value === "other-stoppage" ||
+    value === "skip" ||
+    value === "suppress" ||
+    value === "enable" ||
+    value === "disable"
+  );
+}
+
 function buildLiveOfficialOverride(
   intent: LiveEventControllerIntent,
   sessionId: string,
@@ -5298,6 +6565,7 @@ function buildLiveOfficialOverride(
   const expected = explainLiveEventGuardrail({
     type: intent.type,
     ...(intent.type === "substantive" ? { trigger: intent.trigger } : {}),
+    ...(intent.type === "substantive" ? { heatAction: intent.heatAction } : {}),
     gameTimeMs: intent.gameTimeMs,
     sportingOrder: intent.sportingOrder,
   });

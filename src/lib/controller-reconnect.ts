@@ -21,6 +21,7 @@ import {
 import {
   orderControllerGameFacts,
   LIVE_SUSPENSION_SNAPSHOT_VERSION,
+  deriveHeatStoppageState,
   parseLiveEventControllerIntent,
 } from "@/lib/live-event-game-control";
 import {
@@ -831,6 +832,7 @@ function applyOptimisticAction(
           ? {}
           : { sportingOrderAdjudication: intent.sportingOrderAdjudication }),
         ...(intent.heatAction === undefined ? {} : { heatAction: intent.heatAction }),
+        ...(intent.heatTriggerId === undefined ? {} : { heatTriggerId: intent.heatTriggerId }),
       },
     });
     return rebuildOptimisticProjection(state, nextFacts, action.dispatchedAtMs);
@@ -1458,6 +1460,8 @@ function parseHeatState(value: unknown): LiveHeatState {
       value.status !== "started" &&
       value.status !== "ended" &&
       value.status !== "skipped" &&
+      value.status !== "required-skip" &&
+      value.status !== "suppressed" &&
       value.status !== "extended")
   ) {
     throw new Error("Projection heat state is invalid.");
@@ -1470,11 +1474,92 @@ function parseHeatState(value: unknown): LiveHeatState {
     value.nominalDurationMs,
     "heat.nominalDurationMs",
   );
+  const allowedDurationMs = parseNullableBoundedNumber(
+    value.allowedDurationMs,
+    "heat.allowedDurationMs",
+  );
+  const actualDurationMs = parseNullableBoundedNumber(
+    value.actualDurationMs,
+    "heat.actualDurationMs",
+  );
+  const mode =
+    value.mode === undefined
+      ? undefined
+      : value.mode === "enabled" || value.mode === "disabled"
+        ? value.mode
+        : (() => {
+            throw new Error("Projection heat mode is invalid.");
+          })();
+  const pendingTriggerGameTimeMs = parseNullableBoundedNumber(
+    value.pendingTriggerGameTimeMs,
+    "heat.pendingTriggerGameTimeMs",
+  );
+  const nextTriggerGameTimeMs = parseNullableBoundedNumber(
+    value.nextTriggerGameTimeMs,
+    "heat.nextTriggerGameTimeMs",
+  );
+  const pendingTrigger =
+    value.pendingTrigger === undefined || value.pendingTrigger === null
+      ? null
+      : isRecord(value.pendingTrigger) &&
+          Number.isSafeInteger(value.pendingTrigger.index) &&
+          value.pendingTrigger.index >= 0 &&
+          pendingTriggerGameTimeMs !== null
+        ? { gameTimeMs: pendingTriggerGameTimeMs, index: value.pendingTrigger.index }
+        : (() => {
+            throw new Error("Projection heat pending trigger is invalid.");
+          })();
+  const triggerDecision =
+    value.triggerDecision === undefined || value.triggerDecision === null
+      ? null
+      : value.triggerDecision === "end-of-drive" ||
+          value.triggerDecision === "dead-volleyball" ||
+          value.triggerDecision === "other-stoppage" ||
+          value.triggerDecision === "skip" ||
+          value.triggerDecision === "skip-required"
+        ? value.triggerDecision
+        : (() => {
+            throw new Error("Projection heat trigger decision is invalid.");
+          })();
   return {
     status: value.status,
     factId: parseNullableFactId(value.factId, "heat.factId"),
     startedAtGameTimeMs,
     nominalDurationMs,
+    allowedDurationMs,
+    actualDurationMs,
+    ...(mode === undefined ? {} : { mode }),
+    pendingTriggerId:
+      value.pendingTriggerId === undefined || value.pendingTriggerId === null
+        ? null
+        : requireIdentifier(value.pendingTriggerId, "heat.pendingTriggerId"),
+    pendingTrigger,
+    pendingTriggerGameTimeMs,
+    nextTriggerGameTimeMs,
+    trigger:
+      value.trigger === undefined || value.trigger === null
+        ? null
+        : isRecord(value.trigger) &&
+            typeof value.trigger.id === "string" &&
+            Number.isSafeInteger(value.trigger.gameTimeMs) &&
+            Number.isSafeInteger(value.trigger.index)
+          ? {
+              id: requireIdentifier(value.trigger.id, "heat.trigger.id"),
+              gameTimeMs: value.trigger.gameTimeMs,
+              index: value.trigger.index,
+            }
+          : (() => {
+              throw new Error("Projection heat trigger is invalid.");
+            })(),
+    permittedExtensionTriggerId:
+      value.permittedExtensionTriggerId === undefined || value.permittedExtensionTriggerId === null
+        ? null
+        : requireIdentifier(value.permittedExtensionTriggerId, "heat.permittedExtensionTriggerId"),
+    activeTriggerId:
+      value.activeTriggerId === undefined || value.activeTriggerId === null
+        ? null
+        : requireIdentifier(value.activeTriggerId, "heat.activeTriggerId"),
+    triggerDecision,
   };
 }
 
@@ -1532,6 +1617,12 @@ function parseGameFacts(value: unknown): ControllerProjection["gameFacts"] {
       factId,
       factType,
       gameSideId,
+      ...(typeof candidate.trustedAtMs === "number" && Number.isSafeInteger(candidate.trustedAtMs)
+        ? { trustedAtMs: candidate.trustedAtMs }
+        : {}),
+      ...(typeof candidate.acceptedAtMs === "number" && Number.isSafeInteger(candidate.acceptedAtMs)
+        ? { acceptedAtMs: candidate.acceptedAtMs }
+        : {}),
     };
   });
 }
@@ -1655,6 +1746,8 @@ function appendOptimisticFact(
     gameTimeMs: fact.gameTimeMs,
     sportingOrder: fact.sportingOrder,
     synchronizationOrder,
+    trustedAtMs: 0,
+    acceptedAtMs: 0,
     effective: true,
     data: fact.data as ControllerGameFact["data"],
   });
@@ -1759,7 +1852,17 @@ function rebuildOptimisticProjection(
   if (Object.values(scoreByGameSide).some((score) => score > SHARED_LIMITS.score.max)) {
     return state;
   }
-  const dependentState = deriveOptimisticDependentState(gameFacts);
+  const dependentState = deriveOptimisticDependentState(
+    gameFacts,
+    projection.heat?.mode === "enabled",
+    projection.clock.gameTimeMs,
+  );
+  const hasHeatEvidence = gameFacts.some(
+    (fact) =>
+      fact.effective && (fact.factType === "heat-stoppage" || fact.factType === "heat-mode"),
+  );
+  const optimisticHeat =
+    !hasHeatEvidence && projection.heat?.mode === undefined ? projection.heat : dependentState.heat;
   const commencement =
     projection.commencement.status === "commenced"
       ? projection.commencement
@@ -1799,7 +1902,7 @@ function rebuildOptimisticProjection(
       commencement,
       timeout: dependentState.timeout,
       stoppage: dependentState.stoppage,
-      heat: dependentState.heat,
+      heat: optimisticHeat,
       result,
       overtime,
       overtimeTarget,
@@ -1812,7 +1915,11 @@ function rebuildOptimisticProjection(
   };
 }
 
-function deriveOptimisticDependentState(facts: readonly ControllerGameFact[]): {
+function deriveOptimisticDependentState(
+  facts: readonly ControllerGameFact[],
+  configuredHeatMode = false,
+  gameTimeMs = 0,
+): {
   timeout: LiveTimeoutState;
   suspension: LiveSuspensionState;
   stoppage: LiveStoppageState;
@@ -1822,56 +1929,7 @@ function deriveOptimisticDependentState(facts: readonly ControllerGameFact[]): {
   const latest = (factType: string) =>
     facts.filter((fact) => fact.effective && fact.factType === factType).at(-1) ?? null;
   const timeoutFacts = facts.filter((fact) => fact.effective && fact.factType === "timeout");
-  const heatFact = latest("heat-stoppage");
   const resultFact = latest("result");
-  const heatData =
-    heatFact !== null && isRecord(heatFact.data)
-      ? (heatFact.data as Record<string, unknown>)
-      : null;
-  const heatAction =
-    heatData !== null &&
-    (heatData.heatAction === "end" ||
-      heatData.heatAction === "skip-required" ||
-      heatData.heatAction === "extend-permitted")
-      ? heatData.heatAction
-      : null;
-  const heatStatus: LiveHeatState["status"] =
-    heatFact === null
-      ? "inactive"
-      : heatAction === "end"
-        ? "ended"
-        : heatAction === "skip-required"
-          ? "skipped"
-          : heatAction === "extend-permitted"
-            ? "extended"
-            : "started";
-  const effectiveHeatStarts = facts.filter((fact) => {
-    const data = isRecord(fact.data) ? (fact.data as unknown as Record<string, unknown>) : null;
-    return (
-      fact.effective &&
-      fact.factType === "heat-stoppage" &&
-      (data === null ||
-        (data.heatAction !== "end" &&
-          data.heatAction !== "skip-required" &&
-          data.heatAction !== "extend-permitted"))
-    );
-  });
-  const nominalDurationMs =
-    heatStatus === "started" || heatStatus === "extended"
-      ? effectiveHeatStarts.length <= 1
-        ? 4 * 60 * 1000
-        : 2 * 60 * 1000
-      : null;
-  const startedAtGameTimeMs =
-    nominalDurationMs === null || heatFact?.gameTimeMs === null
-      ? null
-      : (heatFact?.gameTimeMs ?? null);
-  const heat: LiveHeatState = {
-    status: heatStatus,
-    factId: heatFact?.factId ?? null,
-    startedAtGameTimeMs,
-    nominalDurationMs,
-  };
   let suspension: LiveSuspensionState = { status: "none", factId: null, snapshot: null };
   for (const fact of facts.filter(
     (candidate) => candidate.effective && candidate.factType === "suspension",
@@ -1892,6 +1950,7 @@ function deriveOptimisticDependentState(facts: readonly ControllerGameFact[]): {
         : null;
     suspension = { status: "suspended", factId: fact.factId, snapshot };
   }
+  const heat = deriveHeatStoppageState(facts, gameTimeMs, configuredHeatMode);
   return {
     timeout: deriveOptimisticTimeoutState(timeoutFacts),
     suspension,

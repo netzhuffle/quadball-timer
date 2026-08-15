@@ -13,6 +13,7 @@ import type {
   ControlActionCodecRegistry,
   ControlActionGrantProvenance,
   ControlActionInput,
+  ControlActionOrigin,
   ControlActionInterpretation,
   ControlActionKind,
   ControlActionLifecycleContext,
@@ -578,7 +579,16 @@ export function validateStoredInput(
   const kind = validateKind(value.kind);
   const predecessors = validatePredecessors(value.causalPredecessorIds);
   const occurrence = validateOccurrenceWithoutClock(value.occurrence);
-  const grant = validateGrant(value.grant);
+  const origin: ValidationResult<ControlActionOrigin | undefined> =
+    value.origin === undefined
+      ? valid(undefined)
+      : value.origin === "controller" || value.origin === "system-heat-stoppage"
+        ? valid(value.origin)
+        : invalid("origin is unsupported.");
+  const grant =
+    value.origin === "system-heat-stoppage" && value.grant === null
+      ? valid(null)
+      : validateGrant(value.grant);
   const lifecycle = validateLifecycle(value.lifecycle);
   const payload = parseJsonValue(value.payload, "payload");
   const override = validateOverride(value.override);
@@ -590,6 +600,7 @@ export function validateStoredInput(
   if (!predecessors.ok) return predecessors;
   if (!occurrence.ok) return occurrence;
   if (!grant.ok) return grant;
+  if (!origin.ok) return origin;
   if (!lifecycle.ok) return lifecycle;
   if (!payload.ok) return payload;
   if (!override.ok) return override;
@@ -603,6 +614,7 @@ export function validateStoredInput(
     causalPredecessorIds: predecessors.value,
     occurrence: occurrence.value,
     grant: grant.value,
+    ...(origin.value === undefined ? {} : { origin: origin.value }),
     lifecycle: lifecycle.value,
     ...(override.value === undefined ? {} : { override: override.value }),
     ...(recoveryProvenance.value === undefined

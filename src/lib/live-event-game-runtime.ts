@@ -24,6 +24,7 @@ import type {
   FoundationStorageSnapshot,
   FoundationStorageTransaction,
 } from "@/lib/foundation-storage";
+import { resolveHeatStoppageConfiguration as resolvePublishedHeatStoppageConfiguration } from "@/lib/heat-stoppage-configuration";
 import type { FoundationStorage } from "@/lib/foundation-storage";
 
 export type LiveEventGameRuntime = {
@@ -119,12 +120,35 @@ export async function openLiveEventGameRuntime(input: {
           ? { status: "eligible" }
           : { status: "ineligible" },
       validateActionInTransaction: ({ transaction, root, action }) =>
-        validateLiveEventGameActionInTransaction(
-          transaction.listActions(root.recordId),
-          root,
-          action,
-          input.knownDodgeballIdsForEventGame?.(root.eventGameId) ?? null,
-        ),
+        (() => {
+          const validation = validateLiveEventGameActionInTransaction(
+            transaction.listActions(root.recordId),
+            root,
+            action,
+            input.knownDodgeballIdsForEventGame?.(root.eventGameId) ?? null,
+          );
+          if (validation.status === "rejected") return validation;
+          if (
+            action.interpretation.type !== "fact" ||
+            action.interpretation.factType !== "heat-mode"
+          )
+            return validation;
+          const payload = action.interpretation.payload;
+          const data = isRecord(payload) && isRecord(payload.data) ? payload.data : null;
+          const configured = resolvePublishedHeatStoppageConfiguration(transaction, {
+            eventId: root.externalScope.eventId,
+            gameDayId: root.externalScope.gameDayId,
+            eventGameId: root.eventGameId,
+          });
+          if (configured === null || data?.enabled !== (configured === "enabled")) {
+            return {
+              status: "rejected",
+              reason: "invalid-action" as const,
+              detail: "Heat Stoppage Configuration changed or is unavailable.",
+            };
+          }
+          return validation;
+        })(),
     });
     const hasLifecycleInventory = await storage.transaction(
       (transaction) => typeof transaction.listRoots === "function",
@@ -168,7 +192,9 @@ export async function openLiveEventGameRuntime(input: {
         eventGameId,
         grantSessionId,
         grantVersion,
+        evidence,
       }) => {
+        if (evidence !== undefined && lockedReplayCapability.authorized(evidence)) return true;
         const authorized = await authority.authorizeGrant({
           sessionBearer,
           eventGameId,
@@ -189,6 +215,14 @@ export async function openLiveEventGameRuntime(input: {
           lockedAtMs,
         }),
       knownDodgeballIdsForEventGame: input.knownDodgeballIdsForEventGame,
+      readHeatStoppageConfiguration: (scope: {
+        eventId: string;
+        gameDayId: string;
+        eventGameId: string;
+      }) =>
+        storage.transaction((snapshot) =>
+          resolvePublishedHeatStoppageConfiguration(snapshot, scope),
+        ),
     });
     const lockTimer = setInterval(() => {
       void control.reconcileEventGameLocks();
@@ -236,7 +270,7 @@ function createGrantOptions(
     clock: { nowMs: clock },
     randomness: { bytes: (length) => new Uint8Array(randomBytes(length)) },
     keyRing,
-    controlScopeResolver: createControlScopeResolver(clock),
+    controlScopeResolver: createControlScopeResolver(clock, false),
     privilegedAuthorityVerifier: { verify: () => null },
     onLifecycleChange,
   };
@@ -315,11 +349,17 @@ export function readLiveEventDodgeballIdsByEventGame(
 
 export function createControlScopeResolver(
   clock: () => number = () => Date.now(),
+  persistPassiveCommencement = true,
 ): GrantAuthorityOptions["controlScopeResolver"] {
   return {
     resolve(scope, snapshot) {
       if (snapshot === undefined) return { status: "unavailable" };
-      const current = resolveCurrentRootForSlot(scope, snapshot, clock());
+      const current = resolveCurrentRootForSlot(
+        scope,
+        snapshot,
+        clock(),
+        persistPassiveCommencement,
+      );
       if (current.status === "conflict") return current;
       const root = current.root;
       if (root === null) return { status: "empty" };
@@ -330,7 +370,12 @@ export function createControlScopeResolver(
     },
     resolveSession(scope, sessionEventGameId, snapshot) {
       if (snapshot === undefined) return { status: "unavailable" };
-      const resolvedCurrent = resolveCurrentRootForSlot(scope, snapshot, clock());
+      const resolvedCurrent = resolveCurrentRootForSlot(
+        scope,
+        snapshot,
+        clock(),
+        persistPassiveCommencement,
+      );
       if (resolvedCurrent.status === "conflict") return resolvedCurrent;
       const current = resolvedCurrent.root;
       if (current === null) {
@@ -338,7 +383,12 @@ export function createControlScopeResolver(
         const sessionRoot =
           sessionRootValue === null
             ? null
-            : materializeCommencement(sessionRootValue, snapshot, clock());
+            : materializeCommencement(
+                sessionRootValue,
+                snapshot,
+                clock(),
+                persistPassiveCommencement,
+              );
         if (sessionRoot !== null && sessionRoot.lifecycle.commencedAtMs !== null) {
           return {
             status: "pinned",
@@ -358,7 +408,12 @@ export function createControlScopeResolver(
       const sessionRoot =
         sessionRootValue === null
           ? null
-          : materializeCommencement(sessionRootValue, snapshot, clock());
+          : materializeCommencement(
+              sessionRootValue,
+              snapshot,
+              clock(),
+              persistPassiveCommencement,
+            );
       return sessionRoot !== null && sessionRoot.lifecycle.commencedAtMs !== null
         ? {
             status: "pinned",
@@ -378,6 +433,7 @@ function resolveCurrentRootForSlot(
   scope: ControlGrantScope,
   snapshot: FoundationStorageSnapshot,
   nowMs: number,
+  persistPassiveCommencement: boolean,
 ): { status: "resolved"; root: EventGameRecordRoot | null } | { status: "conflict" } {
   const catalogGames = snapshot
     .listEventGames?.(scope.gameDayId)
@@ -397,7 +453,7 @@ function resolveCurrentRootForSlot(
       if (!sameScope(legacyRoot.externalScope, scope)) return { status: "conflict" };
       return {
         status: "resolved",
-        root: materializeCommencement(legacyRoot, snapshot, nowMs),
+        root: materializeCommencement(legacyRoot, snapshot, nowMs, persistPassiveCommencement),
       };
     }
     const pitch = snapshot.findPitchSlot?.(game.pitchSlotId);
@@ -412,19 +468,26 @@ function resolveCurrentRootForSlot(
     const storedRoot = snapshot.findRootByEventGameId(game.eventGameId);
     return {
       status: "resolved",
-      root: storedRoot === null ? null : materializeCommencement(storedRoot, snapshot, nowMs),
+      root:
+        storedRoot === null
+          ? null
+          : materializeCommencement(storedRoot, snapshot, nowMs, persistPassiveCommencement),
     };
   }
   const storedRoot = snapshot.findRootByPitchSlotId(scope.pitchSlotId);
   if (storedRoot === null) return { status: "resolved", root: null };
   if (!sameScope(storedRoot.externalScope, scope)) return { status: "conflict" };
-  return { status: "resolved", root: materializeCommencement(storedRoot, snapshot, nowMs) };
+  return {
+    status: "resolved",
+    root: materializeCommencement(storedRoot, snapshot, nowMs, persistPassiveCommencement),
+  };
 }
 
 function materializeCommencement(
   root: EventGameRecordRoot,
   snapshot: FoundationStorageSnapshot,
   nowMs: number,
+  persist: boolean,
 ): EventGameRecordRoot {
   if (root.lifecycle.phase !== "scheduled" || root.lifecycle.commencedAtMs !== null) return root;
   if (typeof snapshot.listActions !== "function") return root;
@@ -441,7 +504,7 @@ function materializeCommencement(
   const validated = validateEventGameRecordRoot(candidate);
   if (!validated.ok) return root;
   const transaction = snapshot as FoundationStorageTransaction;
-  if (typeof transaction.updateRoot === "function") {
+  if (persist && typeof transaction.updateRoot === "function") {
     transaction.updateRoot({
       root: validated.value,
       canonicalContent: canonicalizeEventGameRecordRoot(validated.value),

@@ -62,6 +62,8 @@ export const SYSTEM_TIMEOUT_COMPLETION_GRANT: Readonly<{
   versionId: "system-v1",
 });
 
+export type ControlActionOrigin = "controller" | "system-heat-stoppage";
+
 export type ControlActionLifecycleContext = {
   phase: EventGameLifecyclePhase;
   commencedAtMs: number | null;
@@ -99,7 +101,10 @@ export type ControlActionInput = {
   payload: unknown;
   causalPredecessorIds: readonly string[];
   occurrence: ControlActionOccurrence;
-  grant: ControlActionGrantProvenance;
+  /** Controller actions carry Grant provenance; trusted system obligations do not. */
+  grant: ControlActionGrantProvenance | null;
+  /** Explicitly distinguishes derived heat obligations from Controller submissions. */
+  origin?: ControlActionOrigin;
   lifecycle: ControlActionLifecycleContext;
   override?: OfficialOverrideMetadata;
   recoveryProvenance?: ControlActionRecoveryProvenance;
@@ -181,6 +186,7 @@ export type ControlAuditLinkage = {
 export type ControlAuditProvenance = {
   occurrence: ControlActionOccurrence | null;
   grant: ControlActionGrantProvenance | null;
+  origin?: ControlActionOrigin;
   lifecycle: ControlActionLifecycleContext | null;
   override: OfficialOverrideMetadata | null;
   recoveryProvenance: ControlActionRecoveryProvenance | null;
@@ -339,13 +345,23 @@ export function validateControlActionEnvelope(
   };
   const predecessors = validatePredecessors(input.causalPredecessorIds);
   const occurrence = validateOccurrence(input.occurrence, serverNowMs);
-  const grant = validateGrant(input.grant);
+  const originResult: ValidationResult<ControlActionOrigin | undefined> =
+    input.origin === undefined
+      ? valid(undefined)
+      : input.origin === "controller" || input.origin === "system-heat-stoppage"
+        ? valid(input.origin)
+        : invalid("origin is unsupported.");
+  const grant =
+    input.origin === "system-heat-stoppage" && input.grant === null
+      ? valid(null)
+      : validateGrant(input.grant);
   const lifecycle = validateLifecycle(input.lifecycle);
   const override = validateOverride(input.override);
   const recovery = validateRecoveryProvenanceShape(input.recoveryProvenance);
   if (!predecessors.ok) return predecessors;
   if (!occurrence.ok) return occurrence;
   if (!grant.ok) return grant;
+  if (!originResult.ok) return originResult;
   if (!lifecycle.ok) return lifecycle;
   if (!override.ok) return override;
   if (!recovery.ok) return recovery;
@@ -359,6 +375,7 @@ export function validateControlActionEnvelope(
     causalPredecessorIds: predecessors.value,
     occurrence: occurrence.value,
     grant: grant.value,
+    ...(originResult.value === undefined ? {} : { origin: originResult.value }),
     lifecycle: lifecycle.value,
     ...(override.value === undefined ? {} : { override: override.value }),
     ...(recovery.value === undefined ? {} : { recoveryProvenance: recovery.value }),
@@ -470,7 +487,17 @@ export function prepareControlAction(
   if (!predecessorResult.ok) return predecessorResult;
   const occurrenceResult = validateOccurrence(input.occurrence, serverNowMs);
   if (!occurrenceResult.ok) return occurrenceResult;
-  const grantResult = validateGrant(input.grant);
+  const originResult: ValidationResult<ControlActionOrigin | undefined> =
+    input.origin === undefined
+      ? valid(undefined)
+      : input.origin === "controller" || input.origin === "system-heat-stoppage"
+        ? valid(input.origin)
+        : invalid("origin is unsupported.");
+  if (!originResult.ok) return originResult;
+  const grantResult =
+    input.origin === "system-heat-stoppage" && input.grant === null
+      ? valid(null)
+      : validateGrant(input.grant);
   if (!grantResult.ok) return grantResult;
   const lifecycleResult = validateLifecycle(input.lifecycle);
   if (!lifecycleResult.ok) return lifecycleResult;
@@ -494,6 +521,7 @@ export function prepareControlAction(
     causalPredecessorIds: predecessorResult.value,
     occurrence: occurrenceResult.value,
     grant: grantResult.value,
+    ...(originResult.value === undefined ? {} : { origin: originResult.value }),
     lifecycle: lifecycleResult.value,
     ...(overrideResult.value === undefined ? {} : { override: overrideResult.value }),
     ...(recoveryResult.value === undefined ? {} : { recoveryProvenance: recoveryResult.value }),

@@ -13,11 +13,14 @@ import type {
   ControllerProjection,
   LiveEventGameControlResult,
   LiveEventControllerIntent,
+  LiveHeatAction,
 } from "@/lib/live-event-game-control";
-import type { OfficialOverrideMetadata } from "@/lib/event-game-actions";
+import {
+  LIVE_EVENT_CONTROL_INTENT_VERSION,
+  projectLiveHeatState,
+} from "@/lib/live-event-game-control";
 import {
   CLOSE_PLAY_ADJUDICATION_WINDOW_MS,
-  LIVE_EVENT_CONTROL_INTENT_VERSION,
   LIVE_SUSPENSION_SNAPSHOT_VERSION,
   suspensionPenaltyStateFromProjection,
 } from "@/lib/live-event-game-control";
@@ -28,6 +31,7 @@ import {
   type LivePenaltyReason,
 } from "@/lib/live-event-penalties";
 import { validateGameClockMs } from "@/lib/validation-policy";
+import type { ActionJsonValue, OfficialOverrideMetadata } from "@/lib/event-game-actions";
 import { readControllerDeviceContext } from "@/lib/controller-device-context";
 import {
   acknowledgeControllerProjection,
@@ -143,6 +147,7 @@ export function EventGameControllerPage() {
   const [dodgeballPossession, setDodgeballPossession] = useState<PossessionSelection>({});
   const [showSuspensionRecovery, setShowSuspensionRecovery] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
+  const [heatOverrideConfirmed, setHeatOverrideConfirmed] = useState(false);
   const [busy, setBusy] = useState(false);
   const [pendingClosePlayAdjudication, setPendingClosePlayAdjudication] =
     useState<PendingClosePlayAdjudication | null>(null);
@@ -179,6 +184,20 @@ export function EventGameControllerPage() {
       : projectClockSample(
           clockReceiptAnchor.projection,
           localMonotonicMs - clockReceiptAnchor.localMonotonicMs,
+        );
+
+  const displayedHeat =
+    projection?.heat === undefined
+      ? undefined
+      : projectLiveHeatState(
+          projection.gameFacts ?? [],
+          projection.heat.mode,
+          clockProjection?.gameTimeMs ?? projection.clock.gameTimeMs,
+          projection.clock.projectedAtMs +
+            Math.max(
+              0,
+              localMonotonicMs - (clockReceiptAnchor?.localMonotonicMs ?? localMonotonicMs),
+            ),
         );
 
   function projectClockImmediately() {
@@ -809,6 +828,106 @@ export function EventGameControllerPage() {
     });
   }
 
+  function submitHeatAction(heatAction: LiveHeatAction) {
+    const heat = displayedHeat;
+    if (projection === null || heat === undefined) return;
+    const decisionAction =
+      heatAction === "start" ||
+      heatAction === "end-of-drive" ||
+      heatAction === "dead-volleyball" ||
+      heatAction === "other-stoppage" ||
+      heatAction === "skip" ||
+      heatAction === "skip-required" ||
+      heatAction === "suppress";
+    const triggerId =
+      heatAction === "extend-permitted"
+        ? heat.permittedExtensionTriggerId
+        : heatAction === "end" || heatAction === "extend"
+          ? heat.activeTriggerId
+          : decisionAction
+            ? heat.pendingTriggerId
+            : null;
+    const gameTimeMs =
+      decisionAction && typeof heat.pendingTriggerGameTimeMs === "number"
+        ? heat.pendingTriggerGameTimeMs
+        : (clockProjection?.gameTimeMs ?? projection.clock.gameTimeMs);
+    const override = heatOverrideConfirmed
+      ? buildHeatOverride(heatAction, heat, gameTimeMs)
+      : undefined;
+    queueIntent({
+      version: LIVE_EVENT_CONTROL_INTENT_VERSION,
+      type: "substantive",
+      trigger: "heat-stoppage",
+      operationId: crypto.randomUUID(),
+      factId: crypto.randomUUID(),
+      gameTimeMs,
+      heatAction,
+      ...(triggerId === null || triggerId === undefined ? {} : { heatTriggerId: triggerId }),
+      ...(override === undefined ? {} : { override }),
+      occurrence: { clientOriginAtMs: Date.now() },
+    });
+  }
+
+  function buildHeatOverride(
+    heatAction: LiveHeatAction,
+    heat: NonNullable<ControllerProjection["heat"]>,
+    gameTimeMs: number,
+  ): OfficialOverrideMetadata {
+    const modeChange = heatAction === "enable" || heatAction === "disable";
+    const pendingTriggerGameTimeMs = heat.pendingTriggerGameTimeMs ?? null;
+    const nominalDurationMs = heat.nominalDurationMs ?? null;
+    const actualDurationMs = heat.actualDurationMs ?? 0;
+    const scores = Object.values(projection?.scoreByGameSide ?? {});
+    const scoreDifference = Math.abs((scores[0] ?? 0) - (scores[1] ?? 0));
+    const beforeValue: ActionJsonValue = (
+      modeChange
+        ? { heatMode: heat.mode === "enabled" }
+        : heatAction === "suppress"
+          ? { pendingTriggerGameTimeMs }
+          : heatAction === "start" ||
+              heatAction === "end-of-drive" ||
+              heatAction === "dead-volleyball" ||
+              heatAction === "other-stoppage"
+            ? { heat: "pending", requiredDecision: "skip" }
+            : heatAction === "skip" || heatAction === "skip-required"
+              ? { scoreDifference }
+              : heatAction === "end" || heatAction === "extend"
+                ? actualDurationMs >= (nominalDurationMs ?? 0)
+                  ? {
+                      heat: heat.status,
+                      nominalDurationMs,
+                      actualDurationMs,
+                    }
+                  : { heat: heat.status }
+                : { heat: heat.status }
+    ) as ActionJsonValue;
+    return {
+      guardrail: modeChange ? "heat-stoppage-mode-change" : "heat-stoppage-rule-deviation",
+      direction: modeChange
+        ? "head-referee-directed-heat-mode-change"
+        : "head-referee-directed-heat-stoppage",
+      confirmation: "head-referee-confirmed",
+      authorityReference: "head-referee",
+      gameTimeMs,
+      beforeValue,
+      afterValue: modeChange
+        ? { heatMode: heatAction === "enable" }
+        : heatAction === "suppress"
+          ? { trigger: "suppressed" }
+          : heatAction === "end"
+            ? { heat: "ended" }
+            : {
+                heat:
+                  heatAction === "skip" || heatAction === "skip-required"
+                    ? "skipped"
+                    : heatAction === "extend"
+                      ? "extended"
+                      : heatAction,
+              },
+      reason: "head-referee-direction",
+    };
+  }
+
   function queueIntent(
     candidate: LiveEventControllerIntent,
     options: { causalPredecessorIds?: readonly string[] } = {},
@@ -1379,6 +1498,140 @@ export function EventGameControllerPage() {
                       ? "SEEKER RELEASED at 20:00"
                       : "Seeker release pending at 20:00"}
                   </p>
+                </div>
+              )}
+              {displayedHeat === undefined ? null : (
+                <div className="space-y-3 rounded-lg border border-orange-500/50 bg-orange-50 p-3 text-sm text-orange-950">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div>
+                      <p className="font-medium">Heat Stoppage Controller workflow</p>
+                      <p>
+                        Mode: {displayedHeat.mode ?? "disabled"} · status: {displayedHeat.status}
+                      </p>
+                    </div>
+                    <div className="flex gap-2">
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        onClick={() => submitHeatAction("enable")}
+                        disabled={busy || displayedHeat.mode === "enabled"}
+                      >
+                        Enable mode
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        onClick={() => submitHeatAction("disable")}
+                        disabled={busy || displayedHeat.mode !== "enabled"}
+                      >
+                        Disable mode
+                      </Button>
+                    </div>
+                  </div>
+                  <p>
+                    {displayedHeat.pendingTrigger === null ||
+                    displayedHeat.pendingTrigger === undefined
+                      ? "No Heat Stoppage cue is pending."
+                      : `Pending cue at ${formatClock(displayedHeat.pendingTrigger.gameTimeMs)} · the Game Clock remains running until a Controller decision.`}
+                  </p>
+                  {displayedHeat.status === "started" || displayedHeat.status === "extended" ? (
+                    <div className="rounded border bg-white/70 p-2">
+                      <p>
+                        Timer: {formatClock(displayedHeat.actualDurationMs ?? 0)} elapsed · nominal{" "}
+                        {formatClock(displayedHeat.nominalDurationMs ?? 0)} · allowed{" "}
+                        {formatClock(
+                          displayedHeat.allowedDurationMs ?? displayedHeat.nominalDurationMs ?? 0,
+                        )}
+                      </p>
+                      <p className="text-xs">
+                        Start game time: {formatClock(displayedHeat.startedAtGameTimeMs ?? 0)}
+                      </p>
+                    </div>
+                  ) : null}
+                  {displayedHeat.status === "ended" && displayedHeat.completedAtAllowed === true ? (
+                    <div className="rounded border bg-white/70 p-2">
+                      <p>
+                        Heat Stoppage complete at the allowed duration; the Game Clock remains
+                        stopped.
+                      </p>
+                      <Button size="sm" onClick={() => submitHeatAction("end")} disabled={busy}>
+                        Acknowledge completion
+                      </Button>
+                    </div>
+                  ) : null}
+                  <label className="flex items-center gap-2">
+                    <input
+                      type="checkbox"
+                      checked={heatOverrideConfirmed}
+                      onChange={(event) => setHeatOverrideConfirmed(event.target.checked)}
+                    />
+                    Head Referee Official Override confirmed
+                  </label>
+                  {displayedHeat.pendingTriggerId === null ? null : (
+                    <div className="flex flex-wrap gap-2">
+                      {(
+                        [
+                          ["end-of-drive", "End of drive"],
+                          ["dead-volleyball", "Dead volleyball"],
+                          ["other-stoppage", "Other stoppage"],
+                          ["skip-required", "Required skip"],
+                          ["start", "Start Heat Stoppage"],
+                        ] as const
+                      ).map(([action, label]) => (
+                        <Button
+                          key={action}
+                          size="sm"
+                          variant="outline"
+                          onClick={() => submitHeatAction(action)}
+                          disabled={busy}
+                        >
+                          {label}
+                        </Button>
+                      ))}
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        onClick={() => submitHeatAction("skip")}
+                        disabled={busy || !heatOverrideConfirmed}
+                      >
+                        Skip (Official Override)
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        onClick={() => submitHeatAction("suppress")}
+                        disabled={busy || !heatOverrideConfirmed}
+                      >
+                        Suppress cue (override)
+                      </Button>
+                    </div>
+                  )}
+                  {displayedHeat.status === "started" || displayedHeat.status === "extended" ? (
+                    <div className="flex flex-wrap gap-2">
+                      <Button size="sm" onClick={() => submitHeatAction("end")} disabled={busy}>
+                        End Heat Stoppage
+                      </Button>
+                      {displayedHeat.permittedExtensionTriggerId ===
+                      displayedHeat.activeTriggerId ? (
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          onClick={() => submitHeatAction("extend-permitted")}
+                          disabled={busy}
+                        >
+                          Permitted extension
+                        </Button>
+                      ) : null}
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        onClick={() => submitHeatAction("extend")}
+                        disabled={busy || !heatOverrideConfirmed}
+                      >
+                        Extend (override)
+                      </Button>
+                    </div>
+                  ) : null}
                 </div>
               )}
               <div className="flex flex-wrap gap-2">

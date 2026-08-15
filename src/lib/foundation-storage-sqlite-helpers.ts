@@ -362,19 +362,34 @@ function readAuditProvenance(value: unknown): ControlAuditProvenance {
     }
   }
   const occurrence = validateOccurrenceWithoutClock(value.occurrence);
-  const grant = validateGrant(value.grant);
+  const grant =
+    value.grant === null ? ({ ok: true, value: null } as const) : validateGrant(value.grant);
+  const origin =
+    value.origin === undefined
+      ? ({ ok: true, value: undefined } as const)
+      : value.origin === "controller" || value.origin === "system-heat-stoppage"
+        ? ({ ok: true, value: value.origin } as const)
+        : ({ ok: false, error: "Stored Control Audit origin is invalid." } as const);
   const lifecycle = validateLifecycle(value.lifecycle);
   const override = validateOverride(value.override === null ? undefined : value.override);
   const recoveryProvenance =
     value.recoveryProvenance === null
       ? { ok: true as const, value: null }
       : validateRecoveryProvenanceShape(value.recoveryProvenance);
-  if (!occurrence.ok || !grant.ok || !lifecycle.ok || !override.ok || !recoveryProvenance.ok) {
+  if (
+    !occurrence.ok ||
+    !grant.ok ||
+    !origin.ok ||
+    !lifecycle.ok ||
+    !override.ok ||
+    !recoveryProvenance.ok
+  ) {
     throw new Error("Stored Control Audit provenance is invalid.");
   }
   return {
     occurrence: occurrence.value,
     grant: grant.value,
+    ...(origin.value === undefined ? {} : { origin: origin.value }),
     lifecycle: lifecycle.value,
     override: override.value ?? null,
     recoveryProvenance: recoveryProvenance.value ?? null,
