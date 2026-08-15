@@ -251,9 +251,9 @@ export async function createDockerProbeExecution(
       image: dependencies.image,
     }),
     // A work-timeout may race the daemon-side create request. Keep the Docker
-    // client alive only through the short admission grace; cleanup owns the
-    // remaining reserve for exact identity and absence proof.
-    { signal: admissionSignal },
+    // client alive through the cleanup reserve so the daemon's create result is
+    // reconciled before final evidence is emitted.
+    { signal: cleanupSignal },
   ).catch(() => null);
   if (create === null || create.exitCode !== 0 || create.outputExceeded) {
     const cleanupDisposition = await cleanupMalformedCreateOutput(runCommand, name, capability, {
@@ -283,6 +283,17 @@ export async function createDockerProbeExecution(
     artifactPath,
     identityVerified: false,
   };
+  if (admissionSignal?.aborted) {
+    const disposition = await cleanupLateCreatedDockerContainer(
+      runCommand,
+      container,
+      cleanupSignal,
+    );
+    throw new DockerAdmissionError(
+      "Docker admission completed after its work deadline.",
+      disposition,
+    );
+  }
   const admitted = await verifyDockerContainerConfiguration(
     runCommand,
     container,
@@ -538,6 +549,15 @@ export async function cleanupOwnedDockerContainer(
     identityVerified: true,
     removed: await verifyOwnedDockerContainerAbsence(runCommand, container.id, signal),
   };
+}
+
+export async function cleanupLateCreatedDockerContainer(
+  runCommand: DockerCommandRunner,
+  container: Pick<DockerProbeContainer, "id" | "name" | "capability">,
+  signal?: AbortSignal,
+): Promise<DockerAdmissionDisposition> {
+  const cleanup = await cleanupOwnedDockerContainer(runCommand, container, signal);
+  return cleanup.identityVerified && cleanup.removed ? "removed" : "unverified";
 }
 
 async function verifyOwnedContainer(

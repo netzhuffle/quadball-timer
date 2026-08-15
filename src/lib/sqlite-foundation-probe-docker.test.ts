@@ -302,7 +302,7 @@ describe("Docker SQLite qualification boundary", () => {
     ]);
     expect(calls[2]).toContain(`type=bind,src=${artifactPath},dst=/opt/quadball-timer,readonly`);
     expect(calls.map((value) => value[0])).not.toContain("start");
-    expect(createSignal).toBe(admissionSignal);
+    expect(createSignal).toBe(cleanupSignal);
   });
 
   test("uses production stop, kill, wait, removal, and exact absence in order", async () => {
@@ -782,6 +782,69 @@ describe("Docker SQLite qualification boundary", () => {
     );
     expect(cleanup).toBe("removed");
     expect(calls).toEqual(["ps", "ps", "ps", "ps", "ps", "ps", "inspect", "rm", "ps"]);
+  });
+
+  test("waits for daemon-side create completion before final late-create cleanup", async () => {
+    const artifactPath = await realpath("/bin/sh");
+    const admission = new AbortController();
+    const reconciliation = new AbortController();
+    const cleanup = new AbortController();
+    const calls: string[] = [];
+    let daemonCreated = false;
+    let createSignal: AbortSignal | undefined;
+    let resolveCreateDaemonResult!: () => void;
+    const createDaemonResult = new Promise<void>((resolve) => {
+      resolveCreateDaemonResult = () => {
+        daemonCreated = true;
+        resolve();
+      };
+    });
+    let markCreateStarted!: () => void;
+    const createStarted = new Promise<void>((resolve) => {
+      markCreateStarted = resolve;
+    });
+
+    const pending = createDockerProbeExecution(artifactPath, {
+      platform: "linux",
+      architecture: "x64",
+      invocationId: capability,
+      admissionSignal: admission.signal,
+      reconciliationSignal: reconciliation.signal,
+      cleanupSignal: cleanup.signal,
+      runCommand: async (arguments_, options) => {
+        const command = arguments_[0] ?? "";
+        calls.push(command);
+        if (command === "info")
+          return dockerResult(JSON.stringify({ OSType: "linux", Architecture: "x86_64" }));
+        if (command === "version")
+          return dockerResult(JSON.stringify({ Os: "linux", Arch: "amd64" }));
+        if (command === "create") {
+          createSignal = options?.signal;
+          markCreateStarted();
+          const aborted = new Promise<never>((_, reject) => {
+            options?.signal?.addEventListener("abort", () => reject(new Error("client aborted")), {
+              once: true,
+            });
+          });
+          await Promise.race([createDaemonResult, aborted]);
+          return dockerResult(`${containerId}\n`);
+        }
+        if (command === "inspect") return dockerResult(ownedContainerInspection());
+        if (command === "rm") return dockerResult();
+        if (command === "ps") return dockerResult();
+        throw new Error(`unexpected Docker command: ${arguments_.join(" ")}`);
+      },
+    }).catch((value) => value);
+    await createStarted;
+    admission.abort();
+    reconciliation.abort();
+    resolveCreateDaemonResult();
+    const error = await pending;
+    expect(daemonCreated).toBe(true);
+    expect(createSignal).toBe(cleanup.signal);
+    expect(error).toBeInstanceOf(DockerAdmissionError);
+    expect((error as DockerAdmissionError).disposition).toBe("removed");
+    expect(calls).toEqual(["info", "version", "create", "inspect", "rm", "ps"]);
   });
 
   test("classifies explicit pre-create empty observations as not-created", async () => {

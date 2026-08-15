@@ -2,6 +2,7 @@ import { performance } from "node:perf_hooks";
 import {
   admitDockerEngine,
   buildFocusedDockerCommand,
+  cleanupLateCreatedDockerContainer,
   cleanupMalformedCreateOutput,
   cleanupOwnedDockerContainer,
   parseContainerId,
@@ -154,9 +155,9 @@ async function createHarmlessExecution(
   lifecycle: DockerProbeLifecycle,
 ) {
   const name = command[command.indexOf("--name") + 1] ?? `quadball-timer-focused-${capability}`;
-  // Allow only the short admission grace after the work deadline; cleanup keeps
-  // the remaining reserve for exact ownership and absence proof.
-  const create = await runDockerCommand(command, { signal: lifecycle.admissionSignal }).catch(
+  // Keep the daemon-side create request alive through the cleanup reserve so a
+  // late-created container is reconciled before final evidence is emitted.
+  const create = await runDockerCommand(command, { signal: lifecycle.cleanupSignal }).catch(
     () => null,
   );
   if (create === null || create.exitCode !== 0 || create.outputExceeded) {
@@ -182,6 +183,17 @@ async function createHarmlessExecution(
     throw new FocusedAdmissionError(
       "Docker returned an invalid focused container identity",
       cleanupDisposition,
+    );
+  }
+  if (lifecycle.admissionSignal.aborted) {
+    const disposition = await cleanupLateCreatedDockerContainer(
+      runDockerCommand,
+      { id, name, capability },
+      lifecycle.cleanupSignal,
+    );
+    throw new FocusedAdmissionError(
+      "Docker focused admission completed after its work deadline",
+      disposition,
     );
   }
   const admitted = await verifyDockerContainerConfiguration(
