@@ -52,6 +52,11 @@ import {
   type EventAdministrationMutationOutcome,
   type EventAdministrationOutcome,
 } from "@/lib/event-administration";
+import {
+  createAdministrativeAuditProjection,
+  type AdministrativeAuditProjection,
+  type AdministrativeAuditProjectionKind,
+} from "@/lib/administrative-audit";
 import { createGrantAuthority } from "@/lib/grant-authority";
 import { readGrantAuthorityOptions } from "@/lib/grant-runtime";
 import type { TypedGrantMutation, TypedGrantReveal } from "@/lib/grant-management";
@@ -209,6 +214,7 @@ async function startServer() {
     const eventCatalog = createEventCatalog(eventCatalogStorage, {});
     const audienceProjection = createAudienceProjection(eventCatalogStorage);
     let eventAdministration: EventAdministration | null = null;
+    let administrativeAuditProjection: AdministrativeAuditProjection | null = null;
     if (foundationStorage !== undefined) {
       try {
         const grantOptions = {
@@ -220,6 +226,10 @@ async function startServer() {
           storage: foundationStorage,
           grants: grantAuthority,
           controlScopeResolver: grantOptions.controlScopeResolver,
+        });
+        administrativeAuditProjection = createAdministrativeAuditProjection({
+          storage: foundationStorage,
+          grants: grantAuthority,
         });
       } catch {
         // Grant keys are an Event Administration dependency, not a server-wide dependency.
@@ -692,6 +702,19 @@ async function startServer() {
             return catalogResponse(await eventCatalog.removeEvent(eventId, token));
           },
         },
+        "/api/admin/events/:eventId/audit": {
+          async GET(req: Request) {
+            const token = requireTechnicalAdminToken(req, technicalAdminAuth);
+            if (token === null) return sensitiveGenericAuthFailure(401);
+            if (administrativeAuditProjection === null) return sensitiveGenericAuthFailure(503);
+            const eventId = new URL(req.url).pathname.split("/").at(-2) ?? "";
+            return administrativeAuditResponse(
+              await administrativeAuditProjection.read(
+                administrativeAuditQuery(new URL(req.url), eventId, token),
+              ),
+            );
+          },
+        },
         "/api/admin/events/:eventId/publication-status": {
           async POST(req: Request) {
             const token = requireTechnicalAdminMutationToken(req, technicalAdminAuth);
@@ -1152,6 +1175,19 @@ async function startServer() {
               authority,
             });
             return sensitiveEventAdministrationResponse(result);
+          },
+        },
+        "/api/event-admin/audit": {
+          async GET(req: Request) {
+            if (administrativeAuditProjection === null) return sensitiveGenericAuthFailure(503);
+            const authority = resolveEventAdministrationAuthority(req, technicalAdminAuth);
+            if (authority === null) return sensitiveGenericAuthFailure(401);
+            const url = new URL(req.url);
+            return administrativeAuditResponse(
+              await administrativeAuditProjection.read(
+                administrativeAuditQuery(url, url.searchParams.get("eventId") ?? "", authority),
+              ),
+            );
           },
         },
         "/api/event-admin/catalog": {
@@ -2266,6 +2302,38 @@ function sensitiveEventAdministrationResponse<T>(
     result.reason === "unauthorized" ? 401 : result.reason === "not-found" ? 404 : 400,
     extraHeaders,
   );
+}
+
+function administrativeAuditResponse<T>(
+  result: import("@/lib/administrative-audit").AdministrativeAuditOutcome<T>,
+) {
+  if (result.status === "accepted") return sensitiveJson(result);
+  if (result.status === "unavailable") return sensitiveJson(result, 503);
+  return sensitiveJson(result, result.reason === "unauthorized" ? 401 : 400);
+}
+
+function administrativeAuditQuery(
+  url: URL,
+  eventId: string,
+  authority: EventAdministrationAuthority,
+) {
+  const projection = url.searchParams.get("projection");
+  return {
+    projection: (projection === null
+      ? "event-administration"
+      : projection) as AdministrativeAuditProjectionKind,
+    eventId,
+    authority,
+    cursor: url.searchParams.get("cursor") ?? undefined,
+    limit: url.searchParams.get("limit") ?? undefined,
+    direction: url.searchParams.get("direction") ?? undefined,
+    action: url.searchParams.get("action") ?? undefined,
+    grantId: url.searchParams.get("grantId") ?? undefined,
+    eventGameId: url.searchParams.get("eventGameId") ?? undefined,
+    gameDayId: url.searchParams.get("gameDayId") ?? undefined,
+    pitchId: url.searchParams.get("pitchId") ?? undefined,
+    pitchSlotId: url.searchParams.get("pitchSlotId") ?? undefined,
+  };
 }
 
 function sensitiveEventAdministrationMutationResponse<T>(

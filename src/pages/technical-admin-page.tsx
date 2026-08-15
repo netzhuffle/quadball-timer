@@ -4,6 +4,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { AdministrativeAuditBrowser } from "@/pages/administrative-audit-browser";
 
 type AdminSession = {
   authenticated: true;
@@ -477,6 +478,11 @@ function EventCatalogPanel() {
                   Open Event Hub
                 </Button>
               </div>
+              <AdministrativeAuditBrowser
+                eventId={selected.eventId}
+                route="technical-admin"
+                request={adminFetch}
+              />
               <div className="space-y-3 rounded-lg border p-3">
                 <div>
                   <h3 className="font-semibold">Event Admin Grant</h3>
