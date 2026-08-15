@@ -43,10 +43,14 @@ export function PublicGameTimeline({
         {hasNewPlay ? (
           <button
             type="button"
+            aria-label="Show newest play"
             className="rounded-full border px-3 py-1 text-xs font-semibold text-primary hover:bg-accent focus:outline-none focus:ring-2 focus:ring-ring"
             onClick={() => {
               const node = scrollRef.current;
-              if (node !== null) node.scrollTo({ top: 0, behavior: "smooth" });
+              if (node !== null) {
+                node.scrollTo({ top: 0, behavior: prefersReducedMotion() ? "auto" : "smooth" });
+                node.focus({ preventScroll: true });
+              }
               atLiveEdgeRef.current = true;
               setHasNewPlay(false);
             }}
@@ -57,7 +61,9 @@ export function PublicGameTimeline({
       </div>
       <div
         ref={scrollRef}
-        className="max-h-[32rem] overflow-y-auto overscroll-contain rounded-xl border bg-muted/20 p-2"
+        className="max-h-[32rem] overflow-y-auto overscroll-contain rounded-xl border bg-muted/20 p-2 [overflow-anchor:none] focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
+        tabIndex={0}
+        role="region"
         onScroll={(event) => {
           const node = event.currentTarget;
           atLiveEdgeRef.current = node.scrollTop <= 8;
@@ -76,6 +82,14 @@ export function PublicGameTimeline({
         </ol>
       </div>
     </section>
+  );
+}
+
+function prefersReducedMotion(): boolean {
+  return (
+    typeof window !== "undefined" &&
+    typeof window.matchMedia === "function" &&
+    window.matchMedia("(prefers-reduced-motion: reduce)").matches
   );
 }
 

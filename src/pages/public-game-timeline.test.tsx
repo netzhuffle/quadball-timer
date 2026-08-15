@@ -124,6 +124,7 @@ describe("public Game Timeline browser seam", () => {
       await Promise.resolve();
     });
     expect(region.scrollTop).toBe(0);
+    expect(document.activeElement).toBe(region);
 
     height = 320;
     await act(async () => {

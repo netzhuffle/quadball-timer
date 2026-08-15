@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent, CardDescription, CardHeader } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { getAdHocBrowserId } from "@/lib/ad-hoc-handoff";
@@ -55,14 +55,21 @@ export function PublicEventHomePage({ showAll = false }: { showAll?: boolean }) 
     >
       {events === null && !discoveryUnavailable ? (
         <div className="space-y-6">
-          <p className="rounded-2xl border bg-card/80 p-5 text-sm text-muted-foreground">
+          <p
+            className="rounded-2xl border bg-card/80 p-5 text-sm text-muted-foreground"
+            role="status"
+            aria-live="polite"
+          >
             Loading Published Events…
           </p>
           <StartAdHocGame />
         </div>
       ) : discoveryUnavailable ? (
         <div className="space-y-6">
-          <p className="rounded-2xl border bg-card/80 p-5 text-sm text-muted-foreground">
+          <p
+            className="rounded-2xl border bg-card/80 p-5 text-sm text-muted-foreground"
+            role="alert"
+          >
             Event discovery is unavailable.
           </p>
           <StartAdHocGame />
@@ -75,13 +82,18 @@ export function PublicEventHomePage({ showAll = false }: { showAll?: boolean }) 
 }
 
 export function PublicEventPage({ eventId }: { eventId: string }) {
-  const { event, unavailable } = usePublicEventProjection(eventId);
+  const { event, unavailable, connectionStatus } = usePublicEventProjection(eventId);
 
   if (unavailable) return <UnavailablePanel />;
   if (event === null) {
     return (
       <PublicShell title="Published Event" description="Loading public Event information…">
-        <p className="rounded-2xl border bg-card/80 p-5 text-sm text-muted-foreground">Loading…</p>
+        <p
+          className="rounded-2xl border bg-card/80 p-5 text-sm text-muted-foreground"
+          role="status"
+        >
+          Loading…
+        </p>
       </PublicShell>
     );
   }
@@ -98,10 +110,11 @@ export function PublicEventPage({ eventId }: { eventId: string }) {
             All events
           </Button>
         </div>
+        <LiveProjectionStatus status={connectionStatus} message={eventAnnouncement(event)} />
         <ScheduleBoard schedule={schedule} timeZone={event.timeZone} />
         <Card>
           <CardHeader>
-            <CardTitle>Game Days</CardTitle>
+            <h2 className="text-base leading-none font-semibold">Game Days</h2>
             <CardDescription>
               Published Event information from the authoritative catalog.
             </CardDescription>
@@ -120,7 +133,7 @@ export function PublicEventPage({ eventId }: { eventId: string }) {
             )}
             {event.teams.length > 0 && (
               <div>
-                <h2 className="text-sm font-semibold">Event Teams</h2>
+                <h3 className="text-sm font-semibold">Event Teams</h3>
                 <ul className="mt-2 grid gap-2 sm:grid-cols-2">
                   {event.teams.map((team) => (
                     <li
@@ -135,7 +148,7 @@ export function PublicEventPage({ eventId }: { eventId: string }) {
             )}
             {event.pitches.length > 1 && (
               <div>
-                <h2 className="text-sm font-semibold">Pitches</h2>
+                <h3 className="text-sm font-semibold">Pitches</h3>
                 <ul className="mt-2 flex flex-wrap gap-2">
                   {event.pitches.map((pitch) => (
                     <li key={pitch.name} className="rounded-full border px-3 py-1 text-sm">
@@ -155,6 +168,9 @@ export function PublicEventPage({ eventId }: { eventId: string }) {
 function usePublicEventProjection(eventId: string) {
   const [event, setEvent] = useState<PublicAudienceEventProjection | null>(null);
   const [unavailable, setUnavailable] = useState(false);
+  const [connectionStatus, setConnectionStatus] = useState<
+    "loading" | "connected" | "reconnecting" | "unavailable"
+  >("loading");
 
   useEffect(() => {
     let active = true;
@@ -164,6 +180,7 @@ function usePublicEventProjection(eventId: string) {
     let terminalUnavailable = false;
     setEvent(null);
     setUnavailable(false);
+    setConnectionStatus("loading");
 
     const readAuthoritativeEvent = async () => {
       const response = await fetch(`/api/audience/events/${encodeURIComponent(eventId)}`);
@@ -191,6 +208,7 @@ function usePublicEventProjection(eventId: string) {
       const connection = new WebSocket(publicEventWebSocketUrl());
       socket = connection;
       connection.onopen = () => {
+        setConnectionStatus("connected");
         connection.send(JSON.stringify({ type: "subscribe-public-event", eventId }));
       };
       connection.onmessage = (message) => {
@@ -207,15 +225,18 @@ function usePublicEventProjection(eventId: string) {
           terminalUnavailable = true;
           setEvent(null);
           setUnavailable(true);
+          setConnectionStatus("unavailable");
           connection.close();
           return;
         }
         if (result.status !== "applied" || replica.projection === null) return;
         setEvent(replica.projection);
+        setConnectionStatus("connected");
       };
       connection.onclose = () => {
         if (!active || terminalUnavailable || socket !== connection) return;
         socket = null;
+        setConnectionStatus("reconnecting");
         void recoverFromDisconnect();
       };
     };
@@ -223,13 +244,12 @@ function usePublicEventProjection(eventId: string) {
     recoverFromDisconnect = async () => {
       if (!active || terminalUnavailable || recovering) return;
       if (reconnectAttempts >= PUBLIC_EVENT_MAX_RECONNECT_ATTEMPTS) {
-        setEvent(null);
         setUnavailable(true);
+        setConnectionStatus("unavailable");
         return;
       }
       recovering = true;
       reconnectAttempts += 1;
-      setEvent(null);
       try {
         const nextEvent = await readAuthoritativeEvent();
         if (!active || terminalUnavailable) return;
@@ -238,8 +258,8 @@ function usePublicEventProjection(eventId: string) {
         connect(makeReplica(nextEvent));
       } catch {
         if (active) {
-          setEvent(null);
           setUnavailable(true);
+          setConnectionStatus("unavailable");
         }
       } finally {
         recovering = false;
@@ -257,6 +277,7 @@ function usePublicEventProjection(eventId: string) {
         if (active) {
           setEvent(null);
           setUnavailable(true);
+          setConnectionStatus("unavailable");
         }
       });
     return () => {
@@ -266,7 +287,7 @@ function usePublicEventProjection(eventId: string) {
     };
   }, [eventId]);
 
-  return { event, unavailable };
+  return { event, unavailable, connectionStatus };
 }
 
 const PUBLIC_EVENT_MAX_RECONNECT_ATTEMPTS = 2;
@@ -298,7 +319,7 @@ export function PublicEventGamePage({
   eventId: string;
   eventGameId: string;
 }) {
-  const { event, unavailable } = usePublicEventProjection(eventId);
+  const { event, unavailable, connectionStatus } = usePublicEventProjection(eventId);
   const game =
     event?.schedule.scheduleGames.find((candidate) => candidate.eventGameId === eventGameId) ??
     null;
@@ -326,7 +347,12 @@ export function PublicEventGamePage({
     if (event !== null) return <GameUnavailablePanel eventId={eventId} />;
     return (
       <PublicShell title="Live spectator Game" description="Loading public Game information…">
-        <p className="rounded-2xl border bg-card/80 p-5 text-sm text-muted-foreground">Loading…</p>
+        <p
+          className="rounded-2xl border bg-card/80 p-5 text-sm text-muted-foreground"
+          role="status"
+        >
+          Loading…
+        </p>
       </PublicShell>
     );
   }
@@ -356,6 +382,7 @@ export function PublicEventGamePage({
           </Button>
           <p className="text-sm text-muted-foreground">{game.pitch ?? "Event Game"}</p>
         </div>
+        <LiveProjectionStatus status={connectionStatus} message={gameAnnouncement(game)} />
         <div
           ref={scoreboardSentinelRef}
           aria-hidden="true"
@@ -443,7 +470,9 @@ export function PublicEventGamePage({
         </section>
         <Card>
           <CardHeader>
-            <CardTitle>Game Phase and operational status</CardTitle>
+            <h2 className="text-base leading-none font-semibold">
+              Game Phase and operational status
+            </h2>
             <CardDescription>
               Committed public information from the Event Game&apos;s Audience Projection.
             </CardDescription>
@@ -518,6 +547,8 @@ function PublicScoreSide({
       className={`min-w-0 rounded-2xl border-2 bg-card p-3 ${align === "right" ? "text-right" : "text-left"}`}
       style={{ borderColor: side.color ?? "hsl(var(--border))" }}
       data-side-id={sideId}
+      role="group"
+      aria-label={`${label}: ${side.name ?? "Unassigned Team"}, score ${side.score ?? "unavailable"}${isCatching ? ", flag catch" : ""}`}
     >
       <p className="text-xs font-semibold tracking-wide text-muted-foreground uppercase">{label}</p>
       <p className="mt-1 break-words text-base font-semibold leading-tight sm:text-xl">
@@ -757,9 +788,27 @@ function GameCard({
       <CardHeader className={compact ? "pb-3" : undefined}>
         <div className="flex flex-wrap items-start justify-between gap-2">
           <div>
-            <CardTitle className={compact ? "text-base" : "text-lg"}>
-              {game.gameDesignation ?? game.gameCode ?? "Scheduled Game"}
-            </CardTitle>
+            <h3 className={compact ? "text-base font-semibold" : "text-lg font-semibold"}>
+              <a
+                href={game.canonicalPath}
+                className="rounded-sm underline-offset-4 hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+                onClick={(click) => {
+                  if (
+                    click.button !== 0 ||
+                    click.metaKey ||
+                    click.ctrlKey ||
+                    click.shiftKey ||
+                    click.altKey
+                  )
+                    return;
+                  click.preventDefault();
+                  navigateTo(game.canonicalPath);
+                }}
+              >
+                {game.gameDesignation ?? game.gameCode ?? "Scheduled Game"}
+                <span className="sr-only"> Open spectator Game</span>
+              </a>
+            </h3>
             {game.gameDesignation !== null && game.gameCode !== null ? (
               <CardDescription>Game {game.gameCode}</CardDescription>
             ) : null}
@@ -1158,7 +1207,7 @@ function StartAdHocGame() {
   return (
     <Card>
       <CardHeader>
-        <CardTitle>Start Ad Hoc Game</CardTitle>
+        <h2 className="text-base leading-none font-semibold">Start Ad Hoc Game</h2>
         <CardDescription>
           Need an unscheduled Game? Start one here as an equal Ad Hoc Controller.
         </CardDescription>
@@ -1203,6 +1252,7 @@ function StartAdHocGame() {
           </div>
         </div>
         <Button
+          type="button"
           className="w-full"
           disabled={creationPending}
           onClick={() => void handleCreateGame()}
@@ -1234,6 +1284,12 @@ function PublicShell({
 }) {
   return (
     <div className="mx-auto w-full max-w-5xl p-4 pb-12 sm:p-6">
+      <a
+        href="#main-content"
+        className="sr-only z-50 rounded-md bg-background px-3 py-2 text-sm font-semibold focus:not-sr-only focus:absolute focus:left-4 focus:top-4 focus-visible:ring-2 focus-visible:ring-ring"
+      >
+        Skip to main content
+      </a>
       <header className="mb-6 rounded-2xl border bg-card/80 p-5 shadow-sm backdrop-blur">
         <p className="text-xs font-semibold tracking-widest text-muted-foreground uppercase">
           Quadball Timer
@@ -1241,9 +1297,62 @@ function PublicShell({
         <h1 className="mt-2 text-3xl font-semibold tracking-tight">{title}</h1>
         <p className="mt-2 text-sm text-muted-foreground">{description}</p>
       </header>
-      {children}
+      <main id="main-content" tabIndex={-1}>
+        {children}
+      </main>
     </div>
   );
+}
+
+function LiveProjectionStatus({
+  status,
+  message,
+}: {
+  status: "loading" | "connected" | "reconnecting" | "unavailable";
+  message: string;
+}) {
+  const connectionMessage =
+    status === "reconnecting"
+      ? "Live updates reconnecting; the last committed view remains visible."
+      : status === "unavailable"
+        ? "Live updates are unavailable."
+        : status === "loading"
+          ? "Loading live updates."
+          : "Live updates connected.";
+  return (
+    <p
+      className="sr-only"
+      role="status"
+      aria-live="polite"
+      aria-atomic="true"
+      data-live-projection-status
+    >
+      {connectionMessage} {message}
+    </p>
+  );
+}
+
+function gameAnnouncement(game: PublicAudienceGameProjection): string {
+  return `${formatScoreAnnouncement(game)}. ${gamePhaseLabel(game.phase)}. ${operationalStatusLabel(game.operationalStatus)}.`;
+}
+
+function eventAnnouncement(event: PublicAudienceEventProjection): string {
+  const liveScores = event.schedule.runningGames.map(formatScoreAnnouncement).join("; ");
+  const liveSummary =
+    liveScores.length === 0
+      ? "There are no running Games."
+      : `${event.schedule.runningGames.length} running Game${event.schedule.runningGames.length === 1 ? "" : "s"}: ${liveScores}.`;
+  const timelineCount = event.schedule.scheduleGames.reduce(
+    (count, game) => count + game.timeline.length,
+    0,
+  );
+  return `${liveSummary} ${event.schedule.upcomingGames.length} upcoming Game${event.schedule.upcomingGames.length === 1 ? "" : "s"}. ${timelineCount} public Timeline entr${timelineCount === 1 ? "y" : "ies"}.`;
+}
+
+function formatScoreAnnouncement(game: PublicAudienceGameProjection): string {
+  const sideA = game.sideA.name ?? "Side A";
+  const sideB = game.sideB.name ?? "Side B";
+  return `${sideA} ${game.sideA.score ?? "unavailable"}, ${sideB} ${game.sideB.score ?? "unavailable"}`;
 }
 
 function UnavailablePanel() {
