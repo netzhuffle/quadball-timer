@@ -94,6 +94,22 @@ describe("Test Environment deployment contract", () => {
     expect(activation).toContain('chmod -R a-w -- "$release_dir"');
   });
 
+  test("restores the validated Test staging root write bit before promotion", () => {
+    const activation = readFileSync(
+      join(repositoryRoot, "deploy/activate-test-release.sh"),
+      "utf8",
+    );
+    const verification = activation.indexOf('verify_bundle "$staged_dir"');
+    const rootWrite = activation.indexOf('chmod u+w -- "$staged_dir"', verification);
+    const promotion = activation.indexOf('mv -- "$staged_dir" "$release_dir"', rootWrite);
+    const finalization = activation.indexOf('chmod -R a-w -- "$release_dir"', promotion);
+
+    expect(verification).toBeGreaterThanOrEqual(0);
+    expect(rootWrite).toBeGreaterThan(verification);
+    expect(promotion).toBeGreaterThan(rootWrite);
+    expect(finalization).toBeGreaterThan(promotion);
+  });
+
   test("provisions and verifies the dedicated Test group before either user", () => {
     const provisioning = readFileSync(
       join(repositoryRoot, "deploy/test-environment-provisioning.md"),
