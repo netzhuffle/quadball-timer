@@ -38,6 +38,8 @@ import {
   MemoryTechnicalAdminAuthRepository,
   createTechnicalAdminAuth,
 } from "@/lib/technical-admin-auth";
+import { SHARED_LIMITS } from "@/lib/validation-policy";
+import { createSpectatorCapacity } from "@/lib/spectator-capacity";
 
 describe("Live Event Game control", () => {
   test("projects only the current correction with its correction-time name and gates acknowledgement", async () => {
@@ -169,6 +171,607 @@ describe("Live Event Game control", () => {
         seekerPenalty: "controller-guessed",
       }),
     ).toMatchObject({ ok: false });
+  });
+
+  test("converges actual acceptance, projection, outcomes, and audit references for causal arrival orders", async () => {
+    const seed = 0x97c0ffee;
+    const pairOrders = [
+      [0, 1, 2],
+      [1, 0, 2],
+    ];
+    const pairSnapshots = await Promise.all(
+      pairOrders.map((order) => runLiveControlConvergenceSequence(seed, 0, order)),
+    );
+    expect(pairSnapshots[0]).toEqual(pairSnapshots[1]);
+
+    for (const order of [
+      [0, 2, 1],
+      [1, 0, 2],
+      [2, 0, 1],
+    ]) {
+      const snapshot = await runLiveControlConvergenceSequence(seed, 1, order);
+      expect(snapshot.acceptedOrder).toEqual(["goal-1", "correction-1", "follow-up-1"]);
+      expect(snapshot.outcomes).toEqual([
+        { operationId: "goal-1", status: "accepted" },
+        { operationId: "correction-1", status: "accepted" },
+        { operationId: "follow-up-1", status: "accepted" },
+      ]);
+      expect(snapshot.auditReferences).toHaveLength(3);
+    }
+  });
+
+  test("minimizes a bounded synthetic failure to its smallest useful reproducer", async () => {
+    const minimized = await minimizeFailingGeneratedSequence(
+      ["unrelated-a", "cause", "unrelated-b", "trigger"],
+      async (candidate) => candidate.includes("cause") && candidate.includes("trigger"),
+      (candidate) => candidate.length >= 2,
+    );
+
+    expect(minimized).toEqual(["cause", "trigger"]);
+  });
+
+  test("identifies nested generated mismatches by path and bounded values", () => {
+    expect(() =>
+      assertGeneratedSnapshotConvergence(
+        { projection: { scoreByGameSide: { "side-a": 10 } } },
+        { projection: { scoreByGameSide: { "side-a": 0 } } },
+      ),
+    ).toThrow("snapshot-mismatch:path=$.projection.scoreByGameSide.side-a:expected=0:actual=10");
+  });
+
+  test("audits the complete live-control noncommutative matrix through composed replay", async () => {
+    const cases: readonly ComposedReplayMatrixCase[] = [
+      {
+        name: "clock transitions / correction / Offline Clock Holder",
+        actions: () => [
+          { intent: clockIntent("matrix-clock-start", true), causalPredecessorIds: [] },
+          {
+            intent: clockCorrectionIntent("matrix-clock-correction", 5_000),
+            causalPredecessorIds: ["matrix-clock-start"],
+          },
+          {
+            intent: clockIntent("matrix-clock-pause", false),
+            causalPredecessorIds: ["matrix-clock-correction"],
+          },
+        ],
+      },
+      {
+        name: "goal / flag-catch close play / result lifecycle",
+        actions: () => [
+          {
+            intent: goalIntent({
+              operationId: "matrix-close-goal",
+              factId: "matrix-close-goal",
+              gameSideId: "side-a",
+              gameTimeMs: 1_199_500,
+            }),
+            causalPredecessorIds: [],
+          },
+          {
+            intent: {
+              ...flagCatchIntent("matrix-close-catch", "matrix-close-catch", "side-b"),
+              sportingOrderAdjudication: {
+                relatedFactId: "matrix-close-goal",
+                relation: "after" as const,
+              },
+              override: closePlayAdjudicationOverride(
+                1_200_000,
+                "matrix-close-goal",
+                1_199_500,
+                "after",
+              ),
+            },
+            causalPredecessorIds: ["matrix-close-goal"],
+          },
+        ],
+      },
+      {
+        name: "card / opposing goal / durable score release",
+        actions: () => [
+          {
+            intent: cardIntent({
+              operationId: "matrix-penalty-card",
+              factId: "matrix-penalty-card",
+              gameSideId: "side-b",
+              gameTimeMs: 0,
+            }),
+            causalPredecessorIds: [],
+          },
+          {
+            intent: goalIntent({
+              operationId: "matrix-penalty-goal",
+              factId: "matrix-penalty-goal",
+              gameSideId: "side-a",
+              gameTimeMs: 1_000,
+            }),
+            causalPredecessorIds: ["matrix-penalty-card"],
+          },
+          {
+            intent: correctionIntent(
+              "matrix-penalty-correction",
+              "matrix-penalty-correction",
+              false,
+              "matrix-penalty-goal",
+            ),
+            causalPredecessorIds: ["matrix-penalty-goal"],
+          },
+        ],
+      },
+      {
+        name: "timeout procedure / suspension start and resume lifecycle",
+        knownDodgeballIds: ["ball-1"],
+        actions: () => [
+          {
+            intent: clockIntent("matrix-timeout-pause", false),
+            causalPredecessorIds: [],
+          },
+          {
+            intent: substantiveIntent("matrix-timeout", "timeout"),
+            causalPredecessorIds: ["matrix-timeout-pause"],
+          },
+          {
+            intent: {
+              ...substantiveIntent("matrix-suspension-start", "suspension"),
+              suspensionAction: "start" as const,
+              suspensionSnapshot: suspensionSnapshot(0),
+            },
+            causalPredecessorIds: ["matrix-timeout"],
+          },
+          {
+            intent: {
+              ...substantiveIntent("matrix-suspension-resume", "suspension"),
+              suspensionAction: "resume" as const,
+              resumesSuspensionFactId: "fact-matrix-suspension-start",
+            },
+            causalPredecessorIds: ["matrix-suspension-start"],
+          },
+        ],
+      },
+      {
+        name: "Heat Stoppage Mode / durable trigger / Head Referee decision",
+        heatStoppageConfiguration: true,
+        actions: () => [
+          {
+            intent: clockIntent("matrix-heat-start", true),
+            causalPredecessorIds: [],
+          },
+          {
+            intent: clockIntent("matrix-heat-pause", false),
+            causalPredecessorIds: ["matrix-heat-start"],
+          },
+          {
+            intent: {
+              ...clockCorrectionIntent("matrix-heat-trigger", 15 * 60 * 1000),
+              clockTimeMs: 15 * 60 * 1000,
+              gameTimeMs: 15 * 60 * 1000,
+            },
+            causalPredecessorIds: ["matrix-heat-pause"],
+          },
+        ],
+      },
+      {
+        name: "Game Presentation same-field ordering",
+        presentation: true,
+        actions: () => [
+          {
+            intent: presentationIntent("matrix-presentation-left", "side-b-left"),
+            causalPredecessorIds: [],
+          },
+          {
+            intent: presentationIntent("matrix-presentation-right", "side-a-left"),
+            causalPredecessorIds: ["matrix-presentation-left"],
+          },
+        ],
+      },
+      {
+        name: "finish / late sporting Fact / Correction and reinstatement",
+        actions: () => [
+          {
+            intent: substantiveIntent("matrix-finish", "result"),
+            causalPredecessorIds: [],
+          },
+          {
+            intent: goalIntent({
+              operationId: "matrix-late-goal",
+              factId: "matrix-late-goal",
+              gameSideId: "side-b",
+              gameTimeMs: 1_000,
+            }),
+            causalPredecessorIds: ["matrix-finish-reinstatement"],
+          },
+          {
+            intent: correctionIntent(
+              "matrix-finish-correction",
+              "matrix-finish-correction",
+              false,
+              "fact-matrix-finish",
+            ),
+            causalPredecessorIds: ["matrix-finish"],
+          },
+          {
+            intent: correctionIntent(
+              "matrix-finish-reinstatement",
+              "matrix-finish-reinstatement",
+              true,
+              "fact-matrix-finish",
+            ),
+            causalPredecessorIds: ["matrix-finish-correction"],
+          },
+        ],
+      },
+    ];
+
+    for (const scenario of cases) {
+      const orders = allPermutationIndexes(scenario.actions().length);
+      const snapshots = await Promise.all(
+        orders.map((order) => runComposedReplayMatrixCase(scenario, order)),
+      );
+      const baseline = snapshots[0];
+      expect(baseline, scenario.name).toBeDefined();
+      const operationIds = scenario.actions().map((action) => readOperationId(action.intent));
+      expect(
+        operationIds.every((operationId) =>
+          baseline?.outcomes.some((outcome) => outcome.operationId === operationId),
+        ),
+        scenario.name,
+      ).toBe(true);
+      expect(
+        baseline?.outcomes
+          .filter((outcome) => operationIds.includes(outcome.operationId))
+          .every((outcome) =>
+            ["accepted", "idempotent", "held-for-correction"].includes(outcome.status),
+          ),
+        scenario.name,
+      ).toBe(true);
+      for (const snapshot of snapshots) {
+        expect(JSON.stringify(snapshot)).toBe(JSON.stringify(baseline));
+      }
+    }
+    await runGeneratedComposedSequences(cases, 0x97c0ffee);
+  }, 30_000);
+
+  test("runs the redacted 96-Game envelope through actual Controllers and bounded replay", async () => {
+    const envelope = {
+      gameCount: SHARED_LIMITS.load.maxLoadedEventGames,
+      livePitchCount: SHARED_LIMITS.load.maxSimultaneouslyLivePitches,
+      gameIds: Array.from(
+        { length: SHARED_LIMITS.load.maxLoadedEventGames },
+        (_, index) => `sqm-game-${index}`,
+      ),
+      livePitchIds: Array.from(
+        { length: SHARED_LIMITS.load.maxSimultaneouslyLivePitches },
+        (_, index) => `sqm-pitch-${index}`,
+      ),
+    };
+    const games: Awaited<ReturnType<typeof createHarness>>[] = [];
+    const liveControllers: {
+      game: Awaited<ReturnType<typeof createHarness>>;
+      first: { sessionBearer: string; grantSessionId: string; grantVersion: string };
+      second: { sessionBearer: string; grantSessionId: string; grantVersion: string };
+      index: number;
+    }[] = [];
+    let controllers = 0;
+    for (let index = 0; index < envelope.gameCount; index += 1) {
+      const game = await createHarness({
+        eventGameId: envelope.gameIds[index] ?? `sqm-game-${index}`,
+        pitchId: envelope.livePitchIds[index % envelope.livePitchCount] ?? `sqm-pitch-${index}`,
+      });
+      games.push(game);
+      if (index >= envelope.livePitchCount) continue;
+      controllers += 1;
+      const first = game.initialControllerSession;
+      const second = await game.control.openController({
+        qrCredential: game.qrCredential,
+        browserContext: `sqm-${index}-b`,
+      });
+      if (second.status !== "opened") throw new Error("Expected the second logical Controller.");
+      controllers += 1;
+      liveControllers.push({ game, first, second: second.session, index });
+    }
+
+    const replayResults = [];
+    const ordinaryResults = [];
+    for (const [position, { game, second, index }] of liveControllers.entries()) {
+      const replayPromise = game.control.replayControllerActions({
+        sessionBearer: second.sessionBearer,
+        eventGameId: game.root.eventGameId,
+        batchId: `sqm-replay-${index}`,
+        replicaGeneration: `sqm-generation-${index}`,
+        expectedGrantSessionId: second.grantSessionId,
+        expectedGrantVersion: second.grantVersion,
+        actions: [
+          {
+            eventGameId: game.root.eventGameId,
+            intent: goalIntent({
+              operationId: `sqm-replay-action-${index}`,
+              factId: `sqm-replay-action-${index}`,
+              gameSideId: "side-b",
+              gameTimeMs: index + 1,
+            }),
+            causalPredecessorIds: [],
+          },
+        ],
+      });
+      const ordinaryTarget = liveControllers[(position + 1) % liveControllers.length];
+      if (ordinaryTarget === undefined) throw new Error("Expected an ordinary progress target.");
+      ordinaryResults.push(
+        await ordinaryTarget.game.control.submitControllerIntent({
+          sessionBearer: ordinaryTarget.first.sessionBearer,
+          eventGameId: ordinaryTarget.game.root.eventGameId,
+          intent: goalIntent({
+            operationId: `sqm-ordinary-${index}`,
+            factId: `sqm-ordinary-${index}`,
+            gameTimeMs: index,
+          }),
+        }),
+      );
+      replayResults.push(await replayPromise);
+    }
+    expect(ordinaryResults.every((result) => result.status === "accepted")).toBe(true);
+    expect(
+      replayResults.every(
+        (result, index) =>
+          result.status === "synchronized" &&
+          result.outcomes.some(
+            (outcome) =>
+              outcome.operationId === `sqm-replay-action-${index}` && outcome.status === "accepted",
+          ),
+      ),
+    ).toBe(true);
+
+    expect({
+      loadedGames: games.length,
+      livePitches: new Set(
+        games.slice(0, envelope.livePitchCount).map((game) => game.root.externalScope.pitchId),
+      ).size,
+      controllers,
+      replayed: replayResults.length,
+      ordinaryProgress: ordinaryResults.length,
+    }).toEqual({
+      loadedGames: 96,
+      livePitches: 6,
+      controllers: 12,
+      replayed: 6,
+      ordinaryProgress: 6,
+    });
+  });
+
+  test("recovers essential Controller outcomes while a slow Audience Projection socket disconnects", async () => {
+    const harness = await createHarness();
+    const opened = await harness.control.openController({
+      qrCredential: harness.qrCredential,
+      browserContext: "durable-outcome-controller",
+    });
+    if (opened.status !== "opened") throw new Error("Expected the Controller to open.");
+    const closed: { clientId: string; reason: string }[] = [];
+    const audience = createSpectatorCapacity<{ score: number }>({
+      adapter: {
+        readCurrentVersion: async () => ({
+          status: "available",
+          current: { version: "projection-v1", payload: { score: 0 } },
+        }),
+        measureQueuedOutputBytes: () => 32,
+        write: async () => false,
+        close: (clientId, reason) => closed.push({ clientId, reason }),
+      },
+      controllerCapacity: {
+        totalConnections: 14,
+        reservedConnections: 2,
+        activeControllerSessions: () => 1,
+      },
+    });
+    expect(await audience.admit({ clientId: "slow-spectator", eventId: "event-1" })).toMatchObject({
+      status: "admitted",
+    });
+
+    const intent = goalIntent({
+      operationId: "durable-essential-goal",
+      factId: "durable-essential-goal",
+      gameTimeMs: 1_000,
+    });
+    const first = await harness.control.submitControllerIntent({
+      sessionBearer: opened.session.sessionBearer,
+      eventGameId: harness.root.eventGameId,
+      intent,
+    });
+    expect(first).toMatchObject({
+      status: "accepted",
+      acknowledgement: { status: "acknowledged", operationId: "durable-essential-goal" },
+      auditReference: { kind: "control" },
+    });
+    await audience.drain("slow-spectator");
+    expect(closed).toEqual([{ clientId: "slow-spectator", reason: "slow-reader" }]);
+
+    const recovered = await harness.control.submitControllerIntent({
+      sessionBearer: opened.session.sessionBearer,
+      eventGameId: harness.root.eventGameId,
+      intent,
+    });
+    expect(recovered).toMatchObject({
+      status: "duplicate-accepted",
+      acknowledgement: { status: "acknowledged", operationId: "durable-essential-goal" },
+      auditReference: { kind: "control" },
+    });
+    expect(
+      recovered.status === "duplicate-accepted" && recovered.auditReference.id.length > 0,
+    ).toBe(true);
+    expect((await harness.record.readActions()).map(({ action }) => action.operationId)).toEqual([
+      "durable-essential-goal",
+    ]);
+    expect(audience.getMetrics()).toMatchObject({
+      activeSpectators: 0,
+      slowReaderDisconnects: 1,
+      queuedUpdates: 0,
+      controllerImpactGuardrail: { activeControllerSessions: 1 },
+    });
+  });
+
+  test("rejects malformed composed Controller envelopes before actual mutation or acknowledgement", async () => {
+    const harness = await createHarness();
+    const transport = createLiveEventGameControlTransport(
+      () => harness.control,
+      () => true,
+    );
+    const openedResponse = await transport.openController(
+      jsonRequest({
+        qrCredential: harness.qrCredential,
+        browserContext: "composed-route-controller",
+      }),
+    );
+    expect(openedResponse.status).toBe(200);
+    const opened = (await openedResponse.json()) as {
+      session: { sessionBearer: string; grantSessionId: string; grantVersion: string };
+    };
+    const before = await ownerState(harness);
+    const invalidActions = [
+      jsonRequest({
+        sessionBearer: "self-asserted-authority",
+        eventGameId: harness.root.eventGameId,
+        intent: null,
+      }),
+      jsonRequest({
+        sessionBearer: opened.session.sessionBearer,
+        eventGameId: harness.root.eventGameId,
+        intent: goalIntent({ operationId: "route-invalid-number", gameTimeMs: -1 }),
+      }),
+      jsonRequest({
+        sessionBearer: opened.session.sessionBearer,
+        eventGameId: harness.root.eventGameId,
+        intent: goalIntent({ operationId: "route-invalid-domain", gameSideId: "unknown-side" }),
+      }),
+      new Request("http://localhost/api/event-control/intent", {
+        method: "POST",
+        headers: { "content-type": "application/json", "content-length": String(65 * 1024) },
+        body: JSON.stringify({
+          sessionBearer: opened.session.sessionBearer,
+          eventGameId: harness.root.eventGameId,
+          intent: {
+            ...goalIntent({ operationId: "route-oversized-ack" }),
+            payload: "x".repeat(65_000),
+          },
+        }),
+      }),
+    ];
+    expect((await transport.submitControllerIntent(invalidActions[0]!)).status).toBe(403);
+    for (const request of invalidActions.slice(1)) {
+      expect((await transport.submitControllerIntent(request)).status).not.toBe(200);
+    }
+
+    const common = {
+      sessionBearer: opened.session.sessionBearer,
+      eventGameId: harness.root.eventGameId,
+      batchId: "route-batch",
+      replicaGeneration: "route-generation",
+      grantSessionId: opened.session.grantSessionId,
+      grantVersion: opened.session.grantVersion,
+    };
+    const invalidReplays = [
+      Array.from({ length: 101 }, () => ({
+        eventGameId: harness.root.eventGameId,
+        intent: goalIntent(),
+      })),
+      [{ eventGameId: harness.root.eventGameId, intent: goalIntent(), causalPredecessorIds: [42] }],
+      [
+        {
+          eventGameId: harness.root.eventGameId,
+          intent: goalIntent(),
+          causalPredecessorIds: ["same", "same"],
+        },
+      ],
+      [
+        {
+          eventGameId: harness.root.eventGameId,
+          intent: { ...goalIntent(), operationId: "i".repeat(129) },
+        },
+      ],
+    ];
+    for (const actions of invalidReplays) {
+      expect(
+        (await transport.replayControllerActions(jsonRequest({ ...common, actions }))).status,
+      ).not.toBe(200);
+    }
+    expect(await ownerState(harness)).toEqual(before);
+  });
+
+  test("covers injected duplicate, clock-jump, write-failure, revocation, and reorder seams", async () => {
+    const duplicateHarness = await createHarness();
+    const duplicateOpened = await duplicateHarness.control.openController({
+      qrCredential: duplicateHarness.qrCredential,
+      browserContext: "fault-duplicate",
+    });
+    if (duplicateOpened.status !== "opened") throw new Error("Expected the fault Controller.");
+    const duplicateResults = await Promise.all(
+      [0, 1].map(() =>
+        duplicateHarness.control.submitControllerIntent({
+          sessionBearer: duplicateOpened.session.sessionBearer,
+          eventGameId: duplicateHarness.root.eventGameId,
+          intent: goalIntent({ operationId: "fault-duplicate", factId: "fault-duplicate" }),
+        }),
+      ),
+    );
+    expect(duplicateResults.map((result) => result.status).sort()).toEqual([
+      "accepted",
+      "duplicate-accepted",
+    ]);
+
+    const clockHarness = await createHarness();
+    const clockOpened = await clockHarness.control.openController({
+      qrCredential: clockHarness.qrCredential,
+      browserContext: "fault-clock-jump",
+    });
+    if (clockOpened.status !== "opened") throw new Error("Expected the clock Controller.");
+    clockHarness.setNow(3_600_000);
+    expect(
+      await clockHarness.control.submitControllerIntent({
+        sessionBearer: clockOpened.session.sessionBearer,
+        eventGameId: clockHarness.root.eventGameId,
+        intent: clockCorrectionIntent("fault-clock-jump", 1_000_000),
+      }),
+    ).toMatchObject({ status: "accepted" });
+
+    const writeFailureHarness = await createHarness({ failureBoundary: "after-action" });
+    const writeOpened = await writeFailureHarness.control.openController({
+      qrCredential: writeFailureHarness.qrCredential,
+      browserContext: "fault-write-failure",
+    });
+    if (writeOpened.status !== "opened") throw new Error("Expected the write-failure Controller.");
+    expect(
+      await writeFailureHarness.control.submitControllerIntent({
+        sessionBearer: writeOpened.session.sessionBearer,
+        eventGameId: writeFailureHarness.root.eventGameId,
+        intent: goalIntent({ operationId: "fault-write", factId: "fault-write" }),
+      }),
+    ).toMatchObject({ status: "retryable" });
+    writeFailureHarness.failureBoundary = undefined;
+    expect(
+      await writeFailureHarness.control.submitControllerIntent({
+        sessionBearer: writeOpened.session.sessionBearer,
+        eventGameId: writeFailureHarness.root.eventGameId,
+        intent: goalIntent({ operationId: "fault-write", factId: "fault-write" }),
+      }),
+    ).toMatchObject({ status: "accepted" });
+
+    const revokedHarness = await createHarness();
+    const revokedOpened = await revokedHarness.control.openController({
+      qrCredential: revokedHarness.qrCredential,
+      browserContext: "fault-revocation",
+    });
+    if (revokedOpened.status !== "opened") throw new Error("Expected the revocation Controller.");
+    await revokedHarness.authority.revokeGrant(revokedHarness.grantId, {
+      kind: "fixture",
+      id: "fixture",
+    });
+    expect(
+      await revokedHarness.control.submitControllerIntent({
+        sessionBearer: revokedOpened.session.sessionBearer,
+        eventGameId: revokedHarness.root.eventGameId,
+        intent: goalIntent({ operationId: "fault-revoked", factId: "fault-revoked" }),
+      }),
+    ).toMatchObject({ status: "rejected" });
+    expect(await revokedHarness.record.readActions()).toHaveLength(0);
+
+    const reordered = await runLiveControlConvergenceSequence(0x97c0ffee, 777, [2, 0, 1]);
+    expect(reordered.outcomes.every((outcome) => outcome.status === "accepted")).toBe(true);
   });
 
   test("derives sticks-up and seeker-floor timing from the real Controller seam", async () => {
@@ -3496,7 +4099,7 @@ describe("Live Event Game control", () => {
     expect(await harness.record.readActions()).toHaveLength(3);
   });
 
-  test("freezes Game Day heat mode at commencement and carries durable trigger obligations", async () => {
+  test("freezes Game Day Heat Stoppage Mode at commencement and carries durable trigger obligations", async () => {
     const harness = await createHarness({ heatStoppageConfiguration: true });
     const opened = await harness.control.openController({
       qrCredential: harness.qrCredential,
@@ -6752,6 +7355,561 @@ describe("Live Event Game control", () => {
   });
 });
 
+type ComposedReplayMatrixCase = {
+  name: string;
+  heatStoppageConfiguration?: boolean;
+  knownDodgeballIds?: readonly string[];
+  presentation?: boolean;
+  actions: () => readonly {
+    intent: unknown;
+    causalPredecessorIds: readonly string[];
+    controllerIndex?: number;
+  }[];
+};
+
+class GeneratedSequenceFailure extends Error {
+  constructor(
+    readonly failureClass: string,
+    message: string,
+  ) {
+    super(message);
+    this.name = "GeneratedSequenceFailure";
+  }
+}
+
+async function minimizeFailingGeneratedSequence<T>(
+  sequence: readonly T[],
+  preservesFailure: (candidate: readonly T[]) => boolean | Promise<boolean>,
+  isUseful: (candidate: readonly T[]) => boolean = () => true,
+  maximumEvaluations = 31,
+): Promise<T[]> {
+  let evaluations = 0;
+  for (let size = 1; size < sequence.length; size += 1) {
+    for (const candidate of combinationsOfSize(sequence, size)) {
+      if (!isUseful(candidate)) continue;
+      if (evaluations >= maximumEvaluations) return [...sequence];
+      evaluations += 1;
+      if (await preservesFailure(candidate)) return candidate;
+    }
+  }
+  return [...sequence];
+}
+
+function combinationsOfSize<T>(values: readonly T[], size: number): T[][] {
+  if (size === 0) return [[]];
+  if (values.length < size) return [];
+  const combinations: T[][] = [];
+  for (let index = 0; index <= values.length - size; index += 1) {
+    const head = values[index];
+    if (head === undefined) continue;
+    for (const tail of combinationsOfSize(values.slice(index + 1), size - 1)) {
+      combinations.push([head, ...tail]);
+    }
+  }
+  return combinations;
+}
+
+function assertGeneratedSnapshotConvergence(actual: unknown, expected: unknown): void {
+  if (JSON.stringify(actual) === JSON.stringify(expected)) return;
+  const difference = findSnapshotDifference(actual, expected, "$", 0);
+  const path = difference.path === "" ? "$" : difference.path;
+  const failureClass = `snapshot-mismatch:path=${path}:expected=${boundedSnapshotValue(difference.expected)}:actual=${boundedSnapshotValue(difference.actual)}`;
+  throw new GeneratedSequenceFailure(
+    failureClass,
+    `${failureClass}; expected=${boundedSnapshotValue(expected)} actual=${boundedSnapshotValue(actual)}`,
+  );
+}
+
+function findSnapshotDifference(
+  actual: unknown,
+  expected: unknown,
+  path: string,
+  depth: number,
+): { path: string; actual: unknown; expected: unknown } {
+  if (depth >= 12) return { path, actual, expected };
+  if (Array.isArray(actual) && Array.isArray(expected)) {
+    if (actual.length !== expected.length) {
+      return { path: `${path}.length`, actual: actual.length, expected: expected.length };
+    }
+    for (let index = 0; index < actual.length; index += 1) {
+      const difference = findSnapshotDifference(
+        actual[index],
+        expected[index],
+        `${path}[${index}]`,
+        depth + 1,
+      );
+      if (difference.path !== "") return difference;
+    }
+    return { path: "", actual, expected };
+  }
+  if (isTestRecord(actual) && isTestRecord(expected)) {
+    const keys = [...new Set([...Object.keys(actual), ...Object.keys(expected)])].sort();
+    const operationSuffix =
+      typeof actual.operationId === "string"
+        ? `[operationId=${boundedSnapshotPathPart(actual.operationId)}]`
+        : "";
+    for (const key of keys) {
+      if (!(key in actual) || !(key in expected)) {
+        return {
+          path: `${path}${operationSuffix}.${key}`,
+          actual: actual[key],
+          expected: expected[key],
+        };
+      }
+      const difference = findSnapshotDifference(
+        actual[key],
+        expected[key],
+        `${path}${operationSuffix}.${key}`,
+        depth + 1,
+      );
+      if (difference.path !== "") return difference;
+    }
+    return { path: "", actual, expected };
+  }
+  if (JSON.stringify(actual) === JSON.stringify(expected)) return { path: "", actual, expected };
+  return { path, actual, expected };
+}
+
+function boundedSnapshotValue(value: unknown): string {
+  const serialized = JSON.stringify(value);
+  if (serialized === undefined) return typeof value;
+  return serialized.length <= 128 ? serialized : `${serialized.slice(0, 125)}...`;
+}
+
+function boundedSnapshotPathPart(value: string): string {
+  return value.length <= 64 ? value : `${value.slice(0, 61)}...`;
+}
+
+function generatedFailureClass(error: unknown): string {
+  if (error instanceof GeneratedSequenceFailure) return error.failureClass;
+  if (!(error instanceof Error)) return `thrown:${typeof error}`;
+  const messageClass = error.message.split(/[\n:]/, 1)[0] ?? "unknown";
+  return `thrown:${error.name}:${messageClass}`;
+}
+
+function isTestRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+async function minimizeGeneratedComposedFailure(
+  scenario: ComposedReplayMatrixCase,
+  order: readonly number[],
+  failureClass: string,
+  identity: string,
+): Promise<number[]> {
+  const actions = scenario.actions();
+  let attempt = 0;
+  const isUseful = (candidate: readonly number[]) => {
+    if (candidate.length < 2) return false;
+    const retainedOperationIds = new Set(
+      candidate.map((index) => readOperationId(actions[index]?.intent)),
+    );
+    const controllerCount = new Set(
+      candidate.map((index) => actions[index]?.controllerIndex ?? index % 2),
+    ).size;
+    return (
+      controllerCount === 2 &&
+      candidate.every((index) =>
+        (actions[index]?.causalPredecessorIds ?? []).every((predecessor) =>
+          retainedOperationIds.has(predecessor),
+        ),
+      )
+    );
+  };
+  return minimizeFailingGeneratedSequence(
+    order,
+    async (candidate) => {
+      const canonicalOriginalIndexes = [...candidate].sort((left, right) => left - right);
+      const subsetActions = canonicalOriginalIndexes.flatMap((originalIndex) => {
+        const action = actions[originalIndex];
+        return action === undefined
+          ? []
+          : [{ ...action, controllerIndex: action.controllerIndex ?? originalIndex % 2 }];
+      });
+      const remappedOrder = candidate.map((originalIndex) =>
+        canonicalOriginalIndexes.indexOf(originalIndex),
+      );
+      const candidateScenario: ComposedReplayMatrixCase = {
+        ...scenario,
+        actions: () => subsetActions,
+      };
+      const eventGameId = `generated-minimized-${identity}-${attempt}`;
+      attempt += 1;
+      const baseline = await runComposedReplayMatrixCase(
+        candidateScenario,
+        [...Array(subsetActions.length).keys()],
+        eventGameId,
+        { suppressIntermediateProjection: true },
+      );
+      try {
+        const observed = await runComposedReplayMatrixCase(
+          candidateScenario,
+          remappedOrder,
+          eventGameId,
+          { suppressIntermediateProjection: true },
+        );
+        assertGeneratedSnapshotConvergence(observed, baseline);
+        return false;
+      } catch (error) {
+        return generatedFailureClass(error) === failureClass;
+      }
+    },
+    isUseful,
+  );
+}
+
+async function runGeneratedComposedSequences(
+  scenarios: readonly ComposedReplayMatrixCase[],
+  seed: number,
+) {
+  let random = seed;
+  const next = (maximum: number) => {
+    random = (Math.imul(random, 1_664_525) + 1_013_904_223) >>> 0;
+    return random % maximum;
+  };
+  const baselines = await Promise.all(
+    scenarios.map((scenario, scenarioIndex) =>
+      runComposedReplayMatrixCase(
+        scenario,
+        [...Array(scenario.actions().length).keys()],
+        `generated-${scenarioIndex}`,
+        { suppressIntermediateProjection: true },
+      ),
+    ),
+  );
+  const sequences = Array.from({ length: 1_000 }, (_, sequence) => {
+    const scenarioIndex = next(scenarios.length);
+    const scenario = scenarios[scenarioIndex];
+    if (scenario === undefined) throw new Error(`seed=${seed} sequence=${sequence}`);
+    const permutations = allPermutationIndexes(scenario.actions().length);
+    const order = permutations[next(permutations.length)];
+    if (order === undefined) throw new Error(`seed=${seed} sequence=${sequence}`);
+    return { sequence, scenarioIndex, scenario, order };
+  });
+  expect(new Set(sequences.map(({ scenarioIndex }) => scenarioIndex)).size).toBe(scenarios.length);
+
+  for (let offset = 0; offset < sequences.length; offset += 25) {
+    await Promise.all(
+      sequences.slice(offset, offset + 25).map(async (sample) => {
+        try {
+          const snapshot = await runComposedReplayMatrixCase(
+            sample.scenario,
+            sample.order,
+            `generated-${sample.scenarioIndex}`,
+            { suppressIntermediateProjection: true },
+          );
+          const baseline = baselines[sample.scenarioIndex];
+          if (baseline === undefined) throw new Error("Expected a generated baseline.");
+          assertGeneratedSnapshotConvergence(snapshot, baseline);
+        } catch (error) {
+          const actions = sample.scenario.actions();
+          const failureClass = generatedFailureClass(error);
+          const minimizedOrder = await minimizeGeneratedComposedFailure(
+            sample.scenario,
+            sample.order,
+            failureClass,
+            `${seed}-${sample.sequence}`,
+          );
+          throw new Error(
+            `seed=${seed} sequence=${sample.sequence} category=${sample.scenario.name} failureClass=${failureClass} minimized=${JSON.stringify(minimizedOrder.map((index) => readOperationId(actions[index]?.intent)))} arrivalOrder=${JSON.stringify(minimizedOrder)}: ${String(error)}`,
+          );
+        }
+      }),
+    );
+    await Bun.sleep(0);
+  }
+}
+
+async function runComposedReplayMatrixCase(
+  scenario: ComposedReplayMatrixCase,
+  order: readonly number[],
+  eventGameId = `matrix-${scenario.name}`,
+  options: { suppressIntermediateProjection?: boolean } = {},
+) {
+  const harness = await createHarness({
+    eventGameId,
+    heatStoppageConfiguration: scenario.heatStoppageConfiguration,
+    knownDodgeballIds: scenario.knownDodgeballIds,
+    ...(options.suppressIntermediateProjection === true ? { projectionFailure: () => true } : {}),
+  });
+  const opened = { session: harness.initialControllerSession };
+  const observer = await harness.control.openController({
+    qrCredential: harness.qrCredential,
+    browserContext: `matrix-${order.join("-")}-b`,
+  });
+  if (observer.status !== "opened") throw new Error(`Expected ${scenario.name} observer.`);
+  const actions = scenario.actions();
+  const ordered = order.flatMap((index) => {
+    const action = actions[index];
+    return action === undefined
+      ? []
+      : [{ ...action, controllerIndex: action.controllerIndex ?? index % 2 }];
+  });
+  const common = {
+    sessionBearer: opened.session.sessionBearer,
+    eventGameId: harness.root.eventGameId,
+    batchId: `matrix-batch-${order.join("-")}`,
+    replicaGeneration: `matrix-generation-${order.join("-")}`,
+    expectedGrantSessionId: opened.session.grantSessionId,
+    expectedGrantVersion: opened.session.grantVersion,
+  };
+  harness.setNow(20_000);
+  const result = scenario.presentation
+    ? await submitPresentationArrival(harness, [opened.session, observer.session], ordered)
+    : await replayControlArrival(
+        harness,
+        [opened.session, observer.session],
+        ordered,
+        common.batchId,
+      );
+  expect(new Set(result.initialArrivalGrantSessionIds).size, scenario.name).toBe(
+    Math.min(2, ordered.length),
+  );
+  const observed =
+    options.suppressIntermediateProjection === true
+      ? null
+      : await harness.control.refreshController({
+          sessionBearer: observer.session.sessionBearer,
+          eventGameId: harness.root.eventGameId,
+        });
+  if (observed !== null && observed.status !== "authorized") {
+    throw new Error(`Expected ${scenario.name} observer refresh.`);
+  }
+  const outcomes = [...result.outcomes].sort((left, right) =>
+    left.operationId.localeCompare(right.operationId),
+  );
+  if (scenario.presentation) {
+    const presentation = await harness.record.readPresentation();
+    if (observed !== null && observed.status === "authorized") {
+      expect(observed.projection?.presentation).toEqual(presentation);
+    }
+    const presentationHistory = await harness.record.readPresentationHistory();
+    const audit = await harness.record.readPresentationAudit(null);
+    const operationIds = actions.map((action) => readOperationId(action.intent));
+    return {
+      acceptedOrder: presentationHistory.map(({ operationId }) => operationId),
+      derivedGameState: presentation,
+      outcomes,
+      auditReferences: audit
+        .filter(
+          (entry) =>
+            entry.kind === "presentation-accepted" &&
+            entry.operationId !== null &&
+            operationIds.includes(entry.operationId),
+        )
+        .map(({ operationId, auditId }) => ({ operationId, auditId }))
+        .sort((left, right) => (left.operationId ?? "").localeCompare(right.operationId ?? "")),
+    };
+  }
+  const rebuilt = await harness.record.rebuild();
+  if (rebuilt.status !== "ready") throw new Error(`Expected ${scenario.name} to rebuild.`);
+  if (observed !== null && observed.status === "authorized") {
+    expect(observed.projection).toEqual(result.projection);
+  }
+  const audit = await harness.record.readAudit(null);
+  const operationIds = actions.map((action) => readOperationId(action.intent));
+  return {
+    acceptedOrder: (await harness.record.readActions()).map(({ action }) => action.operationId),
+    derivedGameState: rebuilt.derivedGameState,
+    outcomes,
+    auditReferences: audit
+      .filter(
+        (entry) =>
+          entry.kind === "action-accepted" &&
+          entry.operationId !== null &&
+          operationIds.includes(entry.operationId),
+      )
+      .map(({ operationId, auditId }) => ({ operationId, auditId }))
+      .sort((left, right) => (left.operationId ?? "").localeCompare(right.operationId ?? "")),
+  };
+}
+
+type ComposedReplayHarness = Pick<
+  Awaited<ReturnType<typeof createHarness>>,
+  "root" | "record" | "control"
+>;
+
+async function submitPresentationArrival(
+  harness: ComposedReplayHarness,
+  sessions: readonly { sessionBearer: string; grantSessionId: string; grantVersion: string }[],
+  ordered: readonly {
+    intent: unknown;
+    causalPredecessorIds: readonly string[];
+    controllerIndex?: number;
+  }[],
+) {
+  const finalOutcomes = new Map<string, "accepted" | "idempotent" | "terminally-rejected">();
+  const initialArrivalGrantSessionIds: string[] = [];
+  let deferred: { action: (typeof ordered)[number]; initialIndex: number }[] = [];
+  for (const [index, action] of ordered.entries()) {
+    const controllerIndex = action.controllerIndex ?? index % sessions.length;
+    const session = sessions[controllerIndex];
+    if (session === undefined) throw new Error("Expected a presentation Controller.");
+    initialArrivalGrantSessionIds.push(session.grantSessionId);
+    const result = await harness.control.submitGamePresentationChange({
+      sessionBearer: session.sessionBearer,
+      eventGameId: harness.root.eventGameId,
+      change: action.intent,
+      causalPredecessorIds: action.causalPredecessorIds,
+      originatingGrant: { sessionId: session.grantSessionId, versionId: session.grantVersion },
+    });
+    const operationId = readOperationId(action.intent);
+    if (result.status === "accepted" || result.status === "duplicate-accepted") {
+      finalOutcomes.set(operationId, result.status === "accepted" ? "accepted" : "idempotent");
+    } else {
+      deferred.push({ action, initialIndex: controllerIndex });
+    }
+  }
+  for (let round = 0; deferred.length > 0 && round < ordered.length; round += 1) {
+    const nextDeferred: typeof deferred = [];
+    for (const { action, initialIndex } of deferred) {
+      const session = sessions[initialIndex];
+      if (session === undefined) throw new Error("Expected a presentation retry Controller.");
+      const result = await harness.control.submitGamePresentationChange({
+        sessionBearer: session.sessionBearer,
+        eventGameId: harness.root.eventGameId,
+        change: action.intent,
+        causalPredecessorIds: action.causalPredecessorIds,
+        originatingGrant: { sessionId: session.grantSessionId, versionId: session.grantVersion },
+      });
+      if (result.status === "accepted" || result.status === "duplicate-accepted") {
+        finalOutcomes.set(
+          readOperationId(action.intent),
+          result.status === "accepted" ? "accepted" : "idempotent",
+        );
+      } else {
+        finalOutcomes.set(readOperationId(action.intent), "terminally-rejected");
+        nextDeferred.push({ action, initialIndex });
+      }
+    }
+    deferred = nextDeferred;
+  }
+  return {
+    status: "synchronized" as const,
+    outcomes: [...finalOutcomes].map(([operationId, status]) => ({ operationId, status })),
+    projection: null,
+    initialArrivalGrantSessionIds,
+  };
+}
+
+async function replayControlArrival(
+  harness: ComposedReplayHarness,
+  sessions: readonly { sessionBearer: string; grantSessionId: string; grantVersion: string }[],
+  ordered: readonly {
+    intent: unknown;
+    causalPredecessorIds: readonly string[];
+    controllerIndex?: number;
+  }[],
+  batchId: string,
+) {
+  const submit = async (
+    action: { intent: unknown; causalPredecessorIds: readonly string[] },
+    sessionIndex: number,
+    suffix: string,
+  ) => {
+    const session = sessions[sessionIndex % sessions.length];
+    if (session === undefined) throw new Error("Expected a replay Controller.");
+    return harness.control.replayControllerActions({
+      sessionBearer: session.sessionBearer,
+      eventGameId: harness.root.eventGameId,
+      batchId: `${batchId}-${suffix}`,
+      replicaGeneration: `${batchId}-${suffix}`,
+      expectedGrantSessionId: session.grantSessionId,
+      expectedGrantVersion: session.grantVersion,
+      actions: [action].map((entry) => ({
+        eventGameId: harness.root.eventGameId,
+        intent: entry.intent,
+        causalPredecessorIds: entry.causalPredecessorIds,
+      })),
+    });
+  };
+  const outcomes = new Map<string, Awaited<ReturnType<typeof submit>>["outcomes"][number]>();
+  const initialArrivalGrantSessionIds: string[] = [];
+  let projection: Awaited<ReturnType<typeof submit>>["projection"] = null;
+  let status: Awaited<ReturnType<typeof submit>>["status"] = "synchronized";
+  let deferred: { action: (typeof ordered)[number]; initialIndex: number }[] = [];
+  for (const [index, action] of ordered.entries()) {
+    const controllerIndex = action.controllerIndex ?? index % sessions.length;
+    const session = sessions[controllerIndex];
+    if (session === undefined) throw new Error("Expected an initial replay Controller.");
+    initialArrivalGrantSessionIds.push(session.grantSessionId);
+    const result = await submit(action, controllerIndex, `arrival-${index}`);
+    status = result.status;
+    projection = result.projection;
+    const outcome = result.outcomes[0];
+    if (outcome !== undefined) outcomes.set(outcome.operationId, outcome);
+    if (outcome === undefined || !["accepted", "idempotent"].includes(outcome.status)) {
+      deferred.push({ action, initialIndex: controllerIndex });
+    }
+  }
+  for (let round = 0; deferred.length > 0 && round < ordered.length; round += 1) {
+    const nextDeferred: typeof deferred = [];
+    for (const { action, initialIndex } of deferred) {
+      const result = await submit(action, initialIndex, `causal-retry-${round}-${initialIndex}`);
+      status = result.status;
+      projection = result.projection;
+      const outcome = result.outcomes[0];
+      if (outcome !== undefined) outcomes.set(outcome.operationId, outcome);
+      if (outcome === undefined || !["accepted", "idempotent"].includes(outcome.status)) {
+        nextDeferred.push({ action, initialIndex });
+      }
+    }
+    deferred = nextDeferred;
+  }
+  return {
+    status,
+    outcomes: [...outcomes.values()],
+    projection,
+    initialArrivalGrantSessionIds,
+  };
+}
+
+function allPermutationIndexes(length: number): number[][] {
+  return allPermutationIndexesFrom([...Array(length).keys()]);
+}
+
+function allPermutationIndexesFrom(values: readonly number[]): number[][] {
+  if (values.length <= 1) return [values.slice()];
+  const permutations: number[][] = [];
+  for (const [index, value] of values.entries()) {
+    const remaining = [...values.slice(0, index), ...values.slice(index + 1)];
+    for (const suffix of allPermutationIndexesFrom(remaining))
+      permutations.push([value, ...suffix]);
+  }
+  return permutations;
+}
+
+function presentationIntent(operationId: string, pitchOrientation: "side-a-left" | "side-b-left") {
+  return {
+    version: LIVE_EVENT_CONTROL_INTENT_VERSION,
+    type: "set-pitch-orientation" as const,
+    operationId,
+    factId: `fact-${operationId}`,
+    presentationChangeId: `presentation-${operationId}`,
+    pitchOrientation,
+    gameTimeMs: 0,
+    occurrence: { clientOriginAtMs: null },
+  };
+}
+
+function readOperationId(value: unknown): string {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return "";
+  return typeof (value as { operationId?: unknown }).operationId === "string"
+    ? (value as { operationId: string }).operationId
+    : "";
+}
+
+function suspensionSnapshot(gameTimeMs: number) {
+  return {
+    version: LIVE_SUSPENSION_SNAPSHOT_VERSION,
+    gameTimeMs,
+    scoreByGameSide: { "side-a": 0, "side-b": 0 },
+    penalties: { segments: [] },
+    volleyballPossession: "side-a",
+    dodgeballPossession: { "ball-1": "side-a" },
+  };
+}
+
 async function createHarness(
   overrides: {
     eventGameId?: string;
@@ -6762,6 +7920,7 @@ async function createHarness(
     projectionFailure?: () => boolean;
     scopeStatus?: "empty" | "conflict";
     controlClock?: () => number;
+    pitchId?: string;
     knownDodgeballIds?: readonly string[];
     storage?: FoundationStorage;
     sessionResolution?: ControlGrantSessionResolution;
@@ -6774,6 +7933,9 @@ async function createHarness(
   } = {},
 ) {
   const root = createRoot(overrides.eventGameId ?? "game-live-control");
+  if (overrides.pitchId !== undefined) {
+    root.externalScope = { ...root.externalScope, pitchId: overrides.pitchId };
+  }
   const reassignedRoot = createRoot("game-reassigned", "reassigned");
   const storage = overrides.storage ?? createInMemoryFoundationStorage();
   const grantOptions = createGrantOptions(overrides.grantEventGameId ?? root.eventGameId);
@@ -6878,6 +8040,11 @@ async function createHarness(
     grantId: created.grantId,
     qrCredential: created.qrCredential,
     sessionBearer: admitted.sessionBearer,
+    initialControllerSession: {
+      sessionBearer: admitted.sessionBearer,
+      grantSessionId: admitted.grantSessionId,
+      grantVersion: admitted.grantVersion,
+    },
     get lifecycleNotifications() {
       return lifecycleNotifications;
     },
@@ -7225,6 +8392,82 @@ function createGrantOptions(eventGameId: string): TestGrantOptions {
       sessionResolution = value;
     },
   };
+}
+
+async function runLiveControlConvergenceSequence(
+  seed: number,
+  sequence: number,
+  order: readonly number[],
+) {
+  const harness = await createHarness({ eventGameId: `convergence-${sequence}` });
+  const opened = await harness.control.openController({
+    qrCredential: harness.qrCredential,
+    browserContext: `convergence-${seed}-${sequence}`,
+  });
+  if (opened.status !== "opened") throw new Error("Expected the convergence Controller to open.");
+  const actions = [
+    {
+      eventGameId: harness.root.eventGameId,
+      intent: goalIntent({
+        operationId: `goal-${sequence}`,
+        factId: `fact-goal-${sequence}`,
+        gameTimeMs: 10_000,
+      }),
+      causalPredecessorIds: [],
+    },
+    {
+      eventGameId: harness.root.eventGameId,
+      intent: correctionIntent(
+        `correction-${sequence}`,
+        `fact-correction-${sequence}`,
+        false,
+        `fact-goal-${sequence}`,
+      ),
+      causalPredecessorIds: [`goal-${sequence}`],
+    },
+    {
+      eventGameId: harness.root.eventGameId,
+      intent: goalIntent({
+        operationId: `follow-up-${sequence}`,
+        factId: `fact-follow-up-${sequence}`,
+        gameSideId: "side-b",
+        gameTimeMs: 20_000,
+      }),
+      causalPredecessorIds: [`correction-${sequence}`],
+    },
+  ];
+  const result = await harness.control.replayControllerActions({
+    sessionBearer: opened.session.sessionBearer,
+    eventGameId: harness.root.eventGameId,
+    batchId: `convergence-batch-${sequence}`,
+    replicaGeneration: `convergence-generation-${sequence}`,
+    expectedGrantSessionId: opened.session.grantSessionId,
+    expectedGrantVersion: opened.session.grantVersion,
+    actions: order.flatMap((index) => {
+      const action = actions[index];
+      return action === undefined ? [] : [action];
+    }),
+  });
+  const rebuilt = await harness.record.rebuild();
+  if (rebuilt.status !== "ready") throw new Error("Expected a rebuilt convergence state.");
+  const audit = await harness.record.readAudit({});
+  return {
+    acceptedOrder: (await harness.record.readActions()).map(({ action }) => action.operationId),
+    derivedGameState: rebuilt.derivedGameState,
+    outcomes: result.outcomes,
+    auditReferences: audit
+      .filter((entry) => entry.kind === "action-accepted")
+      .map((entry) => ({ operationId: entry.operationId, auditId: entry.auditId }))
+      .sort((left, right) => (left.operationId ?? "").localeCompare(right.operationId ?? "")),
+  };
+}
+
+function jsonRequest(body: unknown): Request {
+  return new Request("http://localhost/api/event-control/intent", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
 }
 
 async function ownerState(harness: Awaited<ReturnType<typeof createHarness>>) {

@@ -15,6 +15,7 @@
     "test:focused:technical-admin-browser": "bun scripts/test-technical-admin-browser.ts",
     "test:focused:public-event-browser": "bun scripts/test-public-event-browser.ts",
     "test:focused:event-game-controller-browser": "bun scripts/test-event-game-controller-browser.ts",
+    "test:focused:event-game-routes": "bun test --isolate ./src/lib/live-event-game-transport.focused.ts",
     "test:focused:technical-admin": "bun test --isolate ./src/lib/technical-admin-auth-sqlite.focused.ts",
     "test:focused:startup": "bun test --isolate ./src/index-startup.focused.ts",
     "build": "bun run build.ts",

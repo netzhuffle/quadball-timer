@@ -8,7 +8,7 @@ import type {
   LiveEventGameControlResult,
   OpenControllerResult,
 } from "@/lib/live-event-game-control";
-import { SHARED_LIMITS } from "@/lib/validation-policy";
+import { SHARED_LIMITS, validateOpaqueIdentifier } from "@/lib/validation-policy";
 
 export type LiveEventGameControlTransport = {
   openController(request: Request): Promise<Response>;
@@ -126,6 +126,7 @@ export function createLiveEventGameControlTransport(
       if (
         typeof body.body.sessionBearer !== "string" ||
         typeof body.body.eventGameId !== "string" ||
+        !validateOpaqueIdentifier(body.body.eventGameId, "eventGameId").ok ||
         body.body.intent === undefined
       ) {
         return unavailable();
@@ -154,6 +155,7 @@ export function createLiveEventGameControlTransport(
         !isRecord(body.body) ||
         typeof body.body.sessionBearer !== "string" ||
         typeof body.body.eventGameId !== "string" ||
+        !validateOpaqueIdentifier(body.body.eventGameId, "eventGameId").ok ||
         body.body.change === undefined
       ) {
         return unavailable();
@@ -182,7 +184,8 @@ export function createLiveEventGameControlTransport(
         typeof body.body.replicaGeneration !== "string" ||
         typeof body.body.grantSessionId !== "string" ||
         typeof body.body.grantVersion !== "string" ||
-        !Array.isArray(body.body.actions)
+        !Array.isArray(body.body.actions) ||
+        !validateReplayEnvelopeIdentifiers(body.body)
       )
         return unavailable();
       if (
@@ -191,6 +194,8 @@ export function createLiveEventGameControlTransport(
       ) {
         return unavailable();
       }
+      const actions = readReplayActions(body.body.actions);
+      if (actions === null) return unavailable();
       const result = await control.replayControlActions({
         sessionBearer: body.body.sessionBearer,
         eventGameId: body.body.eventGameId,
@@ -198,17 +203,7 @@ export function createLiveEventGameControlTransport(
         replicaGeneration: body.body.replicaGeneration,
         expectedGrantSessionId: body.body.grantSessionId,
         expectedGrantVersion: body.body.grantVersion,
-        actions: body.body.actions.map((action) => {
-          if (!isRecord(action))
-            return { eventGameId: "", intent: null, causalPredecessorIds: [null] };
-          return {
-            eventGameId: typeof action.eventGameId === "string" ? action.eventGameId : "",
-            intent: action.intent,
-            causalPredecessorIds: Array.isArray(action.causalPredecessorIds)
-              ? action.causalPredecessorIds
-              : [null],
-          };
-        }),
+        actions,
       });
       return noStoreJson(result, resultStatus(result));
     },
@@ -233,11 +228,14 @@ export function createLiveEventGameControlTransport(
         typeof body.body.grantSessionId !== "string" ||
         typeof body.body.grantVersion !== "string" ||
         !Array.isArray(body.body.changes) ||
+        !validateReplayEnvelopeIdentifiers(body.body) ||
         body.body.changes.length === 0 ||
         body.body.changes.length > SHARED_LIMITS.replay.maxControlActions
       ) {
         return unavailable();
       }
+      const changes = readPresentationReplayChanges(body.body.changes);
+      if (changes === null) return unavailable();
       const result = await control.replayGamePresentationChanges({
         sessionBearer: body.body.sessionBearer,
         eventGameId: body.body.eventGameId,
@@ -245,24 +243,7 @@ export function createLiveEventGameControlTransport(
         replicaGeneration: body.body.replicaGeneration,
         expectedGrantSessionId: body.body.grantSessionId,
         expectedGrantVersion: body.body.grantVersion,
-        changes: body.body.changes.map((change) => {
-          if (!isRecord(change)) {
-            return {
-              eventGameId: "",
-              change: null,
-              causalPredecessorIds: [null],
-              originatingGrant: null,
-            };
-          }
-          return {
-            eventGameId: typeof change.eventGameId === "string" ? change.eventGameId : "",
-            change: change.change,
-            causalPredecessorIds: Array.isArray(change.causalPredecessorIds)
-              ? change.causalPredecessorIds
-              : [null],
-            originatingGrant: change.originatingGrant,
-          };
-        }),
+        changes,
       });
       return noStoreJson(result, resultStatus(result));
     },
@@ -337,6 +318,7 @@ async function readSessionInput(
   const body = await readJsonBodyWithinLimit(request, SHARED_LIMITS.transport.httpJsonBodyBytes);
   if (!body.ok || !isRecord(body.body) || typeof body.body.sessionBearer !== "string") return null;
   if (typeof body.body.eventGameId === "string") {
+    if (!validateOpaqueIdentifier(body.body.eventGameId, "eventGameId").ok) return null;
     return {
       sessionBearer: body.body.sessionBearer,
       eventGameId: body.body.eventGameId,
@@ -353,6 +335,13 @@ function resultStatus(
 ): number {
   if (result.status === "retryable") return 503;
   if (result.status === "rejected") return 403;
+  if (
+    "outcomes" in result &&
+    result.outcomes.length > 0 &&
+    result.outcomes.every((outcome) => outcome.status === "terminally-rejected")
+  ) {
+    return 403;
+  }
   return 200;
 }
 
@@ -366,6 +355,79 @@ function controllerResultStatus(
 
 function unavailable() {
   return noStoreJson({ error: "Event Game Controller is unavailable." }, 404);
+}
+
+function readReplayActions(values: readonly unknown[]):
+  | {
+      eventGameId: string;
+      intent: unknown;
+      causalPredecessorIds: readonly string[];
+    }[]
+  | null {
+  const actions = [];
+  for (const value of values) {
+    if (
+      !isRecord(value) ||
+      typeof value.eventGameId !== "string" ||
+      !validateOpaqueIdentifier(value.eventGameId, "eventGameId").ok ||
+      value.intent === undefined
+    ) {
+      return null;
+    }
+    const causalPredecessorIds = readCausalPredecessors(value.causalPredecessorIds);
+    if (causalPredecessorIds === null) return null;
+    actions.push({ eventGameId: value.eventGameId, intent: value.intent, causalPredecessorIds });
+  }
+  return actions;
+}
+
+function readPresentationReplayChanges(values: readonly unknown[]):
+  | {
+      eventGameId: string;
+      change: unknown;
+      causalPredecessorIds: readonly string[];
+      originatingGrant: unknown;
+    }[]
+  | null {
+  const changes = [];
+  for (const value of values) {
+    if (
+      !isRecord(value) ||
+      typeof value.eventGameId !== "string" ||
+      !validateOpaqueIdentifier(value.eventGameId, "eventGameId").ok ||
+      value.change === undefined ||
+      value.originatingGrant === undefined
+    ) {
+      return null;
+    }
+    const causalPredecessorIds = readCausalPredecessors(value.causalPredecessorIds);
+    if (causalPredecessorIds === null) return null;
+    changes.push({
+      eventGameId: value.eventGameId,
+      change: value.change,
+      causalPredecessorIds,
+      originatingGrant: value.originatingGrant,
+    });
+  }
+  return changes;
+}
+
+function readCausalPredecessors(value: unknown): readonly string[] | null {
+  if (value === undefined) return [];
+  if (
+    !Array.isArray(value) ||
+    value.length > SHARED_LIMITS.replay.maxControlActions ||
+    value.some((candidate) => !validateOpaqueIdentifier(candidate, "causalPredecessorId").ok)
+  )
+    return null;
+  if (new Set(value).size !== value.length) return null;
+  return value;
+}
+
+function validateReplayEnvelopeIdentifiers(value: Record<string, unknown>): boolean {
+  return ["eventGameId", "batchId", "replicaGeneration", "grantSessionId", "grantVersion"].every(
+    (field) => validateOpaqueIdentifier(value[field], field).ok,
+  );
 }
 
 function noStoreJson(payload: unknown, status = 200) {
