@@ -20,6 +20,11 @@ import {
   validateIntegerInRange,
   validateOpaqueIdentifier,
 } from "@/lib/validation-policy";
+import {
+  projectControllerReplayRetry,
+  orderControllerOperations,
+  validateControllerReplay,
+} from "@/lib/controller-synchronization";
 
 export const CONTROLLER_REPLICA_VERSION = "controller-replica-v3" as const;
 export const CONTROLLER_REPLICA_STORAGE_KEY = "quadball:event-controller-replica";
@@ -40,6 +45,7 @@ export type ControllerActionOutcomeStatus =
   | "terminally-rejected";
 
 export type PendingControllerAction = {
+  workflow?: "event";
   eventGameId: string;
   intent: LiveEventControllerIntent;
   causalPredecessorIds: readonly string[];
@@ -55,6 +61,7 @@ export type PendingControllerAction = {
 
 export type ControllerReplicaState = {
   version: typeof CONTROLLER_REPLICA_VERSION;
+  workflow?: "event";
   eventGameId: string;
   authoritativeProjection: ControllerProjection;
   projection: ControllerProjection;
@@ -88,6 +95,7 @@ export type ControllerReplicaLoad = {
 };
 
 export type ControllerReplayBatch = {
+  workflow?: "event";
   batchId: string;
   replicaGeneration: string;
   session: ControllerSessionAttachment;
@@ -100,6 +108,7 @@ export type ControllerReplayBatch = {
 };
 
 export type ControllerReplayBatchResponse = {
+  workflow?: "event";
   batchId: string;
   replicaGeneration: string;
   session: ControllerSessionAttachment;
@@ -129,6 +138,7 @@ export function createControllerReplica(input: {
   requireIdentifier(deviceId, "deviceId");
   return {
     version: CONTROLLER_REPLICA_VERSION,
+    workflow: "event",
     eventGameId,
     authoritativeProjection: cloneProjection(input.projection),
     projection: cloneProjection(input.projection),
@@ -170,6 +180,7 @@ export function dispatchControllerAction(
   if (existing !== undefined) return { state, action: existing };
   const counter = state.identity.nextCounter;
   const action: PendingControllerAction = {
+    workflow: "event",
     eventGameId: state.eventGameId,
     intent: structuredClone(parsed.value),
     causalPredecessorIds: predecessors,
@@ -221,6 +232,7 @@ export function dispatchControllerClockAction(
   if (existing !== undefined) return { state, action: existing };
   const counter = state.identity.nextCounter;
   const action: PendingControllerAction = {
+    workflow: "event",
     eventGameId: state.eventGameId,
     intent: structuredClone(parsed.value),
     causalPredecessorIds: predecessors,
@@ -278,9 +290,21 @@ export function prepareControllerReplayBatch(
       actionOperationIds: selected.map((action) => action.intent.operationId),
     },
   };
+  const envelope = validateControllerReplay(
+    selected.map((action) => ({
+      id: action.intent.operationId,
+      workflow: "event" as const,
+      clientSentAtMs: action.dispatchedAtMs,
+      causalPredecessorIds: action.causalPredecessorIds,
+      intent: action.intent,
+    })),
+    "event",
+  );
+  if (!envelope.ok) return null;
   return {
     state: nextState,
     batch: {
+      workflow: "event",
       batchId,
       replicaGeneration: state.replicaGeneration,
       session: structuredClone(state.session),
@@ -352,12 +376,9 @@ export function reconcileControllerReplay(
     authoritativeProjection,
     outcomes,
     unacknowledgedBatch: null,
-    pendingActions: pendingActions.filter(
-      (action) =>
-        action.status === "pending" ||
-        action.status === "retryable" ||
-        action.status === "causally-blocked" ||
-        action.status === "held-for-correction",
+    pendingActions: projectControllerReplayRetry(
+      pendingActions,
+      new Set(["pending", "retryable", "causally-blocked", "held-for-correction"]),
     ),
   };
   return reapplyPendingOptimisticActions(reconciled);
@@ -444,6 +465,8 @@ export function parseControllerReplica(
   if (!isRecord(value)) throw new Error("Controller replica must be an object.");
   if (value.version !== CONTROLLER_REPLICA_VERSION)
     throw new Error("Controller replica version is unsupported.");
+  if (value.workflow !== undefined && value.workflow !== "event")
+    throw new Error("Controller replica workflow is invalid.");
   const eventGameId = requireIdentifier(value.eventGameId, "eventGameId");
   if (expectedEventGameId !== undefined && eventGameId !== expectedEventGameId) {
     throw new Error("Controller replica belongs to another Event Game.");
@@ -476,6 +499,7 @@ export function parseControllerReplica(
   }
   const state: ControllerReplicaState = {
     version: CONTROLLER_REPLICA_VERSION,
+    workflow: "event",
     eventGameId,
     authoritativeProjection,
     projection,
@@ -560,6 +584,8 @@ export function persistControllerReplica(
 export function validateControllerReplica(state: ControllerReplicaState): void {
   if (state.version !== CONTROLLER_REPLICA_VERSION)
     throw new Error("Controller replica version is unsupported.");
+  if (state.workflow !== undefined && state.workflow !== "event")
+    throw new Error("Controller replica workflow is invalid.");
   requireIdentifier(state.eventGameId, "eventGameId");
   parseProjection(state.authoritativeProjection);
   parseProjection(state.projection);
@@ -802,6 +828,17 @@ function validateCausalGraph(state: ControllerReplicaState) {
     if (hasCausalCycle(action.intent.operationId, state.pendingActions, new Set()))
       throw new Error("Controller causal graph contains a cycle.");
   }
+  const pendingIds = new Set(state.pendingActions.map((action) => action.intent.operationId));
+  const ordered = orderControllerOperations(
+    state.pendingActions.map((action) => ({
+      operationId: action.intent.operationId,
+      workflow: "event" as const,
+      clientOriginAtMs: action.dispatchedAtMs,
+      causalPredecessorIds: action.causalPredecessorIds.filter((id) => pendingIds.has(id)),
+      payload: action.intent,
+    })),
+  );
+  if (!ordered.ok) throw new Error(ordered.error);
 }
 
 function validateDerivedProjection(state: ControllerReplicaState) {
@@ -873,6 +910,8 @@ function parsePendingAction(
 ): PendingControllerAction {
   if (!isRecord(value) || value.eventGameId !== eventGameId)
     throw new Error("Pending action has the wrong Event Game.");
+  if (value.workflow !== undefined && value.workflow !== "event")
+    throw new Error("Pending action workflow is invalid.");
   const intent = parseLiveEventControllerIntent(value.intent);
   if (!intent.ok) throw new Error(intent.error);
   if (!Array.isArray(value.causalPredecessorIds))
@@ -902,6 +941,11 @@ function parsePendingAction(
   const predecessors = value.causalPredecessorIds.map((candidate) =>
     requireIdentifier(candidate, "causalPredecessorId"),
   );
+  if (
+    new Set(predecessors).size !== predecessors.length ||
+    predecessors.includes(intent.value.operationId)
+  )
+    throw new Error("Pending action causal predecessors are invalid.");
   if (!isRecord(value.identity)) throw new Error("Pending action identity is invalid.");
   const identityDeviceId = requireIdentifier(value.identity.deviceId, "action.identity.deviceId");
   const identityCounter = validateIntegerInRange(
@@ -915,6 +959,7 @@ function parsePendingAction(
     throw new Error("Pending action identity is inconsistent.");
   }
   return {
+    workflow: "event",
     eventGameId,
     intent: intent.value,
     causalPredecessorIds: predecessors,

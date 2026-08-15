@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  createPersistedControllerSession,
-  getControllerSessionStorageKey,
-  parsePersistedControllerSession,
-} from "@/lib/controller-session";
+  getAdHocControllerSessionStorageKey,
+  parseAdHocControllerSession,
+  serializeAdHocControllerSession,
+  type AdHocPendingOperation,
+} from "@/lib/ad-hoc-controller-session";
 import { applyGameCommand } from "@/lib/game-engine";
 import type {
   ControllerRole,
@@ -13,7 +14,8 @@ import type {
   PlayerPenaltyState,
   TeamId,
 } from "@/lib/game-types";
-import type { ClientCommandEnvelope, ServerWsMessage } from "@/lib/ws-protocol";
+import { orderControllerOperations } from "@/lib/controller-synchronization";
+import type { ServerWsMessage } from "@/lib/ws-protocol";
 
 export type ConnectionState = "connecting" | "online" | "offline" | "local-only";
 export type PendingReleaseAction = {
@@ -38,14 +40,15 @@ const RELEASE_EVENT_VISIBLE_MS = 30_000;
 export function useGameConnection({ gameId, role }: { gameId: string; role: ControllerRole }) {
   const wsUrl = useMemo(createWebSocketUrl, []);
   const [baseState, setBaseState] = useState<GameState | null>(null);
+  const authoritativeStateRef = useRef<GameState | null>(null);
   const [controlQr, setControlQr] = useState<string | null>(null);
   const [clockOffsetMs, setClockOffsetMs] = useState(0);
   const [connectionState, setConnectionState] = useState<ConnectionState>("connecting");
   const [error, setError] = useState<string | null>(null);
   const [pendingCommandsCount, setPendingCommandsCount] = useState(0);
   const [localOnlyMode, setLocalOnlyMode] = useState(false);
-
-  const pendingRef = useRef<ClientCommandEnvelope[]>([]);
+  const pendingRef = useRef<AdHocPendingOperation[]>([]);
+  const outcomesRef = useRef<AdHocControllerOutcomes>({});
   const reconnectTimeoutRef = useRef<number | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const commandCounterRef = useRef(0);
@@ -57,47 +60,44 @@ export function useGameConnection({ gameId, role }: { gameId: string; role: Cont
     localOnlyModeRef.current = value;
     setLocalOnlyMode(value);
   }, []);
-
-  const setPendingCommands = useCallback((commands: ClientCommandEnvelope[]) => {
+  const setPendingCommands = useCallback((commands: AdHocPendingOperation[]) => {
     pendingRef.current = commands;
     setPendingCommandsCount(commands.length);
   }, []);
-
   const persistControllerSession = useCallback(
-    (state: GameState, pendingCommands: ClientCommandEnvelope[], commandCounter: number) => {
-      if (role !== "controller") {
-        return;
+    (state: GameState, pendingOperations: AdHocPendingOperation[], operationCounter: number) => {
+      if (role !== "controller") return;
+      try {
+        window.localStorage.setItem(
+          getAdHocControllerSessionStorageKey(gameId),
+          serializeAdHocControllerSession({
+            version: "ad-hoc-controller-session-v1",
+            workflow: "ad-hoc",
+            gameId,
+            state,
+            authoritativeState: authoritativeStateRef.current ?? state,
+            pendingOperations,
+            outcomes: outcomesRef.current,
+            operationCounter,
+            savedAtMs: Date.now(),
+          }),
+        );
+      } catch {
+        // Keep the in-memory replica useful when browser storage is unavailable.
       }
-
-      savePersistedControllerSession({
-        gameId,
-        state,
-        pendingCommands,
-        commandCounter,
-      });
     },
     [gameId, role],
   );
-
   const flushPendingCommands = useCallback(() => {
-    if (role !== "controller") {
+    if (
+      role !== "controller" ||
+      localOnlyModeRef.current ||
+      !subscribedToServerGameRef.current ||
+      wsRef.current?.readyState !== WebSocket.OPEN ||
+      pendingRef.current.length === 0
+    )
       return;
-    }
-
-    if (localOnlyModeRef.current) {
-      return;
-    }
-
-    if (!subscribedToServerGameRef.current) {
-      return;
-    }
-
-    const ws = wsRef.current;
-    if (ws === null || ws.readyState !== WebSocket.OPEN || pendingRef.current.length === 0) {
-      return;
-    }
-
-    ws.send(
+    wsRef.current.send(
       JSON.stringify({
         type: "apply-commands",
         gameId,
@@ -105,32 +105,31 @@ export function useGameConnection({ gameId, role }: { gameId: string; role: Cont
       }),
     );
   }, [gameId, role]);
-
   const reconcileWithServer = useCallback(
     ({
       state,
       serverNowMs,
       ackedCommandIds,
+      operationOutcomes = [],
     }: {
       state: GameState;
       serverNowMs: number;
       ackedCommandIds: string[];
+      operationOutcomes?: readonly AdHocOutcome[];
     }) => {
-      if (ackedCommandIds.length > 0) {
-        const ackedSet = new Set(ackedCommandIds);
-        setPendingCommands(pendingRef.current.filter((command) => !ackedSet.has(command.id)));
-      }
-
+      for (const outcome of operationOutcomes)
+        outcomesRef.current[outcome.operationId] = outcome.status;
+      const settled = new Set([
+        ...ackedCommandIds,
+        ...operationOutcomes.map((outcome) => outcome.operationId),
+      ]);
+      const pending = pendingRef.current.filter((operation) => !settled.has(operation.id));
+      setPendingCommands(pending);
       setClockOffsetMs(serverNowMs - Date.now());
-
-      let reconciled = state;
-
-      for (const command of pendingRef.current) {
-        reconciled = applyLocalEnvelope(reconciled, command);
-      }
-
+      authoritativeStateRef.current = state;
+      const reconciled = applyPendingOperations(state, pending, outcomesRef.current);
       setBaseState(reconciled);
-      persistControllerSession(reconciled, pendingRef.current, commandCounterRef.current);
+      persistControllerSession(reconciled, pending, commandCounterRef.current);
     },
     [persistControllerSession, setPendingCommands],
   );
@@ -138,19 +137,25 @@ export function useGameConnection({ gameId, role }: { gameId: string; role: Cont
   useEffect(() => {
     let cancelled = false;
     let recoveredFromLocal = false;
-
     if (role === "controller") {
       const persisted = loadPersistedControllerSession(gameId);
       if (persisted !== null) {
         recoveredFromLocal = true;
-        setPendingCommands(persisted.pendingCommands);
-        commandCounterRef.current = Math.max(commandCounterRef.current, persisted.commandCounter);
-        setBaseState(persisted.state);
+        setPendingCommands(persisted.pendingOperations);
+        outcomesRef.current = persisted.outcomes;
+        commandCounterRef.current = persisted.operationCounter;
+        authoritativeStateRef.current = persisted.authoritativeState ?? persisted.state;
+        setBaseState(
+          applyPendingOperations(
+            authoritativeStateRef.current,
+            persisted.pendingOperations,
+            persisted.outcomes,
+          ),
+        );
         setConnectionState("offline");
         setError("Recovered local game state. Reconnecting server...");
       }
     }
-
     const fetchInitialSnapshot = async () => {
       try {
         const response = await fetch(`/api/games/${gameId}`);
@@ -159,75 +164,46 @@ export function useGameConnection({ gameId, role }: { gameId: string; role: Cont
             setLocalOnlyState(true);
             setConnectionState("local-only");
             setError(LOCAL_ONLY_MESSAGE);
-            return;
-          }
-
-          setError("Ad Hoc Game unavailable.");
+          } else setError("Ad Hoc Game unavailable.");
           return;
         }
-
         const payload = (await response.json()) as {
           game?: GameView & { controlQr?: string | null };
         };
         if (!cancelled && payload.game !== undefined) {
           setError(null);
           setControlQr(payload.game.controlQr ?? null);
-
-          let reconciled = payload.game.state;
-          for (const command of pendingRef.current) {
-            reconciled = applyLocalEnvelope(reconciled, command);
-          }
-
+          authoritativeStateRef.current = payload.game.state;
+          const reconciled = applyPendingOperations(
+            authoritativeStateRef.current,
+            pendingRef.current,
+            outcomesRef.current,
+          );
           setLocalOnlyState(false);
           setBaseState(reconciled);
           persistControllerSession(reconciled, pendingRef.current, commandCounterRef.current);
         }
       } catch {
         if (!cancelled) {
-          if (role === "controller" && recoveredFromLocal) {
+          if (role === "controller" && recoveredFromLocal)
             setError("Unable to reach server. Continuing locally on this device.");
-            return;
-          }
-
-          setError("Ad Hoc Game unavailable.");
+          else setError("Ad Hoc Game unavailable.");
         }
       }
     };
-
     const connect = () => {
-      if (cancelled) {
-        return;
-      }
-
-      if (localOnlyModeRef.current) {
-        setConnectionState("local-only");
-      } else {
-        setConnectionState("connecting");
-      }
-
+      if (cancelled) return;
+      setConnectionState(localOnlyModeRef.current ? "local-only" : "connecting");
       const ws = new WebSocket(wsUrl);
       wsRef.current = ws;
       subscribedToServerGameRef.current = false;
-
       ws.onopen = () => {
-        if (!localOnlyModeRef.current) {
-          setConnectionState("online");
-        }
-
-        ws.send(
-          JSON.stringify({
-            type: "subscribe-game",
-            gameId,
-          }),
-        );
+        if (!localOnlyModeRef.current) setConnectionState("online");
+        ws.send(JSON.stringify({ type: "subscribe-game", gameId }));
       };
-
       ws.onmessage = (event) => {
         const parsed = parseServerMessage(event.data);
-        if (parsed === null) {
-          return;
-        }
-
+        if (parsed === null) return;
         if (parsed.type === "error") {
           if (role === "controller" && isServerGameUnavailableError(parsed.message)) {
             subscribedToServerGameRef.current = false;
@@ -235,13 +211,9 @@ export function useGameConnection({ gameId, role }: { gameId: string; role: Cont
             setConnectionState("local-only");
             setError(LOCAL_ONLY_MESSAGE);
             ws.close();
-            return;
-          }
-
-          setError(parsed.message);
+          } else setError(parsed.message);
           return;
         }
-
         if (parsed.type === "game-snapshot") {
           subscribedToServerGameRef.current = true;
           setLocalOnlyState(false);
@@ -252,45 +224,31 @@ export function useGameConnection({ gameId, role }: { gameId: string; role: Cont
             state: parsed.game.state,
             serverNowMs: parsed.serverNowMs,
             ackedCommandIds: parsed.ackedCommandIds,
+            operationOutcomes: parsed.operationOutcomes,
           });
           flushPendingCommands();
         }
       };
-
       ws.onclose = () => {
-        if (localOnlyModeRef.current) {
-          setConnectionState("local-only");
-        } else {
-          setConnectionState("offline");
-        }
-
+        setConnectionState(localOnlyModeRef.current ? "local-only" : "offline");
         wsRef.current = null;
         subscribedToServerGameRef.current = false;
         if (!cancelled) {
-          const retryDelay = localOnlyModeRef.current
-            ? LOCAL_ONLY_RETRY_DELAY_MS
-            : NORMAL_RECONNECT_DELAY_MS;
-          reconnectTimeoutRef.current = window.setTimeout(connect, retryDelay);
+          reconnectTimeoutRef.current = window.setTimeout(
+            connect,
+            localOnlyModeRef.current ? LOCAL_ONLY_RETRY_DELAY_MS : NORMAL_RECONNECT_DELAY_MS,
+          );
         }
       };
-
-      ws.onerror = () => {
-        ws.close();
-      };
+      ws.onerror = () => ws.close();
     };
-
     void fetchInitialSnapshot();
     connect();
-
     return () => {
       cancelled = true;
       subscribedToServerGameRef.current = false;
-      if (wsRef.current !== null) {
-        wsRef.current.close();
-      }
-      if (reconnectTimeoutRef.current !== null) {
-        window.clearTimeout(reconnectTimeoutRef.current);
-      }
+      wsRef.current?.close();
+      if (reconnectTimeoutRef.current !== null) window.clearTimeout(reconnectTimeoutRef.current);
     };
   }, [
     flushPendingCommands,
@@ -305,35 +263,31 @@ export function useGameConnection({ gameId, role }: { gameId: string; role: Cont
 
   const dispatchCommand = useCallback(
     (command: GameCommand) => {
-      if (role !== "controller") {
-        return;
-      }
-
+      if (role !== "controller") return;
       setBaseState((previous) => {
-        if (previous === null) {
-          return previous;
-        }
-
+        if (authoritativeStateRef.current === null && previous === null) return previous;
         commandCounterRef.current += 1;
-        const envelope: ClientCommandEnvelope = {
+        const operation: AdHocPendingOperation = {
           id: `${clientInstanceId.current}-${commandCounterRef.current}`,
           clientSentAtMs: Date.now() + clockOffsetMs,
           command,
+          workflow: "ad-hoc",
+          causalPredecessorIds: pendingRef.current.at(-1)?.id
+            ? [pendingRef.current.at(-1)!.id]
+            : [],
         };
-
-        const nextPendingCommands = [...pendingRef.current, envelope];
-        setPendingCommands(nextPendingCommands);
-        const next = applyLocalEnvelope(previous, envelope);
-        persistControllerSession(next, nextPendingCommands, commandCounterRef.current);
-
+        const pending = [...pendingRef.current, operation];
+        setPendingCommands(pending);
+        const authoritative = authoritativeStateRef.current ?? previous;
+        if (authoritative === null) return previous;
+        const next = applyPendingOperations(authoritative, pending, outcomesRef.current);
+        persistControllerSession(next, pending, commandCounterRef.current);
         window.setTimeout(flushPendingCommands, 0);
-
         return next;
       });
     },
     [clockOffsetMs, flushPendingCommands, persistControllerSession, role, setPendingCommands],
   );
-
   return {
     baseState,
     controlQr,
@@ -379,6 +333,7 @@ function parseServerMessage(input: unknown): ServerWsMessage | null {
 
 function isServerGameUnavailableError(message: string) {
   return (
+    message === "Ad Hoc Game unavailable." ||
     message === "Game not found." ||
     message === "Not subscribed to a game." ||
     message === "Command gameId mismatch."
@@ -387,54 +342,76 @@ function isServerGameUnavailableError(message: string) {
 
 function loadPersistedControllerSession(gameId: string) {
   try {
-    const raw = window.localStorage.getItem(getControllerSessionStorageKey(gameId));
+    const raw = window.localStorage.getItem(getAdHocControllerSessionStorageKey(gameId));
     if (raw === null) {
       return null;
     }
 
-    return parsePersistedControllerSession(raw, gameId);
+    const parsed = parseAdHocControllerSession(raw, gameId);
+    if (parsed === null)
+      window.localStorage.removeItem(getAdHocControllerSessionStorageKey(gameId));
+    return parsed;
   } catch {
+    try {
+      window.localStorage.removeItem(getAdHocControllerSessionStorageKey(gameId));
+    } catch {
+      /* best effort */
+    }
     return null;
   }
 }
 
-function savePersistedControllerSession({
-  gameId,
-  state,
-  pendingCommands,
-  commandCounter,
-}: {
-  gameId: string;
-  state: GameState;
-  pendingCommands: ClientCommandEnvelope[];
-  commandCounter: number;
-}) {
-  try {
-    const payload = createPersistedControllerSession({
-      gameId,
-      state,
-      pendingCommands,
-      commandCounter,
-      savedAtMs: Date.now(),
-    });
+type AdHocOutcome = {
+  operationId: string;
+  workflow: "ad-hoc" | "event";
+  status: "accepted" | "duplicate" | "rejected" | "causally-blocked";
+  detail?: string;
+};
+type AdHocControllerOutcomes = Record<string, AdHocOutcome["status"]>;
 
-    window.localStorage.setItem(getControllerSessionStorageKey(gameId), JSON.stringify(payload));
-  } catch {
-    // Best-effort persistence only; keep runtime behavior even if storage is unavailable.
-  }
+function applyPendingOperations(
+  state: GameState,
+  pending: readonly AdHocPendingOperation[],
+  outcomes: Readonly<AdHocControllerOutcomes>,
+): GameState {
+  const pendingIds = new Set(pending.map((operation) => operation.id));
+  const operations = pending
+    .filter((operation) => outcomes[operation.id] === undefined)
+    .filter((operation) =>
+      operation.causalPredecessorIds.every((predecessor) => {
+        if (pendingIds.has(predecessor)) return true;
+        const outcome = outcomes[predecessor];
+        return outcome === "accepted" || outcome === "duplicate";
+      }),
+    )
+    .map((operation) => ({
+      operationId: operation.id,
+      workflow: "ad-hoc" as const,
+      clientOriginAtMs: operation.clientSentAtMs,
+      causalPredecessorIds: operation.causalPredecessorIds.filter((predecessor) =>
+        pendingIds.has(predecessor),
+      ),
+      payload: operation.command,
+    }));
+  const ordered = orderControllerOperations(operations);
+  if (!ordered.ok) return state;
+  return ordered.operations.reduce((current, operation) => {
+    let generated = 0;
+    return applyGameCommand({
+      state: current,
+      command: operation.payload,
+      nowMs: operation.clientOriginAtMs,
+      idGenerator: () => `${operation.operationId}:${++generated}`,
+    });
+  }, state);
 }
 
-function applyLocalEnvelope(state: GameState, envelope: ClientCommandEnvelope): GameState {
-  let idCounter = 0;
-  return applyGameCommand({
-    state,
-    command: envelope.command,
-    nowMs: envelope.clientSentAtMs,
-    idGenerator: () => {
-      idCounter += 1;
-      return `${envelope.id}:${idCounter}`;
-    },
-  });
+export function deriveAdHocOptimisticState(
+  authoritative: GameState,
+  pending: readonly AdHocPendingOperation[],
+  outcomes: Readonly<AdHocControllerOutcomes> = {},
+) {
+  return applyPendingOperations(authoritative, pending, outcomes);
 }
 
 export function navigateTo(path: string) {

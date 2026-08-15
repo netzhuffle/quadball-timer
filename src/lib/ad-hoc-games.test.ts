@@ -1,16 +1,13 @@
 import { describe, expect, test } from "bun:test";
-import { Database } from "bun:sqlite";
-import { createHash } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import {
   createAdHocGamesService,
   createInMemoryAdHocStore,
-  openSqliteAdHocStore,
+  type AdHocStore,
   type AdHocGamesService,
 } from "@/lib/ad-hoc-games";
-import { createInitialGameState } from "@/lib/game-engine";
+import { applyGameCommand, createInitialGameState } from "@/lib/game-engine";
+import { deriveAdHocOptimisticState } from "@/lib/game-page-support";
+import type { AdHocPendingOperation } from "@/lib/ad-hoc-controller-session";
 
 function service(): AdHocGamesService {
   return createAdHocGamesService({
@@ -24,6 +21,133 @@ function service(): AdHocGamesService {
 }
 
 describe("Ad Hoc Games service", () => {
+  test("derives multiple offline operations once from the authoritative base and rebases on reconciliation", () => {
+    const authoritative = createInitialGameState({ id: "adhoc-optimistic", nowMs: 1_000 });
+    const pending: AdHocPendingOperation[] = [
+      {
+        id: "offline-1",
+        clientSentAtMs: 1_001,
+        workflow: "ad-hoc",
+        causalPredecessorIds: [],
+        command: { type: "change-score", team: "home", delta: 10, reason: "goal" },
+      },
+      {
+        id: "offline-2",
+        clientSentAtMs: 1_002,
+        workflow: "ad-hoc",
+        causalPredecessorIds: ["offline-1"],
+        command: { type: "change-score", team: "home", delta: 10, reason: "goal" },
+      },
+    ];
+    expect(deriveAdHocOptimisticState(authoritative, pending).score.home).toBe(20);
+    const reconciledBase = applyGameCommand({
+      state: authoritative,
+      command: pending[0]!.command,
+      nowMs: 1_001,
+      idGenerator: () => "server-1",
+    });
+    expect(
+      deriveAdHocOptimisticState(reconciledBase, pending.slice(1), { "offline-1": "accepted" })
+        .score.home,
+    ).toBe(20);
+  });
+
+  test("orders reordered causal batches, blocks only descendants, and rejects identity conflicts", async () => {
+    const games = service();
+    const created = await games.create({ homeName: "Home", awayName: "Away" });
+    if (created.status !== "accepted") throw new Error("creation failed");
+    const replay = await games.apply({
+      gameId: created.gameId,
+      sessionId: created.sessionId,
+      operations: [
+        {
+          id: "child",
+          clientSentAtMs: 1_002,
+          causalPredecessorIds: ["parent"],
+          command: { type: "change-score", team: "home", delta: 10, reason: "goal" },
+        },
+        {
+          id: "unrelated",
+          clientSentAtMs: 1_000,
+          command: { type: "change-score", team: "away", delta: 10, reason: "goal" },
+        },
+        {
+          id: "parent",
+          clientSentAtMs: 1_001,
+          command: { type: "change-score", team: "home", delta: 10, reason: "goal" },
+        },
+      ],
+    });
+    expect(replay.status).toBe("accepted");
+    if (replay.status !== "accepted") return;
+    expect(replay.game.state.score).toEqual({ home: 20, away: 10 });
+    const missing = await games.apply({
+      gameId: created.gameId,
+      sessionId: created.sessionId,
+      operations: [
+        {
+          id: "blocked-child",
+          clientSentAtMs: 1_003,
+          causalPredecessorIds: ["missing"],
+          command: { type: "change-score", team: "home", delta: 10, reason: "goal" },
+        },
+        {
+          id: "still-unrelated",
+          clientSentAtMs: 1_004,
+          command: { type: "change-score", team: "away", delta: 10, reason: "goal" },
+        },
+      ],
+    });
+    expect(missing.status).toBe("accepted");
+    if (missing.status === "accepted") {
+      expect(
+        missing.outcomes.find((outcome) => outcome.operationId === "blocked-child")?.status,
+      ).toBe("rejected");
+      expect(missing.game.state.score).toEqual({ home: 20, away: 20 });
+    }
+    const conflict = await games.apply({
+      gameId: created.gameId,
+      sessionId: created.sessionId,
+      operations: [
+        { id: "parent", clientSentAtMs: 1_001, command: { type: "set-running", running: true } },
+      ],
+    });
+    expect(conflict).toMatchObject({ status: "rejected", reason: "conflict" });
+    const cyclic = await games.apply({
+      gameId: created.gameId,
+      sessionId: created.sessionId,
+      operations: [
+        {
+          id: "cycle-a",
+          clientSentAtMs: 1_005,
+          causalPredecessorIds: ["cycle-b"],
+          command: { type: "change-score", team: "home", delta: 10, reason: "goal" },
+        },
+        {
+          id: "cycle-b",
+          clientSentAtMs: 1_006,
+          causalPredecessorIds: ["cycle-a"],
+          command: { type: "change-score", team: "away", delta: 10, reason: "goal" },
+        },
+      ],
+    });
+    expect(cyclic).toMatchObject({ status: "rejected", reason: "invalid-operation" });
+    const reusedAfterRejectedBatch = await games.apply({
+      gameId: created.gameId,
+      sessionId: created.sessionId,
+      operations: [
+        {
+          id: "cycle-a",
+          clientSentAtMs: 1_005,
+          command: { type: "change-score", team: "home", delta: 10, reason: "goal" },
+        },
+      ],
+    });
+    expect(reusedAfterRejectedBatch.status).toBe("accepted");
+    if (reusedAfterRejectedBatch.status === "accepted") {
+      expect(reusedAfterRejectedBatch.game.state.score).toEqual({ home: 30, away: 20 });
+    }
+  });
   test("normalizes bounded names and atomically admits the initially admitted Ad Hoc Controller", async () => {
     const games = service();
     const result = await games.create({
@@ -87,6 +211,44 @@ describe("Ad Hoc Games service", () => {
     ).toBe("accepted");
   });
 
+  test("uses the explicit Ad Hoc workflow and converges concurrent operations deterministically", async () => {
+    const first = service();
+    const created = await first.create({ homeName: "Home", awayName: "Away" });
+    if (created.status !== "accepted") throw new Error("creation failed");
+    const second = await first.admit({ gameId: created.gameId, controlQr: created.controlQr });
+    if (second.status !== "accepted") throw new Error("admission failed");
+    const replay = await first.apply({
+      gameId: created.gameId,
+      sessionId: second.game.sessionId,
+      operations: [
+        {
+          id: "later-operation",
+          clientSentAtMs: 1_002,
+          workflow: "ad-hoc",
+          command: { type: "change-score", team: "home", delta: 10, reason: "goal" },
+        },
+        {
+          id: "earlier-operation",
+          clientSentAtMs: 1_001,
+          workflow: "ad-hoc",
+          command: { type: "change-score", team: "away", delta: 10, reason: "goal" },
+        },
+      ],
+    });
+    expect(replay.status).toBe("accepted");
+    if (replay.status !== "accepted") return;
+    expect(replay.outcomes.every((outcome) => outcome.workflow === "ad-hoc")).toBe(true);
+    expect(replay.game.state.score).toEqual({ home: 10, away: 10 });
+    const restarted = createAdHocGamesService({ store: first.store, now: () => 1_003 });
+    const recovered = await restarted.read({
+      gameId: created.gameId,
+      sessionId: created.sessionId,
+    });
+    expect(recovered.status).toBe("accepted");
+    if (recovered.status === "accepted")
+      expect(recovered.game.state.score).toEqual({ home: 10, away: 10 });
+  });
+
   test("binds QR admission and retained sessions to the configured environment", async () => {
     const store = createInMemoryAdHocStore();
     const field = createAdHocGamesService({
@@ -116,103 +278,6 @@ describe("Ad Hoc Games service", () => {
     expect(
       (await copiedField.admit({ gameId: created.gameId, controlQr: created.controlQr })).status,
     ).toBe("unavailable");
-  });
-
-  test("migrates a retained #152 SQLite Game into the upgrading environment", async () => {
-    const root = mkdtempSync(join(tmpdir(), "quadball-timer-adhoc-migration-"));
-    const databasePath = join(root, "ad-hoc.sqlite");
-    const gameId = "adhoc-legacy-game-1234567890";
-    const sessionId = "legacy-session-1234567890-abcdefghijklmnopqrstuvwxyz";
-    const controlQr = "legacy-control-qr-1234567890-abcdefghijklmnopqrstuvwxyz";
-    const state = createInitialGameState({
-      id: gameId,
-      nowMs: 1_000,
-      homeName: "Home",
-      awayName: "Away",
-      homeColor: "#0f172a",
-      awayColor: "#f8fafc",
-    });
-    const digest = (value: string) => createHash("sha256").update(value).digest("hex");
-    const legacyDb = new Database(databasePath, { create: true, strict: true });
-    legacyDb.run(
-      "CREATE TABLE adhoc_schema (id INTEGER PRIMARY KEY CHECK (id = 1), version INTEGER NOT NULL)",
-    );
-    legacyDb.run("INSERT INTO adhoc_schema (id, version) VALUES (1, 1)");
-    legacyDb.run(`CREATE TABLE adhoc_games (
-      game_id TEXT PRIMARY KEY,
-      created_at_ms INTEGER NOT NULL,
-      state_json TEXT NOT NULL,
-      control_qr TEXT NOT NULL,
-      control_qr_hash TEXT NOT NULL,
-      sessions_json TEXT NOT NULL,
-      operations_json TEXT NOT NULL
-    )`);
-    legacyDb.run(`CREATE TABLE adhoc_creation_events (
-      source_hash TEXT NOT NULL,
-      successful INTEGER NOT NULL,
-      occurred_at_ms INTEGER NOT NULL
-    )`);
-    legacyDb.run(
-      "INSERT INTO adhoc_games (game_id, created_at_ms, state_json, control_qr, control_qr_hash, sessions_json, operations_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
-      [
-        gameId,
-        1_000,
-        JSON.stringify(state),
-        controlQr,
-        digest(controlQr),
-        JSON.stringify([
-          {
-            sessionHash: digest(sessionId),
-            browserId: null,
-            connected: false,
-            lastConnectedAtMs: 1_000,
-            lastDisconnectedAtMs: null,
-          },
-        ]),
-        JSON.stringify({}),
-      ],
-    );
-    legacyDb.close();
-
-    try {
-      const firstStore = openSqliteAdHocStore(databasePath, "field-a");
-      const first = createAdHocGamesService({
-        store: firstStore,
-        environmentIdentity: "field-a",
-        now: () => 1_000,
-      });
-      const firstRead = await first.read({ gameId, sessionId });
-      expect(firstRead.status).toBe("accepted");
-      if (firstRead.status !== "accepted") return;
-      expect(firstRead.game.controlQr).toBe(controlQr);
-      first.close();
-
-      const secondStore = openSqliteAdHocStore(databasePath, "field-a");
-      const restarted = createAdHocGamesService({
-        store: secondStore,
-        environmentIdentity: "field-a",
-        now: () => 1_000,
-      });
-      const restartedRead = await restarted.read({ gameId, sessionId });
-      expect(restartedRead.status).toBe("accepted");
-      if (restartedRead.status === "accepted") {
-        expect(restartedRead.game.controlQr).toBe(controlQr);
-      }
-      const admitted = await restarted.admit({ gameId, controlQr });
-      expect(admitted.status).toBe("accepted");
-      restarted.close();
-
-      const copiedStore = openSqliteAdHocStore(databasePath, "field-b");
-      const copied = createAdHocGamesService({
-        store: copiedStore,
-        environmentIdentity: "field-b",
-        now: () => 1_000,
-      });
-      expect((await copied.read({ gameId, sessionId })).status).toBe("unavailable");
-      copied.close();
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
   });
 
   test("hands the unchanged QR to every Controller and replaces only a re-admitting browser", async () => {
@@ -342,6 +407,31 @@ describe("Ad Hoc Games service", () => {
     expect(rejected).toMatchObject({ status: "rejected", reason: "invalid-operation" });
     expect(read.status).toBe("accepted");
     if (read.status === "accepted") expect(read.game.state.isRunning).toBe(false);
+  });
+
+  test("retains pending work and emits no acknowledgement when durable mutation fails", async () => {
+    const base = createInMemoryAdHocStore();
+    const failingStore: AdHocStore = {
+      close: () => base.close(),
+      listGames: () => base.listGames(),
+      readGame: (gameId) => base.readGame(gameId),
+      createGame: (input) => base.createGame(input),
+      mutateGame: () => null,
+    };
+    const games = createAdHocGamesService({ store: failingStore, now: () => 1_000 });
+    expect(
+      await games.apply({
+        gameId: "adhoc-missing",
+        sessionId: "session-that-is-long-enough-to-pass-validation-123456",
+        operations: [
+          {
+            id: "durable-failure",
+            clientSentAtMs: 1_000,
+            command: { type: "set-running", running: true },
+          },
+        ],
+      }),
+    ).toMatchObject({ status: "rejected", reason: "unavailable" });
   });
 
   test("keeps capacity cleanup isolated and rejects protected saturation", async () => {

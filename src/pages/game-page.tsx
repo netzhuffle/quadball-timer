@@ -34,7 +34,7 @@ import {
   willFlagCatchWin,
 } from "@/lib/game-page-support";
 import { buildAdHocControlQrPayload } from "@/lib/ad-hoc-handoff";
-import { clearPersistedControllerSession } from "@/lib/controller-session";
+import { clearAdHocControllerSession } from "@/lib/ad-hoc-controller-session";
 import {
   DEFAULT_AWAY_TEAM_COLOR,
   DEFAULT_HOME_TEAM_COLOR,
@@ -125,7 +125,7 @@ export function GamePage({ gameId, role }: { gameId: string; role: ControllerRol
     try {
       const response = await fetch(`/api/games/${gameId}/leave`, { method: "POST" });
       if (!response.ok) throw new Error("leave failed");
-      clearPersistedControllerSession(gameId);
+      clearAdHocControllerSession(gameId);
       navigateTo("/");
     } catch {
       setLeaveMessage("Ad Hoc Game unavailable.");

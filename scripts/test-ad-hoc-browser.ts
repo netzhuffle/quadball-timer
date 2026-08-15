@@ -104,6 +104,13 @@ async function run() {
 
         await second.getByRole("button", { name: "Start game" }).click();
         await first.getByText("Running", { exact: true }).waitFor();
+        await stopServer();
+        await second.getByRole("button", { name: "Pause game" }).click();
+        await second.getByRole("button", { name: "Start game" }).click();
+        await second.getByText(/Offline 2/u).waitFor();
+        await startServer();
+        await second.getByText("Live", { exact: true }).waitFor();
+        await first.getByText("Running", { exact: true }).waitFor();
         await second.getByRole("button", { name: "Pause game" }).click();
         await second.getByRole("button", { name: "Game end" }).click();
         await second.getByRole("button", { name: "Double forfeit" }).click();
@@ -141,6 +148,14 @@ async function run() {
         await second.goto(handoffUrl);
         await waitForGameRoute(second, gameId);
         await assertAccessibleQr(second, "readmitted second browser");
+
+        await stopServer();
+        rmSync(databasePath, { force: true });
+        await startServer();
+        await second.reload();
+        await waitForGameRoute(second, gameId);
+        await second.getByText("Local", { exact: true }).waitFor();
+        await second.getByText("Server does not know this game", { exact: false }).waitFor();
       })(),
       lifecycleController.signal,
     );
