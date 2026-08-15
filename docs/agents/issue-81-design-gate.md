@@ -16,25 +16,27 @@ Gaps are durable 0600 sidecars rather than a new application relation.
 
 ## Backup policy and integrity
 
-`foundation-backup-policy-v1` is a closed relation allowlist. It includes all Event Game Record,
-Control Action, idempotency, replay, Event catalog, non-Technical-Admin Grant, Grant Session,
-credential/verifier, audit, integrity-anchor, admission, and migration-ledger relations. It excludes
-the exact Technical Admin credential, enrollment, challenge, browser-session, identity/state, log,
-and alert relations. A new or otherwise unclassified table/view fails the backup before retention can
-change.
+`foundation-backup-policy-v2` is a closed Foundation-only relation allowlist. It includes only the
+Event Game Record, Control Action, idempotency, replay, Event catalog, non-Technical-Admin Grant,
+Grant Session, credential/verifier, audit, integrity-anchor, admission, and migration-ledger
+relations owned by Foundation. Any relation outside that allowlist—including any `technical_admin_*`
+or other authentication relation—fails the backup before `VACUUM INTO` or publication can change
+state. The separate Technical Admin database is outside this database boundary and is never opened,
+read, copied, filtered, or sanitized by Foundation backup.
 
-The live writer queue drains and remains held while `VACUUM INTO` creates a consistent raw snapshot
-outside the live database directory. Explicitly excluded relations are removed only from that raw
-snapshot. A second `VACUUM INTO` creates the compact retained image, so deleted Technical Admin
-payload is absent from free pages as well as logical rows.
+The live writer queue drains and remains held while `VACUUM INTO` creates a consistent Foundation
+snapshot outside the live database directory. No relation is dropped or filtered from that image:
+the closed allowlist has already established that the source is Foundation-only. A second
+`VACUUM INTO` creates the compact retained image. This structural boundary ensures that no
+Technical Admin payload is ever copied into, or sanitized out of, the backup.
 
 The backup workspace is a physically separate, caller-owned, non-symlink `0700` directory. Raw,
 staged, retained, manifest, evidence, and failed-image destinations fail closed on pre-existing or
-symlink paths. The raw unsanitized image is tightened to `0600` before the SQLite writer queue yields;
+symlink paths. The raw Foundation image is tightened to `0600` before the SQLite writer queue yields;
 all other files are `0600`. Verification and restore copy from no-follow file handles whose inode,
 size, and modification identity remain stable, into exclusively created private files. Published
 files are rechecked against the opened inode; failed/live image moves use exclusive same-filesystem
-links before unlinking the source. Every owned Event, Technical Admin, WAL/SHM, and quarantine source
+links before unlinking the source. Every owned Event, WAL/SHM, and quarantine source
 is tightened and verified as a non-symlink `0600` regular file before preservation; the linked
 destination is verified at the same private mode. Rollback repeats that identity and mode check.
 Cleanup unlinks only the inode recovery created. Existing,
@@ -48,7 +50,7 @@ Verification uses a separate database handle and disposable copy. It requires:
   Game replay through the existing readiness verifier;
 - every encryption, lookup, and audit key version represented in retained rows to exist in the
   separately supplied key ring;
-- no Technical Admin relation after compaction.
+- no relation outside the closed Foundation-only allowlist.
 
 Grant credential/session lookup versions are lookup-key requirements. The accepted Grant Code format
 derives its stored lookup/fingerprint material from the audit ring, so its represented lookup-version
@@ -63,9 +65,11 @@ manifest have both passed verification and their directory entry is synced.
 ## Restore and authority policy
 
 Restore verifies the retained snapshot before touching the live database and copies it to an
-exclusive staging path beside the live file. Technical Admin and Event authoritative writers then
-stop, drain, and close before the one final current-authority evaluation immediately preceding
-replacement. Expired Grants are cryptographically erased through the existing lifecycle
+exclusive staging path beside the live file. Foundation storage is quiesced and closed for
+replacement. Technical Admin authentication is exclusively quiesced and drained, but remains
+adapter-usable until `prepareForFoundationRestore` commits. The one final current-authority
+evaluation then immediately precedes replacement. Expired Grants are cryptographically erased
+through the existing lifecycle
 implementation; stale Event Admin sessions are expired. Every active Control Session is resolved
 through `resolveSession(scope, session.eventGameId)`: exact current, pinned, and switchable sessions
 remain usable; only the exact session reported terminal for Game Lock or past Game Day is terminated.
@@ -75,14 +79,17 @@ resolved current scope is Game-locked, with that exact current Game recorded as 
 unavailable, conflicted, malformed, or identity-mismatched resolution aborts restore.
 
 The staging database passes readiness again, is sealed into a portable checkpointed image, and is
-confirmed free of Technical Admin state. The injected Technical Admin auth adapter then stops new
-auth writes and drains/closes its separate database before authoritative Event writes are drained.
-The live Event image, Technical Admin auth image, and any sidecars/quarantine marker move exclusively
-to unique failed-image paths; only the staged Event image moves exclusively into active use. On next startup the
-auth repository therefore creates empty auth state rather than reviving the former passkey, sessions,
-challenges, or enrollment authorization. A replacement failure removes only the installed inode and
-moves both failed images back without overwriting a competing path. The caller must reopen storage
-after either outcome.
+confirmed free of Technical Admin state. After both authoritative stores are quiesced, Foundation
+calls the injected Technical Admin auth adapter with the selected semantic mode, normally
+preserve-compatible-credential. The adapter preserves a validated compatible live credential
+while atomically invalidating sessions, fresh-verification state, challenges, and enrollment
+authorizations; missing, invalid, incompatible, or explicitly reset state is classified as
+re-enrollment-required. sanitation-failed aborts before Foundation replacement. The live Event
+image and any Event sidecars/quarantine marker move exclusively to unique failed-image paths; the
+sanitized Technical Admin auth store remains at its live path, and only the staged Event image moves
+exclusively into active use. A replacement failure removes only the installed Foundation inode and
+rolls back Foundation files; it does not move, reopen, or restore the already-sanitized auth store.
+The caller must reopen storage after either outcome.
 
 Before cutover, recovery writes and syncs one immutable private pending record. After successful live
 replacement it atomically adds a separate synced `0600` completion record. A completion-record I/O
@@ -91,10 +98,12 @@ failure cannot turn the already completed restore into a reported failure: the r
 retains the cutover identity for reconciliation and prevents an unsafe blind retry.
 
 Redacted restore evidence records snapshot time, snapshot/current action counts, whether potentially
-newer work existed, the preserved failed-image path, and restored Grant type/version tuples with
-Grant IDs hashed. This is the accepted older-snapshot resurrection-risk evidence for later Technical
-Admin review. It never claims that restored authority was current at snapshot time; current lifecycle
-reevaluation remains decisive.
+newer work existed, the preserved failed-image path, restored Grant type/version tuples with Grant
+IDs hashed, and only the finite Technical Admin auth outcome plus its allowlisted re-enrollment
+reason when present. It contains no credential, RP/origin, session/challenge, auth path/schema, or
+raw adapter error. This is the accepted older-snapshot resurrection-risk evidence for later
+Technical Admin review. It never claims that restored authority was current at snapshot time;
+current lifecycle reevaluation remains decisive.
 
 ## Recovery import and Recovery Gaps
 
@@ -126,14 +135,17 @@ Score Sheet, recording Recovery Gaps. This is not an automatic failover or a sec
 
 ## Fast-test evidence
 
-Ordinary hermetic tests cover SQLite snapshot/compaction, synthetic Technical Admin rows and physical
-canaries, unclassified relations, independent verification, retained predecessor backups, staged
+Ordinary hermetic tests cover SQLite snapshot/compaction, rejection of synthetic Technical Admin and
+other unclassified relations, separate-auth inode/content preservation, independent verification,
+retained predecessor backups, staged
 replacement, failed replacement rollback, failed-image preservation, restart, current lifecycle
 reevaluation, redacted evidence, explicit gaps, and real composed-acceptance import with durable
 SQLite mutation. They do not run Qualification, soak, load, crash, or exact-production-artifact
 workloads.
 
-The corrected suite additionally covers the synchronized final-evaluation/cutover race; a pinned old
+The corrected suite additionally covers the synchronized final-evaluation/cutover race; semantic
+Technical Admin restore ordering, abort-before-replacement, finite re-enrollment classification,
+and rollback without cross-database transient revival; a pinned old
 Game beside multiple exact locked and past-Game-Day sessions on one reused Grant; one truthful current
 Game Code erasure across memory, SQLite, and restart; rejected/malformed per-session
 resolution; private/no-follow filesystem behavior including synchronized backup-final replacement,

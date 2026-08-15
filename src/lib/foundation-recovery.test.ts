@@ -31,15 +31,91 @@ import {
 } from "@/lib/ad-hoc-games";
 import { FoundationBackupPolicyError } from "@/lib/foundation-recovery-sqlite";
 import { openSqliteFoundationStorage } from "@/lib/foundation-storage-sqlite";
+import {
+  SqliteTechnicalAdminAuthRepository,
+  createTechnicalAdminAuth,
+  type WebAuthnVerifier,
+} from "@/lib/technical-admin-auth";
 
-const CURRENT_MIGRATION_COUNT = FOUNDATION_MIGRATIONS.length;
 const CURRENT_SCHEMA_VERSION = String(FOUNDATION_MIGRATIONS.at(-1)?.schemaVersion ?? 0);
+const technicalAdminBinding = {
+  origin: "https://localhost:39421",
+  host: "localhost:39421",
+};
+const technicalAdminIdentity = {
+  environment: "test" as const,
+  origin: technicalAdminBinding.origin,
+  rpId: "localhost",
+};
+const validTechnicalAdminPublicKey: JsonWebKey = {
+  kty: "OKP",
+  crv: "Ed25519",
+  x: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+  alg: "EdDSA",
+  ext: true,
+};
+
+function createTechnicalAdminTestVerifier(): WebAuthnVerifier {
+  let signCount = 1;
+  return {
+    async verifyRegistration() {
+      return {
+        credentialId: "credential-1",
+        publicKey: { ...validTechnicalAdminPublicKey },
+        signCount: signCount++,
+      };
+    },
+    async verifyAuthentication() {
+      return { signCount: signCount++ };
+    },
+  };
+}
+
+async function enrollTechnicalAdmin(
+  repository: SqliteTechnicalAdminAuthRepository,
+  now: () => number,
+) {
+  const auth = createTechnicalAdminAuth(
+    technicalAdminIdentity,
+    repository,
+    createTechnicalAdminTestVerifier(),
+    now,
+  );
+  const issued = auth.issueEnrollmentAuthorization();
+  if (!issued.ok) throw new Error("Expected enrollment authorization.");
+  const token = decodeURIComponent(issued.value.url.split("token=")[1] ?? "");
+  const enrollment = auth.beginEnrollment(token, technicalAdminBinding);
+  if (!enrollment.ok) throw new Error("Expected enrollment options.");
+  const completed = await auth.completeEnrollment(
+    enrollment.value.challengeId,
+    {},
+    technicalAdminBinding,
+  );
+  if (!completed.ok) throw new Error("Expected enrollment completion.");
+  const authentication = await auth.beginAuthentication(technicalAdminBinding);
+  if (!authentication.ok) throw new Error("Expected authentication options.");
+  const session = await auth.completeAuthentication(
+    authentication.value.challengeId,
+    {},
+    technicalAdminBinding,
+  );
+  if (!session.ok) throw new Error("Expected authenticated session.");
+  return { auth, session: session.value };
+}
 
 describe("Event foundation recovery", () => {
-  test("sanitizes Technical Admin auth physically and verifies a retained VACUUM snapshot", async () => {
+  test("rejects auth relations in Foundation and leaves the separate auth store untouched", async () => {
     await withRecoveryPaths(async ({ livePath, backupDirectory }) => {
       const harness = await createHarness(livePath, backupDirectory);
-      const canary = "synthetic-passkey-canary-never-in-backup";
+      const technicalAdminPath = harness.options.technicalAdminAuth.databasePath;
+      const authRepository = new SqliteTechnicalAdminAuthRepository(
+        technicalAdminPath,
+        technicalAdminIdentity,
+      );
+      authRepository.issueEnrollment("separate-auth-canary", 61_000);
+      authRepository.close();
+      const authBefore = readFileSync(technicalAdminPath);
+      const authIdentityBefore = lstatSync(technicalAdminPath);
       const injected = new Database(livePath);
       injected.exec(`
         CREATE TABLE technical_admin_credentials (credential_id TEXT PRIMARY KEY, public_key_json TEXT);
@@ -47,38 +123,27 @@ describe("Event foundation recovery", () => {
       `);
       injected
         .query("INSERT INTO technical_admin_credentials VALUES (?, ?)")
-        .run("credential", canary);
+        .run("credential", "synthetic-foundation-auth");
       injected
         .query("INSERT INTO technical_admin_sessions VALUES (?, ?)")
-        .run("session", `${canary}-session`);
+        .run("session", "synthetic-session");
       injected.close();
 
-      const manifest = await harness.recovery.createPreDeploymentBackup();
-      const manifestPath = join(backupDirectory, `${manifest.snapshotId}.manifest.json`);
-      const databasePath = join(backupDirectory, manifest.databaseFile);
-      expect(await harness.recovery.verifyBackup(manifestPath)).toEqual(manifest);
-      const manifestAlias = join(backupDirectory, "manifest-alias.json");
-      await symlink(manifestPath, manifestAlias);
-      expect(harness.recovery.verifyBackup(manifestAlias)).rejects.toThrow();
-      const compactedBytes = readFileSync(databasePath);
-      expect(compactedBytes.includes(Buffer.from(canary))).toBe(false);
-      const verified = new Database(databasePath, { readonly: true });
-      expect(
-        verified
-          .query(
-            "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'technical_admin_%'",
-          )
-          .all(),
-      ).toEqual([]);
-      expect(
-        verified.query("SELECT COUNT(*) AS count FROM foundation_migration_ledger").get(),
-      ).toEqual({ count: CURRENT_MIGRATION_COUNT });
-      verified.close();
+      expect(harness.recovery.createPreDeploymentBackup()).rejects.toBeInstanceOf(
+        FoundationBackupPolicyError,
+      );
+      expect(existsSync(join(backupDirectory, "recovery-1.sqlite"))).toBe(false);
+      expect(existsSync(join(backupDirectory, "recovery-1.manifest.json"))).toBe(false);
+      expect(readFileSync(technicalAdminPath)).toEqual(authBefore);
+      expect(lstatSync(technicalAdminPath)).toMatchObject({
+        dev: authIdentityBefore.dev,
+        ino: authIdentityBefore.ino,
+      });
       harness.storage.close();
     });
   });
 
-  test("fails closed on an unclassified authority relation and retains the prior verified backup", async () => {
+  test("fails closed on any other authority relation and retains the prior verified backup", async () => {
     await withRecoveryPaths(async ({ livePath, backupDirectory }) => {
       const ids = ["first", "verify-first", "second"];
       const harness = await createHarness(livePath, backupDirectory, () => ids.shift() ?? "extra");
@@ -219,7 +284,7 @@ describe("Event foundation recovery", () => {
     });
   });
 
-  test("stages restore, preserves the failed database, and rolls replacement failures back", async () => {
+  test("stages restore, preserves the failed database, and keeps sanitized auth live", async () => {
     await withRecoveryPaths(async ({ livePath, backupDirectory }) => {
       const ids = ["snapshot", "verify-backup", "verify-before-restore", "restore"];
       const harness = await createHarness(livePath, backupDirectory, () => ids.shift() ?? "extra");
@@ -231,44 +296,42 @@ describe("Event foundation recovery", () => {
         .run("newer-event", "Potentially newer work", "Europe/Zurich", 20, 20);
       live.close();
       const technicalAdminPath = harness.options.technicalAdminAuth.databasePath;
-      const technicalAdmin = new Database(technicalAdminPath, { create: true });
-      technicalAdmin.exec(
-        "CREATE TABLE technical_admin_credentials (credential_id TEXT PRIMARY KEY, public_key_json TEXT);",
+      const repository = new SqliteTechnicalAdminAuthRepository(
+        technicalAdminPath,
+        technicalAdminIdentity,
       );
-      technicalAdmin
-        .query("INSERT INTO technical_admin_credentials VALUES (?, ?)")
-        .run("active-passkey", "must-not-revive");
-      technicalAdmin.close();
-
-      const technicalAdminWalPath = `${technicalAdminPath}-wal`;
-      const technicalAdminShmPath = `${technicalAdminPath}-shm`;
-      const quarantinePath = `${livePath}.quarantine`;
+      const { auth, session } = await enrollTechnicalAdmin(repository, () => 1_000);
+      const pending = await auth.beginAuthentication(technicalAdminBinding);
+      if (!pending.ok) throw new Error("Expected pending authentication challenge.");
+      repository.issueEnrollment("pending-enrollment", 61_000);
+      const credentialBefore = structuredClone(repository.getCredential());
+      const storageIdentityBefore = structuredClone(repository.getStorageIdentity());
+      const authFileBefore = lstatSync(technicalAdminPath);
       const recovery = createFoundationRecovery(harness.storage, {
         ...harness.options,
-        faultInjector(phase) {
-          if (phase !== "after-final-authority-evaluation") return;
-          chmodSync(livePath, 0o644);
-          chmodSync(technicalAdminPath, 0o644);
-          writeFileSync(technicalAdminWalPath, "technical-admin-wal", { mode: 0o644 });
-          writeFileSync(technicalAdminShmPath, "technical-admin-shm", { mode: 0o644 });
-          writeFileSync(quarantinePath, "quarantine", { mode: 0o644 });
+        technicalAdminAuth: {
+          ...harness.options.technicalAdminAuth,
+          adapter: auth,
         },
       });
       const restored = await recovery.restore(manifestPath);
       expect(restored.potentiallyNewerWork).toBe(true);
       expect(existsSync(restored.failedDatabasePath)).toBe(true);
-      expect(existsSync(technicalAdminPath)).toBe(false);
-      expect(restored.failedTechnicalAdminDatabasePath).not.toBeNull();
-      expect(existsSync(restored.failedTechnicalAdminDatabasePath ?? "")).toBe(true);
-      for (const privatePath of [
-        restored.failedDatabasePath,
-        restored.failedTechnicalAdminDatabasePath ?? "",
-        `${restored.failedTechnicalAdminDatabasePath ?? ""}-wal`,
-        `${restored.failedTechnicalAdminDatabasePath ?? ""}-shm`,
-        `${restored.failedDatabasePath}.quarantine`,
-      ]) {
-        expect(lstatSync(privatePath).mode & 0o777).toBe(0o600);
-      }
+      expect(restored.failedTechnicalAdminDatabasePath).toBeNull();
+      expect(existsSync(technicalAdminPath)).toBe(true);
+      expect(lstatSync(technicalAdminPath)).toMatchObject({
+        dev: authFileBefore.dev,
+        ino: authFileBefore.ino,
+      });
+      expect(repository.getCredential()).toEqual(credentialBefore);
+      expect(repository.getStorageIdentity()).toEqual(storageIdentityBefore);
+      expect(auth.authenticateSession(session.token)).toBe(false);
+      expect(auth.verifyCsrf(session.token, session.csrfToken)).toBe(false);
+      expect(auth.resolveCurrentAuthority(session.token)).toBeNull();
+      expect(
+        await auth.completeAuthentication(pending.value.challengeId, {}, technicalAdminBinding),
+      ).toEqual({ ok: false, error: "invalid-ceremony" });
+      expect(lstatSync(restored.failedDatabasePath).mode & 0o777).toBe(0o600);
       expect(existsSync(livePath)).toBe(true);
       const current = new Database(livePath);
       expect(
@@ -295,10 +358,45 @@ describe("Event foundation recovery", () => {
       expect(lstatSync(restored.completionEvidencePath).mode & 0o777).toBe(0o600);
       expect(JSON.parse(readFileSync(restored.completionEvidencePath, "utf8"))).toMatchObject({
         status: "completed",
-        technicalAdminAuthRevived: false,
+        technicalAdminAuth: {
+          outcome: "preserved-transients-invalidated",
+        },
         potentiallyNewerWork: true,
         snapshotAtMs: manifest.snapshotAtMs,
       });
+      expect(
+        JSON.stringify(JSON.parse(readFileSync(restored.completionEvidencePath, "utf8"))),
+      ).not.toMatch(/credential|origin|session|challenge|auth path|schema/i);
+      auth.close();
+      repository.close();
+      harness.storage.close();
+      const restartedRepository = new SqliteTechnicalAdminAuthRepository(
+        technicalAdminPath,
+        technicalAdminIdentity,
+      );
+      const restartedAuth = createTechnicalAdminAuth(
+        technicalAdminIdentity,
+        restartedRepository,
+        createTechnicalAdminTestVerifier(),
+        () => 2_000,
+      );
+      expect(restartedRepository.getCredential()).toEqual(credentialBefore);
+      expect(restartedRepository.getStorageIdentity()).toEqual(storageIdentityBefore);
+      expect(lstatSync(technicalAdminPath)).toMatchObject({
+        dev: authFileBefore.dev,
+        ino: authFileBefore.ino,
+      });
+      const fresh = await restartedAuth.beginAuthentication(technicalAdminBinding);
+      if (!fresh.ok) throw new Error("Expected fresh authentication options after restore.");
+      expect(
+        await restartedAuth.completeAuthentication(
+          fresh.value.challengeId,
+          {},
+          technicalAdminBinding,
+        ),
+      ).toMatchObject({ ok: true });
+      restartedAuth.close();
+      restartedRepository.close();
     });
 
     await withRecoveryPaths(async ({ livePath, backupDirectory }) => {
@@ -307,18 +405,22 @@ describe("Event foundation recovery", () => {
       const manifest = await initial.recovery.createPreDeploymentBackup();
       const manifestPath = join(backupDirectory, `${manifest.snapshotId}.manifest.json`);
       const technicalAdminPath = initial.options.technicalAdminAuth.databasePath;
-      const technicalAdmin = new Database(technicalAdminPath, { create: true });
-      technicalAdmin.exec("CREATE TABLE technical_admin_credentials (credential_id TEXT);");
-      technicalAdmin.close();
+      writeFileSync(technicalAdminPath, "pre-sanitation-auth", { mode: 0o600 });
       const recovery = createFoundationRecovery(initial.storage, {
         ...initial.options,
+        technicalAdminAuth: {
+          ...initial.options.technicalAdminAuth,
+          adapter: {
+            async prepareForFoundationRestore() {
+              writeFileSync(technicalAdminPath, "sanitized-auth", { mode: 0o600 });
+              return { outcome: "preserved-transients-invalidated" as const };
+            },
+          },
+        },
         createId: () => ids.shift() ?? "extra",
         faultInjector(phase) {
           if (phase === "after-final-authority-evaluation") {
             chmodSync(livePath, 0o644);
-            chmodSync(technicalAdminPath, 0o644);
-            writeFileSync(`${technicalAdminPath}-wal`, "rollback-wal", { mode: 0o644 });
-            writeFileSync(`${technicalAdminPath}-shm`, "rollback-shm", { mode: 0o644 });
             writeFileSync(`${livePath}.quarantine`, "rollback-quarantine", { mode: 0o644 });
           }
           if (phase === "before-live-replacement") throw new Error("injected replacement failure");
@@ -327,15 +429,10 @@ describe("Event foundation recovery", () => {
       expect(recovery.restore(manifestPath)).rejects.toThrow("injected replacement failure");
       expect(existsSync(livePath)).toBe(true);
       expect(existsSync(technicalAdminPath)).toBe(true);
-      for (const privatePath of [
-        livePath,
-        technicalAdminPath,
-        `${technicalAdminPath}-wal`,
-        `${technicalAdminPath}-shm`,
-        `${livePath}.quarantine`,
-      ]) {
+      for (const privatePath of [livePath, `${livePath}.quarantine`]) {
         expect(lstatSync(privatePath).mode & 0o777).toBe(0o600);
       }
+      expect(readFileSync(technicalAdminPath, "utf8")).toBe("sanitized-auth");
       await rm(`${livePath}.quarantine`);
       const reopened = openSqliteFoundationStorage(livePath, {
         grantKeyRing: initial.keyRing,
@@ -490,6 +587,170 @@ describe("Event foundation recovery", () => {
       reopened.setReadinessContext(initial.readinessContext);
       expect(await reopened.readiness()).toMatchObject({ ok: true });
       reopened.close();
+    });
+  });
+
+  test("quiesces both stores before invoking the semantic auth adapter", async () => {
+    await withRecoveryPaths(async ({ livePath, backupDirectory }) => {
+      const ids = ["snapshot", "verify-backup", "restore", "verify-restore"];
+      const harness = await createHarness(livePath, backupDirectory, () => ids.shift() ?? "extra");
+      const manifest = await harness.recovery.createPreDeploymentBackup();
+      const events: string[] = [];
+      const recovery = createFoundationRecovery(harness.storage, {
+        ...harness.options,
+        technicalAdminAuth: {
+          ...harness.options.technicalAdminAuth,
+          async quiesce() {
+            events.push("technical-admin-quiesced");
+          },
+          adapter: {
+            async prepareForFoundationRestore(request) {
+              events.push("auth:" + request.mode);
+              return { outcome: "preserved-transients-invalidated" as const };
+            },
+          },
+        },
+        faultInjector(phase) {
+          if (phase === "after-authoritative-quiescence") events.push("foundation-quiesced");
+          if (phase === "before-live-replacement") events.push("before-replacement");
+        },
+      });
+
+      await recovery.restore(join(backupDirectory, manifest.snapshotId + ".manifest.json"));
+      expect(events).toEqual([
+        "technical-admin-quiesced",
+        "foundation-quiesced",
+        "auth:preserve-compatible-credential",
+        "before-replacement",
+      ]);
+      harness.storage.close();
+    });
+  });
+
+  test("records exceptional re-enrollment separately from a successful Foundation restore", async () => {
+    await withRecoveryPaths(async ({ livePath, backupDirectory }) => {
+      const ids = ["snapshot", "verify-backup", "restore", "verify-restore"];
+      const harness = await createHarness(livePath, backupDirectory, () => ids.shift() ?? "extra");
+      const manifest = await harness.recovery.createPreDeploymentBackup();
+      let requestedMode: string | null = null;
+      const recovery = createFoundationRecovery(harness.storage, {
+        ...harness.options,
+        technicalAdminAuth: {
+          ...harness.options.technicalAdminAuth,
+          adapter: {
+            async prepareForFoundationRestore(request) {
+              requestedMode = request.mode;
+              return { outcome: "re-enrollment-required", reason: "explicit-reset" as const };
+            },
+          },
+        },
+      });
+
+      const restored = await recovery.restore(
+        join(backupDirectory, manifest.snapshotId + ".manifest.json"),
+        { technicalAdminAuthMode: "explicit-reset" },
+      );
+      if (requestedMode !== "explicit-reset") {
+        throw new Error("Foundation did not pass the explicit-reset mode to the auth adapter.");
+      }
+      if (restored.completionEvidencePath === null) {
+        throw new Error("Expected completed restore evidence.");
+      }
+      expect(JSON.parse(readFileSync(restored.completionEvidencePath, "utf8"))).toMatchObject({
+        status: "completed",
+        technicalAdminAuth: {
+          outcome: "re-enrollment-required",
+          reason: "explicit-reset",
+        },
+      });
+      harness.storage.close();
+    });
+  });
+
+  test("aborts before Foundation replacement on auth sanitation failure with bounded evidence", async () => {
+    await withRecoveryPaths(async ({ livePath, backupDirectory }) => {
+      const ids = ["snapshot", "verify-backup", "restore", "verify-restore"];
+      const harness = await createHarness(livePath, backupDirectory, () => ids.shift() ?? "extra");
+      const manifest = await harness.recovery.createPreDeploymentBackup();
+      let replacementAttempted = false;
+      const recovery = createFoundationRecovery(harness.storage, {
+        ...harness.options,
+        technicalAdminAuth: {
+          ...harness.options.technicalAdminAuth,
+          adapter: {
+            async prepareForFoundationRestore() {
+              return { outcome: "sanitation-failed" as const };
+            },
+          },
+        },
+        faultInjector(phase) {
+          if (phase === "before-live-replacement") replacementAttempted = true;
+        },
+      });
+
+      const sanitationFailure = await recovery
+        .restore(join(backupDirectory, manifest.snapshotId + ".manifest.json"))
+        .then(
+          () => null,
+          (error: unknown) => error,
+        );
+      if (!(sanitationFailure instanceof Error)) {
+        throw new Error("Expected auth sanitation to abort the restore.");
+      }
+      expect(sanitationFailure.message).toContain("sanitation failed before replacement");
+      expect(replacementAttempted).toBe(false);
+      expect(existsSync(livePath + ".failed-restore")).toBe(false);
+      const evidence = JSON.parse(
+        readFileSync(join(backupDirectory, "restore.restore-evidence.json"), "utf8"),
+      );
+      expect(evidence).toMatchObject({
+        status: "aborted-auth-sanitation",
+        technicalAdminAuth: { outcome: "sanitation-failed" },
+      });
+      expect(JSON.stringify(evidence)).not.toMatch(/credential|origin|session|schema|path/i);
+      harness.storage.close();
+    });
+  });
+
+  test("Foundation rollback never restores pre-sanitation Technical Admin transients", async () => {
+    await withRecoveryPaths(async ({ livePath, backupDirectory }) => {
+      const ids = ["snapshot", "verify-backup", "restore", "verify-restore"];
+      const harness = await createHarness(livePath, backupDirectory, () => ids.shift() ?? "extra");
+      const manifest = await harness.recovery.createPreDeploymentBackup();
+      const technicalAdminPath = harness.options.technicalAdminAuth.databasePath;
+      writeFileSync(technicalAdminPath, "pre-sanitation-transients", { mode: 0o600 });
+      const recovery = createFoundationRecovery(harness.storage, {
+        ...harness.options,
+        technicalAdminAuth: {
+          ...harness.options.technicalAdminAuth,
+          adapter: {
+            async prepareForFoundationRestore() {
+              writeFileSync(technicalAdminPath, "preserved-credential-no-transients", {
+                mode: 0o600,
+              });
+              return { outcome: "preserved-transients-invalidated" as const };
+            },
+          },
+        },
+        faultInjector(phase) {
+          if (phase === "before-live-replacement") {
+            throw new Error("injected Foundation replacement failure");
+          }
+        },
+      });
+
+      const replacementFailure = await recovery
+        .restore(join(backupDirectory, manifest.snapshotId + ".manifest.json"))
+        .then(
+          () => null,
+          (error: unknown) => error,
+        );
+      if (!(replacementFailure instanceof Error)) {
+        throw new Error("Expected Foundation replacement to fail.");
+      }
+      expect(replacementFailure.message).toContain("injected Foundation replacement failure");
+      expect(readFileSync(technicalAdminPath, "utf8")).toBe("preserved-credential-no-transients");
+      harness.storage.close();
     });
   });
 
@@ -724,6 +985,11 @@ describe("Event foundation recovery", () => {
         technicalAdminAuth: {
           databasePath: join(dirname(livePath), "technical-admin.sqlite"),
           async quiesce() {},
+          adapter: {
+            async prepareForFoundationRestore() {
+              return { outcome: "preserved-transients-invalidated" as const };
+            },
+          },
         },
         nowMs: () => now,
         faultInjector(phase) {
@@ -1213,6 +1479,11 @@ async function createHarness(
     technicalAdminAuth: {
       databasePath: join(dirname(livePath), "technical-admin.sqlite"),
       async quiesce() {},
+      adapter: {
+        async prepareForFoundationRestore() {
+          return { outcome: "preserved-transients-invalidated" as const };
+        },
+      },
     },
     nowMs: () => 10,
     createId,

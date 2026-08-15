@@ -43,11 +43,15 @@ import {
 import type { FoundationStorageReadinessContext } from "@/lib/foundation-storage";
 import type { FoundationStorageTransaction } from "@/lib/foundation-storage";
 import type { AdHocRecoveryAdapter, AdHocRecoveryFacts } from "@/lib/ad-hoc-games";
+import type {
+  TechnicalAdminAuth,
+  TechnicalAdminRestorePreparationRequest,
+  TechnicalAdminRestorePreparationResult,
+} from "@/lib/technical-admin-auth";
 import {
   FOUNDATION_BACKUP_POLICY_VERSION,
   inspectRecoveryDatabase,
   readRepresentedKeyVersions,
-  removeExcludedRelations,
   quoteRecoverySqliteString,
   type RepresentedKeyVersions,
   type RecoverySnapshotFacts,
@@ -72,7 +76,6 @@ export type FoundationRecoveryManifest = {
     grantType: string;
     grantVersion: string;
   }[];
-  excludedRelations: readonly string[];
   adHoc?: {
     databaseFile: string;
     databaseSha256: string;
@@ -89,10 +92,12 @@ export type FoundationRecoveryOptions = {
   /** Composed once against this recovery's storage and Grant environment. */
   acceptance: Omit<FoundationAcceptanceOptions, "grant">;
   technicalAdminAuth: {
-    /** Separate Technical Admin auth database; it is preserved but never restored as active. */
+    /** Separate Technical Admin auth database; it is preserved but never restored from Foundation. */
     databasePath: string;
-    /** Stops new auth writes and drains/closes the repository before replacement. */
+    /** Stops new auth writes and drains the auth store before semantic restore preparation. */
     quiesce(): Promise<void>;
+    /** The sole semantic auth boundary consumed by Foundation recovery. */
+    adapter: Pick<TechnicalAdminAuth, "prepareForFoundationRestore">;
   };
   /** Optional Ad Hoc database included in the same staged recovery boundary. */
   adHoc?: AdHocRecoveryAdapter;
@@ -101,7 +106,7 @@ export type FoundationRecoveryOptions = {
   faultInjector?: (
     phase:
       | "after-vacuum"
-      | "after-sanitize"
+      | "after-compaction"
       | "after-verification"
       | "after-restore-staging"
       | "after-authoritative-quiescence"
@@ -137,9 +142,16 @@ export type RecoveryImportInput = {
 export type FoundationRecovery = {
   createPreDeploymentBackup(): Promise<FoundationRecoveryManifest>;
   verifyBackup(manifestPath: string): Promise<FoundationRecoveryManifest>;
-  restore(manifestPath: string): Promise<{
+  restore(
+    manifestPath: string,
+    options?: FoundationRestoreOptions,
+  ): Promise<{
     restoreId: string;
     failedDatabasePath: string;
+    /**
+     * @deprecated Compatibility-only field. Policy A never moves the separate Technical Admin
+     * store and always returns null.
+     */
     failedTechnicalAdminDatabasePath: string | null;
     failedAdHocDatabasePath: string | null;
     completed: true;
@@ -151,6 +163,10 @@ export type FoundationRecovery = {
   importControllerRecovery(
     input: RecoveryImportInput,
   ): Promise<{ outcome: FoundationBatchOutcome; evidencePath: string }>;
+};
+
+export type FoundationRestoreOptions = {
+  technicalAdminAuthMode?: TechnicalAdminRestorePreparationRequest["mode"];
 };
 
 export function createFoundationRecovery(
@@ -195,7 +211,7 @@ export function createFoundationRecovery(
     let completed = false;
     try {
       await assertPathAbsent(rawPath, "raw recovery snapshot");
-      await assertPathAbsent(stagedPath, "sanitized recovery snapshot");
+      await assertPathAbsent(stagedPath, "compacted recovery snapshot");
       await assertPathAbsent(databasePath, "verified recovery snapshot");
       await assertPathAbsent(manifestPath, "recovery manifest");
       if (options.adHoc !== undefined) {
@@ -207,14 +223,13 @@ export function createFoundationRecovery(
       options.faultInjector?.("after-vacuum");
       const raw = new Database(rawPath);
       try {
-        removeExcludedRelations(raw);
         raw.exec(`VACUUM INTO ${quoteRecoverySqliteString(stagedPath)};`);
       } finally {
         raw.close();
       }
       await chmod(stagedPath, 0o600);
-      options.faultInjector?.("after-sanitize");
-      stagedIdentity = await assertOwnedPrivateFile(stagedPath, "sanitized recovery snapshot");
+      options.faultInjector?.("after-compaction");
+      stagedIdentity = await assertOwnedPrivateFile(stagedPath, "compacted recovery snapshot");
       const verified = await verifyDatabase(stagedPath, sourceFacts);
       options.faultInjector?.("after-verification");
       if (options.adHoc !== undefined) {
@@ -239,7 +254,6 @@ export function createFoundationRecovery(
         actionCount: verified.facts.actionCount,
         representedKeyVersions: verified.keyVersions,
         restoredGrantVersions: redactGrantVersions(verified.facts),
-        excludedRelations: sourceFacts.excludedRelations,
         ...(options.adHoc === undefined || adHocFacts === null
           ? {}
           : {
@@ -297,7 +311,6 @@ export function createFoundationRecovery(
         logicalDigest: manifest.logicalDigest,
         actionCount: manifest.actionCount,
         grantVersions: [],
-        excludedRelations: manifest.excludedRelations,
       });
       if (
         JSON.stringify(verified.keyVersions) !== JSON.stringify(manifest.representedKeyVersions)
@@ -327,14 +340,13 @@ export function createFoundationRecovery(
     }
   }
 
-  async function restore(manifestPath: string) {
+  async function restore(manifestPath: string, restoreOptions: FoundationRestoreOptions = {}) {
     await prepareBackupWorkspace(liveDirectory, backupDirectory);
     const manifest = await readManifest(manifestPath, backupDirectory);
     const backupPath = resolveBackupDatabasePath(manifestPath, manifest, backupDirectory);
     const restoreId = boundedId(createId(), "restoreId");
     const stagedPath = join(liveDirectory, `.${basename(livePath)}.${restoreId}.staged`);
     const failedDatabasePath = `${livePath}.failed-${restoreId}`;
-    const failedTechnicalAdminDatabasePath = `${technicalAdminPath}.failed-${restoreId}`;
     const adHocLivePath = options.adHoc?.databasePath ?? null;
     const stagedAdHocPath =
       adHocLivePath === null
@@ -353,7 +365,6 @@ export function createFoundationRecovery(
     let evidenceIdentity: StableFileIdentity | null = null;
     try {
       await assertPathAbsent(failedDatabasePath, "failed Event foundation image");
-      await assertPathAbsent(failedTechnicalAdminDatabasePath, "failed Technical Admin image");
       if (failedAdHocDatabasePath !== null)
         await assertPathAbsent(failedAdHocDatabasePath, "failed Ad Hoc image");
       await assertPathAbsent(evidencePath, "restore evidence");
@@ -363,7 +374,6 @@ export function createFoundationRecovery(
         logicalDigest: manifest.logicalDigest,
         actionCount: manifest.actionCount,
         grantVersions: [],
-        excludedRelations: manifest.excludedRelations,
       });
       if (
         JSON.stringify(verified.keyVersions) !== JSON.stringify(manifest.representedKeyVersions)
@@ -396,7 +406,6 @@ export function createFoundationRecovery(
         snapshotId: manifest.snapshotId,
         snapshotAtMs: manifest.snapshotAtMs,
         snapshotActionCount: manifest.actionCount,
-        technicalAdminAuthRevived: false,
         restoredGrantVersions: manifest.restoredGrantVersions,
       });
 
@@ -407,6 +416,51 @@ export function createFoundationRecovery(
       await storage.quiesceForRecovery();
       await options.adHoc?.quiesceForRecovery();
       options.faultInjector?.("after-authoritative-quiescence");
+
+      const technicalAdminAuthResult = await prepareTechnicalAdminForRestore(
+        options.technicalAdminAuth.adapter,
+        restoreOptions.technicalAdminAuthMode ?? "preserve-compatible-credential",
+      );
+      const technicalAdminAuthEvidence =
+        redactTechnicalAdminRestoreResult(technicalAdminAuthResult);
+      if (technicalAdminAuthResult.outcome === "sanitation-failed") {
+        evidenceIdentity = await writeJsonFile(
+          evidencePath,
+          {
+            version: RECOVERY_EVIDENCE_VERSION,
+            kind: "restore",
+            status: "aborted-auth-sanitation",
+            restoreId,
+            snapshotId: manifest.snapshotId,
+            snapshotAtMs: manifest.snapshotAtMs,
+            snapshotActionCount: manifest.actionCount,
+            technicalAdminAuth: technicalAdminAuthEvidence,
+            restoredGrantVersions: manifest.restoredGrantVersions,
+          },
+          "replace-owned",
+          evidenceIdentity,
+        );
+        throw new Error("Technical Admin authentication sanitation failed before replacement.");
+      }
+      // The finite auth result is committed to the pending record before any
+      // Foundation replacement. A later replacement rollback changes only
+      // Foundation state and leaves the already-sanitized auth store untouched.
+      evidenceIdentity = await writeJsonFile(
+        evidencePath,
+        {
+          version: RECOVERY_EVIDENCE_VERSION,
+          kind: "restore",
+          status: "pending-replacement",
+          restoreId,
+          snapshotId: manifest.snapshotId,
+          snapshotAtMs: manifest.snapshotAtMs,
+          snapshotActionCount: manifest.actionCount,
+          technicalAdminAuth: technicalAdminAuthEvidence,
+          restoredGrantVersions: manifest.restoredGrantVersions,
+        },
+        "replace-owned",
+        evidenceIdentity,
+      );
 
       await assertStablePrivateFile(
         stagedPath,
@@ -428,7 +482,6 @@ export function createFoundationRecovery(
       }
       await staged.quiesceForRecovery();
       staged = undefined;
-      assertNoTechnicalAdminRelations(stagedPath);
       const reevaluatedStagedIdentity = await assertOwnedPrivateFile(
         stagedPath,
         "verified restore staging image",
@@ -487,33 +540,8 @@ export function createFoundationRecovery(
           );
           movedSidecars.push({ from: failed, to: source, identity: failedIdentity });
         }
-        if (await pathExists(technicalAdminPath)) {
-          const technicalAdminIdentity = stableIdentity(await lstat(technicalAdminPath));
-          const failedIdentity = await moveToExclusivePath(
-            technicalAdminPath,
-            failedTechnicalAdminDatabasePath,
-            "failed Technical Admin image",
-            technicalAdminIdentity,
-          );
-          movedSidecars.push({
-            from: failedTechnicalAdminDatabasePath,
-            to: technicalAdminPath,
-            identity: failedIdentity,
-          });
-        }
-        for (const suffix of ["-wal", "-shm"] as const) {
-          const source = `${technicalAdminPath}${suffix}`;
-          if (!(await pathExists(source))) continue;
-          const failed = `${failedTechnicalAdminDatabasePath}${suffix}`;
-          const sourceIdentity = stableIdentity(await lstat(source));
-          const failedIdentity = await moveToExclusivePath(
-            source,
-            failed,
-            "failed Technical Admin sidecar",
-            sourceIdentity,
-          );
-          movedSidecars.push({ from: failed, to: source, identity: failedIdentity });
-        }
+        // Policy A keeps the already-sanitized Technical Admin store at its live
+        // path. Foundation replacement must not displace or reopen that store.
         if (
           manifest.adHoc !== undefined &&
           adHocLivePath !== null &&
@@ -607,9 +635,6 @@ export function createFoundationRecovery(
           }
         }
         await syncDirectory(liveDirectory);
-        if (dirname(technicalAdminPath) !== liveDirectory) {
-          await syncDirectory(dirname(technicalAdminPath));
-        }
         if (adHocLivePath !== null && dirname(adHocLivePath) !== liveDirectory) {
           await syncDirectory(dirname(adHocLivePath));
         }
@@ -626,9 +651,6 @@ export function createFoundationRecovery(
             );
         }
         await syncDirectory(liveDirectory);
-        if (dirname(technicalAdminPath) !== liveDirectory) {
-          await syncDirectory(dirname(technicalAdminPath));
-        }
         if (adHocLivePath !== null && dirname(adHocLivePath) !== liveDirectory) {
           await syncDirectory(dirname(adHocLivePath));
         }
@@ -660,14 +682,11 @@ export function createFoundationRecovery(
                 restoredLogicalDigest: restoredAdHocFacts?.logicalDigest ?? null,
               },
         failedDatabasePath,
-        failedTechnicalAdminDatabasePath: (await pathExists(failedTechnicalAdminDatabasePath))
-          ? failedTechnicalAdminDatabasePath
-          : null,
         failedAdHocDatabasePath:
           failedAdHocDatabasePath !== null && (await pathExists(failedAdHocDatabasePath))
             ? failedAdHocDatabasePath
             : null,
-        technicalAdminAuthRevived: false,
+        technicalAdminAuth: technicalAdminAuthEvidence,
         restoredGrantVersions:
           restoredFacts === null
             ? manifest.restoredGrantVersions
@@ -689,9 +708,7 @@ export function createFoundationRecovery(
       return {
         restoreId,
         failedDatabasePath,
-        failedTechnicalAdminDatabasePath: (await pathExists(failedTechnicalAdminDatabasePath))
-          ? failedTechnicalAdminDatabasePath
-          : null,
+        failedTechnicalAdminDatabasePath: null,
         failedAdHocDatabasePath:
           failedAdHocDatabasePath !== null && (await pathExists(failedAdHocDatabasePath))
             ? failedAdHocDatabasePath
@@ -797,7 +814,6 @@ export function createFoundationRecovery(
     const verificationIdentity = await copyStablePrivateFile(databasePath, verificationPath);
     let verifier: SqliteFoundationStorage | undefined;
     try {
-      assertNoTechnicalAdminRelations(verificationPath);
       const inspection = new Database(verificationPath, { readonly: true });
       let facts: RecoverySnapshotFacts;
       let keyVersions: RepresentedKeyVersions;
@@ -839,6 +855,38 @@ export function createFoundationRecovery(
   }
 
   return { createPreDeploymentBackup, verifyBackup, restore, importControllerRecovery };
+}
+
+async function prepareTechnicalAdminForRestore(
+  adapter: Pick<TechnicalAdminAuth, "prepareForFoundationRestore">,
+  mode: TechnicalAdminRestorePreparationRequest["mode"],
+): Promise<TechnicalAdminRestorePreparationResult> {
+  try {
+    const result = await adapter.prepareForFoundationRestore({ mode });
+    if (result.outcome === "preserved-transients-invalidated") {
+      return result;
+    }
+    if (
+      result.outcome === "re-enrollment-required" &&
+      (result.reason === "missing" ||
+        result.reason === "invalid" ||
+        result.reason === "incompatible" ||
+        result.reason === "explicit-reset")
+    ) {
+      return result;
+    }
+  } catch {
+    // The composition boundary deliberately exposes no adapter or storage error.
+  }
+  return { outcome: "sanitation-failed" };
+}
+
+function redactTechnicalAdminRestoreResult(
+  result: TechnicalAdminRestorePreparationResult,
+): TechnicalAdminRestorePreparationResult {
+  return result.outcome === "re-enrollment-required"
+    ? { outcome: result.outcome, reason: result.reason }
+    : { outcome: result.outcome };
 }
 
 async function reevaluateRestoredAuthority(
@@ -1042,18 +1090,6 @@ function requireRepresentedKeys(versions: RepresentedKeyVersions, keyRing: Grant
         );
       }
     }
-  }
-}
-
-function assertNoTechnicalAdminRelations(databasePath: string): void {
-  const database = new Database(databasePath, { readonly: true });
-  try {
-    const facts = inspectRecoveryDatabase(database);
-    if (facts.excludedRelations.length !== 0) {
-      throw new Error("Technical Admin authentication state survived backup sanitization.");
-    }
-  } finally {
-    database.close();
   }
 }
 
