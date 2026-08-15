@@ -109,6 +109,7 @@ import {
   serializeBrowserMonitoringConfig,
 } from "@/lib/monitoring-redaction";
 import { runProductionActivationCli } from "@/lib/production-activation-cli";
+import { createPublicHealthRoute } from "@/lib/public-health";
 
 type SessionSubscription =
   | {
@@ -2110,6 +2111,14 @@ async function startServer() {
             ]);
           },
         },
+        "/healthz": createPublicHealthRoute({
+          foundationStorage,
+          technicalAdminAuth,
+          authoritativeServices: {
+            eventAdministration: eventAdministration !== null,
+            liveEventRuntime,
+          },
+        }),
         "/internal/healthz": {
           GET(req: Request) {
             if (!isInternalHealthHost(req.headers.get("host"))) {

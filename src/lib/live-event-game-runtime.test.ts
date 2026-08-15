@@ -265,6 +265,11 @@ describe("Live Event Game SQLite runtime", () => {
       clock: () => 10_000,
     });
     try {
+      expect(await runtime.readiness()).toMatchObject({
+        ok: true,
+        storage: "sqlite",
+        evidence: { transaction: { writePressure: "normal" } },
+      });
       const opened = await runtime.control.openController({
         qrCredential,
         browserContext: "runtime-test-device",
