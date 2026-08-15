@@ -279,10 +279,8 @@ export type StoredGrantAuditEntry = {
 
 export type GrantSessionSummary = {
   label: string;
-  status: StoredGrantSessionStatus;
   createdAtMs: number;
   lastActiveAtMs: number;
-  revokedAtMs: number | null;
   deviceClass: string;
   browserClass: string;
 };

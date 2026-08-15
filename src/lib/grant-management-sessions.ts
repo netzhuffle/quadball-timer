@@ -39,7 +39,7 @@ import {
   findActiveContext,
   findGrantByCredential,
   findSessionByBearer,
-  refreshEventAdminSession,
+  refreshGrantManagementSession,
   resolveManagementAuthority,
   terminateControlSessionForEventGame,
 } from "@/lib/grant-management-policy";
@@ -727,49 +727,59 @@ export async function revokeGrantSession(
   sessionReference: string,
   authority: GrantManagementAuthority,
 ): Promise<TypedGrantMutation> {
-  const trustedAuthority = verifyGrantAuthority(options.privilegedAuthorityVerifier, authority);
-  if (trustedAuthority === null) return unauthorizedGrant();
   try {
-    return await storage.transaction((transaction) => {
-      const storedGrant = transaction.findGrantById(grantId);
-      if (storedGrant === null) return { status: "rejected", reason: "not-found" };
-      const grant = expireGrantIfDue(transaction, options, storedGrant);
-      const resolvedAuthority = resolveManagementAuthority(transaction, options, trustedAuthority);
-      if (
-        grant.status !== "active" ||
-        resolvedAuthority === null ||
-        !canManageInTransaction(transaction, options, grant, resolvedAuthority, "manage")
-      )
-        return unauthorizedGrant();
-      const matches = transaction
-        .listGrantSessions(grantId)
-        .filter((candidate) => sessionLabel(options, candidate) === sessionReference);
-      if (matches.length !== 1) return { status: "rejected", reason: "not-found" };
-      const session = matches[0];
-      if (session === undefined) return { status: "rejected", reason: "not-found" };
-      if (session.status !== "active")
-        return {
-          status: "rejected",
-          reason: "invalid-state",
-          detail: "Grant Session is already inactive.",
-        };
-      transaction.updateGrantSession({
-        ...session,
-        status: "revoked",
-        revokedAtMs: readGrantNow(options),
-      });
-      transaction.appendGrantAudit(
-        createAuditEntry(
-          options,
-          auditInput("session-revoked", grant, resolvedAuthority, grant.status, session.sessionId),
-        ),
-      );
-      refreshEventAdminSession(transaction, options, resolvedAuthority);
-      return { status: "updated", grantId, grantVersion: grant.grantVersion };
-    });
+    return await storage.transaction((transaction) =>
+      revokeGrantSessionInTransaction(transaction, options, grantId, sessionReference, authority),
+    );
   } catch {
     return unavailableGrant();
   }
+}
+
+export function revokeGrantSessionInTransaction(
+  transaction: FoundationStorageTransaction,
+  options: GrantAuthorityOptions,
+  grantId: string,
+  sessionReference: string,
+  authority: GrantManagementAuthority,
+): TypedGrantMutation {
+  const trustedAuthority = verifyGrantAuthority(options.privilegedAuthorityVerifier, authority);
+  if (trustedAuthority === null) return unauthorizedGrant();
+  const storedGrant = transaction.findGrantById(grantId);
+  if (storedGrant === null) return { status: "rejected", reason: "not-found" };
+  const grant = expireGrantIfDue(transaction, options, storedGrant);
+  const resolvedAuthority = resolveManagementAuthority(transaction, options, trustedAuthority);
+  if (
+    grant.status !== "active" ||
+    resolvedAuthority === null ||
+    !canManageInTransaction(transaction, options, grant, resolvedAuthority, "manage")
+  )
+    return unauthorizedGrant();
+  const matches = transaction
+    .listGrantSessions(grantId)
+    .filter((candidate) => sessionLabel(options, candidate) === sessionReference);
+  if (matches.length !== 1) return { status: "rejected", reason: "not-found" };
+  const session = matches[0];
+  if (session === undefined) return { status: "rejected", reason: "not-found" };
+  if (session.status !== "active")
+    return {
+      status: "rejected",
+      reason: "invalid-state",
+      detail: "Grant Session is already inactive.",
+    };
+  transaction.updateGrantSession({
+    ...session,
+    status: "revoked",
+    revokedAtMs: readGrantNow(options),
+  });
+  transaction.appendGrantAudit(
+    createAuditEntry(
+      options,
+      auditInput("session-revoked", grant, resolvedAuthority, grant.status, session.sessionId),
+    ),
+  );
+  refreshGrantManagementSession(transaction, options, resolvedAuthority);
+  return { status: "updated", grantId, grantVersion: grant.grantVersion };
 }
 
 export async function leaveGrantSession(

@@ -130,7 +130,7 @@ describe("typed Grant management", () => {
         sessionBearer: session.sessionBearer,
       });
       if (summaries.status !== "ok") throw new Error("Expected session summaries.");
-      const label = summaries.value.find((summary) => summary.status === "active")?.label;
+      const label = summaries.value[0]?.label;
       if (label === undefined) throw new Error("Expected active session label.");
       expect(
         await authority.revokeGrantSession(control.grantId, label, {
@@ -317,9 +317,7 @@ describe("typed Grant management", () => {
     });
     expect(managerSummaries.status).toBe("ok");
     if (managerSummaries.status !== "ok") throw new Error("Expected manager session summaries.");
-    const managerControllerSummary = managerSummaries.value.find(
-      (summary) => summary.status === "active",
-    );
+    const managerControllerSummary = managerSummaries.value[0];
     if (managerControllerSummary === undefined)
       throw new Error("Expected a manager-visible controller summary.");
     expect(JSON.stringify(managerSummaries)).not.toContain(controllerSession.sessionBearer);
@@ -399,7 +397,7 @@ describe("typed Grant management", () => {
     const sessions = await authority.listGrantSessions(control.grantId, technical);
     expect(sessions).toMatchObject({ status: "ok" });
     if (sessions.status !== "ok") throw new Error("Expected session summaries.");
-    expect(sessions.value[0]).toMatchObject({ deviceClass: "unknown", browserClass: "unknown" });
+    expect(sessions.value).toHaveLength(0);
     expect(JSON.stringify(sessions)).not.toContain(controllerSession.sessionBearer);
     storage.close();
   });
@@ -777,8 +775,6 @@ describe("typed Grant management", () => {
       "deviceClass",
       "label",
       "lastActiveAtMs",
-      "revokedAtMs",
-      "status",
     ]);
     expect(JSON.stringify(sessions)).not.toMatch(
       /bearer|digest|verifier|keyVersion|grantId|sessionId/i,

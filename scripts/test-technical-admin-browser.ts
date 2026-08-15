@@ -598,6 +598,174 @@ try {
     .getByText(/Control Grant:/u)
     .first()
     .waitFor();
+
+  const controlSetupResponse = await eventAdminContext.request.get(
+    `${origin}/api/event-admin/slot-setup?eventId=${eventId}&gameDayId=${pitchManagerGameDayId}`,
+  );
+  const controlSetupPayload = (await controlSetupResponse.json()) as {
+    value?: {
+      pitchSlots?: Array<{ pitchSlotId: string; pitchId: string; gameDayId: string }>;
+    };
+  };
+  const controlSlot = controlSetupPayload.value?.pitchSlots?.find(
+    (slot) => slot.pitchId === pitchManagerPitchId && slot.gameDayId === pitchManagerGameDayId,
+  );
+  const pitchManagerControlSlot = controlSetupPayload.value?.pitchSlots?.find(
+    (slot) =>
+      slot.pitchId === pitchManagerPitchId &&
+      slot.gameDayId === pitchManagerGameDayId &&
+      slot.pitchSlotId !== controlSlot?.pitchSlotId,
+  );
+  assert(
+    controlSetupResponse.status() === 200 &&
+      controlSlot !== undefined &&
+      pitchManagerControlSlot !== undefined,
+    "Control Slot setup failed",
+  );
+  const controlGrantPath = `/api/event-admin/events/${eventId}/game-days/${pitchManagerGameDayId}/pitches/${pitchManagerPitchId}/pitch-slots/${controlSlot.pitchSlotId}/control-grant`;
+  const controlCreateResponse = await postJsonBodyFromPage(
+    eventAdminPage,
+    `${origin}${controlGrantPath}`,
+    {},
+  );
+  const controlCreatePayload = JSON.parse(controlCreateResponse.body) as {
+    value?: Record<string, unknown>;
+  };
+  assert(
+    controlCreateResponse.status === 201 &&
+      controlCreatePayload.value?.grantId !== undefined &&
+      controlCreatePayload.value?.qrCredential === undefined,
+    "Control Grant creation disclosed a credential or failed",
+  );
+  const eventAdminCookieBeforePitchManagerMutation = (await eventAdminContext.cookies()).find(
+    (cookie) => cookie.name === "__Host-event-admin-session",
+  );
+  if (eventAdminCookieBeforePitchManagerMutation === undefined)
+    throw new Error("Event Admin session cookie was not available for cookie isolation evidence.");
+  await pitchManagerContext.addCookies([eventAdminCookieBeforePitchManagerMutation]);
+  const pitchManagerControlPath = `/api/pitch-manager/events/${eventId}/game-days/${pitchManagerGameDayId}/pitches/${pitchManagerPitchId}/pitch-slots/${pitchManagerControlSlot.pitchSlotId}/control-grant`;
+  const pitchManagerControlCreateResponsePromise = pitchManagerPage.waitForResponse(
+    (response) =>
+      response
+        .url()
+        .endsWith(`/pitch-slots/${pitchManagerControlSlot.pitchSlotId}/control-grant`) &&
+      response.request().method() === "POST",
+  );
+  const pitchManagerControlCreateResponse = await pitchManagerPage.evaluate(async (requestUrl) => {
+    const response = await fetch(requestUrl, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    return response.status;
+  }, `${origin}${pitchManagerControlPath}`);
+  const pitchManagerControlCreateResponseHeaders = await pitchManagerControlCreateResponsePromise;
+  const pitchManagerControlCreateCookie = (
+    await pitchManagerControlCreateResponseHeaders.headersArray()
+  ).find((header) => header.name === "set-cookie")?.value;
+  assert(
+    pitchManagerControlCreateResponse === 201 &&
+      pitchManagerControlCreateCookie?.includes("__Host-pitch-manager-session=") === true &&
+      pitchManagerControlCreateCookie?.includes("__Host-event-admin-session=") !== true,
+    "Pitch Manager Control Grant creation did not refresh only its own cookie",
+  );
+  const eventAdminCookieAfterPitchManagerMutation = (await pitchManagerContext.cookies()).find(
+    (cookie) => cookie.name === "__Host-event-admin-session",
+  );
+  assert(
+    eventAdminCookieAfterPitchManagerMutation?.value ===
+      eventAdminCookieBeforePitchManagerMutation.value,
+    "Pitch Manager Control Grant mutation overwrote the Event Admin cookie",
+  );
+  const pitchManagerCreatedControlInspect = await pitchManagerContext.request.get(
+    `${origin}${pitchManagerControlPath}`,
+  );
+  assert(
+    pitchManagerCreatedControlInspect.status() === 200,
+    "Pitch Manager Control Grant inspection failed",
+  );
+  const pitchManagerControlSessions = await pitchManagerContext.request.get(
+    `${origin}${pitchManagerControlPath}/sessions`,
+  );
+  assert(
+    pitchManagerControlSessions.status() === 200 &&
+      pitchManagerControlSessions.headers()["set-cookie"] === undefined,
+    "Pitch Manager Control Grant session listing was not read-only",
+  );
+  const wrongPitchManagerControl = await pitchManagerContext.request.get(
+    `${origin}/api/pitch-manager/events/${eventId}/game-days/${pitchManagerGameDayId}/pitches/wrong-pitch/pitch-slots/${pitchManagerControlSlot.pitchSlotId}/control-grant`,
+  );
+  const wrongGameDayPitchManagerControl = await pitchManagerContext.request.get(
+    `${origin}/api/pitch-manager/events/${eventId}/game-days/wrong-game-day/pitches/${pitchManagerPitchId}/pitch-slots/${pitchManagerControlSlot.pitchSlotId}/control-grant`,
+  );
+  assert(
+    (wrongPitchManagerControl.status() === 401 || wrongPitchManagerControl.status() === 404) &&
+      (wrongGameDayPitchManagerControl.status() === 401 ||
+        wrongGameDayPitchManagerControl.status() === 404),
+    "Pitch Manager Control Grant scope accepted a wrong Pitch or Game Day",
+  );
+  await eventAdminPage.reload();
+  await eventAdminPage
+    .getByLabel("Game Day", { exact: true })
+    .selectOption({ value: pitchManagerGameDayId });
+  await eventAdminPage.getByRole("button", { name: "Pitch Main", exact: true }).click();
+  const controlInspectResponsePromise = eventAdminPage.waitForResponse(
+    (response) =>
+      response.url().endsWith(`/pitch-slots/${controlSlot.pitchSlotId}/control-grant`) &&
+      response.request().method() === "GET",
+  );
+  await eventAdminPage.getByRole("button", { name: "Inspect Control Grant" }).first().click();
+  assert((await controlInspectResponsePromise).status() === 200, "Control Grant inspection failed");
+  const pitchManagerControlInspect = await pitchManagerContext.request.get(
+    `${origin}/api/pitch-manager${controlGrantPath}`,
+  );
+  assert(
+    pitchManagerControlInspect.status() === 200,
+    "Pitch Manager could not inspect its exact Pitch and Game Day Control Grant",
+  );
+  const wrongPitchManagerControlInspect = await pitchManagerContext.request.get(
+    `${origin}/api/pitch-manager/events/${eventId}/game-days/wrong-game-day/pitches/${pitchManagerPitchId}/pitch-slots/${controlSlot.pitchSlotId}/control-grant`,
+  );
+  assert(
+    wrongPitchManagerControlInspect.status() === 401 ||
+      wrongPitchManagerControlInspect.status() === 404,
+    "Pitch Manager Control Grant scope was broader than its exact Game Day",
+  );
+  const controlRevealResponsePromise = eventAdminPage.waitForResponse(
+    (response) =>
+      response.url().endsWith(`/pitch-slots/${controlSlot.pitchSlotId}/control-grant/reveal`) &&
+      response.request().method() === "POST",
+  );
+  await eventAdminPage.getByRole("button", { name: "Reveal QR" }).first().click();
+  const controlRevealResponse = await controlRevealResponsePromise;
+  const controlRevealPayload = (await controlRevealResponse.json()) as {
+    status?: string;
+    reason?: string;
+    value?: { qrCredential?: string };
+  };
+  assert(
+    controlRevealResponse.status() === 401 &&
+      controlRevealPayload.value?.qrCredential === undefined &&
+      controlRevealPayload.reason === "unauthorized",
+    "ineligible Control Grant reveal was not generic and redacted",
+  );
+  const controlSessionsResponsePromise = eventAdminPage.waitForResponse(
+    (response) =>
+      response.url().endsWith(`/pitch-slots/${controlSlot.pitchSlotId}/control-grant/sessions`) &&
+      response.request().method() === "GET",
+  );
+  await eventAdminPage.getByRole("button", { name: "Sessions" }).first().click();
+  const controlSessionsResponse = await controlSessionsResponsePromise;
+  assert(controlSessionsResponse.status() === 200, "Control Grant session listing failed");
+  const controlRotateResponse = await postJsonFromPage(
+    eventAdminPage,
+    `${origin}${controlGrantPath}/rotate`,
+    {},
+  );
+  assert(
+    controlRotateResponse.status === 400 || controlRotateResponse.status === 401,
+    "ineligible Control Grant rotation did not fail generically",
+  );
   await pitchManagerPage.reload();
   await pitchManagerPage.getByText("Pitch Main", { exact: true }).waitFor();
   await pitchManagerPage.getByText(/2026-08-15 10:00 Europe\/Zurich/u).waitFor();
@@ -1007,6 +1175,12 @@ try {
       eventAdminRotationRevocationIsolation: true,
       pitchManagerHandoff: true,
       pitchManagerScopedView: true,
+      controlGrantManagement: true,
+      controlGrantRedaction: true,
+      controlGrantScopedView: true,
+      pitchManagerControlCookieIsolation: true,
+      pitchManagerControlReadOnly: true,
+      pitchManagerControlScopedView: true,
       forgedAuthorityRejected: true,
       revocationRevalidated: true,
     }),
@@ -1099,6 +1273,24 @@ async function postJsonFromPage(page: Page, url: string, body: Record<string, st
         status: response.status,
         cacheControl: response.headers.get("cache-control"),
         referrerPolicy: response.headers.get("referrer-policy"),
+        setCookie: response.headers.get("set-cookie"),
+      };
+    },
+    { requestUrl: url, requestBody: body },
+  );
+}
+
+async function postJsonBodyFromPage(page: Page, url: string, body: Record<string, string>) {
+  return page.evaluate(
+    async ({ requestUrl, requestBody }) => {
+      const response = await fetch(requestUrl, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(requestBody),
+      });
+      return {
+        status: response.status,
+        body: await response.text(),
         setCookie: response.headers.get("set-cookie"),
       };
     },

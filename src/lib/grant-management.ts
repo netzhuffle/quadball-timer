@@ -9,11 +9,13 @@ import {
 } from "@/lib/grant-management-commands";
 import {
   revealGrant,
+  revealGrantInTransaction,
   rotateGrant,
+  rotateGrantInTransaction,
   rotateGrantCredentialKeys,
 } from "@/lib/grant-management-credentials";
 import { recalculateExpiry } from "@/lib/grant-management-lifecycle";
-import { listAudit, listSessions } from "@/lib/grant-management-queries";
+import { listAudit, listSessions, listSessionsInTransaction } from "@/lib/grant-management-queries";
 import { admitGrantCode, createGrantCode, disableGrantCode } from "@/lib/grant-management-code";
 import {
   admitGrant,
@@ -23,6 +25,7 @@ import {
   authorizeControlGrantReplay,
   leaveGrantSession,
   revokeGrantSession,
+  revokeGrantSessionInTransaction,
 } from "@/lib/grant-management-sessions";
 import type { TypedGrantAuthority } from "@/lib/grant-management-types";
 
@@ -73,6 +76,11 @@ export function createTypedGrantAuthority(
       }),
     createControlGrant: (input) =>
       createGrant(storage, options, { ...input, grantType: GRANT_TYPE }),
+    createControlGrantInTransaction: (transaction, input) =>
+      createGrantInTransaction(transaction, options, {
+        ...input,
+        grantType: GRANT_TYPE,
+      }),
     createGrantCode: (grantId, authority) =>
       createGrantCode(storage, options, grantId, authority, false),
     replaceGrantCode: (grantId, authority) =>
@@ -91,20 +99,28 @@ export function createTypedGrantAuthority(
       acceptControlGrantSessionSwitch(storage, options, input.sessionBearer),
     authorizeControlGrantReplay: (input) => authorizeControlGrantReplay(storage, options, input),
     revealGrant: (grantId, authority) => revealGrant(storage, options, grantId, authority),
+    revealGrantInTransaction: (transaction, grantId, authority) =>
+      revealGrantInTransaction(transaction, options, grantId, authority),
     disableGrant: (grantId, authority) =>
       updateGrantStatus(storage, options, grantId, authority, "disabled", "grant-disabled"),
     revokeGrant: (grantId, authority) =>
       updateGrantStatus(storage, options, grantId, authority, "revoked", "grant-revoked"),
     reactivateGrant: (grantId, authority) => reactivateGrant(storage, options, grantId, authority),
     rotateGrant: (grantId, authority) => rotateGrant(storage, options, grantId, authority),
+    rotateGrantInTransaction: (transaction, grantId, authority) =>
+      rotateGrantInTransaction(transaction, options, grantId, authority),
     rotateGrantCredentialKeys: (grantId, authority) =>
       rotateGrantCredentialKeys(storage, options, grantId, authority),
     recalculateGrantExpiry: (grantId, correction, authority) =>
       recalculateExpiry(storage, options, grantId, correction, authority),
     revokeGrantSession: (grantId, sessionReference, authority) =>
       revokeGrantSession(storage, options, grantId, sessionReference, authority),
+    revokeGrantSessionInTransaction: (transaction, grantId, sessionReference, authority) =>
+      revokeGrantSessionInTransaction(transaction, options, grantId, sessionReference, authority),
     leaveGrantSession: (sessionBearer) => leaveGrantSession(storage, options, sessionBearer),
     listGrantSessions: (grantId, authority) => listSessions(storage, options, grantId, authority),
+    listGrantSessionsInTransaction: (transaction, grantId, authority) =>
+      listSessionsInTransaction(transaction, options, grantId, authority),
     listGrantAudit: (grantId, authority) => listAudit(storage, options, grantId, authority),
   };
 }
