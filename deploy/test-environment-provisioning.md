@@ -134,7 +134,7 @@ and load the unit after that upload. Replace `$release_id` with the
 
 ```fish
 set release_id "REPLACE_WITH_40_CHARACTER_WORKFLOW_COMMIT"
-set unit_source /srv/quadball-timer-test/releases/$release_id/deploy/systemd/quadball-timer-test.service
+set unit_source /srv/quadball-timer-test/releases/$release_id/deploy/quadball-timer-test.service
 
 sudo install -o root -g root -m 0644 $unit_source /etc/systemd/system/quadball-timer-test.service
 sudo systemctl daemon-reload
@@ -145,7 +145,7 @@ sudo visudo -f /etc/sudoers.d/deploy-quadball-timer-test
 The sudoers file must contain only:
 
 ```text
-deploy-quadball-timer-test ALL=(root) NOPASSWD: /bin/systemctl restart quadball-timer-test
+deploy-quadball-timer-test ALL=(root) NOPASSWD: /usr/bin/systemctl restart quadball-timer-test
 ```
 
 Verify the bounded result without printing the key file:

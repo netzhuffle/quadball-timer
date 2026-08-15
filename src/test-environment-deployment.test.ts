@@ -46,6 +46,8 @@ describe("Test Environment deployment contract", () => {
     expect(activation).toContain('service_name="quadball-timer-test"');
     expect(activation).toContain("Test environment — not for live games");
     expect(activation).toContain("executableSha256");
+    expect(activation).toContain("${release_dir}/deploy/quadball-timer-test.service");
+    expect(activation).not.toContain("${release_dir}/deploy/systemd/");
     expect(activation).not.toContain("quadball-timer.service");
     expect(activation).not.toContain("/srv/quadball-timer/current");
   });
@@ -64,5 +66,9 @@ describe("Test Environment deployment contract", () => {
       provisioning.indexOf("useradd --system --home-dir $base_dir"),
     );
     expect(provisioning).not.toContain("--gid $app");
+    expect(provisioning).toContain("/releases/$release_id/deploy/quadball-timer-test.service");
+    expect(provisioning).not.toContain("/releases/$release_id/deploy/systemd/");
+    expect(provisioning).toContain("NOPASSWD: /usr/bin/systemctl restart quadball-timer-test");
+    expect(provisioning).not.toContain("NOPASSWD: /bin/systemctl");
   });
 });
