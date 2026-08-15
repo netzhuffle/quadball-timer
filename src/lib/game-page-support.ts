@@ -214,7 +214,6 @@ export function useGameConnection({ gameId, role }: { gameId: string; role: Cont
           JSON.stringify({
             type: "subscribe-game",
             gameId,
-            role,
           }),
         );
       };

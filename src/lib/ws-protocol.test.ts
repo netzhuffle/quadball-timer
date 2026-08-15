@@ -207,12 +207,11 @@ describe("ws-protocol", () => {
     }
   });
 
-  test("parses subscribe-game events", () => {
+  test("parses subscribe-game without client-asserted authority", () => {
     const parsed = parseClientWsMessage(
       JSON.stringify({
         type: "subscribe-game",
         gameId: "game-123",
-        role: "spectator",
       }),
     );
 
@@ -227,7 +226,15 @@ describe("ws-protocol", () => {
     }
 
     expect(parsed.message.gameId).toBe("game-123");
-    expect(parsed.message.role).toBe("spectator");
+    expect(parsed.message).toEqual({ type: "subscribe-game", gameId: "game-123" });
+  });
+
+  test("rejects client-asserted subscribe-game roles", () => {
+    expect(
+      parseClientWsMessage(
+        JSON.stringify({ type: "subscribe-game", gameId: "game-123", role: "controller" }),
+      ),
+    ).toEqual({ ok: false, error: "subscribe-game does not accept a role." });
   });
 
   test("parses apply-commands with valid command payload", () => {

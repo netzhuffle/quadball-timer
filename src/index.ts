@@ -1,15 +1,8 @@
 import { serve, type ServerWebSocket } from "bun";
 import index from "./index.html";
-import {
-  applyGameCommand,
-  createInitialGameState,
-  projectGameSummary,
-  projectGameView,
-} from "@/lib/game-engine";
-import type { ControllerRole, GameCommand, GameState } from "@/lib/game-types";
 import { readJsonBodyWithinLimit } from "@/lib/http-body";
 import { isInternalHealthHost } from "@/lib/internal-health";
-import { normalizeBoundedText, SHARED_LIMITS } from "@/lib/validation-policy";
+import { SHARED_LIMITS } from "@/lib/validation-policy";
 import {
   parseSqliteProbeInvocation,
   runSqliteFoundationProbe,
@@ -57,12 +50,12 @@ import { openSqliteFoundationStorage } from "@/lib/foundation-storage-sqlite";
 import type { FoundationStorage } from "@/lib/foundation-storage";
 import { assertProductionStateBoundary } from "@/lib/runtime-storage-config";
 import { createStartupCleanup } from "@/lib/startup-resources";
-
-type ManagedGame = {
-  state: GameState;
-  appliedCommandIds: Set<string>;
-  appliedCommandOrder: string[];
-};
+import {
+  createAdHocGamesService,
+  openSqliteAdHocStore,
+  type AdHocGameView,
+  type AdHocGamesService,
+} from "@/lib/ad-hoc-games";
 
 type SessionSubscription =
   | {
@@ -74,18 +67,18 @@ type SessionSubscription =
   | {
       type: "game";
       gameId: string;
-      role: ControllerRole;
+      sessionId: string;
     };
 
 type SessionData = {
   id: string;
+  cookieHeader: string | null;
+  sessionId: string | null;
   subscription: SessionSubscription;
 };
 
-const games = new Map<string, ManagedGame>();
 const sockets = new Set<ServerWebSocket<SessionData>>();
-
-const MAX_TRACKED_COMMAND_IDS = 5_000;
+const defaultAdHocService = createAdHocGamesService();
 
 const probeInvocation = parseSqliteProbeInvocation(process.argv.slice(1));
 
@@ -120,6 +113,24 @@ async function startServer() {
     const { technicalAdmin: technicalAdminConfig, storagePaths } = readRuntimeConfig();
     const { environment } = technicalAdminConfig;
     assertProductionStateBoundary(environment, storagePaths);
+    const adHocDatabasePath =
+      process.env.AD_HOC_DATABASE?.trim() ||
+      (environment === "production"
+        ? "/var/lib/quadball-timer/ad-hoc.sqlite"
+        : `data/${environment}/ad-hoc.sqlite`);
+    if (
+      environment === "production" &&
+      adHocDatabasePath !== "/var/lib/quadball-timer/ad-hoc.sqlite"
+    ) {
+      throw new Error("Production Ad Hoc database must use its canonical path.");
+    }
+    const adHocService = createAdHocGamesService({
+      store:
+        environment === "test" && !process.env.AD_HOC_DATABASE?.trim()
+          ? undefined
+          : openSqliteAdHocStore(adHocDatabasePath),
+    });
+    startupCleanup.add(() => adHocService.close());
     const databasePath = storagePaths.technicalAdminDatabase;
     technicalAdminRepository = createSqliteTechnicalAdminAuthRepository(databasePath, {
       environment: technicalAdminConfig.environment,
@@ -250,6 +261,8 @@ async function startServer() {
           const upgraded = routeServer.upgrade(req, {
             data: {
               id: crypto.randomUUID(),
+              cookieHeader: req.headers.get("cookie"),
+              sessionId: null,
               subscription: { type: "none" },
             },
           });
@@ -273,26 +286,40 @@ async function startServer() {
         },
         "/api/games": {
           GET() {
-            const nowMs = Date.now();
-            const snapshots = [...games.values()]
-              .map((game) => projectGameSummary(game.state, nowMs))
-              .sort((a, b) => b.updatedAtMs - a.updatedAtMs);
-
-            return json({ games: snapshots });
+            return adHocUnavailableResponse();
           },
           POST(req: Request) {
-            return createGame(req);
+            return createGame(
+              req,
+              adHocService,
+              requestSource(req, technicalAdminConfig.trustProxyHeaders),
+            );
           },
         },
         "/api/games/:gameId": {
           GET(req: Request) {
-            const gameId = new URL(req.url).pathname.replace("/api/games/", "");
-            const game = readAdHocGame(gameId);
-            if (game === null) {
-              return json({ error: "Game not found." }, 404);
-            }
-
-            return json({ game });
+            return readGame(req, adHocService);
+          },
+        },
+        "/api/games/:gameId/admit": {
+          async POST(req: Request) {
+            const gameId = new URL(req.url).pathname.split("/").at(-2) ?? "";
+            const body = await readJsonRecord(req);
+            const result = await adHocService.admit({
+              gameId,
+              controlQr: body?.controlQr,
+              browserId: requestSource(req, technicalAdminConfig.trustProxyHeaders),
+            });
+            return result.status === "accepted"
+              ? sensitiveJson({ game: stripSession(result.game) }, 200, [
+                  ["set-cookie", adHocSessionCookie(gameId, result.game.sessionId)],
+                ])
+              : adHocUnavailableResponse();
+          },
+        },
+        "/api/games/:gameId/leave": {
+          POST(req: Request) {
+            return leaveGame(req, adHocService);
           },
         },
         "/api/event-control/open": {
@@ -729,7 +756,15 @@ async function startServer() {
             return json({ ok: true });
           },
         },
-        "/*": index,
+        "/game/:gameId": {
+          async GET(req: Request) {
+            const gameId = new URL(req.url).pathname.split("/").at(-1) ?? "";
+            const sessionId = readAdHocSession(req.headers.get("cookie"), gameId);
+            const result = await adHocService.read({ gameId, sessionId });
+            return result.status === "accepted" ? index : adHocUnavailableResponse();
+          },
+        },
+        "/*": adHocFallbackRoute,
       },
       development: process.env.NODE_ENV !== "production" && {
         hmr: true,
@@ -741,8 +776,15 @@ async function startServer() {
         },
         close(ws) {
           sockets.delete(ws);
+          if (ws.data.subscription.type === "game" && ws.data.sessionId !== null) {
+            void adHocService.setConnection({
+              gameId: ws.data.subscription.gameId,
+              sessionId: ws.data.sessionId,
+              connected: false,
+            });
+          }
         },
-        message(ws, message) {
+        async message(ws, message) {
           if (typeof message !== "string") {
             sendMessage(ws, {
               type: "error",
@@ -764,32 +806,42 @@ async function startServer() {
 
           switch (parsed.message.type) {
             case "subscribe-lobby": {
-              ws.data.subscription = {
-                type: "lobby",
-              };
-              sendLobbySnapshot(ws);
+              sendMessage(ws, { type: "error", message: adHocService.genericUnavailableMessage });
               return;
             }
 
             case "subscribe-game": {
-              const game = games.get(parsed.message.gameId);
-              if (game === undefined) {
-                sendMessage(ws, {
-                  type: "error",
-                  message: "Game not found.",
-                });
+              const result = await resolveAdHocWebSocketSubscription({
+                service: adHocService,
+                cookieHeader: ws.data.cookieHeader,
+                gameId: parsed.message.gameId,
+              });
+              if (result.status !== "accepted") {
+                sendMessage(ws, { type: "error", message: adHocService.genericUnavailableMessage });
                 return;
               }
-
+              if (ws.data.subscription.type === "game") {
+                await adHocService.setConnection({
+                  gameId: ws.data.subscription.gameId,
+                  sessionId: ws.data.subscription.sessionId,
+                  connected: false,
+                });
+              }
+              await adHocService.setConnection({
+                gameId: parsed.message.gameId,
+                sessionId: result.sessionId,
+                connected: true,
+              });
+              ws.data.sessionId = result.sessionId;
               ws.data.subscription = {
                 type: "game",
                 gameId: parsed.message.gameId,
-                role: parsed.message.role,
+                sessionId: result.sessionId,
               };
-
-              sendGameSnapshot({
-                ws,
-                game,
+              sendMessage(ws, {
+                type: "game-snapshot",
+                game: stripSession(result.game),
+                serverNowMs: Date.now(),
                 ackedCommandIds: [],
               });
               return;
@@ -804,14 +856,6 @@ async function startServer() {
                 return;
               }
 
-              if (ws.data.subscription.role !== "controller") {
-                sendMessage(ws, {
-                  type: "error",
-                  message: "Spectators cannot apply commands.",
-                });
-                return;
-              }
-
               if (ws.data.subscription.gameId !== parsed.message.gameId) {
                 sendMessage(ws, {
                   type: "error",
@@ -820,27 +864,27 @@ async function startServer() {
                 return;
               }
 
-              const game = games.get(parsed.message.gameId);
-              if (game === undefined) {
+              const result = await adHocService.apply({
+                gameId: parsed.message.gameId,
+                sessionId: ws.data.subscription.sessionId,
+                operations: parsed.message.commands,
+              });
+              if (result.status === "rejected") {
                 sendMessage(ws, {
                   type: "error",
-                  message: "Game not found.",
+                  message:
+                    result.reason === "unavailable"
+                      ? adHocService.genericUnavailableMessage
+                      : "Ad Hoc operation rejected.",
                 });
                 return;
               }
-
-              const ackedCommandIds = applyCommandsToGame({
-                managedGame: game,
-                commands: parsed.message.commands,
-              });
-
-              broadcastGameSnapshot({
+              await broadcastGameSnapshot({
                 gameId: parsed.message.gameId,
-                game,
+                service: adHocService,
                 sender: ws,
-                senderAckedCommandIds: ackedCommandIds,
+                senderAckedCommandIds: result.ackedOperationIds,
               });
-              broadcastLobbySnapshot();
               return;
             }
 
@@ -909,7 +953,11 @@ async function runProbeMode(
   }
 }
 
-export async function createGame(req: Request) {
+export async function createGame(
+  req: Request,
+  service: AdHocGamesService = defaultAdHocService,
+  sourceKey = "anonymous-browser",
+) {
   const body = await readJsonBodyWithinLimit(req, SHARED_LIMITS.transport.httpJsonBodyBytes);
   if (!body.ok) {
     return json({ error: body.error }, body.status);
@@ -920,191 +968,165 @@ export async function createGame(req: Request) {
   }
 
   const payload = body.body;
-  const homeName =
-    payload.homeName === undefined
-      ? { ok: true as const, value: "Home" }
-      : normalizeBoundedText(
-          payload.homeName,
-          SHARED_LIMITS.names.teamAndPitchMaxCodePoints,
-          "homeName",
-        );
-  const awayName =
-    payload.awayName === undefined
-      ? { ok: true as const, value: "Away" }
-      : normalizeBoundedText(
-          payload.awayName,
-          SHARED_LIMITS.names.teamAndPitchMaxCodePoints,
-          "awayName",
-        );
-
-  if (!homeName.ok) {
-    return json(
+  const result = await service.create({
+    homeName: payload.homeName === undefined ? "Home" : payload.homeName,
+    awayName: payload.awayName === undefined ? "Away" : payload.awayName,
+    homeColor: payload.homeColor,
+    awayColor: payload.awayColor,
+    sourceKey,
+  });
+  if (result.status !== "accepted") {
+    const status =
+      result.reason === "invalid-input" ? 400 : result.reason === "unavailable" ? 503 : 429;
+    return sensitiveJson(
       {
-        error: homeName.error,
+        error: result.detail ?? "Unable to create an Ad Hoc Game.",
+        retryAfterMs: result.retryAfterMs,
       },
-      400,
+      status,
     );
   }
-  if (!awayName.ok) {
-    return json({ error: awayName.error }, 400);
-  }
-
-  const homeColor = typeof payload.homeColor === "string" ? payload.homeColor : undefined;
-  const awayColor = typeof payload.awayColor === "string" ? payload.awayColor : undefined;
-
-  const id = createGameId();
-  const nowMs = Date.now();
-  const managedGame: ManagedGame = {
-    state: createInitialGameState({
-      id,
-      nowMs,
-      homeName: homeName.value,
-      awayName: awayName.value,
-      homeColor,
-      awayColor,
-    }),
-    appliedCommandIds: new Set(),
-    appliedCommandOrder: [],
-  };
-
-  games.set(id, managedGame);
-  broadcastLobbySnapshot();
-
-  return json(
-    {
-      gameId: id,
-      game: projectGameView(managedGame.state, nowMs),
-    },
+  return sensitiveJson(
+    { gameId: result.gameId, controlQr: result.controlQr, game: stripSession(result.game) },
     201,
+    [["set-cookie", adHocSessionCookie(result.gameId, result.sessionId)]],
   );
 }
 
-export function readAdHocGame(gameId: string) {
-  const game = games.get(gameId);
-  return game === undefined ? null : projectGameView(game.state, Date.now());
+export async function readGame(req: Request, service: AdHocGamesService = defaultAdHocService) {
+  const gameId = new URL(req.url).pathname.replace("/api/games/", "");
+  const sessionId = readAdHocSession(req.headers.get("cookie"), gameId);
+  const result = await service.read({ gameId, sessionId });
+  return result.status === "accepted"
+    ? sensitiveJson({ game: stripSession(result.game) })
+    : adHocUnavailableResponse(service);
 }
 
-export function applyAdHocCommand(input: {
-  gameId: string;
-  id: string;
-  clientSentAtMs: number;
-  command: GameCommand;
-}) {
-  const managedGame = games.get(input.gameId);
-  if (managedGame === undefined) return false;
-  applyCommandsToGame({ managedGame, commands: [input] });
-  return true;
+export async function leaveGame(req: Request, service: AdHocGamesService = defaultAdHocService) {
+  const gameId = new URL(req.url).pathname.split("/").at(-2) ?? "";
+  const sessionId = readAdHocSession(req.headers.get("cookie"), gameId);
+  const left = await service.leave({ gameId, sessionId });
+  return left
+    ? sensitiveJson({ left: true }, 200, [["set-cookie", clearAdHocSessionCookie(gameId)]])
+    : adHocUnavailableResponse(service);
 }
 
-function createGameId() {
-  return `game-${crypto.randomUUID().slice(0, 8)}`;
-}
-
-function applyCommandsToGame({
-  managedGame,
-  commands,
-}: {
-  managedGame: ManagedGame;
-  commands: {
-    id: string;
-    clientSentAtMs: number;
-    command: GameCommand;
-  }[];
-}) {
-  const ackedCommandIds: string[] = [];
-
-  for (const envelope of commands) {
-    if (managedGame.appliedCommandIds.has(envelope.id)) {
-      ackedCommandIds.push(envelope.id);
-      continue;
-    }
-
-    managedGame.state = applyGameCommand({
-      state: managedGame.state,
-      command: envelope.command,
-      nowMs: envelope.clientSentAtMs,
-    });
-
-    managedGame.appliedCommandIds.add(envelope.id);
-    managedGame.appliedCommandOrder.push(envelope.id);
-    ackedCommandIds.push(envelope.id);
-
-    if (managedGame.appliedCommandOrder.length > MAX_TRACKED_COMMAND_IDS) {
-      const removedId = managedGame.appliedCommandOrder.shift();
-      if (removedId !== undefined) {
-        managedGame.appliedCommandIds.delete(removedId);
-      }
-    }
-  }
-
-  return ackedCommandIds;
-}
-
-function broadcastLobbySnapshot() {
-  for (const ws of sockets) {
-    if (ws.data.subscription.type === "lobby") {
-      sendLobbySnapshot(ws);
-    }
-  }
-}
-
-function sendLobbySnapshot(ws: ServerWebSocket<SessionData>) {
-  const nowMs = Date.now();
-  const summaries = [...games.values()]
-    .map((game) => projectGameSummary(game.state, nowMs))
-    .sort((a, b) => b.updatedAtMs - a.updatedAtMs);
-
-  sendMessage(ws, {
-    type: "lobby-snapshot",
-    games: summaries,
-    serverNowMs: nowMs,
-  });
-}
-
-function broadcastGameSnapshot({
+export async function resolveAdHocWebSocketSubscription({
+  service,
+  cookieHeader,
   gameId,
-  game,
+}: {
+  service: AdHocGamesService;
+  cookieHeader: string | null;
+  gameId: unknown;
+}): Promise<
+  { status: "accepted"; sessionId: string; game: AdHocGameView } | { status: "unavailable" }
+> {
+  const sessionId = readAdHocSession(cookieHeader, gameId);
+  const result = await service.read({ gameId, sessionId });
+  if (result.status !== "accepted") return { status: "unavailable" };
+  return { status: "accepted", sessionId: result.game.sessionId, game: result.game };
+}
+
+export async function readAuthorizedAdHocGame(
+  service: AdHocGamesService,
+  gameId: string,
+  sessionId: string,
+  nowMs?: number,
+): Promise<AdHocGameView | null> {
+  const result = await service.read({ gameId, sessionId, nowMs });
+  return result.status === "accepted" ? result.game : null;
+}
+
+async function broadcastGameSnapshot({
+  gameId,
+  service,
   sender,
   senderAckedCommandIds,
 }: {
   gameId: string;
-  game: ManagedGame;
+  service: AdHocGamesService;
   sender: ServerWebSocket<SessionData>;
   senderAckedCommandIds: string[];
 }) {
-  for (const ws of sockets) {
-    if (ws.data.subscription.type !== "game" || ws.data.subscription.gameId !== gameId) {
-      continue;
-    }
-
-    sendGameSnapshot({
-      ws,
-      game,
-      ackedCommandIds: ws === sender ? senderAckedCommandIds : [],
-    });
-  }
-}
-
-function sendGameSnapshot({
-  ws,
-  game,
-  ackedCommandIds,
-}: {
-  ws: ServerWebSocket<SessionData>;
-  game: ManagedGame;
-  ackedCommandIds: string[];
-}) {
-  const nowMs = Date.now();
-  sendMessage(ws, {
-    type: "game-snapshot",
-    game: projectGameView(game.state, nowMs),
-    serverNowMs: nowMs,
-    ackedCommandIds,
-  });
+  await Promise.all(
+    [...sockets].map(async (ws) => {
+      if (ws.data.subscription.type !== "game" || ws.data.subscription.gameId !== gameId) {
+        return;
+      }
+      const serverNowMs = Date.now();
+      const game = await readAuthorizedAdHocGame(
+        service,
+        gameId,
+        ws.data.subscription.sessionId,
+        serverNowMs,
+      );
+      if (game === null) return;
+      sendMessage(ws, {
+        type: "game-snapshot",
+        game: stripSession(game),
+        serverNowMs,
+        ackedCommandIds: ws === sender ? senderAckedCommandIds : [],
+      });
+    }),
+  );
 }
 
 function sendMessage(ws: ServerWebSocket<SessionData>, payload: ServerWsMessage) {
   ws.send(JSON.stringify(payload));
+}
+
+function stripSession<T extends { sessionId: string }>(game: T) {
+  const { sessionId: _sessionId, ...safe } = game;
+  return safe;
+}
+
+function adHocUnavailableResponse(service: AdHocGamesService = defaultAdHocService) {
+  return sensitiveJson({ error: service.genericUnavailableMessage }, 404);
+}
+
+export function readAdHocSession(cookieHeader: string | null, gameId: unknown): string | null {
+  if (cookieHeader === null) return null;
+  const cookieName = adHocSessionCookieName(gameId);
+  if (cookieName === null) return null;
+  for (const cookie of cookieHeader.split(";")) {
+    const [name, ...value] = cookie.trim().split("=");
+    if (name === cookieName && value.length > 0) {
+      try {
+        return decodeURIComponent(value.join("="));
+      } catch {
+        return null;
+      }
+    }
+  }
+  return null;
+}
+
+function adHocSessionCookieName(gameId: unknown): string | null {
+  if (typeof gameId !== "string" || !/^adhoc-[a-zA-Z0-9_-]+$/.test(gameId)) return null;
+  return `adhoc_session_${gameId}`;
+}
+
+function adHocSessionCookie(gameId: string, sessionId: string): string {
+  return `${adHocSessionCookieName(gameId)}=${encodeURIComponent(sessionId)}; Path=/; Max-Age=31536000; HttpOnly; SameSite=Lax`;
+}
+
+function clearAdHocSessionCookie(gameId: string): string {
+  return `${adHocSessionCookieName(gameId)}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax`;
+}
+
+export function adHocFallbackRoute(req: Request) {
+  const pathname = new URL(req.url).pathname;
+  return isAdHocPath(pathname) ? adHocUnavailableResponse() : index;
+}
+
+function isAdHocPath(pathname: string): boolean {
+  return (
+    pathname === "/game" ||
+    pathname.startsWith("/game/") ||
+    pathname === "/api/games" ||
+    pathname.startsWith("/api/games/")
+  );
 }
 
 function json(payload: unknown, status = 200, extraHeaders: Iterable<[string, string]> = []) {
