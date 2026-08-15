@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { createHash, randomBytes } from "node:crypto";
-import { mkdirSync } from "node:fs";
+import { chmodSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { createInitialGameState } from "@/lib/game-engine";
 import type { GameCommand, GameState, GameView } from "@/lib/game-types";
@@ -178,6 +178,46 @@ export type AdHocStore = {
     | { status: "rate-limited"; retryAfterMs: number }
     | { status: "accepted"; removedGameId: string | null };
   mutateGame<T>(gameId: string, mutation: (game: StoredAdHocGame) => T): T | null;
+  /** Optional recovery boundary exposed by the SQLite adapter. */
+  recovery?: AdHocRecoveryAdapter;
+};
+
+export const AD_HOC_RECOVERY_MANIFEST_VERSION = "ad-hoc-recovery-manifest-v1" as const;
+
+export type AdHocRecoveryFacts = {
+  version: typeof AD_HOC_RECOVERY_MANIFEST_VERSION;
+  schemaVersion: number;
+  environmentIdentity: string;
+  retainedGameCount: number;
+  unfinishedGameCount: number;
+  creationEventCount: number;
+  logicalDigest: string;
+  capacityEvidenceDigest: string;
+};
+
+export type AdHocRecoveryReadiness =
+  | {
+      ok: true;
+      status: "ready";
+      facts: AdHocRecoveryFacts;
+    }
+  | {
+      ok: false;
+      status: "unavailable" | "incompatible-schema" | "integrity-failure";
+      detail: string;
+    };
+
+export type AdHocRecoveryAdapter = {
+  readonly databasePath: string;
+  readonly environmentIdentity: string;
+  createRecoveryVacuumSnapshot(destinationPath: string): Promise<AdHocRecoveryFacts>;
+  verifyRecoverySnapshot(
+    databasePath: string,
+    expected: AdHocRecoveryFacts,
+  ): Promise<AdHocRecoveryFacts>;
+  inspectRecoveryDatabase(databasePath: string): AdHocRecoveryFacts;
+  readiness(databasePath?: string): AdHocRecoveryReadiness;
+  quiesceForRecovery(): Promise<void>;
 };
 
 export type AdHocLiveSessionIdentity = {
@@ -385,6 +425,7 @@ export type AdHocSqliteStoreOptions = {
   reconcileConnectionsAtStartup?: boolean;
   startupNowMs?: number;
   beforeCapacityCommit?: () => void;
+  recoveryWriteabilityProbe?: () => void;
 };
 
 export type AdHocGamesServiceOptions = {
@@ -1384,6 +1425,79 @@ export function createInMemoryAdHocStore(): AdHocStore {
   };
 }
 
+export function inspectAdHocRecoveryDatabase(
+  databasePath: string,
+  expectedEnvironmentIdentity?: string,
+): AdHocRecoveryFacts {
+  const database = new Database(databasePath, { readonly: true, strict: true });
+  try {
+    return inspectAdHocRecoveryDatabaseHandle(database, expectedEnvironmentIdentity);
+  } finally {
+    database.close();
+  }
+}
+
+export function createSqliteAdHocRecoveryAdapter(
+  databasePath: string,
+  environmentIdentity = "test",
+  options: Pick<AdHocSqliteStoreOptions, "recoveryWriteabilityProbe"> = {},
+): AdHocRecoveryAdapter {
+  const normalizedEnvironment = environmentIdentity.trim() || "test";
+  return {
+    databasePath,
+    environmentIdentity: normalizedEnvironment,
+    async createRecoveryVacuumSnapshot(destinationPath) {
+      const database = new Database(databasePath, { create: false, strict: true });
+      try {
+        return createAdHocRecoveryVacuumSnapshot(database, destinationPath, normalizedEnvironment);
+      } finally {
+        database.close();
+      }
+    },
+    async verifyRecoverySnapshot(databasePathToVerify, expected) {
+      const actual = inspectAdHocRecoveryDatabase(databasePathToVerify, normalizedEnvironment);
+      if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+        throw new Error("Ad Hoc recovery snapshot facts changed.");
+      }
+      return actual;
+    },
+    inspectRecoveryDatabase(path) {
+      return inspectAdHocRecoveryDatabase(path, normalizedEnvironment);
+    },
+    readiness(path = databasePath) {
+      try {
+        const facts = inspectAdHocRecoveryDatabase(path, normalizedEnvironment);
+        const writable = new Database(path, { create: false, strict: true });
+        try {
+          writable.run("PRAGMA busy_timeout = 0");
+          probeAdHocRecoveryWriteability(writable, options.recoveryWriteabilityProbe);
+        } finally {
+          writable.close();
+        }
+        return {
+          ok: true,
+          status: "ready",
+          facts,
+        };
+      } catch (error) {
+        return {
+          ok: false,
+          status: classifyAdHocRecoveryReadinessError(error),
+          detail: "Ad Hoc storage readiness verification failed.",
+        };
+      }
+    },
+    async quiesceForRecovery() {
+      const database = new Database(databasePath, { create: false, strict: true });
+      try {
+        sealAdHocRecoveryDatabase(database);
+      } finally {
+        database.close();
+      }
+    },
+  };
+}
+
 export function openSqliteAdHocStore(
   databasePath: string,
   environmentIdentity = "test",
@@ -1391,6 +1505,39 @@ export function openSqliteAdHocStore(
 ): AdHocStore {
   mkdirSync(dirname(databasePath), { recursive: true });
   const db = new Database(databasePath, { create: true, strict: true });
+  let closed = false;
+  const genericRecovery = createSqliteAdHocRecoveryAdapter(
+    databasePath,
+    environmentIdentity,
+    options,
+  );
+  const recovery: AdHocRecoveryAdapter = {
+    ...genericRecovery,
+    async createRecoveryVacuumSnapshot(destinationPath) {
+      if (closed) throw new Error("Ad Hoc SQLite store is closed.");
+      return createAdHocRecoveryVacuumSnapshot(db, destinationPath, environmentIdentity);
+    },
+    readiness(path = databasePath) {
+      if (path !== databasePath) return genericRecovery.readiness(path);
+      try {
+        const facts = inspectAdHocRecoveryDatabaseHandle(db, environmentIdentity);
+        probeAdHocRecoveryWriteability(db, options.recoveryWriteabilityProbe);
+        return { ok: true, status: "ready", facts };
+      } catch (error) {
+        return {
+          ok: false,
+          status: classifyAdHocRecoveryReadinessError(error),
+          detail: "Ad Hoc storage readiness verification failed.",
+        };
+      }
+    },
+    async quiesceForRecovery() {
+      if (closed) return;
+      sealAdHocRecoveryDatabase(db);
+      closed = true;
+      db.close();
+    },
+  };
   db.run("PRAGMA journal_mode = WAL");
   db.run("PRAGMA foreign_keys = ON");
   db.run("PRAGMA busy_timeout = 0");
@@ -1493,6 +1640,8 @@ export function openSqliteAdHocStore(
   const transaction = db.transaction((work: () => unknown) => work());
   return {
     close() {
+      if (closed) return;
+      closed = true;
       db.close();
     },
     listGames() {
@@ -1647,6 +1796,7 @@ export function openSqliteAdHocStore(
         return result;
       }) as T | null;
     },
+    recovery,
   };
 }
 
@@ -1672,6 +1822,165 @@ function parseStoredRow(row: Record<string, string | number>): StoredAdHocGame {
     operations,
   };
   return validateStoredGame(parsed);
+}
+
+function createAdHocRecoveryVacuumSnapshot(
+  database: Database,
+  destinationPath: string,
+  expectedEnvironmentIdentity: string,
+): AdHocRecoveryFacts {
+  const facts = inspectAdHocRecoveryDatabaseHandle(database, expectedEnvironmentIdentity);
+  const previousUmask = process.umask(0o177);
+  try {
+    database.exec(`VACUUM INTO ${quoteAdHocSqliteString(destinationPath)};`);
+  } finally {
+    process.umask(previousUmask);
+  }
+  chmodSync(destinationPath, 0o600);
+  return facts;
+}
+
+function probeAdHocRecoveryWriteability(database: Database, injectedFailure?: () => void): void {
+  let transactionStarted = false;
+  try {
+    database.run("BEGIN IMMEDIATE");
+    transactionStarted = true;
+    injectedFailure?.();
+    database.run("UPDATE adhoc_schema SET version = version WHERE id = 1");
+  } catch (error) {
+    if (transactionStarted) database.run("ROLLBACK");
+    throw new Error("Ad Hoc recovery writeability probe failed.", { cause: error });
+  }
+  database.run("ROLLBACK");
+}
+
+function sealAdHocRecoveryDatabase(database: Database): void {
+  const checkpoint = database.query("PRAGMA wal_checkpoint(TRUNCATE)").get() as {
+    busy?: number;
+  } | null;
+  if (checkpoint?.busy !== undefined && checkpoint.busy !== 0) {
+    throw new Error("Ad Hoc recovery quiescence could not checkpoint the database.");
+  }
+  const journalMode = String(
+    (database.query("PRAGMA journal_mode = DELETE").get() as { journal_mode?: string } | null)
+      ?.journal_mode ?? "",
+  );
+  if (journalMode.toLowerCase() !== "delete") {
+    throw new Error("Ad Hoc recovery quiescence could not seal a portable database image.");
+  }
+}
+
+function classifyAdHocRecoveryReadinessError(
+  error: unknown,
+): Extract<AdHocRecoveryReadiness, { ok: false }>["status"] {
+  const message = error instanceof Error ? error.message : "";
+  if (
+    message.includes("writeability") ||
+    message.includes("database is locked") ||
+    message.includes("attempt to write a readonly database") ||
+    message.includes("readonly database") ||
+    message.includes("no such file") ||
+    message.includes("unable to open")
+  )
+    return "unavailable";
+  if (message.includes("schema") || message.includes("relation set")) return "incompatible-schema";
+  return "integrity-failure";
+}
+
+function inspectAdHocRecoveryDatabaseHandle(
+  database: Database,
+  expectedEnvironmentIdentity?: string,
+): AdHocRecoveryFacts {
+  const integrity = database.query("PRAGMA integrity_check").get() as {
+    integrity_check?: string;
+  } | null;
+  if (integrity?.integrity_check !== "ok") {
+    throw new Error("Ad Hoc recovery database integrity verification failed.");
+  }
+  const relations = (
+    database
+      .query(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+      )
+      .all() as Array<{ name: string }>
+  ).map((row) => row.name);
+  const expectedRelations = ["adhoc_creation_events", "adhoc_games", "adhoc_schema"];
+  if (JSON.stringify(relations) !== JSON.stringify(expectedRelations)) {
+    throw new Error("Ad Hoc recovery database contains an unsupported relation set.");
+  }
+  const schema = database.query("SELECT version FROM adhoc_schema WHERE id = 1").get() as {
+    version?: number | string;
+  } | null;
+  const schemaVersion = Number(schema?.version ?? NaN);
+  if (schemaVersion !== SCHEMA_VERSION) {
+    throw new Error("Ad Hoc recovery database schema is incompatible.");
+  }
+  const games = database.query("SELECT * FROM adhoc_games ORDER BY game_id").all() as Record<
+    string,
+    string | number
+  >[];
+  const canonical = createHash("sha256");
+  const capacityEvidence = createHash("sha256");
+  const normalizedExpectedEnvironment = expectedEnvironmentIdentity?.trim() || undefined;
+  let unfinishedGameCount = 0;
+  for (const row of games) {
+    const game = parseStoredRow(row);
+    if (
+      normalizedExpectedEnvironment !== undefined &&
+      game.environmentIdentity !== normalizedExpectedEnvironment
+    ) {
+      throw new Error("Ad Hoc recovery database environment identity is inconsistent.");
+    }
+    if (game.state.isFinished === false) unfinishedGameCount += 1;
+    canonical.update(JSON.stringify(row));
+    canonical.update("\n");
+    capacityEvidence.update(
+      JSON.stringify({
+        gameId: game.gameId,
+        createdAtMs: game.createdAtMs,
+        sessions: game.sessions,
+      }),
+    );
+    capacityEvidence.update("\n");
+  }
+  const creationEvents = database
+    .query(
+      "SELECT source_hash, successful, occurred_at_ms, retry_until_ms FROM adhoc_creation_events ORDER BY occurred_at_ms, source_hash, successful, retry_until_ms",
+    )
+    .all() as Array<Record<string, string | number | null>>;
+  for (const event of creationEvents) {
+    if (
+      typeof event.source_hash !== "string" ||
+      !/^[a-f0-9]{64}$/u.test(event.source_hash) ||
+      (event.successful !== 0 && event.successful !== 1) ||
+      !Number.isSafeInteger(Number(event.occurred_at_ms)) ||
+      Number(event.occurred_at_ms) < 0 ||
+      (event.retry_until_ms !== null &&
+        event.retry_until_ms !== undefined &&
+        (!Number.isSafeInteger(Number(event.retry_until_ms)) || Number(event.retry_until_ms) < 0))
+    ) {
+      throw new Error("Ad Hoc recovery capacity evidence is invalid.");
+    }
+    canonical.update(JSON.stringify(event));
+    canonical.update("\n");
+    capacityEvidence.update(JSON.stringify(event));
+    capacityEvidence.update("\n");
+  }
+  return {
+    version: AD_HOC_RECOVERY_MANIFEST_VERSION,
+    schemaVersion,
+    environmentIdentity:
+      normalizedExpectedEnvironment || String(games[0]?.environment_identity ?? ""),
+    retainedGameCount: games.length,
+    unfinishedGameCount,
+    creationEventCount: creationEvents.length,
+    logicalDigest: canonical.digest("hex"),
+    capacityEvidenceDigest: capacityEvidence.digest("hex"),
+  };
+}
+
+function quoteAdHocSqliteString(value: string): string {
+  return `'${value.replaceAll("'", "''")}'`;
 }
 
 function projectAuthorizedGame(
@@ -1711,6 +2020,8 @@ function validateStoredGame(game: StoredAdHocGame): StoredAdHocGame {
     throw new Error("Stored control QR is invalid.");
   if (!/^[a-f0-9]{64}$/u.test(game.controlQrHash))
     throw new Error("Stored control QR hash is invalid.");
+  if (digest(game.controlQr) !== game.controlQrHash)
+    throw new Error("Stored control QR authority reference is inconsistent.");
   if (!Array.isArray(game.sessions)) throw new Error("Stored sessions are invalid.");
   for (const session of game.sessions) validateStoredSession(session);
   if (!isRecord(game.operations)) throw new Error("Stored operations are invalid.");
