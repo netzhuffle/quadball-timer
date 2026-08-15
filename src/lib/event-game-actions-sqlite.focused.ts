@@ -25,6 +25,8 @@ import type { EventGameRecordRoot } from "@/lib/foundation-record-types";
 import { canonicalizeEventGameRecordRoot } from "@/lib/foundation-record-types";
 import { FOUNDATION_MIGRATIONS } from "@/lib/foundation-migrations";
 
+const CURRENT_SCHEMA_VERSION = FOUNDATION_MIGRATIONS.at(-1)?.schemaVersion ?? 0;
+
 describe("SQLite immutable Event Game actions", () => {
   test("persists the action, idempotency, metadata, and audit across restart", async () => {
     await withDatabase(async (databasePath) => {
@@ -930,7 +932,7 @@ describe("SQLite immutable Event Game actions", () => {
       database.close();
 
       const current = openSqliteFoundationStorage(databasePath);
-      expect((await current.applyMigrations()).schemaVersion).toBe(21);
+      expect((await current.applyMigrations()).schemaVersion).toBe(CURRENT_SCHEMA_VERSION);
       const currentRecord = createRecord(current, root);
       expect(await currentRecord.registerRoot(root)).toMatchObject({ status: "idempotent" });
       expect(await currentRecord.readiness()).toMatchObject({ ok: true, actionCount: 1 });
@@ -945,7 +947,7 @@ describe("SQLite immutable Event Game actions", () => {
       await seedLegacyConflictHistory(databasePath, root);
 
       const storage = openSqliteFoundationStorage(databasePath);
-      expect((await storage.applyMigrations()).schemaVersion).toBe(21);
+      expect((await storage.applyMigrations()).schemaVersion).toBe(CURRENT_SCHEMA_VERSION);
       const record = createRecord(storage, root);
       expect(await record.registerRoot(root)).toMatchObject({ status: "idempotent" });
       expect(await record.readiness()).toMatchObject({ ok: true, actionCount: 3 });
@@ -966,7 +968,7 @@ describe("SQLite immutable Event Game actions", () => {
       await seedLegacyConflictHistory(databasePath, root);
 
       const storage = openSqliteFoundationStorage(databasePath);
-      expect((await storage.applyMigrations()).schemaVersion).toBe(21);
+      expect((await storage.applyMigrations()).schemaVersion).toBe(CURRENT_SCHEMA_VERSION);
       const record = createRecord(storage, root);
       expect(await record.registerRoot(root)).toMatchObject({ status: "idempotent" });
       expect(

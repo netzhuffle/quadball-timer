@@ -130,6 +130,7 @@ export type ControlGrantSessionResolution =
       currentEventGameId: string;
     }
   | { status: "game-locked"; eventGameId: string }
+  | { status: "past-game-day"; eventGameId: string }
   | { status: "empty" | "conflict" | "mismatch" | "unavailable"; detail?: string };
 
 export type ControlGrantReplayResolution =

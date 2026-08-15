@@ -251,13 +251,13 @@ export function authorizeGrantInTransaction(
       grant.scope as ControlGrantScope,
       session.eventGameId,
     );
-    if (relationship.status === "game-locked") {
+    if (relationship.status === "game-locked" || relationship.status === "past-game-day") {
       if (input.readOnly) return GENERIC_GRANT_AUTHORIZATION_FAILURE;
       terminateControlSessionForEventGame(
         transaction,
         options,
         grant,
-        "game-locked",
+        relationship.status,
         relationship.eventGameId,
       );
       return GENERIC_GRANT_AUTHORIZATION_FAILURE;
@@ -605,7 +605,7 @@ export async function authorizeControlGrantReplay(
   }
 }
 
-function resolveControlSession(
+export function resolveControlSession(
   transaction: FoundationStorageTransaction,
   options: GrantAuthorityOptions,
   scope: ControlGrantScope,
@@ -640,6 +640,11 @@ function resolveControlSession(
         validateOpaqueIdentifier(resolved.eventGameId, "eventGameId").ok
         ? resolved
         : { status: "mismatch" };
+    if (resolved.status === "past-game-day")
+      return resolved.eventGameId === sessionEventGameId &&
+        validateOpaqueIdentifier(resolved.eventGameId, "eventGameId").ok
+        ? resolved
+        : { status: "mismatch" };
     return resolved;
   }
   const current = options.controlScopeResolver.resolve(scope, transaction);
@@ -652,11 +657,11 @@ function resolveControlSession(
       : { status: "mismatch" };
   if (
     current.status === "terminal" &&
-    current.reason === "game-locked" &&
+    (current.reason === "game-locked" || current.reason === "past-game-day") &&
     current.eventGameId === sessionEventGameId &&
     validateOpaqueIdentifier(current.eventGameId, "eventGameId").ok
   )
-    return { status: "game-locked", eventGameId: current.eventGameId };
+    return { status: current.reason, eventGameId: current.eventGameId };
   return { status: "mismatch" };
 }
 

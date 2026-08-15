@@ -30,6 +30,9 @@ import {
 } from "@/lib/grant-authority-test-support";
 import type { GrantKeyRing } from "@/lib/grant-types";
 import { readStoredGrantAuditEntry } from "@/lib/grant-storage-sqlite";
+import { FOUNDATION_MIGRATIONS } from "@/lib/foundation-migrations";
+
+const CURRENT_SCHEMA_VERSION = String(FOUNDATION_MIGRATIONS.at(-1)?.schemaVersion ?? 0);
 
 describe("focused SQLite composed acceptance", () => {
   test("commits paired evidence, survives restart, and acknowledges only a durable receipt", async () => {
@@ -90,7 +93,10 @@ describe("focused SQLite composed acceptance", () => {
         auditAuthorityVerifier: { verify: () => true },
       });
       expect(await reopenedRecord.registerRoot(root)).toMatchObject({ status: "idempotent" });
-      expect(await reopened.readiness()).toMatchObject({ ok: true, schemaVersion: "21" });
+      expect(await reopened.readiness()).toMatchObject({
+        ok: true,
+        schemaVersion: CURRENT_SCHEMA_VERSION,
+      });
       expect(await reopened.readActions(root.recordId)).toHaveLength(1);
       expect(await reopened.readAuditEntries(root.recordId)).toHaveLength(1);
       reopened.close();
@@ -727,7 +733,10 @@ describe("focused SQLite composed acceptance", () => {
       expect(await reopenedAcceptance.acknowledgeReplay(rejectionReceipt!)).toEqual({
         status: "acknowledged",
       });
-      expect(await reopened.readiness()).toMatchObject({ ok: true, schemaVersion: "21" });
+      expect(await reopened.readiness()).toMatchObject({
+        ok: true,
+        schemaVersion: CURRENT_SCHEMA_VERSION,
+      });
       reopened.close();
     });
   });
