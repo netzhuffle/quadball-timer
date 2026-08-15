@@ -219,8 +219,9 @@ export function canManageInTransaction(
     if (resolved.status !== "eligible" || resolved.eventGameId !== session.eventGameId)
       return false;
   }
-  if (caller.grantType === "event-admin")
-    return grant.grantType !== "event-admin" && caller.scope.eventId === grant.scope.eventId;
+  if (caller.grantType === "event-admin") {
+    return caller.scope.eventId === grant.scope.eventId && grant.grantType !== "event-admin";
+  }
   if (caller.grantType === "pitch-manager" && grant.grantType === "control") {
     const callerScope = caller.scope as PitchManagerGrantScope;
     const targetScope = grant.scope as ControlGrantScope;
@@ -233,6 +234,49 @@ export function canManageInTransaction(
   return (
     operation === "reveal" && caller.grantType === "control" && caller.grantId === grant.grantId
   );
+}
+
+/**
+ * Access Sheet composition may render an Event Admin Grant for the exact
+ * Event Admin session that owns it. This exception is intentionally outside
+ * ordinary Grant reveal policy and rechecks the current session binding.
+ */
+export function canResolveAccessSheetCredentialInTransaction(
+  transaction: FoundationStorageTransaction,
+  options: GrantAuthorityOptions,
+  grant: StoredGrant,
+  authority: TrustedGrantAuthority,
+): boolean {
+  if (canManageInTransaction(transaction, options, grant, authority, "reveal")) return true;
+  if (authority.kind !== "grant-session" || grant.grantType !== "event-admin") return false;
+  const session = findSessionByBearer(transaction, options, authority.sessionBearer);
+  if (
+    session === null ||
+    session.status !== "active" ||
+    session.grantId !== grant.grantId ||
+    session.grantVersion !== grant.grantVersion
+  )
+    return false;
+  const storedCaller = transaction.findGrantById(session.grantId);
+  if (storedCaller === null) return false;
+  const caller = expireGrantIfDue(transaction, options, storedCaller);
+  if (
+    caller.status !== "active" ||
+    caller.grantId !== grant.grantId ||
+    caller.grantVersion !== session.grantVersion ||
+    caller.grantType !== "event-admin" ||
+    caller.scope.eventId !== grant.scope.eventId
+  )
+    return false;
+  const nowMs = readNow(options);
+  if (
+    nowMs >=
+    Math.min(caller.expiresAtMs ?? Number.MAX_SAFE_INTEGER, session.lastActiveAtMs + 30 * DAY_MS)
+  ) {
+    expireSession(transaction, options, caller, session);
+    return false;
+  }
+  return caller.expiresAtMs === null || nowMs < caller.expiresAtMs;
 }
 
 export function canCreateInTransaction(

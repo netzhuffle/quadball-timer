@@ -47,6 +47,13 @@ import {
 import { isTechnicalAdminAuthority } from "@/lib/technical-admin-auth";
 import { canonicalizeJson, sha256 } from "@/lib/event-game-action-json";
 import { validateOpaqueIdentifier } from "@/lib/validation-policy";
+import {
+  generateAccessSheetInTransaction,
+  type AccessSheetArtifact,
+  type AccessSheetRenderer,
+  type AccessSheetRequest,
+  type AccessSheetIds,
+} from "@/lib/access-sheet";
 
 export const GENERIC_EVENT_HUB_AUTHORIZATION_FAILURE = Object.freeze({
   status: "rejected",
@@ -167,6 +174,9 @@ export type EventAdministrationOptions = {
   controlScopeResolver?: ControlGrantScopeResolver;
   /** Test-only composition seam for proving rollback after typed retirement. */
   removalFailureInjector?: () => void;
+  environmentId?: string;
+  accessSheetRenderer?: AccessSheetRenderer;
+  accessSheetIds?: AccessSheetIds;
 };
 
 export type EventAdministration = {
@@ -316,6 +326,10 @@ export type EventAdministration = {
     gameDayId?: unknown;
     authority: EventAdministrationAuthority;
   }): Promise<EventAdministrationOutcome<EventHubProjection>>;
+  generateAccessSheet(
+    input: AccessSheetRequest,
+    authority: EventAdministrationAuthority,
+  ): Promise<EventAdministrationMutationOutcome<AccessSheetArtifact>>;
   changePublicationStatus(
     eventId: unknown,
     input: { status: unknown; impactConfirmed?: unknown },
@@ -1138,6 +1152,39 @@ export function createEventAdministration(
             grantSessionId: authorized.sessionId,
             grantSessionExpiresAtMs: authorized.sessionExpiresAtMs,
           });
+        });
+      } catch {
+        return unavailable();
+      }
+    },
+
+    async generateAccessSheet(input, authority) {
+      const eventId = validateEventId(input.scope.eventId);
+      if (!eventId.ok) return invalid(eventId.error);
+      try {
+        return await options.storage.transaction((transaction) => {
+          const authorized = authorizeEventScopeInTransaction(
+            options,
+            transaction,
+            eventId.value,
+            authority,
+          );
+          if (authorized === null) return unauthorized();
+          const result = generateAccessSheetInTransaction(
+            transaction,
+            input,
+            authorized.actorReference,
+            {
+              environmentId: options.environmentId ?? "test",
+              nowMs,
+              grants: options.grants,
+              authority,
+              renderer: options.accessSheetRenderer,
+              ids: options.accessSheetIds,
+            },
+          );
+          if (result.status !== "accepted") return result;
+          return { ...result, sessionExpiresAtMs: authorized.sessionExpiresAtMs };
         });
       } catch {
         return unavailable();

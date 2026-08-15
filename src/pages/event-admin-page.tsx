@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import QRCode from "qrcode/lib/browser";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -94,6 +94,21 @@ type ControlSession = {
   deviceClass: string;
   browserClass: string;
 };
+type AccessSheetType = "event-admin" | "pitch-manager" | "control-grant";
+type AccessSheetResponse = {
+  status: "accepted";
+  value: {
+    contentType: "text/html";
+    body: string;
+    version: {
+      versionId: string;
+      environmentId: string;
+      type: AccessSheetType;
+      generatedAtMs: number;
+      testMark: boolean;
+    };
+  };
+};
 
 type CatalogRemovalPreview = {
   target: {
@@ -128,6 +143,75 @@ const publicationWarningLabels: Record<string, string> = {
   "missing-event-games": "Event Games",
   "unresolved-matchups": "unresolved matchups or confirmed sides",
 };
+
+type AccessSheetArtifactScope = {
+  eventId: string;
+  authority: HubResponse["value"]["authority"] | "none";
+  gameDayId: string | null;
+  pitchId: string;
+  type: AccessSheetType;
+};
+
+type AccessSheetGenerationAttempt = {
+  sequence: number;
+  scopeKey: string;
+};
+
+function useAccessSheetArtifactOwner(scope: AccessSheetArtifactScope) {
+  const scopeKey = JSON.stringify(scope);
+  const sequenceRef = useRef(0);
+  const [stored, setStored] = useState<{
+    scopeKey: string;
+    artifact: AccessSheetResponse["value"];
+  } | null>(null);
+
+  useEffect(() => {
+    sequenceRef.current += 1;
+    setStored(null);
+  }, [scopeKey]);
+
+  useEffect(
+    () => () => {
+      sequenceRef.current += 1;
+    },
+    [],
+  );
+
+  const invalidate = () => {
+    sequenceRef.current += 1;
+    setStored(null);
+  };
+
+  const begin = (): AccessSheetGenerationAttempt => {
+    sequenceRef.current += 1;
+    setStored(null);
+    return { sequence: sequenceRef.current, scopeKey };
+  };
+
+  const matches = (attempt: AccessSheetGenerationAttempt) =>
+    attempt.sequence === sequenceRef.current && attempt.scopeKey === scopeKey;
+
+  const install = (
+    attempt: AccessSheetGenerationAttempt,
+    artifact: AccessSheetResponse["value"],
+  ) => {
+    if (!matches(attempt)) return false;
+    setStored({ scopeKey, artifact });
+    return true;
+  };
+
+  const fail = (attempt: AccessSheetGenerationAttempt) => {
+    if (matches(attempt)) setStored(null);
+  };
+
+  return {
+    artifact: stored?.scopeKey === scopeKey ? stored.artifact : null,
+    begin,
+    fail,
+    install,
+    invalidate,
+  };
+}
 
 type ScheduleDelayPreview = {
   dimension: "gameplay-slot" | "pitch-slot";
@@ -200,8 +284,17 @@ export function EventAdminPage() {
   const [controlSessions, setControlSessions] = useState<Record<string, ControlSession[]>>({});
   const [publicationImpactConfirmed, setPublicationImpactConfirmed] = useState(false);
   const [removalPreview, setRemovalPreview] = useState<CatalogRemovalPreview | null>(null);
+  const [accessSheetType, setAccessSheetType] = useState<AccessSheetType>("event-admin");
+  const accessSheetOwner = useAccessSheetArtifactOwner({
+    eventId: eventId.trim(),
+    authority: hub?.authority ?? "none",
+    gameDayId: selectedGameDayId,
+    pitchId: selectedPitchId,
+    type: accessSheetType,
+  });
 
   const loadHub = async (nextGameDayId = selectedGameDayId) => {
+    accessSheetOwner.invalidate();
     if (eventId.trim().length === 0) throw new Error("An Event is required.");
     const params = new URLSearchParams({ eventId: eventId.trim() });
     if (nextGameDayId !== null) params.set("gameDayId", nextGameDayId);
@@ -477,6 +570,37 @@ export function EventAdminPage() {
     await loadHub(selectedGameDayId);
   };
 
+  const generateAccessSheet = async () => {
+    const attempt = accessSheetOwner.begin();
+    const gameDayId = selectedGameDayId ?? "";
+    const pitchId = selectedPitchId;
+    try {
+      if (eventId.length === 0 || (accessSheetType === "control-grant" && gameDayId.length === 0))
+        throw new Error("Select a Game Day before generating this Access Sheet.");
+      if (accessSheetType === "control-grant" && pitchId.length === 0)
+        throw new Error("Select a Pitch before generating the Control Access Sheet.");
+      const response = await fetch(
+        `/api/event-admin/events/${encodeURIComponent(eventId)}/access-sheets`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            type: accessSheetType,
+            ...(accessSheetType === "control-grant" && gameDayId.length > 0 ? { gameDayId } : {}),
+            ...(accessSheetType === "control-grant" && pitchId.length > 0 ? { pitchId } : {}),
+          }),
+        },
+      );
+      const payload = (await response.json()) as AccessSheetResponse | { status: string };
+      if (!response.ok || payload.status !== "accepted")
+        throw new Error("Access Sheet generation failed.");
+      accessSheetOwner.install(attempt, (payload as AccessSheetResponse).value);
+    } catch (error) {
+      accessSheetOwner.fail(attempt);
+      throw error;
+    }
+  };
+
   const managePitchManagerGrant = async (
     operation: "rotate" | "disable" | "revoke" | "reactivate",
   ) => {
@@ -660,7 +784,10 @@ export function EventAdminPage() {
             <Input
               id="event-id"
               value={eventId}
-              onChange={(event) => setEventId(event.target.value)}
+              onChange={(event) => {
+                accessSheetOwner.invalidate();
+                setEventId(event.target.value);
+              }}
             />
           </div>
           {hub === null ? (
@@ -859,6 +986,7 @@ export function EventAdminPage() {
                   value={selectedGameDayId ?? ""}
                   onChange={(event) => {
                     const next = event.target.value || null;
+                    accessSheetOwner.invalidate();
                     setSelectedGameDayId(next);
                     void run(async () => {
                       await loadHub(next);
@@ -1432,6 +1560,7 @@ export function EventAdminPage() {
                       key={pitch.pitchId}
                       variant={selectedPitchId === pitch.pitchId ? "default" : "outline"}
                       onClick={() => {
+                        accessSheetOwner.invalidate();
                         setSelectedPitchId(pitch.pitchId);
                         void run(() => loadPitchView(pitch.pitchId));
                       }}
@@ -1663,6 +1792,66 @@ export function EventAdminPage() {
               </div>
               <div className="space-y-3 rounded-lg border p-3">
                 <div>
+                  <p className="font-semibold">Grant Access Sheets</p>
+                  <p className="text-xs text-muted-foreground">
+                    Generate a print-ready QR handoff. Grant Codes are never included. Test sheets
+                    are marked TEST in the artifact.
+                  </p>
+                </div>
+                <div className="grid gap-2 sm:grid-cols-3">
+                  <select
+                    aria-label="Access Sheet type"
+                    className="h-10 rounded-md border bg-background px-3 text-sm"
+                    value={accessSheetType}
+                    onChange={(event) => {
+                      accessSheetOwner.invalidate();
+                      setAccessSheetType(event.target.value as AccessSheetType);
+                    }}
+                  >
+                    <option value="event-admin">Event Admin</option>
+                    <option value="pitch-manager">Pitch Manager</option>
+                    <option value="control-grant">Control Grant</option>
+                  </select>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    disabled={busy || hub === null}
+                    onClick={() => void run(generateAccessSheet)}
+                  >
+                    Generate Access Sheet
+                  </Button>
+                </div>
+                {accessSheetOwner.artifact ? (
+                  <div className="space-y-2">
+                    <p className="text-xs text-muted-foreground">
+                      Version {accessSheetOwner.artifact.version.versionId} ·{" "}
+                      {accessSheetOwner.artifact.version.environmentId}
+                      {accessSheetOwner.artifact.version.testMark ? " · TEST" : ""}
+                    </p>
+                    <iframe
+                      id="generated-access-sheet-preview"
+                      title="Generated Grant Access Sheet preview"
+                      className="min-h-[28rem] w-full rounded border bg-white"
+                      srcDoc={accessSheetOwner.artifact.body}
+                    />
+                    <Button
+                      type="button"
+                      variant="outline"
+                      onClick={() => {
+                        const frame = document.getElementById(
+                          "generated-access-sheet-preview",
+                        ) as HTMLIFrameElement | null;
+                        frame?.contentWindow?.focus();
+                        frame?.contentWindow?.print();
+                      }}
+                    >
+                      Print Access Sheet
+                    </Button>
+                  </div>
+                ) : null}
+              </div>
+              <div className="space-y-3 rounded-lg border p-3">
+                <div>
                   <p className="font-semibold">Pitch Manager handoff</p>
                   <p className="text-xs text-muted-foreground">
                     One Grant covers exactly one Pitch and Game Day. The QR is revealed only on
@@ -1675,6 +1864,7 @@ export function EventAdminPage() {
                     className="h-10 rounded-md border bg-background px-3 text-sm"
                     value={pitchManagerGameDayId}
                     onChange={(event) => {
+                      accessSheetOwner.invalidate();
                       setPitchManagerGameDayId(event.target.value);
                       setPitchManagerGrant(null);
                       setPitchManagerQrDataUrl(null);
@@ -1692,6 +1882,7 @@ export function EventAdminPage() {
                     className="h-10 rounded-md border bg-background px-3 text-sm"
                     value={pitchManagerPitchId}
                     onChange={(event) => {
+                      accessSheetOwner.invalidate();
                       setPitchManagerPitchId(event.target.value);
                       setPitchManagerGrant(null);
                       setPitchManagerQrDataUrl(null);
@@ -1815,7 +2006,13 @@ export function EventAdminPage() {
                   />
                 ) : null}
               </div>
-              <Button variant="outline" onClick={() => setHub(null)}>
+              <Button
+                variant="outline"
+                onClick={() => {
+                  accessSheetOwner.invalidate();
+                  setHub(null);
+                }}
+              >
                 Change authority
               </Button>
             </div>

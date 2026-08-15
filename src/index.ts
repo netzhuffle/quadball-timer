@@ -55,6 +55,7 @@ import {
 import { createGrantAuthority } from "@/lib/grant-authority";
 import { readGrantAuthorityOptions } from "@/lib/grant-runtime";
 import type { TypedGrantMutation, TypedGrantReveal } from "@/lib/grant-management";
+import type { AccessSheetRequest } from "@/lib/access-sheet";
 import { createInMemoryFoundationStorage } from "@/lib/foundation-storage-memory";
 import { openSqliteFoundationStorage } from "@/lib/foundation-storage-sqlite";
 import type { FoundationStorage } from "@/lib/foundation-storage";
@@ -220,6 +221,7 @@ async function startServer() {
           storage: foundationStorage,
           grants: grantAuthority,
           controlScopeResolver: grantOptions.controlScopeResolver,
+          environmentId: environment,
         });
       } catch {
         // Grant keys are an Event Administration dependency, not a server-wide dependency.
@@ -1262,6 +1264,27 @@ async function startServer() {
               authority,
             });
             return sensitiveEventAdministrationResponse(result);
+          },
+        },
+        "/api/event-admin/events/:eventId/access-sheets": {
+          async POST(req: Request) {
+            if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
+            const authority = resolveEventAdministrationAuthority(req, technicalAdminAuth);
+            const body = await readJsonRecord(req);
+            const eventId = new URL(req.url).pathname.split("/").at(-2) ?? "";
+            if (authority === null || body === null) return sensitiveGenericAuthFailure(401);
+            const input = {
+              type: body.type,
+              scope: {
+                eventId,
+                gameDayId: body.gameDayId,
+                pitchId: body.pitchId,
+              },
+            } as AccessSheetRequest;
+            return sensitiveEventAdministrationMutationResponse(
+              await eventAdministration.generateAccessSheet(input, authority),
+              authority,
+            );
           },
         },
         "/api/event-admin/events/:eventId/publication-status": {
