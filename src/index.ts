@@ -843,8 +843,82 @@ async function startServer() {
           async DELETE(req: Request) {
             const token = requireTechnicalAdminMutationToken(req, technicalAdminAuth);
             if (token === null) return genericAuthFailure(401);
+            if (eventAdministration === null) return genericAuthFailure(503);
             const eventId = new URL(req.url).pathname.split("/").at(-1) ?? "";
-            return catalogResponse(await eventCatalog.removeEvent(eventId, token));
+            const body = await readJsonRecord(req);
+            if (body === null)
+              return json(
+                {
+                  status: "rejected",
+                  reason: "in-use",
+                  detail: "Event Catalog removal requires a fresh preview and confirmation.",
+                },
+                409,
+              );
+            return eventAdministrationResponse(
+              await eventAdministration.removeEventCatalogEntry(
+                {
+                  kind: "event",
+                  eventId,
+                  targetId: eventId,
+                  previewFingerprint: body?.previewFingerprint,
+                },
+                token,
+              ),
+            );
+          },
+        },
+        "/api/admin/events/:eventId/catalog-removal/preview": {
+          async POST(req: Request) {
+            const token = requireTechnicalAdminToken(req, technicalAdminAuth);
+            if (token === null) return genericAuthFailure(401);
+            if (eventAdministration === null) return genericAuthFailure(503);
+            const body = await readJsonRecord(req);
+            const eventId = new URL(req.url).pathname.split("/").at(-3) ?? "";
+            if (body === null)
+              return json(
+                {
+                  status: "rejected",
+                  reason: "invalid-input",
+                  detail: "JSON body must be an object.",
+                },
+                400,
+              );
+            return eventAdministrationResponse(
+              await eventAdministration.previewEventCatalogRemoval(
+                { kind: body.kind, eventId, targetId: body.targetId ?? eventId },
+                token,
+              ),
+            );
+          },
+        },
+        "/api/admin/events/:eventId/catalog-removal": {
+          async DELETE(req: Request) {
+            const token = requireTechnicalAdminMutationToken(req, technicalAdminAuth);
+            if (token === null) return genericAuthFailure(401);
+            if (eventAdministration === null) return genericAuthFailure(503);
+            const body = await readJsonRecord(req);
+            const eventId = new URL(req.url).pathname.split("/").at(-2) ?? "";
+            if (body === null)
+              return json(
+                {
+                  status: "rejected",
+                  reason: "invalid-input",
+                  detail: "JSON body must be an object.",
+                },
+                400,
+              );
+            return eventAdministrationResponse(
+              await eventAdministration.removeEventCatalogEntry(
+                {
+                  kind: body.kind,
+                  eventId,
+                  targetId: body.targetId ?? eventId,
+                  previewFingerprint: body.previewFingerprint,
+                },
+                token,
+              ),
+            );
           },
         },
         "/api/admin/events/:eventId/audit": {
@@ -930,10 +1004,31 @@ async function startServer() {
           async DELETE(req: Request) {
             const token = requireTechnicalAdminMutationToken(req, technicalAdminAuth);
             if (token === null) return genericAuthFailure(401);
+            if (eventAdministration === null) return genericAuthFailure(503);
             const path = new URL(req.url).pathname.split("/");
             const eventId = path.at(-3) ?? "";
             const gameDayId = path.at(-1) ?? "";
-            return catalogResponse(await eventCatalog.removeGameDay(eventId, gameDayId, token));
+            const body = await readJsonRecord(req);
+            if (body === null)
+              return json(
+                {
+                  status: "rejected",
+                  reason: "in-use",
+                  detail: "Event Catalog removal requires a fresh preview and confirmation.",
+                },
+                409,
+              );
+            return eventAdministrationResponse(
+              await eventAdministration.removeEventCatalogEntry(
+                {
+                  kind: "game-day",
+                  eventId,
+                  targetId: gameDayId,
+                  previewFingerprint: body?.previewFingerprint,
+                },
+                token,
+              ),
+            );
           },
         },
         "/api/admin/events/:eventId/event-admin-grant": {
@@ -1466,6 +1561,44 @@ async function startServer() {
               await eventAdministration.changePublicationStatus(
                 eventId,
                 { status: body.status, impactConfirmed: body.impactConfirmed },
+                authority,
+              ),
+              authority,
+            );
+          },
+        },
+        "/api/event-admin/events/:eventId/catalog-removal/preview": {
+          async POST(req: Request) {
+            if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
+            const authority = resolveEventAdministrationAuthority(req, technicalAdminAuth);
+            const body = await readJsonRecord(req);
+            const eventId = new URL(req.url).pathname.split("/").at(-3) ?? "";
+            if (authority === null) return sensitiveGenericAuthFailure(401);
+            if (body === null) return sensitiveEventAdministrationResponse(invalidEventBody());
+            return sensitiveEventAdministrationResponse(
+              await eventAdministration.previewEventCatalogRemoval(
+                { kind: body.kind, eventId, targetId: body.targetId },
+                authority,
+              ),
+            );
+          },
+        },
+        "/api/event-admin/events/:eventId/catalog-removal": {
+          async DELETE(req: Request) {
+            if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
+            const authority = resolveEventAdministrationAuthority(req, technicalAdminAuth);
+            const body = await readJsonRecord(req);
+            const eventId = new URL(req.url).pathname.split("/").at(-2) ?? "";
+            if (authority === null) return sensitiveGenericAuthFailure(401);
+            if (body === null) return sensitiveEventAdministrationResponse(invalidEventBody());
+            return sensitiveEventAdministrationMutationResponse(
+              await eventAdministration.removeEventCatalogEntry(
+                {
+                  kind: body.kind,
+                  eventId,
+                  targetId: body.targetId,
+                  previewFingerprint: body.previewFingerprint,
+                },
                 authority,
               ),
               authority,
@@ -2646,8 +2779,23 @@ function eventAdministrationResponse<T>(
 ) {
   if (result.status === "accepted") return json(result, acceptedStatus, extraHeaders);
   if (result.status === "retryable-failure") return json(result, 503, extraHeaders);
-  const status = result.reason === "unauthorized" ? 401 : result.reason === "not-found" ? 404 : 400;
+  const status =
+    result.reason === "unauthorized"
+      ? 401
+      : result.reason === "not-found"
+        ? 404
+        : result.reason === "in-use"
+          ? 409
+          : 400;
   return json(result, status, extraHeaders);
+}
+
+function invalidEventBody(): EventAdministrationOutcome<never> {
+  return {
+    status: "rejected",
+    reason: "invalid-input",
+    detail: "JSON body must be an object.",
+  };
 }
 
 function sensitiveEventAdministrationResponse<T>(
@@ -2659,7 +2807,13 @@ function sensitiveEventAdministrationResponse<T>(
   if (result.status === "retryable-failure") return sensitiveJson(result, 503, extraHeaders);
   return sensitiveJson(
     result,
-    result.reason === "unauthorized" ? 401 : result.reason === "not-found" ? 404 : 400,
+    result.reason === "unauthorized"
+      ? 401
+      : result.reason === "not-found"
+        ? 404
+        : result.reason === "in-use"
+          ? 409
+          : 400,
     extraHeaders,
   );
 }

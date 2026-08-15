@@ -277,6 +277,24 @@ function EventCatalogPanel({
   clearSecretsRef: { current: () => void };
   qrRenderer: GrantQrRenderer;
 }) {
+  type EventCatalogRemovalPreview = {
+    target: { kind: "event"; eventId: string; targetId: string };
+    eligible: boolean;
+    rejectionCategory: string | null;
+    repairWorkflow: string | null;
+    impact: {
+      descendantCount: number;
+      retiredAuthorityCount: number;
+      retiredAuthorityCategories: {
+        eventAdmin: number;
+        pitchManager: number;
+        control: number;
+      };
+      retainedEventGameCount: number;
+      retainedControlActionCount: number;
+    };
+    fingerprint: string;
+  };
   const [events, setEvents] = useState<EventProjection[]>([]);
   const [selected, setSelected] = useState<EventProjection | null>(null);
   const [editedName, setEditedName] = useState("");
@@ -308,6 +326,7 @@ function EventCatalogPanel({
     setMessage(null);
     secretOwner.invalidate(secretScopeKey());
   };
+  const [removalPreview, setRemovalPreview] = useState<EventCatalogRemovalPreview | null>(null);
 
   useEffect(() => {
     clearSecretsRef.current = clearEventAdminSecrets;
@@ -419,6 +438,36 @@ function EventCatalogPanel({
     } finally {
       setBusy(false);
     }
+  };
+
+  const previewRemoval = async (kind: "event", targetId: string) => {
+    if (selected === null) return;
+    const preview = await request<EventCatalogRemovalPreview>(
+      `/api/admin/events/${selected.eventId}/catalog-removal/preview`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ kind, targetId }),
+      },
+    );
+    setRemovalPreview(preview);
+  };
+
+  const acceptRemoval = async () => {
+    if (selected === null || removalPreview === null || !removalPreview.eligible) return;
+    clearEventAdminSecrets();
+    await request(`/api/admin/events/${selected.eventId}/catalog-removal`, {
+      method: "DELETE",
+      headers: { "content-type": "application/json", "x-technical-admin-csrf": "1" },
+      body: JSON.stringify({
+        kind: removalPreview.target.kind,
+        targetId: removalPreview.target.targetId,
+        previewFingerprint: removalPreview.fingerprint,
+      }),
+    });
+    setRemovalPreview(null);
+    setSelected(null);
+    await refresh();
   };
 
   return (
@@ -541,22 +590,23 @@ function EventCatalogPanel({
                 </Button>
                 <Button
                   disabled={busy || selected.gameDays.length > 0}
-                  onClick={() =>
-                    void run(async () => {
-                      clearEventAdminSecrets();
-                      await request(`/api/admin/events/${selected.eventId}`, {
-                        method: "DELETE",
-                        headers: { "x-technical-admin-csrf": "1" },
-                      });
-                      setSelected(null);
-                      await refresh();
-                    })
-                  }
+                  onClick={() => void run(() => previewRemoval("event", selected.eventId))}
                   type="button"
                   variant="outline"
                 >
                   Remove empty Event
                 </Button>
+                {removalPreview?.target.kind === "event" &&
+                removalPreview.target.targetId === selected.eventId ? (
+                  <Button
+                    disabled={busy || !removalPreview.eligible}
+                    onClick={() => void run(acceptRemoval)}
+                    type="button"
+                    variant="destructive"
+                  >
+                    Confirm Event removal
+                  </Button>
+                ) : null}
                 <Button
                   variant="outline"
                   onClick={() => {
@@ -939,25 +989,6 @@ function EventCatalogPanel({
                       >
                         Save Game Day
                       </Button>
-                      <Button
-                        onClick={() =>
-                          void run(async () => {
-                            await request(
-                              `/api/admin/events/${selected.eventId}/game-days/${day.gameDayId}`,
-                              {
-                                method: "DELETE",
-                                headers: { "x-technical-admin-csrf": "1" },
-                              },
-                            );
-                            await refresh();
-                          })
-                        }
-                        size="sm"
-                        type="button"
-                        variant="ghost"
-                      >
-                        Remove
-                      </Button>
                     </div>
                   </li>
                 ))}
@@ -965,6 +996,26 @@ function EventCatalogPanel({
                   <li className="text-muted-foreground">No Game Days.</li>
                 ) : null}
               </ul>
+              {removalPreview ? (
+                <div className="rounded-md border p-3 text-sm" role="status">
+                  <p>
+                    Removal preview: {removalPreview.eligible ? "eligible" : "blocked"}; catalog
+                    descendants {removalPreview.impact.descendantCount}; retained Event Game Records{" "}
+                    {removalPreview.impact.retainedEventGameCount}; accepted Control Actions{" "}
+                    {removalPreview.impact.retainedControlActionCount}; retiring{" "}
+                    {removalPreview.impact.retiredAuthorityCount} authority item(s).
+                  </p>
+                  <p className="text-muted-foreground">
+                    Authority categories: Event Admin{" "}
+                    {removalPreview.impact.retiredAuthorityCategories.eventAdmin}, Pitch Manager{" "}
+                    {removalPreview.impact.retiredAuthorityCategories.pitchManager}, Control{" "}
+                    {removalPreview.impact.retiredAuthorityCategories.control}.
+                  </p>
+                  {!removalPreview.eligible && removalPreview.repairWorkflow ? (
+                    <p className="text-muted-foreground">{removalPreview.repairWorkflow}</p>
+                  ) : null}
+                </div>
+              ) : null}
             </div>
           ) : (
             <p className="text-sm text-muted-foreground">Select an Event to inspect it.</p>

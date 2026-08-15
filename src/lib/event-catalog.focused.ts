@@ -162,6 +162,56 @@ describe("Event operations catalog through foundation SQLite", () => {
     }
   });
 
+  test("removes an eligible Team through the SQLite catalog transaction", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "quadball-event-catalog-removal-"));
+    const foundation = openSqliteFoundationStorage(join(directory, "catalog.sqlite"));
+    await foundation.applyMigrations();
+    try {
+      const catalog = createEventCatalog(createFoundationEventCatalogStorage(foundation), {
+        clock: { nowMs: () => Date.UTC(2026, 7, 14, 12) },
+      });
+      const event = await catalog.createEvent(
+        { name: "Removal Event", timeZone: "UTC" },
+        authority,
+      );
+      if (event.status !== "accepted") throw new Error("Expected Event.");
+      const team = await catalog.createEventTeam(event.value.eventId, { name: "Blue" }, authority);
+      if (team.status !== "accepted") throw new Error("Expected Team.");
+      const preview = await catalog.previewEventCatalogRemoval(
+        { kind: "event-team", eventId: event.value.eventId, targetId: team.value.eventTeamId },
+        authority,
+      );
+      expect(preview).toMatchObject({ status: "accepted", value: { eligible: true } });
+      if (preview.status !== "accepted") return;
+      expect(
+        await foundation.transaction((transaction) =>
+          catalog.runMutationInTransaction(
+            transaction,
+            event.value.eventId,
+            "technical-admin:test",
+            (operations) =>
+              operations.removeEventCatalogEntry(
+                {
+                  kind: "event-team",
+                  eventId: event.value.eventId,
+                  targetId: team.value.eventTeamId,
+                },
+                preview.value.fingerprint,
+                0,
+              ),
+          ),
+        ),
+      ).toMatchObject({ status: "accepted", value: { removed: true } });
+      expect(await catalog.inspectEvent(event.value.eventId, authority)).toMatchObject({
+        status: "accepted",
+        value: { teams: [] },
+      });
+    } finally {
+      foundation.close();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   test("keeps retained Game Facts unchanged across roster additions and corrections", async () => {
     const directory = await mkdtemp(join(tmpdir(), "quadball-event-catalog-facts-"));
     const foundation = openSqliteFoundationStorage(join(directory, "catalog.sqlite"));

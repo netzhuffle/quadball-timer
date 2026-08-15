@@ -103,6 +103,29 @@ type ControlSession = {
   browserClass: string;
 };
 
+type CatalogRemovalPreview = {
+  target: {
+    kind: "event-team" | "game-day" | "pitch" | "gameplay-slot" | "pitch-slot" | "event-game";
+    eventId: string;
+    targetId: string;
+  };
+  eligible: boolean;
+  rejectionCategory: string | null;
+  repairWorkflow: string | null;
+  impact: {
+    descendantCount: number;
+    retiredAuthorityCount: number;
+    retiredAuthorityCategories: {
+      eventAdmin: number;
+      pitchManager: number;
+      control: number;
+    };
+    retainedEventGameCount: number;
+    retainedControlActionCount: number;
+  };
+  fingerprint: string;
+};
+
 class EventPublicationValidationError extends Error {}
 
 export type GrantQrRenderer = (credential: string) => Promise<string>;
@@ -202,6 +225,7 @@ export function EventAdminPage({
   const [controlRotationCounts, setControlRotationCounts] = useState<Record<string, number>>({});
   const [secretWarning, setSecretWarning] = useState<string | null>(null);
   const [publicationImpactConfirmed, setPublicationImpactConfirmed] = useState(false);
+  const [removalPreview, setRemovalPreview] = useState<CatalogRemovalPreview | null>(null);
   const [secretOwner] = useState(createGrantSecretOwner);
 
   const secretScopeKey = (
@@ -371,6 +395,7 @@ export function EventAdminPage({
           ),
         );
       });
+      return payload.value;
     } catch (error) {
       if (secretOwner.current(token)) throw error;
     }
@@ -395,14 +420,17 @@ export function EventAdminPage({
     }
   };
 
-  const loadPitchView = async (pitchId: string, providedToken?: GrantSecretToken) => {
-    if (selectedGameDayId === null || pitchId.length === 0) return;
-    const token =
-      providedToken ?? secretOwner.capture(secretScopeKey(eventId, selectedGameDayId, pitchId));
+  const loadPitchView = async (
+    pitchId: string,
+    gameDayId = selectedGameDayId,
+    providedToken?: GrantSecretToken,
+  ) => {
+    if (gameDayId === null || pitchId.length === 0) return;
+    const token = providedToken ?? secretOwner.capture(secretScopeKey(eventId, gameDayId, pitchId));
     if (!secretOwner.current(token)) return;
     try {
       const response = await fetch(
-        `/api/event-admin/pitch-view?eventId=${encodeURIComponent(eventId)}&gameDayId=${encodeURIComponent(selectedGameDayId)}&pitchId=${encodeURIComponent(pitchId)}`,
+        `/api/event-admin/pitch-view?eventId=${encodeURIComponent(eventId)}&gameDayId=${encodeURIComponent(gameDayId)}&pitchId=${encodeURIComponent(pitchId)}`,
       );
       const payload = (await response.json()) as {
         status: string;
@@ -415,6 +443,97 @@ export function EventAdminPage({
     } catch (error) {
       if (secretOwner.current(token)) throw error;
     }
+  };
+
+  const previewCatalogRemoval = async (
+    kind: CatalogRemovalPreview["target"]["kind"],
+    targetId: string,
+  ) => {
+    const response = await fetch(
+      `/api/event-admin/events/${encodeURIComponent(eventId)}/catalog-removal/preview`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ kind, targetId }),
+      },
+    );
+    const payload = (await response.json()) as
+      | { status: "accepted"; value: CatalogRemovalPreview }
+      | { status: "rejected" | "retryable-failure"; detail?: string };
+    if (!response.ok || payload.status !== "accepted")
+      throw new Error(
+        "detail" in payload
+          ? (payload.detail ?? "Removal preview failed.")
+          : "Removal preview failed.",
+      );
+    setRemovalPreview(payload.value);
+  };
+
+  const acceptCatalogRemoval = async () => {
+    if (removalPreview === null || !removalPreview.eligible) return;
+    invalidateGrantSecrets();
+    const target = removalPreview.target;
+    const removedSelectedGameDay =
+      target.kind === "game-day" && target.targetId === selectedGameDayId;
+    const removedSelectedPitch = target.kind === "pitch" && target.targetId === selectedPitchId;
+    const preferredGameDayId = removedSelectedGameDay ? null : selectedGameDayId;
+    const preferredPitchId = removedSelectedPitch ? "" : selectedPitchId;
+    if (removedSelectedGameDay) {
+      setSelectedGameDayId(null);
+      setSchedule(null);
+      setSelectedPitchId("");
+      setPitchView(null);
+    } else if (removedSelectedPitch) {
+      setSelectedPitchId("");
+      setPitchView(null);
+    }
+    const response = await fetch(
+      `/api/event-admin/events/${encodeURIComponent(eventId)}/catalog-removal`,
+      {
+        method: "DELETE",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          kind: removalPreview.target.kind,
+          targetId: removalPreview.target.targetId,
+          previewFingerprint: removalPreview.fingerprint,
+        }),
+      },
+    );
+    const payload = (await response.json()) as { status: string; detail?: string };
+    if (!response.ok || payload.status !== "accepted")
+      throw new Error(payload.detail ?? "Event Catalog removal failed.");
+    setRemovalPreview(null);
+    const base = await loadHub(null);
+    if (base === undefined) return;
+    const nextGameDayId =
+      (preferredGameDayId !== null &&
+        base.event.gameDays.some((day) => day.gameDayId === preferredGameDayId) &&
+        preferredGameDayId) ||
+      base.event.gameDays[0]?.gameDayId ||
+      null;
+    if (nextGameDayId === null) {
+      setSelectedGameDayId(null);
+      setSchedule(null);
+      setSelectedPitchId("");
+      setPitchView(null);
+      return;
+    }
+    const selected = await loadHub(nextGameDayId);
+    if (selected === undefined) return;
+    await loadSchedule(nextGameDayId);
+    const nextPitchId =
+      (preferredPitchId.length > 0 &&
+        selected.event.pitches.some((pitch) => pitch.pitchId === preferredPitchId) &&
+        preferredPitchId) ||
+      selected.event.pitches[0]?.pitchId ||
+      "";
+    if (nextPitchId.length === 0) {
+      setSelectedPitchId("");
+      setPitchView(null);
+      return;
+    }
+    setSelectedPitchId(nextPitchId);
+    await loadPitchView(nextPitchId, nextGameDayId);
   };
 
   const controlGrantUrl = (pitchSlotId: string) =>
@@ -915,7 +1034,7 @@ export function EventAdminPage({
     );
     if (!response.ok) throw new Error(await responseError(response, "Delay apply failed."));
     await loadSchedule(selectedGameDayId, token);
-    if (selectedPitchId.length > 0) await loadPitchView(selectedPitchId, token);
+    if (selectedPitchId.length > 0) await loadPitchView(selectedPitchId, selectedGameDayId, token);
     setDelayPreviews((current) => {
       const next = { ...current };
       delete next[slotId];
@@ -942,7 +1061,7 @@ export function EventAdminPage({
     );
     if (!response.ok) throw new Error(await responseError(response, "Pitch Reassignment failed."));
     await loadSchedule(selectedGameDayId, token);
-    if (selectedPitchId.length > 0) await loadPitchView(selectedPitchId, token);
+    if (selectedPitchId.length > 0) await loadPitchView(selectedPitchId, selectedGameDayId, token);
   };
 
   const confirmGameplaySlot = async (
@@ -1070,7 +1189,11 @@ export function EventAdminPage({
                 <Button
                   variant="outline"
                   disabled={busy || eventId.trim().length === 0}
-                  onClick={() => void run(() => loadHub(null))}
+                  onClick={() =>
+                    void run(async () => {
+                      await loadHub(null);
+                    })
+                  }
                 >
                   Open as Technical Admin
                 </Button>
@@ -1085,6 +1208,101 @@ export function EventAdminPage({
                 </p>
               </div>
               <AdministrativeAuditBrowser eventId={hub.event.eventId} route="event-admin" />
+              <div className="space-y-3 rounded-lg border p-3">
+                <div>
+                  <p className="font-semibold">Unused catalog removal</p>
+                  <p className="text-xs text-muted-foreground">
+                    Preview validates references and lifecycle state. Accepted removal refetches the
+                    Event Hub and schedule projections.
+                  </p>
+                </div>
+                <div className="space-y-2">
+                  {[
+                    ...hub.event.teams.map((item) => ({
+                      kind: "event-team" as const,
+                      targetId: item.eventTeamId,
+                      label: `Event Team ${item.name}`,
+                    })),
+                    ...hub.event.gameDays.map((item) => ({
+                      kind: "game-day" as const,
+                      targetId: item.gameDayId,
+                      label: `Game Day ${item.date}`,
+                    })),
+                    ...hub.event.pitches.map((item) => ({
+                      kind: "pitch" as const,
+                      targetId: item.pitchId,
+                      label: `Pitch ${item.name}`,
+                    })),
+                    ...hub.event.gameplaySlots.map((item) => ({
+                      kind: "gameplay-slot" as const,
+                      targetId: item.gameplaySlotId,
+                      label: `Gameplay Slot ${item.sequence}`,
+                    })),
+                    ...hub.event.pitchSlots.map((item) => ({
+                      kind: "pitch-slot" as const,
+                      targetId: item.pitchSlotId,
+                      label: `Pitch Slot ${item.sequence}`,
+                    })),
+                    ...hub.event.eventGames.map((item) => ({
+                      kind: "event-game" as const,
+                      targetId: item.eventGameId,
+                      label: `Event Game ${item.eventGameId}`,
+                    })),
+                  ].map((item) => {
+                    const active =
+                      removalPreview?.target.kind === item.kind &&
+                      removalPreview.target.targetId === item.targetId;
+                    return (
+                      <div className="flex flex-wrap items-center gap-2" key={item.targetId}>
+                        <span className="min-w-40 text-sm">{item.label}</span>
+                        <Button
+                          aria-label={`Preview removal ${item.label}`}
+                          disabled={busy}
+                          onClick={() =>
+                            void run(() => previewCatalogRemoval(item.kind, item.targetId))
+                          }
+                          size="sm"
+                          type="button"
+                          variant="outline"
+                        >
+                          Preview removal
+                        </Button>
+                        {active && removalPreview !== null && removalPreview.eligible ? (
+                          <Button
+                            disabled={busy}
+                            onClick={() => void run(acceptCatalogRemoval)}
+                            size="sm"
+                            type="button"
+                            variant="destructive"
+                          >
+                            Confirm
+                          </Button>
+                        ) : null}
+                      </div>
+                    );
+                  })}
+                </div>
+                {removalPreview ? (
+                  <div className="rounded border p-2 text-sm" role="status">
+                    <p>
+                      {removalPreview.eligible ? "Eligible" : "Blocked"} · catalog descendants{" "}
+                      {removalPreview.impact.descendantCount}; retained Event Game Records{" "}
+                      {removalPreview.impact.retainedEventGameCount}; accepted Control Actions{" "}
+                      {removalPreview.impact.retainedControlActionCount}; retiring{" "}
+                      {removalPreview.impact.retiredAuthorityCount} authority item(s).
+                    </p>
+                    <p className="text-muted-foreground">
+                      Authority categories: Event Admin{" "}
+                      {removalPreview.impact.retiredAuthorityCategories.eventAdmin}, Pitch Manager{" "}
+                      {removalPreview.impact.retiredAuthorityCategories.pitchManager}, Control{" "}
+                      {removalPreview.impact.retiredAuthorityCategories.control}.
+                    </p>
+                    {!removalPreview.eligible && removalPreview.repairWorkflow ? (
+                      <p className="text-muted-foreground">{removalPreview.repairWorkflow}</p>
+                    ) : null}
+                  </div>
+                ) : null}
+              </div>
               <div className="space-y-3 rounded-lg border p-3">
                 <p className="font-semibold">Publication Status</p>
                 <p className="text-sm text-muted-foreground">
@@ -1134,7 +1352,9 @@ export function EventAdminPage({
                     const next = event.target.value || null;
                     invalidateGrantSecrets();
                     setSelectedGameDayId(next);
-                    void run(() => loadHub(next));
+                    void run(async () => {
+                      await loadHub(next);
+                    });
                   }}
                 >
                   <option value="">Choose a Game Day</option>
@@ -1709,7 +1929,7 @@ export function EventAdminPage({
                           secretScopeKey(eventId, selectedGameDayId, pitch.pitchId),
                         );
                         setSelectedPitchId(pitch.pitchId);
-                        void run(() => loadPitchView(pitch.pitchId, token));
+                        void run(() => loadPitchView(pitch.pitchId, selectedGameDayId, token));
                       }}
                     >
                       {pitch.name}

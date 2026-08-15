@@ -32,7 +32,8 @@ export function createAuditEntry(
     actor:
       | { kind: "authority"; value: GrantAuthorityActor }
       | { kind: "session"; sessionId: string; pseudonymKeyVersion: string }
-      | { kind: "system"; value: "grant-expiry" | "grant-session-termination" };
+      | { kind: "system"; value: "grant-expiry" | "grant-session-termination" }
+      | { kind: "external"; value: string };
     grant: StoredGrant;
     sessionId: string | null;
     replacedSessionId: string | null;
@@ -169,7 +170,9 @@ export function expireGrantIfDue(
   return expiredGrant;
 }
 
-function eraseGrantCredential(credential: StoredGrant["credential"]): StoredGrant["credential"] {
+export function eraseGrantCredential(
+  credential: StoredGrant["credential"],
+): StoredGrant["credential"] {
   return {
     materialState: "erased",
     formatVersion: credential.formatVersion,
@@ -190,14 +193,17 @@ function deriveAuditActorReference(
   actor:
     | { kind: "authority"; value: GrantAuthorityActor }
     | { kind: "session"; sessionId: string; pseudonymKeyVersion: string }
-    | { kind: "system"; value: "grant-expiry" | "grant-session-termination" },
+    | { kind: "system"; value: "grant-expiry" | "grant-session-termination" }
+    | { kind: "external"; value: string },
 ): string {
   const source =
     actor.kind === "authority"
       ? { source: actor.kind, authorityKind: actor.value.kind, authorityId: actor.value.id }
       : actor.kind === "session"
         ? { source: actor.kind, sessionId: actor.sessionId }
-        : { source: actor.kind, operation: actor.value };
+        : actor.kind === "external"
+          ? { source: actor.kind, actorReference: actor.value }
+          : { source: actor.kind, operation: actor.value };
   return `actor-${computeLookupDigest(
     JSON.stringify({ domain: "grant-audit", grantId, source }),
     options.keyRing,
