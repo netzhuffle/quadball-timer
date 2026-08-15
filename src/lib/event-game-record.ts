@@ -44,7 +44,26 @@ import {
   type ControlAuditEntry,
   type EventGameRecordMetadata,
   type IqaGameRulesInterpreter,
+  sha256,
 } from "@/lib/event-game-actions";
+import {
+  canonicalizeGamePresentationChange,
+  fingerprintGamePresentationChange,
+  isValidHexColor,
+  orderGamePresentationChanges,
+  type GamePresentation,
+  type GamePresentationAuditKind,
+  type GamePresentationChange,
+  type StoredGamePresentationAuditEntry,
+  type StoredGamePresentationChange,
+} from "@/lib/game-presentation";
+import {
+  collapseGamePresentationAuditEntries,
+  deriveGamePresentation,
+  type GamePresentationAcceptanceInput,
+  revisionGamePresentationAuditEntry,
+} from "@/lib/game-presentation-projection";
+import { validateIntegerInRange, validateOpaqueIdentifier } from "@/lib/validation-policy";
 
 /**
  * Trusted composition boundary for Control Audit Trail access.
@@ -72,6 +91,14 @@ export type ExternalEventTeamResolution =
   | { status: "resolved" }
   | { status: "missing" | "mismatch"; detail: string };
 
+export type ExternalEventTeamColorResolver = {
+  resolveDefaultColor(
+    eventId: string,
+    eventTeamId: string,
+    snapshot: FoundationStorageSnapshot,
+  ): string | null;
+};
+
 /**
  * Resolves the external Event hierarchy without exposing external storage rows.
  * The transaction capability is the same synchronous snapshot used to accept the owned root.
@@ -86,6 +113,7 @@ export type ExternalScopeResolver = {
     eventTeamId: string,
     snapshot: FoundationStorageSnapshot,
   ): ExternalEventTeamResolution;
+  resolveEventTeamDefaultColor?: ExternalEventTeamColorResolver["resolveDefaultColor"];
 };
 
 function sameLifecycleContext(
@@ -160,11 +188,17 @@ export type EventGameRecord = {
   acceptAction(input: unknown): Promise<ControlActionAcceptanceOutcome>;
   readActions(): Promise<StoredControlAction[]>;
   readRecoveryProvenance(): Promise<ControlActionRecoveryProvenance[]>;
-  readAudit(credential: unknown): Promise<ControlAuditEntry[]>;
+  readAudit(credential: unknown): Promise<ControlAuditTrailEntry[]>;
+  acceptPresentationChange(input: unknown): Promise<GamePresentationAcceptanceOutcome>;
+  readPresentationHistory(): Promise<StoredGamePresentationChange[]>;
+  readPresentation(): Promise<GamePresentation>;
+  readPresentationAudit(credential: unknown): Promise<StoredGamePresentationAuditEntry[]>;
   readMetadata(): Promise<EventGameRecordMetadata | null>;
   rebuild(): Promise<ActionRebuildResult>;
   readiness(): Promise<EventGameRecordReadiness>;
 };
+
+export type ControlAuditTrailEntry = ControlAuditEntry | StoredGamePresentationAuditEntry;
 
 export type LifecycleTransitionOutcome =
   | { status: "updated" | "idempotent"; root: EventGameRecordRoot }
@@ -187,6 +221,18 @@ export type ControlActionAcceptanceOutcome =
         | "cyclic-dependency"
         | "fact-target-missing"
         | "storage-not-ready";
+      detail: string;
+    };
+
+export type GamePresentationAcceptanceOutcome =
+  | {
+      status: "accepted" | "duplicate-accepted";
+      change: StoredGamePresentationChange;
+      auditId: string;
+    }
+  | {
+      status: "rejected";
+      reason: "invalid-change" | "record-not-found" | "operation-conflict" | "storage-not-ready";
       detail: string;
     };
 
@@ -282,6 +328,150 @@ function hasCompatibleReplayContext(
   );
 }
 
+function presentationDefaultColors(
+  root: EventGameRecordRoot,
+  snapshot: FoundationStorageSnapshot,
+  resolver: ExternalScopeResolver,
+): Record<string, string> {
+  const defaults: Record<string, string> = {};
+  for (const side of root.gameSides) {
+    const color = resolver.resolveEventTeamDefaultColor?.(root.eventId, side.eventTeamId, snapshot);
+    if (color !== null && color !== undefined && isValidHexColor(color)) {
+      defaults[side.id] = `#${color.trim().replace(/^#/, "").toLowerCase()}`;
+    }
+  }
+  return defaults;
+}
+
+function isRecord(value: unknown): value is Record<string, any> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function presentationAuditId(
+  root: EventGameRecordRoot,
+  kind: GamePresentationAuditKind,
+  operationId: string | null,
+  detail: string,
+): string {
+  return `presentation:${kind}:${root.recordId}:${operationId ?? sha256(detail)}`;
+}
+
+function materializePresentationAuditSnapshots(
+  root: EventGameRecordRoot,
+  changes: readonly StoredGamePresentationChange[],
+  audits: readonly StoredGamePresentationAuditEntry[],
+  defaultColors: Readonly<Record<string, string>>,
+): StoredGamePresentationAuditEntry[] {
+  const ordered = orderGamePresentationChanges(changes);
+  const indexByOperationId = new Map(
+    ordered.map((change, index) => [change.operationId, index] as const),
+  );
+  const gameSideIds = root.gameSides.map((side) => side.id);
+  return collapseGamePresentationAuditEntries(audits).map((audit) => {
+    if (audit.kind !== "presentation-accepted" || audit.operationId === null) {
+      return structuredClone(audit);
+    }
+    const index = indexByOperationId.get(audit.operationId);
+    if (index === undefined) return structuredClone(audit);
+    return {
+      ...structuredClone(audit),
+      previousPresentation: deriveGamePresentation(
+        gameSideIds,
+        ordered.slice(0, index),
+        defaultColors,
+      ),
+      resultingPresentation: deriveGamePresentation(
+        gameSideIds,
+        ordered.slice(0, index + 1),
+        defaultColors,
+      ),
+    };
+  });
+}
+
+function readPresentationAcceptanceInput(value: unknown): GamePresentationAcceptanceInput | null {
+  if (!isRecord(value)) return null;
+  const change = value.change;
+  if (
+    !isRecord(change) ||
+    typeof value.recordId !== "string" ||
+    typeof value.eventGameId !== "string"
+  ) {
+    return null;
+  }
+  if (
+    !validateOpaqueIdentifier(value.recordId, "recordId").ok ||
+    !validateOpaqueIdentifier(value.eventGameId, "eventGameId").ok ||
+    !validateOpaqueIdentifier(value.operationId, "operationId").ok ||
+    !validateOpaqueIdentifier(value.presentationChangeId, "presentationChangeId").ok ||
+    typeof value.operationId !== "string" ||
+    typeof value.presentationChangeId !== "string" ||
+    !Array.isArray(value.causalPredecessorIds) ||
+    !isRecord(value.occurrence) ||
+    !isRecord(value.grant) ||
+    typeof value.acceptedAtMs !== "number"
+  )
+    return null;
+  let normalizedChange: GamePresentationChange;
+  if (
+    change.type === "pitch-orientation" &&
+    (change.pitchOrientation === "side-a-left" || change.pitchOrientation === "side-b-left")
+  ) {
+    normalizedChange = { type: "pitch-orientation", pitchOrientation: change.pitchOrientation };
+  } else if (
+    change.type === "displayed-team-color" &&
+    validateOpaqueIdentifier(change.gameSideId, "gameSideId").ok &&
+    typeof change.color === "string" &&
+    isValidHexColor(change.color)
+  ) {
+    normalizedChange = {
+      type: "displayed-team-color",
+      gameSideId: change.gameSideId,
+      color: `#${change.color.trim().replace(/^#/, "").toLowerCase()}`,
+    };
+  } else return null;
+  if (
+    !value.causalPredecessorIds.every(
+      (id): id is string => validateOpaqueIdentifier(id, "causalPredecessorId").ok,
+    ) ||
+    new Set(value.causalPredecessorIds).size !== value.causalPredecessorIds.length ||
+    value.causalPredecessorIds.includes(value.operationId) ||
+    !validateIntegerInRange(
+      value.occurrence.trustedAtMs,
+      0,
+      Number.MAX_SAFE_INTEGER,
+      "occurrence.trustedAtMs",
+    ).ok ||
+    (value.occurrence.clientOriginAtMs !== null &&
+      !validateIntegerInRange(
+        value.occurrence.clientOriginAtMs,
+        0,
+        Number.MAX_SAFE_INTEGER,
+        "occurrence.clientOriginAtMs",
+      ).ok) ||
+    (value.occurrence.source !== "online" && value.occurrence.source !== "offline") ||
+    !validateOpaqueIdentifier(value.grant.sessionId, "grant.sessionId").ok ||
+    !validateOpaqueIdentifier(value.grant.versionId, "grant.versionId").ok ||
+    !validateIntegerInRange(value.acceptedAtMs, 0, Number.MAX_SAFE_INTEGER, "acceptedAtMs").ok
+  )
+    return null;
+  return {
+    recordId: value.recordId,
+    eventGameId: value.eventGameId,
+    operationId: value.operationId,
+    presentationChangeId: value.presentationChangeId,
+    change: normalizedChange,
+    causalPredecessorIds: value.causalPredecessorIds,
+    occurrence: {
+      trustedAtMs: value.occurrence.trustedAtMs,
+      clientOriginAtMs: value.occurrence.clientOriginAtMs,
+      source: value.occurrence.source,
+    },
+    grant: { sessionId: value.grant.sessionId, versionId: value.grant.versionId },
+    acceptedAtMs: value.acceptedAtMs,
+  };
+}
+
 export function createEventGameRecord(
   storage: FoundationStorage,
   options: EventGameRecordOptions,
@@ -324,13 +514,13 @@ export function createEventGameRecord(
         storage.readAuditEntries(root.recordId),
         storage.readRecordMetadata(root.recordId),
       ]);
-      const snapshot: FoundationStorageSnapshot = {
+      const snapshot = {
         revision: 0,
         findRootByRecordId: () => root,
         findRootByEventGameId: () => root,
         findRootByPitchSlotId: () => root,
         findRootByGameSideId: () => root,
-        findActionByOperationId: (_recordId, operationId) =>
+        findActionByOperationId: (_recordId: string, operationId: string) =>
           storedActions.find((stored) => stored.action.operationId === operationId) ?? null,
         listActions: () => storedActions,
         listIdempotencyEntries: () => idempotencyEntries,
@@ -339,12 +529,6 @@ export function createEventGameRecord(
         findEvent: () => null,
         listEvents: () => [],
         listGameDays: () => [],
-        findEventTeam: () => null,
-        listEventTeams: () => [],
-        listRoster: () => [],
-        findRosterEntry: () => null,
-        findPitch: () => null,
-        listPitches: () => [],
         listEventAuditTrail: () => [],
         findGrantById: () => null,
         listGrants: () => [],
@@ -361,7 +545,7 @@ export function createEventGameRecord(
         findReplayReceiptByDigest: () => null,
         findReplayReceiptByReservationId: () => null,
         listAcceptanceIntegrityAnchors: () => [],
-      };
+      } as unknown as FoundationStorageSnapshot;
       return rebuildRecordSnapshot(root, snapshot, codecRegistry, options.interpreter);
     } catch (error) {
       if (error instanceof FoundationStorageNotReadyError) {
@@ -871,7 +1055,323 @@ export function createEventGameRecord(
         throw new Error("A trusted Event Admin or Technical Admin audit authority is required.");
       }
       const entries = await storage.readAuditEntries(currentRecordId());
-      return entries.sort(compareAuditEntries);
+      const presentationEntries = await storage.transaction((transaction) => {
+        const root = transaction.findRootByRecordId(currentRecordId());
+        if (root === null) return [];
+        return materializePresentationAuditSnapshots(
+          root,
+          transaction.listPresentationChanges?.(root.recordId) ?? [],
+          transaction.listPresentationAuditEntries?.(root.recordId) ?? [],
+          presentationDefaultColors(root, transaction, options.externalScopeResolver),
+        );
+      });
+      const presentationRanks = await storage.transaction((transaction) => {
+        const changes = transaction.listPresentationChanges?.(currentRecordId()) ?? [];
+        return new Map(
+          orderGamePresentationChanges(changes).map((change, index) => [change.operationId, index]),
+        );
+      });
+      return [...entries, ...presentationEntries].sort((left, right) =>
+        compareAuditEntries(left, right, presentationRanks),
+      );
+    },
+
+    async acceptPresentationChange(input) {
+      const parsed = readPresentationAcceptanceInput(input);
+      if (parsed === null) {
+        return {
+          status: "rejected",
+          reason: "invalid-change",
+          detail: "Game Presentation Change is malformed.",
+        } satisfies GamePresentationAcceptanceOutcome;
+      }
+      try {
+        const outcome = await storage.transaction((transaction) => {
+          if (
+            transaction.findPresentationChangeByOperationId === undefined ||
+            transaction.listPresentationChanges === undefined ||
+            transaction.listPresentationAuditEntries === undefined ||
+            transaction.insertPresentationChange === undefined ||
+            transaction.appendPresentationAuditEntry === undefined ||
+            transaction.appendPresentationAuditRevision === undefined ||
+            transaction.sealPresentationEvidence === undefined
+          ) {
+            return {
+              status: "rejected",
+              reason: "storage-not-ready",
+              detail: "The presentation record seam is not durably available.",
+            } satisfies GamePresentationAcceptanceOutcome;
+          }
+          const root = transaction.findRootByRecordId(parsed.recordId);
+          if (root === null || root.eventGameId !== parsed.eventGameId) {
+            return {
+              status: "rejected",
+              reason: "record-not-found",
+              detail: "The Event Game Record is not registered for this Event Game.",
+            } satisfies GamePresentationAcceptanceOutcome;
+          }
+          if (parsed.recordId !== currentRecordId()) {
+            return {
+              status: "rejected",
+              reason: "record-not-found",
+              detail: "The Event Game Record is not active.",
+            } satisfies GamePresentationAcceptanceOutcome;
+          }
+          if (parsed.change.type === "displayed-team-color") {
+            const gameSideId = parsed.change.gameSideId;
+            if (!root.gameSides.some((side) => side.id === gameSideId)) {
+              return {
+                status: "rejected",
+                reason: "invalid-change",
+                detail: "Game Presentation Change references an unknown stable Game Side.",
+              } satisfies GamePresentationAcceptanceOutcome;
+            }
+          }
+          const retainedPresentationChanges = transaction.listPresentationChanges(root.recordId);
+          const predecessorIds = new Set(parsed.causalPredecessorIds);
+          const retainedOperationIds = new Set([
+            ...transaction.listActions(root.recordId).map((stored) => stored.action.operationId),
+            ...retainedPresentationChanges.map((change) => change.operationId),
+          ]);
+          if (
+            predecessorIds.size !== parsed.causalPredecessorIds.length ||
+            predecessorIds.has(parsed.operationId) ||
+            parsed.causalPredecessorIds.some(
+              (predecessor) => !retainedOperationIds.has(predecessor),
+            )
+          ) {
+            return {
+              status: "rejected",
+              reason: "invalid-change",
+              detail: "Game Presentation Change causal predecessors are not retained.",
+            } satisfies GamePresentationAcceptanceOutcome;
+          }
+          const previousPresentation = deriveGamePresentation(
+            root.gameSides.map((side) => side.id),
+            retainedPresentationChanges,
+            presentationDefaultColors(root, transaction, options.externalScopeResolver),
+          );
+          const existing = transaction.findPresentationChangeByOperationId?.(
+            root.recordId,
+            parsed.operationId,
+          );
+          const fingerprint = fingerprintGamePresentationChange(parsed);
+          if (existing !== null && existing !== undefined) {
+            if (existing.contentFingerprint === fingerprint) {
+              const audit: StoredGamePresentationAuditEntry = {
+                auditVersion: "control-audit-v1",
+                auditId: presentationAuditId(
+                  root,
+                  "presentation-duplicate",
+                  parsed.operationId,
+                  "",
+                ),
+                recordId: root.recordId,
+                eventGameId: root.eventGameId,
+                operationId: parsed.operationId,
+                presentationChangeId: parsed.presentationChangeId,
+                kind: "presentation-duplicate",
+                classification: "game-presentation-change",
+                outcome: "duplicate-accepted",
+                createdAtMs: parsed.acceptedAtMs,
+                redactedDetail: "Duplicate Game Presentation Change acknowledged idempotently.",
+                previousPresentation: structuredClone(previousPresentation),
+                resultingPresentation: structuredClone(previousPresentation),
+                change: parsed.change,
+                grant: parsed.grant,
+              };
+              if (
+                !transaction
+                  .listPresentationAuditEntries?.(root.recordId)
+                  .some((entry) => entry.auditId === audit.auditId)
+              ) {
+                transaction.appendPresentationAuditEntry?.(audit);
+                transaction.sealPresentationEvidence(root.recordId);
+              }
+              return {
+                status: "duplicate-accepted",
+                change: structuredClone(existing),
+                auditId: audit.auditId,
+              } satisfies GamePresentationAcceptanceOutcome;
+            }
+            const audit: StoredGamePresentationAuditEntry = {
+              auditVersion: "control-audit-v1",
+              auditId: presentationAuditId(
+                root,
+                "presentation-conflict",
+                parsed.operationId,
+                fingerprint,
+              ),
+              recordId: root.recordId,
+              eventGameId: root.eventGameId,
+              operationId: parsed.operationId,
+              presentationChangeId: parsed.presentationChangeId,
+              kind: "presentation-conflict",
+              classification: "game-presentation-change",
+              outcome: "rejected",
+              createdAtMs: parsed.acceptedAtMs,
+              redactedDetail:
+                "operation identity is already bound to different presentation content",
+              previousPresentation: structuredClone(previousPresentation),
+              resultingPresentation: structuredClone(previousPresentation),
+              change: parsed.change,
+              grant: parsed.grant,
+            };
+            transaction.appendPresentationAuditEntry?.(audit);
+            transaction.sealPresentationEvidence(root.recordId);
+            return {
+              status: "rejected",
+              reason: "operation-conflict",
+              detail: "The presentation operation identity is already bound to different content.",
+            } satisfies GamePresentationAcceptanceOutcome;
+          }
+          const sameChange = transaction
+            .listPresentationChanges?.(root.recordId)
+            .find((change) => change.presentationChangeId === parsed.presentationChangeId);
+          if (sameChange !== undefined) {
+            return {
+              status: "rejected",
+              reason: "operation-conflict",
+              detail: "The presentation change identity is already retained.",
+            } satisfies GamePresentationAcceptanceOutcome;
+          }
+          const stored: StoredGamePresentationChange = {
+            ...parsed,
+            causalPredecessorIds: [...parsed.causalPredecessorIds],
+            canonicalContent: canonicalizeGamePresentationChange(parsed),
+            contentFingerprint: fingerprint,
+          };
+          transaction.insertPresentationChange?.(stored);
+          const orderedChanges = orderGamePresentationChanges(
+            transaction.listPresentationChanges(root.recordId),
+          );
+          const storedIndex = orderedChanges.findIndex(
+            (change) => change.operationId === stored.operationId,
+          );
+          const canonicalPreviousPresentation = deriveGamePresentation(
+            root.gameSides.map((side) => side.id),
+            orderedChanges.slice(0, storedIndex),
+            presentationDefaultColors(root, transaction, options.externalScopeResolver),
+          );
+          const resultingPresentation = deriveGamePresentation(
+            root.gameSides.map((side) => side.id),
+            orderedChanges.slice(0, storedIndex + 1),
+            presentationDefaultColors(root, transaction, options.externalScopeResolver),
+          );
+          const audit: StoredGamePresentationAuditEntry = {
+            auditVersion: "control-audit-v1",
+            auditId: presentationAuditId(root, "presentation-accepted", parsed.operationId, ""),
+            recordId: root.recordId,
+            eventGameId: root.eventGameId,
+            operationId: parsed.operationId,
+            presentationChangeId: parsed.presentationChangeId,
+            kind: "presentation-accepted",
+            classification: "game-presentation-change",
+            outcome: "accepted",
+            createdAtMs: parsed.acceptedAtMs,
+            redactedDetail: "Game Presentation Change accepted and synchronized.",
+            previousPresentation: structuredClone(canonicalPreviousPresentation),
+            resultingPresentation: structuredClone(resultingPresentation),
+            change: parsed.change,
+            grant: parsed.grant,
+          };
+          transaction.appendPresentationAuditEntry?.(audit);
+          const allAudits = transaction.listPresentationAuditEntries(root.recordId);
+          const canonicalAudits = materializePresentationAuditSnapshots(
+            root,
+            orderedChanges,
+            allAudits,
+            presentationDefaultColors(root, transaction, options.externalScopeResolver),
+          );
+          const effectiveAudits = collapseGamePresentationAuditEntries(allAudits);
+          for (const canonicalAudit of canonicalAudits) {
+            if (canonicalAudit.kind !== "presentation-accepted") continue;
+            const currentAudit = effectiveAudits.find(
+              (entry) => entry.auditId === canonicalAudit.auditId,
+            );
+            if (
+              currentAudit !== undefined &&
+              (JSON.stringify(currentAudit.previousPresentation) !==
+                JSON.stringify(canonicalAudit.previousPresentation) ||
+                JSON.stringify(currentAudit.resultingPresentation) !==
+                  JSON.stringify(canonicalAudit.resultingPresentation))
+            ) {
+              transaction.appendPresentationAuditRevision(
+                revisionGamePresentationAuditEntry(canonicalAudit),
+              );
+            }
+          }
+          transaction.sealPresentationEvidence(root.recordId);
+          return {
+            status: "accepted",
+            change: stored,
+            auditId: audit.auditId,
+          } satisfies GamePresentationAcceptanceOutcome;
+        });
+        return outcome;
+      } catch (error) {
+        if (error instanceof FoundationStorageNotReadyError) {
+          return {
+            status: "rejected",
+            reason: "storage-not-ready",
+            detail: "Presentation records are not durably available.",
+          } satisfies GamePresentationAcceptanceOutcome;
+        }
+        return {
+          status: "rejected",
+          reason: "storage-not-ready",
+          detail: "The Game Presentation Change could not be durably committed.",
+        } satisfies GamePresentationAcceptanceOutcome;
+      }
+    },
+
+    async readPresentation() {
+      return storage.transaction((transaction) => {
+        const root = transaction.findRootByRecordId(currentRecordId());
+        if (root === null) throw new Error("The Event Game Record is not registered.");
+        const changes = transaction.listPresentationChanges?.(root.recordId) ?? [];
+        return deriveGamePresentation(
+          root.gameSides.map((side) => side.id),
+          changes,
+          presentationDefaultColors(root, transaction, options.externalScopeResolver),
+        );
+      });
+    },
+
+    async readPresentationHistory() {
+      return storage.transaction((transaction) => {
+        const root = transaction.findRootByRecordId(currentRecordId());
+        if (root === null) throw new Error("The Event Game Record is not registered.");
+        return orderGamePresentationChanges(
+          transaction.listPresentationChanges?.(root.recordId) ?? [],
+        ).map((change) => structuredClone(change));
+      });
+    },
+
+    async readPresentationAudit(credential) {
+      let verified = false;
+      try {
+        verified = options.auditAuthorityVerifier?.verify(credential) === true;
+      } catch {
+        verified = false;
+      }
+      if (!verified) {
+        throw new Error("A trusted Event Admin or Technical Admin audit authority is required.");
+      }
+      return storage.transaction((transaction) => {
+        const root = transaction.findRootByRecordId(currentRecordId());
+        if (root === null) throw new Error("The Event Game Record is not registered.");
+        const changes = transaction.listPresentationChanges?.(root.recordId) ?? [];
+        const presentationRanks = new Map(
+          orderGamePresentationChanges(changes).map((change, index) => [change.operationId, index]),
+        );
+        return materializePresentationAuditSnapshots(
+          root,
+          changes,
+          transaction.listPresentationAuditEntries?.(root.recordId) ?? [],
+          presentationDefaultColors(root, transaction, options.externalScopeResolver),
+        ).sort((left, right) => compareAuditEntries(left, right, presentationRanks));
+      });
     },
 
     readMetadata() {
@@ -978,17 +1478,44 @@ export function appendConcurrentCorrectionAudits(
   }
 }
 
-function compareAuditEntries(left: ControlAuditEntry, right: ControlAuditEntry): number {
-  const leftOccurrence = left.provenance?.occurrence?.trustedAtMs ?? Number.MAX_SAFE_INTEGER;
-  const rightOccurrence = right.provenance?.occurrence?.trustedAtMs ?? Number.MAX_SAFE_INTEGER;
-  const leftOperation = left.operationId ?? left.links?.relatedOperationIds.join(":") ?? "";
-  const rightOperation = right.operationId ?? right.links?.relatedOperationIds.join(":") ?? "";
+function compareAuditEntries(
+  left: ControlAuditTrailEntry,
+  right: ControlAuditTrailEntry,
+  presentationRanks: ReadonlyMap<string, number> = new Map(),
+): number {
+  if (
+    isPresentationAuditEntry(left) &&
+    isPresentationAuditEntry(right) &&
+    left.operationId !== null &&
+    right.operationId !== null
+  ) {
+    const leftRank = presentationRanks.get(left.operationId);
+    const rightRank = presentationRanks.get(right.operationId);
+    if (leftRank !== undefined && rightRank !== undefined && leftRank !== rightRank) {
+      return leftRank - rightRank;
+    }
+  }
+  const leftControl = left as ControlAuditEntry;
+  const rightControl = right as ControlAuditEntry;
+  const leftOccurrence = leftControl.provenance?.occurrence?.trustedAtMs ?? leftControl.createdAtMs;
+  const rightOccurrence =
+    rightControl.provenance?.occurrence?.trustedAtMs ?? rightControl.createdAtMs;
+  const leftOperation =
+    leftControl.operationId ?? leftControl.links?.relatedOperationIds.join(":") ?? "";
+  const rightOperation =
+    rightControl.operationId ?? rightControl.links?.relatedOperationIds.join(":") ?? "";
   return (
     (leftOccurrence === rightOccurrence ? 0 : leftOccurrence < rightOccurrence ? -1 : 1) ||
     compareOpaqueIdentifiers(leftOperation, rightOperation) ||
     compareOpaqueIdentifiers(left.kind, right.kind) ||
     compareOpaqueIdentifiers(left.auditId, right.auditId)
   );
+}
+
+function isPresentationAuditEntry(
+  entry: ControlAuditTrailEntry,
+): entry is ControlAuditTrailEntry & { classification: "game-presentation-change" } {
+  return "classification" in entry && entry.classification === "game-presentation-change";
 }
 
 function compareOpaqueIdentifiers(left: string, right: string): number {

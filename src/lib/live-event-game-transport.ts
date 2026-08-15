@@ -4,6 +4,7 @@ import type {
   ControllerQrResult,
   ControllerRefreshResult,
   ControllerReplayResult,
+  GamePresentationChangeResult,
   LiveEventGameControlResult,
   OpenControllerResult,
 } from "@/lib/live-event-game-control";
@@ -16,8 +17,12 @@ export type LiveEventGameControlTransport = {
   stayController(request: Request): Promise<Response>;
   revealControllerQr(request: Request): Promise<Response>;
   leaveController(request: Request): Promise<Response>;
+  submitControlAction(request: Request): Promise<Response>;
   submitControllerIntent(request: Request): Promise<Response>;
+  replayControlActions(request: Request): Promise<Response>;
   replayControllerActions(request: Request): Promise<Response>;
+  submitGamePresentationChange(request: Request): Promise<Response>;
+  replayGamePresentationChanges(request: Request): Promise<Response>;
 };
 
 export type LiveEventGameControlTransportTarget = {
@@ -41,12 +46,12 @@ export type LiveEventGameControlTransportTarget = {
     eventGameId: string;
   }): Promise<ControllerQrResult>;
   leaveController(input: { sessionBearer: string }): Promise<ControllerLeaveResult>;
-  submitControllerIntent(input: {
+  submitControlAction(input: {
     sessionBearer: string;
     eventGameId: string;
     intent: unknown;
   }): Promise<LiveEventGameControlResult>;
-  replayControllerActions(input: {
+  replayControlActions(input: {
     sessionBearer: string;
     eventGameId: string;
     batchId: string;
@@ -57,6 +62,25 @@ export type LiveEventGameControlTransportTarget = {
       eventGameId: string;
       intent: unknown;
       causalPredecessorIds?: readonly unknown[];
+    }[];
+  }): Promise<ControllerReplayResult>;
+  submitGamePresentationChange(input: {
+    sessionBearer: string;
+    eventGameId: string;
+    change: unknown;
+  }): Promise<GamePresentationChangeResult>;
+  replayGamePresentationChanges(input: {
+    sessionBearer: string;
+    eventGameId: string;
+    batchId: string;
+    replicaGeneration: string;
+    expectedGrantSessionId: string;
+    expectedGrantVersion: string;
+    changes: readonly {
+      eventGameId: string;
+      change: unknown;
+      causalPredecessorIds?: readonly unknown[];
+      originatingGrant: unknown;
     }[];
   }): Promise<ControllerReplayResult>;
 };
@@ -89,7 +113,7 @@ export function createLiveEventGameControlTransport(
       return result.status === "opened" ? noStoreJson(result) : unavailable();
     },
 
-    async submitControllerIntent(request) {
+    async submitControlAction(request) {
       if (!isAllowedRequest(request)) return unavailable();
       const control = resolve();
       if (control === null) return unavailable();
@@ -107,14 +131,41 @@ export function createLiveEventGameControlTransport(
         return unavailable();
       }
 
-      const result = await control.submitControllerIntent({
+      const result = await control.submitControlAction({
         sessionBearer: body.body.sessionBearer,
         eventGameId: body.body.eventGameId,
         intent: body.body.intent,
       });
       return noStoreJson(result, resultStatus(result));
     },
-    async replayControllerActions(request) {
+    async submitControllerIntent(request) {
+      return this.submitControlAction(request);
+    },
+    async submitGamePresentationChange(request) {
+      if (!isAllowedRequest(request)) return unavailable();
+      const control = resolve();
+      if (control === null) return unavailable();
+      const body = await readJsonBodyWithinLimit(
+        request,
+        SHARED_LIMITS.transport.httpJsonBodyBytes,
+      );
+      if (
+        !body.ok ||
+        !isRecord(body.body) ||
+        typeof body.body.sessionBearer !== "string" ||
+        typeof body.body.eventGameId !== "string" ||
+        body.body.change === undefined
+      ) {
+        return unavailable();
+      }
+      const result = await control.submitGamePresentationChange({
+        sessionBearer: body.body.sessionBearer,
+        eventGameId: body.body.eventGameId,
+        change: body.body.change,
+      });
+      return noStoreJson(result, resultStatus(result));
+    },
+    async replayControlActions(request) {
       if (!isAllowedRequest(request)) return unavailable();
       const control = resolve();
       if (control === null) return unavailable();
@@ -140,7 +191,7 @@ export function createLiveEventGameControlTransport(
       ) {
         return unavailable();
       }
-      const result = await control.replayControllerActions({
+      const result = await control.replayControlActions({
         sessionBearer: body.body.sessionBearer,
         eventGameId: body.body.eventGameId,
         batchId: body.body.batchId,
@@ -156,6 +207,60 @@ export function createLiveEventGameControlTransport(
             causalPredecessorIds: Array.isArray(action.causalPredecessorIds)
               ? action.causalPredecessorIds
               : [null],
+          };
+        }),
+      });
+      return noStoreJson(result, resultStatus(result));
+    },
+    async replayControllerActions(request) {
+      return this.replayControlActions(request);
+    },
+    async replayGamePresentationChanges(request) {
+      if (!isAllowedRequest(request)) return unavailable();
+      const control = resolve();
+      if (control === null) return unavailable();
+      const body = await readJsonBodyWithinLimit(
+        request,
+        SHARED_LIMITS.transport.httpJsonBodyBytes,
+      );
+      if (
+        !body.ok ||
+        !isRecord(body.body) ||
+        typeof body.body.sessionBearer !== "string" ||
+        typeof body.body.eventGameId !== "string" ||
+        typeof body.body.batchId !== "string" ||
+        typeof body.body.replicaGeneration !== "string" ||
+        typeof body.body.grantSessionId !== "string" ||
+        typeof body.body.grantVersion !== "string" ||
+        !Array.isArray(body.body.changes) ||
+        body.body.changes.length === 0 ||
+        body.body.changes.length > SHARED_LIMITS.replay.maxControlActions
+      ) {
+        return unavailable();
+      }
+      const result = await control.replayGamePresentationChanges({
+        sessionBearer: body.body.sessionBearer,
+        eventGameId: body.body.eventGameId,
+        batchId: body.body.batchId,
+        replicaGeneration: body.body.replicaGeneration,
+        expectedGrantSessionId: body.body.grantSessionId,
+        expectedGrantVersion: body.body.grantVersion,
+        changes: body.body.changes.map((change) => {
+          if (!isRecord(change)) {
+            return {
+              eventGameId: "",
+              change: null,
+              causalPredecessorIds: [null],
+              originatingGrant: null,
+            };
+          }
+          return {
+            eventGameId: typeof change.eventGameId === "string" ? change.eventGameId : "",
+            change: change.change,
+            causalPredecessorIds: Array.isArray(change.causalPredecessorIds)
+              ? change.causalPredecessorIds
+              : [null],
+            originatingGrant: change.originatingGrant,
           };
         }),
       });
@@ -243,7 +348,9 @@ async function readSessionInput(
   return { sessionBearer: body.body.sessionBearer };
 }
 
-function resultStatus(result: LiveEventGameControlResult | ControllerReplayResult): number {
+function resultStatus(
+  result: LiveEventGameControlResult | GamePresentationChangeResult | ControllerReplayResult,
+): number {
   if (result.status === "retryable") return 503;
   if (result.status === "rejected") return 403;
   return 200;

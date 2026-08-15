@@ -33,6 +33,7 @@ import {
 import { validateGameClockMs } from "@/lib/validation-policy";
 import type { ActionJsonValue, OfficialOverrideMetadata } from "@/lib/event-game-actions";
 import { readControllerDeviceContext } from "@/lib/controller-device-context";
+import { createInitialGamePresentation } from "@/lib/game-presentation-projection";
 import {
   acknowledgeControllerProjection,
   controllerReplicaStorageKey,
@@ -128,6 +129,7 @@ export function EventGameControllerPage() {
     "unavailable",
   );
   const [revealedQr, setRevealedQr] = useState<string | null>(null);
+  const [qrDialogOpen, setQrDialogOpen] = useState(false);
   const [switchTarget, setSwitchTarget] = useState<string | null>(null);
   const [stayedOnAssignment, setStayedOnAssignment] = useState<string | null>(null);
   const [clockRunning, setClockRunning] = useState(false);
@@ -167,6 +169,8 @@ export function EventGameControllerPage() {
     persistedReplicaLoad.warning,
   );
   const [browserContext] = useState(() => readControllerDeviceContext());
+  const qrTriggerRef = useRef<HTMLButtonElement>(null);
+  const qrDialogRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     const timer = window.setInterval(() => setLocalMonotonicMs(readMonotonicNow()), 250);
@@ -484,6 +488,7 @@ export function EventGameControllerPage() {
       );
       if (response.status !== "revealed") throw new Error("reveal failed");
       setRevealedQr(response.qrCredential);
+      setQrDialogOpen(true);
     } catch {
       setMessage("The active Control Grant QR is no longer revealable.");
     } finally {
@@ -704,6 +709,34 @@ export function EventGameControllerPage() {
         ? { foulBeforeScore: cardFoulBeforeScore }
         : {}),
       ...(cardSeekerPenaltyConfirmed ? { seekerPenalty: "head-referee-confirmed" as const } : {}),
+      gameTimeMs: controllerGameTimeMs(),
+      occurrence: { clientOriginAtMs: Date.now() },
+    });
+  }
+
+  function flipPitchOrientation() {
+    const current = projection?.presentation ?? createInitialGamePresentation([]);
+    queueIntent({
+      version: LIVE_EVENT_CONTROL_INTENT_VERSION,
+      type: "set-pitch-orientation",
+      pitchOrientation: current.pitchOrientation === "side-a-left" ? "side-b-left" : "side-a-left",
+      operationId: crypto.randomUUID(),
+      factId: crypto.randomUUID(),
+      presentationChangeId: crypto.randomUUID(),
+      gameTimeMs: controllerGameTimeMs(),
+      occurrence: { clientOriginAtMs: Date.now() },
+    });
+  }
+
+  function changeDisplayedTeamColor(gameSideId: string, color: string) {
+    queueIntent({
+      version: LIVE_EVENT_CONTROL_INTENT_VERSION,
+      type: "set-displayed-team-color",
+      gameSideId,
+      color,
+      operationId: crypto.randomUUID(),
+      factId: crypto.randomUUID(),
+      presentationChangeId: crypto.randomUUID(),
       gameTimeMs: controllerGameTimeMs(),
       occurrence: { clientOriginAtMs: Date.now() },
     });
@@ -1363,20 +1396,63 @@ export function EventGameControllerPage() {
     setClockReceiptAnchor(null);
     setClockCorrectionInput("");
     setRevealedQr(null);
+    setQrDialogOpen(false);
     setSwitchTarget(null);
     setStayedOnAssignment(null);
   }
 
+  useEffect(() => {
+    if (!qrDialogOpen) return;
+    const dialog = qrDialogRef.current;
+    const opener = qrTriggerRef.current;
+    const focusable = dialog?.querySelector<HTMLElement>(
+      'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
+    );
+    focusable?.focus();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setQrDialogOpen(false);
+        window.setTimeout(() => opener?.focus(), 0);
+        return;
+      }
+      if (event.key !== "Tab" || dialog === null) return;
+      const elements = Array.from(
+        dialog.querySelectorAll<HTMLElement>(
+          'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
+        ),
+      );
+      if (elements.length === 0) return;
+      const first = elements[0];
+      const last = elements[elements.length - 1];
+      if (first === undefined || last === undefined) return;
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [qrDialogOpen]);
+
+  function closeQrDialog() {
+    setQrDialogOpen(false);
+    window.setTimeout(() => qrTriggerRef.current?.focus(), 0);
+  }
+
   return (
-    <main className="mx-auto max-h-[calc(100vh-1rem)] w-full max-w-xl overflow-y-auto p-4 pb-12 sm:max-h-none sm:overflow-visible sm:p-6">
-      <Card>
-        <CardHeader>
+    <main className="h-[100dvh] w-full overflow-hidden bg-slate-100 p-2 sm:p-6">
+      <Card className="mx-auto flex h-full min-h-0 w-full max-w-xl flex-col">
+        <CardHeader className="shrink-0 px-4 py-3 sm:px-6">
           <CardTitle>Event Game Controller</CardTitle>
           <CardDescription>
             A Grant Session survives refresh and connectivity loss until you explicitly leave.
           </CardDescription>
         </CardHeader>
-        <CardContent className="space-y-4">
+        <CardContent className="flex min-h-0 flex-1 flex-col overflow-hidden px-3 pb-3 sm:px-6">
           {sessionBearer === null ? (
             <>
               <div className="space-y-2">
@@ -1406,12 +1482,17 @@ export function EventGameControllerPage() {
                   disabled={busy}
                 />
               </div>
-              <Button className="w-full" onClick={() => void openController()} disabled={busy}>
+              <Button
+                className="min-h-11 w-full"
+                aria-label="Open Event Game Controller"
+                onClick={() => void openController()}
+                disabled={busy}
+              >
                 Open Controller Device
               </Button>
             </>
           ) : (
-            <>
+            <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain [&_button]:min-h-11">
               <div className="rounded-lg border bg-muted/30 p-3 text-sm">
                 <p className="font-medium">Controller Device: {eventGameId}</p>
                 <p className="mt-1 text-muted-foreground">
@@ -1423,14 +1504,37 @@ export function EventGameControllerPage() {
                   <p className="mt-1 text-muted-foreground">Projection temporarily unavailable.</p>
                 ) : null}
               </div>
-              <div className="flex flex-wrap gap-2 max-[639px]:hidden">
-                <Button variant="outline" onClick={() => void revealQr()} disabled={busy}>
-                  Reveal active Grant QR
+              <div className="flex shrink-0 flex-wrap gap-2">
+                <Button
+                  ref={qrTriggerRef}
+                  variant="outline"
+                  aria-label={
+                    revealedQr === null ? "Reveal active Grant QR" : "Show active Grant QR"
+                  }
+                  aria-expanded={qrDialogOpen}
+                  aria-controls="active-grant-qr-dialog"
+                  onClick={() => {
+                    if (revealedQr === null) void revealQr();
+                    else setQrDialogOpen(true);
+                  }}
+                  disabled={busy}
+                >
+                  {revealedQr === null ? "Reveal active Grant QR" : "Show active Grant QR"}
                 </Button>
-                <Button variant="outline" onClick={() => void refreshController()} disabled={busy}>
+                <Button
+                  variant="outline"
+                  aria-label="Refresh Event Game assignment"
+                  onClick={() => void refreshController()}
+                  disabled={busy}
+                >
                   Refresh assignment
                 </Button>
-                <Button variant="outline" onClick={() => void leaveController()} disabled={busy}>
+                <Button
+                  variant="outline"
+                  aria-label="Leave Event Game Controller session"
+                  onClick={() => void leaveController()}
+                  disabled={busy}
+                >
                   Leave Controller Session
                 </Button>
               </div>
@@ -1440,40 +1544,58 @@ export function EventGameControllerPage() {
                   <p className="mt-1">
                     Switch to {switchTarget}, or stay on {eventGameId}.
                   </p>
-                  <div className="mt-3 flex gap-2">
-                    <Button onClick={() => void switchController()} disabled={busy}>
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    <Button
+                      aria-label={`Switch to Event Game ${switchTarget}`}
+                      onClick={() => void switchController()}
+                      disabled={busy}
+                    >
                       Switch Event Game
                     </Button>
-                    <Button variant="outline" onClick={stayOnCurrentAssignment} disabled={busy}>
+                    <Button
+                      variant="outline"
+                      aria-label={`Stay on Event Game ${eventGameId}`}
+                      onClick={stayOnCurrentAssignment}
+                      disabled={busy}
+                    >
                       Stay here
                     </Button>
                   </div>
                 </div>
               )}
-              {revealedQr === null ? null : (
-                <div className="rounded-lg border p-3 text-sm">
-                  <p className="font-medium">Share this active Pitch Slot QR</p>
-                  <code className="mt-2 block break-all text-xs">{revealedQr}</code>
+              <div
+                className="sticky top-0 z-10 flex shrink-0 items-center justify-between gap-2 rounded-lg border bg-slate-950 p-3 text-white"
+                role="region"
+                aria-label="Event Game Clock"
+                aria-live="polite"
+              >
+                <div className="min-w-0 text-center">
+                  <p className="text-xs uppercase tracking-[0.2em] text-slate-300">Game Clock</p>
+                  <p className="mt-1 text-4xl font-semibold tabular-nums">
+                    {clockProjection === null || clockProjection.synchronization === "unavailable"
+                      ? "--:--"
+                      : formatClock(clockProjection.gameTimeMs)}
+                  </p>
+                  <p className="mt-1 text-xs text-slate-300">
+                    {clockProjection?.running ? "Play" : "Paused"} · Controller projection
+                  </p>
+                  <p className="mt-2 text-xs text-slate-300" data-clock-freshness="true">
+                    {clockProjection === null
+                      ? "Unavailable · manual timing required"
+                      : `${clockProjection.synchronization} · last synchronization: ${formatSynchronizationTime(clockProjection.lastSynchronizedAtMs)}`}
+                  </p>
                 </div>
-              )}
-              <div className="rounded-lg border bg-slate-950 p-4 text-center text-white">
-                <p className="text-xs uppercase tracking-[0.2em] text-slate-300">Game Clock</p>
-                <p className="mt-1 text-5xl font-semibold tabular-nums">
-                  {clockProjection === null || clockProjection.synchronization === "unavailable"
-                    ? "--:--"
-                    : formatClock(clockProjection.gameTimeMs)}
-                </p>
-                <p className="mt-1 text-xs text-slate-300">
-                  {clockProjection?.running ? "Play" : "Paused"} · Controller projection
-                </p>
-                <p className="mt-2 text-xs text-slate-300" data-clock-freshness="true">
-                  {clockProjection === null
-                    ? "Unavailable · manual timing required"
-                    : `${clockProjection.synchronization} · last synchronization: ${formatSynchronizationTime(clockProjection.lastSynchronizedAtMs)}`}
-                </p>
+                <Button
+                  aria-label={clockRunning ? "Pause game clock" : "Start game clock"}
+                  aria-pressed={clockRunning}
+                  onClick={toggleClock}
+                  disabled={busy}
+                >
+                  {clockRunning ? "Pause clock" : "Start clock"}
+                </Button>
               </div>
               {clockProjection === null ? null : (
-                <div className="space-y-1 rounded-lg border border-amber-500/50 bg-amber-50 p-3 text-sm text-amber-950 max-[639px]:hidden">
+                <div className="space-y-1 rounded-lg border border-amber-500/50 bg-amber-50 p-3 text-sm text-amber-950">
                   <p data-clock-cue="flag-runner">
                     {clockProjection.cues.flagRunnerEntry === "pending"
                       ? "Flag-runner entry pending at 19:00"
@@ -1634,14 +1756,51 @@ export function EventGameControllerPage() {
                   ) : null}
                 </div>
               )}
+              {projection === null ? null : (
+                <div className="flex flex-wrap items-center gap-2 rounded-lg border p-3">
+                  <Button
+                    variant="outline"
+                    aria-label="Flip Event Game physical ends"
+                    onClick={flipPitchOrientation}
+                    disabled={busy}
+                  >
+                    Flip physical ends
+                  </Button>
+                  <span className="text-sm text-muted-foreground">
+                    Game Side{" "}
+                    {projection.presentation?.pitchOrientation === "side-b-left"
+                      ? "side-b"
+                      : "side-a"}{" "}
+                    left
+                  </span>
+                  {Object.keys(projection.scoreByGameSide).map((gameSideId) => (
+                    <label key={gameSideId} className="flex items-center gap-2 text-sm">
+                      <input
+                        type="color"
+                        aria-label={`Game Side ${gameSideId} displayed team color`}
+                        value={
+                          projection.presentation?.displayedTeamColors[gameSideId] ?? "#00afe8"
+                        }
+                        onInput={(event) =>
+                          changeDisplayedTeamColor(
+                            gameSideId,
+                            (event.target as HTMLInputElement).value,
+                          )
+                        }
+                        disabled={busy}
+                        className="h-11 w-11 cursor-pointer rounded border border-slate-300 bg-white p-1"
+                      />
+                      {gameSideId}
+                    </label>
+                  ))}
+                </div>
+              )}
               <div className="flex flex-wrap gap-2">
-                <Button onClick={toggleClock} disabled={busy}>
-                  {clockRunning ? "Pause clock" : "Start clock"}
-                </Button>
                 {[-60_000, -10_000, 10_000, 60_000].map((adjustmentMs) => (
                   <Button
                     key={adjustmentMs}
                     variant="outline"
+                    aria-label={`Adjust game clock by ${adjustmentMs < 0 ? "minus" : "plus"} ${Math.abs(adjustmentMs) / 1000} seconds`}
                     onClick={() => adjustClock(adjustmentMs)}
                     disabled={busy}
                   >
@@ -1649,7 +1808,7 @@ export function EventGameControllerPage() {
                     {Math.abs(adjustmentMs) / 1000}s
                   </Button>
                 ))}
-                <div className="flex w-full flex-wrap items-end gap-2 rounded border p-2 text-left max-[639px]:hidden">
+                <div className="flex w-full flex-wrap items-end gap-2 rounded border p-2 text-left">
                   <div className="min-w-48 flex-1 space-y-1">
                     <Label htmlFor="clock-correction">Set game clock (milliseconds)</Label>
                     <Input
@@ -1663,6 +1822,7 @@ export function EventGameControllerPage() {
                   </div>
                   <Button
                     variant="outline"
+                    aria-label="Correct Event Game clock"
                     data-clock-correction="true"
                     onClick={correctClock}
                     disabled={busy}
@@ -1670,7 +1830,7 @@ export function EventGameControllerPage() {
                     Correct clock
                   </Button>
                 </div>
-                <div className="flex w-full flex-wrap items-end gap-2 rounded border border-amber-500/50 p-2 text-left max-[639px]:hidden">
+                <div className="flex w-full flex-wrap items-end gap-2 rounded border border-amber-500/50 p-2 text-left">
                   <div className="min-w-48 flex-1 space-y-1">
                     <Label htmlFor="clock-takeover-adjustment">
                       Emergency takeover adjustment (ms)
@@ -1686,6 +1846,7 @@ export function EventGameControllerPage() {
                   </div>
                   <Button
                     variant="outline"
+                    aria-label="Apply emergency Event Game clock takeover"
                     data-clock-takeover="true"
                     onClick={emergencyClockTakeover}
                     disabled={busy}
@@ -1693,7 +1854,7 @@ export function EventGameControllerPage() {
                     Emergency clock takeover
                   </Button>
                 </div>
-                <div className="flex w-full flex-wrap items-end gap-2 rounded border p-2 text-left max-[639px]:hidden">
+                <div className="flex w-full flex-wrap items-end gap-2 rounded border p-2 text-left">
                   <div className="min-w-32 flex-1 space-y-1">
                     <Label htmlFor="penalty-game-side">Penalized Game Side</Label>
                     <select
@@ -1749,6 +1910,7 @@ export function EventGameControllerPage() {
                   </p>
                   <Button
                     variant="outline"
+                    aria-label="Accept penalty card for the selected Game Side"
                     onClick={recordCard}
                     disabled={busy || cardGameSideId === ""}
                   >
@@ -1906,12 +2068,17 @@ export function EventGameControllerPage() {
                     )}
                   </div>
                 ) : null}
-                <Button variant="outline" onClick={() => trigger("result")} disabled={busy}>
+                <Button
+                  variant="outline"
+                  aria-label="Record final Event Game result"
+                  onClick={() => trigger("result")}
+                  disabled={busy}
+                >
                   Record result
                 </Button>
               </div>
               {projection === null ? null : (
-                <div className="space-y-3 max-[639px]:hidden">
+                <div className="space-y-3">
                   <p className="text-sm text-muted-foreground">
                     Phase: {projection.phase} · Goals: {projection.goalCount}
                     {projection.overtime ? " · Overtime" : ""}
@@ -1976,6 +2143,7 @@ export function EventGameControllerPage() {
                       <div>
                         <Button
                           variant="ghost"
+                          aria-label="Cancel close-play adjudication"
                           onClick={() => setPendingClosePlayAdjudication(null)}
                           disabled={busy}
                         >
@@ -2000,6 +2168,7 @@ export function EventGameControllerPage() {
                         </Button>
                         <Button
                           variant="ghost"
+                          aria-label="Cancel flag-catch boundary override"
                           onClick={() => setPendingFlagCatchBoundaryOverride(null)}
                           disabled={busy}
                         >
@@ -2026,11 +2195,16 @@ export function EventGameControllerPage() {
                       <span className="font-medium">Game Side {gameSideId}</span>
                       <div className="flex items-center gap-3">
                         <span className="text-2xl font-semibold tabular-nums">{score}</span>
-                        <Button onClick={() => recordGoal(gameSideId)} disabled={busy}>
+                        <Button
+                          aria-label={`Record 10-point goal for Game Side ${gameSideId}`}
+                          onClick={() => recordGoal(gameSideId)}
+                          disabled={busy}
+                        >
                           Record 10-point goal
                         </Button>
                         <Button
                           variant="outline"
+                          aria-label={`Record flag catch for Game Side ${gameSideId}`}
                           onClick={() => recordFlagCatch(gameSideId)}
                           disabled={busy}
                         >
@@ -2041,6 +2215,7 @@ export function EventGameControllerPage() {
                         projection.winnerGameSideId === null ? (
                           <Button
                             variant="outline"
+                            aria-label={`Concede Event Game for Game Side ${gameSideId}`}
                             onClick={() => recordConcession(gameSideId)}
                             disabled={busy}
                           >
@@ -2049,6 +2224,7 @@ export function EventGameControllerPage() {
                         ) : null}
                         <Button
                           variant="outline"
+                          aria-label={`Record directed forfeit for Game Side ${gameSideId}`}
                           onClick={() => recordForfeit(gameSideId)}
                           disabled={busy}
                         >
@@ -2057,7 +2233,12 @@ export function EventGameControllerPage() {
                       </div>
                     </div>
                   ))}
-                  <Button variant="outline" onClick={recordDoubleForfeit} disabled={busy}>
+                  <Button
+                    variant="outline"
+                    aria-label="Record directed double-forfeit"
+                    onClick={recordDoubleForfeit}
+                    disabled={busy}
+                  >
                     Record double-forfeit
                   </Button>
                   <div className="space-y-3 rounded-lg border p-3">
@@ -2189,6 +2370,7 @@ export function EventGameControllerPage() {
                           <Button
                             size="sm"
                             variant="outline"
+                            aria-label={`${fact.effective ? "Correct" : "Reinstate"} Game Fact ${fact.factId}`}
                             onClick={() => correctFact(fact.factId, !fact.effective)}
                             disabled={busy}
                           >
@@ -2211,11 +2393,41 @@ export function EventGameControllerPage() {
                   {durabilityWarning}
                 </p>
               )}
-            </>
+            </div>
           )}
-          {message === null ? null : <p className="text-sm text-muted-foreground">{message}</p>}
+          {message === null ? null : (
+            <p className="shrink-0 text-sm text-muted-foreground" role="status" aria-live="polite">
+              {message}
+            </p>
+          )}
         </CardContent>
       </Card>
+      {qrDialogOpen && revealedQr !== null ? (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/50 p-4"
+          onClick={(event) => {
+            if (event.target === event.currentTarget) closeQrDialog();
+          }}
+        >
+          <div
+            id="active-grant-qr-dialog"
+            ref={qrDialogRef}
+            role="dialog"
+            aria-modal="true"
+            aria-label="Active Grant QR"
+            tabIndex={-1}
+            className="w-full max-w-sm rounded-lg bg-white p-4 text-slate-900 shadow-xl"
+          >
+            <div className="flex items-start justify-between gap-3">
+              <p className="font-medium">Share this active Pitch Slot QR</p>
+              <Button variant="outline" aria-label="Close active Grant QR" onClick={closeQrDialog}>
+                Close
+              </Button>
+            </div>
+            <code className="mt-3 block break-all text-xs">{revealedQr}</code>
+          </div>
+        </div>
+      ) : null}
     </main>
   );
 }

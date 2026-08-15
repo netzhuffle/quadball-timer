@@ -5,6 +5,7 @@ import {
   LEGACY_CONTROL_ACTION_VERSION,
   LEGACY_CONTROL_AUDIT_VERSION,
   type ControlActionInput,
+  type ControlAuditEntry,
 } from "@/lib/event-game-actions";
 import { createEventGameRecord } from "@/lib/event-game-record";
 import { DURABLE_EVIDENCE_PROVENANCE } from "@/lib/foundation-storage";
@@ -36,7 +37,7 @@ export async function snapshot(record: Awaited<ReturnType<typeof createRecord>>)
       derivedGameState: projectedRebuild.derivedGameState,
       conflicts: projectedRebuild.conflicts,
     },
-    audit: audit.map(projectControlAuditEntryForConvergence),
+    audit: audit.filter(isControlAuditEntry).map(projectControlAuditEntryForConvergence),
   };
 }
 
@@ -478,8 +479,14 @@ async function snapshotFromRebuild(
       derivedGameState: projectedRebuild.derivedGameState,
       conflicts: projectedRebuild.conflicts,
     },
-    audit: audit.map(projectControlAuditEntryForConvergence),
+    audit: audit.filter(isControlAuditEntry).map(projectControlAuditEntryForConvergence),
   };
+}
+
+function isControlAuditEntry(
+  entry: Awaited<ReturnType<Awaited<ReturnType<typeof createRecord>>["readAudit"]>>[number],
+): entry is ControlAuditEntry {
+  return !("classification" in entry && entry.classification === "game-presentation-change");
 }
 
 function mismatchFailure(
