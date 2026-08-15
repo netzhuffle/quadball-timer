@@ -1756,6 +1756,24 @@ async function startServer() {
             );
           },
         },
+        "/api/event-admin/events/:eventId/game-days/:gameDayId/heat-stoppage-configuration": {
+          async PATCH(req: Request) {
+            if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
+            const authority = resolveEventAdministrationAuthority(req, technicalAdminAuth);
+            const body = await readJsonRecord(req);
+            const path = new URL(req.url).pathname.split("/");
+            if (authority === null || body === null) return sensitiveGenericAuthFailure(401);
+            return sensitiveEventAdministrationMutationResponse(
+              await eventAdministration.setGameDayHeatStoppageConfiguration(
+                path[4] ?? "",
+                path[6] ?? "",
+                { configuration: body.configuration },
+                authority,
+              ),
+              authority,
+            );
+          },
+        },
         "/api/event-admin/events/:eventId/game-days/:gameDayId/event-games": {
           async POST(req: Request) {
             if (eventAdministration === null) return sensitiveGenericAuthFailure(503);

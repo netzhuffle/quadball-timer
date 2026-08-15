@@ -254,6 +254,11 @@ export type EventCatalogMutationOperations = {
     eventTeamId: unknown,
     input: { name?: unknown; defaultColor?: unknown },
   ): CatalogOutcome<EventTeamProjection>;
+  setGameDayHeatStoppageConfiguration(
+    eventId: unknown,
+    gameDayId: unknown,
+    input: { configuration: unknown },
+  ): CatalogOutcome<EventGameDay>;
   upsertEventTeamRoster(
     eventId: unknown,
     eventTeamId: unknown,
@@ -449,6 +454,12 @@ export type EventCatalog = {
     eventId: unknown,
     gameDayId: unknown,
     input: { date: unknown },
+    authority: TechnicalAdminAuthority,
+  ): Promise<CatalogOutcome<EventGameDay>>;
+  setGameDayHeatStoppageConfiguration(
+    eventId: unknown,
+    gameDayId: unknown,
+    input: { configuration: unknown },
     authority: TechnicalAdminAuthority,
   ): Promise<CatalogOutcome<EventGameDay>>;
   createEventTeam(
@@ -848,6 +859,24 @@ export function createEventCatalog(
         transaction.appendAudit(audit);
         return accepted(projectDay(updated, event.timeZone, nowMs));
       });
+    },
+
+    async setGameDayHeatStoppageConfiguration(eventIdInput, gameDayIdInput, input, authority) {
+      if (!isTechnicalAdminAuthority(authority)) return unauthorized();
+      const actor = authorityActor(authority);
+      const nowMs = validNow(clock);
+      if (nowMs === null) return invalid("Event clock returned an invalid timestamp.");
+      return commit(storage, (transaction) =>
+        setGameDayHeatStoppageConfigurationOperation(
+          transaction,
+          clock,
+          ids,
+          eventIdInput,
+          gameDayIdInput,
+          input,
+          actor,
+        ),
+      );
     },
 
     async createEventTeam(eventId, input, authority) {
@@ -1401,6 +1430,16 @@ function createMutationOperations(
         ids,
         eventId,
         eventTeamId,
+        input,
+        actorReference,
+      ),
+    setGameDayHeatStoppageConfiguration: (eventId, gameDayId, input) =>
+      setGameDayHeatStoppageConfigurationOperation(
+        transaction,
+        clock,
+        ids,
+        eventId,
+        gameDayId,
         input,
         actorReference,
       ),
@@ -3028,6 +3067,62 @@ function validateOptionalText(
   if (value === undefined || value === null || value === "") return { ok: true, value: null };
   const result = normalizeBoundedText(value, maxCodePoints, field);
   return result.ok ? { ok: true, value: result.value } : result;
+}
+
+function setGameDayHeatStoppageConfigurationOperation(
+  transaction: EventCatalogStorageTransaction,
+  clock: EventCatalogClock,
+  ids: EventCatalogIds,
+  eventIdInput: unknown,
+  gameDayIdInput: unknown,
+  input: { configuration: unknown },
+  actorReference: string,
+): CatalogOutcome<EventGameDay> {
+  const eventId = validateId(eventIdInput, "eventId");
+  const gameDayId = validateId(gameDayIdInput, "gameDayId");
+  if (!eventId.ok) return invalid(eventId.error);
+  if (!gameDayId.ok) return invalid(gameDayId.error);
+  if (input.configuration !== "enabled" && input.configuration !== "disabled")
+    return invalid("Heat Stoppage Configuration must be enabled or disabled.");
+  const nowMs = validNow(clock);
+  if (nowMs === null) return invalid("Event clock returned an invalid timestamp.");
+  const event = transaction.findEvent(eventId.value);
+  if (event === null) return notFound("Event was not found.");
+  const existing = transaction
+    .listGameDays(event.eventId)
+    .find((day) => day.gameDayId === gameDayId.value);
+  if (existing === undefined) {
+    const elsewhere = transaction
+      .listEvents()
+      .some((candidate) =>
+        transaction
+          .listGameDays(candidate.eventId)
+          .some((day) => day.gameDayId === gameDayId.value),
+      );
+    return elsewhere
+      ? crossEvent("Game Day belongs to another Event.")
+      : notFound("Game Day was not found.");
+  }
+  if (existing.heatStoppageConfiguration === input.configuration)
+    return noChange("The Game Day already has this Heat Stoppage Configuration.");
+  const updated: StoredGameDay = {
+    ...existing,
+    heatStoppageConfiguration: input.configuration,
+    updatedAtMs: nowMs,
+  };
+  const audit = createAudit(
+    ids,
+    "game-day-heat-stoppage-configured",
+    event.eventId,
+    existing.gameDayId,
+    actorReference,
+    nowMs,
+    { heatStoppageConfiguration: existing.heatStoppageConfiguration },
+    { heatStoppageConfiguration: updated.heatStoppageConfiguration },
+  );
+  transaction.updateGameDay(updated);
+  transaction.appendAudit(audit);
+  return accepted(projectDay(updated, event.timeZone, nowMs));
 }
 
 function updatePitchOperation(

@@ -564,7 +564,7 @@ describe("SQLite foundation storage", () => {
       expect(await reopenedRecord.registerRoot(root)).toMatchObject({ status: "idempotent" });
       expect(await reopened.readiness()).toMatchObject({
         ok: true,
-        schemaVersion: "30",
+        schemaVersion: "31",
         evidence: { replay: { result: "passed", rootCount: 1, durationMs: expect.any(Number) } },
       });
       reopened.close();
@@ -612,12 +612,12 @@ describe("SQLite foundation storage", () => {
       const storage = openSqliteFoundationStorage(databasePath);
       const candidate = await storage.validateCandidate();
       expect(candidate.ready).toBe(true);
-      expect(candidate.readiness).toMatchObject({ ok: true, schemaVersion: "30" });
+      expect(candidate.readiness).toMatchObject({ ok: true, schemaVersion: "31" });
       expect(existsSync(candidate.candidatePath)).toBe(false);
       expect(await storage.readiness()).toMatchObject({ ok: false, status: "pending" });
 
       const migration = await storage.applyMigrations({ requireCandidate: true });
-      expect(migration.schemaVersion).toBe(30);
+      expect(migration.schemaVersion).toBe(31);
       expect(await storage.readiness()).toMatchObject({ ok: true });
       storage.close();
     });
@@ -849,15 +849,16 @@ describe("SQLite foundation storage", () => {
         removalAuditMigration.id,
         "029-access-sheet-generated-audit-action",
         heatStoppageConfigurationMigration.id,
+        "031-heat-stoppage-audit-action",
       ]);
-      expect(await current.readiness()).toMatchObject({ ok: true, schemaVersion: "30" });
+      expect(await current.readiness()).toMatchObject({ ok: true, schemaVersion: "31" });
       current.close();
     });
   });
 
   test("adds the Access Sheet audit action while preserving prior audit rows and shape", async () => {
     await withDatabase(async (databasePath) => {
-      const priorMigrations = FOUNDATION_MIGRATIONS.slice(0, -2);
+      const priorMigrations = FOUNDATION_MIGRATIONS.slice(0, -3);
       const prior = openSqliteFoundationStorage(databasePath, { migrations: priorMigrations });
       await prior.applyMigrations({ requireCandidate: false });
       prior.close();
@@ -890,7 +891,7 @@ describe("SQLite foundation storage", () => {
       database.close();
 
       const current = openSqliteFoundationStorage(databasePath, {
-        migrations: FOUNDATION_MIGRATIONS.slice(0, -1),
+        migrations: FOUNDATION_MIGRATIONS.slice(0, -2),
       });
       expect(await current.applyMigrations({ requireCandidate: false })).toMatchObject({
         appliedMigrationIds: ["029-access-sheet-generated-audit-action"],
@@ -957,9 +958,9 @@ describe("SQLite foundation storage", () => {
     await withDatabase(async (databasePath) => {
       const baseMigrations = FOUNDATION_MIGRATIONS;
       const failingMigration = createMigration(
-        "031-failing-test-migration",
-        31,
-        31,
+        "032-failing-test-migration",
+        32,
+        32,
         "CREATE TABLE migration_failure_probe (id TEXT) STRICT; THIS IS NOT SQL;",
       );
       const store = openSqliteFoundationStorage(databasePath, {
@@ -979,7 +980,7 @@ describe("SQLite foundation storage", () => {
       });
       expect(await priorBinary.readiness()).toMatchObject({
         ok: true,
-        schemaVersion: "30",
+        schemaVersion: "31",
       });
       priorBinary.close();
 
@@ -1051,7 +1052,7 @@ describe("SQLite foundation storage", () => {
         .query(
           "INSERT INTO foundation_migration_ledger (migration_id, ordinal, schema_version, checksum, status, applied_at_ms) VALUES (?, ?, ?, ?, ?, ?)",
         )
-        .run("future-999", 31, 31, "future-checksum", "complete", 2_000);
+        .run("future-999", 32, 32, "future-checksum", "complete", 2_000);
       futureDatabase.close();
       const future = openSqliteFoundationStorage(databasePath);
       expect(await future.readiness()).toMatchObject({ ok: false });

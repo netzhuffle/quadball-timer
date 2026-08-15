@@ -53,6 +53,196 @@ describe("Event operations catalog", () => {
     });
   });
 
+  test("lets the Technical Admin configure one Game Day and records before/after evidence", async () => {
+    const fixture = createFixture();
+    const event = await fixture.catalog.createEvent(
+      { name: "Heat configuration Event", timeZone: "UTC" },
+      authority,
+    );
+    if (event.status !== "accepted") throw new Error("Expected Event.");
+    const day = await fixture.catalog.addGameDay(
+      event.value.eventId,
+      { date: "2026-08-15" },
+      authority,
+    );
+    if (day.status !== "accepted") throw new Error("Expected Game Day.");
+
+    const enabled = await fixture.catalog.setGameDayHeatStoppageConfiguration(
+      event.value.eventId,
+      day.value.gameDayId,
+      { configuration: "enabled" },
+      authority,
+    );
+
+    expect(enabled).toMatchObject({
+      status: "accepted",
+      value: { heatStoppageConfiguration: "enabled" },
+    });
+    const inspected = await fixture.catalog.inspectEvent(event.value.eventId, authority);
+    expect(inspected.status).toBe("accepted");
+    if (inspected.status !== "accepted") throw new Error("Expected inspection.");
+    expect(inspected.value.gameDays[0]).toMatchObject({
+      heatStoppageConfiguration: "enabled",
+    });
+    expect(inspected.value.auditTrail.at(-1)).toMatchObject({
+      action: "game-day-heat-stoppage-configured",
+      before: { heatStoppageConfiguration: "disabled" },
+      after: { heatStoppageConfiguration: "enabled" },
+    });
+  });
+
+  test("rejects invalid or cross-Event heat configuration without mutation", async () => {
+    const fixture = createFixture();
+    const first = await fixture.catalog.createEvent({ name: "One", timeZone: "UTC" }, authority);
+    const second = await fixture.catalog.createEvent({ name: "Two", timeZone: "UTC" }, authority);
+    if (first.status !== "accepted" || second.status !== "accepted")
+      throw new Error("Expected Events.");
+    const day = await fixture.catalog.addGameDay(
+      first.value.eventId,
+      { date: "2026-08-15" },
+      authority,
+    );
+    if (day.status !== "accepted") throw new Error("Expected Game Day.");
+
+    expect(
+      await fixture.catalog.setGameDayHeatStoppageConfiguration(
+        first.value.eventId,
+        day.value.gameDayId,
+        { configuration: "maybe" },
+        authority,
+      ),
+    ).toMatchObject({ status: "rejected", reason: "invalid-input" });
+    expect(
+      await fixture.catalog.setGameDayHeatStoppageConfiguration(
+        second.value.eventId,
+        day.value.gameDayId,
+        { configuration: "enabled" },
+        authority,
+      ),
+    ).toMatchObject({ status: "rejected", reason: "cross-event" });
+  });
+
+  test("projects one current configuration for multiple uncommenced Event Games", async () => {
+    const fixture = createFixture();
+    const event = await fixture.catalog.createEvent(
+      { name: "Multiple Heat Games", timeZone: "UTC" },
+      authority,
+    );
+    if (event.status !== "accepted") throw new Error("Expected Event.");
+    const day = await fixture.catalog.addGameDay(
+      event.value.eventId,
+      { date: "2026-08-15" },
+      authority,
+    );
+    const pitch = await fixture.catalog.createPitch(
+      event.value.eventId,
+      { name: "Heat Pitch" },
+      authority,
+    );
+    if (day.status !== "accepted" || pitch.status !== "accepted")
+      throw new Error("Expected schedule structure.");
+    const firstSlot = await fixture.catalog.createGameplaySlot(
+      event.value.eventId,
+      day.value.gameDayId,
+      { sequence: 1, scheduledStart: "2026-08-15T10:00" },
+      authority,
+    );
+    const secondSlot = await fixture.catalog.createGameplaySlot(
+      event.value.eventId,
+      day.value.gameDayId,
+      { sequence: 2, scheduledStart: "2026-08-15T11:00" },
+      authority,
+    );
+    if (firstSlot.status !== "accepted" || secondSlot.status !== "accepted")
+      throw new Error("Expected Gameplay Slots.");
+    const pitchSlots = await fixture.storage
+      .snapshot()
+      .then((snapshot) => snapshot.listPitchSlots(day.value.gameDayId, pitch.value.pitchId));
+    const firstPitchSlot = pitchSlots.find(
+      (slot) => slot.gameplaySlotId === firstSlot.value.gameplaySlotId,
+    );
+    const secondPitchSlot = pitchSlots.find(
+      (slot) => slot.gameplaySlotId === secondSlot.value.gameplaySlotId,
+    );
+    if (firstPitchSlot === undefined || secondPitchSlot === undefined)
+      throw new Error("Expected one Pitch Slot per Gameplay Slot.");
+    const firstGame = await fixture.catalog.createEventGame(
+      event.value.eventId,
+      day.value.gameDayId,
+      {
+        gameplaySlotId: firstSlot.value.gameplaySlotId,
+        pitchSlotId: firstPitchSlot.pitchSlotId,
+        gameCode: "HEAT-A",
+        sideA: { sourceLabel: "A" },
+        sideB: { sourceLabel: "B" },
+      },
+      authority,
+    );
+    const secondGame = await fixture.catalog.createEventGame(
+      event.value.eventId,
+      day.value.gameDayId,
+      {
+        gameplaySlotId: secondSlot.value.gameplaySlotId,
+        pitchSlotId: secondPitchSlot.pitchSlotId,
+        gameCode: "HEAT-B",
+        sideA: { sourceLabel: "C" },
+        sideB: { sourceLabel: "D" },
+      },
+      authority,
+    );
+    if (firstGame.status !== "accepted" || secondGame.status !== "accepted")
+      throw new Error("Expected Event Games.");
+
+    const configured = await fixture.catalog.setGameDayHeatStoppageConfiguration(
+      event.value.eventId,
+      day.value.gameDayId,
+      { configuration: "enabled" },
+      authority,
+    );
+    expect(configured).toMatchObject({
+      status: "accepted",
+      value: { heatStoppageConfiguration: "enabled" },
+    });
+    const inspected = await fixture.catalog.inspectEvent(event.value.eventId, authority);
+    expect(inspected).toMatchObject({
+      status: "accepted",
+      value: {
+        gameDays: [{ gameDayId: day.value.gameDayId, heatStoppageConfiguration: "enabled" }],
+        eventGames: [
+          { eventGameId: firstGame.value.eventGameId, gameDayId: day.value.gameDayId },
+          { eventGameId: secondGame.value.eventGameId, gameDayId: day.value.gameDayId },
+        ],
+      },
+    });
+  });
+
+  test("rolls back Game Day configuration, audit, and projection on an atomic failure", async () => {
+    const fixture = createFixture();
+    const event = await fixture.catalog.createEvent(
+      { name: "Atomic Heat Failure", timeZone: "UTC" },
+      authority,
+    );
+    if (event.status !== "accepted") throw new Error("Expected Event.");
+    const day = await fixture.catalog.addGameDay(
+      event.value.eventId,
+      { date: "2026-08-15" },
+      authority,
+    );
+    if (day.status !== "accepted") throw new Error("Expected Game Day.");
+    const before = await fixture.catalog.inspectEvent(event.value.eventId, authority);
+    fixture.storage.failNextTransaction(new Error("injected heat configuration failure"));
+
+    expect(
+      await fixture.catalog.setGameDayHeatStoppageConfiguration(
+        event.value.eventId,
+        day.value.gameDayId,
+        { configuration: "enabled" },
+        authority,
+      ),
+    ).toMatchObject({ status: "retryable-failure" });
+    expect(await fixture.catalog.inspectEvent(event.value.eventId, authority)).toEqual(before);
+  });
+
   test("projects Expected Start from the greater Gameplay and Pitch Slot delay", () => {
     expect(
       projectExpectedStartMs(

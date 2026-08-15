@@ -1549,6 +1549,172 @@ describe("Event Administration handoff", () => {
     });
   });
 
+  test("lets Event Admin authority configure a Game Day without forecast evidence", async () => {
+    const fixture = createFixture();
+    const event = await fixture.catalog.createEvent(
+      { name: "Heat Administration Event", timeZone: "UTC" },
+      fixture.technical,
+    );
+    if (event.status !== "accepted") throw new Error("Expected Event.");
+    const day = await fixture.catalog.addGameDay(
+      event.value.eventId,
+      { date: "2026-08-15" },
+      fixture.technical,
+    );
+    if (day.status !== "accepted") throw new Error("Expected Game Day.");
+    const grant = await fixture.administration.createEventAdminGrant(
+      event.value.eventId,
+      fixture.technical,
+    );
+    if (grant.status !== "accepted") throw new Error("Expected Event Admin Grant.");
+    const reveal = await fixture.grants.revealGrant(grant.value.grantId, fixture.technical);
+    if (reveal.status !== "revealed") throw new Error("Expected Grant reveal.");
+    const admission = await fixture.administration.admitEventAdmin({
+      qrCredential: reveal.qrCredential,
+      browserContext: "heat-admin-browser",
+    });
+    if (admission.status !== "admitted") throw new Error("Expected Event Admin session.");
+    const eventAdmin = { kind: "grant-session" as const, sessionBearer: admission.sessionBearer };
+
+    expect(
+      await fixture.administration.setGameDayHeatStoppageConfiguration(
+        event.value.eventId,
+        day.value.gameDayId,
+        { configuration: "enabled" },
+        eventAdmin,
+      ),
+    ).toMatchObject({
+      status: "accepted",
+      value: { heatStoppageConfiguration: "enabled" },
+    });
+    expect(
+      await fixture.administration.setGameDayHeatStoppageConfiguration(
+        event.value.eventId,
+        day.value.gameDayId,
+        { configuration: "disabled" },
+        { kind: "grant-session", sessionBearer: "wrong-session" },
+      ),
+    ).toMatchObject({ status: "rejected", reason: "unauthorized" });
+    const hub = await fixture.administration.openEventHub({
+      eventId: event.value.eventId,
+      gameDayId: day.value.gameDayId,
+      authority: eventAdmin,
+    });
+    expect(hub).toMatchObject({
+      status: "accepted",
+      value: { event: { gameDays: [{ heatStoppageConfiguration: "enabled" }] } },
+    });
+  });
+
+  test("denies real Pitch Manager and Controller authorities without mutation", async () => {
+    const fixture = createFixture(undefined, {
+      resolve: () => ({ status: "eligible", eventGameId: "heat-controller-game" }),
+    });
+    const event = await fixture.catalog.createEvent(
+      { name: "Heat Authority Boundary", timeZone: "UTC" },
+      fixture.technical,
+    );
+    if (event.status !== "accepted") throw new Error("Expected Event.");
+    const day = await fixture.catalog.addGameDay(
+      event.value.eventId,
+      { date: "2026-08-15" },
+      fixture.technical,
+    );
+    const pitch = await fixture.administration.createPitch(
+      event.value.eventId,
+      { name: "Heat Pitch" },
+      fixture.technical,
+    );
+    if (day.status !== "accepted" || pitch.status !== "accepted")
+      throw new Error("Expected schedule structure.");
+    const eventGrant = await fixture.administration.createEventAdminGrant(
+      event.value.eventId,
+      fixture.technical,
+    );
+    if (eventGrant.status !== "accepted") throw new Error("Expected Event Admin Grant.");
+    const eventQr = await fixture.grants.revealGrant(eventGrant.value.grantId, fixture.technical);
+    if (eventQr.status !== "revealed") throw new Error("Expected Event Admin QR.");
+    const eventAdmission = await fixture.administration.admitEventAdmin({
+      qrCredential: eventQr.qrCredential,
+      browserContext: "heat-boundary-event-admin",
+    });
+    if (eventAdmission.status !== "admitted") throw new Error("Expected Event Admin session.");
+    const eventAuthority = {
+      kind: "grant-session" as const,
+      sessionBearer: eventAdmission.sessionBearer,
+    };
+    const managerGrant = await fixture.administration.createPitchManagerGrant(
+      event.value.eventId,
+      day.value.gameDayId,
+      pitch.value.pitchId,
+      eventAuthority,
+    );
+    if (managerGrant.status !== "accepted") throw new Error("Expected Pitch Manager Grant.");
+    const managerQr = await fixture.grants.revealGrant(managerGrant.value.grantId, eventAuthority);
+    if (managerQr.status !== "revealed") throw new Error("Expected Pitch Manager QR.");
+    const managerAdmission = await fixture.administration.admitPitchManager({
+      qrCredential: managerQr.qrCredential,
+      browserContext: "heat-boundary-pitch-manager",
+    });
+    if (managerAdmission.status !== "admitted") throw new Error("Expected Pitch Manager session.");
+    const slot = await fixture.administration.createGameplaySlot(
+      event.value.eventId,
+      day.value.gameDayId,
+      { sequence: 1, scheduledStart: "2026-08-15T10:00" },
+      fixture.technical,
+    );
+    if (slot.status !== "accepted") throw new Error("Expected Gameplay Slot.");
+    const pitchSlot = await fixture.storage.transaction(
+      (transaction) => transaction.listPitchSlots(day.value.gameDayId, pitch.value.pitchId)[0],
+    );
+    if (pitchSlot === undefined) throw new Error("Expected Pitch Slot.");
+    const control = await fixture.grants.createControlGrant({
+      authority: { kind: "grant-session", sessionBearer: managerAdmission.sessionBearer },
+      scope: {
+        eventId: event.value.eventId,
+        gameDayId: day.value.gameDayId,
+        pitchId: pitch.value.pitchId,
+        pitchSlotId: pitchSlot.pitchSlotId,
+      },
+    });
+    if (control.status !== "created") throw new Error("Expected Control Grant.");
+    const controlQr = await fixture.grants.revealGrant(control.grantId, fixture.technical);
+    if (controlQr.status !== "revealed") throw new Error("Expected Control Grant QR.");
+    const controllerAdmission = await fixture.administration.admitControlGrant({
+      qrCredential: controlQr.qrCredential,
+      browserContext: "heat-boundary-controller",
+    });
+    if (controllerAdmission.status !== "admitted") throw new Error("Expected Controller session.");
+
+    const before = await fixture.storage.transaction((transaction) => ({
+      gameDays: transaction.listGameDays(event.value.eventId),
+      audit: transaction.listEventAuditTrail(event.value.eventId),
+    }));
+    for (const sessionBearer of [
+      managerAdmission.sessionBearer,
+      controllerAdmission.sessionBearer,
+    ]) {
+      expect(
+        await fixture.administration.setGameDayHeatStoppageConfiguration(
+          event.value.eventId,
+          day.value.gameDayId,
+          { configuration: "enabled" },
+          { kind: "grant-session", sessionBearer },
+        ),
+      ).toMatchObject({
+        status: "rejected",
+        reason: "unauthorized",
+        detail: "Unable to authorize Event Administration.",
+      });
+    }
+    expect(
+      await fixture.storage.transaction((transaction) => ({
+        gameDays: transaction.listGameDays(event.value.eventId),
+        audit: transaction.listEventAuditTrail(event.value.eventId),
+      })),
+    ).toEqual(before);
+  });
+
   test("configures ordered schedule projections and confirms one Gameplay Slot", async () => {
     const fixture = createFixture();
     const event = await fixture.catalog.createEvent(

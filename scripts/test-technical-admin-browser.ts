@@ -5,6 +5,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { openSqliteFoundationStorage } from "@/lib/foundation-storage-sqlite";
+import { createGrantKeyRingDocument, writeGrantKeyRingFile } from "@/lib/grant-key-ring-custody";
 import { readGrantAuthorityOptions } from "@/lib/grant-runtime";
 import {
   createSqliteTechnicalAdminAuthRepository,
@@ -16,6 +17,7 @@ const directory = mkdtempSync(join(tmpdir(), "quadball-timer-admin-browser-"));
 const certificatePath = join(directory, "localhost.crt");
 const keyPath = join(directory, "localhost.key");
 const databasePath = join(directory, "technical-admin.sqlite");
+const grantKeyRingPath = join(directory, "grant-key-ring.json");
 const port = 38_000 + Math.floor(Math.random() * 1_000);
 const origin = `https://localhost:${port}`;
 const environment = {
@@ -26,6 +28,7 @@ const environment = {
   WEBAUTHN_RP_ID: "localhost",
   TECHNICAL_ADMIN_DATABASE: databasePath,
   FOUNDATION_DATABASE: join(directory, "foundation.sqlite"),
+  GRANT_KEY_RING_FILE: grantKeyRingPath,
   TLS_CERT_FILE: certificatePath,
   TLS_KEY_FILE: keyPath,
   PORT: String(port),
@@ -57,6 +60,7 @@ try {
   ]);
   if (certificate.exitCode !== 0)
     throw new Error("openssl could not create a temporary certificate.");
+  writeGrantKeyRingFile(grantKeyRingPath, createGrantKeyRingDocument("test"));
 
   const grantOptions = readGrantAuthorityOptions("test", environment);
   const foundation = openSqliteFoundationStorage(join(directory, "foundation.sqlite"), {
@@ -376,7 +380,17 @@ try {
   );
   await page.getByRole("button", { name: "Open Event Hub" }).click();
   await page.getByText("Event Hub", { exact: true }).waitFor();
+  const technicalInitialHeatHubResponsePromise = page.waitForResponse(
+    (response) =>
+      response.url().includes(`/api/event-admin/hub?eventId=${eventId}`) &&
+      response.url().includes("gameDayId=") &&
+      response.request().method() === "GET",
+  );
   await page.getByLabel("Game Day", { exact: true }).selectOption({ index: 1 });
+  assert(
+    (await technicalInitialHeatHubResponsePromise).status() === 200,
+    "Technical Admin initial Game Day selection failed",
+  );
   const eventAdminContext = await browser.newContext({ ignoreHTTPSErrors: true });
   const eventAdminPage = await eventAdminContext.newPage();
   eventAdminPage.setDefaultTimeout(5_000);
@@ -387,6 +401,116 @@ try {
   await eventAdminPage.getByText("Administrative audit evidence", { exact: true }).waitFor();
   await eventAdminPage.getByText("Event Administration", { exact: true }).waitFor();
   await eventAdminPage.getByText("Grant Audit", { exact: true }).waitFor();
+  const eventAdminHeatGameDaySelector = eventAdminPage.getByLabel("Game Day", { exact: true });
+  const eventAdminInitialHeatHubResponsePromise = eventAdminPage.waitForResponse(
+    (response) =>
+      response.url().includes(`/api/event-admin/hub?eventId=${eventId}`) &&
+      response.url().includes("gameDayId=") &&
+      response.request().method() === "GET",
+  );
+  await eventAdminHeatGameDaySelector.selectOption({ index: 1 });
+  assert(
+    (await eventAdminInitialHeatHubResponsePromise).status() === 200,
+    "Event Admin initial Game Day selection failed",
+  );
+  const configuredHeatGameDayId = await eventAdminHeatGameDaySelector.inputValue();
+  await eventAdminPage.getByText("Currently disabled", { exact: true }).waitFor();
+  const eventAdminHeatPatchResponsePromise = eventAdminPage.waitForResponse(
+    (response) =>
+      response
+        .url()
+        .endsWith(
+          `/api/event-admin/events/${eventId}/game-days/${configuredHeatGameDayId}/heat-stoppage-configuration`,
+        ) && response.request().method() === "PATCH",
+  );
+  const eventAdminHeatHubResponsePromise = eventAdminPage.waitForResponse(
+    (response) =>
+      response.url().includes(`/api/event-admin/hub?eventId=${eventId}`) &&
+      response.url().includes(`gameDayId=${configuredHeatGameDayId}`) &&
+      response.request().method() === "GET",
+  );
+  await eventAdminPage.getByRole("button", { name: "Enable", exact: true }).click();
+  assert(
+    (await eventAdminHeatPatchResponsePromise).status() === 200,
+    "Event Admin Heat Stoppage Configuration PATCH failed",
+  );
+  assert(
+    (await eventAdminHeatHubResponsePromise).status() === 200,
+    "Event Admin Heat Stoppage Configuration refresh failed",
+  );
+  await eventAdminPage.getByText("Currently enabled", { exact: true }).waitFor();
+
+  const technicalHeatGameDaySelector = page.getByLabel("Game Day", { exact: true });
+  await page.getByText("Currently disabled", { exact: true }).waitFor();
+  const technicalHeatDayTransitionResponsePromise = page.waitForResponse(
+    (response) =>
+      response.url().includes(`/api/event-admin/hub?eventId=${eventId}`) &&
+      response.url().includes("gameDayId=") &&
+      response.request().method() === "GET",
+  );
+  await technicalHeatGameDaySelector.selectOption({ index: 2 });
+  assert(
+    (await technicalHeatDayTransitionResponsePromise).status() === 200,
+    "Technical Admin Event Hub Game Day transition failed",
+  );
+  const technicalHeatReturnResponsePromise = page.waitForResponse(
+    (response) =>
+      response.url().includes(`/api/event-admin/hub?eventId=${eventId}`) &&
+      response.url().includes(`gameDayId=${configuredHeatGameDayId}`) &&
+      response.request().method() === "GET",
+  );
+  await technicalHeatGameDaySelector.selectOption({ value: configuredHeatGameDayId });
+  assert(
+    (await technicalHeatReturnResponsePromise).status() === 200,
+    "Technical Admin Event Hub Game Day return failed",
+  );
+  await page.getByText("Currently enabled", { exact: true }).waitFor();
+  const technicalHeatPatchResponsePromise = page.waitForResponse(
+    (response) =>
+      response
+        .url()
+        .endsWith(
+          `/api/event-admin/events/${eventId}/game-days/${configuredHeatGameDayId}/heat-stoppage-configuration`,
+        ) && response.request().method() === "PATCH",
+  );
+  const technicalHeatHubResponsePromise = page.waitForResponse(
+    (response) =>
+      response.url().includes(`/api/event-admin/hub?eventId=${eventId}`) &&
+      response.url().includes(`gameDayId=${configuredHeatGameDayId}`) &&
+      response.request().method() === "GET",
+  );
+  await page.getByRole("button", { name: "Disable", exact: true }).click();
+  assert(
+    (await technicalHeatPatchResponsePromise).status() === 200,
+    "Technical Admin delegated Heat Stoppage Configuration PATCH failed",
+  );
+  assert(
+    (await technicalHeatHubResponsePromise).status() === 200,
+    "Technical Admin delegated Heat Stoppage Configuration refresh failed",
+  );
+  await page.getByText("Currently disabled", { exact: true }).waitFor();
+  const heatAuditResponse = await eventAdminContext.request.get(
+    `${origin}/api/event-admin/audit?eventId=${eventId}&projection=event-administration&action=game-day-heat-stoppage-configured&limit=10`,
+  );
+  const heatAuditPayload = (await heatAuditResponse.json()) as {
+    status?: string;
+    value?: {
+      entries?: Array<{
+        action: string;
+        scope?: { gameDayId?: string | null };
+      }>;
+    };
+  };
+  assert(
+    heatAuditResponse.status() === 200 &&
+      heatAuditPayload.status === "accepted" &&
+      heatAuditPayload.value?.entries?.filter(
+        (entry) =>
+          entry.action === "game-day-heat-stoppage-configured" &&
+          entry.scope?.gameDayId === configuredHeatGameDayId,
+      ).length === 2,
+    "Heat Stoppage Configuration history did not expose both bounded transitions",
+  );
   const eventAdminAuditResponse = await eventAdminContext.request.get(
     `${origin}/api/event-admin/audit?eventId=${eventId}&projection=grant&limit=1`,
   );
@@ -621,7 +745,10 @@ try {
       removalPreviewPayload.value.fingerprint?.startsWith("event-catalog-removal-v1:") === true,
     "Event Admin Game Day removal preview failed",
   );
-  const removalStatusText = await eventAdminPage.getByRole("status").innerText();
+  const removalStatusText = await eventAdminPage
+    .getByRole("status")
+    .filter({ hasText: "catalog descendants 0" })
+    .innerText();
   assert(
     removalStatusText.includes("catalog descendants 0") &&
       removalStatusText.includes("retained Event Game Records 0") &&
@@ -1101,6 +1228,35 @@ try {
     pitchManagerAuditResponse.status() === 401 &&
       pitchManagerAuditResponse.headers()["set-cookie"] === undefined,
     "admitted Pitch Manager was not generically denied administrative audit evidence",
+  );
+  const pitchManagerHeatMutation = await pitchManagerContext.request.patch(
+    `${origin}/api/event-admin/events/${eventId}/game-days/${configuredHeatGameDayId}/heat-stoppage-configuration`,
+    { data: { configuration: "enabled" } },
+  );
+  assert(
+    pitchManagerHeatMutation.status() === 401 &&
+      pitchManagerHeatMutation.headers()["set-cookie"] === undefined &&
+      (await pitchManagerHeatMutation.text()).includes("Authentication failed.") === true,
+    "admitted Pitch Manager was not generically denied Heat Stoppage Configuration mutation",
+  );
+  const postDenialHubResponse = await eventAdminContext.request.get(
+    `${origin}/api/event-admin/hub?eventId=${eventId}&gameDayId=${configuredHeatGameDayId}`,
+  );
+  const postDenialHubPayload = (await postDenialHubResponse.json()) as {
+    status?: string;
+    value?: {
+      event?: {
+        gameDays?: Array<{ gameDayId: string; heatStoppageConfiguration: string }>;
+      };
+    };
+  };
+  assert(
+    postDenialHubResponse.status() === 200 &&
+      postDenialHubPayload.status === "accepted" &&
+      postDenialHubPayload.value?.event?.gameDays?.find(
+        (day) => day.gameDayId === configuredHeatGameDayId,
+      )?.heatStoppageConfiguration === "disabled",
+    "Pitch Manager Heat Stoppage Configuration denial changed catalog projection",
   );
   await pitchManagerPage
     .getByText(/Control Grant:/u)
