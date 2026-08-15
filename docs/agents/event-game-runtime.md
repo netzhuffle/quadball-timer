@@ -18,3 +18,15 @@ Foundation migrations to this database. Runtime startup only checks schema
 readiness and compatibility; it never migrates or upgrades the production
 database. Migration remains an explicit operational step with its backup,
 quiescence, readiness, and rollback procedure.
+
+Clock operation has a separate outage boundary. The server-issued Clock Baseline
+identifies the Offline Clock Holder, authority generation, and last synchronization.
+The holder may retain disconnected clock actions locally; other disconnected
+Controllers retain ordinary non-clock actions but cannot create clock authority.
+An already-admitted device may record a deliberate emergency takeover only after
+physical Timekeeper or Head Referee confirmation. Takeovers create a new baseline
+and generation; actions carrying a superseded generation remain audit evidence and
+are ignored by projection. Running local projections are estimated from monotonic
+elapsed time, paused projections are stale, and an untrustworthy projection is
+unavailable with manual timing required. A fresh device never reconstructs clock
+authority during a total server outage.

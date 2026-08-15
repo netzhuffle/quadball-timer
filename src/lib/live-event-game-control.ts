@@ -33,6 +33,7 @@ type ControllerIntentBase = {
     clientOriginAtMs: number | null;
     source?: "online" | "offline";
   };
+  clockGeneration?: number;
 };
 
 export type LiveEventControllerIntent =
@@ -51,6 +52,13 @@ export type LiveEventControllerIntent =
   | (ControllerIntentBase & {
       type: "clock-correction";
       clockTimeMs: number;
+    })
+  | (ControllerIntentBase & {
+      type: "clock-takeover";
+      clockTimeMs: number;
+      running: boolean;
+      authorityGeneration: number;
+      confirmation: "physical-timekeeper-or-head-referee";
     })
   | (ControllerIntentBase & {
       type: "substantive";
@@ -239,6 +247,7 @@ export function parseLiveEventControllerIntent(
     value.type !== "adjust-clock" &&
     value.type !== "adjust-game-clock" &&
     value.type !== "clock-correction" &&
+    value.type !== "clock-takeover" &&
     value.type !== "correct-clock" &&
     value.type !== "set-game-clock" &&
     value.type !== "substantive" &&
@@ -272,7 +281,7 @@ export function parseLiveEventControllerIntent(
     gameSideId = parsedSide.value;
   }
   let running: boolean | undefined;
-  if (value.type === "clock" || value.type === "set-running") {
+  if (value.type === "clock" || value.type === "set-running" || value.type === "clock-takeover") {
     if (typeof value.running !== "boolean") return invalid("running must be a boolean.");
     running = value.running;
   }
@@ -283,12 +292,46 @@ export function parseLiveEventControllerIntent(
     adjustmentMs = adjustment.value;
   }
   let clockTimeMs: number | undefined;
-  if (normalizedType === "clock-correction") {
+  if (normalizedType === "clock-correction" || normalizedType === "clock-takeover") {
     const clockTime = validateGameClock(
       value.clockTimeMs ?? value.targetGameTimeMs ?? value.gameTimeMs,
     );
     if (!clockTime.ok) return invalid(clockTime.error);
     clockTimeMs = clockTime.value;
+  }
+  let authorityGeneration: number | undefined;
+  let confirmation: "physical-timekeeper-or-head-referee" | undefined;
+  if (normalizedType === "clock-takeover") {
+    const generation = validateIntegerInRange(
+      value.authorityGeneration,
+      0,
+      Number.MAX_SAFE_INTEGER,
+      "authorityGeneration",
+    );
+    if (!generation.ok) return invalid(generation.error);
+    if (value.confirmation !== "physical-timekeeper-or-head-referee") {
+      return invalid("Clock takeover requires physical Timekeeper or Head Referee confirmation.");
+    }
+    authorityGeneration = generation.value;
+    confirmation = value.confirmation;
+  }
+  let clockGeneration: number | undefined;
+  if (
+    value.type === "clock" ||
+    value.type === "set-running" ||
+    value.type === "clock-adjust" ||
+    value.type === "clock-correction"
+  ) {
+    if (value.clockGeneration !== undefined) {
+      const generation = validateIntegerInRange(
+        value.clockGeneration,
+        0,
+        Number.MAX_SAFE_INTEGER,
+        "clockGeneration",
+      );
+      if (!generation.ok) return invalid(generation.error);
+      clockGeneration = generation.value;
+    }
   }
   let trigger: "card" | "timeout" | "suspension" | "result" | undefined;
   if (value.type === "substantive") {
@@ -337,6 +380,9 @@ export function parseLiveEventControllerIntent(
       ...(running === undefined ? {} : { running }),
       ...(adjustmentMs === undefined ? {} : { adjustmentMs }),
       ...(clockTimeMs === undefined ? {} : { clockTimeMs }),
+      ...(authorityGeneration === undefined ? {} : { authorityGeneration }),
+      ...(confirmation === undefined ? {} : { confirmation }),
+      ...(clockGeneration === undefined ? {} : { clockGeneration }),
       ...(trigger === undefined ? {} : { trigger }),
     } as LiveEventControllerIntent,
   };
@@ -653,6 +699,24 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
     if (clockData.status === "rejected") {
       return rejectedAction(parsed.value.operationId);
     }
+    if (isClockIntent(parsed.value)) {
+      if (
+        parsed.value.type === "clock-takeover" &&
+        parsed.value.authorityGeneration !== clockBefore.baseline.authorityGeneration
+      ) {
+        return rejectedAction(parsed.value.operationId);
+      }
+      if (
+        parsed.value.type !== "clock-takeover" &&
+        parsed.value.occurrence.source === "offline" &&
+        (clockBefore.baseline.holderGrantSessionId === null ||
+          (clockBefore.baseline.holderGrantSessionId !== authorized.grantSessionId &&
+            (parsed.value.clockGeneration === undefined ||
+              parsed.value.clockGeneration === clockBefore.baseline.authorityGeneration)))
+      ) {
+        return rejectedAction(parsed.value.operationId);
+      }
+    }
     const clockStartMs =
       parsed.value.type === "clock" || parsed.value.type === "set-running"
         ? parsed.value.running
@@ -850,12 +914,7 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
           const predecessors = candidate.causalPredecessorIds ?? [];
           if (operationId === null) continue;
           const parsedIntent = parseLiveEventControllerIntent(candidate.intent);
-          if (
-            !parsedIntent.ok ||
-            parsedIntent.value.type === "clock" ||
-            parsedIntent.value.type === "set-running" ||
-            (operationCounts.get(operationId) ?? 0) > 1
-          ) {
+          if (!parsedIntent.ok || (operationCounts.get(operationId) ?? 0) > 1) {
             outcomes.push({ operationId, status: "terminally-rejected" });
             blocked.add(operationId);
             progressed = true;
@@ -1058,7 +1117,8 @@ function controllerFactType(intent: LiveEventControllerIntent): string {
     intent.type === "clock" ||
     intent.type === "set-running" ||
     intent.type === "clock-adjust" ||
-    intent.type === "clock-correction"
+    intent.type === "clock-correction" ||
+    intent.type === "clock-takeover"
   )
     return "clock";
   if (intent.type === "substantive") return intent.trigger;
@@ -1172,6 +1232,32 @@ export function validateLiveEventClockActionInTransaction(
   if (candidateClock === undefined || candidateClock.command === "penalty-start") {
     return { status: "accepted" };
   }
+  const current = deriveClockAuthority(readClockAuthorityActions(actions));
+  if (
+    candidateClock.command === "takeover" &&
+    candidateClock.authorityGeneration !== undefined &&
+    candidateClock.authorityGeneration !== current.authorityGeneration
+  ) {
+    return {
+      status: "rejected",
+      reason: "invalid-action",
+      detail: "Clock takeover generation is stale.",
+    };
+  }
+  if (
+    candidateClock.command !== "takeover" &&
+    candidateClock.source === "offline" &&
+    (current.holderGrantSessionId === null ||
+      (candidateClock.sessionId !== current.holderGrantSessionId &&
+        (candidateClock.authorityGeneration === undefined ||
+          candidateClock.authorityGeneration === current.authorityGeneration)))
+  ) {
+    return {
+      status: "rejected",
+      reason: "invalid-action",
+      detail: "Only the Offline Clock Holder may submit disconnected clock actions.",
+    };
+  }
   const validation = validateClockAuthorityAction(
     readClockAuthorityActions(actions),
     candidateClock,
@@ -1185,13 +1271,13 @@ function readClockAuthorityActions(
   actions: readonly {
     action?: {
       operationId: string;
-      occurrence: { trustedAtMs: number };
+      occurrence: { trustedAtMs: number; source: "online" | "offline" };
       acceptedAtMs: number;
       grant: { sessionId: string };
       interpretation: unknown;
     };
     operationId?: string;
-    occurrence?: { trustedAtMs: number };
+    occurrence?: { trustedAtMs: number; source: "online" | "offline" };
     acceptedAtMs?: number;
     grant?: { sessionId: string };
     interpretation?: unknown;
@@ -1225,7 +1311,10 @@ function readClockAuthorityActions(
       continue;
     }
     const command =
-      data.command === "adjust" || data.command === "correct" || data.command === "set-running"
+      data.command === "adjust" ||
+      data.command === "correct" ||
+      data.command === "set-running" ||
+      data.command === "takeover"
         ? data.command
         : typeof data.running === "boolean"
           ? "set-running"
@@ -1237,6 +1326,11 @@ function readClockAuthorityActions(
       acceptedAtMs: storedAction.acceptedAtMs,
       sessionId: storedAction.grant.sessionId,
       command,
+      source: storedAction.occurrence.source,
+      ...(typeof data.authorityGeneration === "number"
+        ? { authorityGeneration: data.authorityGeneration }
+        : {}),
+      ...(data.command === "takeover" ? { takeover: true } : {}),
       ...(typeof data.running === "boolean" ? { running: data.running } : {}),
       ...(typeof data.gameTimeMs === "number" ? { gameTimeMs: data.gameTimeMs } : {}),
       ...(typeof data.adjustmentMs === "number" ? { adjustmentMs: data.adjustmentMs } : {}),
@@ -1251,12 +1345,28 @@ function readClockIntentData(
   current: ClockProjection,
   nowMs: number,
 ): { status: "ready"; value: Record<string, unknown> | null } | { status: "rejected" } {
+  if (intent.type === "clock-takeover") {
+    return {
+      status: "ready",
+      value: {
+        command: "takeover",
+        running: intent.running,
+        gameTimeMs: intent.clockTimeMs,
+        authorityGeneration: intent.authorityGeneration,
+        confirmation: intent.confirmation,
+        startedAtMs: intent.running ? nowMs : null,
+      },
+    };
+  }
   if (intent.type === "clock" || intent.type === "set-running") {
     return {
       status: "ready",
       value: {
         command: "set-running",
         running: intent.running,
+        ...(intent.clockGeneration === undefined
+          ? {}
+          : { authorityGeneration: intent.clockGeneration }),
         startedAtMs: intent.running
           ? (current.baseline.runningSinceMs ?? nowMs)
           : current.baseline.runningSinceMs,
@@ -1269,6 +1379,9 @@ function readClockIntentData(
       value: {
         command: "adjust",
         adjustmentMs: intent.adjustmentMs,
+        ...(intent.clockGeneration === undefined
+          ? {}
+          : { authorityGeneration: intent.clockGeneration }),
       },
     };
   }
@@ -1278,10 +1391,28 @@ function readClockIntentData(
       value: {
         command: "correct",
         gameTimeMs: intent.clockTimeMs,
+        ...(intent.clockGeneration === undefined
+          ? {}
+          : { authorityGeneration: intent.clockGeneration }),
       },
     };
   }
   return { status: "ready", value: null };
+}
+
+function isClockIntent(
+  intent: LiveEventControllerIntent,
+): intent is Extract<
+  LiveEventControllerIntent,
+  { type: "clock" | "set-running" | "clock-adjust" | "clock-correction" | "clock-takeover" }
+> {
+  return (
+    intent.type === "clock" ||
+    intent.type === "set-running" ||
+    intent.type === "clock-adjust" ||
+    intent.type === "clock-correction" ||
+    intent.type === "clock-takeover"
+  );
 }
 
 function readClockProjection(value: unknown): ClockProjection | null {
@@ -1293,10 +1424,17 @@ function readClockProjection(value: unknown): ClockProjection | null {
     typeof value.running !== "boolean" ||
     typeof value.projectedAtMs !== "number" ||
     !Number.isSafeInteger(value.projectedAtMs) ||
-    value.synchronization !== "synchronized"
+    (value.synchronization !== "synchronized" &&
+      value.synchronization !== "estimated" &&
+      value.synchronization !== "stale" &&
+      value.synchronization !== "unavailable")
   )
     return null;
-  return value as unknown as ClockProjection;
+  return {
+    ...(value as unknown as ClockProjection),
+    lastSynchronizedAtMs:
+      typeof value.lastSynchronizedAtMs === "number" ? value.lastSynchronizedAtMs : null,
+  };
 }
 
 function synchronized(): ControllerSynchronization {

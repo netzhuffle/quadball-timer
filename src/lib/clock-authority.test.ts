@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   createInitialClockBaseline,
   deriveClockAuthority,
+  projectClockSample,
   projectClockBaseline,
   type ClockAuthorityAction,
 } from "@/lib/clock-authority";
@@ -162,6 +163,80 @@ describe("Clock Authority", () => {
     ]);
     expect(projectClockBaseline(resumedBaseline, 11_000).activePenaltyTimeMs).toBe(5_000);
   });
+
+  test("uses monotonic elapsed time for estimated running projections and stale paused projections", () => {
+    const baseline = deriveClockAuthority([
+      clockAction({
+        operationId: "start-monotonic",
+        trustedAtMs: 10_000,
+        sessionId: "session-a",
+        command: "set-running",
+        running: true,
+      }),
+    ]);
+    const receipt = projectClockBaseline(baseline, 10_000);
+    const estimated = projectClockSample(receipt, 2_500);
+    expect(estimated).toMatchObject({
+      gameTimeMs: 2_500,
+      synchronization: "estimated",
+      lastSynchronizedAtMs: 10_000,
+    });
+    expect(projectClockSample(receipt, 86_400_000).gameTimeMs).toBe(7_200_000);
+
+    const paused = projectClockSample(
+      projectClockBaseline(
+        deriveClockAuthority([
+          clockAction({
+            operationId: "paused",
+            trustedAtMs: 10_000,
+            sessionId: "session-a",
+            command: "set-running",
+            running: false,
+          }),
+        ]),
+        10_000,
+      ),
+      2_500,
+    );
+    expect(paused).toMatchObject({ gameTimeMs: 0, synchronization: "stale" });
+  });
+
+  test("creates a new takeover generation and retains stale-generation evidence", () => {
+    const baseline = deriveClockAuthority([
+      clockAction({
+        operationId: "holder-start",
+        trustedAtMs: 1_000,
+        sessionId: "session-a",
+        command: "set-running",
+        running: true,
+      }),
+      clockAction({
+        operationId: "takeover",
+        trustedAtMs: 2_000,
+        sessionId: "session-b",
+        command: "takeover",
+        gameTimeMs: 5_000,
+        running: false,
+        authorityGeneration: 1,
+      }),
+      clockAction({
+        operationId: "stale-holder-action",
+        trustedAtMs: 3_000,
+        sessionId: "session-a",
+        command: "set-running",
+        running: true,
+        authorityGeneration: 1,
+      }),
+    ]);
+
+    expect(baseline).toMatchObject({
+      gameTimeMs: 5_000,
+      running: false,
+      holderGrantSessionId: "session-b",
+      authorityGeneration: 2,
+      staleGenerationOperationIds: ["stale-holder-action"],
+    });
+  });
 });
 
 function baselineActions(): ClockAuthorityAction[] {
@@ -190,6 +265,8 @@ function clockAction(input: {
   command: ClockAuthorityAction["command"];
   running?: boolean;
   adjustmentMs?: number;
+  gameTimeMs?: number;
+  authorityGeneration?: number;
 }): ClockAuthorityAction {
   return {
     operationId: input.operationId,
@@ -199,5 +276,9 @@ function clockAction(input: {
     command: input.command,
     ...(input.running === undefined ? {} : { running: input.running }),
     ...(input.adjustmentMs === undefined ? {} : { adjustmentMs: input.adjustmentMs }),
+    ...(input.gameTimeMs === undefined ? {} : { gameTimeMs: input.gameTimeMs }),
+    ...(input.authorityGeneration === undefined
+      ? {}
+      : { authorityGeneration: input.authorityGeneration }),
   };
 }

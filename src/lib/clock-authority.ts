@@ -10,12 +10,17 @@ export const FLAG_RUNNER_ENTRY_MS = 19 * 60 * 1000;
 export const SEEKER_RELEASE_MS = 20 * 60 * 1000;
 export const CLOCK_AUTHORITY_VERSION = "clock-authority-v1" as const;
 
+export type ClockSynchronization = "synchronized" | "estimated" | "stale" | "unavailable";
+
 export type ClockAuthorityAction = {
   operationId: string;
   trustedAtMs: number;
   acceptedAtMs: number;
   sessionId: string;
-  command: "set-running" | "adjust" | "correct" | "penalty-start";
+  command: "set-running" | "adjust" | "correct" | "penalty-start" | "takeover";
+  authorityGeneration?: number;
+  source?: "online" | "offline";
+  takeover?: boolean;
   running?: boolean;
   gameTimeMs?: number;
   adjustmentMs?: number;
@@ -40,6 +45,8 @@ export type ClockBaseline = {
   holderGeneration: number;
   lastTransitionOperationId: string | null;
   lastAcceptedAtMs: number | null;
+  authorityGeneration: number;
+  staleGenerationOperationIds: readonly string[];
 };
 
 export type ClockCueState = {
@@ -56,7 +63,8 @@ export type ClockProjection = {
   activePenaltyTimeMs: number;
   running: boolean;
   projectedAtMs: number;
-  synchronization: "synchronized";
+  synchronization: ClockSynchronization;
+  lastSynchronizedAtMs: number | null;
   offlineClockHolderGrantSessionId: string | null;
   cues: ClockCueState;
 };
@@ -73,6 +81,23 @@ export function validateClockFactData(value: unknown): ValidationResult<unknown>
     if (!startedAtMs.ok) return startedAtMs;
   }
   const command = value.command;
+  if (command === "takeover") {
+    const gameTimeMs = validateGameClockMs(value.gameTimeMs);
+    const authorityGeneration = validateIntegerInRange(
+      value.authorityGeneration,
+      0,
+      Number.MAX_SAFE_INTEGER,
+      "Clock takeover authorityGeneration",
+    );
+    if (!gameTimeMs.ok) return gameTimeMs;
+    if (typeof value.running !== "boolean")
+      return invalid("Clock takeover running must be a boolean.");
+    if (!authorityGeneration.ok) return authorityGeneration;
+    if (value.confirmation !== "physical-timekeeper-or-head-referee") {
+      return invalid("Clock takeover confirmation is required.");
+    }
+    return valid(value);
+  }
   if (command !== "set-running" && command !== "adjust" && command !== "correct") {
     if (typeof value.running !== "boolean") {
       return invalid("Clock Fact data command is unsupported.");
@@ -106,6 +131,8 @@ export function createInitialClockBaseline(): ClockBaseline {
     holderGeneration: 0,
     lastTransitionOperationId: null,
     lastAcceptedAtMs: null,
+    authorityGeneration: 0,
+    staleGenerationOperationIds: [],
   };
 }
 
@@ -124,7 +151,12 @@ export function deriveClockAuthority(actions: readonly ClockAuthorityAction[]): 
     const transitioned = applyClockAction(baseline, action);
     if (transitioned === null) continue;
     baseline = transitioned;
-    if (action.command !== "penalty-start") appliedClockActions.push(action);
+    if (
+      action.command !== "penalty-start" &&
+      baseline.lastTransitionOperationId === action.operationId
+    ) {
+      appliedClockActions.push(action);
+    }
   }
 
   const latestAccepted = [...appliedClockActions].sort(compareAcceptedClockActions).at(-1) ?? null;
@@ -133,6 +165,7 @@ export function deriveClockAuthority(actions: readonly ClockAuthorityAction[]): 
     holderGrantSessionId: latestAccepted?.sessionId ?? null,
     holderGeneration: appliedClockActions.length,
     lastAcceptedAtMs: latestAccepted?.acceptedAtMs ?? null,
+    authorityGeneration: appliedClockActions.length,
   };
 }
 
@@ -164,13 +197,88 @@ export function projectClockBaseline(baseline: ClockBaseline, nowMs: number): Cl
   return createProjection(projected, nowMs);
 }
 
+export function markClockProjectionUnavailable(projection: ClockProjection): ClockProjection {
+  return {
+    ...structuredClone(projection),
+    synchronization: "unavailable",
+  };
+}
+
+export function applyClockProjectionAction(
+  projection: ClockProjection,
+  action: {
+    command: "set-running" | "adjust" | "correct" | "takeover";
+    running?: boolean;
+    gameTimeMs?: number;
+    adjustmentMs?: number;
+    authorityGeneration?: number;
+    sessionId?: string;
+    operationId?: string;
+  },
+): ClockProjection {
+  const current = structuredClone(projection);
+  const baselineDefaults = {
+    authorityGeneration: Number.isSafeInteger(current.baseline.authorityGeneration)
+      ? current.baseline.authorityGeneration
+      : 0,
+    staleGenerationOperationIds: current.baseline.staleGenerationOperationIds ?? [],
+  };
+  current.baseline = { ...current.baseline, ...baselineDefaults };
+  const currentGameTimeMs = current.gameTimeMs;
+  const actionGameTimeMs = action.gameTimeMs ?? currentGameTimeMs;
+  const nextGameTimeMs =
+    action.command === "adjust"
+      ? actionGameTimeMs + (action.adjustmentMs ?? 0)
+      : action.command === "correct" || action.command === "takeover"
+        ? actionGameTimeMs
+        : currentGameTimeMs;
+  const validatedGameTime = validateGameClockMs(nextGameTimeMs);
+  if (!validatedGameTime.ok) return current;
+  const running =
+    action.command === "set-running" || action.command === "takeover"
+      ? action.running === true
+      : current.running;
+  const baseline: ClockBaseline = {
+    ...current.baseline,
+    gameTimeMs: validatedGameTime.value,
+    penaltyTimeMs: current.baseline.activePenalty?.elapsedMs ?? 0,
+    running: running && validatedGameTime.value < SHARED_LIMITS.clock.maxMs,
+    runningSinceMs: !running
+      ? null
+      : action.command === "takeover" || !current.running
+        ? current.projectedAtMs
+        : current.baseline.runningSinceMs,
+    establishedAtMs: current.projectedAtMs,
+    holderGrantSessionId: action.sessionId ?? current.baseline.holderGrantSessionId,
+    authorityGeneration:
+      action.command === "takeover"
+        ? current.baseline.authorityGeneration + 1
+        : Math.max(current.baseline.authorityGeneration, action.authorityGeneration ?? 0) + 1,
+    lastTransitionOperationId: action.operationId ?? current.baseline.lastTransitionOperationId,
+  };
+  baseline.holderGeneration = baseline.authorityGeneration;
+  return {
+    ...current,
+    baseline,
+    gameTimeMs: baseline.gameTimeMs,
+    running: baseline.running,
+    activePenaltyTimeMs: baseline.activePenalty?.elapsedMs ?? 0,
+    synchronization: baseline.running ? "estimated" : "stale",
+    lastSynchronizedAtMs: current.lastSynchronizedAtMs ?? current.baseline.lastAcceptedAtMs ?? null,
+    cues: cuesFor(baseline.gameTimeMs),
+  };
+}
+
 /** Advance a server sample by local monotonic elapsed time, never wall time. */
 export function projectClockSample(
   projection: ClockProjection,
   elapsedMs: number,
 ): ClockProjection {
   if (!Number.isFinite(elapsedMs) || elapsedMs <= 0 || !projection.running) {
-    return structuredClone(projection);
+    return {
+      ...structuredClone(projection),
+      synchronization: projection.running ? "estimated" : "stale",
+    };
   }
   const elapsed = Math.floor(elapsedMs);
   const gameTimeMs = Math.min(SHARED_LIMITS.clock.maxMs, projection.gameTimeMs + elapsed);
@@ -184,6 +292,7 @@ export function projectClockSample(
     activePenaltyTimeMs,
     running: gameTimeMs < SHARED_LIMITS.clock.maxMs,
     projectedAtMs: projection.projectedAtMs + elapsed,
+    synchronization: "estimated" as const,
   };
   return { ...projected, cues: cuesFor(gameTimeMs) };
 }
@@ -197,6 +306,7 @@ function createProjection(baseline: ClockBaseline, projectedAtMs: number): Clock
     running: baseline.running,
     projectedAtMs,
     synchronization: "synchronized",
+    lastSynchronizedAtMs: baseline.lastAcceptedAtMs ?? null,
     offlineClockHolderGrantSessionId: baseline.holderGrantSessionId,
     cues: cuesFor(baseline.gameTimeMs),
   };
@@ -274,6 +384,26 @@ function applyClockAction(
   baseline: ClockBaseline,
   action: ClockAuthorityAction,
 ): ClockBaseline | null {
+  if (
+    action.authorityGeneration !== undefined &&
+    action.command !== "takeover" &&
+    action.authorityGeneration !== baseline.authorityGeneration
+  ) {
+    return {
+      ...baseline,
+      staleGenerationOperationIds: [...baseline.staleGenerationOperationIds, action.operationId],
+    };
+  }
+  if (
+    action.command === "takeover" &&
+    action.authorityGeneration !== undefined &&
+    action.authorityGeneration !== baseline.authorityGeneration
+  ) {
+    return {
+      ...baseline,
+      staleGenerationOperationIds: [...baseline.staleGenerationOperationIds, action.operationId],
+    };
+  }
   if (action.command === "penalty-start") {
     return baseline.activePenalty === null
       ? {
@@ -286,6 +416,22 @@ function applyClockAction(
           },
         }
       : baseline;
+  }
+
+  if (action.command === "takeover") {
+    const validatedGameTime = validateGameClockMs(action.gameTimeMs);
+    if (!validatedGameTime.ok || action.running === undefined) return null;
+    return {
+      ...baseline,
+      gameTimeMs: validatedGameTime.value,
+      running: action.running && validatedGameTime.value < SHARED_LIMITS.clock.maxMs,
+      runningSinceMs: action.running ? action.trustedAtMs : null,
+      establishedAtMs: action.trustedAtMs,
+      holderGrantSessionId: action.sessionId,
+      holderGeneration: baseline.holderGeneration + 1,
+      authorityGeneration: baseline.authorityGeneration + 1,
+      lastTransitionOperationId: action.operationId,
+    };
   }
 
   const nextGameTimeMs =
@@ -311,6 +457,7 @@ function applyClockAction(
       : null,
     establishedAtMs: action.trustedAtMs,
     lastTransitionOperationId: action.operationId,
+    authorityGeneration: baseline.authorityGeneration + 1,
   };
 }
 
