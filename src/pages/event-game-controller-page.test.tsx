@@ -374,6 +374,7 @@ describe("Event Game Controller reconnect browser seam", () => {
     });
     expect(replayCalls).toBe(2);
     expect(container.textContent).not.toContain("retained for reconnect replay");
+    expect(container.textContent).toContain("Clock resynchronized.");
   });
 
   test("unmount and remount restores persisted work before foreground replay", async () => {
@@ -542,7 +543,7 @@ describe("Event Game Controller reconnect browser seam", () => {
     expect(replayCalls).toBe(2);
   });
 
-  test("online Clock submits directly while disconnected Clock taps stay out of the replica", async () => {
+  test("online Clock submits directly while disconnected holder Clock taps stay in the replica", async () => {
     await enterAndOpen();
     Object.defineProperty(testWindow.navigator, "onLine", { configurable: true, value: true });
     await act(async () => {
@@ -562,11 +563,40 @@ describe("Event Game Controller reconnect browser seam", () => {
       await Promise.resolve();
     });
     expect(intentCalls).toBe(1);
-    expect(container.textContent).toContain("unavailable while disconnected");
+    expect(container.textContent).toContain("Clock action retained for synchronization");
     const stored = JSON.parse(
       testWindow.localStorage.getItem(controllerReplicaStorageKey("game-browser")) ?? "null",
     ) as { pendingActions?: unknown[] };
-    expect(stored.pendingActions).toHaveLength(0);
+    expect(stored.pendingActions).toHaveLength(1);
+  });
+
+  test("admitted device performs a confirmed emergency takeover while disconnected", async () => {
+    replayMode = "lost";
+    await enterAndOpen();
+    Object.defineProperty(testWindow.navigator, "onLine", { configurable: true, value: false });
+    Object.defineProperty(testWindow, "confirm", {
+      configurable: true,
+      value: () => true,
+    });
+    const takeover = container.querySelector(
+      'button[data-clock-takeover="true"]',
+    ) as HTMLButtonElement;
+    expect(takeover).not.toBeNull();
+    await act(async () => {
+      takeover.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(container.textContent).toContain(
+      "Emergency clock takeover retained for synchronization",
+    );
+    const stored = JSON.parse(
+      testWindow.localStorage.getItem(controllerReplicaStorageKey("game-browser")) ?? "null",
+    ) as { pendingActions?: { intent?: { type?: string; confirmation?: string } }[] };
+    expect(stored.pendingActions?.[0]?.intent).toMatchObject({
+      type: "clock-takeover",
+      confirmation: "physical-timekeeper-or-head-referee",
+    });
   });
 
   test("quota warning is prominent while ordinary actions continue in memory", async () => {
@@ -694,12 +724,16 @@ describe("Event Game Controller reconnect browser seam", () => {
 });
 
 function projection(eventGameId = "game-browser"): ControllerProjection {
+  const baseline = createInitialClockBaseline();
+  baseline.holderGrantSessionId = "session";
+  baseline.holderGeneration = 1;
+  baseline.authorityGeneration = 1;
   return {
     eventGameId,
     phase: "scheduled",
     scoreByGameSide: { "side-a": 0, "side-b": 0 },
     goalCount: 0,
-    clock: projectClockBaseline(createInitialClockBaseline(), 0),
+    clock: projectClockBaseline(baseline, 0),
     commencement: {
       status: "provisional",
       commencedAtMs: null,

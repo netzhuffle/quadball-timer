@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   buildControllerReplayBatch,
   createControllerReplica,
+  dispatchControllerClockAction,
   dispatchControllerAction,
   loadControllerReplica,
   prepareControllerReplayBatch,
@@ -193,6 +194,67 @@ describe("Controller reconnect replica", () => {
     ).toThrow("Clock reconnect belongs to Clock Authority");
   });
 
+  test("keeps disconnected clock authority with the holder and permits deliberate admitted takeover", () => {
+    const holder = createReplica();
+    const queued = dispatchControllerClockAction(holder, clock("offline-clock", true), {
+      nowMs: 200,
+    });
+    expect(queued.state.projection.clock.running).toBe(true);
+    expect(queued.state.pendingActions).toHaveLength(1);
+
+    expect(() =>
+      dispatchControllerClockAction(
+        createReplica({ grantSessionId: "session-2" }),
+        clock("non-holder-clock", true),
+      ),
+    ).toThrow("Offline Clock Holder");
+
+    const takeover = dispatchControllerClockAction(
+      createReplica({ grantSessionId: "session-2" }),
+      {
+        ...clock("takeover", false),
+        type: "clock-takeover" as const,
+        clockTimeMs: 5_000,
+        authorityGeneration: 1,
+        confirmation: "physical-timekeeper-or-head-referee" as const,
+      },
+      { nowMs: 300 },
+    );
+    expect(takeover.state.projection.clock).toMatchObject({
+      gameTimeMs: 5_000,
+      synchronization: "stale",
+      baseline: { authorityGeneration: 2, holderGrantSessionId: "session-2" },
+    });
+  });
+
+  test("fails closed for disconnected clock actions before an Offline Clock Holder exists", () => {
+    const state = createControllerReplica({
+      eventGameId: "game-1",
+      grantSessionId: "session-without-holder",
+      grantVersion: "grant-version-1",
+      deviceId: "device-1",
+      projection: {
+        eventGameId: "game-1",
+        phase: "scheduled",
+        scoreByGameSide: { "side-a": 0, "side-b": 0 },
+        goalCount: 0,
+        clock: projectClockBaseline(createInitialClockBaseline(), 0),
+        commencement: {
+          status: "provisional",
+          commencedAtMs: null,
+          provisionalRunningSinceMs: null,
+          provisionalElapsedMs: 0,
+        },
+      },
+    });
+
+    expect(() => dispatchControllerClockAction(state, clock("no-holder", true))).toThrow(
+      "Offline Clock Holder",
+    );
+    expect(state.pendingActions).toHaveLength(0);
+    expect(state.projection.clock.gameTimeMs).toBe(0);
+  });
+
   test("derives optimism exactly once across null and authoritative rebinds", () => {
     let state = createReplica();
     state = dispatchControllerAction(state, goal("goal-rebind", "fact-goal-rebind"), {
@@ -377,10 +439,14 @@ describe("Controller reconnect replica", () => {
   });
 });
 
-function createReplica() {
+function createReplica(input: { grantSessionId?: string } = {}) {
+  const baseline = createInitialClockBaseline();
+  baseline.holderGrantSessionId = "session-1";
+  baseline.holderGeneration = 1;
+  baseline.authorityGeneration = 1;
   return createControllerReplica({
     eventGameId: "game-1",
-    grantSessionId: "session-1",
+    grantSessionId: input.grantSessionId ?? "session-1",
     grantVersion: "grant-version-1",
     deviceId: "device-1",
     projection: {
@@ -388,7 +454,7 @@ function createReplica() {
       phase: "scheduled",
       scoreByGameSide: { "side-a": 0, "side-b": 0 },
       goalCount: 0,
-      clock: projectClockBaseline(createInitialClockBaseline(), 0),
+      clock: projectClockBaseline(baseline, 0),
       commencement: {
         status: "provisional",
         commencedAtMs: null,
@@ -397,6 +463,18 @@ function createReplica() {
       },
     },
   });
+}
+
+function clock(operationId: string, running: boolean) {
+  return {
+    version: LIVE_EVENT_CONTROL_INTENT_VERSION,
+    type: "clock" as const,
+    operationId,
+    factId: `fact-${operationId}`,
+    running,
+    gameTimeMs: 0,
+    occurrence: { clientOriginAtMs: null, source: "offline" as const },
+  };
 }
 
 function goal(operationId: string, factId: string) {

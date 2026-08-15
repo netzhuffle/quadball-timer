@@ -3,7 +3,11 @@ import type {
   ControllerProjection,
   LiveEventControllerIntent,
 } from "@/lib/live-event-game-control";
-import { createInitialClockBaseline, projectClockBaseline } from "@/lib/clock-authority";
+import {
+  applyClockProjectionAction,
+  createInitialClockBaseline,
+  projectClockBaseline,
+} from "@/lib/clock-authority";
 import { parseLiveEventControllerIntent } from "@/lib/live-event-game-control";
 import {
   SHARED_LIMITS,
@@ -154,6 +158,57 @@ export function dispatchControllerAction(
   if (predecessors.some((predecessor) => state.outcomes[predecessor] === "terminally-rejected")) {
     throw new Error("Causal predecessor was terminally rejected.");
   }
+  const existing = state.pendingActions.find(
+    (action) => action.intent.operationId === parsed.value.operationId,
+  );
+  if (existing !== undefined) return { state, action: existing };
+  const counter = state.identity.nextCounter;
+  const action: PendingControllerAction = {
+    eventGameId: state.eventGameId,
+    intent: structuredClone(parsed.value),
+    causalPredecessorIds: predecessors,
+    dispatchedAtMs: options.nowMs ?? Date.now(),
+    identity: { deviceId: state.identity.deviceId, counter },
+    counter,
+    status: "pending",
+  };
+  const nextState = applyOptimisticAction(
+    {
+      ...state,
+      pendingActions: [...state.pendingActions, action],
+      identity: { ...state.identity, nextCounter: counter + 1 },
+    },
+    action,
+  );
+  return { state: nextState, action };
+}
+
+/** Queue a disconnected clock action without widening the ordinary reconnect path. */
+export function dispatchControllerClockAction(
+  state: ControllerReplicaState,
+  intent: LiveEventControllerIntent,
+  options: { nowMs?: number; causalPredecessorIds?: readonly string[] } = {},
+): { state: ControllerReplicaState; action: PendingControllerAction } {
+  const parsed = parseLiveEventControllerIntent(intent);
+  if (!parsed.ok) throw new Error(`Cannot dispatch invalid Controller action: ${parsed.error}`);
+  if (
+    parsed.value.type !== "clock" &&
+    parsed.value.type !== "set-running" &&
+    parsed.value.type !== "clock-adjust" &&
+    parsed.value.type !== "clock-correction" &&
+    parsed.value.type !== "clock-takeover"
+  ) {
+    throw new Error("Only clock actions belong to Clock Authority.");
+  }
+  if (
+    parsed.value.type !== "clock-takeover" &&
+    (state.projection.clock.offlineClockHolderGrantSessionId === null ||
+      state.projection.clock.offlineClockHolderGrantSessionId !== state.session.grantSessionId)
+  ) {
+    throw new Error("Only the Offline Clock Holder may submit disconnected clock actions.");
+  }
+  const predecessors = [...(options.causalPredecessorIds ?? [])];
+  validateCausalPredecessors(state, parsed.value.operationId, predecessors);
   const existing = state.pendingActions.find(
     (action) => action.intent.operationId === parsed.value.operationId,
   );
@@ -583,6 +638,37 @@ function applyOptimisticAction(
       },
     };
   }
+  if (
+    intent.type === "clock" ||
+    intent.type === "set-running" ||
+    intent.type === "clock-adjust" ||
+    intent.type === "clock-correction" ||
+    intent.type === "clock-takeover"
+  ) {
+    return {
+      ...state,
+      projection: {
+        ...state.projection,
+        clock: applyClockProjectionAction(state.projection.clock, {
+          command:
+            intent.type === "clock" || intent.type === "set-running"
+              ? "set-running"
+              : intent.type === "clock-adjust"
+                ? "adjust"
+                : intent.type === "clock-correction"
+                  ? "correct"
+                  : "takeover",
+          running: "running" in intent ? intent.running : undefined,
+          gameTimeMs: "clockTimeMs" in intent ? intent.clockTimeMs : undefined,
+          adjustmentMs: "adjustmentMs" in intent ? intent.adjustmentMs : undefined,
+          authorityGeneration:
+            "authorityGeneration" in intent ? intent.authorityGeneration : intent.clockGeneration,
+          sessionId: state.session.grantSessionId,
+          operationId: intent.operationId,
+        }),
+      },
+    };
+  }
   return {
     ...state,
   };
@@ -673,6 +759,7 @@ function sameProjection(left: ControllerProjection, right: ControllerProjection)
     left.commencement.commencedAtMs === right.commencement.commencedAtMs &&
     left.commencement.provisionalRunningSinceMs === right.commencement.provisionalRunningSinceMs &&
     left.commencement.provisionalElapsedMs === right.commencement.provisionalElapsedMs &&
+    JSON.stringify(left.clock) === JSON.stringify(right.clock) &&
     leftScores.length === rightScores.length &&
     leftScores.every(
       ([side, score], index) =>
@@ -742,9 +829,6 @@ function parsePendingAction(
   if (!identityCounter.ok) throw new Error(identityCounter.error);
   if (identityDeviceId !== expectedDeviceId || identityCounter.value !== counter.value) {
     throw new Error("Pending action identity is inconsistent.");
-  }
-  if (intent.value.type === "clock" || intent.value.type === "set-running") {
-    throw new Error("Clock actions are not eligible for reconnect.");
   }
   return {
     eventGameId,

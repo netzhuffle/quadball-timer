@@ -20,6 +20,7 @@ import {
   acknowledgeControllerProjection,
   controllerReplicaStorageKey,
   createControllerReplica,
+  dispatchControllerClockAction,
   dispatchControllerAction,
   invalidateControllerReplica,
   loadControllerReplica,
@@ -88,6 +89,7 @@ export function EventGameControllerPage() {
   const [clockReceiptAnchor, setClockReceiptAnchor] = useState<ClockReceiptAnchor | null>(null);
   const [localMonotonicMs, setLocalMonotonicMs] = useState(readMonotonicNow);
   const [clockCorrectionInput, setClockCorrectionInput] = useState("");
+  const [takeoverAdjustmentInput, setTakeoverAdjustmentInput] = useState("");
   const [message, setMessage] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [persistedReplicaLoad] = useState<ControllerReplicaLoad>(() =>
@@ -99,6 +101,7 @@ export function EventGameControllerPage() {
   const installedReplayAuthorityRef = useRef<ReplayAuthority | null>(null);
   const activeReplayRef = useRef<ActiveReplay | null>(null);
   const queuedReplayRef = useRef<ReplayRequest | null>(null);
+  const resynchronizationTimerRef = useRef<number | null>(null);
   const [durabilityWarning, setDurabilityWarning] = useState<string | null>(
     persistedReplicaLoad.warning,
   );
@@ -106,7 +109,12 @@ export function EventGameControllerPage() {
 
   useEffect(() => {
     const timer = window.setInterval(() => setLocalMonotonicMs(readMonotonicNow()), 250);
-    return () => window.clearInterval(timer);
+    return () => {
+      window.clearInterval(timer);
+      if (resynchronizationTimerRef.current !== null) {
+        window.clearTimeout(resynchronizationTimerRef.current);
+      }
+    };
   }, []);
 
   const clockProjection =
@@ -116,6 +124,19 @@ export function EventGameControllerPage() {
           clockReceiptAnchor.projection,
           localMonotonicMs - clockReceiptAnchor.localMonotonicMs,
         );
+
+  function projectClockImmediately() {
+    const now = readMonotonicNow();
+    setLocalMonotonicMs(now);
+    setClockReceiptAnchor((anchor) =>
+      anchor === null
+        ? null
+        : {
+            projection: projectClockSample(anchor.projection, now - anchor.localMonotonicMs),
+            localMonotonicMs: now,
+          },
+    );
+  }
 
   useEffect(() => {
     if (sessionBearer === null || eventGameId === null) {
@@ -149,6 +170,7 @@ export function EventGameControllerPage() {
   useEffect(() => {
     const reconcileWhenForegrounded = () => {
       if (document.visibilityState === "hidden") return;
+      projectClockImmediately();
       void (async () => {
         const revalidated = await refreshController(true);
         if (revalidated && replicaRef.current !== null) {
@@ -213,7 +235,9 @@ export function EventGameControllerPage() {
       await flushReplica(nextReplica, response.session.sessionBearer);
     } catch {
       clearSession();
-      setMessage("Unable to open Controller experience.");
+      setMessage(
+        "Unable to open Controller experience. A fresh device cannot reconstruct Clock Authority during a server outage; use manual timing.",
+      );
     } finally {
       setBusy(false);
     }
@@ -221,6 +245,7 @@ export function EventGameControllerPage() {
 
   async function refreshController(silent = false): Promise<boolean> {
     if (sessionBearer === null || eventGameId === null) return false;
+    projectClockImmediately();
     if (!silent) setBusy(true);
     try {
       const response = await postJson<ControllerRefreshResponse>("/api/event-control/refresh", {
@@ -236,7 +261,7 @@ export function EventGameControllerPage() {
       if (response.status === "rejected") throw new Error("refresh failed");
       setSwitchTarget(null);
       setEventGameId(response.session.eventGameId);
-      receiveProjection(response.projection);
+      receiveProjection(response.projection, { resynchronized: true });
       const currentReplica = replicaRef.current;
       const refreshedSession = {
         eventGameId: response.session.eventGameId,
@@ -485,7 +510,24 @@ export function EventGameControllerPage() {
         setMessage("Reconnect is incomplete; retained actions will retry.");
     } catch {
       if (isInstalledReplayAuthority(request.authority)) {
-        setMessage("Connection lost. Pending Controller actions remain safely retained.");
+        const hasPendingClock = replicaRef.current?.pendingActions.some(
+          (action) =>
+            action.intent.type === "clock" ||
+            action.intent.type === "set-running" ||
+            action.intent.type === "clock-adjust" ||
+            action.intent.type === "clock-correction" ||
+            action.intent.type === "clock-takeover",
+        );
+        const hasPendingTakeover = replicaRef.current?.pendingActions.some(
+          (action) => action.intent.type === "clock-takeover",
+        );
+        setMessage(
+          hasPendingTakeover
+            ? "Emergency clock takeover retained for synchronization."
+            : hasPendingClock
+              ? "Clock action retained for synchronization."
+              : "Connection lost. Pending Controller actions remain safely retained.",
+        );
       }
     } finally {
       if (activeReplayRef.current?.requestToken === active.requestToken) {
@@ -549,7 +591,15 @@ export function EventGameControllerPage() {
     const currentEventGameId = eventGameId;
     if (bearer === null || currentEventGameId === null) return;
     if (navigator.onLine === false) {
-      setMessage("Clock control is unavailable while disconnected and was not retained.");
+      queueClockAuthorityIntent({
+        version: LIVE_EVENT_CONTROL_INTENT_VERSION,
+        type: "clock",
+        running: !clockRunning,
+        operationId: crypto.randomUUID(),
+        factId: crypto.randomUUID(),
+        gameTimeMs: clockProjection?.gameTimeMs ?? projection?.clock.gameTimeMs ?? 0,
+        occurrence: { clientOriginAtMs: Date.now(), source: "offline" },
+      });
       return;
     }
     void submitOnlineControllerIntent(
@@ -572,7 +622,15 @@ export function EventGameControllerPage() {
     const currentEventGameId = eventGameId;
     if (bearer === null || currentEventGameId === null) return;
     if (navigator.onLine === false) {
-      setMessage("Clock control is unavailable while disconnected and was not retained.");
+      queueClockAuthorityIntent({
+        version: LIVE_EVENT_CONTROL_INTENT_VERSION,
+        type: "clock-adjust",
+        adjustmentMs,
+        operationId: crypto.randomUUID(),
+        factId: crypto.randomUUID(),
+        gameTimeMs: clockProjection?.gameTimeMs ?? projection?.clock.gameTimeMs ?? 0,
+        occurrence: { clientOriginAtMs: Date.now(), source: "offline" },
+      });
       return;
     }
     void submitOnlineControllerIntent(
@@ -605,7 +663,15 @@ export function EventGameControllerPage() {
     const currentEventGameId = eventGameId;
     if (bearer === null || currentEventGameId === null) return;
     if (navigator.onLine === false) {
-      setMessage("Clock control is unavailable while disconnected and was not retained.");
+      queueClockAuthorityIntent({
+        version: LIVE_EVENT_CONTROL_INTENT_VERSION,
+        type: "clock-correction",
+        clockTimeMs: validated.value,
+        operationId: crypto.randomUUID(),
+        factId: crypto.randomUUID(),
+        gameTimeMs: clockProjection?.gameTimeMs ?? projection?.clock.gameTimeMs ?? 0,
+        occurrence: { clientOriginAtMs: Date.now(), source: "offline" },
+      });
       return;
     }
     void submitOnlineControllerIntent(
@@ -624,7 +690,85 @@ export function EventGameControllerPage() {
     setClockCorrectionInput("");
   }
 
-  function receiveProjection(nextProjection: ControllerProjection | null) {
+  function emergencyClockTakeover() {
+    const current = clockProjection ?? projection?.clock;
+    if (current === undefined || replicaRef.current === null) {
+      setMessage("Clock is unavailable; use manual timing until an admitted device reconnects.");
+      return;
+    }
+    if (!window.confirm("Confirm emergency clock takeover with the Timekeeper or Head Referee.")) {
+      return;
+    }
+    const parsedAdjustment =
+      takeoverAdjustmentInput.trim() === "" ? 0 : Number(takeoverAdjustmentInput);
+    const confirmationElapsedMs = current.running
+      ? Math.max(0, readMonotonicNow() - localMonotonicMs)
+      : 0;
+    const adjustment = validateGameClockMs(
+      current.gameTimeMs + confirmationElapsedMs + parsedAdjustment,
+    );
+    if (!adjustment.ok) {
+      setMessage(
+        "Takeover adjustment must keep the game clock between 0 and 7200000 milliseconds.",
+      );
+      return;
+    }
+    queueClockAuthorityIntent({
+      version: LIVE_EVENT_CONTROL_INTENT_VERSION,
+      type: "clock-takeover",
+      clockTimeMs: adjustment.value,
+      running: current.running,
+      authorityGeneration: current.baseline.authorityGeneration,
+      confirmation: "physical-timekeeper-or-head-referee",
+      operationId: crypto.randomUUID(),
+      factId: crypto.randomUUID(),
+      gameTimeMs: adjustment.value,
+      occurrence: {
+        clientOriginAtMs: Date.now(),
+        source: navigator.onLine === false ? "offline" : "online",
+      },
+    });
+    setTakeoverAdjustmentInput("");
+  }
+
+  function queueClockAuthorityIntent(intent: LiveEventControllerIntent) {
+    const current = replicaRef.current;
+    if (current === null) return;
+    try {
+      const dispatched = dispatchControllerClockAction(
+        current,
+        {
+          ...intent,
+          ...(intent.type === "clock" ||
+          intent.type === "set-running" ||
+          intent.type === "clock-adjust" ||
+          intent.type === "clock-correction"
+            ? { clockGeneration: current.projection.clock.baseline.authorityGeneration }
+            : {}),
+        },
+        { nowMs: Math.floor(readMonotonicNow()) },
+      );
+      commitReplica(dispatched.state);
+      receiveProjection(dispatched.state.projection);
+      setMessage(
+        intent.type === "clock-takeover"
+          ? "Emergency clock takeover retained for synchronization."
+          : "Clock action retained for synchronization.",
+      );
+      void flushReplica(dispatched.state);
+    } catch (error) {
+      setMessage(
+        error instanceof Error && error.message.includes("Offline Clock Holder")
+          ? "Only the Offline Clock Holder may control the disconnected clock."
+          : "Clock action could not be retained safely.",
+      );
+    }
+  }
+
+  function receiveProjection(
+    nextProjection: ControllerProjection | null,
+    options: { resynchronized?: boolean } = {},
+  ) {
     setProjection(nextProjection);
     setProjectionStatus(nextProjection === null ? "unavailable" : "available");
     setClockRunning(nextProjection?.clock.running ?? false);
@@ -633,6 +777,15 @@ export function EventGameControllerPage() {
         ? null
         : { projection: nextProjection.clock, localMonotonicMs: readMonotonicNow() },
     );
+    if (options.resynchronized) {
+      setMessage("Clock resynchronized.");
+      if (resynchronizationTimerRef.current !== null) {
+        window.clearTimeout(resynchronizationTimerRef.current);
+      }
+      resynchronizationTimerRef.current = window.setTimeout(() => {
+        setMessage((current) => (current === "Clock resynchronized." ? null : current));
+      }, 2_000);
+    }
   }
 
   async function submitOnlineControllerIntent(
@@ -762,10 +915,17 @@ export function EventGameControllerPage() {
               <div className="rounded-lg border bg-slate-950 p-4 text-center text-white">
                 <p className="text-xs uppercase tracking-[0.2em] text-slate-300">Game Clock</p>
                 <p className="mt-1 text-5xl font-semibold tabular-nums">
-                  {clockProjection === null ? "--:--" : formatClock(clockProjection.gameTimeMs)}
+                  {clockProjection === null || clockProjection.synchronization === "unavailable"
+                    ? "--:--"
+                    : formatClock(clockProjection.gameTimeMs)}
                 </p>
                 <p className="mt-1 text-xs text-slate-300">
                   {clockProjection?.running ? "Play" : "Paused"} · Controller projection
+                </p>
+                <p className="mt-2 text-xs text-slate-300" data-clock-freshness="true">
+                  {clockProjection === null
+                    ? "Unavailable · manual timing required"
+                    : `${clockProjection.synchronization} · last synchronization: ${formatSynchronizationTime(clockProjection.lastSynchronizedAtMs)}`}
                 </p>
               </div>
               {clockProjection === null ? null : (
@@ -832,6 +992,29 @@ export function EventGameControllerPage() {
                     Correct clock
                   </Button>
                 </div>
+                <div className="flex w-full flex-wrap items-end gap-2 rounded border border-amber-500/50 p-2 text-left">
+                  <div className="min-w-48 flex-1 space-y-1">
+                    <Label htmlFor="clock-takeover-adjustment">
+                      Emergency takeover adjustment (ms)
+                    </Label>
+                    <Input
+                      id="clock-takeover-adjustment"
+                      inputMode="numeric"
+                      value={takeoverAdjustmentInput}
+                      onChange={(event) => setTakeoverAdjustmentInput(event.target.value)}
+                      placeholder="optional, e.g. -1000"
+                      disabled={busy}
+                    />
+                  </div>
+                  <Button
+                    variant="outline"
+                    data-clock-takeover="true"
+                    onClick={emergencyClockTakeover}
+                    disabled={busy}
+                  >
+                    Emergency clock takeover
+                  </Button>
+                </div>
                 <Button variant="outline" onClick={() => trigger("card")} disabled={busy}>
                   Record card
                 </Button>
@@ -888,6 +1071,10 @@ function formatClock(milliseconds: number): string {
   const minutes = Math.floor(totalSeconds / 60);
   const seconds = totalSeconds % 60;
   return `${minutes.toString().padStart(2, "0")}:${seconds.toString().padStart(2, "0")}`;
+}
+
+function formatSynchronizationTime(milliseconds: number | null | undefined): string {
+  return typeof milliseconds !== "number" ? "not available" : new Date(milliseconds).toISOString();
 }
 
 function readMonotonicNow(): number {

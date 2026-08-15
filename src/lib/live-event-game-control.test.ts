@@ -1294,6 +1294,112 @@ describe("Live Event Game control", () => {
     expect(await harness.record.readActions()).toHaveLength(0);
   });
 
+  test("keeps offline holder continuity, accepts deliberate takeover, and ignores stale generation evidence", async () => {
+    const harness = await createHarness();
+    const first = await harness.control.openController({
+      qrCredential: harness.qrCredential,
+      browserContext: "holder-phone",
+    });
+    if (first.status !== "opened") throw new Error("Expected the holder Controller to open.");
+    const started = await harness.control.submitControllerIntent({
+      sessionBearer: first.session.sessionBearer,
+      eventGameId: harness.root.eventGameId,
+      intent: clockIntent("holder-start", true),
+    });
+    expect(started).toMatchObject({ status: "accepted" });
+
+    const second = await harness.authority.admitGrant({
+      qrCredential: harness.qrCredential,
+      browserContext: "replacement-phone",
+    });
+    if (second.status !== "admitted")
+      throw new Error("Expected the replacement Controller to open.");
+    const rejectedNonHolder = await harness.control.submitControllerIntent({
+      sessionBearer: second.sessionBearer,
+      eventGameId: harness.root.eventGameId,
+      intent: clockIntent("non-holder-offline", false, {
+        source: "offline",
+        clockGeneration: 1,
+      }),
+    });
+    expect(rejectedNonHolder.status).toBe("rejected");
+
+    harness.setNow(11_000);
+    const takeover = await harness.control.submitControllerIntent({
+      sessionBearer: second.sessionBearer,
+      eventGameId: harness.root.eventGameId,
+      intent: {
+        ...clockIntent("emergency-takeover", false, { source: "offline" }),
+        type: "clock-takeover" as const,
+        clockTimeMs: 5_000,
+        authorityGeneration: 1,
+        confirmation: "physical-timekeeper-or-head-referee" as const,
+      },
+    });
+    expect(takeover).toMatchObject({
+      status: "accepted",
+      projection: {
+        clock: {
+          gameTimeMs: 5_000,
+          running: false,
+          baseline: { authorityGeneration: 2, holderGrantSessionId: second.grantSessionId },
+        },
+      },
+    });
+
+    harness.setNow(12_000);
+    const stale = await harness.control.submitControllerIntent({
+      sessionBearer: first.session.sessionBearer,
+      eventGameId: harness.root.eventGameId,
+      intent: clockIntent("stale-holder-action", true, {
+        source: "offline",
+        clockGeneration: 1,
+      }),
+    });
+    expect(stale).toMatchObject({
+      status: "accepted",
+      projection: {
+        clock: {
+          gameTimeMs: 5_000,
+          running: false,
+          baseline: { staleGenerationOperationIds: ["stale-holder-action"] },
+        },
+      },
+    });
+    expect(await harness.record.readActions()).toHaveLength(3);
+  });
+
+  test("rejects an ordinary offline clock action before any Offline Clock Holder exists", async () => {
+    const harness = await createHarness();
+    const opened = await harness.control.openController({
+      qrCredential: harness.qrCredential,
+      browserContext: "fresh-offline-phone",
+    });
+    if (opened.status !== "opened") throw new Error("Expected the Controller to open.");
+
+    const rejected = await harness.control.submitControllerIntent({
+      sessionBearer: opened.session.sessionBearer,
+      eventGameId: harness.root.eventGameId,
+      intent: clockIntent("no-offline-holder", true, { source: "offline" }),
+    });
+
+    expect(rejected).toMatchObject({ status: "rejected", operationId: "no-offline-holder" });
+    expect(await harness.record.readActions()).toHaveLength(0);
+    const refreshed = await harness.control.refreshController({
+      sessionBearer: opened.session.sessionBearer,
+      eventGameId: harness.root.eventGameId,
+    });
+    if (refreshed.status !== "authorized" || refreshed.projection === null) {
+      throw new Error("Expected an authorized Controller projection.");
+    }
+    expect(refreshed.projection.clock).toMatchObject({
+      gameTimeMs: 0,
+      running: false,
+      offlineClockHolderGrantSessionId: null,
+      baseline: { authorityGeneration: 0, holderGrantSessionId: null },
+    });
+  });
+
   test("exposes the Controller through its HTTP transport without changing Ad Hoc routes", async () => {
     const harness = await createHarness();
     const allowedOrigin = "https://timer.quadball.app";
@@ -1506,7 +1612,11 @@ function goalIntent(
   };
 }
 
-function clockIntent(operationId: string, running: boolean) {
+function clockIntent(
+  operationId: string,
+  running: boolean,
+  options: { source?: "online" | "offline"; clockGeneration?: number } = {},
+) {
   return {
     version: LIVE_EVENT_CONTROL_INTENT_VERSION,
     type: "clock" as const,
@@ -1514,7 +1624,11 @@ function clockIntent(operationId: string, running: boolean) {
     factId: `fact-${operationId}`,
     running,
     gameTimeMs: 0,
-    occurrence: { clientOriginAtMs: null },
+    occurrence: {
+      clientOriginAtMs: null,
+      ...(options.source === undefined ? {} : { source: options.source }),
+    },
+    ...(options.clockGeneration === undefined ? {} : { clockGeneration: options.clockGeneration }),
   };
 }
 
