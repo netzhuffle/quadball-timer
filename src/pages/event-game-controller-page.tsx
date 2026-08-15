@@ -860,6 +860,11 @@ export function EventGameControllerPage() {
       const nextReplica = reconcileControllerReplay(replicaRef.current ?? prepared.state, response);
       commitReplica(nextReplica);
       receiveProjection(response.projection);
+      if (response.discardedCount !== undefined) {
+        setMessage(
+          `${response.discardedCount} queued Controller action(s) were discarded after Game Lock.`,
+        );
+      }
       if (
         response.status === "synchronized" &&
         nextReplica.pendingActions.some((action) => action.status === "pending")

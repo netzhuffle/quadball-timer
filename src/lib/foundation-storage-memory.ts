@@ -1015,6 +1015,12 @@ function createTransaction(
 ): FoundationStorageTransaction {
   return {
     revision,
+    listRoots() {
+      return [...state.roots.values()]
+        .sort((left, right) => left.root.recordId.localeCompare(right.root.recordId))
+        .map((stored) => cloneRoot(stored))
+        .filter((root): root is EventGameRecordRoot => root !== null);
+    },
     findRootByRecordId(recordId) {
       return cloneRoot(state.roots.get(recordId));
     },

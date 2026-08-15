@@ -5474,6 +5474,7 @@ async function createHarness(
     acceptance,
     grantAuthority: authority,
     clock: overrides.controlClock ?? (() => grantOptions.clock.nowMs()),
+    listEventGameRoots: async () => [root, reassignedRoot],
     projectionFailure: overrides.projectionFailure,
   });
   triggerLifecycleChange = () => {

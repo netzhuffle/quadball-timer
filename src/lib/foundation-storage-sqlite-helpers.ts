@@ -163,13 +163,23 @@ export function readAudit(row: RootRow): StoredControlAuditEntry {
   ) {
     throw new Error("Stored Control Audit durable format marker is inconsistent.");
   }
+  const lockedReplay = entry.lockedReplay !== undefined;
   if (
+    lockedReplay &&
+    (entry.redactedDetail !== undefined ||
+      entry.links !== undefined ||
+      entry.provenance !== undefined)
+  ) {
+    throw new Error("Stored locked replay evidence has unexpected fields.");
+  }
+  if (
+    !lockedReplay &&
     auditVersion === CONTROL_AUDIT_VERSION &&
     (entry.links === undefined || entry.provenance === undefined)
   ) {
     throw new Error("Stored #75 Control Audit evidence is incomplete.");
   }
-  const result: StoredControlAuditEntry = {
+  const result = {
     auditVersion,
     durableFormat,
     [DURABLE_EVIDENCE_PROVENANCE]: provenanceFormat,
@@ -181,7 +191,9 @@ export function readAudit(row: RootRow): StoredControlAuditEntry {
     kind,
     outcome: readText(entry.outcome),
     createdAtMs: readRequiredTimestamp(entry.createdAtMs, "createdAtMs"),
-    redactedDetail: readText(entry.redactedDetail),
+    ...(entry.redactedDetail === undefined
+      ? {}
+      : { redactedDetail: readText(entry.redactedDetail) }),
     ...(entry.links === undefined ? {} : { links: readAuditLinks(entry.links) }),
     ...(entry.provenance === undefined
       ? {}
@@ -189,7 +201,7 @@ export function readAudit(row: RootRow): StoredControlAuditEntry {
     ...(entry.lockedReplay === undefined
       ? {}
       : { lockedReplay: readLockedReplay(entry.lockedReplay) }),
-  };
+  } as StoredControlAuditEntry;
   if (
     result.auditId !== readText(row.audit_id) ||
     result.recordId !== readText(row.record_id) ||
@@ -198,7 +210,9 @@ export function readAudit(row: RootRow): StoredControlAuditEntry {
     result.kind !== readText(row.audit_kind) ||
     result.outcome !== readText(row.outcome) ||
     result.createdAtMs !== readInteger(row.created_at_ms) ||
-    result.redactedDetail !== readText(row.redacted_detail)
+    (result.redactedDetail === undefined
+      ? readText(row.redacted_detail) !== ""
+      : result.redactedDetail !== readText(row.redacted_detail))
   ) {
     throw new Error("Stored Control Audit entry projection is inconsistent.");
   }

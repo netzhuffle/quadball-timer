@@ -455,11 +455,21 @@ export async function lockControlGrantEventGame(
         if (grant.grantType !== GRANT_TYPE) continue;
         const current = expireGrantIfDue(transaction, options, grant);
         if (current.status === "expired") continue;
+        const targetBoundSession = transaction
+          .listGrantSessions(current.grantId)
+          .some(
+            (session) =>
+              session.status === "active" && session.eventGameId === transition.eventGameId,
+          );
         let resolved: ControlGrantScopeResolution;
         try {
-          resolved = options.controlScopeResolver.resolve(current.scope as ControlGrantScope);
+          resolved = options.controlScopeResolver.resolve(
+            current.scope as ControlGrantScope,
+            transaction,
+          );
         } catch {
-          return { status: "rejected", reason: "unavailable" };
+          if (targetBoundSession) return { status: "rejected", reason: "unavailable" };
+          continue;
         }
         const resolvedEventGameId =
           resolved.status === "eligible"
@@ -467,12 +477,17 @@ export async function lockControlGrantEventGame(
             : resolved.status === "terminal" && resolved.reason === "game-locked"
               ? resolved.eventGameId
               : undefined;
-        if (
-          resolvedEventGameId === undefined ||
-          !validateOpaqueIdentifier(resolvedEventGameId, "eventGameId").ok
-        )
+        if (resolvedEventGameId === undefined) {
+          if (targetBoundSession) return { status: "rejected", reason: "unavailable" };
+          continue;
+        }
+        if (resolvedEventGameId !== transition.eventGameId && !targetBoundSession) continue;
+        if (!validateOpaqueIdentifier(resolvedEventGameId, "eventGameId").ok)
           return { status: "rejected", reason: "unavailable" };
-        resolvedGrants.push({ grant: current, eventGameId: resolvedEventGameId });
+        resolvedGrants.push({
+          grant: current,
+          eventGameId: transition.eventGameId,
+        });
       }
       let terminatedSessionCount = 0;
       for (const { grant, eventGameId } of resolvedGrants) {

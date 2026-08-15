@@ -47,6 +47,7 @@ export type ControllerActionOutcomeStatus =
   | "retryable"
   | "causally-blocked"
   | "held-for-correction"
+  | "locked-discarded"
   | "terminally-rejected";
 
 export type PendingControllerAction = {
@@ -119,6 +120,7 @@ export type ControllerReplayBatchResponse = {
   session: ControllerSessionAttachment;
   eventGameId: string;
   status: "synchronized" | "retryable" | "rejected";
+  discardedCount?: number;
   outcomes: readonly {
     operationId: string;
     status: Exclude<ControllerActionOutcomeStatus, "pending">;
@@ -350,6 +352,7 @@ export function reconcileControllerReplay(
           "retryable",
           "causally-blocked",
           "held-for-correction",
+          "locked-discarded",
           "terminally-rejected",
         ].includes(outcome.status);
       responseOperationIds.add(outcome.operationId);
@@ -1111,6 +1114,7 @@ function parsePendingAction(
       "retryable",
       "causally-blocked",
       "held-for-correction",
+      "locked-discarded",
       "terminally-rejected",
     ].includes(value.status as string)
   ) {
@@ -1420,6 +1424,7 @@ function parseOutcomes(value: unknown): Readonly<Record<string, ControllerAction
         "retryable",
         "causally-blocked",
         "held-for-correction",
+        "locked-discarded",
         "terminally-rejected",
       ].includes(outcome as string)
     )

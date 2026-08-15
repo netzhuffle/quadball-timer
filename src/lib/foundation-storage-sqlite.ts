@@ -1139,6 +1139,10 @@ export class SqliteFoundationStorage implements FoundationStorage {
     const statements = this.getStatements();
     return {
       revision: this.revision,
+      listRoots: () =>
+        statements.allRoots
+          .all()
+          .map((value) => readValidatedFoundationRoot(this.database, asRecord(value))),
       findRootByRecordId: (recordId) => this.readRootByStatement(statements.byRecordId, recordId),
       findRootByEventGameId: (eventGameId) =>
         this.readRootByStatement(statements.byEventGameId, eventGameId),
@@ -1699,7 +1703,7 @@ export class SqliteFoundationStorage implements FoundationStorage {
       entry.kind,
       entry.outcome,
       entry.createdAtMs,
-      entry.redactedDetail,
+      entry.redactedDetail ?? "",
       JSON.stringify(entry),
       entry.auditVersion,
       "current",

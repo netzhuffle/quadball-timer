@@ -46,10 +46,12 @@ import {
   validateIntegerInRange,
   validateOpaqueIdentifier,
 } from "@/lib/validation-policy";
+import { sha256 } from "@/lib/event-game-action-json";
 
 export const LIVE_EVENT_CONTROL_INTENT_VERSION = "live-event-control-intent-v1" as const;
 export const LIVE_EVENT_IQA_INTERPRETER_VERSION = "live-event-iqa-v1" as const;
 export const CLOSE_PLAY_ADJUDICATION_WINDOW_MS = 1_000;
+export const EVENT_GAME_LOCK_DELAY_MS = 15 * 60 * 1000;
 
 export type SportingOrderAdjudication = {
   relatedFactId: string;
@@ -319,6 +321,8 @@ export type LiveEventGameControlResult =
       status: "retryable";
       message: "Controller action was not committed; retry is safe.";
       operationId: string | null;
+      /** Internal replay handoff; omitted from ordinary transport results. */
+      replayReservationId?: string;
     }
   | {
       status: "rejected";
@@ -341,6 +345,29 @@ export type LiveEventGameControlOptions = {
     | "revealGrant"
     | "leaveGrantSession"
   >;
+  listEventGameRoots: () => Promise<readonly EventGameRecordRoot[]>;
+  /** Runtime-owned, per-replay capability store. */
+  lockedReplayCapability?: {
+    issue(replayDigest: string): string;
+    remember(input: { evidence: string; replayDigest: string; reservationId: string }): void;
+    find(replayDigest: string): string | null;
+    authorize(replayDigest: string): void;
+    authorized(evidence: string): boolean;
+    reservationId(evidence: string): string | null;
+  };
+  authorizeLockedReplay?: (input: {
+    sessionBearer: string;
+    eventGameId: string;
+    grantSessionId: string;
+    grantVersion: string;
+  }) => Promise<boolean>;
+  lockEventGame?: (
+    eventGameId: string,
+    lockedAtMs: number,
+  ) => Promise<
+    | { status: "locked"; eventGameId: string; terminatedSessionCount: number }
+    | { status: "rejected"; reason: string }
+  >;
   clock?: () => number;
   /** Test-only seam for proving the post-commit projection response. */
   projectionFailure?: () => boolean;
@@ -354,6 +381,7 @@ export type ControllerReplayOutcome = {
     | "retryable"
     | "causally-blocked"
     | "held-for-correction"
+    | "locked-discarded"
     | "terminally-rejected";
   detail?: string;
 };
@@ -366,6 +394,7 @@ export type ControllerReplayResult = {
   status: "synchronized" | "retryable" | "rejected";
   outcomes: readonly ControllerReplayOutcome[];
   projection: ControllerProjection | null;
+  discardedCount?: number;
 };
 
 export function createLiveEventGameIqaInterpreter(
@@ -806,6 +835,57 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
   let reconciliationCompletion: Promise<number> | null = null;
   let closed = false;
 
+  async function lockEventGameIfDue(eventGameId: string): Promise<boolean> {
+    try {
+      if (options.lockEventGame === undefined) return false;
+      const owner = await options.resolveEventGameRecord(eventGameId);
+      if (owner === null) return false;
+      const root = await owner.record.readRoot(owner.recordId);
+      if (
+        root === null ||
+        root.lifecycle.phase !== "finished" ||
+        root.lifecycle.finishedAtMs === null ||
+        root.lifecycle.lockedAtMs !== null
+      )
+        return false;
+      const metadata = await owner.record.readMetadata();
+      const lastAcceptedAtMs = metadata?.lastAcceptedAtMs;
+      const nowMs = clock();
+      if (
+        lastAcceptedAtMs === null ||
+        lastAcceptedAtMs === undefined ||
+        !Number.isSafeInteger(lastAcceptedAtMs) ||
+        !Number.isSafeInteger(nowMs) ||
+        nowMs < 0 ||
+        nowMs < lastAcceptedAtMs + EVENT_GAME_LOCK_DELAY_MS
+      )
+        return false;
+      const result = await options.lockEventGame(eventGameId, nowMs);
+      if (result.status !== "locked") return false;
+      for (const [sessionBearer, session] of activeControllerSessions) {
+        if (session.eventGameId === eventGameId) activeControllerSessions.delete(sessionBearer);
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async function reconcileEventGameLocks(): Promise<number> {
+    if (closed) return 0;
+    let roots: readonly EventGameRecordRoot[];
+    try {
+      roots = await options.listEventGameRoots();
+    } catch {
+      return 0;
+    }
+    let lockedCount = 0;
+    for (const root of roots) {
+      if (await lockEventGameIfDue(root.eventGameId)) lockedCount += 1;
+    }
+    return lockedCount;
+  }
+
   const trackActiveControllerSession = (
     sessionBearer: string,
     eventGameId: string,
@@ -883,6 +963,7 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
     deviceClass?: string;
     browserClass?: string;
   }): Promise<OpenControllerResult> {
+    await reconcileEventGameLocks();
     const admitted =
       input.grantCode === undefined
         ? await options.grantAuthority.admitGrant(
@@ -956,6 +1037,7 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
     sessionBearer: string;
     eventGameId: string;
   }): Promise<ControllerRefreshResult> {
+    await lockEventGameIfDue(input.eventGameId);
     const authorized = await options.grantAuthority.authorizeGrant({
       sessionBearer: input.sessionBearer,
       eventGameId: input.eventGameId,
@@ -1051,6 +1133,7 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
   async function switchController(input: {
     sessionBearer: string;
   }): Promise<ControllerRefreshResult> {
+    await reconcileEventGameLocks();
     const switched = await options.grantAuthority.acceptControlGrantSessionSwitch({
       sessionBearer: input.sessionBearer,
     });
@@ -1088,6 +1171,7 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
     sessionBearer: string;
     eventGameId: string;
   }): Promise<ControllerRefreshResult> {
+    await lockEventGameIfDue(input.eventGameId);
     const authorized = await options.grantAuthority.authorizeGrant({
       sessionBearer: input.sessionBearer,
       eventGameId: input.eventGameId,
@@ -1131,6 +1215,7 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
     sessionBearer: string;
     eventGameId: string;
   }): Promise<ControllerQrResult> {
+    await lockEventGameIfDue(input.eventGameId);
     const authorized = await options.grantAuthority.authorizeGrant({
       sessionBearer: input.sessionBearer,
       eventGameId: input.eventGameId,
@@ -1164,12 +1249,101 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
       : { status: "rejected", message: "Unable to leave Controller session." };
   }
 
+  async function discardLockedReplay(input: {
+    sessionBearer: string;
+    eventGameId: string;
+    expectedGrantSessionId: string;
+    capabilityEvidence: string;
+    actions: readonly { eventGameId: string; intent: unknown }[];
+    context: Omit<ControllerReplayResult, "status" | "outcomes" | "projection">;
+  }): Promise<ControllerReplayResult | null> {
+    if (options.lockedReplayCapability === undefined) return null;
+    const owner = await options.resolveEventGameRecord(input.eventGameId);
+    const root = owner === null ? null : await owner.record.readRoot(owner.recordId);
+    if (owner === null || root === null || root.lifecycle.lockedAtMs === null) return null;
+    if (
+      input.actions.length === 0 ||
+      input.actions.length > SHARED_LIMITS.replay.maxControlActions ||
+      input.actions.some((candidate) => candidate.eventGameId !== input.eventGameId)
+    )
+      return null;
+    const parsed = input.actions.map((candidate) =>
+      parseLiveEventControllerIntent(candidate.intent),
+    );
+    if (parsed.some((candidate) => !candidate.ok)) return null;
+    const actionIds = parsed.map((candidate) => (candidate.ok ? candidate.value.operationId : ""));
+    if (new Set(actionIds).size !== actionIds.length || actionIds.some((id) => id === ""))
+      return null;
+    const actions = parsed.map((candidate) => {
+      if (!candidate.ok) throw new Error("Locked replay intent is invalid.");
+      return {
+        recordId: root.recordId,
+        eventGameId: root.eventGameId,
+        operationId: candidate.value.operationId,
+        kind: { id: "game-fact", version: "1" },
+        payload: {
+          factId: candidate.value.factId,
+          factType: "locked-replay-discard",
+          gameSideId: null,
+          gameTimeMs: 0,
+          data: null,
+        },
+        causalPredecessorIds: [],
+        occurrence: {
+          trustedAtMs: root.lifecycle.lockedAtMs ?? clock(),
+          clientOriginAtMs: candidate.value.occurrence.clientOriginAtMs,
+          source: "offline",
+        },
+        grant: {
+          sessionId: input.expectedGrantSessionId,
+          versionId: input.context.session.grantVersion,
+        },
+        lifecycle: structuredClone(root.lifecycle),
+      };
+    });
+    try {
+      const accepted = await options.acceptance.submitBatch({
+        mode: "replay",
+        recordId: root.recordId,
+        eventGameId: root.eventGameId,
+        replay: {
+          sessionBearer: input.sessionBearer,
+          originatingSessionId: input.expectedGrantSessionId,
+          replayEvidenceId: input.capabilityEvidence,
+        },
+        actions,
+      });
+      const discarded = accepted.results.find((result) => result.status === "locked-discarded");
+      if (discarded?.status !== "locked-discarded") return null;
+      return {
+        ...input.context,
+        status: "synchronized",
+        outcomes: actionIds.map((operationId) => ({
+          operationId,
+          status: "locked-discarded" as const,
+          detail: `${discarded.count} queued Controller action(s) were discarded after Game Lock.`,
+        })),
+        projection: null,
+        discardedCount: discarded.count,
+      };
+    } catch {
+      return null;
+    }
+  }
+
   async function submitControllerIntent(input: {
     sessionBearer: string;
     eventGameId: string;
     intent: unknown;
     causalPredecessorIds?: readonly string[];
+    replay?: {
+      sessionBearer: string;
+      originatingSessionId: string;
+      replayEvidenceId: string;
+      reserveOnly?: boolean;
+    };
   }): Promise<LiveEventGameControlResult> {
+    await lockEventGameIfDue(input.eventGameId);
     const authorized = await options.grantAuthority.authorizeGrant({
       sessionBearer: input.sessionBearer,
       eventGameId: input.eventGameId,
@@ -1225,7 +1399,8 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
       effectiveStateBefore.phase === "finished" &&
       existingAction === undefined &&
       parsed.value.type !== "correct-fact" &&
-      !allowsLatePreCatchGoal(parsed.value, effectiveStateBefore)
+      !allowsLatePreCatchGoal(parsed.value, effectiveStateBefore) &&
+      input.replay?.reserveOnly !== true
     ) {
       return rejectedAction(parsed.value.operationId);
     }
@@ -1522,7 +1697,8 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
       accepted = await options.acceptance.submitBatch({
         recordId: activeRoot.recordId,
         eventGameId: activeRoot.eventGameId,
-        sessionBearer: input.sessionBearer,
+        ...(input.replay === undefined ? { sessionBearer: input.sessionBearer } : {}),
+        ...(input.replay === undefined ? {} : { mode: "replay", replay: input.replay }),
         lifecycleTransition,
         actions,
         reconcileDerivedLifecycle: derivedLifecycle !== undefined,
@@ -1534,7 +1710,7 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
     const result = accepted.results[0];
     const consequenceResult = accepted.results[1];
     if (accepted.status === "partial" || result?.status === "retry-later") {
-      return retryableAction(parsed.value.operationId);
+      return retryableAction(parsed.value.operationId, accepted.reservationId);
     }
     if (
       consequenceResult !== undefined &&
@@ -1599,6 +1775,46 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
     ) {
       return replayRejected(input.actions, replayContext);
     }
+    const replayDigest = sha256(
+      canonicalizeJson({
+        eventGameId: input.eventGameId,
+        batchId: input.batchId,
+        replicaGeneration: input.replicaGeneration,
+        grantSessionId: input.expectedGrantSessionId,
+        grantVersion: input.expectedGrantVersion,
+        actions: input.actions,
+      }),
+    );
+    if (options.authorizeLockedReplay !== undefined) {
+      const authorized = await options.authorizeLockedReplay({
+        sessionBearer: input.sessionBearer,
+        eventGameId: input.eventGameId,
+        grantSessionId: input.expectedGrantSessionId,
+        grantVersion: input.expectedGrantVersion,
+      });
+      if (!authorized) return replayRejected(input.actions, replayContext);
+      options.lockedReplayCapability?.authorize(replayDigest);
+    }
+    await lockEventGameIfDue(input.eventGameId);
+    const capability = options.lockedReplayCapability;
+    const capabilityEvidence = capability?.find(replayDigest) ?? null;
+    const ownerAfterLock = await options.resolveEventGameRecord(input.eventGameId);
+    const rootAfterLock =
+      ownerAfterLock === null
+        ? null
+        : await ownerAfterLock.record.readRoot(ownerAfterLock.recordId);
+    if (rootAfterLock?.lifecycle.lockedAtMs !== null && capabilityEvidence === null) {
+      return replayRejected(input.actions, replayContext);
+    }
+    const lockedReplay = await discardLockedReplay({
+      sessionBearer: input.sessionBearer,
+      eventGameId: input.eventGameId,
+      expectedGrantSessionId: input.expectedGrantSessionId,
+      capabilityEvidence: capabilityEvidence ?? "",
+      actions: input.actions,
+      context: replayContext,
+    });
+    if (lockedReplay !== null) return lockedReplay;
     const authorized = await options.grantAuthority.authorizeGrant({
       sessionBearer: input.sessionBearer,
       eventGameId: input.eventGameId,
@@ -1660,6 +1876,16 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
         input.actions.flatMap((candidate) => {
           const operationId = readOperationId(candidate.intent);
           return operationId === null ? [] : [operationId];
+        }),
+      );
+      const replayDigest = sha256(
+        canonicalizeJson({
+          eventGameId: input.eventGameId,
+          batchId: input.batchId,
+          replicaGeneration: input.replicaGeneration,
+          grantSessionId: input.expectedGrantSessionId,
+          grantVersion: input.expectedGrantVersion,
+          actions: input.actions,
         }),
       );
       let remaining = [...input.actions];
@@ -1728,6 +1954,33 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
             !allowsLatePreCatchGoal(parsedIntent.value, replayState) &&
             !persistedOperationIds.has(operationId)
           ) {
+            const capability = options.lockedReplayCapability;
+            const replayEvidenceId =
+              capability?.find(replayDigest) ?? capability?.issue(replayDigest);
+            if (replayEvidenceId !== undefined) {
+              const heldResult = await submitControllerIntent({
+                sessionBearer: input.sessionBearer,
+                eventGameId: authorized.eventGameId,
+                intent: candidate.intent,
+                causalPredecessorIds: predecessors,
+                replay: {
+                  sessionBearer: input.sessionBearer,
+                  originatingSessionId: input.expectedGrantSessionId,
+                  replayEvidenceId,
+                  reserveOnly: true,
+                },
+              });
+              if (
+                heldResult.status === "retryable" &&
+                heldResult.replayReservationId !== undefined
+              ) {
+                capability?.remember({
+                  evidence: replayEvidenceId,
+                  replayDigest,
+                  reservationId: heldResult.replayReservationId,
+                });
+              }
+            }
             outcomes.push({ operationId, status: "held-for-correction" });
             held.add(operationId);
             progressed = true;
@@ -1866,6 +2119,7 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
       }
       return activeControllerSessions.size;
     },
+    reconcileEventGameLocks,
     reconcileActiveControllerSessions,
     close() {
       closed = true;
@@ -3888,11 +4142,15 @@ function rejectedAction(operationId: string | null): LiveEventGameControlResult 
   };
 }
 
-function retryableAction(operationId: string | null): LiveEventGameControlResult {
+function retryableAction(
+  operationId: string | null,
+  replayReservationId?: string,
+): LiveEventGameControlResult {
   return {
     status: "retryable",
     message: "Controller action was not committed; retry is safe.",
     operationId,
+    ...(replayReservationId === undefined ? {} : { replayReservationId }),
   };
 }
 

@@ -380,6 +380,8 @@ export type FoundationStorageLiveness = { ok: true; process: "available" };
 
 export type FoundationStorageSnapshot = {
   revision: number;
+  /** Optional inventory used by lifecycle coordinators; older adapters may omit it. */
+  listRoots?(): EventGameRecordRoot[];
   findRootByRecordId(recordId: string): EventGameRecordRoot | null;
   findRootByEventGameId(eventGameId: string): EventGameRecordRoot | null;
   findRootByPitchSlotId(pitchSlotId: string): EventGameRecordRoot | null;
