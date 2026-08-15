@@ -42,6 +42,9 @@ import {
   type StoredEventGameRecordRoot,
   type StoredEventCatalogEvent,
   type StoredEventCatalogGameDay,
+  type StoredEventCatalogTeam,
+  type StoredEventCatalogRosterEntry,
+  type StoredEventCatalogPitch,
   type EventCatalogAuditEntry,
   type GrantAdmissionStateAnchor,
   isThenable,
@@ -94,6 +97,9 @@ type MemoryState = {
   integrityAnchors: Map<string, AcceptanceIntegrityAnchor>;
   events: Map<string, StoredEventCatalogEvent>;
   gameDays: Map<string, StoredEventCatalogGameDay>;
+  eventTeams: Map<string, StoredEventCatalogTeam>;
+  rosterEntries: Map<string, StoredEventCatalogRosterEntry>;
+  pitches: Map<string, StoredEventCatalogPitch>;
   eventAudits: Map<string, EventCatalogAuditEntry>;
   grantStateAnchors: Map<string, MemoryGrantStateAnchor>;
   grantAdmissionTelemetry: Map<string, GrantAdmissionTelemetry>;
@@ -134,6 +140,9 @@ class InMemoryFoundationStorage implements FoundationStorage {
     integrityAnchors: new Map(),
     events: new Map(),
     gameDays: new Map(),
+    eventTeams: new Map(),
+    rosterEntries: new Map(),
+    pitches: new Map(),
     eventAudits: new Map(),
     grantStateAnchors: new Map(),
     grantAdmissionTelemetry: new Map(),
@@ -455,6 +464,28 @@ class InMemoryFoundationStorage implements FoundationStorage {
       ],
       maintenance: ["pruneGrantAdmissionTelemetry", "writeGrantAdmissionStateAnchor"],
       anchors: ["readGrantAdmissionStateAnchor", "writeGrantAdmissionStateAnchor"],
+    } as const;
+  }
+
+  eventCatalogStorageCapability() {
+    return {
+      name: "event-catalog-storage",
+      version: 1,
+      implementation: "event-teams-rosters-pitches-transaction-v1",
+      transaction: [
+        "findEventTeam",
+        "listEventTeams",
+        "listRoster",
+        "findRosterEntry",
+        "findPitch",
+        "listPitches",
+        "insertEventTeam",
+        "updateEventTeam",
+        "insertRosterEntry",
+        "updateRosterEntry",
+        "insertPitch",
+        "updatePitch",
+      ],
     } as const;
   }
 
@@ -1020,6 +1051,39 @@ function createTransaction(
         )
         .map((gameDay) => structuredClone(gameDay));
     },
+    findEventTeam(eventTeamId) {
+      const team = state.eventTeams.get(eventTeamId);
+      return team === undefined ? null : structuredClone(team);
+    },
+    listEventTeams(eventId) {
+      return [...state.eventTeams.values()]
+        .filter((team) => team.eventId === eventId)
+        .sort((left, right) => left.eventTeamId.localeCompare(right.eventTeamId))
+        .map((team) => structuredClone(team));
+    },
+    listRoster(eventTeamId) {
+      return [...state.rosterEntries.values()]
+        .filter((entry) => entry.eventTeamId === eventTeamId)
+        .sort((left, right) => left.playerNumber - right.playerNumber)
+        .map((entry) => structuredClone(entry));
+    },
+    findRosterEntry(eventTeamId, playerNumber) {
+      const entry = [...state.rosterEntries.values()].find(
+        (candidate) =>
+          candidate.eventTeamId === eventTeamId && candidate.playerNumber === playerNumber,
+      );
+      return entry === undefined ? null : structuredClone(entry);
+    },
+    findPitch(pitchId) {
+      const pitch = state.pitches.get(pitchId);
+      return pitch === undefined ? null : structuredClone(pitch);
+    },
+    listPitches(eventId) {
+      return [...state.pitches.values()]
+        .filter((pitch) => pitch.eventId === eventId)
+        .sort((left, right) => left.pitchId.localeCompare(right.pitchId))
+        .map((pitch) => structuredClone(pitch));
+    },
     listEventAuditTrail(eventId) {
       return [...state.eventAudits.values()]
         .filter((audit) => audit.eventId === eventId)
@@ -1092,6 +1156,92 @@ function createTransaction(
       if (previous === undefined) throw new FoundationStorageConstraintError("game-day-id");
       state.gameDays.delete(gameDayId);
       undo.push(() => state.gameDays.set(gameDayId, previous));
+    },
+    insertEventTeam(team) {
+      if (!state.events.has(team.eventId)) throw new FoundationStorageConstraintError("event-id");
+      if (state.eventTeams.has(team.eventTeamId))
+        throw new FoundationStorageConstraintError("event-team-id");
+      if (
+        [...state.eventTeams.values()].some(
+          (candidate) => candidate.eventId === team.eventId && candidate.name === team.name,
+        )
+      )
+        throw new FoundationStorageConstraintError("event-team-name");
+      state.eventTeams.set(team.eventTeamId, structuredClone(team));
+      undo.push(() => state.eventTeams.delete(team.eventTeamId));
+    },
+    updateEventTeam(team) {
+      const previous = state.eventTeams.get(team.eventTeamId);
+      if (previous === undefined) throw new FoundationStorageConstraintError("event-team-id");
+      if (
+        [...state.eventTeams.values()].some(
+          (candidate) =>
+            candidate.eventTeamId !== team.eventTeamId &&
+            candidate.eventId === team.eventId &&
+            candidate.name === team.name,
+        )
+      )
+        throw new FoundationStorageConstraintError("event-team-name");
+      state.eventTeams.set(team.eventTeamId, structuredClone(team));
+      undo.push(() => state.eventTeams.set(team.eventTeamId, previous));
+    },
+    insertRosterEntry(entry) {
+      if (!state.eventTeams.has(entry.eventTeamId) || !state.events.has(entry.eventId))
+        throw new FoundationStorageConstraintError("event-team-id");
+      if (state.rosterEntries.has(entry.rosterEntryId))
+        throw new FoundationStorageConstraintError("roster-entry-id");
+      if (
+        [...state.rosterEntries.values()].some(
+          (candidate) =>
+            candidate.eventTeamId === entry.eventTeamId &&
+            candidate.playerNumber === entry.playerNumber,
+        )
+      )
+        throw new FoundationStorageConstraintError("roster-player-number");
+      state.rosterEntries.set(entry.rosterEntryId, structuredClone(entry));
+      undo.push(() => state.rosterEntries.delete(entry.rosterEntryId));
+    },
+    updateRosterEntry(entry) {
+      const previous = state.rosterEntries.get(entry.rosterEntryId);
+      if (previous === undefined) throw new FoundationStorageConstraintError("roster-entry-id");
+      if (
+        [...state.rosterEntries.values()].some(
+          (candidate) =>
+            candidate.rosterEntryId !== entry.rosterEntryId &&
+            candidate.eventTeamId === entry.eventTeamId &&
+            candidate.playerNumber === entry.playerNumber,
+        )
+      )
+        throw new FoundationStorageConstraintError("roster-player-number");
+      state.rosterEntries.set(entry.rosterEntryId, structuredClone(entry));
+      undo.push(() => state.rosterEntries.set(entry.rosterEntryId, previous));
+    },
+    insertPitch(pitch) {
+      if (!state.events.has(pitch.eventId)) throw new FoundationStorageConstraintError("event-id");
+      if (state.pitches.has(pitch.pitchId)) throw new FoundationStorageConstraintError("pitch-id");
+      if (
+        [...state.pitches.values()].some(
+          (candidate) => candidate.eventId === pitch.eventId && candidate.name === pitch.name,
+        )
+      )
+        throw new FoundationStorageConstraintError("pitch-name");
+      state.pitches.set(pitch.pitchId, structuredClone(pitch));
+      undo.push(() => state.pitches.delete(pitch.pitchId));
+    },
+    updatePitch(pitch) {
+      const previous = state.pitches.get(pitch.pitchId);
+      if (previous === undefined) throw new FoundationStorageConstraintError("pitch-id");
+      if (
+        [...state.pitches.values()].some(
+          (candidate) =>
+            candidate.pitchId !== pitch.pitchId &&
+            candidate.eventId === pitch.eventId &&
+            candidate.name === pitch.name,
+        )
+      )
+        throw new FoundationStorageConstraintError("pitch-name");
+      state.pitches.set(pitch.pitchId, structuredClone(pitch));
+      undo.push(() => state.pitches.set(pitch.pitchId, previous));
     },
     appendEventAudit(entry) {
       if (state.eventAudits.has(entry.auditId)) {

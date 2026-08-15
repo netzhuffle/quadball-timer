@@ -3,6 +3,12 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
+  createDeterministicTestIqaInterpreter,
+  type ControlActionInput,
+} from "@/lib/event-game-actions";
+import { createEventGameRecord } from "@/lib/event-game-record";
+import type { EventGameRecordRoot } from "@/lib/foundation-record-types";
+import {
   createEventCatalog,
   createFoundationEventCatalogStorage,
   type EventCatalogFoundationStorage,
@@ -85,6 +91,136 @@ describe("Event operations catalog through foundation SQLite", () => {
     }
   });
 
+  test("persists Team roster corrections and stable Pitches across restart", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "quadball-event-teams-pitches-"));
+    const databasePath = join(directory, "catalog.sqlite");
+    let idCounter = 0;
+    const options = {
+      clock: { nowMs: () => Date.UTC(2026, 7, 14, 12) },
+      ids: {
+        next: (kind: "event" | "game-day" | "audit" | "operation") =>
+          `${kind}-teams-${++idCounter}`,
+      },
+    };
+    try {
+      const foundation = openSqliteFoundationStorage(databasePath);
+      await foundation.applyMigrations();
+      const catalog = createEventCatalog(createFoundationEventCatalogStorage(foundation), options);
+      const event = await catalog.createEvent({ name: "Roster Event", timeZone: "UTC" }, authority);
+      if (event.status !== "accepted") throw new Error("Expected Event.");
+      const team = await catalog.createEventTeam(event.value.eventId, { name: "Blue" }, authority);
+      if (team.status !== "accepted") throw new Error("Expected Team.");
+      await catalog.upsertEventTeamRoster(
+        event.value.eventId,
+        team.value.eventTeamId,
+        { playerNumber: 12, publicName: "Before" },
+        authority,
+      );
+      const pitch = await catalog.createPitch(
+        event.value.eventId,
+        { name: "Pitch One" },
+        authority,
+      );
+      if (pitch.status !== "accepted") throw new Error("Expected Pitch.");
+      await catalog.upsertEventTeamRoster(
+        event.value.eventId,
+        team.value.eventTeamId,
+        { playerNumber: 12, publicName: "After" },
+        authority,
+      );
+      expect(
+        await catalog.lookupAudienceRoster(event.value.eventId, team.value.eventTeamId, 12),
+      ).toMatchObject({ status: "accepted", value: { publicName: "After" } });
+      foundation.close();
+
+      const reopenedFoundation = openSqliteFoundationStorage(databasePath);
+      const reopened = createEventCatalog(
+        createFoundationEventCatalogStorage(reopenedFoundation),
+        options,
+      );
+      const inspected = await reopened.inspectEvent(event.value.eventId, authority);
+      expect(inspected).toMatchObject({
+        status: "accepted",
+        value: {
+          teams: [{ eventTeamId: team.value.eventTeamId, roster: [{ publicName: "After" }] }],
+          pitches: [{ pitchId: pitch.value.pitchId, name: "Pitch One" }],
+        },
+      });
+      const audit = await reopened.listAuditTrail(event.value.eventId, authority);
+      expect(audit).toMatchObject({ status: "accepted" });
+      if (audit.status !== "accepted") return;
+      expect(audit.value.map((entry) => entry.action).sort()).toEqual([
+        "event-created",
+        "event-team-created",
+        "pitch-created",
+        "roster-updated",
+        "roster-updated",
+      ]);
+      reopenedFoundation.close();
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps retained Game Facts unchanged across roster additions and corrections", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "quadball-event-catalog-facts-"));
+    const foundation = openSqliteFoundationStorage(join(directory, "catalog.sqlite"));
+    await foundation.applyMigrations();
+    try {
+      const catalog = createEventCatalog(createFoundationEventCatalogStorage(foundation), {
+        clock: { nowMs: () => Date.UTC(2026, 7, 14, 12) },
+      });
+      const event = await catalog.createEvent({ name: "Facts Event", timeZone: "UTC" }, authority);
+      if (event.status !== "accepted") throw new Error("Expected Event.");
+      const root = createFactRoot(event.value.eventId);
+      const record = createEventGameRecord(foundation, {
+        externalScopeResolver: {
+          resolve: (scope) => ({ status: "resolved", scope: structuredClone(scope) }),
+          resolveEventTeam: () => ({ status: "resolved" }),
+        },
+        clock: () => 1_000,
+        interpreter: createDeterministicTestIqaInterpreter("rules-v1"),
+        auditAuthorityVerifier: { verify: () => true },
+      });
+      expect(await record.registerRoot(root)).toMatchObject({ status: "registered" });
+      expect(await record.acceptAction(createFactInput(root))).toMatchObject({
+        status: "accepted",
+      });
+      const before = {
+        root: await foundation.readRoot(root.recordId),
+        actions: await foundation.readActions(root.recordId),
+        audits: await foundation.readAuditEntries(root.recordId),
+      };
+      const team = await catalog.createEventTeam(
+        event.value.eventId,
+        { name: "Facts Blue" },
+        authority,
+      );
+      if (team.status !== "accepted") throw new Error("Expected Team.");
+      await catalog.upsertEventTeamRoster(
+        event.value.eventId,
+        team.value.eventTeamId,
+        { playerNumber: 8, publicName: "Fact Player" },
+        authority,
+      );
+      await catalog.upsertEventTeamRoster(
+        event.value.eventId,
+        team.value.eventTeamId,
+        { playerNumber: 8, publicName: "Corrected Fact Player" },
+        authority,
+      );
+      const after = {
+        root: await foundation.readRoot(root.recordId),
+        actions: await foundation.readActions(root.recordId),
+        audits: await foundation.readAuditEntries(root.recordId),
+      };
+      expect(after).toEqual(before);
+    } finally {
+      foundation.close();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   test("rolls back a catalog mutation when its audit append fails", async () => {
     const directory = await mkdtemp(join(tmpdir(), "quadball-event-catalog-atomic-"));
     const databasePath = join(directory, "catalog.sqlite");
@@ -150,6 +286,7 @@ describe("Event operations catalog through foundation SQLite", () => {
         return durable.transaction(work);
       },
       snapshot: () => durable.snapshot(),
+      eventCatalogStorageCapability: () => durable.eventCatalogStorageCapability(),
     };
     const catalog = createEventCatalog(injected, {
       clock: { nowMs: () => Date.UTC(2026, 7, 14, 12) },
@@ -196,3 +333,60 @@ describe("Event operations catalog through foundation SQLite", () => {
     }
   });
 });
+
+function createFactRoot(eventId: string): EventGameRecordRoot {
+  return {
+    recordId: "facts-record",
+    eventId,
+    eventGameId: "facts-game",
+    ownership: { eventId, eventGameId: "facts-game" },
+    externalScope: {
+      eventId,
+      gameDayId: "facts-day",
+      pitchId: "facts-pitch",
+      pitchSlotId: "facts-slot",
+    },
+    gameSides: [
+      { id: "side-a", eventTeamId: "team-a", teamInterpretationRef: "interpretation-a" },
+      { id: "side-b", eventTeamId: "team-b", teamInterpretationRef: "interpretation-b" },
+    ],
+    lifecycle: {
+      phase: "scheduled",
+      commencedAtMs: null,
+      finishedAtMs: null,
+      lockedAtMs: null,
+      lockReason: null,
+    },
+    compatibility: {
+      recordVersion: "record-v1",
+      schemaVersion: "schema-v1",
+      interpreterVersion: "rules-v1",
+    },
+    creationEvidence: {
+      operationId: "register-facts-record",
+      actorReference: "event-admin-session-1",
+      source: "event-game-registration",
+      createdAtMs: 500,
+    },
+  };
+}
+
+function createFactInput(root: EventGameRecordRoot): ControlActionInput {
+  return {
+    recordId: root.recordId,
+    eventGameId: root.eventGameId,
+    operationId: "fact-operation",
+    kind: { id: "game-fact", version: "1" },
+    payload: {
+      factId: "fact-one",
+      factType: "deterministic-test-fact",
+      gameSideId: "side-a",
+      gameTimeMs: 1_000,
+      data: { kind: "retained" },
+    },
+    causalPredecessorIds: [],
+    occurrence: { trustedAtMs: 1_000, clientOriginAtMs: 1_000, source: "online" },
+    grant: { sessionId: "session-1", versionId: "grant-version-1" },
+    lifecycle: structuredClone(root.lifecycle),
+  };
+}
