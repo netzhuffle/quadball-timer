@@ -9,11 +9,13 @@ import {
   createSqliteAdHocRecoveryAdapter,
   openSqliteAdHocStore,
 } from "@/lib/ad-hoc-games";
+import { createGrantKeyRingDocument, writeGrantKeyRingFile } from "@/lib/grant-key-ring-custody";
 
 let directory = "";
 let certificatePath = "";
 let keyPath = "";
 let databasePath = "";
+let grantKeyRingPath = "";
 let port = 0;
 let origin = "";
 let environment: NodeJS.ProcessEnv = {};
@@ -31,6 +33,7 @@ async function run() {
   certificatePath = join(directory, "localhost.crt");
   keyPath = join(directory, "localhost.key");
   databasePath = join(directory, "ad-hoc.sqlite");
+  grantKeyRingPath = join(directory, "grant-key-ring.json");
   port = 39_000 + Math.floor(Math.random() * 1_000);
   origin = `https://localhost:${port}`;
   environment = {
@@ -43,6 +46,7 @@ async function run() {
     TECHNICAL_ADMIN_DATABASE: join(directory, "technical-admin.sqlite"),
     TLS_CERT_FILE: certificatePath,
     TLS_KEY_FILE: keyPath,
+    GRANT_KEY_RING_FILE: grantKeyRingPath,
     HOST: "127.0.0.1",
     PORT: String(port),
   };
@@ -74,6 +78,7 @@ async function run() {
     const certificateExit = await raceWithDeadline(setupProcess.exited, lifecycleController.signal);
     setupProcess = null;
     if (certificateExit !== 0) throw new Error("openssl could not create a certificate.");
+    writeGrantKeyRingFile(grantKeyRingPath, createGrantKeyRingDocument("test"));
 
     await raceWithDeadline(startServer(), lifecycleController.signal);
     browser = await raceWithDeadline(
