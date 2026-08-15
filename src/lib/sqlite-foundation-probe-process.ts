@@ -34,6 +34,7 @@ export type ProbeWorkerResult = {
   stderrBytes: number;
   outputExceeded: boolean;
   observedOutputBytes?: number;
+  measurement?: ProbeResourceMeasurement;
 };
 
 export type ProbeOutputBudget = {

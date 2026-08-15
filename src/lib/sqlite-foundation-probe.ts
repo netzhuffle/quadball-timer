@@ -14,37 +14,20 @@ import {
   type ProbeSupervisionOptions,
   type ProbeWorkerResult,
 } from "@/lib/sqlite-foundation-probe-process";
-export {
-  buildNoNetworkProbeCommand,
-  createProbeNetworkBoundary,
-  ProbeNetworkBoundaryError,
-} from "@/lib/sqlite-foundation-probe-network";
-export {
-  countProbeDescendants,
-  createProbeResourceController,
-  ProbeResourceControlError,
-  ProbeResourceLimitError,
-} from "@/lib/sqlite-foundation-probe-resources";
 import {
   SqliteFoundationGateError,
   translateProbeError,
 } from "@/lib/sqlite-foundation-probe-errors";
 import {
   cleanupOwnedProbeWorkspace,
-  cleanupOwnedProbeWorkspaceContainer,
-  createProbeOuterEnvironment,
   createProbeWorkspace,
-  createProbeWorkspaceContainer,
+  measureOwnedProbeWorkspaceBytes,
   parseSqliteProbeInvocation,
   ProbeOwnershipError,
-  SQLITE_FOUNDATION_PROBE_PARENT_CAPABILITY_ENV,
-  SQLITE_FOUNDATION_PROBE_PARENT_DIRECTORY_ENV,
-  readProbeWorkspaceContainerFromEnv,
   SQLITE_FOUNDATION_PROBE_WRITER_COUNT,
   validateOwnedProbeWorkspace,
   validateOwnedProbeWorkerWorkspace,
   type ProbeWorkspace,
-  type ProbeWorkspaceContainer,
 } from "@/lib/sqlite-foundation-probe-containment";
 
 export {
@@ -52,10 +35,8 @@ export {
   capDiagnosticOutput,
   createProbeOutputBudget,
   cleanupOwnedProbeWorkspace,
-  cleanupOwnedProbeWorkspaceContainer,
   createProbeWorkspace,
-  createProbeWorkspaceContainer,
-  createProbeOuterEnvironment,
+  measureOwnedProbeWorkspaceBytes,
   parseSqliteProbeInvocation,
   validateOwnedProbeWorkspace,
   validateOwnedProbeWorkerWorkspace,
@@ -73,10 +54,36 @@ export type {
 } from "@/lib/sqlite-foundation-probe-process";
 export type {
   ProbeWorkspace,
-  ProbeWorkspaceContainer,
   ProbeWorkspaceState,
   SqliteProbeInvocation,
 } from "@/lib/sqlite-foundation-probe-containment";
+export {
+  admitDockerEngine,
+  buildDockerContainerArguments,
+  buildFocusedDockerCommand,
+  cleanupMalformedCreateOutput,
+  cleanupOwnedDockerContainer,
+  createDockerProbeExecution,
+  isDockerResourceViolation,
+  isSupportedEmbeddedSqliteVersion,
+  parseContainerId,
+  parseDockerArtifactIdentity,
+  parseDockerEngineIdentity,
+  verifyOwnedDockerContainerAbsence,
+  verifyDockerContainerConfiguration,
+  DockerAdmissionError,
+  DockerCleanupError,
+  DockerExecutionError,
+  DockerOwnershipError,
+  DockerResourceLimitError,
+} from "@/lib/sqlite-foundation-probe-docker";
+export type {
+  DockerAdmissionDisposition,
+  DockerCommandResult,
+  DockerArtifactIdentity,
+  DockerProbeDependencies,
+  DockerProbeExecution,
+} from "@/lib/sqlite-foundation-probe-docker";
 export {
   SQLITE_FOUNDATION_PROBE_COMMAND,
   SQLITE_FOUNDATION_PROBE_MAX_DISK_BYTES,
@@ -108,6 +115,13 @@ type CheckpointRow = {
 };
 
 export type SqliteFoundationProbeReport = {
+  artifactIdentity: {
+    os: string;
+    architecture: string;
+    bunVersion: string;
+    bunRevision: string;
+    sqliteVersion: string;
+  };
   bunVersion: string;
   bunRevision: string;
   sqliteVersion: string;
@@ -120,6 +134,7 @@ export type SqliteFoundationProbeReport = {
   quickCheck: string;
   foreignKeyViolations: number;
   duplicateKeys: number;
+  temporaryDataBytes: number;
 };
 
 export function isSupportedSqliteVersion(version: string): boolean {
@@ -156,19 +171,11 @@ export async function runSqliteFoundationProbe(
     ...(signalScope === null ? {} : { signal: signalScope.signal }),
   };
   let workspace: ProbeWorkspace | undefined;
-  let ownedContainer: ProbeWorkspaceContainer | undefined;
   let report: SqliteFoundationProbeReport | undefined;
   let probeError: SqliteFoundationGateError | undefined;
 
   try {
-    const inheritedContainer = await readProbeWorkspaceContainerFromEnv();
-    const container = inheritedContainer ?? (await createProbeWorkspaceContainer());
-    if (inheritedContainer === null) {
-      ownedContainer = container;
-      process.env[SQLITE_FOUNDATION_PROBE_PARENT_DIRECTORY_ENV] = container.directoryPath;
-      process.env[SQLITE_FOUNDATION_PROBE_PARENT_CAPABILITY_ENV] = container.capability;
-    }
-    const probeWorkspace = await createProbeWorkspace(container);
+    const probeWorkspace = await createProbeWorkspace();
     workspace = probeWorkspace;
     const runtime = await prepareProbeDatabase(probeWorkspace);
     if (!isSupportedSqliteVersion(runtime.sqliteVersion)) {
@@ -209,22 +216,6 @@ export async function runSqliteFoundationProbe(
         "SQLite integrity probe cleanup could not be verified; return the database choice to a human.",
       );
     }
-  }
-  if (ownedContainer !== undefined) {
-    try {
-      await cleanupOwnedProbeWorkspaceContainer(
-        ownedContainer.directoryPath,
-        ownedContainer.capability,
-      );
-    } catch {
-      cleanupError ??= new SqliteFoundationGateError(
-        "SQLite integrity probe cleanup could not be verified; return the database choice to a human.",
-      );
-    }
-  }
-  if (ownedContainer !== undefined) {
-    delete process.env[SQLITE_FOUNDATION_PROBE_PARENT_DIRECTORY_ENV];
-    delete process.env[SQLITE_FOUNDATION_PROBE_PARENT_CAPABILITY_ENV];
   }
   signalScope?.cleanup();
 
@@ -320,6 +311,13 @@ async function verifyProbeDatabase(
     );
 
     const report: SqliteFoundationProbeReport = {
+      artifactIdentity: {
+        os: process.platform,
+        architecture: process.arch,
+        bunVersion: runtime.bunVersion,
+        bunRevision: runtime.bunRevision,
+        sqliteVersion: runtime.sqliteVersion,
+      },
       ...runtime,
       expectedRows:
         SQLITE_FOUNDATION_PROBE_WORKLOAD.writerCount *
@@ -332,6 +330,10 @@ async function verifyProbeDatabase(
       quickCheck,
       foreignKeyViolations,
       duplicateKeys,
+      temporaryDataBytes: await measureOwnedProbeWorkspaceBytes(
+        workspace.directoryPath,
+        workspace.capability,
+      ),
     };
 
     if (

@@ -1,4 +1,3 @@
-import type { ProbeRetainedCgroupController } from "@/lib/sqlite-foundation-probe-cgroup";
 import type { ProbeQualificationResult } from "@/lib/sqlite-foundation-probe-result";
 
 export const SQLITE_FOUNDATION_PROBE_RESULT_MAX_BYTES = 4 * 1024;
@@ -28,108 +27,31 @@ export function capProbeEvidenceList(values: readonly unknown[], maximum = 16): 
     .filter((value) => value !== "unknown");
 }
 
-export function retainedControllerEvidence(
-  controller: ProbeRetainedCgroupController | null,
-  cleanupUnknown = false,
-): ProbeQualificationResult["cleanup"]["retainedController"] {
-  if (controller === null) {
-    return {
-      state: cleanupUnknown ? "unknown" : "none",
-      scope: cleanupUnknown ? "invocation-cgroup" : null,
-      resources: [],
-    };
-  }
-  const resources: ProbeQualificationResult["cleanup"]["retainedController"]["resources"] = [];
-  for (const retainedPath of controller.retainedPaths) {
-    if (retainedPath === controller.rootPath) resources.push("root");
-    else if (retainedPath === controller.helperPath) resources.push("helper");
-    else if (retainedPath === controller.workloadPath) resources.push("workload");
-    else if (retainedPath === controller.markerPath) resources.push("capability-marker");
-  }
-  return {
-    state: "retained",
-    scope: "invocation-cgroup",
-    resources: [...new Set(resources)],
-  };
-}
-
 export function boundedProbeQualificationResult(
   result: ProbeQualificationResult,
 ): ProbeQualificationResult {
   if (jsonByteLength(result) <= SQLITE_FOUNDATION_PROBE_RESULT_MAX_BYTES) return result;
-  const fallback: ProbeQualificationResult = {
-    schemaVersion: 1,
-    invocationId: capProbeEvidenceString(result.invocationId, 64, "unknown"),
-    phase: result.phase,
+  return {
+    ...result,
     command: "qualification-harness",
     commit: validCommit(result.commit),
-    platform: {
-      os: capProbeEvidenceString(result.platform.os, 16),
-      arch: capProbeEvidenceString(result.platform.arch, 16),
-      bunVersion: capProbeEvidenceString(result.platform.bunVersion, 32),
-      bunRevision: capProbeEvidenceString(result.platform.bunRevision, 64),
-      sqliteVersion: capProbeEvidenceString(result.platform.sqliteVersion, 32, "unknown"),
-    },
-    startedAt: capProbeEvidenceString(result.startedAt, 32),
-    endedAt: capProbeEvidenceString(result.endedAt, 32),
-    durationMs: Number.isSafeInteger(result.durationMs) ? result.durationMs : 0,
     measuredResources: {
       processCount: boundedMeasurement(result.measuredResources.processCount),
       peakMemoryBytes: boundedMeasurement(result.measuredResources.peakMemoryBytes),
       diskBytes: boundedMeasurement(result.measuredResources.diskBytes),
       outputBytes: boundedMeasurement(result.measuredResources.outputBytes),
+      ...(result.measuredResources.resourceViolations === undefined
+        ? {}
+        : { resourceViolations: result.measuredResources.resourceViolations.slice(0, 8) }),
     },
-    outcome: result.outcome,
     cleanup: {
       ...result.cleanup,
-      failures: ["evidence-size"],
-      temporaryDataRemoved: false,
-      status: "failed",
     },
     evidence: {
-      disposition: "cleanup-failure",
-      location: null,
-      retention: "coordinator-handoff",
+      ...result.evidence,
+      emission: "failed",
+      failures: [...new Set([...(result.evidence?.failures ?? []), "evidence-size"])],
     },
-    diagnostics: { references: [], stdoutBytes: 0, stderrBytes: 0 },
-  };
-  if (jsonByteLength(fallback) <= SQLITE_FOUNDATION_PROBE_RESULT_MAX_BYTES) return fallback;
-  return {
-    schemaVersion: 1,
-    invocationId: "unknown",
-    phase: result.phase,
-    command: "qualification-harness",
-    commit: "unknown",
-    platform: {
-      os: "unknown",
-      arch: "unknown",
-      bunVersion: "unknown",
-      bunRevision: "unknown",
-      sqliteVersion: null,
-    },
-    startedAt: "unknown",
-    endedAt: "unknown",
-    durationMs: 0,
-    measuredResources: {
-      processCount: null,
-      peakMemoryBytes: null,
-      diskBytes: null,
-      outputBytes: null,
-    },
-    outcome: result.outcome,
-    cleanup: {
-      descendantsTerminated: null,
-      descendantsReaped: false,
-      controllerEmpty: null,
-      controllerRemoved: false,
-      tmpfsRemoved: null,
-      workspaceRemoved: false,
-      temporaryDataRemoved: false,
-      retainedController: { state: "unknown", scope: "invocation-cgroup", resources: [] },
-      status: "failed",
-      failures: ["evidence-size"],
-    },
-    evidence: { disposition: "cleanup-failure", location: null, retention: "coordinator-handoff" },
     diagnostics: { references: [], stdoutBytes: 0, stderrBytes: 0 },
   };
 }
@@ -140,15 +62,12 @@ export function markProbeResultEmissionFailed(
   return boundedProbeQualificationResult({
     ...result,
     outcome: result.outcome === "passed" ? "failed" : result.outcome,
-    cleanup: {
-      ...result.cleanup,
-      status: "failed",
-      failures: [...new Set([...result.cleanup.failures, "result-emission"])],
-    },
     evidence: {
-      disposition: "cleanup-failure",
-      location: null,
+      ...result.evidence,
+      disposition: result.cleanup.status === "failed" ? "cleanup-failure" : "retained-owned-state",
       retention: "coordinator-handoff",
+      emission: "failed",
+      failures: [...new Set([...(result.evidence?.failures ?? []), "result-emission"])],
     },
   });
 }

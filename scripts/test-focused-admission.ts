@@ -1,356 +1,233 @@
 import { performance } from "node:perf_hooks";
-import { tmpdir } from "node:os";
-import path from "node:path";
 import {
-  cleanupOwnedProbeWorkspaceContainer,
-  createProbeOuterEnvironment,
-  createProbeWorkspaceContainer,
-  type ProbeWorkspaceContainer,
-} from "@/lib/sqlite-foundation-probe-containment";
-import { createProbeNetworkBoundary } from "@/lib/sqlite-foundation-probe-network";
-import {
-  createProbeOutputBudget,
-  spawnProbeCommand,
-  superviseProbeWorkers,
-} from "@/lib/sqlite-foundation-probe-process";
-import {
-  createProbeResourceController,
-  readProbeTmpfsDisposition,
-  type ProbeResourceController,
-} from "@/lib/sqlite-foundation-probe-resources";
-import { createFocusedAdmissionDeadline } from "@/lib/sqlite-foundation-probe-focused-deadline";
+  admitDockerEngine,
+  buildFocusedDockerCommand,
+  cleanupMalformedCreateOutput,
+  cleanupOwnedDockerContainer,
+  parseContainerId,
+  DockerAdmissionError,
+  runDockerCommand,
+  verifyDockerContainerConfiguration,
+  type DockerAdmissionDisposition,
+} from "@/lib/sqlite-foundation-probe-docker";
 import {
   focusedAdmissionExitCode,
   focusedAdmissionRecordByteLength,
-  runFocusedBounded,
 } from "@/lib/sqlite-foundation-probe-focused-admission";
-import { capProbeEvidenceString } from "@/lib/sqlite-foundation-probe-evidence";
 
-const FOCUSED_TOTAL_DEADLINE_MS = 5_000;
-const FOCUSED_CLEANUP_RESERVE_MS = 2_000;
+class FocusedAdmissionError extends Error {
+  readonly disposition: DockerAdmissionDisposition;
+
+  constructor(message: string, disposition: DockerAdmissionDisposition) {
+    super(message);
+    this.name = "FocusedAdmissionError";
+    this.disposition = disposition;
+  }
+}
+
 const startedAt = performance.now();
-const deadline = createFocusedAdmissionDeadline(
-  FOCUSED_TOTAL_DEADLINE_MS,
-  FOCUSED_CLEANUP_RESERVE_MS,
-);
-const workSignal = deadline.workSignal;
-const overallSignal = deadline.overallSignal;
-
-let container: ProbeWorkspaceContainer | undefined;
-let controller: ProbeResourceController | undefined;
-let worker: ReturnType<typeof spawnProbeCommand> | undefined;
-let controllerEmpty: boolean | null = null;
-let controllerRemoved: boolean | null = null;
-let workspaceRemoved: boolean | null = null;
-let tmpfsRemoved: boolean | null = null;
-let descendantsTerminated: boolean | null = null;
-let descendantsReaped: boolean | null = null;
-let retainedController = false;
-const failures: string[] = [];
+const invocationId = crypto.randomUUID();
 let outcome: "passed" | "failed" | "blocked" = "blocked";
+let containerRemoved: boolean | null = null;
+let identityVerified: boolean | null = null;
+let workloadLaunched = false;
 let errorReference: string | null = null;
-const measurements: Record<string, number | null> = {
-  admissionMs: null,
-  readinessMs: null,
-  releaseAndExitMs: null,
-  sampleMs: null,
-  emitterMs: null,
-  teardownMs: null,
-  totalMs: null,
-};
+let engine: unknown = null;
+let descendantsTerminated: boolean | null = null;
+let descendantsReaped = false;
+let temporaryDataRemoved = false;
+const workAbort = new AbortController();
+const hardAbort = new AbortController();
+const workTimer = setTimeout(() => workAbort.abort(), 3_000);
+const hardTimer = setTimeout(() => hardAbort.abort(), 5_000);
+let execution: Awaited<ReturnType<typeof createHarmlessExecution>> | undefined;
 
 try {
-  if (process.platform !== "linux" || process.arch !== "x64") {
-    errorReference = "native-linux-x64-controls-unavailable";
-  } else {
-    const admissionStartedAt = performance.now();
-    container = await bounded(
-      createProbeWorkspaceContainer(workSignal),
-      workSignal,
-      "container creation",
-    );
-    const networkBoundary = await bounded(
-      createProbeNetworkBoundary({ signal: workSignal, timeoutMs: remainingMs() }),
-      workSignal,
-      "network admission",
-    );
-    controller = await bounded(
-      createProbeResourceController(container.workspaceDirectoryPath ?? container.directoryPath, {
-        networkBoundary,
-        container,
-        invocationId: crypto.randomUUID(),
-        signal: workSignal,
-      }),
-      workSignal,
-      "controller creation",
-    );
-    measurements.admissionMs = elapsed(admissionStartedAt);
-
-    const workspacePath = container.workspaceDirectoryPath ?? container.directoryPath;
-    const hostProbePaths = [
-      path.join(container.directoryPath, ".host-write-probe"),
-      path.join(process.cwd(), ".host-write-probe"),
-      path.join(tmpdir(), ".host-write-probe"),
-    ];
-    const launch = await bounded(
-      controller.prepare([
-        "/bin/sh",
-        "-eu",
-        "-c",
-        'for target in "$1" "$2" "$3"; do if printf x > "$target" 2>/dev/null; then exit 42; fi; done; test "$PWD" = "$4"; test "$TMPDIR" = "$4/tmp"',
-        "focused-admission",
-        ...hostProbePaths,
-        workspacePath,
-      ]),
-      workSignal,
-      "launch preparation",
-    );
-    const readyStartedAt = performance.now();
-    worker = spawnProbeCommand([...launch.command], {
-      detached: true,
-      env: createProbeOuterEnvironment(container),
-      outputBudget: createProbeOutputBudget(),
-      readyMarker: "READY\n",
-    });
-    const ready = await bounded(worker.ready ?? Promise.resolve(true), workSignal, "readiness");
-    if (!ready) throw new Error("focused admission did not reach readiness");
-    measurements.readinessMs = elapsed(readyStartedAt);
-    await bounded(controller.attach(worker.process.pid), workSignal, "attachment");
-    const releaseStartedAt = performance.now();
-    await bounded(launch.release(worker.process.pid), workSignal, "release");
-    const [result] = await bounded(
-      superviseProbeWorkers([worker], {
-        signal: workSignal,
-        timeoutMs: remainingMs(),
-        killWorkloadTree: () => controller?.kill() ?? Promise.resolve(),
-      }),
-      workSignal,
-      "harmless helper exit",
-    );
-    descendantsTerminated = result?.exitCode !== null && result?.exitCode !== undefined;
-    tmpfsRemoved = readProbeTmpfsDisposition(result?.stdout ?? "");
-    measurements.releaseAndExitMs = elapsed(releaseStartedAt);
-    const sampleStartedAt = performance.now();
-    await bounded(
-      controller.sample(
-        worker.process.pid,
-        workspacePath,
-        result?.stdoutBytes ?? 0,
-        result?.stdout,
-        result?.stderr,
-      ),
-      workSignal,
-      "resource sample",
-    );
-    measurements.sampleMs = elapsed(sampleStartedAt);
-    outcome = "passed";
-  }
-} catch (error) {
-  outcome = "failed";
-  errorReference = boundedErrorReference(error);
-  if (hasRetainedController(error)) {
-    retainedController = true;
-    controllerEmpty = false;
-    controllerRemoved = false;
-    failures.push("retained-controller");
-  }
-} finally {
-  const teardownStartedAt = performance.now();
-  if (controller !== undefined) {
-    try {
-      await bounded(controller.reap(overallSignal), overallSignal, "controller reap");
-      controllerEmpty = await bounded(
-        controller.isEmpty?.() ?? Promise.resolve(true),
-        overallSignal,
-        "controller empty verification",
-      );
-      descendantsReaped = controllerEmpty;
-      if (controllerEmpty) {
-        await bounded(controller.close(overallSignal), overallSignal, "controller close");
-        controllerRemoved = true;
-        controller = undefined;
-      } else {
-        controllerRemoved = false;
-        failures.push("controller-empty");
-        outcome = "failed";
-      }
-    } catch (error) {
-      retainedController = true;
-      controllerEmpty = false;
-      controllerRemoved = false;
-      descendantsReaped = false;
-      if (hasRetainedController(error)) retainedController = true;
-      failures.push("descendant-reap", "controller-empty", "controller-removal");
-      if (tmpfsRemoved !== true) failures.push("tmpfs-removal");
-      outcome = "failed";
-      errorReference ??= boundedErrorReference(error);
-    }
-  }
-  if (worker !== undefined && worker.process.exitCode === null) {
-    worker.process.kill("SIGKILL");
-    await bounded(worker.process.exited, overallSignal, "direct helper reap").catch((error) => {
-      outcome = "failed";
-      errorReference ??= boundedErrorReference(error);
-    });
-  }
-  if (worker !== undefined && worker.process.exitCode !== null) descendantsTerminated = true;
-  if (
-    container !== undefined &&
-    (controller === undefined || controllerRemoved) &&
-    !retainedController
-  ) {
-    try {
-      await bounded(
-        cleanupOwnedProbeWorkspaceContainer(
-          container.directoryPath,
-          container.capability,
-          overallSignal,
-        ),
-        overallSignal,
-        "workspace cleanup",
-      );
-      workspaceRemoved = true;
-    } catch (error) {
-      workspaceRemoved = false;
-      outcome = "failed";
-      errorReference ??= boundedErrorReference(error);
-    }
-  }
-  measurements.teardownMs = elapsed(teardownStartedAt);
-  const emitterStartedAt = performance.now();
-  const evidence = {
-    schemaVersion: 1,
-    kind: "sqlite-focused-admission-evidence",
-    platform: { os: process.platform, arch: process.arch, bunVersion: Bun.version },
-    qualificationWorkloadRan: false,
-    totalDeadlineMs: FOCUSED_TOTAL_DEADLINE_MS,
-    cleanupReserveMs: FOCUSED_CLEANUP_RESERVE_MS,
-    outcome,
-    measurements,
-    cleanup: {
-      descendantsTerminated,
-      descendantsReaped,
-      controllerEmpty,
-      controllerRemoved,
-      tmpfsRemoved,
-      workspaceRemoved,
-      failures: [...new Set(failures)],
-      retainedController: {
-        state: retainedController ? "retained" : "none",
-        scope: retainedController ? "invocation-cgroup" : null,
-        resources: [],
-      },
-    },
-    evidence: {
-      disposition: retainedController
-        ? "retained-owned-state"
-        : outcome === "failed"
-          ? "cleanup-failure"
-          : "transient-cleanup",
-      retention: retainedController || outcome === "failed" ? "coordinator-handoff" : "none",
-    },
-    blocker:
-      process.platform === "linux" && process.arch === "x64"
-        ? null
-        : "Native Linux x86-64 admission and teardown measurements remain required.",
-    errorReference,
-  };
-  measurements.emitterMs = elapsed(emitterStartedAt);
-  measurements.totalMs = elapsed(startedAt);
-  const emittedEvidence = boundedFocusedEvidence({
-    ...evidence,
-    outcome,
-    errorReference,
-    measurements,
-    cleanup: { ...evidence.cleanup, failures: [...new Set(failures)] },
+  engine = await admitDockerEngine({
+    runCommand: (arguments_) => runDockerCommand(arguments_, { signal: workAbort.signal }),
   });
-  if (emittedEvidence.outcome === "failed") outcome = "failed";
-  process.stdout.write(`${JSON.stringify(emittedEvidence)}\n`);
-  deadline.cleanup();
-  process.exitCode = focusedAdmissionExitCode(outcome);
-}
-
-async function bounded<T>(operation: Promise<T>, signal: AbortSignal, label: string): Promise<T> {
-  try {
-    return await runFocusedBounded(operation, signal, label);
-  } catch (error) {
-    if (signal.aborted && !overallSignal.aborted) {
-      await Promise.race([
-        operation.then(
-          () => undefined,
-          () => undefined,
-        ),
-        waitForAbort(overallSignal),
-      ]);
+  const command = buildFocusedDockerCommand(`quadball-timer-focused-${invocationId}`, invocationId);
+  if (command.includes("--sqlite-foundation-probe"))
+    throw new Error("focused command contains the qualification workload");
+  execution = await createHarmlessExecution(
+    command,
+    invocationId,
+    workAbort.signal,
+    hardAbort.signal,
+  );
+  workloadLaunched = true;
+  const result = await execution.run();
+  if (result.exitCode !== 0) throw new Error("Docker containment helper failed");
+  outcome = "passed";
+} catch (error) {
+  if (error instanceof DockerAdmissionError) errorReference = "docker-admission-unavailable";
+  else if (error instanceof FocusedAdmissionError) {
+    errorReference = error.name;
+    temporaryDataRemoved = error.disposition !== "unverified";
+  } else errorReference = error instanceof Error ? error.name : "UnknownError";
+  outcome = engine === null ? "blocked" : "failed";
+} finally {
+  if (execution !== undefined) {
+    if (outcome !== "passed") {
+      try {
+        await execution.stop(hardAbort.signal);
+        descendantsTerminated = true;
+        descendantsReaped = true;
+      } catch {
+        errorReference ??= "stop-wait-failed";
+      }
     }
-    throw error;
+    try {
+      const cleanup = await execution.cleanup();
+      identityVerified = cleanup.identityVerified;
+      containerRemoved = cleanup.removed;
+      temporaryDataRemoved = cleanup.removed;
+      descendantsTerminated = cleanup.descendantsTerminated ?? descendantsTerminated;
+      descendantsReaped = cleanup.descendantsReaped ?? descendantsReaped;
+      if (!cleanup.identityVerified || !cleanup.removed) outcome = "failed";
+    } catch (error) {
+      identityVerified = false;
+      containerRemoved = false;
+      outcome = "failed";
+      errorReference ??= error instanceof Error ? error.name : "cleanup-failed";
+    }
   }
+  clearTimeout(workTimer);
+  clearTimeout(hardTimer);
 }
 
-function waitForAbort(signal: AbortSignal): Promise<void> {
-  if (signal.aborted) return Promise.resolve();
-  return new Promise((resolve) =>
-    signal.addEventListener("abort", () => resolve(), { once: true }),
+const evidence = {
+  schemaVersion: 1,
+  kind: "sqlite-focused-docker-admission-evidence",
+  platform: { os: process.platform, arch: process.arch, bunVersion: Bun.version },
+  qualificationWorkloadRan: false,
+  dockerCommandContainsQualificationWorkload: false,
+  outcome,
+  containerIdentityVerified: identityVerified,
+  containerRemoved,
+  descendantsTerminated,
+  descendantsReaped,
+  temporaryDataRemoved,
+  workloadLaunched,
+  durationMs: Math.ceil(performance.now() - startedAt),
+  totalDeadlineMs: 5_000,
+  cleanupReserveMs: 2_000,
+  blocker:
+    process.platform === "linux" && process.arch === "x64" ? null : "native-linux-x64-required",
+  errorReference,
+};
+if (focusedAdmissionRecordByteLength(evidence) > 4 * 1024)
+  throw new Error("focused evidence exceeded its bound");
+process.stdout.write(`${JSON.stringify(evidence)}\n`);
+process.exitCode = focusedAdmissionExitCode(outcome);
+
+async function createHarmlessExecution(
+  command: string[],
+  capability: string,
+  workSignal: AbortSignal,
+  cleanupSignal: AbortSignal,
+) {
+  const name = command[command.indexOf("--name") + 1] ?? `quadball-timer-focused-${capability}`;
+  const create = await runDockerCommand(command, { signal: workSignal }).catch(() => null);
+  if (create === null || create.exitCode !== 0 || create.outputExceeded) {
+    const cleanupDisposition = await cleanupMalformedCreateOutput(
+      runDockerCommand,
+      name,
+      capability,
+      cleanupSignal,
+    );
+    throw new FocusedAdmissionError(
+      "Docker could not create focused container",
+      cleanupDisposition,
+    );
+  }
+  const id = parseContainerId(create.stdout);
+  if (id === null) {
+    const cleanupDisposition = await cleanupMalformedCreateOutput(
+      runDockerCommand,
+      name,
+      capability,
+      cleanupSignal,
+    );
+    throw new FocusedAdmissionError(
+      "Docker returned an invalid focused container identity",
+      cleanupDisposition,
+    );
+  }
+  const admitted = await verifyDockerContainerConfiguration(
+    runDockerCommand,
+    { id, name, capability },
+    workSignal,
+    null,
   );
-}
-
-function remainingMs(): number {
-  return Math.max(1, FOCUSED_TOTAL_DEADLINE_MS - elapsed(startedAt));
-}
-
-function elapsed(start: number): number {
-  return Math.max(0, Math.ceil(performance.now() - start));
-}
-
-function boundedErrorReference(error: unknown): string {
-  const name = error instanceof Error ? error.name : "UnknownError";
-  return capProbeEvidenceString(name.replace(/[^A-Za-z0-9_-]/g, ""), 64, "UnknownError");
-}
-
-function boundedFocusedEvidence(record: Record<string, unknown>): Record<string, unknown> {
-  if (focusedAdmissionRecordByteLength(record) <= 4 * 1024) return record;
-  return {
-    schemaVersion: 1,
-    kind: "sqlite-focused-admission-evidence",
-    platform: {
-      os: capProbeEvidenceString(process.platform, 16),
-      arch: capProbeEvidenceString(process.arch, 16),
-      bunVersion: capProbeEvidenceString(Bun.version, 32),
+  if (!admitted) {
+    const cleanupDisposition = await cleanupMalformedCreateOutput(
+      runDockerCommand,
+      name,
+      capability,
+      cleanupSignal,
+    );
+    throw new FocusedAdmissionError(
+      "Docker focused containment configuration could not be verified",
+      cleanupDisposition,
+    );
+  }
+  let stopVerified = false;
+  const execution = {
+    container: { id, name, capability, artifactPath: "", identityVerified: false },
+    async run() {
+      const start = await runDockerCommand(["start", id], { signal: workSignal });
+      if (start.exitCode !== 0) throw new Error("Docker could not start focused container");
+      await Bun.sleep(25);
+      const stop = await runDockerCommand(["stop", "--time", "1", id], { signal: workSignal });
+      if (stop.exitCode !== 0) {
+        await runDockerCommand(["kill", id], { signal: workSignal });
+      }
+      const wait = await runDockerCommand(["wait", id], { signal: workSignal });
+      parseFocusedWaitExitCode(wait);
+      stopVerified = true;
+      return {
+        exitCode: 0,
+        stdout: "",
+        stderr: "",
+        stdoutBytes: 0,
+        stderrBytes: 0,
+        outputExceeded: false,
+      };
     },
-    qualificationWorkloadRan: false,
-    totalDeadlineMs: FOCUSED_TOTAL_DEADLINE_MS,
-    cleanupReserveMs: FOCUSED_CLEANUP_RESERVE_MS,
-    outcome: "failed",
-    measurements: {
-      admissionMs: null,
-      readinessMs: null,
-      releaseAndExitMs: null,
-      sampleMs: null,
-      emitterMs: 0,
-      teardownMs: null,
-      totalMs: elapsed(startedAt),
+    async stop(signal: AbortSignal) {
+      const stop = await runDockerCommand(["stop", "--time", "1", id], {
+        signal,
+      });
+      if (stop.exitCode !== 0) {
+        await runDockerCommand(["kill", id], { signal });
+      }
+      const wait = await runDockerCommand(["wait", id], { signal });
+      parseFocusedWaitExitCode(wait);
+      stopVerified = true;
     },
-    cleanup: {
-      descendantsTerminated: null,
-      descendantsReaped: false,
-      controllerEmpty: null,
-      controllerRemoved: false,
-      tmpfsRemoved: null,
-      workspaceRemoved: false,
-      failures: ["evidence-size"],
-      retainedController: { state: "unknown", scope: "invocation-cgroup", resources: [] },
+    async cleanup() {
+      const cleanup = await cleanupOwnedDockerContainer(
+        runDockerCommand,
+        { id, name, capability },
+        cleanupSignal,
+      );
+      if (!cleanup.identityVerified) throw new Error("focused container ownership failed");
+      return {
+        ...cleanup,
+        descendantsTerminated: stopVerified,
+        descendantsReaped: stopVerified,
+        temporaryDataRemoved: cleanup.removed,
+      };
     },
-    evidence: { disposition: "cleanup-failure", retention: "coordinator-handoff" },
-    blocker: null,
-    errorReference: "focused-evidence-size-limit",
   };
+  return execution;
 }
 
-function hasRetainedController(error: unknown): boolean {
-  return (
-    typeof error === "object" &&
-    error !== null &&
-    "retainedController" in error &&
-    (error as { retainedController?: unknown }).retainedController !== null
-  );
+function parseFocusedWaitExitCode(result: { exitCode: number; stdout: string }): number {
+  if (result.exitCode !== 0 || !/^(?:0|[1-9][0-9]*)\n?$/.test(result.stdout))
+    throw new Error("Docker wait did not return an exact exit code");
+  const exitCode = Number(result.stdout.trim());
+  if (!Number.isSafeInteger(exitCode)) throw new Error("Docker wait exit code was unsafe");
+  return exitCode;
 }

@@ -73,13 +73,13 @@ The owner is a subsystem or acceptance concern, not a person's name. An optional
 - **Protected risk:** the delivered `bun-linux-x64-modern` artifact may embed an unsafe SQLite build or fail concurrent writer/checkpoint integrity despite a supported version label. This is the #71/#70 exact-artifact acceptance risk.
 - **Why cheaper evidence is insufficient:** Fast Tests cover routing, ownership, cleanup, process supervision, output limits, and deterministic database assertions. A Focused Integration Test can exercise disposable SQLite through the development runtime, but neither establishes the embedded SQLite runtime or the exact compiled-artifact concurrency behavior.
 - **Platform and artifact:** native Linux x86-64, using the exact executable produced by `bun run build:executable`. The command rejects other host platforms before launching the artifact.
-- **Isolation and filesystem:** one unique 0700 directory beneath the operating-system temporary directory, nested beneath one wrapper-owned 0700 container and mounted only inside the wrapper's verified private mount+network namespace. Every host-backed mount has positively verified non-empty `ro` and absent `rw` options; cwd and `TMPDIR` are inside the owned 16 MiB `tmpfs`, and the harness owns and validates the capability marker, database, WAL, and shared-memory sidecars. It never writes under the repository or a Production path. Each invocation creates one capability-marked cgroup root below a validated delegated parent, with helper and workload children. Broad, pre-existing, symlinked, replaced, or ambiguous targets fail closed; root members are included in TERM/KILL, reap, emptiness, and removal evidence; partial controller cleanup retains ownership evidence and blocks generic workspace cleanup. After self-attachment, `/sys/fs/cgroup` is positively verified read-only before readiness.
-- **Expected duration and resource envelope:** normally under one second; hard outer timeout 15 seconds for setup, workload, evidence, result handling, and cleanup, reserving five seconds for final termination, cgroup/filesystem cleanup, and final evidence; inner worker deadline 5 seconds; the artifact cgroup enforces at most 7 observed workload descendants (8 processes including the outer artifact), while admission/controller helpers use a separate bounded cgroup; `pids.current`/`pids.peak`, at most 512 MiB cgroup peak memory, at most 16 MiB OS-enforced temporary `tmpfs` disk, and at most 4 KiB raw-byte captured diagnostics are measured; descendants are reaped within 1 second after forced termination.
-- **Deadline justification:** the 10-second admission/work window budgets 1 second for namespace/tool admission, 5 seconds for the inner artifact gate, and 4 seconds for private-controller setup/evidence; the 5-second reserve budgets 250 ms TERM grace, 1 second cgroup-wide reap, private mount/controller teardown, and bounded result construction/emission with remaining margin. The separately named `bun run test:focused-admission` gate retains capped portable evidence for harmless native namespace/cgroup/tmpfs/readiness, sampling, emitter, and teardown under one five-second lifecycle deadline with a two-second cleanup reserve; the signal Focused Integration Test records native startup and signal-to-exit measurements for SIGINT, SIGTERM, and SIGHUP, including direct-child-exit descendant cleanup, without launching this workload. A non-Linux-x86-64 run records null native measurements and an explicit blocker. The 15-second/5-second production budget remains conservative and is not empirically accepted until harmless focused-admission evidence is captured on native Linux x86-64.
+- **Isolation and filesystem:** one newly created disposable Docker container uses `--network=none`, `--read-only`, one OS-enforced `16 MiB` `/tmp` tmpfs, a read-only bind mount of the exact artifact, a sanitized allowlisted environment, dropped capabilities, and `no-new-privileges`; Docker engine and host/server identity must be unambiguously native Linux x86-64 before start. No delegated host cgroup, nested namespace, privileged mode, host network, repository write, or Production path is used.
+- **Expected duration and resource envelope:** normally under one second; hard outer timeout 15 seconds for admission, workload, evidence, result handling, and cleanup, reserving five seconds for bounded cleanup; inner worker deadline 5 seconds; Docker enforces at most 7 observed workload descendants (8 processes including the artifact), at most 512 MiB OS-enforced peak memory, and at most 16 MiB OS-enforced temporary disk; at most 4 KiB raw-byte captured diagnostics are retained and descendants are reaped within 1 second after forced termination. A missing first Docker stats sample is retained as unavailable and does not fail an otherwise successful short workload.
+- **Deadline justification:** the 10-second work window covers Docker admission, create/start, workload, and bounded diagnostics; the 5-second reserve covers TERM/KILL, wait/reap, exact identity verification, removal, absence proof, temporary-data disposition, and evidence emission. The separately named `bun run test:focused-admission` gate uses the same harmless Docker admission/start/stop/wait/cleanup boundary under one five-second lifecycle deadline with a two-second cleanup reserve; `bun run test:focused-signal` proves the real outer entrypoint forwards SIGINT, SIGTERM, and SIGHUP through the same bounded cleanup path. A non-Linux-x86-64 run records a blocker without launching this workload.
 - **Approved occasions and venue:** explicit release qualification or coordinator-directed bounded native-Ubuntu verification only. It is never part of ordinary `test`, `check`, `build`, deployment, or automatic CI. No manual CI venue is authorized by this entry.
-- **Network and credentials:** one wrapper-owned Linux `unshare --user --map-root-user --mount --net` namespace verifies and launches the workload with no non-loopback interface or route; it fails closed if that actual exec namespace or its host-mount sealing cannot be established. The workload has no network destination or loopback target and receives a sanitized child environment. No credential, token, cookie, Production environment, or server data is passed to the artifact.
+- **Network and credentials:** Docker `--network=none` is required and is established before the artifact starts. The artifact receives only the fixed sanitized environment; no credential, token, cookie, Production environment, or server data is passed to it.
 - **Production exclusions:** no Production target, database, deployment state, credential, or durable evidence destination. The exact 6-writer/6,000-row/5,000-checkpoint workload remains unchanged and is never reduced, retried as a workload, or moved into ordinary checks.
-- **Result and diagnostics:** each invocation has one stable invocation identity. Before removing the temporary container, the harness emits one capped JSON result with `phase: pre-cleanup`, `temporaryDataRemoved: false`, and cleanup `status: pending`; after bounded cleanup it emits a separately retained final JSON result with verified cleanup success/failure. Both contain schema version, invocation identity, exact command identity, commit, platform and artifact runtime identity, start/end timestamps, duration, measured process/memory/disk/output resources, outcome, separate descendant termination/reap, controller-empty/removal, tmpfs/workspace-removal facts, retained-controller state, and named cleanup failures, transient evidence disposition, and raw-byte references to capped stdout/stderr diagnostics. Unavailable or pending facts and failure-path measurements are `null`, never fabricated.
+- **Result and diagnostics:** each invocation has one stable invocation identity. Docker daemon logs use the bounded `json-file` driver with `max-size=4k` and `max-file=1`, and the harness retains its separate capped stdout/stderr reads. Before removing the temporary container, the harness emits one capped JSON result with `phase: pre-cleanup`, `temporaryDataRemoved: false`, and cleanup `status: pending`; after bounded cleanup it emits a final result with separate descendant termination, reap/wait, exact identity verification, removal, temporary-data disposition, cleanup failures, evidence-emission status, and bounded stdout/stderr references. A failed final evidence sink never changes a truthful cleanup status, and the pre-cleanup record remains retained. Unavailable or pending facts and failure-path measurements are `null`; an observed ENOSPC path records `diskBytes: null` with the named `disk-lower-bound` violation.
 - **Retention:** the temporary database, sidecars, capability markers, and raw diagnostics are removed on success, failure, interruption, and timeout. The redacted structured result is retained only in the invoking coordinator's handoff; no raw evidence remains in `/tmp`.
 - **Replacement/removal condition:** weaken, replace, or remove this entry only after explicit maintainer approval tied to evidence that the exact-artifact SQLite/WAL risk no longer exists or that a cheaper trustworthy proof establishes the same property.
 
@@ -87,7 +87,7 @@ The committed security proof-of-concept programs under `docs/security/findings/`
 
 ### Main-branch inventory
 
-The production-shaped compiled-executable SQLite/WAL probe described in `docs/research/sqm-2026-safe-platform-baseline-refresh.md` is now maintained as the registered `check:sqlite-runtime` Qualification Test above. Its governing implementation task is #71, and the exact-artifact/concurrency gate remains explicit-only and outside ordinary checks/tests.
+The production-shaped compiled-executable SQLite/WAL probe described in `docs/research/sqm-2026-safe-platform-baseline-refresh.md` is now maintained as the registered `check:sqlite-runtime` Qualification Test above. Its governing correction is #179, and the exact-artifact/concurrency gate remains explicit-only and outside ordinary checks/tests.
 
 ## Harness contract
 
@@ -97,26 +97,28 @@ Every harness must:
 
 - enforce a hard wall-clock timeout and OS-enforced bounded process count, memory, disk, and captured output;
 - isolate every target and use only owned filesystem paths;
-- establish and verify OS-enforced network and private mount namespaces before launch with bounded asynchronous admission; authorize loopback or an isolated disposable non-Production target only when the registry entry says so, and explicitly allowlist every other destination;
+- establish and verify the registered OS-enforced network and filesystem containment boundary before launch with bounded asynchronous admission; authorize loopback or an isolated disposable non-Production target only when the registry entry says so, and explicitly allowlist every other destination;
 - use only purpose-specific non-Production credentials when credentials are unavoidable; Production credentials, Production targets, and Production/server data are prohibited;
 - own the full descendant process tree, handle interruption and timeout, terminate descendants, and verify termination;
 - clean its owned temporary data on success, failure, interruption, and timeout;
 - run a correctness failure exactly once, without automatic retry;
 - emit a bounded pre-cleanup result with cleanup pending, then a separately retained bounded final result after cleanup verification.
 
-For cgroup-backed harnesses, the invocation-root controller is part of the owned workload tree:
-root members are included in TERM/KILL, reap, emptiness, and removal evidence. Partial controller
-creation or cleanup must retain explicit ownership evidence, prevent generic workspace cleanup
-from erasing that evidence, and fail cleanup certification while any owned host cgroup remains.
-Focused-admission evidence reports descendant termination/reap, controller empty/removal,
-tmpfs/workspace removal, and named failures separately, with total duration measured after bounded
-teardown and evidence emission.
+For the Docker-backed harness, the owned container identity is the exact full container ID plus
+the generated name and capability label. Cleanup revalidates all three before removal and proves
+absence with a successful bounded `docker ps --all --no-trunc` query whose exact output is empty.
+Daemon, authentication, timeout, malformed, truncated, prefix, changed-name, changed-label, and
+unrelated-container results fail cleanup closed. Focused-admission evidence reports container
+termination/reap, exact identity, removal, temporary-data disposition, and named failures
+separately, with total duration measured after bounded teardown and evidence emission.
 
 Before any real workload is admitted, deterministic Fast Tests must cover the harness orchestration and safety boundaries through injected clocks, process runners, filesystem seams, and other test doubles. Those tests cover timeout, interruption, output and resource limits, target and credential gating, descendant cleanup, result emission, and the no-retry rule without launching the expensive workload.
 
 ## Evidence and retention
 
-Raw workload files are transient. Each invocation creates a unique, validated directory beneath the operating system's temporary directory; it does not write evidence under the repository's `out/` directory. Workload files and diagnostics are bounded by the registry entry.
+Raw workload files are transient and live only in the owned container's writable tmpfs. The
+invocation does not write evidence under the repository's `out/` directory. Workload files and
+diagnostics are bounded by the registry entry.
 
 Before removing that directory, the harness emits a capped pre-cleanup structured result containing:
 
@@ -124,13 +126,17 @@ Before removing that directory, the harness emits a capped pre-cleanup structure
 - platform and start/end timestamps;
 - duration and measured resource use;
 - outcome and cleanup result;
-- explicit retained-controller state and truthful evidence disposition/retention;
+- exact container identity, absence, temporary-data disposition, and truthful evidence
+  disposition/retention;
 - references to capped diagnostics.
 
 After bounded cleanup, it emits a final structured result with verified cleanup success or failure;
 failure-path measurements that cannot be observed are explicitly `null`.
 
-The harness removes its owned temporary directory on every terminal path. Durable evidence is exceptional: it must be redacted, have an explicit destination and retention period in its registry entry, and contain no Production data or credentials. A run must not leave old raw evidence in `/tmp`.
+The harness removes its owned container and temporary data on every terminal path. Durable evidence
+is exceptional: it must be redacted, have an explicit destination and retention period in its
+registry entry, and contain no Production data or credentials. A run must not leave old raw
+evidence in `/tmp`.
 
 ## Registry lifecycle
 
