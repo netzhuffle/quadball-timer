@@ -84,7 +84,7 @@ check_service_contract() {
     [[ " $effective_environment " != *" FOUNDATION_DATABASE=/var/lib/quadball-timer-test/foundation.sqlite "* ]] ||
     [[ " $effective_environment " != *" EVENT_GAME_DATABASE=/var/lib/quadball-timer-test/event-game.sqlite "* ]]; then
     echo "Test service does not provide the required isolated state contract." >&2
-    echo "Install ${release_dir}/deploy/systemd/quadball-timer-test.service and run systemctl daemon-reload." >&2
+    echo "Install ${release_dir}/deploy/quadball-timer-test.service and run systemctl daemon-reload." >&2
     return 1
   fi
 }
