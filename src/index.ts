@@ -1,8 +1,9 @@
 import { serve, type ServerWebSocket } from "bun";
 import { randomBytes } from "node:crypto";
-import { dirname, resolve } from "node:path";
+import { dirname } from "node:path";
 import index from "./index.html";
 import { readJsonBodyWithinLimit } from "@/lib/http-body";
+import { collectHtmlBundleAssetPaths } from "@/lib/html-bundle-assets";
 import { isInternalHealthHost } from "@/lib/internal-health";
 import { SHARED_LIMITS } from "@/lib/validation-policy";
 import {
@@ -2435,12 +2436,7 @@ async function createHtmlRoute({
       : {}),
   });
   const assetDirectory = dirname(index.index);
-  const assetPaths = new Map<string, string>();
-  for (const match of html.matchAll(/(?:href|src)="\.\/([a-zA-Z0-9._-]+)"/gu)) {
-    const assetName = match[1];
-    if (assetName !== undefined)
-      assetPaths.set(`/${assetName}`, resolve(assetDirectory, assetName));
-  }
+  const assetPaths = collectHtmlBundleAssetPaths(html, assetDirectory);
 
   return (req: Request) => {
     const assetPath = assetPaths.get(new URL(req.url).pathname);

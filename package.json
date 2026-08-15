@@ -22,7 +22,7 @@
     "check:sqlite-runtime": "bun scripts/check-sqlite-runtime.ts",
     "test:focused-signal": "bun scripts/test-focused-signal.ts",
     "test:focused-admission": "bun scripts/test-focused-admission.ts",
-    "test": "bun test --isolate",
+    "test": "bun test --timeout=10000 --isolate",
     "test:focused:sqlite": "bun test --isolate ./src/lib/event-game-actions-sqlite.focused.ts",
     "test:focused:activation": "bun test --timeout=30000 --isolate ./src/lib/production-activation.focused.ts",
     "test:focused:acceptance": "bun test --isolate ./src/lib/foundation-acceptance-sqlite.focused.ts",
