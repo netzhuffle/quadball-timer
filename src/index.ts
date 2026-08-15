@@ -51,6 +51,7 @@ import {
 } from "@/lib/event-administration";
 import { createGrantAuthority } from "@/lib/grant-authority";
 import { readGrantAuthorityOptions } from "@/lib/grant-runtime";
+import type { TypedGrantMutation, TypedGrantReveal } from "@/lib/grant-management";
 import { createInMemoryFoundationStorage } from "@/lib/foundation-storage-memory";
 import { openSqliteFoundationStorage } from "@/lib/foundation-storage-sqlite";
 import type { FoundationStorage } from "@/lib/foundation-storage";
@@ -137,6 +138,12 @@ async function startServer() {
           : openSqliteAdHocStore(adHocDatabasePath),
     });
     startupCleanup.add(() => adHocService.close());
+    let runtimeGrantOptions: ReturnType<typeof readGrantAuthorityOptions> | null = null;
+    try {
+      runtimeGrantOptions = readGrantAuthorityOptions(environment);
+    } catch {
+      // Grant configuration remains an Event Administration dependency.
+    }
     const databasePath = storagePaths.technicalAdminDatabase;
     technicalAdminRepository = createSqliteTechnicalAdminAuthRepository(databasePath, {
       environment: technicalAdminConfig.environment,
@@ -159,7 +166,9 @@ async function startServer() {
       candidateFoundation =
         environment === "test" && !process.env.FOUNDATION_DATABASE?.trim()
           ? createInMemoryFoundationStorage()
-          : openSqliteFoundationStorage(foundationDatabasePath);
+          : openSqliteFoundationStorage(foundationDatabasePath, {
+              grantKeyRing: runtimeGrantOptions?.keyRing,
+            });
       const readiness = await candidateFoundation.readiness();
       if (readiness.ok) {
         const readyFoundation = candidateFoundation;
@@ -192,7 +201,7 @@ async function startServer() {
       try {
         const grantAuthority = createGrantAuthority(
           foundationStorage,
-          readGrantAuthorityOptions(environment),
+          runtimeGrantOptions ?? readGrantAuthorityOptions(environment),
         );
         eventAdministration = createEventAdministration({
           storage: foundationStorage,
@@ -239,6 +248,59 @@ async function startServer() {
         const eventId = new URL(req.url).pathname.split("/").at(-3) ?? "";
         return eventAdministrationResponse(await eventAdministration[operation](eventId, token));
       };
+    const pitchManagerGrantMutation = async (
+      req: Request,
+      operation:
+        | "revealPitchManagerGrant"
+        | "rotatePitchManagerGrant"
+        | "disablePitchManagerGrant"
+        | "revokePitchManagerGrant"
+        | "reactivatePitchManagerGrant",
+    ) => {
+      if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
+      const authority = resolveEventAdministrationAuthority(req, technicalAdminAuth);
+      const path = new URL(req.url).pathname.split("/");
+      if (authority === null) return sensitiveGenericAuthFailure(401);
+      const result =
+        operation === "revealPitchManagerGrant"
+          ? await eventAdministration.revealPitchManagerGrant(
+              path[4] ?? "",
+              path[6] ?? "",
+              path[8] ?? "",
+              authority,
+            )
+          : operation === "rotatePitchManagerGrant"
+            ? await eventAdministration.rotatePitchManagerGrant(
+                path[4] ?? "",
+                path[6] ?? "",
+                path[8] ?? "",
+                authority,
+              )
+            : operation === "disablePitchManagerGrant"
+              ? await eventAdministration.disablePitchManagerGrant(
+                  path[4] ?? "",
+                  path[6] ?? "",
+                  path[8] ?? "",
+                  authority,
+                )
+              : operation === "revokePitchManagerGrant"
+                ? await eventAdministration.revokePitchManagerGrant(
+                    path[4] ?? "",
+                    path[6] ?? "",
+                    path[8] ?? "",
+                    authority,
+                  )
+                : await eventAdministration.reactivatePitchManagerGrant(
+                    path[4] ?? "",
+                    path[6] ?? "",
+                    path[8] ?? "",
+                    authority,
+                  );
+      return sensitiveEventAdministrationMutationResponse<TypedGrantMutation | TypedGrantReveal>(
+        result,
+        authority,
+      );
+    };
     const tls =
       process.env.TLS_CERT_FILE && process.env.TLS_KEY_FILE
         ? { cert: Bun.file(process.env.TLS_CERT_FILE), key: Bun.file(process.env.TLS_KEY_FILE) }
@@ -744,6 +806,134 @@ async function startServer() {
             );
           },
         },
+        "/api/event-admin/events/:eventId/game-days/:gameDayId/pitches/:pitchId/pitch-manager-grant":
+          {
+            async GET(req: Request) {
+              if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
+              const authority = resolveEventAdministrationAuthority(req, technicalAdminAuth);
+              const path = new URL(req.url).pathname.split("/");
+              if (authority === null) return sensitiveGenericAuthFailure(401);
+              return sensitiveEventAdministrationResponse(
+                await eventAdministration.inspectPitchManagerGrant(
+                  path.at(-6) ?? "",
+                  path.at(-4) ?? "",
+                  path.at(-2) ?? "",
+                  authority,
+                ),
+              );
+            },
+            async POST(req: Request) {
+              if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
+              const authority = resolveEventAdministrationAuthority(req, technicalAdminAuth);
+              const path = new URL(req.url).pathname.split("/");
+              if (authority === null) return sensitiveGenericAuthFailure(401);
+              return sensitiveEventAdministrationMutationResponse(
+                await eventAdministration.createPitchManagerGrant(
+                  path.at(-6) ?? "",
+                  path.at(-4) ?? "",
+                  path.at(-2) ?? "",
+                  authority,
+                ),
+                authority,
+                201,
+              );
+            },
+          },
+        "/api/event-admin/events/:eventId/game-days/:gameDayId/pitches/:pitchId/pitch-manager-grant/reveal":
+          {
+            POST: (req: Request) => pitchManagerGrantMutation(req, "revealPitchManagerGrant"),
+          },
+        "/api/event-admin/events/:eventId/game-days/:gameDayId/pitches/:pitchId/pitch-manager-grant/rotate":
+          {
+            POST: (req: Request) => pitchManagerGrantMutation(req, "rotatePitchManagerGrant"),
+          },
+        "/api/event-admin/events/:eventId/game-days/:gameDayId/pitches/:pitchId/pitch-manager-grant/disable":
+          {
+            POST: (req: Request) => pitchManagerGrantMutation(req, "disablePitchManagerGrant"),
+          },
+        "/api/event-admin/events/:eventId/game-days/:gameDayId/pitches/:pitchId/pitch-manager-grant/revoke":
+          {
+            POST: (req: Request) => pitchManagerGrantMutation(req, "revokePitchManagerGrant"),
+          },
+        "/api/event-admin/events/:eventId/game-days/:gameDayId/pitches/:pitchId/pitch-manager-grant/reactivate":
+          {
+            POST: (req: Request) => pitchManagerGrantMutation(req, "reactivatePitchManagerGrant"),
+          },
+        "/api/pitch-manager/admit": {
+          async POST(req: Request) {
+            if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
+            const body = await readJsonRecord(req);
+            if (body === null || typeof body.qrCredential !== "string")
+              return sensitiveJson({ error: "Unable to admit this Grant." }, 400);
+            const context =
+              readPitchManagerContext(req.headers.get("cookie")) ?? crypto.randomUUID();
+            const result = await eventAdministration.admitPitchManager({
+              qrCredential: body.qrCredential,
+              browserContext: context,
+              deviceClass: body.deviceClass,
+              browserClass: body.browserClass,
+            });
+            if (result.status !== "admitted") return sensitiveJson(result, 401);
+            return sensitiveJson(
+              {
+                status: "admitted",
+                grantId: result.grantId,
+                grantVersion: result.grantVersion,
+                grantType: result.grantType,
+                scope: result.scope,
+                grantSessionId: result.grantSessionId,
+                sessionExpiresAtMs: result.sessionExpiresAtMs ?? null,
+              },
+              200,
+              [
+                ["set-cookie", pitchManagerContextCookie(context)],
+                [
+                  "set-cookie",
+                  pitchManagerSessionCookie(result.sessionBearer, result.sessionExpiresAtMs),
+                ],
+              ],
+            );
+          },
+        },
+        "/api/pitch-manager/view": {
+          async GET(req: Request) {
+            if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
+            const url = new URL(req.url);
+            const authority = resolvePitchManagerAuthority(req, technicalAdminAuth);
+            if (authority === null) return sensitiveGenericAuthFailure(401);
+            return sensitiveEventAdministrationResponse(
+              await eventAdministration.openPitchManagerView({
+                eventId: url.searchParams.get("eventId") ?? "",
+                gameDayId: url.searchParams.get("gameDayId") ?? "",
+                pitchId: url.searchParams.get("pitchId") ?? "",
+                authority,
+              }),
+            );
+          },
+        },
+        "/api/pitch-manager/current": {
+          async GET(req: Request) {
+            if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
+            const sessionBearer = readPitchManagerSession(req.headers.get("cookie"));
+            if (sessionBearer === null) return sensitiveGenericAuthFailure(401);
+            return sensitiveEventAdministrationResponse(
+              await eventAdministration.openPitchManagerCurrentView({
+                authority: { kind: "grant-session", sessionBearer },
+              }),
+            );
+          },
+        },
+        "/api/pitch-manager/leave": {
+          async POST(req: Request) {
+            if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
+            const sessionBearer = readPitchManagerSession(req.headers.get("cookie"));
+            if (sessionBearer === null) return sensitiveGenericAuthFailure(401);
+            const result = await eventAdministration.leavePitchManagerSession(sessionBearer);
+            return sensitiveJson(result, result.status === "updated" ? 200 : 401, [
+              ["set-cookie", clearPitchManagerSessionCookie()],
+            ]);
+          },
+        },
         "/api/event-admin/hub": {
           async GET(req: Request) {
             if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
@@ -1011,6 +1201,7 @@ async function startServer() {
         "/color-test": index,
         "/prototype/event-operations": index,
         "/event-admin": index,
+        "/pitch-manager": index,
         "/event-control": index,
         "/*": adHocFallbackRoute,
       },
@@ -1572,12 +1763,32 @@ function resolveEventAdministrationAuthority(
   return sessionBearer === null ? null : { kind: "grant-session", sessionBearer };
 }
 
+function resolvePitchManagerAuthority(
+  req: Request,
+  technicalAdminAuth: ReturnType<typeof createTechnicalAdminAuth>,
+): EventAdministrationAuthority | null {
+  const technicalToken = readTechnicalAdminCookie(req.headers.get("cookie"));
+  const technical =
+    technicalToken === null ? null : technicalAdminAuth.resolveCurrentAuthority(technicalToken);
+  if (technical !== null) return technical;
+  const sessionBearer = readPitchManagerSession(req.headers.get("cookie"));
+  return sessionBearer === null ? null : { kind: "grant-session", sessionBearer };
+}
+
 function readEventAdminContext(header: string | null): string | null {
   return readCookieValue(header, "__Host-event-admin-context");
 }
 
 function readEventAdminSession(header: string | null): string | null {
   return readCookieValue(header, "__Host-event-admin-session");
+}
+
+function readPitchManagerContext(header: string | null): string | null {
+  return readCookieValue(header, "__Host-pitch-manager-context");
+}
+
+function readPitchManagerSession(header: string | null): string | null {
+  return readCookieValue(header, "__Host-pitch-manager-session");
 }
 
 function readCookieValue(header: string | null, cookieName: string): string | null {
@@ -1601,8 +1812,24 @@ function eventAdminSessionCookie(value: string, expiresAtMs: number | null | und
   return `__Host-event-admin-session=${encodeURIComponent(value)}; Path=/; Max-Age=${maxAgeSeconds}; HttpOnly; Secure; SameSite=Strict`;
 }
 
+function pitchManagerContextCookie(value: string): string {
+  return `__Host-pitch-manager-context=${encodeURIComponent(value)}; Path=/; HttpOnly; Secure; SameSite=Strict`;
+}
+
+function pitchManagerSessionCookie(value: string, expiresAtMs: number | null | undefined): string {
+  const maxAgeSeconds =
+    expiresAtMs === null || expiresAtMs === undefined
+      ? 0
+      : Math.max(0, Math.ceil((expiresAtMs - Date.now()) / 1_000));
+  return `__Host-pitch-manager-session=${encodeURIComponent(value)}; Path=/; Max-Age=${maxAgeSeconds}; HttpOnly; Secure; SameSite=Strict`;
+}
+
 function clearEventAdminSessionCookie(): string {
   return "__Host-event-admin-session=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict";
+}
+
+function clearPitchManagerSessionCookie(): string {
+  return "__Host-pitch-manager-session=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict";
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

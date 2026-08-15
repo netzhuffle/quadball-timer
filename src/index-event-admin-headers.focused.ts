@@ -23,6 +23,63 @@ describe("Event Hub early response headers", () => {
   });
 });
 
+describe("Pitch Manager early response headers", () => {
+  test("keeps malformed, missing-credential, and missing-session failures sensitive", async () => {
+    await withServer({}, async (serverUrl) => {
+      const malformed = await fetch(new URL("/api/pitch-manager/admit", serverUrl), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: "{",
+      });
+      await expectSensitiveFailure(malformed, 400, { error: "Unable to admit this Grant." });
+
+      const missingCredential = await fetch(new URL("/api/pitch-manager/admit", serverUrl), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      await expectSensitiveFailure(missingCredential, 400, {
+        error: "Unable to admit this Grant.",
+      });
+
+      const missingBody = await fetch(new URL("/api/pitch-manager/admit", serverUrl), {
+        method: "POST",
+      });
+      await expectSensitiveFailure(missingBody, 400, { error: "Unable to admit this Grant." });
+
+      const missingSessionLeave = await fetch(new URL("/api/pitch-manager/leave", serverUrl), {
+        method: "POST",
+      });
+      await expectSensitiveFailure(missingSessionLeave, 401, { error: "Authentication failed." });
+    });
+
+    await withServer({ incompleteGrantKeys: true }, async (serverUrl) => {
+      const unavailableAdmit = await fetch(new URL("/api/pitch-manager/admit", serverUrl), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ qrCredential: "opaque" }),
+      });
+      await expectSensitiveFailure(unavailableAdmit, 503, { error: "Authentication failed." });
+
+      const unavailableLeave = await fetch(new URL("/api/pitch-manager/leave", serverUrl), {
+        method: "POST",
+      });
+      await expectSensitiveFailure(unavailableLeave, 503, { error: "Authentication failed." });
+    });
+  });
+});
+
+async function expectSensitiveFailure(
+  response: Response,
+  status: number,
+  body: Record<string, string>,
+) {
+  expect(response.status).toBe(status);
+  expect(response.headers.get("cache-control")).toBe("no-store");
+  expect(response.headers.get("referrer-policy")).toBe("no-referrer");
+  expect(await response.json()).toEqual(body);
+}
+
 async function withServer(
   options: { incompleteGrantKeys?: boolean },
   work: (serverUrl: URL) => Promise<void>,

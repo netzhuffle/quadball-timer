@@ -143,7 +143,8 @@ export function canManageInTransaction(
   operation: "manage" | "reveal",
 ): boolean {
   authority = resolveManagementAuthority(transaction, options, authority) ?? authority;
-  if (authority.kind === "technical-admin") return grant.grantType === "event-admin";
+  if (authority.kind === "technical-admin")
+    return grant.grantType === "event-admin" || grant.grantType === "pitch-manager";
   if (authority.kind === "fixture") return true;
   if (authority.kind !== "grant-session") return false;
   const session = findSessionByBearer(transaction, options, authority.sessionBearer);
@@ -210,7 +211,8 @@ export function canCreateInTransaction(
 ): boolean {
   authority = resolveManagementAuthority(transaction, options, authority) ?? authority;
   if (authority.kind === "fixture") return true;
-  if (authority.kind === "technical-admin") return grant.grantType === "event-admin";
+  if (authority.kind === "technical-admin")
+    return grant.grantType === "event-admin" || grant.grantType === "pitch-manager";
   if (authority.kind !== "grant-session") return false;
   const session = findSessionByBearer(transaction, options, authority.sessionBearer);
   if (session === null || session.status !== "active") return false;
