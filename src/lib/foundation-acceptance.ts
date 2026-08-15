@@ -87,6 +87,8 @@ export type ControlActionBatchInput = {
     replayEvidenceId: string;
   };
   lifecycleTransition?: EventGameRecordRoot["lifecycle"];
+  /** Only the composed Live Event Game seam may reconcile derived scoring lifecycle. */
+  reconcileDerivedLifecycle?: boolean;
 };
 
 export type FoundationActionResult =
@@ -859,6 +861,7 @@ export function createFoundationAcceptance(
         replayState,
         existing.action,
         batch.input.lifecycleTransition,
+        batch.input.reconcileDerivedLifecycle === true,
       );
     if (existing !== null)
       return writeOutcome(
@@ -947,6 +950,7 @@ export function createFoundationAcceptance(
       mode,
       replayState,
       batch.input.lifecycleTransition,
+      batch.input.reconcileDerivedLifecycle === true,
     );
   }
 
@@ -960,6 +964,7 @@ export function createFoundationAcceptance(
     mode: "online" | "replay",
     reservation: StoredReplayReservation | undefined,
     lifecycleTransition: EventGameRecordRoot["lifecycle"] | undefined,
+    reconcileDerivedLifecycle: boolean,
   ): OneOutcome {
     const acceptanceId = `accept-${sha256(`${root.recordId}:${action.operationId}:${action.grant.sessionId}`)}`;
     const grantAudit = linkedGrantAudit(
@@ -990,7 +995,12 @@ export function createFoundationAcceptance(
       action.interpretation.type === "team-assignment-correction"
     )
       appendConcurrentCorrectionAudits(transaction, root.recordId, action.acceptedAtMs);
-    applyLifecycleTransition(transaction, root.recordId, lifecycleTransition);
+    applyLifecycleTransition(
+      transaction,
+      root.recordId,
+      lifecycleTransition,
+      reconcileDerivedLifecycle,
+    );
     return finishReplay(
       transaction,
       reservation,
@@ -1122,6 +1132,7 @@ export function createFoundationAcceptance(
     reservation: StoredReplayReservation | undefined,
     existing: ControlAction,
     lifecycleTransition: EventGameRecordRoot["lifecycle"] | undefined,
+    reconcileDerivedLifecycle: boolean,
   ): OneOutcome {
     const nowMs = readNow(clock);
     const controlAudit = createControlAudit(
@@ -1159,7 +1170,12 @@ export function createFoundationAcceptance(
     options.failureInjector?.("after-control-audit");
     transaction.appendGrantAudit(grantAudit);
     options.failureInjector?.("after-grant-audit");
-    applyLifecycleTransition(transaction, root.recordId, lifecycleTransition);
+    applyLifecycleTransition(
+      transaction,
+      root.recordId,
+      lifecycleTransition,
+      reconcileDerivedLifecycle,
+    );
     return finishReplay(
       transaction,
       reservation,
@@ -1519,6 +1535,7 @@ export function createFoundationAcceptance(
           }
         : null,
       actions: raw.actions,
+      ...(raw.reconcileDerivedLifecycle === true ? { reconcileDerivedLifecycle: true } : {}),
       ...(isRecord(raw.lifecycleTransition)
         ? { lifecycleTransition: raw.lifecycleTransition }
         : {}),
@@ -1531,6 +1548,7 @@ export function createFoundationAcceptance(
         sessionBearer: typeof raw.sessionBearer === "string" ? raw.sessionBearer : undefined,
         mode: effectiveMode,
         replay,
+        reconcileDerivedLifecycle: raw.reconcileDerivedLifecycle === true,
         lifecycleTransition: isRecord(raw.lifecycleTransition)
           ? (structuredClone(raw.lifecycleTransition) as EventGameRecordRoot["lifecycle"])
           : undefined,
@@ -1546,6 +1564,7 @@ export function createFoundationAcceptance(
     transaction: FoundationStorageTransaction,
     recordId: string,
     lifecycle: EventGameRecordRoot["lifecycle"] | undefined,
+    reconcileDerivedLifecycle: boolean,
   ): void {
     if (lifecycle === undefined) return;
     const current = transaction.findRootByRecordId(recordId);
@@ -1564,7 +1583,11 @@ export function createFoundationAcceptance(
     });
     if (
       !validated.ok ||
-      !allowedLifecycleTransition(current.lifecycle, validated.value.lifecycle)
+      !allowedLifecycleTransition(
+        current.lifecycle,
+        validated.value.lifecycle,
+        reconcileDerivedLifecycle,
+      )
     ) {
       throw new Error("Event Game lifecycle transitions are monotonic.");
     }
@@ -1578,8 +1601,20 @@ export function createFoundationAcceptance(
   function allowedLifecycleTransition(
     current: EventGameRecordRoot["lifecycle"],
     next: EventGameRecordRoot["lifecycle"],
+    reconcileDerivedLifecycle = false,
   ): boolean {
-    if (current.lockedAtMs !== null || current.finishedAtMs !== null) return false;
+    if (current.lockedAtMs !== null) return false;
+    if (
+      reconcileDerivedLifecycle &&
+      current.phase === "finished" &&
+      current.finishedAtMs !== null &&
+      next.phase === "in-progress" &&
+      next.finishedAtMs === null &&
+      next.lockedAtMs === null &&
+      next.commencedAtMs === current.commencedAtMs
+    )
+      return true;
+    if (current.finishedAtMs !== null) return false;
     if (
       current.commencedAtMs !== null &&
       (next.commencedAtMs === null || next.commencedAtMs !== current.commencedAtMs)

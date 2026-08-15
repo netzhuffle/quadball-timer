@@ -28,6 +28,27 @@ export function controllerIntentRetryKey(intent: LiveEventControllerIntent): str
         intent.gameSideId,
         intent.gameTimeMs,
         intent.sportingOrder ?? null,
+        intent.sportingOrderAdjudication ?? null,
+        intent.sportingOrderOverride ?? null,
+        intent.override ?? null,
+      ]);
+    case "record-flag-catch":
+    case "record-concession":
+    case "record-forfeit":
+      return JSON.stringify([
+        intent.type,
+        intent.gameSideId,
+        intent.gameTimeMs,
+        intent.sportingOrder ?? null,
+        intent.sportingOrderAdjudication ?? null,
+        intent.sportingOrderOverride ?? null,
+        intent.override ?? null,
+      ]);
+    case "record-double-forfeit":
+      return JSON.stringify([
+        intent.type,
+        intent.gameTimeMs,
+        intent.sportingOrder ?? null,
         intent.override ?? null,
       ]);
     case "correct-fact":
@@ -39,11 +60,29 @@ export function controllerIntentRetryKey(intent: LiveEventControllerIntent): str
       ]);
     case "clock":
     case "set-running":
-      return JSON.stringify([intent.type, intent.running, intent.gameTimeMs]);
+      return JSON.stringify([
+        intent.type,
+        intent.running,
+        intent.gameTimeMs,
+        intent.clockGeneration ?? null,
+        intent.occurrence.source ?? "online",
+      ]);
     case "clock-adjust":
-      return JSON.stringify([intent.type, intent.adjustmentMs, intent.gameTimeMs]);
+      return JSON.stringify([
+        intent.type,
+        intent.adjustmentMs,
+        intent.gameTimeMs,
+        intent.clockGeneration ?? null,
+        intent.occurrence.source ?? "online",
+      ]);
     case "clock-correction":
-      return JSON.stringify([intent.type, intent.clockTimeMs, intent.gameTimeMs]);
+      return JSON.stringify([
+        intent.type,
+        intent.clockTimeMs,
+        intent.gameTimeMs,
+        intent.clockGeneration ?? null,
+        intent.occurrence.source ?? "online",
+      ]);
     case "clock-takeover":
       return JSON.stringify([
         intent.type,
@@ -51,14 +90,17 @@ export function controllerIntentRetryKey(intent: LiveEventControllerIntent): str
         intent.running,
         intent.authorityGeneration,
         intent.gameTimeMs,
+        intent.occurrence.source ?? "online",
       ]);
     case "substantive":
       return JSON.stringify([
         intent.type,
         intent.trigger,
+        intent.gameSideId ?? null,
         intent.heatAction ?? null,
         intent.gameTimeMs,
         intent.sportingOrder ?? null,
+        intent.sportingOrderAdjudication ?? null,
         intent.override ?? null,
       ]);
     case "reset":

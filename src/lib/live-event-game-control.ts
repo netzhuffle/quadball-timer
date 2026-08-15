@@ -8,6 +8,8 @@ import {
   canonicalizeJson,
   createControlActionCodecRegistry,
   createDefaultControlActionCodecs,
+  materializeControlAction,
+  prepareControlAction,
   rebuildControlActionHistory,
 } from "@/lib/event-game-actions";
 import { parseJsonValue, validateOverride } from "@/lib/event-game-action-codecs";
@@ -16,6 +18,7 @@ import {
   CLOCK_AUTHORITY_VERSION,
   deriveClockAuthority,
   projectClockBaseline,
+  SEEKER_RELEASE_MS,
   validateClockAuthorityAction,
   type ClockAuthorityAction,
   type ClockProjection,
@@ -35,6 +38,12 @@ import {
 
 export const LIVE_EVENT_CONTROL_INTENT_VERSION = "live-event-control-intent-v1" as const;
 export const LIVE_EVENT_IQA_INTERPRETER_VERSION = "live-event-iqa-v1" as const;
+export const CLOSE_PLAY_ADJUDICATION_WINDOW_MS = 1_000;
+
+export type SportingOrderAdjudication = {
+  relatedFactId: string;
+  relation: "before" | "after";
+};
 
 type ControllerIntentBase = {
   version: typeof LIVE_EVENT_CONTROL_INTENT_VERSION;
@@ -42,6 +51,8 @@ type ControllerIntentBase = {
   factId: string;
   gameTimeMs: number;
   sportingOrder?: number;
+  sportingOrderAdjudication?: SportingOrderAdjudication;
+  sportingOrderOverride?: OfficialOverrideMetadata;
   occurrence: {
     clientOriginAtMs: number | null;
     source?: "online" | "offline";
@@ -54,6 +65,13 @@ export type LiveEventControllerIntent =
   | (ControllerIntentBase & {
       type: "record-goal";
       gameSideId: string;
+    })
+  | (ControllerIntentBase & {
+      type: "record-flag-catch" | "record-concession" | "record-forfeit";
+      gameSideId: string;
+    })
+  | (ControllerIntentBase & {
+      type: "record-double-forfeit";
     })
   | (ControllerIntentBase & {
       type: "correct-fact";
@@ -81,7 +99,17 @@ export type LiveEventControllerIntent =
     })
   | (ControllerIntentBase & {
       type: "substantive";
-      trigger: "card" | "timeout" | "suspension" | "result" | "heat-stoppage";
+      trigger:
+        | "card"
+        | "timeout"
+        | "suspension"
+        | "result"
+        | "heat-stoppage"
+        | "flag-catch"
+        | "concession"
+        | "forfeit"
+        | "double-forfeit";
+      gameSideId?: string;
       heatAction?: "start" | "end" | "skip-required" | "extend-permitted";
     })
   | (ControllerIntentBase & {
@@ -140,6 +168,10 @@ export type LiveEventGameDerivedState = {
   stoppage: LiveStoppageState;
   heat: LiveHeatState;
   result: LiveResultState;
+  overtime: boolean;
+  overtimeTarget: number | null;
+  winnerGameSideId: string | null;
+  catch: LiveCatchState | null;
   gameFacts: readonly ControllerGameFact[];
 };
 
@@ -164,6 +196,14 @@ export type LiveResultState = {
   factId: string;
   data: ActionJsonValue;
 } | null;
+
+export type LiveCatchState = {
+  factId: string;
+  catchingGameSideId: string;
+  nonCatchingGameSideId: string;
+  gameTimeMs: number;
+  targetScore: number | null;
+};
 
 export type ControllerGameFact = {
   factId: string;
@@ -192,6 +232,12 @@ export type ControllerProjection = {
   stoppage?: LiveStoppageState;
   heat?: LiveHeatState;
   result?: LiveResultState;
+  overtime?: boolean;
+  overtimeTarget?: number | null;
+  /** Alias retained for Controller clients that call the IQA target a target score. */
+  targetScore?: number | null;
+  winnerGameSideId?: string | null;
+  catch?: LiveCatchState | null;
   gameFacts?: readonly ControllerGameFact[];
   guardrails?: readonly LiveEventGuardrailExplanation[];
   commencement: ControllerCommencement;
@@ -316,6 +362,10 @@ export function parseLiveEventControllerIntent(
   }
   if (
     value.type !== "record-goal" &&
+    value.type !== "record-flag-catch" &&
+    value.type !== "record-concession" &&
+    value.type !== "record-forfeit" &&
+    value.type !== "record-double-forfeit" &&
     value.type !== "correct-fact" &&
     value.type !== "correction" &&
     value.type !== "clock" &&
@@ -364,9 +414,39 @@ export function parseLiveEventControllerIntent(
     if (!parsedSportingOrder.ok) return invalid(parsedSportingOrder.error);
     sportingOrder = parsedSportingOrder.value;
   }
+  let sportingOrderAdjudication: SportingOrderAdjudication | undefined;
+  if (value.sportingOrderAdjudication !== undefined) {
+    if (!isRecord(value.sportingOrderAdjudication)) {
+      return invalid("sportingOrderAdjudication must be an object.");
+    }
+    const relatedFactId = validateOpaqueIdentifier(
+      value.sportingOrderAdjudication.relatedFactId,
+      "sportingOrderAdjudication.relatedFactId",
+    );
+    if (!relatedFactId.ok) return invalid(relatedFactId.error);
+    if (
+      value.sportingOrderAdjudication.relation !== "before" &&
+      value.sportingOrderAdjudication.relation !== "after"
+    ) {
+      return invalid("sportingOrderAdjudication.relation is unsupported.");
+    }
+    sportingOrderAdjudication = {
+      relatedFactId: relatedFactId.value,
+      relation: value.sportingOrderAdjudication.relation,
+    };
+  }
 
   let gameSideId: string | undefined;
-  if (value.type === "record-goal") {
+  const requiresGameSide =
+    value.type === "record-goal" ||
+    value.type === "record-flag-catch" ||
+    value.type === "record-concession" ||
+    value.type === "record-forfeit" ||
+    (value.type === "substantive" &&
+      (value.trigger === "flag-catch" ||
+        value.trigger === "concession" ||
+        value.trigger === "forfeit"));
+  if (requiresGameSide) {
     const parsedSide = validateOpaqueIdentifier(value.gameSideId, "gameSideId");
     if (!parsedSide.ok) return invalid(parsedSide.error);
     gameSideId = parsedSide.value;
@@ -433,7 +513,17 @@ export function parseLiveEventControllerIntent(
       clockGeneration = generation.value;
     }
   }
-  let trigger: "card" | "timeout" | "suspension" | "result" | "heat-stoppage" | undefined;
+  let trigger:
+    | "card"
+    | "timeout"
+    | "suspension"
+    | "result"
+    | "heat-stoppage"
+    | "flag-catch"
+    | "concession"
+    | "forfeit"
+    | "double-forfeit"
+    | undefined;
   let heatAction: "start" | "end" | "skip-required" | "extend-permitted" | undefined;
   if (value.type === "substantive") {
     if (
@@ -441,7 +531,11 @@ export function parseLiveEventControllerIntent(
       value.trigger !== "timeout" &&
       value.trigger !== "suspension" &&
       value.trigger !== "result" &&
-      value.trigger !== "heat-stoppage"
+      value.trigger !== "heat-stoppage" &&
+      value.trigger !== "flag-catch" &&
+      value.trigger !== "concession" &&
+      value.trigger !== "forfeit" &&
+      value.trigger !== "double-forfeit"
     )
       return invalid("substantive trigger is unsupported.");
     trigger = value.trigger;
@@ -483,6 +577,18 @@ export function parseLiveEventControllerIntent(
   }
   const overrideResult = validateOverride(value.override);
   if (!overrideResult.ok) return invalid(overrideResult.error);
+  const sportingOrderOverrideResult = validateOverride(value.sportingOrderOverride);
+  if (!sportingOrderOverrideResult.ok) return invalid(sportingOrderOverrideResult.error);
+  if (
+    sportingOrderAdjudication !== undefined &&
+    normalizedType !== "record-goal" &&
+    normalizedType !== "record-flag-catch"
+  ) {
+    return invalid("Sporting-order adjudication is only valid for a goal or flag catch.");
+  }
+  if (sportingOrderOverrideResult.value !== undefined && sportingOrderAdjudication === undefined) {
+    return invalid("sportingOrderOverride requires sportingOrderAdjudication.");
+  }
   return {
     ok: true,
     value: {
@@ -493,6 +599,10 @@ export function parseLiveEventControllerIntent(
       gameTimeMs: gameTimeMs.value,
       occurrence: { clientOriginAtMs, ...(source === undefined ? {} : { source }) },
       ...(sportingOrder === undefined ? {} : { sportingOrder }),
+      ...(sportingOrderAdjudication === undefined ? {} : { sportingOrderAdjudication }),
+      ...(sportingOrderOverrideResult.value === undefined
+        ? {}
+        : { sportingOrderOverride: sportingOrderOverrideResult.value }),
       ...(targetFactId === undefined ? {} : { targetFactId }),
       ...(effective === undefined ? {} : { effective }),
       ...(gameSideId === undefined ? {} : { gameSideId }),
@@ -511,7 +621,7 @@ export function parseLiveEventControllerIntent(
 
 export function explainLiveEventGuardrail(intent: {
   type: LiveEventControllerIntent["type"];
-  trigger?: "card" | "timeout" | "suspension" | "result" | "heat-stoppage";
+  trigger?: Extract<LiveEventControllerIntent, { type: "substantive" }>["trigger"];
   gameTimeMs?: number;
   sportingOrder?: number;
 }): LiveEventGuardrailExplanation {
@@ -541,6 +651,17 @@ export function explainLiveEventGuardrail(intent: {
       normalBehavior: "A suspension is recorded as a normal Controller action.",
       overrideAllowed: false,
       fixedReason: null,
+    };
+  }
+  if (
+    intent.type === "record-flag-catch" ||
+    (intent.type === "substantive" && intent.trigger === "flag-catch")
+  ) {
+    return {
+      guardrail: "flag-catch-requires-seeker-release-and-stopped-play",
+      normalBehavior: "A flag catch is recorded after seeker release and while play is stopped.",
+      overrideAllowed: true,
+      fixedReason: "head-referee-direction",
     };
   }
   if (intent.type === "substantive" && intent.trigger === "heat-stoppage") {
@@ -969,7 +1090,16 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
     if (commenced.status === "rejected") return retryableAction(parsed.value.operationId);
     const activeRoot = commenced.root;
 
-    if (parsed.value.type === "record-goal") {
+    if (
+      parsed.value.type === "record-goal" ||
+      parsed.value.type === "record-flag-catch" ||
+      parsed.value.type === "record-concession" ||
+      parsed.value.type === "record-forfeit" ||
+      (parsed.value.type === "substantive" &&
+        (parsed.value.trigger === "flag-catch" ||
+          parsed.value.trigger === "concession" ||
+          parsed.value.trigger === "forfeit"))
+    ) {
       const gameSideId = parsed.value.gameSideId;
       if (!activeRoot.gameSides.some((side) => side.id === gameSideId)) {
         return rejectedAction(parsed.value.operationId);
@@ -987,7 +1117,16 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
     if (
       effectiveStateBefore.phase === "finished" &&
       existingAction === undefined &&
-      parsed.value.type !== "correct-fact"
+      parsed.value.type !== "correct-fact" &&
+      !allowsLatePreCatchGoal(parsed.value, effectiveStateBefore)
+    ) {
+      return rejectedAction(parsed.value.operationId);
+    }
+    if (
+      effectiveStateBefore.overtime &&
+      parsed.value.type === "substantive" &&
+      parsed.value.trigger === "result" &&
+      effectiveStateBefore.winnerGameSideId === null
     ) {
       return rejectedAction(parsed.value.operationId);
     }
@@ -1026,7 +1165,7 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
           : previousClockStartMs
         : null;
     const factType = controllerFactType(parsed.value);
-    const gameSideId = parsed.value.type === "record-goal" ? parsed.value.gameSideId : null;
+    const gameSideId = controllerGameSideId(parsed.value);
     const isCorrection = parsed.value.type === "correct-fact";
     let override: OfficialOverrideMetadata | undefined;
     try {
@@ -1060,21 +1199,67 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
                   ? {
                       points: 10,
                       sportingOrder: parsed.value.sportingOrder ?? parsed.value.gameTimeMs,
+                      ...(parsed.value.sportingOrderAdjudication === undefined
+                        ? {}
+                        : { sportingOrderAdjudication: parsed.value.sportingOrderAdjudication }),
+                      ...(parsed.value.sportingOrderOverride === undefined
+                        ? {}
+                        : { sportingOrderOverride: parsed.value.sportingOrderOverride }),
                     }
-                  : clockData.value !== null
+                  : isScoringIntent(parsed.value)
                     ? {
-                        ...clockData.value,
+                        points:
+                          parsed.value.type === "record-flag-catch" ||
+                          (parsed.value.type === "substantive" &&
+                            parsed.value.trigger === "flag-catch")
+                            ? 30
+                            : 0,
                         sportingOrder: parsed.value.sportingOrder ?? parsed.value.gameTimeMs,
+                        ...(parsed.value.sportingOrderAdjudication === undefined
+                          ? {}
+                          : { sportingOrderAdjudication: parsed.value.sportingOrderAdjudication }),
+                        ...(parsed.value.sportingOrderOverride === undefined
+                          ? {}
+                          : { sportingOrderOverride: parsed.value.sportingOrderOverride }),
+                        ...(parsed.value.type === "substantive"
+                          ? { trigger: parsed.value.trigger }
+                          : {}),
                       }
-                    : parsed.value.type === "substantive"
+                    : isResultIntent(parsed.value)
                       ? {
-                          trigger: parsed.value.trigger,
+                          resultKind: controllerFactType(parsed.value),
                           sportingOrder: parsed.value.sportingOrder ?? parsed.value.gameTimeMs,
-                          ...(parsed.value.heatAction === undefined
+                          ...(parsed.value.sportingOrderAdjudication === undefined
                             ? {}
-                            : { heatAction: parsed.value.heatAction }),
+                            : {
+                                sportingOrderAdjudication: parsed.value.sportingOrderAdjudication,
+                              }),
                         }
-                      : null,
+                      : clockData.value !== null
+                        ? {
+                            ...clockData.value,
+                            sportingOrder: parsed.value.sportingOrder ?? parsed.value.gameTimeMs,
+                            ...(parsed.value.sportingOrderAdjudication === undefined
+                              ? {}
+                              : {
+                                  sportingOrderAdjudication: parsed.value.sportingOrderAdjudication,
+                                }),
+                          }
+                        : parsed.value.type === "substantive"
+                          ? {
+                              trigger: parsed.value.trigger,
+                              sportingOrder: parsed.value.sportingOrder ?? parsed.value.gameTimeMs,
+                              ...(parsed.value.sportingOrderAdjudication === undefined
+                                ? {}
+                                : {
+                                    sportingOrderAdjudication:
+                                      parsed.value.sportingOrderAdjudication,
+                                  }),
+                              ...(parsed.value.heatAction === undefined
+                                ? {}
+                                : { heatAction: parsed.value.heatAction }),
+                            }
+                          : null,
             },
       causalPredecessorIds: [...(input.causalPredecessorIds ?? [])],
       occurrence: {
@@ -1090,28 +1275,34 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
       ...(override === undefined ? {} : { override }),
     };
 
-    const shouldCommence = isCorrection
-      ? null
-      : shouldRecordCommencement(parsed.value, activeRoot, nowMs, clockStartMs);
+    const derivedLifecycle =
+      existingAction === undefined
+        ? deriveControllerLifecycleAfterAction(
+            activeRoot,
+            actionsBefore,
+            action,
+            parsed.value,
+            nowMs,
+          )
+        : undefined;
+    const shouldCommence =
+      existingAction !== undefined || isCorrection
+        ? null
+        : shouldRecordCommencement(parsed.value, activeRoot, nowMs, clockStartMs);
     const shouldFinish =
-      parsed.value.type === "substantive" &&
-      parsed.value.trigger === "result" &&
-      activeRoot.lifecycle.finishedAtMs === null;
+      existingAction === undefined &&
+      activeRoot.lifecycle.finishedAtMs === null &&
+      intentFinishesGame(parsed.value, effectiveStateBefore);
     const lifecycleTransition: EventGameRecordRoot["lifecycle"] | undefined =
-      shouldCommence !== null || shouldFinish
+      derivedLifecycle ??
+      (shouldCommence !== null || shouldFinish
         ? {
             ...activeRoot.lifecycle,
-            phase:
-              parsed.value.type === "substantive" && parsed.value.trigger === "result"
-                ? "finished"
-                : "in-progress",
+            phase: shouldFinish ? "finished" : "in-progress",
             commencedAtMs: activeRoot.lifecycle.commencedAtMs ?? shouldCommence?.atMs ?? nowMs,
-            finishedAtMs:
-              parsed.value.type === "substantive" && parsed.value.trigger === "result"
-                ? nowMs
-                : activeRoot.lifecycle.finishedAtMs,
+            finishedAtMs: shouldFinish ? nowMs : activeRoot.lifecycle.finishedAtMs,
           }
-        : undefined;
+        : undefined);
 
     let accepted;
     try {
@@ -1121,6 +1312,7 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
         sessionBearer: input.sessionBearer,
         lifecycleTransition,
         actions: [action],
+        reconcileDerivedLifecycle: derivedLifecycle !== undefined,
       });
     } catch {
       return retryableAction(parsed.value.operationId);
@@ -1221,7 +1413,7 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
       );
       const replayRoot = await replayOwner.record.readRoot(replayOwner.recordId);
       if (replayRoot === null) return replayRetryable(input.actions, replayContext);
-      const replayState = rebuildLiveDerivedState(replayRoot, persistedActions);
+      let replayState = rebuildLiveDerivedState(replayRoot, persistedActions);
       if (replayState === null) return replayRetryable(input.actions, replayContext);
       let finishedUnlocked =
         replayState.phase === "finished" && replayRoot.lifecycle.lockedAtMs === null;
@@ -1230,6 +1422,7 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
         if (currentRoot === null) return true;
         const currentActions = await replayOwner.record.readActions();
         const currentState = rebuildLiveDerivedState(currentRoot, currentActions);
+        if (currentState !== null) replayState = currentState;
         return currentState?.phase === "finished" && currentRoot.lifecycle.lockedAtMs === null;
       };
       const outcomes: ControllerReplayOutcome[] = [];
@@ -1311,6 +1504,7 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
           if (
             finishedUnlocked &&
             parsedIntent.value.type !== "correct-fact" &&
+            !allowsLatePreCatchGoal(parsedIntent.value, replayState) &&
             !persistedOperationIds.has(operationId)
           ) {
             outcomes.push({ operationId, status: "held-for-correction" });
@@ -1403,6 +1597,11 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
         stoppage: structuredClone(derived.stoppage),
         heat: structuredClone(derived.heat),
         result: structuredClone(derived.result),
+        overtime: derived.overtime,
+        overtimeTarget: derived.overtimeTarget,
+        targetScore: derived.overtimeTarget,
+        winnerGameSideId: derived.winnerGameSideId,
+        catch: structuredClone(derived.catch),
         gameFacts: derived.gameFacts.map((fact) => ({
           ...fact,
           data: structuredClone(fact.data),
@@ -1465,15 +1664,6 @@ function deriveLiveEventGameState(
   const scoreByGameSide: Record<string, number> = Object.fromEntries(
     root.gameSides.map((side) => [side.id, 0]),
   );
-  let goalCount = 0;
-  for (const fact of effectiveFacts) {
-    if (fact.interpretation.factType !== "goal") continue;
-    const gameSideId = fact.interpretation.gameSideId;
-    if (gameSideId !== null && gameSideId in scoreByGameSide) {
-      scoreByGameSide[gameSideId] = (scoreByGameSide[gameSideId] ?? 0) + 10;
-    }
-    goalCount += 1;
-  }
   const effectiveFactIds = new Set(effectiveFacts.map((fact) => fact.factId));
   const synchronizationOrderByOperationId = new Map(
     [...canonicalActions]
@@ -1484,42 +1674,130 @@ function deriveLiveEventGameState(
       )
       .map(({ action }, index) => [action.operationId, index + 1]),
   );
-  const gameFacts = canonicalActions
-    .flatMap(({ action }) => {
-      if (action.interpretation.type !== "fact") return [];
-      const payload = action.interpretation.payload;
-      const gameTimeMs =
-        isRecord(payload) && typeof payload.gameTimeMs === "number" ? payload.gameTimeMs : null;
-      const data = isRecord(payload) && "data" in payload ? payload.data : null;
-      const sportingOrder =
-        isRecord(data) && typeof data.sportingOrder === "number"
-          ? data.sportingOrder
-          : (gameTimeMs ?? 0);
-      return [
-        {
-          factId: action.interpretation.factId,
-          factType: action.interpretation.factType,
-          gameSideId: action.interpretation.gameSideId,
-          gameTimeMs,
-          sportingOrder,
-          synchronizationOrder: synchronizationOrderByOperationId.get(action.operationId) ?? 0,
-          effective: effectiveFactIds.has(action.interpretation.factId),
-          data: isActionJsonValue(data) ? structuredClone(data) : null,
-        } satisfies ControllerGameFact,
-      ];
-    })
-    .sort(
-      (left, right) =>
-        left.sportingOrder - right.sportingOrder ||
-        left.synchronizationOrder - right.synchronizationOrder ||
-        left.factId.localeCompare(right.factId),
-    );
+  const gameFacts = orderControllerGameFacts(
+    canonicalActions
+      .flatMap(({ action }) => {
+        if (action.interpretation.type !== "fact") return [];
+        const payload = action.interpretation.payload;
+        const gameTimeMs =
+          isRecord(payload) && typeof payload.gameTimeMs === "number" ? payload.gameTimeMs : null;
+        const data = isRecord(payload) && "data" in payload ? payload.data : null;
+        const sportingOrder =
+          isRecord(data) && typeof data.sportingOrder === "number"
+            ? data.sportingOrder
+            : (gameTimeMs ?? 0);
+        return [
+          {
+            factId: action.interpretation.factId,
+            factType: action.interpretation.factType,
+            gameSideId: action.interpretation.gameSideId,
+            gameTimeMs,
+            sportingOrder,
+            synchronizationOrder: synchronizationOrderByOperationId.get(action.operationId) ?? 0,
+            effective: effectiveFactIds.has(action.interpretation.factId),
+            data: isActionJsonValue(data) ? structuredClone(data) : null,
+          } satisfies ControllerGameFact,
+        ];
+      })
+      .sort(
+        (left, right) =>
+          left.sportingOrder - right.sportingOrder ||
+          left.synchronizationOrder - right.synchronizationOrder ||
+          left.factId.localeCompare(right.factId),
+      ),
+  );
+  const orderedEffectiveFacts = gameFacts.filter((fact) => fact.effective);
+  const sideIds = root.gameSides.map((side) => side.id);
+  let goalCount = 0;
+  let overtime = false;
+  let overtimeTarget: number | null = null;
+  let winnerGameSideId: string | null = null;
+  let winnerFactId: string | null = null;
+  let catchState: LiveCatchState | null = null;
+  let resultFact: ControllerGameFact | null = null;
+
+  for (const fact of orderedEffectiveFacts) {
+    const data = isRecord(fact.data) ? fact.data : null;
+    const side = fact.gameSideId;
+    if (fact.factType === "goal") {
+      if (side !== null && side in scoreByGameSide) {
+        scoreByGameSide[side] = (scoreByGameSide[side] ?? 0) + 10;
+      }
+      goalCount += 1;
+      if (overtimeTarget !== null && winnerGameSideId === null) {
+        const reached = side !== null && (scoreByGameSide[side] ?? 0) >= overtimeTarget;
+        if (reached) {
+          winnerGameSideId = side;
+          winnerFactId = fact.factId;
+        }
+      }
+      continue;
+    }
+    if (fact.factType === "flag-catch" && catchState === null && side !== null) {
+      const nonCatching = sideIds.find((candidate) => candidate !== side);
+      if (nonCatching === undefined) continue;
+      scoreByGameSide[side] = (scoreByGameSide[side] ?? 0) + 30;
+      const nonCatchingScore = scoreByGameSide[nonCatching] ?? 0;
+      const catchingScore = scoreByGameSide[side] ?? 0;
+      const targetScore = nonCatchingScore + 30;
+      catchState = {
+        factId: fact.factId,
+        catchingGameSideId: side,
+        nonCatchingGameSideId: nonCatching,
+        gameTimeMs: fact.gameTimeMs ?? fact.sportingOrder,
+        targetScore: catchingScore > nonCatchingScore ? null : targetScore,
+      };
+      if (catchingScore > nonCatchingScore) {
+        winnerGameSideId = side;
+        winnerFactId = fact.factId;
+      } else {
+        overtime = true;
+        overtimeTarget = targetScore;
+      }
+      continue;
+    }
+    if (fact.factType === "concession" && side !== null) {
+      const opponent = sideIds.find((candidate) => candidate !== side);
+      if (opponent === undefined) continue;
+      const concedingScore = scoreByGameSide[side] ?? 0;
+      const opponentScore = scoreByGameSide[opponent] ?? 0;
+      if (concedingScore >= opponentScore) {
+        const requiredLead = concedingScore + 10;
+        const points = Math.max(10, Math.ceil((requiredLead - opponentScore) / 10) * 10);
+        scoreByGameSide[opponent] = opponentScore + points;
+      }
+      winnerGameSideId = opponent;
+      resultFact = fact;
+      winnerFactId = fact.factId;
+      continue;
+    }
+    if (fact.factType === "forfeit" && side !== null) {
+      winnerGameSideId = sideIds.find((candidate) => candidate !== side) ?? null;
+      resultFact = fact;
+      winnerFactId = fact.factId;
+      continue;
+    }
+    if (fact.factType === "double-forfeit") {
+      winnerGameSideId = null;
+      resultFact = fact;
+      continue;
+    }
+    if (fact.factType === "result") {
+      const declaredWinner = data?.winnerGameSideId;
+      winnerGameSideId =
+        typeof declaredWinner === "string" && declaredWinner in scoreByGameSide
+          ? declaredWinner
+          : winnerGameSideId;
+      resultFact = fact;
+      if (winnerGameSideId !== null) winnerFactId = fact.factId;
+    }
+  }
   const latestEffectiveFact = (factType: string): ControllerGameFact | null =>
     gameFacts.filter((fact) => fact.effective && fact.factType === factType).at(-1) ?? null;
   const timeoutFact = latestEffectiveFact("timeout");
   const suspensionFact = latestEffectiveFact("suspension");
   const heatFact = latestEffectiveFact("heat-stoppage");
-  const resultFact = latestEffectiveFact("result");
+  const latestResultFact = latestEffectiveFact("result");
   const heatAction =
     isRecord(heatFact?.data) &&
     (heatFact.data.heatAction === "start" ||
@@ -1576,19 +1854,28 @@ function deriveLiveEventGameState(
         ? { status: "heat-stoppage", factId: heat.factId }
         : { status: "none", factId: null };
   const result: LiveResultState =
-    resultFact === null
+    resultFact === null && latestResultFact === null && winnerFactId === null
       ? null
-      : { factId: resultFact.factId, data: structuredClone(resultFact.data) };
-  const effectiveResult = gameFacts.some((fact) => fact.effective && fact.factType === "result");
+      : {
+          factId: (resultFact ?? latestResultFact)?.factId ?? winnerFactId!,
+          data: structuredClone(
+            (resultFact ?? latestResultFact)?.data ?? {
+              resultKind: "derived-score-completion",
+              winnerGameSideId,
+            },
+          ),
+        };
+  const effectiveResult = result !== null || winnerGameSideId !== null;
   const effectiveSuspension = gameFacts.some(
     (fact) => fact.effective && fact.factType === "suspension",
   );
-  const phase =
-    root.lifecycle.phase === "finished" && !effectiveResult
-      ? "in-progress"
-      : effectiveSuspension && root.lifecycle.phase !== "finished"
-        ? "suspended"
-        : root.lifecycle.phase;
+  const phase = effectiveResult
+    ? "finished"
+    : effectiveSuspension && root.lifecycle.phase !== "finished"
+      ? "suspended"
+      : root.lifecycle.phase === "scheduled"
+        ? "scheduled"
+        : "in-progress";
   return {
     interpreterVersion: version,
     phase,
@@ -1598,6 +1885,10 @@ function deriveLiveEventGameState(
     stoppage,
     heat,
     result,
+    overtime,
+    overtimeTarget,
+    winnerGameSideId,
+    catch: catchState,
     gameFacts,
     clock: projectClockBaseline(
       deriveClockAuthority(
@@ -1610,6 +1901,10 @@ function deriveLiveEventGameState(
 
 function controllerFactType(intent: LiveEventControllerIntent): string {
   if (intent.type === "record-goal") return "goal";
+  if (intent.type === "record-flag-catch") return "flag-catch";
+  if (intent.type === "record-concession") return "concession";
+  if (intent.type === "record-forfeit") return "forfeit";
+  if (intent.type === "record-double-forfeit") return "double-forfeit";
   if (
     intent.type === "clock" ||
     intent.type === "set-running" ||
@@ -1671,7 +1966,14 @@ function shouldRecordCommencement(
   clockStartMs: number | null,
 ): { atMs: number } | null {
   if (root.lifecycle.commencedAtMs !== null) return null;
-  if (intent.type === "record-goal" || intent.type === "substantive") {
+  if (
+    intent.type === "record-goal" ||
+    intent.type === "record-flag-catch" ||
+    intent.type === "record-concession" ||
+    intent.type === "record-forfeit" ||
+    intent.type === "record-double-forfeit" ||
+    intent.type === "substantive"
+  ) {
     return { atMs: nowMs };
   }
   if (
@@ -1682,6 +1984,172 @@ function shouldRecordCommencement(
     return { atMs: clockStartMs + 10_000 };
   }
   return null;
+}
+
+function controllerGameSideId(intent: LiveEventControllerIntent): string | null {
+  return "gameSideId" in intent && typeof intent.gameSideId === "string" ? intent.gameSideId : null;
+}
+
+function isScoringIntent(intent: LiveEventControllerIntent): boolean {
+  return (
+    intent.type === "record-flag-catch" ||
+    intent.type === "record-concession" ||
+    (intent.type === "substantive" &&
+      (intent.trigger === "flag-catch" || intent.trigger === "concession"))
+  );
+}
+
+function isResultIntent(intent: LiveEventControllerIntent): boolean {
+  return (
+    intent.type === "record-forfeit" ||
+    intent.type === "record-double-forfeit" ||
+    (intent.type === "substantive" &&
+      (intent.trigger === "forfeit" || intent.trigger === "double-forfeit"))
+  );
+}
+
+function intentFinishesGame(
+  intent: LiveEventControllerIntent,
+  current: LiveEventGameDerivedState,
+): boolean {
+  if (
+    intent.type === "record-concession" ||
+    intent.type === "record-forfeit" ||
+    intent.type === "record-double-forfeit" ||
+    (intent.type === "substantive" &&
+      (intent.trigger === "concession" ||
+        intent.trigger === "forfeit" ||
+        intent.trigger === "double-forfeit"))
+  )
+    return true;
+  if (intent.type === "substantive" && intent.trigger === "result") {
+    return !current.overtime || current.winnerGameSideId !== null;
+  }
+  if (
+    intent.type === "record-flag-catch" ||
+    (intent.type === "substantive" && intent.trigger === "flag-catch")
+  ) {
+    const catching = intent.gameSideId;
+    if (catching === undefined) return false;
+    const other = currentSideIds(current).find((side) => side !== catching);
+    return (
+      other !== undefined &&
+      (current.scoreByGameSide[catching] ?? 0) + 30 > (current.scoreByGameSide[other] ?? 0)
+    );
+  }
+  if (intent.type === "record-goal" && current.overtimeTarget !== null) {
+    return (current.scoreByGameSide[intent.gameSideId] ?? 0) + 10 >= current.overtimeTarget;
+  }
+  return false;
+}
+
+function deriveControllerLifecycleAfterAction(
+  root: EventGameRecordRoot,
+  actionsBefore: readonly {
+    action: ControlAction;
+    canonicalContent: string;
+    contentFingerprint: string;
+  }[],
+  actionInput: unknown,
+  intent: LiveEventControllerIntent,
+  acceptedAtMs: number,
+): EventGameRecordRoot["lifecycle"] | undefined {
+  const scoringFactNeedsRebuild =
+    root.lifecycle.phase === "finished" ||
+    intent.type !== "record-goal" ||
+    actionsBefore.some(({ action }) => {
+      if (action.interpretation.type !== "fact") return false;
+      return action.interpretation.factType === "flag-catch";
+    });
+  const relevantFact =
+    intent.type === "correct-fact"
+      ? rootDerivedScoringFactForCorrection(root, actionsBefore, intent.targetFactId)
+      : scoringFactNeedsRebuild &&
+          (intent.type === "record-goal" ||
+            intent.type === "record-flag-catch" ||
+            intent.type === "record-concession" ||
+            intent.type === "record-forfeit" ||
+            intent.type === "record-double-forfeit" ||
+            (intent.type === "substantive" && intent.trigger === "result"))
+        ? true
+        : false;
+  if (!relevantFact) return undefined;
+  const prepared = prepareControlAction(
+    actionInput,
+    root,
+    createControlActionCodecRegistry(createDefaultControlActionCodecs()),
+    acceptedAtMs,
+  );
+  if (!prepared.ok) return undefined;
+  const candidate = materializeControlAction(prepared.value, acceptedAtMs);
+  const rebuilt = rebuildLiveDerivedState(root, [
+    ...actionsBefore,
+    {
+      action: candidate,
+      canonicalContent: prepared.value.canonicalContent,
+      contentFingerprint: prepared.value.contentFingerprint,
+    },
+  ]);
+  if (rebuilt === null || (rebuilt.phase !== "in-progress" && rebuilt.phase !== "finished")) {
+    return undefined;
+  }
+  const desiredPhase = rebuilt.phase;
+  const desired: EventGameRecordRoot["lifecycle"] = {
+    ...root.lifecycle,
+    phase: desiredPhase,
+    commencedAtMs: root.lifecycle.commencedAtMs ?? acceptedAtMs,
+    finishedAtMs:
+      desiredPhase === "finished" ? (root.lifecycle.finishedAtMs ?? acceptedAtMs) : null,
+  };
+  return JSON.stringify(desired) === JSON.stringify(root.lifecycle) ? undefined : desired;
+}
+
+function rootDerivedScoringFactForCorrection(
+  root: EventGameRecordRoot,
+  actionsBefore: readonly {
+    action: ControlAction;
+    canonicalContent: string;
+    contentFingerprint: string;
+  }[],
+  targetFactId: string,
+): boolean {
+  const current = rebuildLiveDerivedState(root, actionsBefore);
+  if (current === null) return false;
+  const fact = current.gameFacts.find((candidate) => candidate.factId === targetFactId);
+  return (
+    fact !== undefined &&
+    (fact.factType === "goal" ||
+      fact.factType === "flag-catch" ||
+      fact.factType === "concession" ||
+      fact.factType === "forfeit" ||
+      fact.factType === "double-forfeit" ||
+      fact.factType === "result")
+  );
+}
+
+function allowsLatePreCatchGoal(
+  intent: LiveEventControllerIntent,
+  current: LiveEventGameDerivedState,
+): boolean {
+  if (intent.type !== "record-goal" || current.catch === null) return false;
+  const catchFact = current.gameFacts.find(
+    (fact) => fact.factId === current.catch?.factId && fact.effective,
+  );
+  if (catchFact === undefined) return false;
+  if (
+    intent.sportingOrderAdjudication?.relatedFactId === catchFact.factId &&
+    intent.sportingOrderAdjudication.relation === "before" &&
+    catchFact.gameTimeMs !== null &&
+    Math.abs(intent.gameTimeMs - catchFact.gameTimeMs) <= CLOSE_PLAY_ADJUDICATION_WINDOW_MS
+  ) {
+    return true;
+  }
+  const candidateOrder = intent.sportingOrder ?? intent.gameTimeMs;
+  return candidateOrder < catchFact.sportingOrder;
+}
+
+function currentSideIds(state: LiveEventGameDerivedState): string[] {
+  return Object.keys(state.scoreByGameSide);
 }
 
 function readDerivedState(value: unknown): LiveEventGameDerivedState | null {
@@ -1700,7 +2168,8 @@ function readDerivedState(value: unknown): LiveEventGameDerivedState | null {
       !validateOpaqueIdentifier(gameSideId, "scoreByGameSide.gameSideId").ok ||
       typeof score !== "number" ||
       !Number.isSafeInteger(score) ||
-      score < 0
+      score < 0 ||
+      score > SHARED_LIMITS.score.max
     )
       return null;
     scoreByGameSide[gameSideId] = score;
@@ -1717,6 +2186,14 @@ function readDerivedState(value: unknown): LiveEventGameDerivedState | null {
   const stoppage = readLiveStoppageState(value.stoppage);
   const heat = readLiveHeatState(value.heat);
   const result = readLiveResultState(value.result);
+  const overtime = value.overtime === undefined ? false : value.overtime;
+  if (typeof overtime !== "boolean") return null;
+  const overtimeTarget = readNullableScore(value.overtimeTarget ?? value.targetScore);
+  if (overtimeTarget === "invalid") return null;
+  const winnerGameSideId = readNullableIdentifier(value.winnerGameSideId);
+  if (winnerGameSideId.status === "invalid") return null;
+  const catchState = readLiveCatchState(value.catch);
+  if (catchState === "invalid") return null;
   const gameFacts = readControllerGameFacts(value.gameFacts);
   if (gameFacts === null) return null;
   return {
@@ -1728,6 +2205,10 @@ function readDerivedState(value: unknown): LiveEventGameDerivedState | null {
     stoppage,
     heat,
     result,
+    overtime,
+    overtimeTarget: overtimeTarget === "missing" ? null : overtimeTarget,
+    winnerGameSideId: winnerGameSideId.status === "value" ? winnerGameSideId.value : null,
+    catch: catchState === "missing" ? null : catchState,
     gameFacts,
     clock,
   };
@@ -1875,6 +2356,60 @@ function readLiveResultState(value: unknown): LiveResultState {
   return { factId: factId.value, data: data.value };
 }
 
+function readNullableScore(value: unknown): number | null | "missing" | "invalid" {
+  if (value === undefined) return "missing";
+  if (value === null) return null;
+  const parsed = validateIntegerInRange(value, 0, 1_000, "overtimeTarget");
+  return parsed.ok ? parsed.value : "invalid";
+}
+
+function readNullableIdentifier(
+  value: unknown,
+): { status: "missing" | "null" | "invalid" } | { status: "value"; value: string } {
+  if (value === undefined) return { status: "missing" };
+  if (value === null) return { status: "null" };
+  const parsed = validateOpaqueIdentifier(value, "winnerGameSideId");
+  return parsed.ok ? { status: "value", value: parsed.value } : { status: "invalid" };
+}
+
+function readLiveCatchState(value: unknown): LiveCatchState | null | "missing" | "invalid" {
+  if (value === undefined) return "missing";
+  if (value === null) return null;
+  if (!isRecord(value)) return "invalid";
+  const factId = validateOpaqueIdentifier(value.factId, "catch.factId");
+  const catchingGameSideId = validateOpaqueIdentifier(
+    value.catchingGameSideId,
+    "catch.catchingGameSideId",
+  );
+  const nonCatchingGameSideId = validateOpaqueIdentifier(
+    value.nonCatchingGameSideId,
+    "catch.nonCatchingGameSideId",
+  );
+  const gameTimeMs = validateIntegerInRange(
+    value.gameTimeMs,
+    0,
+    SHARED_LIMITS.clock.maxMs,
+    "catch.gameTimeMs",
+  );
+  const targetScore = readNullableScore(value.targetScore);
+  if (
+    !factId.ok ||
+    !catchingGameSideId.ok ||
+    !nonCatchingGameSideId.ok ||
+    !gameTimeMs.ok ||
+    targetScore === "missing" ||
+    targetScore === "invalid"
+  )
+    return "invalid";
+  return {
+    factId: factId.value,
+    catchingGameSideId: catchingGameSideId.value,
+    nonCatchingGameSideId: nonCatchingGameSideId.value,
+    gameTimeMs: gameTimeMs.value,
+    targetScore,
+  };
+}
+
 export function validateLiveEventClockActionInTransaction(
   actions: readonly { action: ControlAction }[],
   candidate: ControlAction,
@@ -1941,6 +2476,127 @@ function rebuildLiveDerivedState(
   );
 }
 
+function rebuildLiveDerivedStateWithCandidate(
+  actions: readonly {
+    action: ControlAction;
+    canonicalContent: string;
+    contentFingerprint: string;
+  }[],
+  root: EventGameRecordRoot,
+  candidate: ControlAction,
+): LiveEventGameDerivedState | null {
+  const prepared = prepareControlAction(
+    candidate,
+    root,
+    createControlActionCodecRegistry(createDefaultControlActionCodecs()),
+    candidate.acceptedAtMs,
+  );
+  if (!prepared.ok) return null;
+  return rebuildLiveDerivedState(root, [
+    ...actions,
+    {
+      action: candidate,
+      canonicalContent: prepared.value.canonicalContent,
+      contentFingerprint: prepared.value.contentFingerprint,
+    },
+  ]);
+}
+
+function validateEffectiveClosePlayOrdering(
+  state: LiveEventGameDerivedState,
+): { status: "accepted" } | { status: "rejected"; reason: "invalid-action"; detail: string } {
+  const scoringFacts = state.gameFacts.filter(
+    (fact) =>
+      fact.effective &&
+      fact.gameTimeMs !== null &&
+      (fact.factType === "goal" || fact.factType === "flag-catch"),
+  );
+  const selectedPairs: { catchFactId: string; goalFactId: string }[] = [];
+  for (const fact of scoringFacts) {
+    const adjudication = readSportingOrderAdjudication(isRecord(fact.data) ? fact.data : null);
+    if (adjudication === null) continue;
+    const related = scoringFacts.filter(
+      (candidate) => candidate.factId === adjudication.relatedFactId,
+    );
+    if (related.length !== 1 || !isCloseOpposingScoringPair(fact, related[0]!)) {
+      return rejectedLiveAction(
+        "Sporting-order adjudication must name one effective close opposing Game Fact.",
+      );
+    }
+    const pair =
+      fact.factType === "flag-catch"
+        ? { catchFactId: fact.factId, goalFactId: related[0]!.factId }
+        : { catchFactId: related[0]!.factId, goalFactId: fact.factId };
+    if (
+      !selectedPairs.some(
+        (candidate) =>
+          candidate.catchFactId === pair.catchFactId && candidate.goalFactId === pair.goalFactId,
+      )
+    ) {
+      selectedPairs.push(pair);
+    }
+  }
+  for (const catchFact of scoringFacts.filter((fact) => fact.factType === "flag-catch")) {
+    const nearbyGoals = scoringFacts.filter(
+      (fact) => fact.factType === "goal" && isCloseOpposingScoringPair(catchFact, fact),
+    );
+    if (nearbyGoals.length === 0) continue;
+    const catchPairs = selectedPairs.filter((pair) => pair.catchFactId === catchFact.factId);
+    if (catchPairs.length !== 1) {
+      return rejectedLiveAction(
+        catchPairs.length === 0
+          ? "A close goal and flag catch require explicit Head Referee sporting-order adjudication."
+          : "Close-play sporting-order evidence must identify exactly one paired goal.",
+      );
+    }
+  }
+  return { status: "accepted" };
+}
+
+function validateEffectiveConcessionPreconditions(
+  state: LiveEventGameDerivedState,
+): { status: "accepted" } | { status: "rejected"; reason: "invalid-action"; detail: string } {
+  const effectiveFacts = orderControllerGameFacts(state.gameFacts).filter((fact) => fact.effective);
+  for (const [index, fact] of effectiveFacts.entries()) {
+    if (fact.factType !== "concession") continue;
+    const precedingFacts = effectiveFacts.slice(0, index);
+    const precedingOutcome = deriveScoringOutcomeByGameFacts(state.scoreByGameSide, precedingFacts);
+    const precedingResult = precedingFacts.some(
+      (candidate) =>
+        candidate.factType === "concession" ||
+        candidate.factType === "forfeit" ||
+        candidate.factType === "double-forfeit" ||
+        candidate.factType === "result",
+    );
+    if (
+      precedingOutcome.overtimeTarget === null ||
+      precedingResult ||
+      Object.values(precedingOutcome.scoreByGameSide).some(
+        (score) => score >= precedingOutcome.overtimeTarget!,
+      )
+    ) {
+      return rejectedLiveAction("A concession is only effective during unfinished overtime.");
+    }
+  }
+  return { status: "accepted" };
+}
+
+function validateEffectiveResultPreconditions(
+  state: LiveEventGameDerivedState,
+): { status: "accepted" } | { status: "rejected"; reason: "invalid-action"; detail: string } {
+  const hasEffectiveGenericResult = state.gameFacts.some(
+    (fact) => fact.effective && fact.factType === "result",
+  );
+  if (
+    hasEffectiveGenericResult &&
+    state.overtimeTarget !== null &&
+    state.winnerGameSideId === null
+  ) {
+    return rejectedLiveAction("A generic Result cannot finish unfinished overtime.");
+  }
+  return { status: "accepted" };
+}
+
 export function validateLiveEventGameActionInTransaction(
   actions: readonly {
     action: ControlAction;
@@ -1961,7 +2617,27 @@ export function validateLiveEventGameActionInTransaction(
       detail: "The current Event Game state cannot be rebuilt authoritatively.",
     };
   }
+  const scoreValidation = validateDerivedScoreUpperBound(current, candidate);
+  if (scoreValidation.status === "rejected") return scoreValidation;
   if (candidate.interpretation.type === "correction") {
+    const rebuilt = rebuildLiveDerivedStateWithCandidate(actions, root, candidate);
+    if (rebuilt === null) {
+      return rejectedLiveAction("The corrected live Game state cannot be rebuilt authoritatively.");
+    }
+    if (candidate.interpretation.effective) {
+      const effectiveCatchCount = rebuilt.gameFacts.filter(
+        (fact) => fact.effective && fact.factType === "flag-catch",
+      ).length;
+      if (effectiveCatchCount > 1) {
+        return rejectedLiveAction("Only one Flag Catch can remain effective.");
+      }
+      const closePlayValidation = validateEffectiveClosePlayOrdering(rebuilt);
+      if (closePlayValidation.status === "rejected") return closePlayValidation;
+    }
+    const concessionValidation = validateEffectiveConcessionPreconditions(rebuilt);
+    if (concessionValidation.status === "rejected") return concessionValidation;
+    const resultValidation = validateEffectiveResultPreconditions(rebuilt);
+    if (resultValidation.status === "rejected") return resultValidation;
     return candidate.override === undefined
       ? { status: "accepted" }
       : rejectedLiveAction("Official Overrides cannot be attached to a Correction.");
@@ -1979,12 +2655,93 @@ export function validateLiveEventGameActionInTransaction(
     data !== null && typeof data.sportingOrder === "number" ? data.sportingOrder : gameTimeMs;
   const sportingOrderDiffers =
     gameTimeMs !== null && sportingOrder !== null && sportingOrder !== gameTimeMs;
+  const sportingOrderAdjudication = readSportingOrderAdjudication(data);
+  const sportingOrderOverride = readSportingOrderOverride(data);
+  const closePair = findCloseGoalCatchPair(
+    candidate,
+    current,
+    gameTimeMs,
+    sportingOrderAdjudication,
+  );
+  if (closePair.status === "rejected") return closePair;
+  if (closePair.fact !== null) {
+    if (sportingOrderAdjudication === null) {
+      return rejectedLiveAction(
+        "A close goal and flag catch require explicit Head Referee sporting-order adjudication.",
+      );
+    }
+    if (sportingOrderAdjudication.relatedFactId !== closePair.fact.factId) {
+      return rejectedLiveAction(
+        "Sporting-order adjudication must name the close opposing Game Fact.",
+      );
+    }
+  } else if (sportingOrderAdjudication !== null) {
+    return rejectedLiveAction("Sporting-order adjudication requires one close opposing Game Fact.");
+  }
+  if (candidate.interpretation.factType === "target-score") {
+    return rejectedLiveAction("Overtime winners are derived from accepted scoring facts.");
+  }
+  if (
+    candidate.interpretation.factType === "concession" &&
+    (!current.overtime || current.winnerGameSideId !== null || current.phase === "finished")
+  ) {
+    return rejectedLiveAction("A concession is only accepted during unfinished overtime.");
+  }
+  if (candidate.interpretation.factType === "flag-catch") {
+    if (current.catch !== null) {
+      return rejectedLiveAction("Only one effective flag catch may determine the Game result.");
+    }
+    const validCatchBoundary =
+      gameTimeMs !== null && gameTimeMs >= SEEKER_RELEASE_MS && !current.clock.running;
+    if (!validCatchBoundary) {
+      const expectedBoundaryOverride = expectedLiveOverride(
+        candidate,
+        current,
+        false,
+        gameTimeMs,
+        data,
+      );
+      if (candidate.override === undefined || expectedBoundaryOverride === null) {
+        return rejectedLiveAction("A flag catch requires released seekers and stopped play.");
+      }
+      const boundaryValidation = validateOfficialOverrideEvidence(
+        candidate.override,
+        expectedBoundaryOverride,
+      );
+      if (boundaryValidation.status === "rejected") return boundaryValidation;
+      if (closePair.fact !== null && sportingOrderAdjudication !== null) {
+        const expectedSportingOrderOverride = expectedClosePlayOverride(
+          closePair.fact,
+          gameTimeMs,
+          sportingOrderAdjudication,
+        );
+        if (sportingOrderOverride === undefined || expectedSportingOrderOverride === null) {
+          return rejectedLiveAction(
+            "A separate Sporting Order override is required for this close flag catch.",
+          );
+        }
+        return validateOfficialOverrideEvidence(
+          sportingOrderOverride,
+          expectedSportingOrderOverride,
+        );
+      }
+      return { status: "accepted" };
+    }
+  }
   if (candidate.interpretation.factType === "timeout" && current.clock.running) {
     if (candidate.override?.guardrail !== "timeout-requires-paused-play") {
       return rejectedLiveAction("A normal timeout requires paused play.");
     }
   }
-  const expected = expectedLiveOverride(candidate, current, sportingOrderDiffers, gameTimeMs, data);
+  const expected =
+    closePair.fact !== null && sportingOrderAdjudication !== null
+      ? expectedClosePlayOverride(closePair.fact, gameTimeMs, sportingOrderAdjudication)
+      : expectedLiveOverride(candidate, current, sportingOrderDiffers, gameTimeMs, data);
+  if (sportingOrderOverride !== undefined) {
+    return rejectedLiveAction(
+      "A separate Sporting Order override is only valid with a flag-catch boundary override.",
+    );
+  }
   if (expected === null) {
     return candidate.override === undefined
       ? { status: "accepted" }
@@ -2040,6 +2797,22 @@ function expectedLiveOverride(
       gameTimeMs,
     };
   }
+  if (factType === "flag-catch") {
+    if (gameTimeMs >= SEEKER_RELEASE_MS && !current.clock.running && current.catch === null) {
+      return null;
+    }
+    return {
+      required: true,
+      guardrail: "flag-catch-requires-seeker-release-and-stopped-play",
+      direction: "head-referee-directed-flag-catch-boundary",
+      beforeValue: {
+        seekerReleased: gameTimeMs >= SEEKER_RELEASE_MS,
+        running: current.clock.running,
+      },
+      afterValue: { flagCatch: "accepted" },
+      gameTimeMs,
+    };
+  }
   if (factType === "heat-stoppage") {
     const heatAction = data?.heatAction;
     if (
@@ -2071,12 +2844,42 @@ function expectedLiveOverride(
   return null;
 }
 
+function expectedClosePlayOverride(
+  relatedFact: ControllerGameFact,
+  gameTimeMs: number | null,
+  adjudication: SportingOrderAdjudication,
+): LiveOverrideExpectation | null {
+  if (gameTimeMs === null) return null;
+  return {
+    required: true,
+    guardrail: "sporting-order-adjudication",
+    direction: "head-referee-adjudicated-sporting-order",
+    beforeValue: {
+      candidateGameTimeMs: gameTimeMs,
+      relatedFactId: relatedFact.factId,
+      relatedGameTimeMs: relatedFact.gameTimeMs,
+    },
+    afterValue: {
+      relation: adjudication.relation,
+      sportingOrder: "explicit-pair-order",
+    },
+    gameTimeMs,
+  };
+}
+
 function validateLiveOfficialOverrideEvidence(
   candidate: ControlAction,
   expected: LiveOverrideExpectation,
 ): { status: "accepted" } | { status: "rejected"; reason: "invalid-action"; detail: string } {
   const override = candidate.override;
   if (override === undefined) return rejectedLiveAction("Official Override evidence is missing.");
+  return validateOfficialOverrideEvidence(override, expected);
+}
+
+function validateOfficialOverrideEvidence(
+  override: OfficialOverrideMetadata,
+  expected: LiveOverrideExpectation,
+): { status: "accepted" } | { status: "rejected"; reason: "invalid-action"; detail: string } {
   if (
     override.guardrail !== expected.guardrail ||
     override.direction !== expected.direction ||
@@ -2099,6 +2902,296 @@ function rejectedLiveAction(detail: string): {
   detail: string;
 } {
   return { status: "rejected", reason: "invalid-action", detail };
+}
+
+function validateDerivedScoreUpperBound(
+  current: LiveEventGameDerivedState,
+  candidate: ControlAction,
+): { status: "accepted" } | { status: "rejected"; reason: "invalid-action"; detail: string } {
+  const currentScores = Object.values(current.scoreByGameSide);
+  if (currentScores.some((score) => score > SHARED_LIMITS.score.max)) {
+    return rejectedLiveAction("The derived score already exceeds the permitted upper bound.");
+  }
+  const interpretation = candidate.interpretation;
+  if (interpretation.type === "correction") {
+    const target = current.gameFacts.find((fact) => fact.factId === interpretation.targetFactId);
+    if (target === undefined || target.effective === interpretation.effective) {
+      return { status: "accepted" };
+    }
+    const facts = current.gameFacts.map((fact) =>
+      fact.factId === target.factId ? { ...fact, effective: interpretation.effective } : fact,
+    );
+    return validateScoringOutcomeBounds(
+      deriveScoringOutcomeByGameFacts(current.scoreByGameSide, facts),
+    );
+  }
+  if (candidate.interpretation.type !== "fact") return { status: "accepted" };
+  const factType = candidate.interpretation.factType;
+  const gameSideId = candidate.interpretation.gameSideId;
+  if (gameSideId === null || !(gameSideId in current.scoreByGameSide)) {
+    return { status: "accepted" };
+  }
+  const nextScores = { ...current.scoreByGameSide };
+  if (factType === "goal") {
+    nextScores[gameSideId] = (nextScores[gameSideId] ?? 0) + 10;
+  } else if (factType === "flag-catch" && current.catch === null) {
+    nextScores[gameSideId] = (nextScores[gameSideId] ?? 0) + 30;
+  } else if (factType === "concession") {
+    const opponent = Object.keys(nextScores).find((side) => side !== gameSideId);
+    if (opponent !== undefined) {
+      const concedingScore = nextScores[gameSideId] ?? 0;
+      const opponentScore = nextScores[opponent] ?? 0;
+      if (concedingScore >= opponentScore) {
+        const points = Math.max(10, Math.ceil((concedingScore + 10 - opponentScore) / 10) * 10);
+        nextScores[opponent] = opponentScore + points;
+      }
+    }
+  }
+  const scoreValidation = scoreUpperBoundResult(nextScores);
+  if (scoreValidation.status === "rejected") return scoreValidation;
+  if (
+    (factType === "goal" || factType === "flag-catch") &&
+    (factType !== "flag-catch" || current.catch === null)
+  ) {
+    return validateScoringOutcomeBounds(
+      deriveScoringOutcomeByGameFacts(current.scoreByGameSide, [
+        ...current.gameFacts,
+        controllerGameFactFromCandidate(candidate, current.gameFacts),
+      ]),
+    );
+  }
+  return { status: "accepted" };
+}
+
+function scoreUpperBoundResult(
+  scores: Readonly<Record<string, number>>,
+): { status: "accepted" } | { status: "rejected"; reason: "invalid-action"; detail: string } {
+  return Object.values(scores).some((score) => score > SHARED_LIMITS.score.max)
+    ? rejectedLiveAction(`The derived score must not exceed ${SHARED_LIMITS.score.max}.`)
+    : { status: "accepted" };
+}
+
+function validateScoringOutcomeBounds(outcome: {
+  scoreByGameSide: Readonly<Record<string, number>>;
+  overtimeTarget: number | null;
+}): { status: "accepted" } | { status: "rejected"; reason: "invalid-action"; detail: string } {
+  const scoreValidation = scoreUpperBoundResult(outcome.scoreByGameSide);
+  if (scoreValidation.status === "rejected") return scoreValidation;
+  return outcome.overtimeTarget !== null && outcome.overtimeTarget > SHARED_LIMITS.score.max
+    ? rejectedLiveAction(`The derived overtime target must not exceed ${SHARED_LIMITS.score.max}.`)
+    : { status: "accepted" };
+}
+
+function controllerGameFactFromCandidate(
+  candidate: ControlAction,
+  currentFacts: readonly ControllerGameFact[],
+): ControllerGameFact {
+  if (candidate.interpretation.type !== "fact") {
+    throw new Error("Only a Game Fact can be projected as a candidate fact.");
+  }
+  const payload = isRecord(candidate.interpretation.payload)
+    ? candidate.interpretation.payload
+    : {};
+  const gameTimeMs = typeof payload.gameTimeMs === "number" ? payload.gameTimeMs : null;
+  const data = isActionJsonValue(payload.data) ? payload.data : null;
+  const sportingOrder =
+    isRecord(data) && typeof data.sportingOrder === "number"
+      ? data.sportingOrder
+      : (gameTimeMs ?? 0);
+  return {
+    factId: candidate.interpretation.factId,
+    factType: candidate.interpretation.factType,
+    gameSideId: candidate.interpretation.gameSideId,
+    gameTimeMs,
+    sportingOrder,
+    synchronizationOrder:
+      currentFacts.reduce((highest, fact) => Math.max(highest, fact.synchronizationOrder), 0) + 1,
+    effective: true,
+    data,
+  };
+}
+
+function readSportingOrderAdjudication(
+  data: Record<string, unknown> | null,
+): SportingOrderAdjudication | null {
+  const value = data?.sportingOrderAdjudication;
+  if (!isRecord(value)) return null;
+  if (
+    typeof value.relatedFactId !== "string" ||
+    (value.relation !== "before" && value.relation !== "after")
+  ) {
+    return null;
+  }
+  return { relatedFactId: value.relatedFactId, relation: value.relation };
+}
+
+function readSportingOrderOverride(
+  data: Record<string, unknown> | null,
+): OfficialOverrideMetadata | undefined {
+  const parsed = validateOverride(data?.sportingOrderOverride);
+  return parsed.ok ? parsed.value : undefined;
+}
+
+function findCloseGoalCatchPair(
+  candidate: ControlAction,
+  current: LiveEventGameDerivedState,
+  gameTimeMs: number | null,
+  adjudication: SportingOrderAdjudication | null,
+):
+  | { status: "accepted"; fact: ControllerGameFact | null }
+  | { status: "rejected"; reason: "invalid-action"; detail: string } {
+  if (candidate.interpretation.type !== "fact" || gameTimeMs === null)
+    return { status: "accepted", fact: null };
+  const candidateIsGoal = candidate.interpretation.factType === "goal";
+  const candidateIsCatch = candidate.interpretation.factType === "flag-catch";
+  if (!candidateIsGoal && !candidateIsCatch) return { status: "accepted", fact: null };
+  const candidates = current.gameFacts.filter(
+    (fact) =>
+      fact.effective &&
+      fact.gameTimeMs !== null &&
+      Math.abs(fact.gameTimeMs - gameTimeMs) <= CLOSE_PLAY_ADJUDICATION_WINDOW_MS &&
+      ((candidateIsGoal && fact.factType === "flag-catch") ||
+        (candidateIsCatch && fact.factType === "goal")),
+  );
+  if (adjudication !== null) {
+    const namedFacts = current.gameFacts.filter(
+      (fact) => fact.factId === adjudication.relatedFactId,
+    );
+    if (namedFacts.length !== 1) {
+      return rejectedLiveAction(
+        "Sporting-order adjudication must name one known opposing Game Fact.",
+      );
+    }
+    const namedFact = namedFacts[0];
+    if (namedFact === undefined || !candidates.some((fact) => fact.factId === namedFact.factId)) {
+      return rejectedLiveAction(
+        "Sporting-order adjudication must name one effective close opposing Game Fact.",
+      );
+    }
+    if (hasEffectiveClosePlayPair(namedFact, current)) {
+      return rejectedLiveAction(
+        "Close-play sporting-order evidence must identify exactly one paired goal and catch.",
+      );
+    }
+    return { status: "accepted", fact: namedFact };
+  }
+  const unpairedCandidates = candidates.filter((fact) => !hasEffectiveClosePlayPair(fact, current));
+  if (unpairedCandidates.length === 0) return { status: "accepted", fact: null };
+  if (unpairedCandidates.length > 1) {
+    return rejectedLiveAction(
+      "Head Referee sporting-order adjudication must identify the exact paired Game Fact.",
+    );
+  }
+  return { status: "accepted", fact: unpairedCandidates[0] ?? null };
+}
+
+function hasEffectiveClosePlayPair(
+  fact: ControllerGameFact,
+  current: LiveEventGameDerivedState,
+): boolean {
+  const effectiveScoringFacts = current.gameFacts.filter(
+    (candidate) =>
+      candidate.effective && (candidate.factType === "goal" || candidate.factType === "flag-catch"),
+  );
+  const ownAdjudication = readSportingOrderAdjudication(isRecord(fact.data) ? fact.data : null);
+  if (
+    ownAdjudication !== null &&
+    effectiveScoringFacts.some(
+      (candidate) =>
+        candidate.factId === ownAdjudication.relatedFactId &&
+        isCloseOpposingScoringPair(fact, candidate),
+    )
+  ) {
+    return true;
+  }
+  return effectiveScoringFacts.some((candidate) => {
+    const adjudication = readSportingOrderAdjudication(
+      isRecord(candidate.data) ? candidate.data : null,
+    );
+    return (
+      adjudication?.relatedFactId === fact.factId && isCloseOpposingScoringPair(fact, candidate)
+    );
+  });
+}
+
+function isCloseOpposingScoringPair(left: ControllerGameFact, right: ControllerGameFact): boolean {
+  return (
+    left.gameTimeMs !== null &&
+    right.gameTimeMs !== null &&
+    ((left.factType === "goal" && right.factType === "flag-catch") ||
+      (left.factType === "flag-catch" && right.factType === "goal")) &&
+    Math.abs(left.gameTimeMs - right.gameTimeMs) <= CLOSE_PLAY_ADJUDICATION_WINDOW_MS
+  );
+}
+
+export function orderControllerGameFacts(
+  facts: readonly ControllerGameFact[],
+): ControllerGameFact[] {
+  const ordered = [...facts].sort(
+    (left, right) =>
+      left.sportingOrder - right.sportingOrder ||
+      left.synchronizationOrder - right.synchronizationOrder ||
+      left.factId.localeCompare(right.factId),
+  );
+  for (const candidate of facts) {
+    if (!candidate.effective) continue;
+    const adjudication = readSportingOrderAdjudication(
+      isRecord(candidate.data) ? candidate.data : null,
+    );
+    if (adjudication === null) continue;
+    const relatedIndex = ordered.findIndex((fact) => fact.factId === adjudication.relatedFactId);
+    const candidateIndex = ordered.findIndex((fact) => fact.factId === candidate.factId);
+    if (relatedIndex < 0 || candidateIndex < 0 || relatedIndex === candidateIndex) continue;
+    if (ordered[relatedIndex]?.effective !== true) continue;
+    const candidateShouldPrecedeRelated = adjudication.relation === "before";
+    const candidateCurrentlyPrecedesRelated = candidateIndex < relatedIndex;
+    if (candidateShouldPrecedeRelated === candidateCurrentlyPrecedesRelated) continue;
+    const related = ordered[relatedIndex];
+    const currentCandidate = ordered[candidateIndex];
+    if (related === undefined || currentCandidate === undefined) continue;
+    // Swap only the adjudicated pair. Every unrelated fact keeps its established
+    // slot, including facts sharing either endpoint's Game Clock time.
+    ordered[relatedIndex] = currentCandidate;
+    ordered[candidateIndex] = related;
+  }
+  return ordered;
+}
+
+function deriveScoringOutcomeByGameFacts(
+  initialScores: Readonly<Record<string, number>>,
+  facts: readonly ControllerGameFact[],
+): {
+  scoreByGameSide: Readonly<Record<string, number>>;
+  overtimeTarget: number | null;
+} {
+  const scores = Object.fromEntries(Object.keys(initialScores).map((side) => [side, 0]));
+  let catchProcessed = false;
+  let overtimeTarget: number | null = null;
+  const orderedFacts = orderControllerGameFacts(facts).filter((candidate) => candidate.effective);
+  for (const fact of orderedFacts) {
+    const side = fact.gameSideId;
+    if (fact.factType === "goal" && side !== null && side in scores) {
+      scores[side] = (scores[side] ?? 0) + 10;
+    } else if (fact.factType === "flag-catch" && side !== null && side in scores) {
+      if (catchProcessed) continue;
+      scores[side] = (scores[side] ?? 0) + 30;
+      const opponent = Object.keys(scores).find((candidate) => candidate !== side);
+      if (opponent !== undefined && (scores[side] ?? 0) <= (scores[opponent] ?? 0)) {
+        overtimeTarget = (scores[opponent] ?? 0) + 30;
+      }
+      catchProcessed = true;
+    } else if (fact.factType === "concession" && side !== null && side in scores) {
+      const opponent = Object.keys(scores).find((candidate) => candidate !== side);
+      if (opponent === undefined) continue;
+      const concedingScore = scores[side] ?? 0;
+      const opponentScore = scores[opponent] ?? 0;
+      if (concedingScore >= opponentScore) {
+        scores[opponent] =
+          opponentScore + Math.max(10, Math.ceil((concedingScore + 10 - opponentScore) / 10) * 10);
+      }
+    }
+  }
+  return { scoreByGameSide: scores, overtimeTarget };
 }
 
 function readClockAuthorityActions(
@@ -2358,6 +3451,16 @@ function buildLiveOfficialOverride(
     intent.type === "correct-fact"
   ) {
     throw new Error("Official Overrides are not valid for this Controller action.");
+  }
+  if (intent.sportingOrderAdjudication !== undefined) {
+    if (intent.type !== "record-goal" && intent.type !== "record-flag-catch") {
+      throw new Error("Sporting-order adjudication is only valid for a goal or flag catch.");
+    }
+    return {
+      ...structuredClone(intent.override),
+      gameTimeMs: intent.gameTimeMs,
+      authorityReference: intent.override.authorityReference || sessionId,
+    };
   }
   const expected = explainLiveEventGuardrail({
     type: intent.type,

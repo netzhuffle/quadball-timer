@@ -23,7 +23,7 @@ describe("Event Game Controller reconnect browser seam", () => {
   let testWindow: Window;
   let container: HTMLDivElement;
   let root: Root;
-  let replayMode: "lost" | "success" | "deferred";
+  let replayMode: "lost" | "success" | "deferred" | "retryable";
   let openBodies: Record<string, unknown>[];
   let replayCalls: number;
   let replayBodies: Record<string, any>[];
@@ -32,6 +32,7 @@ describe("Event Game Controller reconnect browser seam", () => {
   let openGrantSessionId: string;
   let openGrantVersion: string;
   let openBearer: string;
+  let openProjection: ControllerProjection;
   let refreshProjection: ControllerProjection | null;
   let refreshRejected: boolean;
   let switchRequested: boolean;
@@ -48,6 +49,7 @@ describe("Event Game Controller reconnect browser seam", () => {
     openGrantSessionId = "session";
     openGrantVersion = "version";
     openBearer = "bearer";
+    openProjection = projection();
     refreshProjection = projection();
     refreshRejected = false;
     switchRequested = false;
@@ -74,7 +76,7 @@ describe("Event Game Controller reconnect browser seam", () => {
                 grantSessionId: openGrantSessionId,
                 grantVersion: openGrantVersion,
               },
-              projection: projection(),
+              projection: openProjection,
               projectionStatus: "available",
             }),
             { status: 200, headers: { "content-type": "application/json" } },
@@ -103,12 +105,12 @@ describe("Event Game Controller reconnect browser seam", () => {
                 grantSessionId: body.grantSessionId,
                 grantVersion: body.grantVersion,
               },
-              status: "synchronized",
+              status: replayMode === "retryable" ? "retryable" : "synchronized",
               outcomes: body.actions.map((action) => ({
                 operationId: action.intent.operationId,
-                status: "accepted",
+                status: replayMode === "retryable" ? "retryable" : "accepted",
               })),
-              projection: projection(),
+              projection: replayMode === "retryable" ? openProjection : projection(),
             }),
             { status: 200, headers: { "content-type": "application/json" } },
           );
@@ -282,8 +284,12 @@ describe("Event Game Controller reconnect browser seam", () => {
     expect(container.textContent).toContain("retained for reconnect replay");
     const stored = JSON.parse(
       testWindow.localStorage.getItem(controllerReplicaStorageKey("game-browser")) ?? "null",
-    ) as { pendingActions?: unknown[] };
+    ) as { pendingActions?: { intent?: { gameTimeMs?: number; sportingOrder?: number } }[] };
     expect(stored.pendingActions).toHaveLength(1);
+    expect(stored.pendingActions?.[0]?.intent).toMatchObject({
+      gameTimeMs: 12_000,
+      sportingOrder: 12_000,
+    });
   });
 
   test("requires exactly one Controller credential and keeps both/none local", async () => {
@@ -371,6 +377,361 @@ describe("Event Game Controller reconnect browser seam", () => {
       targetFactId: "fact-goal",
       effective: false,
     });
+  });
+
+  test("uses a contextual Head Referee choice for close-play catch ordering", async () => {
+    await enterAndOpen();
+    const catchButtons = Array.from(container.getElementsByTagName("button")).filter((button) =>
+      button.textContent?.includes("Record flag catch"),
+    );
+    expect(catchButtons.length).toBeGreaterThan(1);
+    await act(async () => {
+      catchButtons.at(-1)?.click();
+      await Promise.resolve();
+    });
+    expect(container.querySelector('[data-close-play-adjudication="true"]')).not.toBeNull();
+    expect(container.textContent).toContain("Head Referee close goal/catch ordering");
+
+    await act(async () => {
+      Array.from(container.getElementsByTagName("button"))
+        .find((button) => button.textContent?.includes("Catch before goal"))
+        ?.click();
+      await Promise.resolve();
+    });
+    expect(
+      replayBodies
+        .flatMap((body) => body.actions ?? [])
+        .find((action) => action.intent.type === "record-flag-catch"),
+    ).toBeUndefined();
+    expect(container.querySelector('[data-flag-catch-boundary-override="true"]')).not.toBeNull();
+    expect(container.textContent).toContain("Sporting Order recorded");
+    await act(async () => {
+      Array.from(container.getElementsByTagName("button"))
+        .find((button) => button.textContent?.includes("Confirm boundary override"))
+        ?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const selected = replayBodies
+      .flatMap((body) => body.actions ?? [])
+      .find((action) => action.intent.type === "record-flag-catch");
+    expect(selected?.intent).toMatchObject({
+      type: "record-flag-catch",
+      gameTimeMs: 12_000,
+      sportingOrderAdjudication: {
+        relatedFactId: "fact-goal",
+        relation: "before",
+      },
+      override: {
+        guardrail: "flag-catch-requires-seeker-release-and-stopped-play",
+        direction: "head-referee-directed-flag-catch-boundary",
+        confirmation: "head-referee-confirmed",
+      },
+      sportingOrderOverride: {
+        guardrail: "sporting-order-adjudication",
+        direction: "head-referee-adjudicated-sporting-order",
+        confirmation: "head-referee-confirmed",
+        beforeValue: {
+          candidateGameTimeMs: 12_000,
+          relatedFactId: "fact-goal",
+          relatedGameTimeMs: 12_000,
+        },
+        afterValue: { relation: "before", sportingOrder: "explicit-pair-order" },
+      },
+    });
+  });
+
+  test("causally retains a close-play fact behind its optimistic paired predecessor", async () => {
+    replayMode = "retryable";
+    const initial = projection();
+    openProjection = {
+      ...initial,
+      scoreByGameSide: { "side-a": 0, "side-b": 0 },
+      goalCount: 0,
+      gameFacts: [],
+    };
+    await enterAndOpen();
+
+    await act(async () => {
+      Array.from(container.getElementsByTagName("button"))
+        .find((button) => button.textContent?.includes("Record 10-point goal"))
+        ?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const goal = replayBodies
+      .flatMap((body) => body.actions ?? [])
+      .find((action) => action.intent.type === "record-goal");
+    expect(goal).toBeDefined();
+
+    await act(async () => {
+      Array.from(container.getElementsByTagName("button"))
+        .find((button) => button.textContent?.includes("Record flag catch"))
+        ?.click();
+      await Promise.resolve();
+    });
+    await act(async () => {
+      Array.from(container.getElementsByTagName("button"))
+        .find((button) => button.textContent?.includes("Catch before goal"))
+        ?.click();
+      await Promise.resolve();
+    });
+    await act(async () => {
+      Array.from(container.getElementsByTagName("button"))
+        .find((button) => button.textContent?.includes("Confirm boundary override"))
+        ?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const catchAction = replayBodies
+      .flatMap((body) => body.actions ?? [])
+      .find((action) => action.intent.type === "record-flag-catch");
+    expect(catchAction?.causalPredecessorIds).toEqual([goal?.intent.operationId]);
+  });
+
+  test("confirms a flag-catch boundary override without conflating Sporting Order", async () => {
+    const initial = projection();
+    openProjection = { ...initial, gameFacts: [] };
+    refreshProjection = openProjection;
+    await enterAndOpen();
+    await act(async () => {
+      Array.from(container.getElementsByTagName("button"))
+        .find((button) => button.textContent?.includes("Record flag catch"))
+        ?.click();
+      await Promise.resolve();
+    });
+    expect(container.querySelector('[data-flag-catch-boundary-override="true"]')).not.toBeNull();
+    await act(async () => {
+      Array.from(container.getElementsByTagName("button"))
+        .find((button) => button.textContent?.includes("Confirm boundary override"))
+        ?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const selected = replayBodies
+      .flatMap((body) => body.actions ?? [])
+      .find((action) => action.intent.type === "record-flag-catch");
+    expect(selected?.intent).toMatchObject({
+      type: "record-flag-catch",
+      gameTimeMs: 12_000,
+      override: {
+        guardrail: "flag-catch-requires-seeker-release-and-stopped-play",
+        direction: "head-referee-directed-flag-catch-boundary",
+        confirmation: "head-referee-confirmed",
+      },
+    });
+    expect(selected?.intent.sportingOrderOverride).toBeUndefined();
+  });
+
+  test("lets the Head Referee select the exact goal from multiple close candidates", async () => {
+    const initial = projection();
+    const firstGoal = initial.gameFacts?.[0];
+    if (firstGoal === undefined) throw new Error("Expected a goal fixture.");
+    openProjection = {
+      ...initial,
+      gameFacts: [
+        firstGoal,
+        {
+          ...firstGoal,
+          factId: "fact-goal-second-close",
+          gameTimeMs: 11_500,
+          sportingOrder: 11_500,
+          synchronizationOrder: firstGoal.synchronizationOrder + 1,
+          data: { points: 10, sportingOrder: 11_500 },
+        },
+      ],
+    };
+    await enterAndOpen();
+    await act(async () => {
+      Array.from(container.getElementsByTagName("button"))
+        .find((button) => button.textContent?.includes("Record flag catch"))
+        ?.click();
+      await Promise.resolve();
+    });
+    const candidates = Array.from(
+      container.querySelectorAll<HTMLElement>("[data-close-play-related-fact-id]"),
+    );
+    expect(candidates).toHaveLength(2);
+    expect(container.textContent).toContain("2 opposing close-play candidates");
+    await act(async () => {
+      Array.from(candidates[1]?.getElementsByTagName("button") ?? [])
+        .find((button) => button.textContent?.includes("Catch before goal"))
+        ?.click();
+      await Promise.resolve();
+    });
+    await act(async () => {
+      Array.from(container.getElementsByTagName("button"))
+        .find((button) => button.textContent?.includes("Confirm boundary override"))
+        ?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const selected = replayBodies
+      .flatMap((body) => body.actions ?? [])
+      .find((action) => action.intent.type === "record-flag-catch");
+    expect(selected?.intent).toMatchObject({
+      sportingOrderAdjudication: {
+        relatedFactId: "fact-goal-second-close",
+        relation: "before",
+      },
+      override: {
+        guardrail: "flag-catch-requires-seeker-release-and-stopped-play",
+      },
+      sportingOrderOverride: {
+        beforeValue: {
+          relatedFactId: "fact-goal-second-close",
+          relatedGameTimeMs: 11_500,
+        },
+      },
+    });
+  });
+
+  test("adjudicates a non-identical close pair without rewriting Game Clock times", async () => {
+    const initial = projection();
+    openProjection = {
+      ...initial,
+      gameFacts: (initial.gameFacts ?? []).map((fact) => ({
+        ...fact,
+        gameTimeMs: 11_500,
+        sportingOrder: 11_500,
+        data: { points: 10, sportingOrder: 11_500 },
+      })),
+    };
+    await enterAndOpen();
+    await act(async () => {
+      Array.from(container.getElementsByTagName("button"))
+        .find((button) => button.textContent?.includes("Record flag catch"))
+        ?.click();
+      await Promise.resolve();
+    });
+    expect(container.textContent).toContain("11500");
+    await act(async () => {
+      Array.from(container.getElementsByTagName("button"))
+        .find((button) => button.textContent?.includes("Catch before goal"))
+        ?.click();
+      await Promise.resolve();
+    });
+    await act(async () => {
+      Array.from(container.getElementsByTagName("button"))
+        .find((button) => button.textContent?.includes("Confirm boundary override"))
+        ?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const selected = replayBodies
+      .flatMap((body) => body.actions ?? [])
+      .find((action) => action.intent.type === "record-flag-catch");
+    expect(selected?.intent).toMatchObject({
+      gameTimeMs: 12_000,
+      sportingOrderAdjudication: { relatedFactId: "fact-goal", relation: "before" },
+      override: {
+        guardrail: "flag-catch-requires-seeker-release-and-stopped-play",
+      },
+      sportingOrderOverride: {
+        beforeValue: {
+          candidateGameTimeMs: 12_000,
+          relatedFactId: "fact-goal",
+          relatedGameTimeMs: 11_500,
+        },
+      },
+    });
+    expect(selected?.intent.sportingOrder).toBeUndefined();
+  });
+
+  test("keeps close-play adjudication safe at Game Clock zero and hides concession outside overtime", async () => {
+    const initial = projection();
+    openProjection = {
+      ...initial,
+      clock: { ...initial.clock, gameTimeMs: 0 },
+      gameFacts: (initial.gameFacts ?? []).map((fact) => ({
+        ...fact,
+        gameTimeMs: 0,
+        sportingOrder: 0,
+        data: { points: 10, sportingOrder: 0 },
+      })),
+    };
+    await enterAndOpen();
+    expect(container.textContent).not.toContain("Concede");
+    await act(async () => {
+      Array.from(container.getElementsByTagName("button"))
+        .find((button) => button.textContent?.includes("Record flag catch"))
+        ?.click();
+      await Promise.resolve();
+    });
+    await act(async () => {
+      Array.from(container.getElementsByTagName("button"))
+        .find((button) => button.textContent?.includes("Catch before goal"))
+        ?.click();
+      await Promise.resolve();
+    });
+    await act(async () => {
+      Array.from(container.getElementsByTagName("button"))
+        .find((button) => button.textContent?.includes("Confirm boundary override"))
+        ?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const selected = replayBodies
+      .flatMap((body) => body.actions ?? [])
+      .find((action) => action.intent.type === "record-flag-catch");
+    expect(selected?.intent).toMatchObject({
+      gameTimeMs: 0,
+      sportingOrderAdjudication: { relatedFactId: "fact-goal", relation: "before" },
+    });
+    expect(selected?.intent.sportingOrder).toBeUndefined();
+    expect(selected?.intent.override.beforeValue).not.toHaveProperty("sportingOrder", -1);
+  });
+
+  test("shows overtime concession and communicates winner or double-forfeit results", async () => {
+    await enterAndOpen();
+    const current = projection();
+    refreshProjection = {
+      ...current,
+      overtime: true,
+      overtimeTarget: 40,
+      targetScore: 40,
+      winnerGameSideId: null,
+      catch: {
+        factId: "catch",
+        catchingGameSideId: "side-a",
+        nonCatchingGameSideId: "side-b",
+        gameTimeMs: 1_200_000,
+        targetScore: 40,
+      },
+    };
+    await act(async () => {
+      document.dispatchEvent(new testWindow.Event("visibilitychange") as unknown as Event);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(container.textContent).toContain("Concede");
+
+    refreshProjection = {
+      ...current,
+      phase: "finished",
+      overtime: true,
+      winnerGameSideId: "side-b",
+      result: { factId: "result", data: { resultKind: "forfeit" } },
+    };
+    await act(async () => {
+      document.dispatchEvent(new testWindow.Event("visibilitychange") as unknown as Event);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(container.textContent).toContain("Winner: Game Side side-b");
+
+    refreshProjection = {
+      ...current,
+      winnerGameSideId: null,
+      result: { factId: "double-result", data: { resultKind: "double-forfeit" } },
+    };
+    await act(async () => {
+      document.dispatchEvent(new testWindow.Event("visibilitychange") as unknown as Event);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(container.textContent).toContain("Double-forfeit: no winner");
   });
 
   test("revalidates a fresh same-Game authority before foreground replay", async () => {
@@ -512,8 +873,8 @@ describe("Event Game Controller reconnect browser seam", () => {
       authoritativeProjection: ControllerProjection;
       projection: ControllerProjection;
     };
-    expect(before.authoritativeProjection.goalCount).toBe(0);
-    expect(before.projection.goalCount).toBe(1);
+    expect(before.authoritativeProjection.goalCount).toBe(1);
+    expect(before.projection.goalCount).toBe(2);
 
     await act(async () => {
       root.unmount();
@@ -527,14 +888,14 @@ describe("Event Game Controller reconnect browser seam", () => {
       await Promise.resolve();
       await Promise.resolve();
     });
-    expect(container.textContent).toContain("Goals: 1");
-    expect(container.textContent).not.toContain("Goals: 2");
+    expect(container.textContent).toContain("Goals: 2");
+    expect(container.textContent).not.toContain("Goals: 1");
     const after = JSON.parse(testWindow.localStorage.getItem(storageKey) ?? "null") as {
       authoritativeProjection: ControllerProjection;
       projection: ControllerProjection;
     };
-    expect(after.authoritativeProjection.goalCount).toBe(0);
-    expect(after.projection.goalCount).toBe(1);
+    expect(after.authoritativeProjection.goalCount).toBe(1);
+    expect(after.projection.goalCount).toBe(2);
   });
 
   test("reconnect drains successive bounded batches without another wake event", async () => {
@@ -806,11 +1167,12 @@ function projection(eventGameId = "game-browser"): ControllerProjection {
   baseline.holderGrantSessionId = "session";
   baseline.holderGeneration = 1;
   baseline.authorityGeneration = 1;
+  baseline.gameTimeMs = 12_000;
   return {
     eventGameId,
-    phase: "scheduled",
-    scoreByGameSide: { "side-a": 0, "side-b": 0 },
-    goalCount: 0,
+    phase: "in-progress",
+    scoreByGameSide: { "side-a": 10, "side-b": 0 },
+    goalCount: 1,
     gameFacts: [
       {
         factId: "fact-goal",
@@ -825,8 +1187,8 @@ function projection(eventGameId = "game-browser"): ControllerProjection {
     ],
     clock: projectClockBaseline(baseline, 0),
     commencement: {
-      status: "provisional",
-      commencedAtMs: null,
+      status: "commenced",
+      commencedAtMs: 10_000,
       provisionalRunningSinceMs: null,
       provisionalElapsedMs: 0,
     },

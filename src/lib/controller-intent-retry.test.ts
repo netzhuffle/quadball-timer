@@ -36,6 +36,50 @@ describe("Controller tap retry identity", () => {
       });
       expect(retry).toBe(first);
     }
+    const scored = intent("record-flag-catch", {
+      gameSideId: "side-a",
+      sportingOrderAdjudication: { relatedFactId: "goal", relation: "before" },
+    });
+    expect(
+      retainControllerIntent(scored, {
+        ...scored,
+        sportingOrderOverride: {
+          guardrail: "sporting-order-adjudication",
+          direction: "head-referee-adjudicated-sporting-order",
+          confirmation: "head-referee-confirmed",
+          authorityReference: "head-referee",
+          gameTimeMs: 0,
+          beforeValue: null,
+          afterValue: null,
+          reason: "head-referee-direction",
+        },
+      }),
+    ).not.toBe(scored);
+    const forfeit = intent("substantive", {
+      trigger: "forfeit",
+      gameSideId: "side-a",
+    }) as Extract<LiveEventControllerIntent, { type: "substantive" }>;
+    expect(retainControllerIntent(forfeit, { ...forfeit, gameSideId: "side-b" })).not.toBe(forfeit);
+  });
+
+  test("does not reuse identities when durable ordering or Clock authority semantics change", () => {
+    const doubleForfeit = intent("record-double-forfeit", { sportingOrder: 10 });
+    expect(retainControllerIntent(doubleForfeit, { ...doubleForfeit, sportingOrder: 11 })).not.toBe(
+      doubleForfeit,
+    );
+
+    const clock = intent("clock-adjust", {
+      adjustmentMs: 1_000,
+      clockGeneration: 2,
+      occurrence: { clientOriginAtMs: 1, source: "online" },
+    });
+    expect(retainControllerIntent(clock, { ...clock, clockGeneration: 3 })).not.toBe(clock);
+    expect(
+      retainControllerIntent(clock, {
+        ...clock,
+        occurrence: { clientOriginAtMs: 1, source: "offline" },
+      }),
+    ).not.toBe(clock);
   });
 });
 
