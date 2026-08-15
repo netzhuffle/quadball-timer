@@ -1,5 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { createBrowserCorrelation, readTrustedMonitoringIdentity } from "@/lib/monitoring-server";
+import {
+  createBrowserCorrelation,
+  initializeServerMonitoring,
+  readTrustedMonitoringIdentity,
+} from "@/lib/monitoring-server";
 
 describe("trusted monitoring release identity", () => {
   test("does not fabricate a deployed identity when the immutable manifest is unavailable", async () => {
@@ -26,5 +30,31 @@ describe("trusted monitoring release identity", () => {
       release: "sha-commit-run-123-attempt-1",
       browserCorrelation: createBrowserCorrelation("sha-commit-run-123-attempt-1"),
     });
+  });
+});
+
+describe("monitoring setup boundary", () => {
+  test("disables a server client when initialization fails", async () => {
+    const monitoring = initializeServerMonitoring(
+      {
+        dsn: "https://public@example.test/1",
+        environment: "test",
+        release: "release-test",
+        browserCorrelation: "browser-test",
+      },
+      {
+        init() {
+          throw new Error("transport setup unavailable");
+        },
+        withScope() {},
+        captureException() {},
+        captureMessage() {},
+        flush: async () => true,
+      },
+    );
+
+    expect(monitoring.enabled).toBe(false);
+    expect(() => monitoring.captureException(new Error("application failure"))).not.toThrow();
+    expect(await monitoring.flush()).toBe(true);
   });
 });

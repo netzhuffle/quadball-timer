@@ -11,6 +11,24 @@ environment or any server credential. Both values are optional, so a missing or
 failed monitoring transport never changes an application response or authority
 decision.
 
+The two environments use separate DSN pairs and must not reuse one another's
+values:
+
+| Environment | Server DSN | Browser DSN | Root-controlled file | Service group |
+| --- | --- | --- | --- | --- |
+| Production | `GLITCHTIP_DSN` | `PUBLIC_GLITCHTIP_DSN` | `/etc/quadball-timer/production.env` | `quadball-timer` |
+| Test | `GLITCHTIP_DSN` | `PUBLIC_GLITCHTIP_DSN` | `/etc/quadball-timer/test.env` | `quadball-timer-test` |
+
+The server DSN is never sent to a browser. The browser DSN is intentionally
+public Sentry-compatible configuration, but remains outside the release and is
+injected only by the matching Environment service. Install both files as
+`root:<service-group>` with mode `0640`: Production uses
+`root:quadball-timer` and Test uses `root:quadball-timer-test`, matching the
+systemd units above. The optional Production file must be created with that
+ownership before enabling Production delivery. Do not print either DSN while
+checking the files: inspect only file metadata and the allowlisted variable
+names.
+
 To exercise server delivery, from the Test host run this bounded transient unit.
 It runs as the Test service identity, loads the root-controlled Test
 `EnvironmentFile`, uses the immutable compiled release as its working directory,
@@ -28,7 +46,7 @@ sudo systemd-run --wait --collect --pipe --quiet \
   /srv/quadball-timer-test/current/quadball-timer --emit-test-monitoring-error
 ```
 
-The command emits one fixed harmless event and has no public HTTP route. It must
+The command emits one fixed harmless exception and has no public HTTP route. It must
 never be run against the Production environment. The repository convenience
 command is `bun run monitoring:test` for non-deployed local Test configuration.
 
@@ -41,7 +59,9 @@ window.dispatchEvent(
 );
 ```
 
-Confirm that one browser event arrives with the Test Environment and active
-release tags. Do not paste the event payload, credentials, cookies, or any
-issue/workflow evidence; this check records only the operator's pass/fail
+Confirm that exactly one browser error arrives with the Test Environment and
+active immutable release/correlation tags, and that its displayed exception is
+the generic redacted application shape rather than the dispatched message or
+any browser/request data. Do not paste the event payload, credentials, cookies,
+or any issue/workflow evidence; record only the operator's pass/fail
 observation.

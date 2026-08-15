@@ -2653,7 +2653,7 @@ async function emitTestMonitoringError(): Promise<void> {
     dsn: process.env.GLITCHTIP_DSN?.trim() || undefined,
   });
   if (!monitoring.enabled) throw new Error("GLITCHTIP_DSN is not configured.");
-  monitoring.captureMessage("Quadball Timer Test monitoring event", {
+  monitoring.captureException(new Error("Quadball Timer Test monitoring error"), {
     category: "test-monitoring",
     component: "host-local",
     operation: "emit-test-error",

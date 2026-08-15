@@ -20,6 +20,32 @@ export type ServerMonitoringOptions = MonitoringIdentity & {
   dsn?: string;
 };
 
+type ServerMonitoringClient = {
+  init(options: Parameters<typeof Sentry.init>[0]): void;
+  withScope(callback: (scope: { setTags(tags: Record<string, string>): void }) => void): void;
+  captureException(error: unknown): void;
+  captureMessage(message: string): void;
+  flush(timeoutMs: number): Promise<boolean>;
+};
+
+const defaultServerMonitoringClient: ServerMonitoringClient = {
+  init(options) {
+    Sentry.init(options);
+  },
+  withScope(callback) {
+    Sentry.withScope((scope) => callback(scope));
+  },
+  captureException(error) {
+    Sentry.captureException(error);
+  },
+  captureMessage(message) {
+    Sentry.captureMessage(message);
+  },
+  flush(timeoutMs) {
+    return Sentry.flush(timeoutMs);
+  },
+};
+
 export async function readTrustedMonitoringIdentity(
   environment: MonitoringIdentity["environment"],
   environmentVariables: Record<string, string | undefined> = process.env,
@@ -55,37 +81,52 @@ export function createBrowserCorrelation(release: string): string {
   return `release-${createHash("sha256").update(release).digest("hex").slice(0, 16)}`;
 }
 
-export function initializeServerMonitoring(options: ServerMonitoringOptions): ServerMonitoring {
+export function initializeServerMonitoring(
+  options: ServerMonitoringOptions,
+  client: ServerMonitoringClient = defaultServerMonitoringClient,
+): ServerMonitoring {
   if (options.dsn === undefined || options.dsn.length === 0) return createDisabledMonitoring();
 
-  Sentry.init({
-    dsn: options.dsn,
-    environment: options.environment,
-    release: options.release,
-    defaultIntegrations: false,
-    sendDefaultPii: false,
-    tracesSampleRate: 0,
-    beforeSend(event) {
-      return redactSentryEvent(event, options) as typeof event;
-    },
-  });
+  try {
+    client.init({
+      dsn: options.dsn,
+      environment: options.environment,
+      release: options.release,
+      defaultIntegrations: false,
+      sendDefaultPii: false,
+      tracesSampleRate: 0,
+      beforeSend(event) {
+        return redactSentryEvent(event, options) as typeof event;
+      },
+    });
+  } catch {
+    return createDisabledMonitoring();
+  }
 
   return {
     enabled: true,
     captureException(error, context) {
-      Sentry.withScope((scope) => {
-        scope.setTags(safeMonitoringTags(context));
-        Sentry.captureException(error);
+      safelyCapture(() => {
+        client.withScope((scope) => {
+          scope.setTags(safeMonitoringTags(context));
+          client.captureException(error);
+        });
       });
     },
     captureMessage(message, context) {
-      Sentry.withScope((scope) => {
-        scope.setTags(safeMonitoringTags(context));
-        Sentry.captureMessage(message);
+      safelyCapture(() => {
+        client.withScope((scope) => {
+          scope.setTags(safeMonitoringTags(context));
+          client.captureMessage(message);
+        });
       });
     },
     flush(timeoutMs = 2_000) {
-      return Sentry.flush(timeoutMs).catch(() => false);
+      try {
+        return client.flush(timeoutMs).catch(() => false);
+      } catch {
+        return Promise.resolve(false);
+      }
     },
   };
 }
@@ -101,4 +142,12 @@ function createDisabledMonitoring(): ServerMonitoring {
     captureMessage() {},
     flush: async () => true,
   };
+}
+
+function safelyCapture(capture: () => void): void {
+  try {
+    capture();
+  } catch {
+    // Monitoring is observational and must never alter application behavior.
+  }
 }

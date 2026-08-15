@@ -48,6 +48,15 @@ describe("Production deployment contract", () => {
     expect(unit).toContain("EnvironmentFile=-/etc/quadball-timer/production.env");
   });
 
+  test("documents Environment-specific GlitchTip DSN file ownership", () => {
+    const monitoring = readFileSync(join(repositoryRoot, "deploy/monitoring.md"), "utf8");
+
+    expect(monitoring).toContain("`/etc/quadball-timer/production.env` | `quadball-timer`");
+    expect(monitoring).toContain("`/etc/quadball-timer/test.env` | `quadball-timer-test`");
+    expect(monitoring).toContain("Production uses\n`root:quadball-timer`");
+    expect(monitoring).toContain("`root:quadball-timer-test`");
+  });
+
   test("builds one shared immutable artifact for independent environment jobs", () => {
     const workflow = readFileSync(
       join(repositoryRoot, ".github/workflows/deploy-production.yml"),
