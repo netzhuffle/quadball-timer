@@ -826,7 +826,7 @@ describe("focused SQLite Grant authority boundary", () => {
       if (controlSession.status !== "admitted") throw new Error("Expected Control Session.");
       const summaries = await authority.listGrantSessions(control.grantId, eventAuthority);
       if (summaries.status !== "ok") throw new Error("Expected session summaries.");
-      const label = summaries.value.find((summary) => summary.status === "active")?.label;
+      const label = summaries.value[0]?.label;
       if (label === undefined) throw new Error("Expected active session label.");
       expect(
         await authority.revokeGrantSession(control.grantId, label, eventAuthority),
@@ -1214,7 +1214,7 @@ describe("focused SQLite Grant authority boundary", () => {
       });
       expect(sessions).toMatchObject({ status: "ok" });
       if (sessions.status !== "ok") throw new Error("Expected terminal session evidence.");
-      expect(sessions.value.filter((session) => session.status === "active")).toHaveLength(0);
+      expect(sessions.value).toHaveLength(0);
       const audit = await authority.listGrantAudit(control.grantId, {
         kind: "technical-admin",
         id: "technical-admin-fixture",
@@ -1483,7 +1483,7 @@ describe("focused SQLite Grant authority boundary", () => {
           expect(sessionsResult.status).toBe("ok");
           if (sessionsResult.status !== "ok") throw new Error("Expected session read evidence.");
           const sessions = sessionsResult.value;
-          const active = sessions.filter((session) => session.status === "active");
+          const active = sessions;
           expect(active).toHaveLength(1);
           expect(Object.keys(sessions[0] ?? {}).sort()).toEqual([
             "browserClass",
@@ -1491,8 +1491,6 @@ describe("focused SQLite Grant authority boundary", () => {
             "deviceClass",
             "label",
             "lastActiveAtMs",
-            "revokedAtMs",
-            "status",
           ]);
           expect(JSON.stringify(sessions)).not.toMatch(
             /sessionId|grantId|bearer|verifier|digest|keyVersion|eventGameId|grantVersion/i,
@@ -1500,8 +1498,6 @@ describe("focused SQLite Grant authority boundary", () => {
           const admittedIds = new Set([leftResult.grantSessionId, rightResult.grantSessionId]);
           expect(admittedIds).toHaveLength(2);
           expect(active[0]?.label).toMatch(/^session-[A-Za-z0-9_-]{12}$/);
-          const revoked = sessions.find((session) => session.status === "revoked");
-          expect(revoked).toBeDefined();
           const auditResult = await readerAuthority.listGrantAudit(created.grantId, createActor());
           expect(auditResult.status).toBe("ok");
           if (auditResult.status !== "ok") throw new Error("Expected audit read evidence.");

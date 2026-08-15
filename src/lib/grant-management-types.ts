@@ -7,7 +7,6 @@ import {
   type GrantType,
   type PitchManagerGrantScope,
   type StoredGrantAuditEntry,
-  type StoredGrantSession,
 } from "@/lib/grant-types";
 import {
   GENERIC_GRANT_ADMISSION_FAILURE,
@@ -78,6 +77,7 @@ export type TypedGrantRotated = {
   codeFormatVersion: 1;
   oneTime: true;
   noStore: true;
+  affectedSessionCount: number;
 };
 
 export type TypedGrantAuthorization =
@@ -147,10 +147,8 @@ export type TypedGrantReveal =
 
 export type TypedSessionSummary = {
   label: string;
-  status: StoredGrantSession["status"];
   createdAtMs: number;
   lastActiveAtMs: number;
-  revokedAtMs: number | null;
   deviceClass: string;
   browserClass: string;
 };
@@ -178,6 +176,10 @@ export type TypedGrantAuthority = {
   createControlGrant(
     input: Omit<CreateTypedGrantInput, "grantType"> & { scope: ControlGrantScope },
   ): Promise<TypedGrantCreated | TypedGrantMutation>;
+  createControlGrantInTransaction(
+    transaction: FoundationStorageTransaction,
+    input: Omit<CreateTypedGrantInput, "grantType"> & { scope: ControlGrantScope },
+  ): TypedGrantCreated | TypedGrantMutation;
   createGrantCode(
     grantId: string,
     authority: GrantManagementAuthority,
@@ -235,6 +237,11 @@ export type TypedGrantAuthority = {
     replayEvidenceId: string;
   }): Promise<TypedGrantReplayAuthorization>;
   revealGrant(grantId: string, authority: GrantManagementAuthority): Promise<TypedGrantReveal>;
+  revealGrantInTransaction(
+    transaction: FoundationStorageTransaction,
+    grantId: string,
+    authority: GrantManagementAuthority,
+  ): TypedGrantReveal;
   disableGrant(grantId: string, authority: GrantManagementAuthority): Promise<TypedGrantMutation>;
   revokeGrant(grantId: string, authority: GrantManagementAuthority): Promise<TypedGrantMutation>;
   reactivateGrant(
@@ -245,6 +252,11 @@ export type TypedGrantAuthority = {
     grantId: string,
     authority: GrantManagementAuthority,
   ): Promise<TypedGrantRotated | TypedGrantMutation>;
+  rotateGrantInTransaction(
+    transaction: FoundationStorageTransaction,
+    grantId: string,
+    authority: GrantManagementAuthority,
+  ): TypedGrantRotated | TypedGrantMutation;
   rotateGrantCredentialKeys(
     grantId: string,
     authority: GrantManagementAuthority,
@@ -259,11 +271,22 @@ export type TypedGrantAuthority = {
     sessionReference: string,
     authority: GrantManagementAuthority,
   ): Promise<TypedGrantMutation>;
+  revokeGrantSessionInTransaction(
+    transaction: FoundationStorageTransaction,
+    grantId: string,
+    sessionReference: string,
+    authority: GrantManagementAuthority,
+  ): TypedGrantMutation;
   leaveGrantSession(sessionBearer: string): Promise<TypedGrantMutation>;
   listGrantSessions(
     grantId: string,
     authority: GrantManagementAuthority,
   ): Promise<{ status: "ok"; value: TypedSessionSummary[] } | typeof GENERIC_GRANT_STORAGE_FAILURE>;
+  listGrantSessionsInTransaction(
+    transaction: FoundationStorageTransaction,
+    grantId: string,
+    authority: GrantManagementAuthority,
+  ): { status: "ok"; value: TypedSessionSummary[] } | typeof GENERIC_GRANT_STORAGE_FAILURE;
   listGrantAudit(
     grantId: string,
     authority: GrantManagementAuthority,

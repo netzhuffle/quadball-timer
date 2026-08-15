@@ -80,6 +80,20 @@ type PitchManagerGrantResponse = {
     expiresAtMs: number | null;
   };
 };
+type ControlGrantResponse = {
+  status: "accepted";
+  value: {
+    grantId: string;
+    status: string;
+    eligibility: string;
+    eventGameId: string | null;
+  } | null;
+};
+type ControlSession = {
+  label: string;
+  deviceClass: string;
+  browserClass: string;
+};
 
 class EventPublicationValidationError extends Error {}
 
@@ -156,6 +170,11 @@ export function EventAdminPage() {
     PitchManagerGrantResponse["value"] | null
   >(null);
   const [pitchManagerQrDataUrl, setPitchManagerQrDataUrl] = useState<string | null>(null);
+  const [controlGrants, setControlGrants] = useState<Record<string, ControlGrantResponse["value"]>>(
+    {},
+  );
+  const [controlQrDataUrls, setControlQrDataUrls] = useState<Record<string, string>>({});
+  const [controlSessions, setControlSessions] = useState<Record<string, ControlSession[]>>({});
   const [publicationImpactConfirmed, setPublicationImpactConfirmed] = useState(false);
 
   const loadHub = async (nextGameDayId = selectedGameDayId) => {
@@ -232,6 +251,68 @@ export function EventAdminPage() {
     if (!response.ok || payload.status !== "accepted")
       throw new Error("Unable to load Pitch view.");
     setPitchView(payload.value);
+  };
+
+  const controlGrantUrl = (pitchSlotId: string) =>
+    `/api/event-admin/events/${eventId}/game-days/${selectedGameDayId}/pitches/${selectedPitchId}/pitch-slots/${pitchSlotId}/control-grant`;
+
+  const inspectControlGrant = async (pitchSlotId: string) => {
+    const response = await fetch(controlGrantUrl(pitchSlotId));
+    const payload = (await response.json()) as ControlGrantResponse;
+    if (!response.ok || payload.status !== "accepted")
+      throw new Error("Control Grant lookup failed.");
+    setControlGrants((current) => ({ ...current, [pitchSlotId]: payload.value }));
+    setControlQrDataUrls((current) => ({ ...current, [pitchSlotId]: "" }));
+  };
+
+  const createControlGrant = async (pitchSlotId: string) => {
+    const response = await fetch(controlGrantUrl(pitchSlotId), { method: "POST" });
+    if (!response.ok) throw new Error("Control Grant creation failed.");
+    await inspectControlGrant(pitchSlotId);
+  };
+
+  const revealControlGrant = async (pitchSlotId: string) => {
+    const response = await fetch(`${controlGrantUrl(pitchSlotId)}/reveal`, { method: "POST" });
+    const payload = (await response.json()) as {
+      status: string;
+      value?: { qrCredential?: string };
+    };
+    if (!response.ok || payload.status !== "accepted" || payload.value?.qrCredential === undefined)
+      throw new Error("Control Grant QR reveal failed.");
+    const dataUrl = await QRCode.toDataURL(payload.value.qrCredential);
+    setControlQrDataUrls((current) => ({ ...current, [pitchSlotId]: dataUrl }));
+  };
+
+  const loadControlSessions = async (pitchSlotId: string) => {
+    const response = await fetch(`${controlGrantUrl(pitchSlotId)}/sessions`);
+    const payload = (await response.json()) as { status: string; value?: ControlSession[] };
+    if (!response.ok || payload.status !== "accepted") throw new Error("Session list failed.");
+    setControlSessions((current) => ({ ...current, [pitchSlotId]: payload.value ?? [] }));
+  };
+
+  const rotateControlGrant = async (pitchSlotId: string) => {
+    const response = await fetch(`${controlGrantUrl(pitchSlotId)}/rotate`, { method: "POST" });
+    const payload = (await response.json()) as {
+      status: string;
+      value?: { affectedSessionCount?: number };
+    };
+    if (!response.ok || payload.status !== "accepted")
+      throw new Error("Control Grant rotation failed.");
+    setMessage(
+      `Control Grant rotated; ${payload.value?.affectedSessionCount ?? 0} session(s) revoked.`,
+    );
+    await inspectControlGrant(pitchSlotId);
+    await loadControlSessions(pitchSlotId);
+  };
+
+  const revokeControlSession = async (pitchSlotId: string, label: string) => {
+    const response = await fetch(`${controlGrantUrl(pitchSlotId)}/sessions/revoke`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ sessionReference: label }),
+    });
+    if (!response.ok) throw new Error("Control session revocation failed.");
+    await loadControlSessions(pitchSlotId);
   };
 
   const loadPitchManagerGrant = async () => {
@@ -1154,6 +1235,7 @@ export function EventAdminPage() {
                       const games = pitchView.eventGames.filter(
                         (candidate) => candidate.pitchSlotId === slot.pitchSlotId,
                       );
+                      const controlGrant = controlGrants[slot.pitchSlotId];
                       return (
                         <div className="rounded border p-2 text-sm" key={slot.pitchSlotId}>
                           <div className="flex flex-wrap justify-between gap-2">
@@ -1272,6 +1354,93 @@ export function EventAdminPage() {
                               </div>
                             ))
                           )}
+                          <div className="mt-3 space-y-2 border-t pt-2">
+                            <div className="flex flex-wrap gap-2">
+                              <Button
+                                size="sm"
+                                variant="outline"
+                                onClick={() =>
+                                  void run(() => inspectControlGrant(slot.pitchSlotId))
+                                }
+                              >
+                                Inspect Control Grant
+                              </Button>
+                              {controlGrant === undefined || controlGrant === null ? (
+                                <Button
+                                  size="sm"
+                                  onClick={() =>
+                                    void run(() => createControlGrant(slot.pitchSlotId))
+                                  }
+                                >
+                                  Create Control Grant
+                                </Button>
+                              ) : (
+                                <>
+                                  <Button
+                                    size="sm"
+                                    variant="outline"
+                                    onClick={() =>
+                                      void run(() => revealControlGrant(slot.pitchSlotId))
+                                    }
+                                  >
+                                    Reveal QR
+                                  </Button>
+                                  <Button
+                                    size="sm"
+                                    variant="outline"
+                                    onClick={() =>
+                                      void run(() => loadControlSessions(slot.pitchSlotId))
+                                    }
+                                  >
+                                    Sessions
+                                  </Button>
+                                  <Button
+                                    size="sm"
+                                    variant="outline"
+                                    onClick={() =>
+                                      void run(() => rotateControlGrant(slot.pitchSlotId))
+                                    }
+                                  >
+                                    Rotate Grant
+                                  </Button>
+                                </>
+                              )}
+                            </div>
+                            {controlGrant ? (
+                              <p className="text-xs text-muted-foreground">
+                                {controlGrant.status} · {controlGrant.eligibility}
+                                {controlGrant.eventGameId ? ` · ${controlGrant.eventGameId}` : ""}
+                              </p>
+                            ) : null}
+                            {controlQrDataUrls[slot.pitchSlotId] ? (
+                              <img
+                                alt={`Control Grant QR for Pitch Slot ${slot.sequence}`}
+                                className="h-40 w-40 rounded border bg-white p-2"
+                                src={controlQrDataUrls[slot.pitchSlotId]}
+                              />
+                            ) : null}
+                            {(controlSessions[slot.pitchSlotId] ?? []).map((session) => (
+                              <div
+                                className="flex items-center justify-between gap-2 text-xs"
+                                key={session.label}
+                              >
+                                <span>
+                                  {session.label} · {session.deviceClass}/{session.browserClass}
+                                </span>
+                                <Button
+                                  size="sm"
+                                  variant="outline"
+                                  onClick={() =>
+                                    void run(() =>
+                                      revokeControlSession(slot.pitchSlotId, session.label),
+                                    )
+                                  }
+                                >
+                                  Revoke
+                                </Button>
+                              </div>
+                            ))}
+                          </div>
                         </div>
                       );
                     })}

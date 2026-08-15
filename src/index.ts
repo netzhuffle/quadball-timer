@@ -15,6 +15,7 @@ import { parseClientWsMessage, type ServerWsMessage } from "@/lib/ws-protocol";
 import { createLiveEventGameControlTransport } from "@/lib/live-event-game-transport";
 import {
   openLiveEventGameRuntime,
+  createControlScopeResolver,
   readLiveEventGrantKeyRing,
   type LiveEventGameRuntime,
 } from "@/lib/live-event-game-runtime";
@@ -210,13 +211,15 @@ async function startServer() {
     let eventAdministration: EventAdministration | null = null;
     if (foundationStorage !== undefined) {
       try {
-        const grantAuthority = createGrantAuthority(
-          foundationStorage,
-          runtimeGrantOptions ?? readGrantAuthorityOptions(environment),
-        );
+        const grantOptions = {
+          ...(runtimeGrantOptions ?? readGrantAuthorityOptions(environment)),
+          controlScopeResolver: createControlScopeResolver(),
+        };
+        const grantAuthority = createGrantAuthority(foundationStorage, grantOptions);
         eventAdministration = createEventAdministration({
           storage: foundationStorage,
           grants: grantAuthority,
+          controlScopeResolver: grantOptions.controlScopeResolver,
         });
       } catch {
         // Grant keys are an Event Administration dependency, not a server-wide dependency.
@@ -307,8 +310,36 @@ async function startServer() {
                     authority,
                   );
       return sensitiveEventAdministrationMutationResponse<TypedGrantMutation | TypedGrantReveal>(
-        result,
+        result as EventAdministrationMutationOutcome<TypedGrantMutation | TypedGrantReveal>,
         authority,
+      );
+    };
+    const controlGrantMutation = async (
+      req: Request,
+      authorityResolver: (request: Request) => EventAdministrationAuthority | null,
+      operation: "reveal" | "rotate" | "revoke-session",
+      audience: "event-admin" | "pitch-manager" = "event-admin",
+    ) => {
+      if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
+      const authority = authorityResolver(req);
+      const path = new URL(req.url).pathname.split("/");
+      if (authority === null) return sensitiveGenericAuthFailure(401);
+      const common = [path[4] ?? "", path[6] ?? "", path[8] ?? "", path[10] ?? ""] as const;
+      const result =
+        operation === "reveal"
+          ? await eventAdministration.revealControlGrant(...common, authority)
+          : operation === "rotate"
+            ? await eventAdministration.rotateControlGrant(...common, authority)
+            : await eventAdministration.revokeControlGrantSession(
+                ...common,
+                (await readJsonRecord(req))?.sessionReference,
+                authority,
+              );
+      return sensitiveEventAdministrationMutationResponse<TypedGrantMutation | TypedGrantReveal>(
+        result as EventAdministrationMutationOutcome<TypedGrantMutation | TypedGrantReveal>,
+        authority,
+        200,
+        audience,
       );
     };
     const tls =
@@ -868,6 +899,86 @@ async function startServer() {
           {
             POST: (req: Request) => pitchManagerGrantMutation(req, "reactivatePitchManagerGrant"),
           },
+        "/api/event-admin/events/:eventId/game-days/:gameDayId/pitches/:pitchId/pitch-slots/:pitchSlotId/control-grant":
+          {
+            async GET(req: Request) {
+              if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
+              const authority = resolveEventAdministrationAuthority(req, technicalAdminAuth);
+              const path = new URL(req.url).pathname.split("/");
+              if (authority === null) return sensitiveGenericAuthFailure(401);
+              return sensitiveEventAdministrationResponse(
+                await eventAdministration.inspectControlGrant(
+                  path[4] ?? "",
+                  path[6] ?? "",
+                  path[8] ?? "",
+                  path[10] ?? "",
+                  authority,
+                ),
+              );
+            },
+            async POST(req: Request) {
+              if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
+              const authority = resolveEventAdministrationAuthority(req, technicalAdminAuth);
+              const path = new URL(req.url).pathname.split("/");
+              if (authority === null) return sensitiveGenericAuthFailure(401);
+              return sensitiveEventAdministrationMutationResponse(
+                await eventAdministration.createControlGrant(
+                  path[4] ?? "",
+                  path[6] ?? "",
+                  path[8] ?? "",
+                  path[10] ?? "",
+                  authority,
+                ),
+                authority,
+                201,
+              );
+            },
+          },
+        "/api/event-admin/events/:eventId/game-days/:gameDayId/pitches/:pitchId/pitch-slots/:pitchSlotId/control-grant/reveal":
+          {
+            POST: (req: Request) =>
+              controlGrantMutation(
+                req,
+                (request) => resolveEventAdministrationAuthority(request, technicalAdminAuth),
+                "reveal",
+              ),
+          },
+        "/api/event-admin/events/:eventId/game-days/:gameDayId/pitches/:pitchId/pitch-slots/:pitchSlotId/control-grant/rotate":
+          {
+            POST: (req: Request) =>
+              controlGrantMutation(
+                req,
+                (request) => resolveEventAdministrationAuthority(request, technicalAdminAuth),
+                "rotate",
+              ),
+          },
+        "/api/event-admin/events/:eventId/game-days/:gameDayId/pitches/:pitchId/pitch-slots/:pitchSlotId/control-grant/sessions":
+          {
+            async GET(req: Request) {
+              if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
+              const authority = resolveEventAdministrationAuthority(req, technicalAdminAuth);
+              const path = new URL(req.url).pathname.split("/");
+              if (authority === null) return sensitiveGenericAuthFailure(401);
+              return sensitiveEventAdministrationResponse(
+                await eventAdministration.listControlGrantSessions(
+                  path[4] ?? "",
+                  path[6] ?? "",
+                  path[8] ?? "",
+                  path[10] ?? "",
+                  authority,
+                ),
+              );
+            },
+          },
+        "/api/event-admin/events/:eventId/game-days/:gameDayId/pitches/:pitchId/pitch-slots/:pitchSlotId/control-grant/sessions/revoke":
+          {
+            POST: (req: Request) =>
+              controlGrantMutation(
+                req,
+                (request) => resolveEventAdministrationAuthority(request, technicalAdminAuth),
+                "revoke-session",
+              ),
+          },
         "/api/pitch-manager/admit": {
           async POST(req: Request) {
             if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
@@ -932,6 +1043,90 @@ async function startServer() {
             );
           },
         },
+        "/api/pitch-manager/events/:eventId/game-days/:gameDayId/pitches/:pitchId/pitch-slots/:pitchSlotId/control-grant":
+          {
+            async GET(req: Request) {
+              if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
+              const authority = resolvePitchManagerAuthority(req, technicalAdminAuth);
+              const path = new URL(req.url).pathname.split("/");
+              if (authority === null) return sensitiveGenericAuthFailure(401);
+              return sensitiveEventAdministrationResponse(
+                await eventAdministration.inspectControlGrant(
+                  path[4] ?? "",
+                  path[6] ?? "",
+                  path[8] ?? "",
+                  path[10] ?? "",
+                  authority,
+                ),
+              );
+            },
+            async POST(req: Request) {
+              if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
+              const authority = resolvePitchManagerAuthority(req, technicalAdminAuth);
+              const path = new URL(req.url).pathname.split("/");
+              if (authority === null) return sensitiveGenericAuthFailure(401);
+              return sensitiveEventAdministrationMutationResponse(
+                await eventAdministration.createControlGrant(
+                  path[4] ?? "",
+                  path[6] ?? "",
+                  path[8] ?? "",
+                  path[10] ?? "",
+                  authority,
+                ),
+                authority,
+                201,
+                "pitch-manager",
+              );
+            },
+          },
+        "/api/pitch-manager/events/:eventId/game-days/:gameDayId/pitches/:pitchId/pitch-slots/:pitchSlotId/control-grant/reveal":
+          {
+            POST: (req: Request) =>
+              controlGrantMutation(
+                req,
+                (request) => resolvePitchManagerAuthority(request, technicalAdminAuth),
+                "reveal",
+                "pitch-manager",
+              ),
+          },
+        "/api/pitch-manager/events/:eventId/game-days/:gameDayId/pitches/:pitchId/pitch-slots/:pitchSlotId/control-grant/rotate":
+          {
+            POST: (req: Request) =>
+              controlGrantMutation(
+                req,
+                (request) => resolvePitchManagerAuthority(request, technicalAdminAuth),
+                "rotate",
+                "pitch-manager",
+              ),
+          },
+        "/api/pitch-manager/events/:eventId/game-days/:gameDayId/pitches/:pitchId/pitch-slots/:pitchSlotId/control-grant/sessions":
+          {
+            async GET(req: Request) {
+              if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
+              const authority = resolvePitchManagerAuthority(req, technicalAdminAuth);
+              const path = new URL(req.url).pathname.split("/");
+              if (authority === null) return sensitiveGenericAuthFailure(401);
+              return sensitiveEventAdministrationResponse(
+                await eventAdministration.listControlGrantSessions(
+                  path[4] ?? "",
+                  path[6] ?? "",
+                  path[8] ?? "",
+                  path[10] ?? "",
+                  authority,
+                ),
+              );
+            },
+          },
+        "/api/pitch-manager/events/:eventId/game-days/:gameDayId/pitches/:pitchId/pitch-slots/:pitchSlotId/control-grant/sessions/revoke":
+          {
+            POST: (req: Request) =>
+              controlGrantMutation(
+                req,
+                (request) => resolvePitchManagerAuthority(request, technicalAdminAuth),
+                "revoke-session",
+                "pitch-manager",
+              ),
+          },
         "/api/pitch-manager/leave": {
           async POST(req: Request) {
             if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
@@ -2077,13 +2272,16 @@ function sensitiveEventAdministrationMutationResponse<T>(
   result: EventAdministrationMutationOutcome<T>,
   authority: EventAdministrationAuthority,
   acceptedStatus = 200,
+  audience: "event-admin" | "pitch-manager" = "event-admin",
 ) {
   const refreshHeaders: Array<[string, string]> =
     authority.kind === "grant-session" && result.status === "accepted"
       ? [
           [
             "set-cookie",
-            eventAdminSessionCookie(authority.sessionBearer, result.sessionExpiresAtMs),
+            audience === "pitch-manager"
+              ? pitchManagerSessionCookie(authority.sessionBearer, result.sessionExpiresAtMs)
+              : eventAdminSessionCookie(authority.sessionBearer, result.sessionExpiresAtMs),
           ],
         ]
       : [];

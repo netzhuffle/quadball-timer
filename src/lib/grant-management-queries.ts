@@ -1,4 +1,4 @@
-import type { FoundationStorage } from "@/lib/foundation-storage";
+import type { FoundationStorage, FoundationStorageTransaction } from "@/lib/foundation-storage";
 import type { GrantAuthorityOptions } from "@/lib/grant-authority";
 import { GENERIC_GRANT_STORAGE_FAILURE } from "@/lib/grant-authority-types";
 import type { GrantManagementAuthority, TypedSessionSummary } from "@/lib/grant-management-types";
@@ -11,6 +11,7 @@ import {
   refreshEventAdminSession,
 } from "@/lib/grant-management-policy";
 import { verifyGrantAuthority } from "@/lib/grant-authority-trust";
+import { readGrantNow } from "@/lib/grant-management-results";
 
 export async function listSessions(
   storage: FoundationStorage,
@@ -18,35 +19,45 @@ export async function listSessions(
   grantId: string,
   authority: GrantManagementAuthority,
 ): Promise<{ status: "ok"; value: TypedSessionSummary[] } | typeof GENERIC_GRANT_STORAGE_FAILURE> {
-  const trustedAuthority = verifyGrantAuthority(options.privilegedAuthorityVerifier, authority);
-  if (trustedAuthority === null) return GENERIC_GRANT_STORAGE_FAILURE;
   try {
-    return await storage.transaction((transaction) => {
-      const grant = transaction.findGrantById(grantId);
-      if (
-        grant === null ||
-        !canInspectSessionSummariesInTransaction(transaction, options, grant, trustedAuthority)
-      )
-        return GENERIC_GRANT_STORAGE_FAILURE;
-      expireGrantIfDue(transaction, options, grant);
-      const result = {
-        status: "ok" as const,
-        value: transaction.listGrantSessions(grantId).map((session) => ({
-          label: sessionLabel(options, session),
-          status: session.status,
-          createdAtMs: session.createdAtMs,
-          lastActiveAtMs: session.lastActiveAtMs,
-          revokedAtMs: session.revokedAtMs,
-          deviceClass: session.deviceClass ?? "unknown",
-          browserClass: session.browserClass ?? "unknown",
-        })),
-      };
-      refreshEventAdminSession(transaction, options, trustedAuthority);
-      return result;
-    });
+    return await storage.transaction((transaction) =>
+      listSessionsInTransaction(transaction, options, grantId, authority),
+    );
   } catch {
     return GENERIC_GRANT_STORAGE_FAILURE;
   }
+}
+
+export function listSessionsInTransaction(
+  transaction: FoundationStorageTransaction,
+  options: GrantAuthorityOptions,
+  grantId: string,
+  authority: GrantManagementAuthority,
+): { status: "ok"; value: TypedSessionSummary[] } | typeof GENERIC_GRANT_STORAGE_FAILURE {
+  const trustedAuthority = verifyGrantAuthority(options.privilegedAuthorityVerifier, authority);
+  if (trustedAuthority === null) return GENERIC_GRANT_STORAGE_FAILURE;
+  const grant = transaction.findGrantById(grantId);
+  if (
+    grant === null ||
+    !canInspectSessionSummariesInTransaction(transaction, options, grant, trustedAuthority)
+  )
+    return GENERIC_GRANT_STORAGE_FAILURE;
+  const nowMs = readGrantNow(options);
+  if (grant.status !== "active" || (grant.expiresAtMs !== null && nowMs >= grant.expiresAtMs))
+    return { status: "ok", value: [] };
+  return {
+    status: "ok",
+    value: transaction
+      .listGrantSessions(grantId)
+      .filter((session) => session.status === "active")
+      .map((session) => ({
+        label: sessionLabel(options, session),
+        createdAtMs: session.createdAtMs,
+        lastActiveAtMs: session.lastActiveAtMs,
+        deviceClass: session.deviceClass ?? "unknown",
+        browserClass: session.browserClass ?? "unknown",
+      })),
+  };
 }
 
 export async function listAudit(

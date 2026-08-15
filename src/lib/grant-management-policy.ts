@@ -7,7 +7,10 @@ import {
   parseCredentialToken,
   sameSecret,
 } from "@/lib/grant-crypto";
-import type { FoundationStorageTransaction } from "@/lib/foundation-storage";
+import type {
+  FoundationStorageSnapshot,
+  FoundationStorageTransaction,
+} from "@/lib/foundation-storage";
 import type { GrantAuthorityOptions } from "@/lib/grant-authority";
 import { DAY_MS } from "@/lib/grant-calendar";
 import { createAuditEntry, expireGrantIfDue } from "@/lib/grant-lifecycle";
@@ -31,10 +34,14 @@ import { validateOpaqueIdentifier } from "@/lib/validation-policy";
 export function hasCurrentAdmissionEligibility(
   options: GrantAuthorityOptions,
   grant: StoredGrant,
+  snapshot?: FoundationStorageSnapshot,
 ): boolean {
   if (grant.grantType !== "control") return true;
   try {
-    const resolved = options.controlScopeResolver.resolve(grant.scope as ControlGrantScope);
+    const resolved = options.controlScopeResolver.resolve(
+      grant.scope as ControlGrantScope,
+      snapshot,
+    );
     return (
       resolved.status === "eligible" &&
       validateOpaqueIdentifier(resolved.eventGameId, "eventGameId").ok
@@ -78,7 +85,7 @@ export function canInspectSessionSummariesInTransaction(
   grant: StoredGrant,
   authority: TrustedGrantAuthority,
 ): boolean {
-  authority = resolveManagementAuthority(transaction, options, authority) ?? authority;
+  authority = resolveManagementAuthority(transaction, options, authority, true) ?? authority;
   if (authority.kind === "technical-admin" || authority.kind === "fixture") return true;
   if (authority.kind !== "grant-session") return false;
 
@@ -86,16 +93,16 @@ export function canInspectSessionSummariesInTransaction(
   if (session === null || session.status !== "active") return false;
   const storedCaller = transaction.findGrantById(session.grantId);
   if (storedCaller === null) return false;
-  const caller = expireGrantIfDue(transaction, options, storedCaller);
+  const caller = storedCaller;
   if (caller.status !== "active" || caller.grantVersion !== session.grantVersion) return false;
+  const nowMs = readNow(options);
+  if (caller.expiresAtMs !== null && nowMs >= caller.expiresAtMs) return false;
 
   if (caller.grantType === "event-admin") {
-    const nowMs = readNow(options);
     if (
       nowMs >=
       Math.min(caller.expiresAtMs ?? Number.MAX_SAFE_INTEGER, session.lastActiveAtMs + 30 * DAY_MS)
     ) {
-      expireSession(transaction, options, caller, session);
       return false;
     }
     return (caller.scope as EventAdminGrantScope).eventId === grant.scope.eventId;
@@ -135,6 +142,31 @@ export function refreshEventAdminSession(
   transaction.updateGrantSession({ ...session, lastActiveAtMs: nowMs });
 }
 
+/** Refresh a successful management caller without coupling the Grant facade to one audience. */
+export function refreshGrantManagementSession(
+  transaction: FoundationStorageTransaction,
+  options: GrantAuthorityOptions,
+  authority: TrustedGrantAuthority,
+): void {
+  if (authority.kind !== "grant-session") return;
+  const session = findSessionByBearer(transaction, options, authority.sessionBearer);
+  if (session === null || session.status !== "active") return;
+  const storedGrant = transaction.findGrantById(session.grantId);
+  if (storedGrant === null) return;
+  const grant = expireGrantIfDue(transaction, options, storedGrant);
+  if (grant.status !== "active" || grant.grantVersion !== session.grantVersion) return;
+  const nowMs = readNow(options);
+  if (
+    grant.grantType === "event-admin" &&
+    nowMs >=
+      Math.min(grant.expiresAtMs ?? Number.MAX_SAFE_INTEGER, session.lastActiveAtMs + 30 * DAY_MS)
+  ) {
+    expireSession(transaction, options, grant, session);
+    return;
+  }
+  transaction.updateGrantSession({ ...session, lastActiveAtMs: nowMs });
+}
+
 export function canManageInTransaction(
   transaction: FoundationStorageTransaction,
   options: GrantAuthorityOptions,
@@ -143,8 +175,7 @@ export function canManageInTransaction(
   operation: "manage" | "reveal",
 ): boolean {
   authority = resolveManagementAuthority(transaction, options, authority) ?? authority;
-  if (authority.kind === "technical-admin")
-    return grant.grantType === "event-admin" || grant.grantType === "pitch-manager";
+  if (authority.kind === "technical-admin") return true;
   if (authority.kind === "fixture") return true;
   if (authority.kind !== "grant-session") return false;
   const session = findSessionByBearer(transaction, options, authority.sessionBearer);
@@ -167,6 +198,7 @@ export function canManageInTransaction(
     expireSession(transaction, options, caller, session);
     return false;
   }
+  if (caller.expiresAtMs !== null && nowMs >= caller.expiresAtMs) return false;
   if (caller.grantType === "control") {
     const resolved = options.controlScopeResolver.resolve(
       caller.scope as ControlGrantScope,
@@ -211,8 +243,7 @@ export function canCreateInTransaction(
 ): boolean {
   authority = resolveManagementAuthority(transaction, options, authority) ?? authority;
   if (authority.kind === "fixture") return true;
-  if (authority.kind === "technical-admin")
-    return grant.grantType === "event-admin" || grant.grantType === "pitch-manager";
+  if (authority.kind === "technical-admin") return true;
   if (authority.kind !== "grant-session") return false;
   const session = findSessionByBearer(transaction, options, authority.sessionBearer);
   if (session === null || session.status !== "active") return false;
@@ -351,23 +382,28 @@ export function revokeAllSessions(
   transaction: FoundationStorageTransaction,
   grantId: string,
   nowMs: number,
-): void {
+): number {
+  let affected = 0;
   for (const session of transaction.listGrantSessions(grantId))
-    if (session.status === "active")
+    if (session.status === "active") {
       transaction.updateGrantSession({ ...session, status: "revoked", revokedAtMs: nowMs });
+      affected += 1;
+    }
+  return affected;
 }
 
 export function resolveManagementAuthority(
   transaction: FoundationStorageTransaction,
   options: GrantAuthorityOptions,
   authority: TrustedGrantAuthority,
+  readOnly = false,
 ): TrustedGrantAuthority | null {
   if (authority.kind !== "grant-session") return authority;
   const session = findSessionByBearer(transaction, options, authority.sessionBearer);
   if (session === null || session.status !== "active") return null;
   const storedGrant = transaction.findGrantById(session.grantId);
   if (storedGrant === null) return null;
-  const grant = expireGrantIfDue(transaction, options, storedGrant);
+  const grant = readOnly ? storedGrant : expireGrantIfDue(transaction, options, storedGrant);
   if (grant.status !== "active" || grant.grantVersion !== session.grantVersion) return null;
   return bindTrustedGrantSession(authority, session.sessionId, session.browserContextKeyVersion);
 }

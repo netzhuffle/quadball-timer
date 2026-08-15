@@ -124,9 +124,7 @@ export function registerGrantAuthorityContract(
       ).toMatchObject({ status: "authorized", grantSessionId: replacement.grantSessionId });
 
       const sessions = await readGrantSessions(authority, created.grantId);
-      expect(sessions).toHaveLength(3);
-      expect(sessions.filter((session) => session.status === "revoked")).toHaveLength(1);
-      expect(sessions.filter((session) => session.status === "active")).toHaveLength(2);
+      expect(sessions).toHaveLength(2);
       expect(sessions.every((session) => /^session-[A-Za-z0-9_-]{12}$/.test(session.label))).toBe(
         true,
       );
