@@ -47,6 +47,8 @@ function injectFocusedFailure(phase: FocusedFailurePhase): void {
 /** Host-local maintenance entrypoint used by the shipped compiled executable. */
 export async function runProductionActivationCli(argv: readonly string[]): Promise<number> {
   const command = argv[0] as MaintenanceCommand | undefined;
+  const rootPromotionRequested =
+    process.env.QBT_ROOT_PROMOTION === "1" || argv.includes("--root-promotion");
   if (
     command !== "backup" &&
     command !== "verify-backup" &&
@@ -257,7 +259,7 @@ export async function runProductionActivationCli(argv: readonly string[]): Promi
       // final pointer swap.  The service user still performs the complete
       // candidate re-verification here, but must not attempt to rename the
       // candidate into the root-controlled retained area.
-      if (process.env.QBT_ROOT_PROMOTION === "1") {
+      if (rootPromotionRequested) {
         const { manifest } = await verifyCandidate();
         console.log(JSON.stringify({ verified: true, snapshotId: manifest.snapshotId }));
         return 0;
