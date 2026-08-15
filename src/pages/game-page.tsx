@@ -851,6 +851,15 @@ export function GamePage({ gameId, role }: { gameId: string; role: ControllerRol
           {leaveMessage ? (
             <p className="mt-1 text-[10px] font-medium text-rose-700">{leaveMessage}</p>
           ) : null}
+          {error !== null ? (
+            <p
+              className="mt-1 text-[10px] font-medium text-amber-700"
+              role="status"
+              aria-live="polite"
+            >
+              {error}
+            </p>
+          ) : null}
           {controller ? (
             localOnlyMode ? (
               <p className="mt-1 text-[10px] font-medium text-amber-700">{LOCAL_ONLY_MESSAGE}</p>

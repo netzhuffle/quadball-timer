@@ -17,8 +17,188 @@ import {
   validateLiveEventGameActionInTransaction,
 } from "@/lib/live-event-game-control";
 import { createLiveEventGameControlTransport } from "@/lib/live-event-game-transport";
+import { createAdHocGamesService } from "@/lib/ad-hoc-games";
 
 describe("Live Event Game control", () => {
+  test("Event authority, storage, and control remain accepted after Ad Hoc pressure", async () => {
+    const adHoc = createAdHocGamesService({
+      now: () => 1_000,
+      maxConnectedSockets: 1,
+      eventCapacity: { totalConnections: 2, reservedConnections: 1, activeConnections: () => 0 },
+    });
+    const created = await adHoc.create({
+      homeName: "Ad Hoc",
+      awayName: "Pressure",
+      sourceKey: "pressure-source",
+    });
+    if (created.status !== "accepted") throw new Error("Expected Ad Hoc Game.");
+    expect(
+      await adHoc.setConnection({
+        gameId: created.gameId,
+        sessionId: created.sessionId,
+        connected: true,
+        connectionId: "pressure-socket",
+      }),
+    ).toBe(true);
+    const operations = Array.from({ length: 40 }, (_, index) => ({
+      id: `pressure-${index}`,
+      clientSentAtMs: 1_000,
+      command: { type: "set-running", running: index % 2 === 0 },
+    })) as never[];
+    expect(
+      (await adHoc.apply({ gameId: created.gameId, sessionId: created.sessionId, operations }))
+        .status,
+    ).toBe("accepted");
+    for (let index = 0; index < 4; index += 1)
+      expect(
+        (
+          await adHoc.create({
+            homeName: `Pressure ${index}`,
+            awayName: "Away",
+            sourceKey: "pressure-source",
+          })
+        ).status,
+      ).toBe("accepted");
+    expect(
+      (await adHoc.create({ homeName: "Delayed", awayName: "Away", sourceKey: "pressure-source" }))
+        .status,
+    ).toBe("rejected");
+
+    const harness = await createHarness();
+    const opened = await harness.control.openController({
+      qrCredential: harness.qrCredential,
+      browserContext: "event-after-ad-hoc-pressure",
+    });
+    if (opened.status !== "opened") throw new Error("Expected the Event Controller to open.");
+    const eventResult = await harness.control.submitControllerIntent({
+      sessionBearer: opened.session.sessionBearer,
+      eventGameId: harness.root.eventGameId,
+      intent: goalIntent({
+        operationId: "event-after-ad-hoc-pressure",
+        factId: "event-after-ad-hoc-pressure",
+      }),
+    });
+    expect(eventResult).toMatchObject({ status: "accepted" });
+    expect(await harness.record.readActions()).toHaveLength(1);
+  });
+
+  test("reconciles invalidated Event Grant Sessions before reporting connection capacity", async () => {
+    const harness = await createHarness();
+    const opened = await harness.control.openController({
+      qrCredential: harness.qrCredential,
+      browserContext: "capacity-expiry",
+    });
+    expect(opened.status).toBe("opened");
+    expect(harness.control.activeControllerSessions()).toBe(1);
+    await harness.authority.revokeGrant(harness.grantId, { kind: "fixture", id: "fixture" });
+    expect(await harness.control.reconcileActiveControllerSessions()).toBe(0);
+    harness.control.close();
+    expect(harness.control.activeControllerSessions()).toBe(0);
+  });
+
+  test("does not scan Event storage for authorization reads or known expiry", async () => {
+    const harness = await createHarness({ grantExpiresAtMs: 10_500 });
+    const opened = await harness.control.openController({
+      qrCredential: harness.qrCredential,
+      browserContext: "capacity-read-boundary",
+    });
+    expect(opened.status).toBe("opened");
+    const notifications = harness.lifecycleNotifications;
+    harness.setNow(11_000);
+    expect(harness.control.activeControllerSessions()).toBe(0);
+    expect(harness.lifecycleNotifications).toBe(notifications);
+    expect(
+      await harness.control.refreshController({
+        sessionBearer: harness.sessionBearer,
+        eventGameId: harness.root.eventGameId,
+      }),
+    ).toMatchObject({ status: "authorized" });
+    expect(harness.lifecycleNotifications).toBe(notifications);
+  });
+
+  test("reruns one dirty Event capacity scan after a lifecycle change arrives", async () => {
+    const harness = await createHarness();
+    const opened = await harness.control.openController({
+      qrCredential: harness.qrCredential,
+      browserContext: "capacity-dirty-scan",
+    });
+    if (opened.status !== "opened") throw new Error("Expected the Controller to open.");
+    const originalAuthorize = harness.authority.authorizeGrant.bind(harness.authority);
+    let release!: () => void;
+    let markStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let authorizeCalls = 0;
+    harness.authority.authorizeGrant = async (input) => {
+      authorizeCalls += 1;
+      if (authorizeCalls === 1) {
+        markStarted();
+        await gate;
+      }
+      return originalAuthorize(input);
+    };
+    const scan = harness.control.reconcileActiveControllerSessions();
+    await started;
+    harness.triggerLifecycleChange();
+    release();
+    expect(await scan).toBe(1);
+    expect(authorizeCalls).toBe(2);
+  });
+
+  test("does not repopulate Event capacity after close during reconciliation", async () => {
+    const harness = await createHarness();
+    const opened = await harness.control.openController({
+      qrCredential: harness.qrCredential,
+      browserContext: "capacity-close-scan",
+    });
+    if (opened.status !== "opened") throw new Error("Expected the Controller to open.");
+    const originalAuthorize = harness.authority.authorizeGrant.bind(harness.authority);
+    let release!: () => void;
+    let markStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    harness.authority.authorizeGrant = async (input) => {
+      markStarted();
+      await gate;
+      return originalAuthorize(input);
+    };
+    const scan = harness.control.reconcileActiveControllerSessions();
+    await started;
+    harness.control.close();
+    release();
+    expect(await scan).toBe(0);
+    expect(harness.control.activeControllerSessions()).toBe(0);
+  });
+
+  test("expires a switched post-restart Event session from synchronous capacity", async () => {
+    const harness = await createHarness({ grantExpiresAtMs: 10_500 });
+    harness.setSessionResolution({
+      status: "switchable",
+      previousEventGameId: harness.root.eventGameId,
+      currentEventGameId: "game-reassigned",
+    });
+    expect(
+      await harness.control.refreshController({
+        sessionBearer: harness.sessionBearer,
+        eventGameId: harness.root.eventGameId,
+      }),
+    ).toMatchObject({ status: "switch-required" });
+    expect(
+      await harness.control.switchController({ sessionBearer: harness.sessionBearer }),
+    ).toMatchObject({ status: "authorized", session: { eventGameId: "game-reassigned" } });
+    expect(harness.control.activeControllerSessions()).toBe(1);
+    harness.setNow(11_000);
+    expect(harness.control.activeControllerSessions()).toBe(0);
+  });
+
   test("exposes stable Game Facts and rebuilds score through contextual correction and reinstatement", async () => {
     const harness = await createHarness();
     const opened = await harness.control.openController({
@@ -2052,6 +2232,12 @@ async function createHarness(
   if (overrides.scopeStatus !== undefined) grantOptions.setScopeStatus(overrides.scopeStatus);
   if (overrides.sessionResolution !== undefined)
     grantOptions.setSessionResolution(overrides.sessionResolution);
+  let lifecycleNotifications = 0;
+  let triggerLifecycleChange = () => {};
+  grantOptions.onLifecycleChange = () => {
+    lifecycleNotifications += 1;
+    triggerLifecycleChange();
+  };
 
   let failureBoundary = overrides.failureBoundary;
   const record = createEventGameRecord(storage, {
@@ -2099,6 +2285,9 @@ async function createHarness(
     clock: overrides.controlClock ?? (() => grantOptions.clock.nowMs()),
     projectionFailure: overrides.projectionFailure,
   });
+  triggerLifecycleChange = () => {
+    void control.reconcileActiveControllerSessions();
+  };
   return {
     root,
     storage,
@@ -2108,11 +2297,20 @@ async function createHarness(
     grantId: created.grantId,
     qrCredential: created.qrCredential,
     sessionBearer: admitted.sessionBearer,
+    get lifecycleNotifications() {
+      return lifecycleNotifications;
+    },
+    triggerLifecycleChange() {
+      grantOptions.onLifecycleChange?.();
+    },
     set failureBoundary(value: typeof failureBoundary) {
       failureBoundary = value;
     },
     setNow(value: number) {
       grantOptions.setNow(value);
+    },
+    setScopeStatus(value: "empty" | "conflict" | undefined) {
+      grantOptions.setScopeStatus(value);
     },
     setScopeEventGameId(value: string) {
       grantOptions.setScopeEventGameId(value);

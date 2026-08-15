@@ -1,4 +1,5 @@
 import { serve, type ServerWebSocket } from "bun";
+import { randomBytes } from "node:crypto";
 import { dirname, resolve } from "node:path";
 import index from "./index.html";
 import { readJsonBodyWithinLimit } from "@/lib/http-body";
@@ -66,12 +67,19 @@ import type { FoundationStorage } from "@/lib/foundation-storage";
 import { assertProductionStateBoundary } from "@/lib/runtime-storage-config";
 import { createStartupCleanup } from "@/lib/startup-resources";
 import {
+  createAdHocLiveSessionTracker,
   createAdHocGamesService,
   openSqliteAdHocStore,
   type AdHocGameView,
   type AdHocGamesService,
 } from "@/lib/ad-hoc-games";
 import { readBuiltRuntimeIdentity, readRunningReleaseIdentity } from "@/lib/release-identity";
+import {
+  AD_HOC_EVENT_RESERVED_CONNECTION_CAPACITY,
+  AD_HOC_EVENT_TOTAL_CONNECTION_CAPACITY,
+  AD_HOC_MAX_CONNECTED_CONTROLLERS,
+  AD_HOC_MAX_QUEUED_OUTPUT_BYTES,
+} from "@/lib/ad-hoc-resource-budgets";
 
 type SessionSubscription =
   | {
@@ -91,10 +99,13 @@ type SessionData = {
   cookieHeader: string | null;
   sessionId: string | null;
   subscription: SessionSubscription;
+  subscriptionWork: Promise<void>;
+  closed: boolean;
 };
 
 const sockets = new Set<ServerWebSocket<SessionData>>();
 const defaultAdHocService = createAdHocGamesService();
+const pendingSocketReservations = new Map<string, ReturnType<typeof setTimeout>>();
 
 const probeInvocation = parseSqliteProbeInvocation(process.argv.slice(1));
 
@@ -147,13 +158,39 @@ async function startServer() {
     }
     const adHocEnvironmentIdentity =
       process.env.AD_HOC_ENVIRONMENT_ID?.trim() || `${environment}:${technicalAdminConfig.origin}`;
+    let eventCapacitySource = () => 0;
     const adHocService = createAdHocGamesService({
       environmentIdentity: adHocEnvironmentIdentity,
+      deferReplayAcknowledgement: true,
+      maxConnectedSockets: readRuntimeCapacity(
+        process.env.AD_HOC_MAX_CONNECTED_SOCKETS,
+        AD_HOC_MAX_CONNECTED_CONTROLLERS,
+      ),
+      eventCapacity: {
+        totalConnections: readRuntimeCapacity(
+          process.env.EVENT_TOTAL_CONNECTION_CAPACITY,
+          AD_HOC_EVENT_TOTAL_CONNECTION_CAPACITY,
+        ),
+        reservedConnections: readRuntimeCapacity(
+          process.env.EVENT_RESERVED_CONNECTION_CAPACITY,
+          AD_HOC_EVENT_RESERVED_CONNECTION_CAPACITY,
+        ),
+        activeConnections: () => eventCapacitySource(),
+      },
       store:
         environment === "test" && !process.env.AD_HOC_DATABASE?.trim()
           ? undefined
-          : openSqliteAdHocStore(adHocDatabasePath, adHocEnvironmentIdentity),
+          : openSqliteAdHocStore(adHocDatabasePath, adHocEnvironmentIdentity, {
+              reconcileConnectionsAtStartup: true,
+            }),
     });
+    const liveAdHocSessions = createAdHocLiveSessionTracker((identity) =>
+      adHocService.setConnection({
+        gameId: identity.gameId,
+        sessionId: identity.sessionId,
+        connected: false,
+      }),
+    );
     startupCleanup.add(() => adHocService.close());
     let runtimeGrantOptions: ReturnType<typeof readGrantAuthorityOptions> | null = null;
     try {
@@ -252,6 +289,7 @@ async function startServer() {
         console.warn("Durable Event Game Controller is unavailable.", error);
       }
     }
+    eventCapacitySource = () => liveEventRuntime?.control.activeControllerSessions() ?? 0;
     const liveEventControlTransport = createLiveEventGameControlTransport(
       () => liveEventRuntime?.control ?? null,
       (request) => technicalAdminAuth.isExpectedBinding(requestBinding(request)),
@@ -269,7 +307,9 @@ async function startServer() {
         if (token === null) return genericAuthFailure(401);
         if (eventAdministration === null) return genericAuthFailure(503);
         const eventId = new URL(req.url).pathname.split("/").at(-3) ?? "";
-        return eventAdministrationResponse(await eventAdministration[operation](eventId, token));
+        const result = await eventAdministration[operation](eventId, token);
+        await liveEventRuntime?.control.reconcileActiveControllerSessions();
+        return eventAdministrationResponse(result);
       };
     const pitchManagerGrantMutation = async (
       req: Request,
@@ -319,6 +359,9 @@ async function startServer() {
                     path[8] ?? "",
                     authority,
                   );
+      if (operation !== "revealPitchManagerGrant") {
+        await liveEventRuntime?.control.reconcileActiveControllerSessions();
+      }
       return sensitiveEventAdministrationMutationResponse<TypedGrantMutation | TypedGrantReveal>(
         result as EventAdministrationMutationOutcome<TypedGrantMutation | TypedGrantReveal>,
         authority,
@@ -345,6 +388,9 @@ async function startServer() {
                 (await readJsonRecord(req))?.sessionReference,
                 authority,
               );
+      if (operation !== "reveal") {
+        await liveEventRuntime?.control.reconcileActiveControllerSessions();
+      }
       return sensitiveEventAdministrationMutationResponse<TypedGrantMutation | TypedGrantReveal>(
         result as EventAdministrationMutationOutcome<TypedGrantMutation | TypedGrantReveal>,
         authority,
@@ -373,7 +419,7 @@ async function startServer() {
       port,
       ...(tls ? { tls } : {}),
       routes: {
-        "/ws": (req: Bun.BunRequest<"/ws">, routeServer: Bun.Server<SessionData>) => {
+        "/ws": async (req: Bun.BunRequest<"/ws">, routeServer: Bun.Server<SessionData>) => {
           if (!isAllowedWebSocketOrigin(req.headers.get("origin"), req.headers.get("host"))) {
             return json(
               {
@@ -383,18 +429,47 @@ async function startServer() {
             );
           }
 
+          const socketId = crypto.randomUUID();
+          const totalSocketCapacity = calculateAdHocUpgradeCapacity({
+            eventTotalConnections: readRuntimeCapacity(
+              process.env.EVENT_TOTAL_CONNECTION_CAPACITY,
+              AD_HOC_EVENT_TOTAL_CONNECTION_CAPACITY,
+            ),
+            eventReservedConnections: readRuntimeCapacity(
+              process.env.EVENT_RESERVED_CONNECTION_CAPACITY,
+              AD_HOC_EVENT_RESERVED_CONNECTION_CAPACITY,
+            ),
+            activeEventConnections: eventCapacitySource(),
+            adHocSocketCeiling: readRuntimeCapacity(
+              process.env.AD_HOC_MAX_CONNECTED_SOCKETS,
+              AD_HOC_MAX_CONNECTED_CONTROLLERS,
+            ),
+          });
+          if (sockets.size + pendingSocketReservations.size >= totalSocketCapacity) {
+            adHocService.recordResourcePressure("connection-shed");
+            return json({ error: "Ad Hoc connection busy.", retryAfterMs: 1_000 }, 503, [
+              ["retry-after", "1"],
+            ]);
+          }
+          pendingSocketReservations.set(
+            socketId,
+            setTimeout(() => releasePendingSocketReservation(socketId), 5_000),
+          );
           const upgraded = routeServer.upgrade(req, {
             data: {
-              id: crypto.randomUUID(),
+              id: socketId,
               cookieHeader: req.headers.get("cookie"),
               sessionId: null,
               subscription: { type: "none" },
+              subscriptionWork: Promise.resolve(),
+              closed: false,
             },
           });
 
           if (upgraded) {
             return;
           }
+          releasePendingSocketReservation(socketId);
 
           console.warn("WebSocket upgrade failed", {
             url: req.url,
@@ -414,11 +489,7 @@ async function startServer() {
             return adHocUnavailableResponse();
           },
           POST(req: Request) {
-            return createGame(
-              req,
-              adHocService,
-              requestSource(req, technicalAdminConfig.trustProxyHeaders),
-            );
+            return createGame(req, adHocService);
           },
         },
         "/api/audience/events/:eventId": {
@@ -1593,18 +1664,25 @@ async function startServer() {
           console: true,
         },
       websocket: {
+        backpressureLimit: AD_HOC_MAX_QUEUED_OUTPUT_BYTES,
+        closeOnBackpressureLimit: true,
         open(ws) {
+          releasePendingSocketReservation(ws.data.id);
           sockets.add(ws);
         },
         close(ws) {
+          releasePendingSocketReservation(ws.data.id);
           sockets.delete(ws);
-          if (ws.data.subscription.type === "game" && ws.data.sessionId !== null) {
-            void adHocService.setConnection({
-              gameId: ws.data.subscription.gameId,
-              sessionId: ws.data.sessionId,
-              connected: false,
-            });
-          }
+          ws.data.closed = true;
+          void ws.data.subscriptionWork
+            .then(
+              () => liveAdHocSessions.disconnect(ws.data.id),
+              () => liveAdHocSessions.disconnect(ws.data.id),
+            )
+            .then((durable) => {
+              if (!durable) void liveAdHocSessions.retryPending();
+            })
+            .catch(() => undefined);
         },
         async message(ws, message) {
           if (typeof message !== "string") {
@@ -1629,43 +1707,79 @@ async function startServer() {
           switch (parsed.message.type) {
             case "subscribe-lobby": {
               sendMessage(ws, { type: "error", message: adHocService.genericUnavailableMessage });
+              ws.close(1008, "Ad Hoc subscription unavailable.");
               return;
             }
 
             case "subscribe-game": {
-              const result = await resolveAdHocWebSocketSubscription({
-                service: adHocService,
-                cookieHeader: ws.data.cookieHeader,
-                gameId: parsed.message.gameId,
-              });
-              if (result.status !== "accepted") {
-                sendMessage(ws, { type: "error", message: adHocService.genericUnavailableMessage });
-                return;
-              }
-              if (ws.data.subscription.type === "game") {
-                await adHocService.setConnection({
-                  gameId: ws.data.subscription.gameId,
-                  sessionId: ws.data.subscription.sessionId,
-                  connected: false,
+              const subscribeGameId = parsed.message.gameId;
+              const handleSubscription = async () => {
+                const result = await resolveAdHocWebSocketSubscription({
+                  service: adHocService,
+                  cookieHeader: ws.data.cookieHeader,
+                  gameId: subscribeGameId,
                 });
-              }
-              await adHocService.setConnection({
-                gameId: parsed.message.gameId,
-                sessionId: result.sessionId,
-                connected: true,
-              });
-              ws.data.sessionId = result.sessionId;
-              ws.data.subscription = {
-                type: "game",
-                gameId: parsed.message.gameId,
-                sessionId: result.sessionId,
+                if (result.status === "capacity") {
+                  if (!ws.data.closed) {
+                    adHocService.recordResourcePressure("connection-shed");
+                    sendMessage(ws, {
+                      type: "error",
+                      message: "Ad Hoc connection busy. Try again later.",
+                      retryAfterMs: result.retryAfterMs,
+                    });
+                    setTimeout(() => ws.close(1013, "Ad Hoc connection busy."), 25);
+                  }
+                  return;
+                }
+                if (result.status !== "accepted") {
+                  if (!ws.data.closed) {
+                    sendMessage(ws, {
+                      type: "error",
+                      message: adHocService.genericUnavailableMessage,
+                    });
+                    ws.close(1008, "Ad Hoc subscription unavailable.");
+                  }
+                  return;
+                }
+                const identity = {
+                  gameId: subscribeGameId,
+                  sessionId: result.sessionId,
+                };
+                const tracking = await liveAdHocSessions.subscribe(ws.data.id, {
+                  ...identity,
+                });
+                if (!tracking.attached) {
+                  if (liveAdHocSessions.count(identity) === 0) {
+                    await adHocService.setConnection({ ...identity, connected: false });
+                  }
+                  if (!ws.data.closed) {
+                    sendMessage(ws, {
+                      type: "error",
+                      message: adHocService.genericUnavailableMessage,
+                    });
+                    ws.close(1008, "Ad Hoc subscription unavailable.");
+                  }
+                  return;
+                }
+                ws.data.sessionId = result.sessionId;
+                ws.data.subscription = {
+                  type: "game",
+                  gameId: subscribeGameId,
+                  sessionId: result.sessionId,
+                };
+                if (!ws.data.closed) {
+                  sendMessage(ws, {
+                    type: "game-snapshot",
+                    game: stripSession(result.game),
+                    serverNowMs: Date.now(),
+                    ackedCommandIds: [],
+                  });
+                }
+                if (!tracking.previousDisconnectDurable) void liveAdHocSessions.retryPending();
               };
-              sendMessage(ws, {
-                type: "game-snapshot",
-                game: stripSession(result.game),
-                serverNowMs: Date.now(),
-                ackedCommandIds: [],
-              });
+              const queued = ws.data.subscriptionWork.then(handleSubscription, handleSubscription);
+              ws.data.subscriptionWork = queued.catch(() => undefined);
+              await queued;
               return;
             }
 
@@ -1706,17 +1820,29 @@ async function startServer() {
                   message:
                     result.reason === "unavailable"
                       ? adHocService.genericUnavailableMessage
-                      : "Ad Hoc operation rejected.",
+                      : result.reason === "rate-limited"
+                        ? "Ad Hoc operation busy. Try again later."
+                        : "Ad Hoc operation rejected.",
+                  ...(result.retryAfterMs === undefined
+                    ? {}
+                    : { retryAfterMs: Math.min(30_000, Math.max(1, result.retryAfterMs)) }),
                 });
                 return;
               }
-              await broadcastGameSnapshot({
+              const delivered = await broadcastGameSnapshot({
                 gameId: parsed.message.gameId,
                 service: adHocService,
                 sender: ws,
                 senderAckedCommandIds: result.ackedOperationIds,
                 operationOutcomes: result.outcomes,
               });
+              if (result.replayId !== undefined) {
+                await adHocService.acknowledgeReplay({
+                  sessionId: ws.data.subscription.sessionId,
+                  replayId: result.replayId,
+                  delivered,
+                });
+              }
               return;
             }
 
@@ -1828,7 +1954,7 @@ async function runProbeMode(
 export async function createGame(
   req: Request,
   service: AdHocGamesService = defaultAdHocService,
-  sourceKey = "anonymous-browser",
+  sourceKey?: string,
 ) {
   const body = await readJsonBodyWithinLimit(req, SHARED_LIMITS.transport.httpJsonBodyBytes);
   if (!body.ok) {
@@ -1840,29 +1966,41 @@ export async function createGame(
   }
 
   const payload = body.body;
+  const existingSource = readAdHocSource(req.headers.get("cookie"));
+  const effectiveSource = sourceKey ?? existingSource ?? randomBytes(32).toString("base64url");
+  const sourceCookie =
+    sourceKey === undefined && existingSource === null ? adHocSourceCookie(effectiveSource) : null;
   const result = await service.create({
     homeName: payload.homeName === undefined ? "Home" : payload.homeName,
     awayName: payload.awayName === undefined ? "Away" : payload.awayName,
     homeColor: payload.homeColor,
     awayColor: payload.awayColor,
     browserId: payload.browserId,
-    sourceKey,
+    sourceKey: effectiveSource,
   });
   if (result.status !== "accepted") {
     const status =
       result.reason === "invalid-input" ? 400 : result.reason === "unavailable" ? 503 : 429;
+    const headers: Array<[string, string]> = [];
+    if (result.retryAfterMs !== undefined)
+      headers.push(["retry-after", String(Math.max(1, Math.ceil(result.retryAfterMs / 1_000)))]);
+    if (sourceCookie !== null) headers.push(["set-cookie", sourceCookie]);
     return sensitiveJson(
       {
         error: result.detail ?? "Unable to create an Ad Hoc Game.",
         retryAfterMs: result.retryAfterMs,
       },
       status,
+      headers,
     );
   }
   return sensitiveJson(
     { gameId: result.gameId, controlQr: result.controlQr, game: stripSession(result.game) },
     201,
-    [["set-cookie", adHocSessionCookie(result.gameId, result.sessionId)]],
+    [
+      ["set-cookie", adHocSessionCookie(result.gameId, result.sessionId)],
+      ...(sourceCookie === null ? [] : [["set-cookie", sourceCookie] as [string, string]]),
+    ],
   );
 }
 
@@ -1955,10 +2093,13 @@ export async function resolveAdHocWebSocketSubscription({
   cookieHeader: string | null;
   gameId: unknown;
 }): Promise<
-  { status: "accepted"; sessionId: string; game: AdHocGameView } | { status: "unavailable" }
+  | { status: "accepted"; sessionId: string; game: AdHocGameView }
+  | { status: "capacity"; retryAfterMs: number }
+  | { status: "unavailable" }
 > {
   const sessionId = readAdHocSession(cookieHeader, gameId);
-  const result = await service.read({ gameId, sessionId });
+  const result = await service.subscribe({ gameId, sessionId });
+  if (result.status === "capacity") return result;
   if (result.status !== "accepted") return { status: "unavailable" };
   return { status: "accepted", sessionId: result.game.sessionId, game: result.game };
 }
@@ -1990,11 +2131,11 @@ async function broadcastGameSnapshot({
     status: "accepted" | "duplicate" | "rejected" | "causally-blocked";
     detail?: string;
   }[];
-}) {
-  await Promise.all(
+}): Promise<boolean> {
+  const delivery = await Promise.all(
     [...sockets].map(async (ws) => {
       if (ws.data.subscription.type !== "game" || ws.data.subscription.gameId !== gameId) {
-        return;
+        return ws === sender ? false : null;
       }
       const serverNowMs = Date.now();
       const game = await readAuthorizedAdHocGame(
@@ -2003,20 +2144,39 @@ async function broadcastGameSnapshot({
         ws.data.subscription.sessionId,
         serverNowMs,
       );
-      if (game === null) return;
-      sendMessage(ws, {
+      if (game === null) return ws === sender ? false : null;
+      const sent = sendMessage(ws, {
         type: "game-snapshot",
         game: stripSession(game),
         serverNowMs,
         ackedCommandIds: ws === sender ? senderAckedCommandIds : [],
         operationOutcomes,
       });
+      if (!sent) service.recordResourcePressure("queue-pressure");
+      return ws === sender ? sent : null;
     }),
   );
+  return delivery.some((sent) => sent === true);
 }
 
 function sendMessage(ws: ServerWebSocket<SessionData>, payload: ServerWsMessage) {
-  ws.send(JSON.stringify(payload));
+  const serialized = JSON.stringify(payload);
+  const bytes = new TextEncoder().encode(serialized).byteLength;
+  if (bytes > AD_HOC_MAX_QUEUED_OUTPUT_BYTES) {
+    ws.close(1013, "Ad Hoc output limit reached.");
+    return false;
+  }
+  try {
+    const sentBytes = ws.send(serialized);
+    if (sentBytes !== bytes) {
+      ws.close(1013, "Ad Hoc output backpressure.");
+      return false;
+    }
+  } catch {
+    ws.close(1011, "Ad Hoc output unavailable.");
+    return false;
+  }
+  return true;
 }
 
 function stripSession<T extends { sessionId: string }>(game: T) {
@@ -2043,6 +2203,27 @@ export function readAdHocSession(cookieHeader: string | null, gameId: unknown): 
     }
   }
   return null;
+}
+
+const AD_HOC_SOURCE_COOKIE_NAME = "adhoc_source";
+
+function readAdHocSource(cookieHeader: string | null): string | null {
+  if (cookieHeader === null) return null;
+  for (const cookie of cookieHeader.split(";")) {
+    const [name, ...value] = cookie.trim().split("=");
+    if (name !== AD_HOC_SOURCE_COOKIE_NAME || value.length === 0) continue;
+    try {
+      const decoded = decodeURIComponent(value.join("="));
+      return /^[A-Za-z0-9_-]{32,128}$/.test(decoded) ? decoded : null;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+function adHocSourceCookie(source: string): string {
+  return `${AD_HOC_SOURCE_COOKIE_NAME}=${encodeURIComponent(source)}; Path=/; Max-Age=31536000; HttpOnly; SameSite=Lax`;
 }
 
 function adHocSessionCookieName(gameId: unknown): string | null {
@@ -2444,6 +2625,31 @@ function clearEventAdminSessionCookie(): string {
 
 function clearPitchManagerSessionCookie(): string {
   return "__Host-pitch-manager-session=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict";
+}
+
+function readRuntimeCapacity(value: string | undefined, fallback: number): number {
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+export function calculateAdHocUpgradeCapacity(input: {
+  eventTotalConnections: number;
+  eventReservedConnections: number;
+  activeEventConnections: number;
+  adHocSocketCeiling: number;
+}): number {
+  const eventTotal = Math.max(0, input.eventTotalConnections);
+  const eventReserve = Math.max(0, input.eventReservedConnections);
+  const activeEvent = Math.max(0, input.activeEventConnections);
+  const adHocCeiling = Math.max(0, input.adHocSocketCeiling);
+  return Math.max(0, Math.min(adHocCeiling, eventTotal - Math.max(eventReserve, activeEvent)));
+}
+
+function releasePendingSocketReservation(socketId: string) {
+  const timer = pendingSocketReservations.get(socketId);
+  if (timer === undefined) return;
+  clearTimeout(timer);
+  pendingSocketReservations.delete(socketId);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

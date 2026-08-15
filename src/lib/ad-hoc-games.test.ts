@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  AD_HOC_DISCONNECTED_GRACE_MS,
   createAdHocGamesService,
   createInMemoryAdHocStore,
   type AdHocStore,
@@ -386,6 +387,32 @@ describe("Ad Hoc Games service", () => {
     ).toBe("accepted");
   });
 
+  test("does not remove connected resource accounting when leave durability fails", async () => {
+    const base = createInMemoryAdHocStore();
+    let failMutations = false;
+    const store: AdHocStore = {
+      close: () => base.close(),
+      listGames: () => base.listGames(),
+      readGame: (gameId) => base.readGame(gameId),
+      createGame: (input) => base.createGame(input),
+      mutateGame: (gameId, mutation) => (failMutations ? null : base.mutateGame(gameId, mutation)),
+    };
+    const games = createAdHocGamesService({ store, now: () => 1_000 });
+    const created = await games.create({ homeName: "Home", awayName: "Away" });
+    if (created.status !== "accepted") throw new Error("creation failed");
+    expect(
+      await games.setConnection({
+        gameId: created.gameId,
+        sessionId: created.sessionId,
+        connected: true,
+        connectionId: "socket-leave",
+      }),
+    ).toBe(true);
+    failMutations = true;
+    expect(await games.leave({ gameId: created.gameId, sessionId: created.sessionId })).toBe(false);
+    expect(games.getResourceMetrics().connectedControllers).toBe(1);
+  });
+
   test("rejects malformed commands without changing current state", async () => {
     const games = service();
     const created = await games.create({ homeName: "Home", awayName: "Away" });
@@ -461,7 +488,11 @@ describe("Ad Hoc Games service", () => {
       awayName: "Game",
       sourceKey: "new-source",
     });
-    expect(rejected).toMatchObject({ status: "rejected", reason: "capacity" });
+    expect(rejected).toMatchObject({
+      status: "rejected",
+      reason: "capacity",
+      detail: "Ad Hoc capacity is currently full; no game was changed.",
+    });
 
     await games.setConnection({
       gameId: created[0]!.gameId,
@@ -477,5 +508,117 @@ describe("Ad Hoc Games service", () => {
     expect(replacement.status).toBe("accepted");
     expect(store.listGames()).toHaveLength(50);
     expect(store.readGame(created[0]!.gameId)).toBeNull();
+  });
+
+  test("protects newly admitted sessions and enforces the exact five-minute boundary", async () => {
+    let nowMs = 1_000;
+    const store = createInMemoryAdHocStore();
+    const games = createAdHocGamesService({ store, now: () => nowMs });
+
+    for (let index = 0; index < 49; index += 1) {
+      nowMs += 60 * 60_000;
+      const result = await games.create({
+        homeName: `Home ${index}`,
+        awayName: "Away",
+        sourceKey: `source-${index}`,
+      });
+      if (result.status !== "accepted") throw new Error("capacity setup failed");
+      await games.setConnection({
+        gameId: result.gameId,
+        sessionId: result.sessionId,
+        connected: true,
+      });
+    }
+
+    const newlyAdmitted = await games.create({
+      homeName: "Newly",
+      awayName: "Admitted",
+      sourceKey: "newly-admitted",
+      nowMs,
+    });
+    expect(newlyAdmitted.status).toBe("accepted");
+    if (newlyAdmitted.status !== "accepted") return;
+
+    const immediatelyRejected = await games.create({
+      homeName: "Immediate",
+      awayName: "Attempt",
+      sourceKey: "immediate-attempt",
+      nowMs,
+    });
+    expect(immediatelyRejected).toMatchObject({ status: "rejected", reason: "capacity" });
+
+    nowMs += AD_HOC_DISCONNECTED_GRACE_MS - 1;
+    const beforeBoundary = await games.create({
+      homeName: "Before",
+      awayName: "Boundary",
+      sourceKey: "before-boundary",
+      nowMs,
+    });
+    expect(beforeBoundary).toMatchObject({ status: "rejected", reason: "capacity" });
+    expect(store.readGame(newlyAdmitted.gameId)).not.toBeNull();
+
+    nowMs += 1;
+    const atBoundary = await games.create({
+      homeName: "At",
+      awayName: "Boundary",
+      sourceKey: "at-boundary",
+      nowMs,
+    });
+    expect(atBoundary.status).toBe("accepted");
+    expect(store.readGame(newlyAdmitted.gameId)).toBeNull();
+  });
+
+  test("enforces one global cap without pruning another environment", async () => {
+    let nowMs = 1_000;
+    const store = createInMemoryAdHocStore();
+    const fieldA = createAdHocGamesService({
+      store,
+      environmentIdentity: "field-a",
+      now: () => nowMs,
+    });
+    const fieldB = createAdHocGamesService({
+      store,
+      environmentIdentity: "field-b",
+      now: () => nowMs,
+    });
+
+    for (let index = 0; index < 49; index += 1) {
+      nowMs += 60 * 60_000;
+      const result = await fieldA.create({
+        homeName: `Field A ${index}`,
+        awayName: "Away",
+        sourceKey: `field-a-${index}`,
+      });
+      if (result.status !== "accepted") throw new Error("mixed capacity setup failed");
+      await fieldA.setConnection({
+        gameId: result.gameId,
+        sessionId: result.sessionId,
+        connected: true,
+      });
+    }
+
+    const otherEnvironment = await fieldB.create({
+      homeName: "Field B",
+      awayName: "Away",
+      sourceKey: "field-b",
+      nowMs,
+    });
+    if (otherEnvironment.status !== "accepted") throw new Error("mixed environment setup failed");
+    await fieldB.setConnection({
+      gameId: otherEnvironment.gameId,
+      sessionId: otherEnvironment.sessionId,
+      connected: true,
+      nowMs,
+    });
+
+    const rejected = await fieldA.create({
+      homeName: "Blocked",
+      awayName: "Capacity",
+      sourceKey: "field-a-new",
+      nowMs,
+    });
+    expect(rejected).toMatchObject({ status: "rejected", reason: "capacity" });
+    expect(store.listGames()).toHaveLength(50);
+    expect(store.readGame(otherEnvironment.gameId)).not.toBeNull();
   });
 });

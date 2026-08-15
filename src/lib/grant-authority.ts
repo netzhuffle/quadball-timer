@@ -50,6 +50,8 @@ export type GrantAuthorityOptions = {
     ) => { eventGameId: string; apply(transaction: FoundationStorageTransaction): void } | null;
   };
   privilegedAuthorityVerifier: GrantAuthorityVerifier;
+  /** Refresh cheap Event capacity snapshots after lifecycle mutations. */
+  onLifecycleChange?: () => void;
 };
 
 /** The single public Grant facade. All Grant types use the trusted typed lifecycle. */

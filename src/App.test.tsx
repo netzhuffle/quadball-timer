@@ -906,6 +906,68 @@ describe("App", () => {
     expect(payload.awayColor).toBe(DEFAULT_AWAY_TEAM_COLOR);
   });
 
+  test("owns one rendered creation retry chain and prevents duplicate submission", async () => {
+    testWindow.history.replaceState(null, "", "/");
+    const requests: string[] = [];
+    const retryCallbacks: (() => void)[] = [];
+    testWindow.setTimeout = ((callback: () => void) => {
+      retryCallbacks.push(callback);
+      return 1;
+    }) as unknown as typeof testWindow.setTimeout;
+    testWindow.clearTimeout = (() => {}) as typeof testWindow.clearTimeout;
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url =
+        typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.endsWith("/api/games") && init?.method === "POST") {
+        requests.push(url);
+        if (requests.length === 1)
+          return new Response(JSON.stringify({ retryAfterMs: 1_000 }), {
+            status: 429,
+            headers: { "content-type": "application/json", "retry-after": "1" },
+          });
+        return new Response(JSON.stringify({ gameId: "retry-created" }), { status: 201 });
+      }
+      if (url.endsWith("/api/games/retry-created")) {
+        const state = createInitialGameState({
+          id: "retry-created",
+          nowMs: Date.now(),
+          homeName: "Home",
+          awayName: "Away",
+        });
+        return new Response(JSON.stringify({ game: { state } }), { status: 200 });
+      }
+      return new Response("Not found", { status: 404 });
+    }) as typeof fetch;
+
+    await act(async () => {
+      root.render(<App />);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const createButton = Array.from(container.getElementsByTagName("button")).find((button) =>
+      (button.textContent ?? "").includes("Create new game"),
+    );
+    expect(createButton).not.toBeNull();
+    await act(async () => {
+      createButton?.click();
+      createButton?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(requests).toHaveLength(1);
+    expect(container.textContent).toContain("Retrying in 1s.");
+    expect(retryCallbacks).toHaveLength(1);
+
+    await act(async () => {
+      retryCallbacks.shift()?.();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(requests).toHaveLength(2);
+    expect(testWindow.location.pathname).toBe("/game/retry-created");
+  });
+
   test("color test route renders 100 color samples", async () => {
     testWindow.history.replaceState(null, "", "/color-test");
 

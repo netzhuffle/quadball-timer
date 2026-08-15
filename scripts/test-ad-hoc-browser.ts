@@ -1,8 +1,10 @@
 #!/usr/bin/env bun
 import { chromium, type Page } from "playwright";
+import { Database } from "bun:sqlite";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { createAdHocGamesService, openSqliteAdHocStore } from "@/lib/ad-hoc-games";
 
 let directory = "";
 let certificatePath = "";
@@ -76,9 +78,9 @@ async function run() {
     );
     await raceWithDeadline(
       (async () => {
-        const firstContext = await browser!.newContext({ ignoreHTTPSErrors: true });
+        let firstContext = await browser!.newContext({ ignoreHTTPSErrors: true });
         let secondContext = await browser!.newContext({ ignoreHTTPSErrors: true });
-        const first = await firstContext.newPage();
+        let first = await firstContext.newPage();
         let second = await secondContext.newPage();
         first.setDefaultTimeout(15_000);
         second.setDefaultTimeout(15_000);
@@ -90,6 +92,67 @@ async function run() {
 
         const gameId = new URL(first.url()).pathname.split("/").at(-1);
         if (gameId === undefined) throw new Error("Game route did not contain a Game ID.");
+        for (let index = 0; index < 4; index += 1) {
+          await first.goto(origin);
+          await first.getByRole("button", { name: /Start an Ad Hoc Game/ }).click();
+          await first.waitForURL(/\/game\/adhoc-/u);
+        }
+        await first.goto(origin);
+        await first.getByRole("button", { name: /Start an Ad Hoc Game/ }).click();
+        await first
+          .getByRole("status")
+          .filter({ hasText: /Retrying in/u })
+          .waitFor();
+        await first.waitForURL(/\/game\/adhoc-/u);
+        const creationRetryGameId = new URL(first.url()).pathname.split("/").at(-1);
+        if (creationRetryGameId === undefined)
+          throw new Error("Rendered creation retry did not navigate to a Game.");
+        await first.goto(`${origin}/game/${gameId}`);
+        await waitForGameRoute(first, gameId);
+        const replayRetryEvidence = await first.evaluate(async (id) => {
+          const wsUrl = `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`;
+          const ws = new WebSocket(wsUrl);
+          const messages: unknown[] = [];
+          let notify: (() => void) | null = null;
+          ws.onmessage = (event) => {
+            messages.push(JSON.parse(String(event.data)) as unknown);
+            notify?.();
+          };
+          const nextMessage = async () => {
+            while (messages.length === 0) await new Promise<void>((resolve) => (notify = resolve));
+            notify = null;
+            return messages.shift() as {
+              type?: string;
+              retryAfterMs?: number;
+              ackedCommandIds?: string[];
+            };
+          };
+          await new Promise<void>((resolve, reject) => {
+            ws.onopen = () => resolve();
+            ws.onerror = () => reject(new Error("Replay evidence WebSocket failed to open."));
+          });
+          ws.send(JSON.stringify({ type: "subscribe-game", gameId: id }));
+          while ((await nextMessage()).type !== "game-snapshot") {}
+          const batch = Array.from({ length: 100 }, (_, index) => ({
+            id: `browser-replay-${index}`,
+            clientSentAtMs: Date.now(),
+            command: { type: "set-running", running: index % 2 === 0 },
+          }));
+          ws.send(JSON.stringify({ type: "apply-commands", gameId: id, commands: batch }));
+          let acknowledged = false;
+          for (;;) {
+            const message = await nextMessage();
+            if (message.type === "game-snapshot") {
+              acknowledged = message.ackedCommandIds?.includes("browser-replay-99") ?? false;
+              if (acknowledged) break;
+            }
+          }
+          ws.close();
+          if (!acknowledged) throw new Error("Scheduled replay was not eventually acknowledged.");
+          return { batchSize: batch.length };
+        }, creationRetryGameId);
+        if (replayRetryEvidence.batchSize !== 100)
+          throw new Error("Browser replay evidence did not use the full batch envelope.");
         const snapshot = (await first.evaluate(async (id) => {
           const response = await fetch(`/api/games/${id}`);
           return (await response.json()) as { game?: { controlQr?: string | null } };
@@ -145,17 +208,106 @@ async function run() {
         if (new URL(second.url()).pathname !== "/") await second.waitForURL(`${origin}/`);
         await first.getByText("Paused", { exact: true }).waitFor();
 
-        await second.goto(handoffUrl);
-        await waitForGameRoute(second, gameId);
-        await assertAccessibleQr(second, "readmitted second browser");
+        environment.AD_HOC_MAX_CONNECTED_SOCKETS = "1";
+        await stopServer();
+        await startServer();
+        await first.reload();
+        await waitForGameRoute(first, gameId);
+        await first.getByText("Live", { exact: true }).waitFor();
+        await first.waitForTimeout(250);
+        const retryContext = await browser!.newContext({
+          ignoreHTTPSErrors: true,
+          storageState: secondStorageState,
+        });
+        const retryPage = await retryContext.newPage();
+        retryPage.setDefaultTimeout(15_000);
+        await retryPage.goto(handoffUrl);
+        await waitForGameRoute(retryPage, gameId);
+        await retryPage.getByText(/Ad Hoc connection busy/u).waitFor();
+        await first.close();
+        await retryPage.getByText("Live", { exact: true }).waitFor();
 
         await stopServer();
         rmSync(databasePath, { force: true });
         await startServer();
-        await second.reload();
-        await waitForGameRoute(second, gameId);
-        await second.getByText("Local", { exact: true }).waitFor();
-        await second.getByText("Server does not know this game", { exact: false }).waitFor();
+        await retryPage.reload();
+        await waitForGameRoute(retryPage, gameId);
+        await retryPage.getByText("Local", { exact: true }).waitFor();
+        await retryPage
+          .getByText("Server does not know this game", { exact: false })
+          .first()
+          .waitFor();
+        await retryContext.close();
+        await secondContext.close();
+
+        const setupContext = await browser!.newContext({ ignoreHTTPSErrors: true });
+        const setup = await setupContext.newPage();
+        setup.setDefaultTimeout(15_000);
+        await setup.goto(`${origin}/events?view=all`);
+        await setup.getByRole("button", { name: /Start an Ad Hoc Game/ }).click();
+        await setup.waitForURL(/\/game\/adhoc-/u);
+        const victimGameId = new URL(setup.url()).pathname.split("/").at(-1);
+        if (victimGameId === undefined)
+          throw new Error("Victim Game route did not contain a Game ID.");
+        await setup.getByRole("button", { name: "Start game" }).click();
+        await setup.getByText("Running", { exact: true }).waitFor();
+        const victimStorageState = await setupContext.storageState();
+        await setupContext.close();
+
+        await stopServer();
+        await seedAdditionalCapacity(victimGameId, 49);
+        await startServer();
+        const prunerContext = await browser!.newContext({ ignoreHTTPSErrors: true });
+        const pruner = await prunerContext.newPage();
+        pruner.setDefaultTimeout(15_000);
+        await pruner.goto(`${origin}/events?view=all`);
+        await pruner.getByRole("button", { name: /Start an Ad Hoc Game/ }).click();
+        await pruner.waitForURL(/\/game\/adhoc-/u);
+        await prunerContext.close();
+
+        const victimContext = await browser!.newContext({
+          ignoreHTTPSErrors: true,
+          storageState: victimStorageState,
+        });
+        const victim = await victimContext.newPage();
+        victim.setDefaultTimeout(15_000);
+        await victim.goto(`${origin}/game/${victimGameId}`);
+        await waitForGameRoute(victim, victimGameId);
+        await victim.getByText("Local", { exact: true }).waitFor();
+        await victim
+          .getByText("Server does not know this game", { exact: false })
+          .first()
+          .waitFor();
+        const removedProbe = await victim.evaluate(async (id) => {
+          const response = await fetch(`/api/games/${id}`);
+          return { status: response.status, url: location.pathname };
+        }, victimGameId);
+        if (removedProbe.status !== 404 || removedProbe.url !== `/game/${victimGameId}`) {
+          throw new Error("Pruned Ad Hoc Game was silently recreated or recovered.");
+        }
+        await victim.reload();
+        await waitForGameRoute(victim, victimGameId);
+        await victim.getByText("Local", { exact: true }).waitFor();
+        await victim
+          .getByText("Server does not know this game", { exact: false })
+          .first()
+          .waitFor();
+        await victimContext.close();
+
+        await stopServer();
+        await seedCapacity(true);
+        await startServer();
+        const capacityContext = await browser!.newContext({ ignoreHTTPSErrors: true });
+        const capacityPage = await capacityContext.newPage();
+        capacityPage.setDefaultTimeout(15_000);
+        await capacityPage.goto(`${origin}/events?view=all`);
+        await capacityPage.getByRole("button", { name: /Start an Ad Hoc Game/ }).click();
+        await capacityPage.getByRole("alert").waitFor();
+        await capacityPage
+          .getByRole("alert")
+          .getByText("Ad Hoc capacity is currently full; no game was changed.", { exact: true })
+          .waitFor();
+        await capacityContext.close();
       })(),
       lifecycleController.signal,
     );
@@ -368,7 +520,10 @@ async function assertAccessibleQr(page: Page, stage: string) {
       throw new Error("Close did not restore focus to the QR trigger");
     }
   } catch (error) {
-    throw new Error(`${stage} QR display failed at ${page.url()}.`, { cause: error });
+    throw new Error(
+      `${stage} QR display failed at ${page.url()}: ${error instanceof Error ? error.message : String(error)}`,
+      { cause: error },
+    );
   }
 }
 
@@ -381,4 +536,103 @@ async function waitForUnfinishedGame(page: Page, gameId: string) {
     };
     return payload.game?.state?.isFinished === false && typeof payload.game.controlQr === "string";
   }, gameId);
+}
+
+async function seedCapacity(connected: boolean) {
+  rmSync(databasePath, { force: true });
+  let seedNowMs = Date.now() - 102 * 60 * 60_000;
+  const store = openSqliteAdHocStore(databasePath, "adhoc-browser-test");
+  const games = createAdHocGamesService({
+    store,
+    environmentIdentity: "adhoc-browser-test",
+    now: () => seedNowMs,
+  });
+  try {
+    for (let index = 0; index < 50; index += 1) {
+      seedNowMs += 2 * 60 * 60_000;
+      const result = await games.create({
+        homeName: `Seed ${index}`,
+        awayName: "Away",
+        sourceKey: `browser-seed-${index}`,
+        nowMs: seedNowMs,
+      });
+      if (result.status !== "accepted") throw new Error("browser capacity seed failed");
+    }
+  } finally {
+    games.close();
+  }
+
+  if (!connected) return;
+  const database = new Database(databasePath, { create: false, strict: true });
+  try {
+    const rows = database.query("SELECT game_id, sessions_json FROM adhoc_games").all() as {
+      game_id: string;
+      sessions_json: string;
+    }[];
+    for (const row of rows) {
+      const sessions = JSON.parse(row.sessions_json) as {
+        connected: boolean;
+        lastConnectedAtMs: number;
+        lastDisconnectedAtMs: number | null;
+      }[];
+      for (const session of sessions) {
+        session.connected = true;
+        session.lastConnectedAtMs = Date.now();
+        session.lastDisconnectedAtMs = null;
+      }
+      database.run("UPDATE adhoc_games SET sessions_json = ? WHERE game_id = ?", [
+        JSON.stringify(sessions),
+        row.game_id,
+      ]);
+    }
+  } finally {
+    database.close();
+  }
+}
+
+async function seedAdditionalCapacity(victimGameId: string, count: number) {
+  const seedStartMs = Date.now() - 100 * 60 * 60_000;
+  const store = openSqliteAdHocStore(databasePath, "adhoc-browser-test");
+  const games = createAdHocGamesService({
+    store,
+    environmentIdentity: "adhoc-browser-test",
+    now: () => seedStartMs,
+  });
+  try {
+    for (let index = 0; index < count; index += 1) {
+      const nowMs = seedStartMs + index * 2 * 60 * 60_000;
+      const result = await games.create({
+        homeName: `Additional seed ${index}`,
+        awayName: "Away",
+        sourceKey: `browser-additional-seed-${index}`,
+        nowMs,
+      });
+      if (result.status !== "accepted") throw new Error("browser additional capacity seed failed");
+    }
+  } finally {
+    games.close();
+  }
+
+  const database = new Database(databasePath, { create: false, strict: true });
+  try {
+    const row = database
+      .query("SELECT sessions_json FROM adhoc_games WHERE game_id = ?")
+      .get(victimGameId) as { sessions_json: string } | null;
+    if (row === null) throw new Error("victim Game was not retained during capacity setup");
+    const sessions = JSON.parse(row.sessions_json) as {
+      connected: boolean;
+      lastDisconnectedAtMs: number | null;
+    }[];
+    for (const session of sessions) {
+      session.connected = false;
+      session.lastDisconnectedAtMs = seedStartMs - 2 * 60 * 60_000;
+    }
+    database.run("UPDATE adhoc_games SET created_at_ms = ?, sessions_json = ? WHERE game_id = ?", [
+      seedStartMs - 2 * 60 * 60_000,
+      JSON.stringify(sessions),
+      victimGameId,
+    ]);
+  } finally {
+    database.close();
+  }
 }

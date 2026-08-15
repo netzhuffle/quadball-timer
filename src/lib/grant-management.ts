@@ -53,6 +53,21 @@ export function createTypedGrantAuthority(
   options: GrantAuthorityOptions,
 ): TypedGrantAuthority {
   requireGrantStorageCapabilities(storage);
+  const notifyLifecycleChange = <T>(
+    operation: Promise<T>,
+    changedStatuses: readonly string[] = ["admitted", "switched", "updated"],
+  ): Promise<T> =>
+    operation.then((result) => {
+      if (
+        typeof result === "object" &&
+        result !== null &&
+        "status" in result &&
+        changedStatuses.includes(String(result.status))
+      ) {
+        options.onLifecycleChange?.();
+      }
+      return result;
+    });
   storage.setGrantValidationContext({
     environmentId: options.environmentId,
     keyRing: options.keyRing,
@@ -88,36 +103,48 @@ export function createTypedGrantAuthority(
     disableGrantCode: (grantId, authority) =>
       disableGrantCode(storage, options, grantId, authority),
     admitGrantCode: (input) => admitGrantCode(storage, options, input),
-    admitGrant: (input) => admitGrant(storage, options, input),
+    admitGrant: (input) => notifyLifecycleChange(admitGrant(storage, options, input)),
     admitPitchManagerGrant: (input) =>
       admitGrant(storage, options, input, PITCH_MANAGER_GRANT_TYPE),
     admitEventAdminGrant: (input) => admitGrant(storage, options, input, EVENT_ADMIN_GRANT_TYPE),
-    authorizeGrant: (input) => authorizeGrant(storage, options, input),
+    authorizeGrant: (input) =>
+      input.readOnly === true
+        ? authorizeGrant(storage, options, input)
+        : notifyLifecycleChange(authorizeGrant(storage, options, input), ["authorized"]),
     authorizeGrantInTransaction: (transaction, input) =>
       authorizeGrantInTransaction(transaction, options, input),
     acceptControlGrantSessionSwitch: (input) =>
-      acceptControlGrantSessionSwitch(storage, options, input.sessionBearer),
+      notifyLifecycleChange(acceptControlGrantSessionSwitch(storage, options, input.sessionBearer)),
     authorizeControlGrantReplay: (input) => authorizeControlGrantReplay(storage, options, input),
     revealGrant: (grantId, authority) => revealGrant(storage, options, grantId, authority),
     revealGrantInTransaction: (transaction, grantId, authority) =>
       revealGrantInTransaction(transaction, options, grantId, authority),
     disableGrant: (grantId, authority) =>
-      updateGrantStatus(storage, options, grantId, authority, "disabled", "grant-disabled"),
+      notifyLifecycleChange(
+        updateGrantStatus(storage, options, grantId, authority, "disabled", "grant-disabled"),
+      ),
     revokeGrant: (grantId, authority) =>
-      updateGrantStatus(storage, options, grantId, authority, "revoked", "grant-revoked"),
-    reactivateGrant: (grantId, authority) => reactivateGrant(storage, options, grantId, authority),
-    rotateGrant: (grantId, authority) => rotateGrant(storage, options, grantId, authority),
+      notifyLifecycleChange(
+        updateGrantStatus(storage, options, grantId, authority, "revoked", "grant-revoked"),
+      ),
+    reactivateGrant: (grantId, authority) =>
+      notifyLifecycleChange(reactivateGrant(storage, options, grantId, authority)),
+    rotateGrant: (grantId, authority) =>
+      notifyLifecycleChange(rotateGrant(storage, options, grantId, authority)),
     rotateGrantInTransaction: (transaction, grantId, authority) =>
       rotateGrantInTransaction(transaction, options, grantId, authority),
     rotateGrantCredentialKeys: (grantId, authority) =>
-      rotateGrantCredentialKeys(storage, options, grantId, authority),
+      notifyLifecycleChange(rotateGrantCredentialKeys(storage, options, grantId, authority)),
     recalculateGrantExpiry: (grantId, correction, authority) =>
-      recalculateExpiry(storage, options, grantId, correction, authority),
+      notifyLifecycleChange(recalculateExpiry(storage, options, grantId, correction, authority)),
     revokeGrantSession: (grantId, sessionReference, authority) =>
-      revokeGrantSession(storage, options, grantId, sessionReference, authority),
+      notifyLifecycleChange(
+        revokeGrantSession(storage, options, grantId, sessionReference, authority),
+      ),
     revokeGrantSessionInTransaction: (transaction, grantId, sessionReference, authority) =>
       revokeGrantSessionInTransaction(transaction, options, grantId, sessionReference, authority),
-    leaveGrantSession: (sessionBearer) => leaveGrantSession(storage, options, sessionBearer),
+    leaveGrantSession: (sessionBearer) =>
+      notifyLifecycleChange(leaveGrantSession(storage, options, sessionBearer)),
     listGrantSessions: (grantId, authority) => listSessions(storage, options, grantId, authority),
     listGrantSessionsInTransaction: (transaction, grantId, authority) =>
       listSessionsInTransaction(transaction, options, grantId, authority),
