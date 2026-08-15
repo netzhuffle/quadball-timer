@@ -6,6 +6,7 @@ import {
   type ValidationResult,
 } from "@/lib/validation-policy";
 import { canonicalizeJson, sha256 } from "@/lib/event-game-action-json";
+import { validateClockFactData } from "@/lib/clock-authority";
 import type {
   ActionJsonValue,
   ControlActionCodec,
@@ -112,6 +113,10 @@ function createGameFactCodec(): ControlActionCodec<GameFactPayload> {
       if (payload.data !== undefined) {
         const dataResult = parseJsonValue(payload.data, "payload.data");
         if (!dataResult.ok) return dataResult;
+        if (factType.value === "clock") {
+          const clockData = validateClockFactData(dataResult.value);
+          if (!clockData.ok) return clockData;
+        }
         data = dataResult.value;
       }
       return valid({

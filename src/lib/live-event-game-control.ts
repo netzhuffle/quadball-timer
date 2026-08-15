@@ -1,11 +1,22 @@
 import type { EffectiveGameFact, IqaGameRulesInterpreter } from "@/lib/event-game-actions";
 import { createDefaultControlActionCodecs } from "@/lib/event-game-actions";
+import {
+  CLOCK_AUTHORITY_VERSION,
+  deriveClockAuthority,
+  projectClockBaseline,
+  validateClockAuthorityAction,
+  type ClockAuthorityAction,
+  type ClockProjection,
+} from "@/lib/clock-authority";
 import type { EventGameLifecyclePhase, EventGameRecordRoot } from "@/lib/foundation-record-types";
 import type { EventGameRecord } from "@/lib/event-game-record";
 import type { FoundationAcceptance } from "@/lib/foundation-acceptance";
+import type { ControlAction } from "@/lib/event-game-actions";
 import type { TypedGrantAuthority } from "@/lib/grant-management-types";
 import {
   SHARED_LIMITS,
+  validateClockAdjustmentMs,
+  validateGameClockMs,
   validateIntegerInRange,
   validateOpaqueIdentifier,
 } from "@/lib/validation-policy";
@@ -32,6 +43,14 @@ export type LiveEventControllerIntent =
   | (ControllerIntentBase & {
       type: "clock" | "set-running";
       running: boolean;
+    })
+  | (ControllerIntentBase & {
+      type: "clock-adjust";
+      adjustmentMs: number;
+    })
+  | (ControllerIntentBase & {
+      type: "clock-correction";
+      clockTimeMs: number;
     })
   | (ControllerIntentBase & {
       type: "substantive";
@@ -88,6 +107,7 @@ export type LiveEventGameDerivedState = {
   phase: EventGameLifecyclePhase;
   scoreByGameSide: Readonly<Record<string, number>>;
   goalCount: number;
+  clock: ClockProjection;
 };
 
 export type ControllerProjection = {
@@ -96,6 +116,7 @@ export type ControllerProjection = {
   scoreByGameSide: Readonly<Record<string, number>>;
   goalCount: number;
   commencement: ControllerCommencement;
+  clock: ClockProjection;
 };
 
 export type ControllerSynchronization = {
@@ -192,8 +213,13 @@ export function createLiveEventGameIqaInterpreter(
 ): IqaGameRulesInterpreter {
   return {
     version,
-    rebuild({ root, effectiveFacts }) {
-      return deriveLiveEventGameState(root, effectiveFacts, version);
+    rebuild({ root, canonicalActions, effectiveFacts }) {
+      return deriveLiveEventGameState(
+        root,
+        canonicalActions.map((action) => ({ action })),
+        effectiveFacts,
+        version,
+      );
     },
   };
 }
@@ -209,11 +235,23 @@ export function parseLiveEventControllerIntent(
     value.type !== "record-goal" &&
     value.type !== "clock" &&
     value.type !== "set-running" &&
+    value.type !== "clock-adjust" &&
+    value.type !== "adjust-clock" &&
+    value.type !== "adjust-game-clock" &&
+    value.type !== "clock-correction" &&
+    value.type !== "correct-clock" &&
+    value.type !== "set-game-clock" &&
     value.type !== "substantive" &&
     value.type !== "reset" &&
     value.type !== "undo"
   )
     return invalid("Controller intent type is unsupported.");
+  const normalizedType =
+    value.type === "adjust-clock" || value.type === "adjust-game-clock"
+      ? "clock-adjust"
+      : value.type === "correct-clock" || value.type === "set-game-clock"
+        ? "clock-correction"
+        : value.type;
 
   const operationId = validateOpaqueIdentifier(value.operationId, "operationId");
   const factId = validateOpaqueIdentifier(value.factId, "factId");
@@ -237,6 +275,20 @@ export function parseLiveEventControllerIntent(
   if (value.type === "clock" || value.type === "set-running") {
     if (typeof value.running !== "boolean") return invalid("running must be a boolean.");
     running = value.running;
+  }
+  let adjustmentMs: number | undefined;
+  if (normalizedType === "clock-adjust") {
+    const adjustment = validateClockAdjustment(value.adjustmentMs ?? value.deltaMs);
+    if (!adjustment.ok) return invalid(adjustment.error);
+    adjustmentMs = adjustment.value;
+  }
+  let clockTimeMs: number | undefined;
+  if (normalizedType === "clock-correction") {
+    const clockTime = validateGameClock(
+      value.clockTimeMs ?? value.targetGameTimeMs ?? value.gameTimeMs,
+    );
+    if (!clockTime.ok) return invalid(clockTime.error);
+    clockTimeMs = clockTime.value;
   }
   let trigger: "card" | "timeout" | "suspension" | "result" | undefined;
   if (value.type === "substantive") {
@@ -276,13 +328,15 @@ export function parseLiveEventControllerIntent(
     ok: true,
     value: {
       version: LIVE_EVENT_CONTROL_INTENT_VERSION,
-      type: value.type,
+      type: normalizedType,
       operationId: operationId.value,
       factId: factId.value,
       gameTimeMs: gameTimeMs.value,
       occurrence: { clientOriginAtMs, ...(source === undefined ? {} : { source }) },
       ...(gameSideId === undefined ? {} : { gameSideId }),
       ...(running === undefined ? {} : { running }),
+      ...(adjustmentMs === undefined ? {} : { adjustmentMs }),
+      ...(clockTimeMs === undefined ? {} : { clockTimeMs }),
       ...(trigger === undefined ? {} : { trigger }),
     } as LiveEventControllerIntent,
   };
@@ -591,6 +645,14 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
     }
     const nowMs = clock();
     const previousClockStartMs = latestRunningClockStart(actionsBefore);
+    const clockBefore = projectClockBaseline(
+      deriveClockAuthority(readClockAuthorityActions(actionsBefore)),
+      nowMs,
+    );
+    const clockData = readClockIntentData(parsed.value, clockBefore, nowMs);
+    if (clockData.status === "rejected") {
+      return rejectedAction(parsed.value.operationId);
+    }
     const clockStartMs =
       parsed.value.type === "clock" || parsed.value.type === "set-running"
         ? parsed.value.running
@@ -613,8 +675,8 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
         data:
           parsed.value.type === "record-goal"
             ? { points: 10 }
-            : parsed.value.type === "clock" || parsed.value.type === "set-running"
-              ? { running: parsed.value.running, startedAtMs: clockStartMs }
+            : clockData.value !== null
+              ? clockData.value
               : parsed.value.type === "substantive"
                 ? { trigger: parsed.value.trigger }
                 : null,
@@ -935,6 +997,7 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
         phase: derived.phase,
         scoreByGameSide: structuredClone(derived.scoreByGameSide),
         goalCount: derived.goalCount,
+        clock: projectClockBaseline(derived.clock.baseline, clock()),
         commencement: {
           status: root.lifecycle.commencedAtMs === null ? "provisional" : "commenced",
           commencedAtMs: root.lifecycle.commencedAtMs,
@@ -961,6 +1024,7 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
 
 function deriveLiveEventGameState(
   root: EventGameRecordRoot,
+  canonicalActions: readonly { action: import("@/lib/event-game-actions").ControlAction }[],
   effectiveFacts: readonly EffectiveGameFact[],
   version: string,
 ): LiveEventGameDerivedState {
@@ -981,12 +1045,22 @@ function deriveLiveEventGameState(
     phase: root.lifecycle.phase,
     scoreByGameSide,
     goalCount,
+    clock: projectClockBaseline(
+      deriveClockAuthority(readClockAuthorityActions(canonicalActions)),
+      0,
+    ),
   };
 }
 
 function controllerFactType(intent: LiveEventControllerIntent): string {
   if (intent.type === "record-goal") return "goal";
-  if (intent.type === "clock" || intent.type === "set-running") return "clock";
+  if (
+    intent.type === "clock" ||
+    intent.type === "set-running" ||
+    intent.type === "clock-adjust" ||
+    intent.type === "clock-correction"
+  )
+    return "clock";
   if (intent.type === "substantive") return intent.trigger;
   return intent.type;
 }
@@ -1079,12 +1153,150 @@ function readDerivedState(value: unknown): LiveEventGameDerivedState | null {
     value.goalCount < 0
   )
     return null;
+  const clock = readClockProjection(value.clock);
+  if (clock === null) return null;
   return {
     interpreterVersion: value.interpreterVersion,
     phase: value.phase,
     scoreByGameSide,
     goalCount: value.goalCount,
+    clock,
   };
+}
+
+export function validateLiveEventClockActionInTransaction(
+  actions: readonly { action: ControlAction }[],
+  candidate: ControlAction,
+): { status: "accepted" } | { status: "rejected"; reason: "invalid-action"; detail: string } {
+  const candidateClock = readClockAuthorityActions([{ action: candidate }])[0];
+  if (candidateClock === undefined || candidateClock.command === "penalty-start") {
+    return { status: "accepted" };
+  }
+  const validation = validateClockAuthorityAction(
+    readClockAuthorityActions(actions),
+    candidateClock,
+  );
+  return validation.ok
+    ? { status: "accepted" }
+    : { status: "rejected", reason: "invalid-action", detail: validation.error };
+}
+
+function readClockAuthorityActions(
+  actions: readonly {
+    action?: {
+      operationId: string;
+      occurrence: { trustedAtMs: number };
+      acceptedAtMs: number;
+      grant: { sessionId: string };
+      interpretation: unknown;
+    };
+    operationId?: string;
+    occurrence?: { trustedAtMs: number };
+    acceptedAtMs?: number;
+    grant?: { sessionId: string };
+    interpretation?: unknown;
+  }[],
+): ClockAuthorityAction[] {
+  const clockActions: ClockAuthorityAction[] = [];
+  for (const stored of actions) {
+    const storedAction = stored.action ?? stored;
+    if (
+      storedAction.operationId === undefined ||
+      storedAction.occurrence === undefined ||
+      storedAction.acceptedAtMs === undefined ||
+      storedAction.grant === undefined ||
+      storedAction.interpretation === undefined
+    )
+      continue;
+    const interpretation = storedAction.interpretation;
+    if (!isRecord(interpretation) || interpretation.type !== "fact") continue;
+    if (interpretation.factType !== "clock" && interpretation.factType !== "card") continue;
+    if (!isRecord(interpretation.payload)) continue;
+    const data = interpretation.payload.data;
+    if (!isRecord(data)) continue;
+    if (interpretation.factType === "card") {
+      clockActions.push({
+        operationId: storedAction.operationId,
+        trustedAtMs: storedAction.occurrence.trustedAtMs,
+        acceptedAtMs: storedAction.acceptedAtMs,
+        sessionId: storedAction.grant.sessionId,
+        command: "penalty-start",
+      });
+      continue;
+    }
+    const command =
+      data.command === "adjust" || data.command === "correct" || data.command === "set-running"
+        ? data.command
+        : typeof data.running === "boolean"
+          ? "set-running"
+          : null;
+    if (command === null) continue;
+    const clockAction: ClockAuthorityAction = {
+      operationId: storedAction.operationId,
+      trustedAtMs: storedAction.occurrence.trustedAtMs,
+      acceptedAtMs: storedAction.acceptedAtMs,
+      sessionId: storedAction.grant.sessionId,
+      command,
+      ...(typeof data.running === "boolean" ? { running: data.running } : {}),
+      ...(typeof data.gameTimeMs === "number" ? { gameTimeMs: data.gameTimeMs } : {}),
+      ...(typeof data.adjustmentMs === "number" ? { adjustmentMs: data.adjustmentMs } : {}),
+    };
+    clockActions.push(clockAction);
+  }
+  return clockActions;
+}
+
+function readClockIntentData(
+  intent: LiveEventControllerIntent,
+  current: ClockProjection,
+  nowMs: number,
+): { status: "ready"; value: Record<string, unknown> | null } | { status: "rejected" } {
+  if (intent.type === "clock" || intent.type === "set-running") {
+    return {
+      status: "ready",
+      value: {
+        command: "set-running",
+        running: intent.running,
+        startedAtMs: intent.running
+          ? (current.baseline.runningSinceMs ?? nowMs)
+          : current.baseline.runningSinceMs,
+      },
+    };
+  }
+  if (intent.type === "clock-adjust") {
+    return {
+      status: "ready",
+      value: {
+        command: "adjust",
+        adjustmentMs: intent.adjustmentMs,
+      },
+    };
+  }
+  if (intent.type === "clock-correction") {
+    return {
+      status: "ready",
+      value: {
+        command: "correct",
+        gameTimeMs: intent.clockTimeMs,
+      },
+    };
+  }
+  return { status: "ready", value: null };
+}
+
+function readClockProjection(value: unknown): ClockProjection | null {
+  if (!isRecord(value) || value.version !== CLOCK_AUTHORITY_VERSION) return null;
+  if (!isRecord(value.baseline)) return null;
+  if (
+    !validateGameClockMs(value.gameTimeMs).ok ||
+    !validateGameClockMs(value.activePenaltyTimeMs).ok ||
+    typeof value.running !== "boolean" ||
+    typeof value.projectedAtMs !== "number" ||
+    !Number.isSafeInteger(value.projectedAtMs) ||
+    value.synchronization !== "synchronized"
+  )
+    return null;
+  return value as unknown as ClockProjection;
 }
 
 function synchronized(): ControllerSynchronization {
@@ -1158,4 +1370,12 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function invalid(error: string): { ok: false; error: string } {
   return { ok: false, error };
+}
+
+function validateClockAdjustment(value: unknown) {
+  return validateClockAdjustmentMs(value);
+}
+
+function validateGameClock(value: unknown) {
+  return validateGameClockMs(value);
 }

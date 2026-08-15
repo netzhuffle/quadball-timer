@@ -3,12 +3,18 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import {
+  createInitialClockBaseline,
+  projectClockBaseline,
+  projectClockSample,
+} from "@/lib/clock-authority";
 import type {
   ControllerProjection,
   LiveEventGameControlResult,
   LiveEventControllerIntent,
 } from "@/lib/live-event-game-control";
 import { LIVE_EVENT_CONTROL_INTENT_VERSION } from "@/lib/live-event-game-control";
+import { validateGameClockMs } from "@/lib/validation-policy";
 import { readControllerDeviceContext } from "@/lib/controller-device-context";
 import {
   acknowledgeControllerProjection,
@@ -59,6 +65,11 @@ type ReplayRequest = { state: ControllerReplicaState; authority: ReplayAuthority
 
 type ActiveReplay = ReplayRequest & { requestToken: symbol };
 
+type ClockReceiptAnchor = {
+  projection: ControllerProjection["clock"];
+  localMonotonicMs: number;
+};
+
 export function EventGameControllerPage() {
   const persisted = readPersistedControllerSession();
   const [qrCredential, setQrCredential] = useState("");
@@ -74,6 +85,9 @@ export function EventGameControllerPage() {
   const [switchTarget, setSwitchTarget] = useState<string | null>(null);
   const [stayedOnAssignment, setStayedOnAssignment] = useState<string | null>(null);
   const [clockRunning, setClockRunning] = useState(false);
+  const [clockReceiptAnchor, setClockReceiptAnchor] = useState<ClockReceiptAnchor | null>(null);
+  const [localMonotonicMs, setLocalMonotonicMs] = useState(readMonotonicNow);
+  const [clockCorrectionInput, setClockCorrectionInput] = useState("");
   const [message, setMessage] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [persistedReplicaLoad] = useState<ControllerReplicaLoad>(() =>
@@ -91,11 +105,24 @@ export function EventGameControllerPage() {
   const [browserContext] = useState(() => readControllerDeviceContext());
 
   useEffect(() => {
+    const timer = window.setInterval(() => setLocalMonotonicMs(readMonotonicNow()), 250);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  const clockProjection =
+    clockReceiptAnchor === null
+      ? null
+      : projectClockSample(
+          clockReceiptAnchor.projection,
+          localMonotonicMs - clockReceiptAnchor.localMonotonicMs,
+        );
+
+  useEffect(() => {
     if (sessionBearer === null || eventGameId === null) {
-      sessionStorage.removeItem("quadball:event-controller-session");
+      window.sessionStorage.removeItem("quadball:event-controller-session");
       return;
     }
-    sessionStorage.setItem(
+    window.sessionStorage.setItem(
       "quadball:event-controller-session",
       JSON.stringify({ sessionBearer, eventGameId } satisfies PersistedControllerSession),
     );
@@ -154,8 +181,7 @@ export function EventGameControllerPage() {
       if (response.status !== "opened") throw new Error("open failed");
       setSessionBearer(response.session.sessionBearer);
       setEventGameId(response.eventGameId);
-      setProjection(response.projection);
-      setProjectionStatus(response.projectionStatus);
+      receiveProjection(response.projection);
       const existingReplica = replicaRef.current;
       const restoredLoad = loadControllerReplica(
         browserReplicaStorage(response.eventGameId),
@@ -210,8 +236,7 @@ export function EventGameControllerPage() {
       if (response.status === "rejected") throw new Error("refresh failed");
       setSwitchTarget(null);
       setEventGameId(response.session.eventGameId);
-      setProjection(response.projection);
-      setProjectionStatus(response.projectionStatus);
+      receiveProjection(response.projection);
       const currentReplica = replicaRef.current;
       const refreshedSession = {
         eventGameId: response.session.eventGameId,
@@ -258,8 +283,7 @@ export function EventGameControllerPage() {
       });
       if (response.status !== "authorized") throw new Error("switch failed");
       setEventGameId(response.session.eventGameId);
-      setProjection(response.projection);
-      setProjectionStatus(response.projectionStatus);
+      receiveProjection(response.projection);
       const restoredLoad = loadControllerReplica(
         browserReplicaStorage(response.session.eventGameId),
         response.session.eventGameId,
@@ -307,8 +331,7 @@ export function EventGameControllerPage() {
       setStayedOnAssignment(switchTarget);
       setSwitchTarget(null);
       setEventGameId(response.session.eventGameId);
-      setProjection(response.projection);
-      setProjectionStatus(response.projectionStatus);
+      receiveProjection(response.projection);
       if (replicaRef.current !== null) {
         const nextReplica = rebindControllerReplica(
           replicaRef.current,
@@ -451,8 +474,7 @@ export function EventGameControllerPage() {
       if (!isInstalledReplayAuthority(request.authority)) return;
       const nextReplica = reconcileControllerReplay(replicaRef.current ?? prepared.state, response);
       commitReplica(nextReplica);
-      setProjection(nextReplica.projection);
-      setProjectionStatus(response.projection === null ? "unavailable" : "available");
+      receiveProjection(response.projection);
       if (
         response.status === "synchronized" &&
         nextReplica.pendingActions.some((action) => action.status === "pending")
@@ -545,6 +567,74 @@ export function EventGameControllerPage() {
     );
   }
 
+  function adjustClock(adjustmentMs: number) {
+    const bearer = sessionBearer;
+    const currentEventGameId = eventGameId;
+    if (bearer === null || currentEventGameId === null) return;
+    if (navigator.onLine === false) {
+      setMessage("Clock control is unavailable while disconnected and was not retained.");
+      return;
+    }
+    void submitOnlineControllerIntent(
+      {
+        version: LIVE_EVENT_CONTROL_INTENT_VERSION,
+        type: "clock-adjust",
+        adjustmentMs,
+        operationId: crypto.randomUUID(),
+        factId: crypto.randomUUID(),
+        gameTimeMs: 0,
+        occurrence: { clientOriginAtMs: Date.now(), source: "online" },
+      },
+      bearer,
+      currentEventGameId,
+    );
+  }
+
+  function correctClock() {
+    if (clockCorrectionInput.trim() === "") {
+      setMessage("Enter a whole number of milliseconds from 0 to 7200000.");
+      return;
+    }
+    const candidate = Number(clockCorrectionInput);
+    const validated = validateGameClockMs(candidate);
+    if (!validated.ok) {
+      setMessage("Clock correction must be a whole number from 0 to 7200000 milliseconds.");
+      return;
+    }
+    const bearer = sessionBearer;
+    const currentEventGameId = eventGameId;
+    if (bearer === null || currentEventGameId === null) return;
+    if (navigator.onLine === false) {
+      setMessage("Clock control is unavailable while disconnected and was not retained.");
+      return;
+    }
+    void submitOnlineControllerIntent(
+      {
+        version: LIVE_EVENT_CONTROL_INTENT_VERSION,
+        type: "clock-correction",
+        clockTimeMs: validated.value,
+        operationId: crypto.randomUUID(),
+        factId: crypto.randomUUID(),
+        gameTimeMs: 0,
+        occurrence: { clientOriginAtMs: Date.now(), source: "online" },
+      },
+      bearer,
+      currentEventGameId,
+    );
+    setClockCorrectionInput("");
+  }
+
+  function receiveProjection(nextProjection: ControllerProjection | null) {
+    setProjection(nextProjection);
+    setProjectionStatus(nextProjection === null ? "unavailable" : "available");
+    setClockRunning(nextProjection?.clock.running ?? false);
+    setClockReceiptAnchor(
+      nextProjection === null
+        ? null
+        : { projection: nextProjection.clock, localMonotonicMs: readMonotonicNow() },
+    );
+  }
+
   async function submitOnlineControllerIntent(
     intent: LiveEventControllerIntent,
     bearer: string,
@@ -560,9 +650,6 @@ export function EventGameControllerPage() {
         setMessage("The online Controller action was not accepted.");
         return;
       }
-      setClockRunning(
-        intent.type === "clock" || intent.type === "set-running" ? intent.running : false,
-      );
       if (response.projection !== null) {
         const current = replicaRef.current;
         if (current?.eventGameId === currentEventGameId) {
@@ -570,8 +657,10 @@ export function EventGameControllerPage() {
           replicaRef.current = nextReplica;
           setReplica(nextReplica);
         }
-        setProjection(response.projection);
-        setProjectionStatus(response.projectionStatus);
+        receiveProjection(response.projection);
+        if (intent.type === "clock" || intent.type === "set-running") {
+          setClockRunning(intent.running);
+        }
       }
     } catch {
       setMessage("The online Controller action could not be submitted.");
@@ -590,6 +679,8 @@ export function EventGameControllerPage() {
     setProjection(null);
     setProjectionStatus("unavailable");
     setClockRunning(false);
+    setClockReceiptAnchor(null);
+    setClockCorrectionInput("");
     setRevealedQr(null);
     setSwitchTarget(null);
     setStayedOnAssignment(null);
@@ -668,10 +759,79 @@ export function EventGameControllerPage() {
                   <code className="mt-2 block break-all text-xs">{revealedQr}</code>
                 </div>
               )}
+              <div className="rounded-lg border bg-slate-950 p-4 text-center text-white">
+                <p className="text-xs uppercase tracking-[0.2em] text-slate-300">Game Clock</p>
+                <p className="mt-1 text-5xl font-semibold tabular-nums">
+                  {clockProjection === null ? "--:--" : formatClock(clockProjection.gameTimeMs)}
+                </p>
+                <p className="mt-1 text-xs text-slate-300">
+                  {clockProjection?.running ? "Play" : "Paused"} · Controller projection
+                </p>
+              </div>
+              {clockProjection === null ? null : (
+                <div className="space-y-1 rounded-lg border border-amber-500/50 bg-amber-50 p-3 text-sm text-amber-950">
+                  <p data-clock-cue="flag-runner">
+                    {clockProjection.cues.flagRunnerEntry === "pending"
+                      ? "Flag-runner entry pending at 19:00"
+                      : clockProjection.cues.flagRunnerEntry === "due"
+                        ? "FLAG-RUNNER ENTRY NOW"
+                        : "Flag-runner entry complete"}
+                  </p>
+                  <p data-clock-cue="seeker-warning">
+                    {clockProjection.cues.seekerWarning === "pending"
+                      ? "Seeker warning pending"
+                      : clockProjection.cues.seekerWarning === "due"
+                        ? "SEEKER WARNING: release countdown active"
+                        : "Seeker warning complete"}
+                  </p>
+                  <p data-clock-cue="seeker-countdown">
+                    {clockProjection.cues.seekerCountdownMs === null
+                      ? "Seeker countdown: complete"
+                      : `SEEKER COUNTDOWN: ${formatClock(clockProjection.cues.seekerCountdownMs)}`}
+                  </p>
+                  <p data-clock-cue="seeker-release">
+                    {clockProjection.cues.seekerRelease === "released"
+                      ? "SEEKER RELEASED at 20:00"
+                      : "Seeker release pending at 20:00"}
+                  </p>
+                </div>
+              )}
               <div className="flex flex-wrap gap-2">
                 <Button onClick={toggleClock} disabled={busy}>
                   {clockRunning ? "Pause clock" : "Start clock"}
                 </Button>
+                {[-60_000, -10_000, 10_000, 60_000].map((adjustmentMs) => (
+                  <Button
+                    key={adjustmentMs}
+                    variant="outline"
+                    onClick={() => adjustClock(adjustmentMs)}
+                    disabled={busy}
+                  >
+                    {adjustmentMs < 0 ? "−" : "+"}
+                    {Math.abs(adjustmentMs) / 1000}s
+                  </Button>
+                ))}
+                <div className="flex w-full flex-wrap items-end gap-2 rounded border p-2 text-left">
+                  <div className="min-w-48 flex-1 space-y-1">
+                    <Label htmlFor="clock-correction">Set game clock (milliseconds)</Label>
+                    <Input
+                      id="clock-correction"
+                      inputMode="numeric"
+                      value={clockCorrectionInput}
+                      onChange={(event) => setClockCorrectionInput(event.target.value)}
+                      placeholder="0–7200000"
+                      disabled={busy}
+                    />
+                  </div>
+                  <Button
+                    variant="outline"
+                    data-clock-correction="true"
+                    onClick={correctClock}
+                    disabled={busy}
+                  >
+                    Correct clock
+                  </Button>
+                </div>
                 <Button variant="outline" onClick={() => trigger("card")} disabled={busy}>
                   Record card
                 </Button>
@@ -723,6 +883,17 @@ export function EventGameControllerPage() {
   );
 }
 
+function formatClock(milliseconds: number): string {
+  const totalSeconds = Math.floor(milliseconds / 1000);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes.toString().padStart(2, "0")}:${seconds.toString().padStart(2, "0")}`;
+}
+
+function readMonotonicNow(): number {
+  return typeof performance === "undefined" ? 0 : performance.now();
+}
+
 async function postJson<T>(path: string, body: unknown): Promise<T> {
   const response = await fetch(path, {
     method: "POST",
@@ -748,7 +919,7 @@ function replicaMatchesAuthority(
 
 function readPersistedControllerSession(): PersistedControllerSession | null {
   try {
-    const raw = sessionStorage.getItem("quadball:event-controller-session");
+    const raw = window.sessionStorage.getItem("quadball:event-controller-session");
     if (raw === null) return null;
     const value = JSON.parse(raw) as Partial<PersistedControllerSession>;
     return typeof value.sessionBearer === "string" && typeof value.eventGameId === "string"
@@ -761,7 +932,7 @@ function readPersistedControllerSession(): PersistedControllerSession | null {
 
 function readPersistedControllerReplica(eventGameId: string | undefined): ControllerReplicaLoad {
   try {
-    if (typeof localStorage === "undefined") {
+    if (typeof window === "undefined") {
       return { state: null, warning: null, quarantined: false };
     }
     return loadControllerReplica(browserReplicaStorage(eventGameId), eventGameId);
@@ -777,9 +948,9 @@ function readPersistedControllerReplica(eventGameId: string | undefined): Contro
 function browserReplicaStorage(eventGameId?: string): ControllerReplicaStorage {
   const storageKey = controllerReplicaStorageKey(eventGameId);
   return {
-    read: () => localStorage.getItem(storageKey),
-    write: (value) => localStorage.setItem(storageKey, value),
-    quarantine: (value) => localStorage.setItem(`${storageKey}:quarantine`, value),
+    read: () => window.localStorage.getItem(storageKey),
+    write: (value) => window.localStorage.setItem(storageKey, value),
+    quarantine: (value) => window.localStorage.setItem(`${storageKey}:quarantine`, value),
   };
 }
 
@@ -789,6 +960,7 @@ function emptyProjection(eventGameId: string): ControllerProjection {
     phase: "scheduled",
     scoreByGameSide: {},
     goalCount: 0,
+    clock: projectClockBaseline(createInitialClockBaseline(), 0),
     commencement: {
       status: "provisional",
       commencedAtMs: null,

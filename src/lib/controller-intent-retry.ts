@@ -27,6 +27,10 @@ export function controllerIntentRetryKey(intent: LiveEventControllerIntent): str
     case "clock":
     case "set-running":
       return JSON.stringify([intent.type, intent.running, intent.gameTimeMs]);
+    case "clock-adjust":
+      return JSON.stringify([intent.type, intent.adjustmentMs, intent.gameTimeMs]);
+    case "clock-correction":
+      return JSON.stringify([intent.type, intent.clockTimeMs, intent.gameTimeMs]);
     case "substantive":
       return JSON.stringify([intent.type, intent.trigger, intent.gameTimeMs]);
     case "reset":

@@ -13,6 +13,8 @@ import {
   createLiveEventGameIqaInterpreter,
   LIVE_EVENT_CONTROL_INTENT_VERSION,
   parseLiveEventControllerIntent,
+  type LiveEventControllerIntent,
+  validateLiveEventClockActionInTransaction,
 } from "@/lib/live-event-game-control";
 import { createLiveEventGameControlTransport } from "@/lib/live-event-game-transport";
 
@@ -927,6 +929,371 @@ describe("Live Event Game control", () => {
     expect(await ownerState(harness)).toEqual(before);
   });
 
+  test("serializes simultaneous clock transitions, transfers the holder, and ignores goal transfer", async () => {
+    const harness = await createHarness();
+    const first = await harness.control.openController({
+      qrCredential: harness.qrCredential,
+      browserContext: "clock-device-a",
+    });
+    const second = await harness.control.openController({
+      qrCredential: harness.qrCredential,
+      browserContext: "clock-device-b",
+    });
+    if (first.status !== "opened" || second.status !== "opened") {
+      throw new Error("Expected two Controller Devices.");
+    }
+
+    const [start, pause] = await Promise.all([
+      harness.control.submitControllerIntent({
+        sessionBearer: first.session.sessionBearer,
+        eventGameId: harness.root.eventGameId,
+        intent: clockIntent("z-start", true),
+      }),
+      harness.control.submitControllerIntent({
+        sessionBearer: second.session.sessionBearer,
+        eventGameId: harness.root.eventGameId,
+        intent: clockIntent("a-pause", false),
+      }),
+    ]);
+    expect(start.status).toBe("accepted");
+    expect(pause.status).toBe("accepted");
+
+    const afterSimultaneous = await harness.control.refreshController({
+      sessionBearer: second.session.sessionBearer,
+      eventGameId: harness.root.eventGameId,
+    });
+    expect(afterSimultaneous).toMatchObject({
+      projection: {
+        clock: {
+          running: true,
+          offlineClockHolderGrantSessionId: first.session.grantSessionId,
+        },
+      },
+    });
+
+    harness.setNow(15_000);
+    const transferred = await harness.control.submitControllerIntent({
+      sessionBearer: second.session.sessionBearer,
+      eventGameId: harness.root.eventGameId,
+      intent: clockIntent("b-pause", false),
+    });
+    expect(transferred).toMatchObject({
+      projection: {
+        clock: {
+          running: false,
+          gameTimeMs: 5_000,
+          offlineClockHolderGrantSessionId: second.session.grantSessionId,
+        },
+      },
+    });
+
+    const goal = await harness.control.submitControllerIntent({
+      sessionBearer: first.session.sessionBearer,
+      eventGameId: harness.root.eventGameId,
+      intent: goalIntent(),
+    });
+    expect(goal).toMatchObject({
+      projection: {
+        clock: { offlineClockHolderGrantSessionId: second.session.grantSessionId },
+      },
+    });
+    const duplicateGoal = await harness.control.submitControllerIntent({
+      sessionBearer: first.session.sessionBearer,
+      eventGameId: harness.root.eventGameId,
+      intent: goalIntent(),
+    });
+    expect(duplicateGoal).toMatchObject({
+      status: "duplicate-accepted",
+      projection: {
+        clock: { offlineClockHolderGrantSessionId: second.session.grantSessionId },
+      },
+    });
+  });
+
+  test("atomically rejects one concurrent bounded adjustment without dropping an accepted Clock action", async () => {
+    const harness = await createHarness();
+    const first = await harness.control.openController({
+      qrCredential: harness.qrCredential,
+      browserContext: "clock-bounds-a",
+    });
+    const second = await harness.control.openController({
+      qrCredential: harness.qrCredential,
+      browserContext: "clock-bounds-b",
+    });
+    if (first.status !== "opened" || second.status !== "opened") {
+      throw new Error("Expected two Controller Devices.");
+    }
+    const correction = {
+      ...clockIntent("clock-correction-105", false),
+      type: "clock-correction" as const,
+      clockTimeMs: 105 * 60 * 1000,
+    };
+    expect(
+      await harness.control.submitControllerIntent({
+        sessionBearer: first.session.sessionBearer,
+        eventGameId: harness.root.eventGameId,
+        intent: correction,
+      }),
+    ).toMatchObject({ status: "accepted" });
+    harness.setNow(20_000);
+
+    const adjustA = clockAdjustmentIntent("clock-bounded-a", 10 * 60 * 1000);
+    const adjustB = clockAdjustmentIntent("clock-bounded-b", 10 * 60 * 1000);
+    const [resultA, resultB] = await Promise.all([
+      harness.control.submitControllerIntent({
+        sessionBearer: first.session.sessionBearer,
+        eventGameId: harness.root.eventGameId,
+        intent: adjustA,
+      }),
+      harness.control.submitControllerIntent({
+        sessionBearer: second.session.sessionBearer,
+        eventGameId: harness.root.eventGameId,
+        intent: adjustB,
+      }),
+    ]);
+    expect([resultA.status, resultB.status].sort()).toEqual(["accepted", "rejected"]);
+    expect(await harness.record.readActions()).toHaveLength(2);
+
+    const rejected =
+      resultA.status === "rejected"
+        ? { intent: adjustA, sessionBearer: first.session.sessionBearer }
+        : { intent: adjustB, sessionBearer: second.session.sessionBearer };
+    expect(
+      await harness.control.submitControllerIntent({
+        sessionBearer: rejected.sessionBearer,
+        eventGameId: harness.root.eventGameId,
+        intent: rejected.intent,
+      }),
+    ).toMatchObject({ status: "rejected" });
+    expect(await harness.record.readActions()).toHaveLength(2);
+
+    const final = await harness.control.refreshController({
+      sessionBearer: first.session.sessionBearer,
+      eventGameId: harness.root.eventGameId,
+    });
+    expect(final).toMatchObject({ projection: { clock: { gameTimeMs: 115 * 60 * 1000 } } });
+
+    const accepted =
+      resultA.status === "accepted"
+        ? { intent: adjustA, sessionBearer: first.session.sessionBearer }
+        : { intent: adjustB, sessionBearer: second.session.sessionBearer };
+    expect(
+      await harness.control.submitControllerIntent({
+        sessionBearer: accepted.sessionBearer,
+        eventGameId: harness.root.eventGameId,
+        intent: accepted.intent,
+      }),
+    ).toMatchObject({ status: "duplicate-accepted" });
+    expect(await harness.record.readActions()).toHaveLength(2);
+  });
+
+  test("composes valid concurrent bounded adjustments at the durable limit", async () => {
+    const harness = await createHarness();
+    const first = await harness.control.openController({
+      qrCredential: harness.qrCredential,
+      browserContext: "clock-compose-a",
+    });
+    const second = await harness.control.openController({
+      qrCredential: harness.qrCredential,
+      browserContext: "clock-compose-b",
+    });
+    if (first.status !== "opened" || second.status !== "opened") {
+      throw new Error("Expected two Controller Devices.");
+    }
+    expect(
+      await harness.control.submitControllerIntent({
+        sessionBearer: first.session.sessionBearer,
+        eventGameId: harness.root.eventGameId,
+        intent: {
+          ...clockIntent("clock-correction-100", false),
+          type: "clock-correction",
+          clockTimeMs: 100 * 60 * 1000,
+        },
+      }),
+    ).toMatchObject({ status: "accepted" });
+    harness.setNow(20_000);
+    const [left, right] = await Promise.all([
+      harness.control.submitControllerIntent({
+        sessionBearer: first.session.sessionBearer,
+        eventGameId: harness.root.eventGameId,
+        intent: clockAdjustmentIntent("clock-compose-left", 10 * 60 * 1000),
+      }),
+      harness.control.submitControllerIntent({
+        sessionBearer: second.session.sessionBearer,
+        eventGameId: harness.root.eventGameId,
+        intent: clockAdjustmentIntent("clock-compose-right", 10 * 60 * 1000),
+      }),
+    ]);
+    expect(left.status).toBe("accepted");
+    expect(right.status).toBe("accepted");
+    expect(
+      await harness.control.refreshController({
+        sessionBearer: first.session.sessionBearer,
+        eventGameId: harness.root.eventGameId,
+      }),
+    ).toMatchObject({ projection: { clock: { gameTimeMs: 120 * 60 * 1000 } } });
+  });
+
+  test("projects clock time between snapshots, emits distinct cues, and enforces adjustment bounds", async () => {
+    const harness = await createHarness();
+    const opened = await harness.control.openController({
+      qrCredential: harness.qrCredential,
+      browserContext: "clock-projection",
+    });
+    if (opened.status !== "opened") throw new Error("Expected the Controller to open.");
+
+    await harness.control.submitControllerIntent({
+      sessionBearer: opened.session.sessionBearer,
+      eventGameId: harness.root.eventGameId,
+      intent: {
+        ...clockIntent("clock-correct-19", false),
+        type: "clock-correction",
+        clockTimeMs: 19 * 60 * 1000,
+      },
+    });
+    const warning = await harness.control.refreshController({
+      sessionBearer: opened.session.sessionBearer,
+      eventGameId: harness.root.eventGameId,
+    });
+    expect(warning).toMatchObject({
+      projection: {
+        clock: {
+          gameTimeMs: 19 * 60 * 1000,
+          activePenaltyTimeMs: 0,
+          cues: {
+            flagRunnerEntry: "due",
+            seekerWarning: "due",
+            seekerRelease: "pending",
+            seekerCountdownMs: 60_000,
+          },
+        },
+      },
+    });
+
+    const adjusted = await harness.control.submitControllerIntent({
+      sessionBearer: opened.session.sessionBearer,
+      eventGameId: harness.root.eventGameId,
+      intent: {
+        ...clockIntent("z-clock-adjust-one-second", false),
+        type: "clock-adjust",
+        adjustmentMs: 1_000,
+      },
+    });
+    expect(adjusted).toMatchObject({
+      status: "accepted",
+      projection: { clock: { gameTimeMs: 19 * 60 * 1000 + 1_000 } },
+    });
+
+    await harness.control.submitControllerIntent({
+      sessionBearer: opened.session.sessionBearer,
+      eventGameId: harness.root.eventGameId,
+      intent: {
+        ...clockIntent("zz-clock-correct-20", false),
+        type: "clock-correction",
+        clockTimeMs: 20 * 60 * 1000,
+      },
+    });
+    const release = await harness.control.refreshController({
+      sessionBearer: opened.session.sessionBearer,
+      eventGameId: harness.root.eventGameId,
+    });
+    expect(release).toMatchObject({
+      projection: { clock: { cues: { seekerWarning: "passed", seekerRelease: "released" } } },
+    });
+
+    for (const invalid of [Number.NaN, 1.5, 10 * 60 * 1000 + 1]) {
+      expect(
+        parseLiveEventControllerIntent({
+          ...clockIntent(`invalid-${String(invalid)}`, true),
+          type: "clock-adjust",
+          adjustmentMs: invalid,
+        }),
+      ).toMatchObject({ ok: false });
+    }
+    expect(
+      parseLiveEventControllerIntent({
+        ...clockIntent("invalid-correction", true),
+        type: "clock-correction",
+        clockTimeMs: 120 * 60 * 1000 + 1,
+      }),
+    ).toMatchObject({ ok: false });
+  });
+
+  test("projects an independent active penalty from a card fact through pause and resume", async () => {
+    const harness = await createHarness();
+    const opened = await harness.control.openController({
+      qrCredential: harness.qrCredential,
+      browserContext: "clock-penalty",
+    });
+    if (opened.status !== "opened") throw new Error("Expected the Controller to open.");
+
+    const submit = (intent: LiveEventControllerIntent) =>
+      harness.control.submitControllerIntent({
+        sessionBearer: opened.session.sessionBearer,
+        eventGameId: harness.root.eventGameId,
+        intent,
+      });
+
+    await submit(substantiveIntent("penalty-card", "card"));
+    const noPlay = await harness.control.refreshController({
+      sessionBearer: opened.session.sessionBearer,
+      eventGameId: harness.root.eventGameId,
+    });
+    expect(noPlay).toMatchObject({
+      projection: { clock: { gameTimeMs: 0, activePenaltyTimeMs: 0 } },
+    });
+
+    harness.setNow(11_000);
+    await submit(clockIntent("penalty-start-clock", true));
+    harness.setNow(14_000);
+    const live = await harness.control.refreshController({
+      sessionBearer: opened.session.sessionBearer,
+      eventGameId: harness.root.eventGameId,
+    });
+    expect(live).toMatchObject({
+      projection: { clock: { gameTimeMs: 3_000, activePenaltyTimeMs: 3_000 } },
+    });
+
+    harness.setNow(15_000);
+    await submit(clockIntent("penalty-pause", false));
+    harness.setNow(20_000);
+    const paused = await harness.control.refreshController({
+      sessionBearer: opened.session.sessionBearer,
+      eventGameId: harness.root.eventGameId,
+    });
+    expect(paused).toMatchObject({
+      projection: { clock: { gameTimeMs: 4_000, activePenaltyTimeMs: 4_000 } },
+    });
+
+    harness.setNow(25_000);
+    await submit(clockIntent("penalty-resume", true));
+    harness.setNow(27_000);
+    const resumed = await harness.control.refreshController({
+      sessionBearer: opened.session.sessionBearer,
+      eventGameId: harness.root.eventGameId,
+    });
+    expect(resumed).toMatchObject({
+      projection: { clock: { gameTimeMs: 6_000, activePenaltyTimeMs: 6_000 } },
+    });
+  });
+
+  test("does not acknowledge a clock transition when durable commit fails", async () => {
+    const harness = await createHarness({ failureBoundary: "after-action" });
+    const opened = await harness.control.openController({
+      qrCredential: harness.qrCredential,
+      browserContext: "clock-commit-failure",
+    });
+    if (opened.status !== "opened") throw new Error("Expected the Controller to open.");
+
+    const failed = await harness.control.submitControllerIntent({
+      sessionBearer: opened.session.sessionBearer,
+      eventGameId: harness.root.eventGameId,
+      intent: clockIntent("clock-failure", true),
+    });
+    expect(failed).toMatchObject({ status: "retryable", operationId: "clock-failure" });
+    expect(await harness.record.readActions()).toHaveLength(0);
+  });
+
   test("exposes the Controller through its HTTP transport without changing Ad Hoc routes", async () => {
     const harness = await createHarness();
     const allowedOrigin = "https://timer.quadball.app";
@@ -1086,6 +1453,8 @@ async function createHarness(
     failureInjector: (boundary) => {
       if (boundary === failureBoundary) throw new Error("simulated durable failure");
     },
+    validateActionInTransaction: ({ transaction, root, action }) =>
+      validateLiveEventClockActionInTransaction(transaction.listActions(root.recordId), action),
   });
   const control = createLiveEventGameControl({
     resolveEventGameRecord: async (eventGameId) =>
@@ -1146,6 +1515,14 @@ function clockIntent(operationId: string, running: boolean) {
     running,
     gameTimeMs: 0,
     occurrence: { clientOriginAtMs: null },
+  };
+}
+
+function clockAdjustmentIntent(operationId: string, adjustmentMs: number) {
+  return {
+    ...clockIntent(operationId, false),
+    type: "clock-adjust" as const,
+    adjustmentMs,
   };
 }
 

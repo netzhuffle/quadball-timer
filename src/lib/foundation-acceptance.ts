@@ -154,6 +154,17 @@ export type FoundationAcceptanceOptions = {
       | "after-lifecycle"
       | "before-receipt",
   ) => void;
+  /**
+   * Optional domain validation executed inside the serialized acceptance
+   * transaction, after authorization and before action insertion.
+   */
+  validateActionInTransaction?: (input: {
+    transaction: FoundationStorageTransaction;
+    root: EventGameRecordRoot;
+    action: ControlAction;
+  }) =>
+    | { status: "accepted" }
+    | { status: "rejected"; reason: FoundationRejectionReason; detail: string };
   /** Test-only barrier between read-only preflight and the first write transaction. */
   afterReadOnlyPreflight?: () => void | Promise<void>;
   limits?: AcceptanceLimits;
@@ -880,6 +891,24 @@ export function createFoundationAcceptance(
       );
 
     const action = materializeControlAction(prepared, readNow(clock));
+    const transactionValidation = options.validateActionInTransaction?.({
+      transaction,
+      root,
+      action,
+    });
+    if (transactionValidation?.status === "rejected")
+      return writeOutcome(
+        transaction,
+        root,
+        prepared.input,
+        prepared,
+        current,
+        mode,
+        replayState,
+        "rejected",
+        transactionValidation.reason,
+        transactionValidation.detail,
+      );
     transaction.insertAction({
       action,
       canonicalContent: prepared.canonicalContent,

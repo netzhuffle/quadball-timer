@@ -9,6 +9,7 @@ import {
   dispatchControllerAction,
 } from "@/lib/controller-reconnect";
 import type { ControllerProjection } from "@/lib/live-event-game-control";
+import { createInitialClockBaseline, projectClockBaseline } from "@/lib/clock-authority";
 
 describe("Event Game Controller reconnect browser seam", () => {
   const originalWindow = globalThis.window;
@@ -698,6 +699,7 @@ function projection(eventGameId = "game-browser"): ControllerProjection {
     phase: "scheduled",
     scoreByGameSide: { "side-a": 0, "side-b": 0 },
     goalCount: 0,
+    clock: projectClockBaseline(createInitialClockBaseline(), 0),
     commencement: {
       status: "provisional",
       commencedAtMs: null,

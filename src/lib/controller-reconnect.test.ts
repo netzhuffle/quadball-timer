@@ -13,6 +13,7 @@ import {
   type ControllerReplicaStorage,
 } from "@/lib/controller-reconnect";
 import { LIVE_EVENT_CONTROL_INTENT_VERSION } from "@/lib/live-event-game-control";
+import { createInitialClockBaseline, projectClockBaseline } from "@/lib/clock-authority";
 
 describe("Controller reconnect replica", () => {
   test("optimistically retains immutable identity, causal dependencies, and original occurrence evidence", () => {
@@ -387,6 +388,7 @@ function createReplica() {
       phase: "scheduled",
       scoreByGameSide: { "side-a": 0, "side-b": 0 },
       goalCount: 0,
+      clock: projectClockBaseline(createInitialClockBaseline(), 0),
       commencement: {
         status: "provisional",
         commencedAtMs: null,

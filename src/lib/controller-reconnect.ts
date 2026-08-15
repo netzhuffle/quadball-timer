@@ -3,6 +3,7 @@ import type {
   ControllerProjection,
   LiveEventControllerIntent,
 } from "@/lib/live-event-game-control";
+import { createInitialClockBaseline, projectClockBaseline } from "@/lib/clock-authority";
 import { parseLiveEventControllerIntent } from "@/lib/live-event-game-control";
 import {
   SHARED_LIMITS,
@@ -794,11 +795,15 @@ function parseProjection(value: unknown): ControllerProjection {
     "provisionalElapsedMs",
   );
   if (!elapsed.ok) throw new Error(elapsed.error);
+  const clock = isRecord(value.clock)
+    ? (structuredClone(value.clock) as ControllerProjection["clock"])
+    : projectClockBaseline(createInitialClockBaseline(), 0);
   return {
     eventGameId,
     phase,
     scoreByGameSide: scores,
     goalCount: goalCount.value,
+    clock,
     commencement: {
       status: commencementStatus,
       commencedAtMs,
