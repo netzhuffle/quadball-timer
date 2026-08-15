@@ -4,7 +4,6 @@ import {
   createFoundationEventCatalogStorage,
   createInMemoryEventCatalogStorage,
   createUnavailableEventCatalogStorage,
-  projectExpectedStartMs,
   type InMemoryEventCatalogStorage,
 } from "@/lib/event-catalog";
 import { createInMemoryFoundationStorage } from "@/lib/foundation-storage-memory";
@@ -35,15 +34,6 @@ function createFixture(storage: InMemoryEventCatalogStorage = createInMemoryEven
 }
 
 describe("Event operations catalog", () => {
-  test("projects Expected Start from the greater Gameplay and Pitch Slot delay", () => {
-    expect(
-      projectExpectedStartMs(
-        { scheduledStartMs: Date.parse("2026-08-14T10:00:00Z"), expectedDelayMs: 5 * 60_000 },
-        { expectedDelayMs: 20 * 60_000 },
-      ),
-    ).toBe(Date.parse("2026-08-14T10:20:00Z"));
-  });
-
   test("requires the complete Event Catalog adapter capability at composition", () => {
     const foundation = createInMemoryFoundationStorage();
     const incomplete = new Proxy(foundation, {

@@ -58,20 +58,6 @@ export type EventGame = StoredEventCatalogGame;
 export type EventGameSide = StoredEventGameSide;
 export type EventAdministrationAuditEntry = EventCatalogAuditEntry;
 
-/** Canonical Expected Start projection shared by schedule and handoff views. */
-export function projectExpectedStartMs(
-  gameplaySlot: Pick<GameplaySlot, "scheduledStartMs" | "expectedDelayMs"> | null,
-  pitchSlot: Pick<PitchSlot, "expectedDelayMs"> | null,
-): number {
-  const scheduledStartMs = gameplaySlot?.scheduledStartMs ?? 0;
-  const gameplayDelayMs = gameplaySlot?.expectedDelayMs ?? 0;
-  const pitchDelayMs = pitchSlot?.expectedDelayMs ?? 0;
-  return Math.max(
-    scheduledStartMs + gameplayDelayMs,
-    scheduledStartMs + Math.max(gameplayDelayMs, pitchDelayMs),
-  );
-}
-
 export type EventGameDay = StoredGameDay & {
   classification: GameDayClassification;
 };

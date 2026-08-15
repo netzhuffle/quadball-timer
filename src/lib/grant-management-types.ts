@@ -171,10 +171,6 @@ export type TypedGrantAuthority = {
   createPitchManagerGrant(
     input: Omit<CreateTypedGrantInput, "grantType"> & { scope: PitchManagerGrantScope },
   ): Promise<TypedGrantCreated | TypedGrantMutation>;
-  createPitchManagerGrantInTransaction(
-    transaction: FoundationStorageTransaction,
-    input: Omit<CreateTypedGrantInput, "grantType"> & { scope: PitchManagerGrantScope },
-  ): TypedGrantCreated | TypedGrantMutation;
   createControlGrant(
     input: Omit<CreateTypedGrantInput, "grantType"> & { scope: ControlGrantScope },
   ): Promise<TypedGrantCreated | TypedGrantMutation>;
@@ -197,18 +193,6 @@ export type TypedGrantAuthority = {
     browserClass?: string;
   }): Promise<TypedGrantAdmission | TypedGrantAdmissionThrottled>;
   admitGrant(input: {
-    qrCredential: string;
-    browserContext: string;
-    deviceClass?: string;
-    browserClass?: string;
-  }): Promise<TypedGrantAdmission | TypedGrantAdmissionThrottled>;
-  admitPitchManagerGrant(input: {
-    qrCredential: string;
-    browserContext: string;
-    deviceClass?: string;
-    browserClass?: string;
-  }): Promise<TypedGrantAdmission | TypedGrantAdmissionThrottled>;
-  admitEventAdminGrant(input: {
     qrCredential: string;
     browserContext: string;
     deviceClass?: string;

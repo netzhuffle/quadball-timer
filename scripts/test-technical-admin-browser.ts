@@ -3,8 +3,6 @@ import { chromium, type Page } from "playwright";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { openSqliteFoundationStorage } from "@/lib/foundation-storage-sqlite";
-import { readGrantAuthorityOptions } from "@/lib/grant-runtime";
 
 const directory = mkdtempSync(join(tmpdir(), "quadball-timer-admin-browser-"));
 const certificatePath = join(directory, "localhost.crt");
@@ -19,7 +17,6 @@ const environment = {
   PUBLIC_ORIGIN: origin,
   WEBAUTHN_RP_ID: "localhost",
   TECHNICAL_ADMIN_DATABASE: databasePath,
-  FOUNDATION_DATABASE: join(directory, "foundation.sqlite"),
   TLS_CERT_FILE: certificatePath,
   TLS_KEY_FILE: keyPath,
   PORT: String(port),
@@ -51,13 +48,6 @@ try {
   ]);
   if (certificate.exitCode !== 0)
     throw new Error("openssl could not create a temporary certificate.");
-
-  const grantOptions = readGrantAuthorityOptions("test", environment);
-  const foundation = openSqliteFoundationStorage(join(directory, "foundation.sqlite"), {
-    grantKeyRing: grantOptions.keyRing,
-  });
-  await foundation.applyMigrations();
-  foundation.close();
 
   server = Bun.spawn(["bun", "run", "src/index.ts"], {
     cwd: process.cwd(),
@@ -254,7 +244,7 @@ try {
   );
   await page.getByRole("button", { name: "Open Event Hub" }).click();
   await page.getByText("Event Hub", { exact: true }).waitFor();
-  await page.getByLabel("Game Day", { exact: true }).selectOption({ index: 1 });
+  await page.getByLabel("Game Day").selectOption({ index: 1 });
   const eventAdminContext = await browser.newContext({ ignoreHTTPSErrors: true });
   const eventAdminPage = await eventAdminContext.newPage();
   eventAdminPage.setDefaultTimeout(5_000);
@@ -262,7 +252,7 @@ try {
   await eventAdminPage.getByLabel("Scanned Event Admin QR value").fill(revealedCredential);
   await eventAdminPage.getByRole("button", { name: "Admit Event Admin" }).click();
   await eventAdminPage.getByText(/event-admin/u).waitFor();
-  const eventAdminGameDaySelector = eventAdminPage.getByLabel("Game Day", { exact: true });
+  const eventAdminGameDaySelector = eventAdminPage.getByLabel("Game Day");
   await eventAdminGameDaySelector.selectOption({ index: 1 });
   const firstSelectedGameDay = await expectSelectValue(eventAdminGameDaySelector, 1);
   await eventAdminGameDaySelector.selectOption({ index: 2 });
@@ -397,230 +387,6 @@ try {
     .getByText(/Slot 1/)
     .last()
     .waitFor();
-  await eventAdminPage.getByLabel("Pitch Manager Game Day").selectOption({ index: 2 });
-  await eventAdminPage.getByLabel("Pitch Manager Pitch").selectOption({ label: "Pitch Main" });
-  const pitchManagerCreateResponsePromise = eventAdminPage.waitForResponse(
-    (response) =>
-      response.url().includes("/pitch-manager-grant") && response.request().method() === "POST",
-  );
-  await eventAdminPage.getByRole("button", { name: "Create Grant" }).last().click();
-  const pitchManagerCreateResponse = await pitchManagerCreateResponsePromise;
-  assert(pitchManagerCreateResponse.status() === 201, "Pitch Manager Grant creation failed");
-  assertCappedEventAdminCookie(
-    (await pitchManagerCreateResponse.headersArray()).find((header) => header.name === "set-cookie")
-      ?.value,
-  );
-  const duplicatePitchManagerGrant = await eventAdminContext.request.post(
-    `${origin}/api/event-admin/events/${eventId}/game-days/${await eventAdminPage.getByLabel("Pitch Manager Game Day").inputValue()}/pitches/${await eventAdminPage.getByLabel("Pitch Manager Pitch").inputValue()}/pitch-manager-grant`,
-  );
-  assert(
-    duplicatePitchManagerGrant.status() === 400 &&
-      duplicatePitchManagerGrant.headers()["cache-control"] === "no-store" &&
-      duplicatePitchManagerGrant.headers()["referrer-policy"] === "no-referrer" &&
-      duplicatePitchManagerGrant.headers()["set-cookie"] === undefined,
-    "invalid duplicate Pitch Manager Grant response was not generic and uncached",
-  );
-  await eventAdminPage.getByText(/active.*expires/u).waitFor();
-  const pitchManagerRevealResponsePromise = eventAdminPage.waitForResponse(
-    (response) =>
-      response.url().includes("/pitch-manager-grant/reveal") &&
-      response.request().method() === "POST",
-  );
-  await eventAdminPage.getByRole("button", { name: "Reveal QR" }).click();
-  const pitchManagerRevealResponse = await pitchManagerRevealResponsePromise;
-  assertCappedEventAdminCookie(
-    (await pitchManagerRevealResponse.headersArray()).find((header) => header.name === "set-cookie")
-      ?.value,
-  );
-  const pitchManagerRevealPayload = (await pitchManagerRevealResponse.json()) as {
-    status: string;
-    value?: { qrCredential?: string };
-  };
-  const pitchManagerCredential = pitchManagerRevealPayload.value?.qrCredential ?? "";
-  assert(
-    pitchManagerRevealResponse.status() === 200 && pitchManagerCredential.length > 0,
-    "Pitch Manager QR reveal failed",
-  );
-  const pitchManagerContext = await browser.newContext({
-    ignoreHTTPSErrors: true,
-    timezoneId: "UTC",
-  });
-  const pitchManagerPage = await pitchManagerContext.newPage();
-  pitchManagerPage.setDefaultTimeout(5_000);
-  browserPage = pitchManagerPage;
-  await pitchManagerPage.goto(`${origin}/pitch-manager`);
-  const wrongPitchManagerAdmission = await postJsonFromPage(
-    pitchManagerPage,
-    `${origin}/api/pitch-manager/admit`,
-    { qrCredential: revealedCredential },
-  );
-  assert(
-    wrongPitchManagerAdmission.status === 401 &&
-      wrongPitchManagerAdmission.cacheControl === "no-store" &&
-      wrongPitchManagerAdmission.referrerPolicy === "no-referrer" &&
-      wrongPitchManagerAdmission.setCookie === null,
-    "wrong Grant type was admitted or disclosed by Pitch Manager admission",
-  );
-  const eventAdminSessionBeforeWrongType = (await eventAdminContext.cookies()).find(
-    (cookie) => cookie.name === "__Host-event-admin-session",
-  );
-  const wrongEventAdminAdmission = await postJsonFromPage(
-    eventAdminPage,
-    `${origin}/api/event-admin/admit`,
-    { qrCredential: pitchManagerCredential },
-  );
-  const eventAdminSessionAfterWrongType = (await eventAdminContext.cookies()).find(
-    (cookie) => cookie.name === "__Host-event-admin-session",
-  );
-  assert(
-    wrongEventAdminAdmission.status === 401 &&
-      wrongEventAdminAdmission.cacheControl === "no-store" &&
-      wrongEventAdminAdmission.referrerPolicy === "no-referrer" &&
-      wrongEventAdminAdmission.setCookie === null &&
-      eventAdminSessionBeforeWrongType?.value === eventAdminSessionAfterWrongType?.value,
-    "wrong Grant type was admitted or disclosed by Event Admin admission",
-  );
-  await pitchManagerPage.getByLabel("Scanned Pitch Manager QR value").fill(pitchManagerCredential);
-  await pitchManagerPage.getByRole("button", { name: "Open Pitch" }).click();
-  await pitchManagerPage.getByText("Pitch Main", { exact: true }).waitFor();
-  await pitchManagerPage.getByText(/Pitch Manager.*Game Day/u).waitFor();
-  await pitchManagerPage.getByText(/2026-08-15 10:00 Europe\/Zurich/u).waitFor();
-  await pitchManagerPage
-    .getByText(/Control Grant:/u)
-    .first()
-    .waitFor();
-  await pitchManagerPage.reload();
-  await pitchManagerPage.getByText("Pitch Main", { exact: true }).waitFor();
-  await pitchManagerPage.getByText(/2026-08-15 10:00 Europe\/Zurich/u).waitFor();
-  await restartServerProcess(origin, environment);
-  const currentAfterRestart = await fetchFromPage(
-    pitchManagerPage,
-    `${origin}/api/pitch-manager/current`,
-  );
-  assert(
-    currentAfterRestart.status === 200,
-    `Pitch Manager current projection failed after restart (${currentAfterRestart.status})`,
-  );
-  await pitchManagerPage.reload();
-  await pitchManagerPage.getByText("Pitch Main", { exact: true }).waitFor();
-  await pitchManagerPage.getByText(/2026-08-15 10:00 Europe\/Zurich/u).waitFor();
-  const pitchManagerInspectBeforeRotation = await eventAdminContext.request.get(
-    `${origin}/api/event-admin/events/${eventId}/game-days/${await eventAdminPage.getByLabel("Pitch Manager Game Day").inputValue()}/pitches/${await eventAdminPage.getByLabel("Pitch Manager Pitch").inputValue()}/pitch-manager-grant`,
-  );
-  const pitchManagerInspectBeforeRotationPayload =
-    (await pitchManagerInspectBeforeRotation.json()) as {
-      status: string;
-      value?: { grantVersion?: string };
-    };
-  const originalPitchManagerVersion =
-    pitchManagerInspectBeforeRotationPayload.value?.grantVersion ?? "";
-  assert(originalPitchManagerVersion.length > 0, "Pitch Manager Grant version was not inspectable");
-  const pitchManagerRotateResponsePromise = eventAdminPage.waitForResponse(
-    (response) =>
-      response.url().includes("/pitch-manager-grant/rotate") &&
-      response.request().method() === "POST",
-  );
-  await eventAdminPage.getByRole("button", { name: "Rotate Pitch Manager Grant" }).click();
-  assert(
-    (await pitchManagerRotateResponsePromise).status() === 200,
-    "Pitch Manager Grant rotation failed",
-  );
-  const rotatedPitchManagerInspect = await eventAdminContext.request.get(
-    `${origin}/api/event-admin/events/${eventId}/game-days/${await eventAdminPage.getByLabel("Pitch Manager Game Day").inputValue()}/pitches/${await eventAdminPage.getByLabel("Pitch Manager Pitch").inputValue()}/pitch-manager-grant`,
-  );
-  const rotatedPitchManagerPayload = (await rotatedPitchManagerInspect.json()) as {
-    status: string;
-    value?: { grantVersion?: string };
-  };
-  const rotatedPitchManagerVersion = rotatedPitchManagerPayload.value?.grantVersion ?? "";
-  assert(
-    rotatedPitchManagerVersion.length > 0 &&
-      rotatedPitchManagerVersion !== originalPitchManagerVersion,
-    "Pitch Manager rotation did not create a new Grant version",
-  );
-  const stalePitchManagerAfterRotation = await fetchFromPage(
-    pitchManagerPage,
-    `${origin}/api/pitch-manager/current`,
-  );
-  assert(
-    stalePitchManagerAfterRotation.status === 401,
-    "rotated Pitch Manager session remained live",
-  );
-  const pitchManagerDisableResponsePromise = eventAdminPage.waitForResponse(
-    (response) =>
-      response.url().includes("/pitch-manager-grant/disable") &&
-      response.request().method() === "POST",
-  );
-  await eventAdminPage.getByRole("button", { name: "Disable Pitch Manager Grant" }).click();
-  assert(
-    (await pitchManagerDisableResponsePromise).status() === 200,
-    "Pitch Manager Grant disable failed",
-  );
-  const pitchManagerReactivateResponsePromise = eventAdminPage.waitForResponse(
-    (response) =>
-      response.url().includes("/pitch-manager-grant/reactivate") &&
-      response.request().method() === "POST",
-  );
-  await eventAdminPage.getByRole("button", { name: "Reactivate Pitch Manager Grant" }).click();
-  assert(
-    (await pitchManagerReactivateResponsePromise).status() === 200,
-    "Pitch Manager Grant reactivation failed",
-  );
-  const reactivatedPitchManagerInspect = await eventAdminContext.request.get(
-    `${origin}/api/event-admin/events/${eventId}/game-days/${await eventAdminPage.getByLabel("Pitch Manager Game Day").inputValue()}/pitches/${await eventAdminPage.getByLabel("Pitch Manager Pitch").inputValue()}/pitch-manager-grant`,
-  );
-  const reactivatedPitchManagerPayload = (await reactivatedPitchManagerInspect.json()) as {
-    status: string;
-    value?: { grantVersion?: string };
-  };
-  const reactivatedPitchManagerVersion = reactivatedPitchManagerPayload.value?.grantVersion ?? "";
-  assert(
-    reactivatedPitchManagerVersion.length > 0 &&
-      reactivatedPitchManagerVersion !== rotatedPitchManagerVersion,
-    "Pitch Manager reactivation did not create a new Grant version",
-  );
-  const reactivatedPitchManagerRevealResponsePromise = eventAdminPage.waitForResponse(
-    (response) =>
-      response.url().includes("/pitch-manager-grant/reveal") &&
-      response.request().method() === "POST",
-  );
-  await eventAdminPage.getByRole("button", { name: "Reveal QR" }).click();
-  const reactivatedPitchManagerReveal = await reactivatedPitchManagerRevealResponsePromise;
-  const reactivatedPitchManagerRevealPayload = (await reactivatedPitchManagerReveal.json()) as {
-    status: string;
-    value?: { qrCredential?: string };
-  };
-  const reactivatedPitchManagerCredential =
-    reactivatedPitchManagerRevealPayload.value?.qrCredential ?? "";
-  assert(
-    reactivatedPitchManagerReveal.status() === 200 &&
-      reactivatedPitchManagerCredential.length > 0 &&
-      reactivatedPitchManagerCredential !== pitchManagerCredential,
-    "Pitch Manager reactivation did not reveal a new QR credential",
-  );
-  const reactivatedPitchManagerAdmission = await postJsonFromPage(
-    pitchManagerPage,
-    `${origin}/api/pitch-manager/admit`,
-    { qrCredential: reactivatedPitchManagerCredential },
-  );
-  assert(
-    reactivatedPitchManagerAdmission.status === 200 &&
-      reactivatedPitchManagerAdmission.cacheControl === "no-store" &&
-      reactivatedPitchManagerAdmission.referrerPolicy === "no-referrer",
-    "Pitch Manager reactivation did not admit a new session",
-  );
-  const reactivatedPitchManagerCurrent = await fetchFromPage(
-    pitchManagerPage,
-    `${origin}/api/pitch-manager/current`,
-  );
-  assert(
-    reactivatedPitchManagerCurrent.status === 200,
-    "reactivated Pitch Manager session was not live",
-  );
-  assert(
-    reactivatedPitchManagerCurrent.cacheControl === "no-store",
-    "reactivated Pitch Manager projection was cacheable",
-  );
   const sessionCookieBeforeRefresh = (await eventAdminContext.cookies()).find(
     (cookie) => cookie.name === "__Host-event-admin-session",
   );
@@ -706,7 +472,6 @@ try {
     revokedFreshSession.status === 401,
     "explicitly revoked live Event Admin session remained live",
   );
-  await pitchManagerContext.close();
   await eventAdminContext.close();
   await revokedEventAdminContext.close();
   const removeButtons = page.getByRole("button", { name: "Remove", exact: true });
@@ -772,8 +537,6 @@ try {
       qrRender: true,
       eventHubDelegation: true,
       eventAdminRotationRevocationIsolation: true,
-      pitchManagerHandoff: true,
-      pitchManagerScopedView: true,
       forgedAuthorityRejected: true,
       revocationRevalidated: true,
     }),
@@ -816,22 +579,6 @@ async function waitForServer(url: string) {
   throw new Error("Technical Admin browser server did not become ready.");
 }
 
-async function restartServerProcess(serverOrigin: string, serverEnvironment: NodeJS.ProcessEnv) {
-  if (server !== null) {
-    server.kill();
-    await server.exited;
-    await Bun.sleep(250);
-  }
-  server = Bun.spawn(["bun", "run", "src/index.ts"], {
-    cwd: process.cwd(),
-    env: serverEnvironment,
-    stdout: "pipe",
-    stderr: "pipe",
-  });
-  serverStderr = new Response(server.stderr as unknown as BodyInit).text();
-  await waitForServer(`${serverOrigin}/internal/healthz`);
-}
-
 function assert(condition: boolean, message: string): asserts condition {
   if (!condition) throw new Error(message);
 }
@@ -854,25 +601,6 @@ async function fetchFromPage(page: Page, url: string) {
   }, url);
 }
 
-async function postJsonFromPage(page: Page, url: string, body: Record<string, string>) {
-  return page.evaluate(
-    async ({ requestUrl, requestBody }) => {
-      const response = await fetch(requestUrl, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(requestBody),
-      });
-      return {
-        status: response.status,
-        cacheControl: response.headers.get("cache-control"),
-        referrerPolicy: response.headers.get("referrer-policy"),
-        setCookie: response.headers.get("set-cookie"),
-      };
-    },
-    { requestUrl: url, requestBody: body },
-  );
-}
-
 function redactBrowserUrl(value: string) {
   try {
     const url = new URL(value);
@@ -885,13 +613,4 @@ function redactBrowserUrl(value: string) {
 
 function redactDiagnosticText(value: string) {
   return value.replace(/(https?:\/\/[^\s"'<>#]+)#\S+/giu, "$1");
-}
-
-function assertCappedEventAdminCookie(setCookie: string | undefined) {
-  const match = setCookie?.match(/__Host-event-admin-session=[^;]+;[^\n]*Max-Age=(\d+)/u);
-  const maxAge = match?.[1] === undefined ? null : Number(match[1]);
-  assert(
-    maxAge !== null && maxAge > 0 && maxAge < 2_592_000,
-    `Event Admin session cap was reset (maxAge=${maxAge ?? "missing"})`,
-  );
 }
