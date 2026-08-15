@@ -28,6 +28,7 @@ import {
 } from "@/lib/foundation-record-types";
 import { lockControlGrantEventGame } from "@/lib/grant-management-sessions";
 import type {
+  FoundationStorageReadiness,
   FoundationStorageSnapshot,
   FoundationStorageTransaction,
 } from "@/lib/foundation-storage";
@@ -37,6 +38,7 @@ import type { FoundationStorage } from "@/lib/foundation-storage";
 export type LiveEventGameRuntime = {
   control: ReturnType<typeof createLiveEventGameControl>;
   readAudienceProjectionGameInput(eventGameId: string): Promise<AudienceProjectionGameInputOutcome>;
+  readiness(): Promise<FoundationStorageReadiness>;
   close(): void;
 };
 
@@ -326,6 +328,7 @@ export async function openLiveEventGameRuntime(input: {
         const projection = await control.readControllerProjection(eventGameId);
         return readAudienceProjectionGameInput(root, projection);
       },
+      readiness: () => storage.readiness(),
       close() {
         clearInterval(lockTimer);
         control.close();
