@@ -309,6 +309,7 @@ export function authorizeGrantInTransaction(
       eventGameId = relationship.eventGameId;
     } else if (relationship.status !== "switchable") return GENERIC_GRANT_AUTHORIZATION_FAILURE;
   }
+  const effectiveActivityAtMs = input.readOnly ? session.lastActiveAtMs : nowMs;
   if (!input.readOnly) {
     transaction.updateGrantSession({ ...session, lastActiveAtMs: nowMs });
   }
@@ -322,7 +323,10 @@ export function authorizeGrantInTransaction(
     grantSessionId: session.sessionId,
     sessionExpiresAtMs:
       grant.grantType === EVENT_ADMIN_GRANT_TYPE
-        ? Math.min(grant.expiresAtMs ?? Number.MAX_SAFE_INTEGER, nowMs + 30 * DAY_MS)
+        ? Math.min(
+            grant.expiresAtMs ?? Number.MAX_SAFE_INTEGER,
+            effectiveActivityAtMs + 30 * DAY_MS,
+          )
         : null,
   };
 }

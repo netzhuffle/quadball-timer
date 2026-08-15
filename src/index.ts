@@ -725,19 +725,7 @@ async function startServer() {
               gameDayId,
               authority,
             });
-            const refreshHeaders: Array<[string, string]> =
-              authority.kind === "grant-session" && result.status === "accepted"
-                ? [
-                    [
-                      "set-cookie",
-                      eventAdminSessionCookie(
-                        authority.sessionBearer,
-                        result.value.grantSessionExpiresAtMs,
-                      ),
-                    ],
-                  ]
-                : [];
-            return sensitiveEventAdministrationResponse(result, 200, refreshHeaders);
+            return sensitiveEventAdministrationResponse(result);
           },
         },
         "/api/event-admin/catalog": {
@@ -838,6 +826,105 @@ async function startServer() {
                 authority,
               ),
               authority,
+            );
+          },
+        },
+        "/api/event-admin/events/:eventId/game-days/:gameDayId/gameplay-slots": {
+          async POST(req: Request) {
+            if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
+            const authority = resolveEventAdministrationAuthority(req, technicalAdminAuth);
+            const body = await readJsonRecord(req);
+            const path = new URL(req.url).pathname.split("/");
+            if (authority === null || body === null) return sensitiveGenericAuthFailure(401);
+            return sensitiveEventAdministrationMutationResponse(
+              await eventAdministration.createGameplaySlot(
+                path.at(-4) ?? "",
+                path.at(-2) ?? "",
+                {
+                  sequence: body.sequence,
+                  scheduledStart: body.scheduledStart ?? body.scheduledStartMs,
+                },
+                authority,
+              ),
+              authority,
+              201,
+            );
+          },
+        },
+        "/api/event-admin/events/:eventId/game-days/:gameDayId/event-games": {
+          async POST(req: Request) {
+            if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
+            const authority = resolveEventAdministrationAuthority(req, technicalAdminAuth);
+            const body = await readJsonRecord(req);
+            const path = new URL(req.url).pathname.split("/");
+            if (authority === null || body === null) return sensitiveGenericAuthFailure(401);
+            return sensitiveEventAdministrationMutationResponse(
+              await eventAdministration.createEventGame(
+                path.at(-4) ?? "",
+                path.at(-2) ?? "",
+                {
+                  gameplaySlotId: body.gameplaySlotId,
+                  pitchSlotId: body.pitchSlotId,
+                  gameCode: body.gameCode,
+                  gameDesignation: body.gameDesignation,
+                  sideA: body.sideA,
+                  sideB: body.sideB,
+                },
+                authority,
+              ),
+              authority,
+              201,
+            );
+          },
+        },
+        "/api/event-admin/events/:eventId/game-days/:gameDayId/gameplay-slots/:gameplaySlotId/confirm-teams":
+          {
+            async POST(req: Request) {
+              if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
+              const authority = resolveEventAdministrationAuthority(req, technicalAdminAuth);
+              const body = await readJsonRecord(req);
+              const path = new URL(req.url).pathname.split("/");
+              if (authority === null || body === null) return sensitiveGenericAuthFailure(401);
+              return sensitiveEventAdministrationMutationResponse(
+                await eventAdministration.confirmGameplaySlotTeams(
+                  path.at(-6) ?? "",
+                  path.at(-4) ?? "",
+                  path.at(-2) ?? "",
+                  { games: body.games },
+                  authority,
+                ),
+                authority,
+              );
+            },
+          },
+        "/api/event-admin/slot-setup": {
+          async GET(req: Request) {
+            if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
+            const url = new URL(req.url);
+            const authority = resolveEventAdministrationAuthority(req, technicalAdminAuth);
+            if (authority === null) return sensitiveGenericAuthFailure(401);
+            return sensitiveEventAdministrationResponse(
+              await eventAdministration.openSlotSetup(
+                url.searchParams.get("eventId") ?? "",
+                url.searchParams.get("gameDayId") ?? "",
+                authority,
+              ),
+            );
+          },
+        },
+        "/api/event-admin/pitch-view": {
+          async GET(req: Request) {
+            if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
+            const url = new URL(req.url);
+            const authority = resolveEventAdministrationAuthority(req, technicalAdminAuth);
+            if (authority === null) return sensitiveGenericAuthFailure(401);
+            return sensitiveEventAdministrationResponse(
+              await eventAdministration.openPitchView(
+                url.searchParams.get("eventId") ?? "",
+                url.searchParams.get("gameDayId") ?? "",
+                url.searchParams.get("pitchId") ?? "",
+                authority,
+              ),
             );
           },
         },

@@ -63,6 +63,56 @@ describe("Event Administration handoff", () => {
       status: "accepted",
       value: { authority: "event-admin", event: { eventId: event.value.eventId } },
     });
+    const sessionBefore = await fixture.storage.transaction(
+      (transaction) => transaction.listGrantSessions(created.value.grantId)[0],
+    );
+    expect(sessionBefore).not.toBeUndefined();
+    if (sessionBefore === undefined) throw new Error("Expected Event Admin session.");
+    const persistedExpiry = Math.min(
+      created.value.expiresAtMs ?? Number.MAX_SAFE_INTEGER,
+      sessionBefore.lastActiveAtMs + 30 * 24 * 60 * 60 * 1000,
+    );
+    fixture.setNow(sessionBefore.lastActiveAtMs + 60 * 60 * 1000);
+    const advancedHub = await fixture.administration.openEventHub({
+      eventId: event.value.eventId,
+      authority: { kind: "grant-session", sessionBearer: admission.sessionBearer },
+    });
+    expect(advancedHub).toMatchObject({
+      status: "accepted",
+      value: { grantSessionExpiresAtMs: persistedExpiry },
+    });
+    const slotProjection = await fixture.administration.openSlotSetup(
+      event.value.eventId,
+      (
+        await fixture.storage.transaction(
+          (transaction) => transaction.listGameDays(event.value.eventId)[0],
+        )
+      )?.gameDayId ?? "",
+      { kind: "grant-session", sessionBearer: admission.sessionBearer },
+    );
+    expect(slotProjection).toMatchObject({ status: "accepted" });
+    const sessionAfter = await fixture.storage.transaction(
+      (transaction) => transaction.listGrantSessions(created.value.grantId)[0],
+    );
+    expect(sessionAfter).toEqual(sessionBefore);
+    const mutationNow = sessionBefore.lastActiveAtMs + 2 * 60 * 60 * 1000;
+    fixture.setNow(mutationNow);
+    const mutation = await fixture.administration.createEventTeam(
+      event.value.eventId,
+      { name: "Renewed by Mutation" },
+      { kind: "grant-session", sessionBearer: admission.sessionBearer },
+    );
+    expect(mutation).toMatchObject({
+      status: "accepted",
+      sessionExpiresAtMs: Math.min(
+        created.value.expiresAtMs ?? Number.MAX_SAFE_INTEGER,
+        mutationNow + 30 * 24 * 60 * 60 * 1000,
+      ),
+    });
+    const sessionAfterMutation = await fixture.storage.transaction(
+      (transaction) => transaction.listGrantSessions(created.value.grantId)[0],
+    );
+    expect(sessionAfterMutation?.lastActiveAtMs).toBe(mutationNow);
     const technicalHub = await fixture.administration.openEventHub({
       eventId: event.value.eventId,
       authority: fixture.technical,
@@ -555,6 +605,135 @@ describe("Event Administration handoff", () => {
           pitches: [{ name: "Pitch 1" }],
         },
       },
+    });
+  });
+
+  test("configures ordered schedule projections and confirms one Gameplay Slot", async () => {
+    const fixture = createFixture();
+    const event = await fixture.catalog.createEvent(
+      { name: "Scheduled Event", timeZone: "UTC" },
+      fixture.technical,
+    );
+    if (event.status !== "accepted") throw new Error("Expected Event.");
+    const day = await fixture.catalog.addGameDay(
+      event.value.eventId,
+      { date: "2026-08-14" },
+      fixture.technical,
+    );
+    if (day.status !== "accepted") throw new Error("Expected Game Day.");
+    const pitch = await fixture.administration.createPitch(
+      event.value.eventId,
+      { name: "Pitch A" },
+      fixture.technical,
+    );
+    if (pitch.status !== "accepted") throw new Error("Expected Pitch.");
+    const firstTeam = await fixture.administration.createEventTeam(
+      event.value.eventId,
+      { name: "First" },
+      fixture.technical,
+    );
+    const secondTeam = await fixture.administration.createEventTeam(
+      event.value.eventId,
+      { name: "Second" },
+      fixture.technical,
+    );
+    if (firstTeam.status !== "accepted" || secondTeam.status !== "accepted")
+      throw new Error("Expected Event Teams.");
+    const later = await fixture.administration.createGameplaySlot(
+      event.value.eventId,
+      day.value.gameDayId,
+      { sequence: 2, scheduledStart: "2026-08-14T10:30" },
+      fixture.technical,
+    );
+    const earlier = await fixture.administration.createGameplaySlot(
+      event.value.eventId,
+      day.value.gameDayId,
+      { sequence: 1, scheduledStart: "2026-08-14T10:00" },
+      fixture.technical,
+    );
+    expect(later).toMatchObject({ status: "accepted" });
+    expect(earlier).toMatchObject({ status: "accepted" });
+    if (later.status !== "accepted" || earlier.status !== "accepted")
+      throw new Error("Expected Gameplay Slots.");
+    const pitchSlots = await fixture.storage.transaction((transaction) =>
+      transaction.listPitchSlots(day.value.gameDayId, pitch.value.pitchId),
+    );
+    const earlierPitchSlot = pitchSlots.find(
+      (pitchSlot) => pitchSlot.gameplaySlotId === earlier.value.gameplaySlotId,
+    );
+    if (earlierPitchSlot === undefined) throw new Error("Expected Pitch Slot.");
+    const game = await fixture.administration.createEventGame(
+      event.value.eventId,
+      day.value.gameDayId,
+      {
+        gameplaySlotId: earlier.value.gameplaySlotId,
+        pitchSlotId: earlierPitchSlot.pitchSlotId,
+        gameCode: "G-01",
+        gameDesignation: "Opening",
+        sideA: { sourceLabel: "Winner of A" },
+        sideB: { sourceLabel: "Winner of B" },
+      },
+      fixture.technical,
+    );
+    expect(game).toMatchObject({
+      status: "accepted",
+      value: { sideA: { sourceLabel: "Winner of A" } },
+    });
+    if (game.status !== "accepted") throw new Error("Expected Event Game.");
+    const setup = await fixture.administration.openSlotSetup(
+      event.value.eventId,
+      day.value.gameDayId,
+      fixture.technical,
+    );
+    expect(setup).toMatchObject({
+      status: "accepted",
+      value: {
+        gameplaySlots: [{ sequence: 1 }, { sequence: 2 }],
+        eventGames: [{ gameCode: "G-01", sideA: { sourceLabel: "Winner of A" } }],
+        pitches: [{ pitchId: pitch.value.pitchId, name: "Pitch A" }],
+      },
+    });
+    expect(JSON.stringify(setup)).not.toContain("actorReference");
+    const pitchView = await fixture.administration.openPitchView(
+      event.value.eventId,
+      day.value.gameDayId,
+      pitch.value.pitchId,
+      fixture.technical,
+    );
+    expect(pitchView).toMatchObject({
+      status: "accepted",
+      value: {
+        pitchId: pitch.value.pitchId,
+        pitchSlots: [
+          { gameplaySlotId: earlier.value.gameplaySlotId },
+          { gameplaySlotId: later.value.gameplaySlotId },
+        ],
+        eventGames: [{ eventGameId: game.value.eventGameId }],
+      },
+    });
+    const confirmed = await fixture.administration.confirmGameplaySlotTeams(
+      event.value.eventId,
+      day.value.gameDayId,
+      earlier.value.gameplaySlotId,
+      {
+        games: [
+          {
+            eventGameId: game.value.eventGameId,
+            sideAEventTeamId: firstTeam.value.eventTeamId,
+            sideBEventTeamId: secondTeam.value.eventTeamId,
+          },
+        ],
+      },
+      fixture.technical,
+    );
+    expect(confirmed).toMatchObject({
+      status: "accepted",
+      value: [
+        {
+          sideA: { eventTeamId: firstTeam.value.eventTeamId },
+          sideB: { eventTeamId: secondTeam.value.eventTeamId },
+        },
+      ],
     });
   });
 });
