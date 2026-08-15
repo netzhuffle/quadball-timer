@@ -1523,6 +1523,12 @@ export const FOUNDATION_EVENT_CATALOG_GAME_DAYS_TABLE_SQL = `
   ) STRICT
 `;
 
+export const FOUNDATION_EVENT_CATALOG_GAME_DAYS_TABLE_V29_SQL =
+  FOUNDATION_EVENT_CATALOG_GAME_DAYS_TABLE_SQL.replace(
+    "    game_day_date TEXT NOT NULL,",
+    "    game_day_date TEXT NOT NULL,\n    heat_stoppage_configuration TEXT NOT NULL DEFAULT 'disabled' CHECK (heat_stoppage_configuration IN ('enabled', 'disabled')),",
+  );
+
 export const FOUNDATION_EVENT_CATALOG_AUDIT_TABLE_SQL = `
   CREATE TABLE foundation_event_catalog_audit (
     audit_id TEXT PRIMARY KEY,
@@ -1996,6 +2002,13 @@ export const FOUNDATION_ACCESS_SHEET_AUDIT_MIGRATION_SQL = `
   ${FOUNDATION_EVENT_CATALOG_AUDIT_EVENT_INDEX_SQL};
 `;
 
+/** Schema-30 adds the durable, disabled-by-default Game Day Heat Stoppage Configuration. */
+export const FOUNDATION_HEAT_STOPPAGE_CONFIGURATION_MIGRATION_SQL = `
+  ALTER TABLE foundation_event_catalog_game_days
+    ADD COLUMN heat_stoppage_configuration TEXT NOT NULL DEFAULT 'disabled'
+      CHECK (heat_stoppage_configuration IN ('enabled', 'disabled'));
+`;
+
 export const FOUNDATION_MIGRATIONS: readonly FoundationMigration[] = Object.freeze([
   createMigration({
     id: "001-foundation-event-game-record-roots",
@@ -2170,6 +2183,12 @@ export const FOUNDATION_MIGRATIONS: readonly FoundationMigration[] = Object.free
     ordinal: 29,
     schemaVersion: 29,
     sql: FOUNDATION_ACCESS_SHEET_AUDIT_MIGRATION_SQL,
+  }),
+  createMigration({
+    id: "030-heat-stoppage-configuration",
+    ordinal: 30,
+    schemaVersion: 30,
+    sql: FOUNDATION_HEAT_STOPPAGE_CONFIGURATION_MIGRATION_SQL,
   }),
 ]);
 

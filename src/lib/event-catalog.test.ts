@@ -35,6 +35,24 @@ function createFixture(storage: InMemoryEventCatalogStorage = createInMemoryEven
 }
 
 describe("Event operations catalog", () => {
+  test("defaults each new Game Day to disabled Heat Stoppage Configuration", async () => {
+    const fixture = createFixture();
+    const event = await fixture.catalog.createEvent(
+      { name: "Heat default Event", timeZone: "UTC" },
+      authority,
+    );
+    if (event.status !== "accepted") return;
+    const day = await fixture.catalog.addGameDay(
+      event.value.eventId,
+      { date: "2026-08-15" },
+      authority,
+    );
+    expect(day).toMatchObject({
+      status: "accepted",
+      value: { heatStoppageConfiguration: "disabled" },
+    });
+  });
+
   test("projects Expected Start from the greater Gameplay and Pitch Slot delay", () => {
     expect(
       projectExpectedStartMs(

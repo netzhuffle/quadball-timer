@@ -21,6 +21,7 @@ import type {
   StoredGamePresentationAuditRevision,
   StoredGamePresentationChange,
 } from "@/lib/game-presentation";
+import type { HeatStoppageConfiguration } from "@/lib/heat-stoppage-configuration";
 
 export type StoredEventGameRecordRoot = {
   root: EventGameRecordRoot;
@@ -148,6 +149,7 @@ export type StoredEventCatalogGameDay = {
   gameDayId: string;
   eventId: string;
   date: string;
+  heatStoppageConfiguration: HeatStoppageConfiguration;
   createdAtMs: number;
   updatedAtMs: number;
 };
@@ -697,6 +699,7 @@ export type FoundationStorageConstraint =
   | "pitch-slot-game"
   | "event-game-side-id"
   | "event-game-code"
+  | "heat-stoppage-configuration"
   | "event-audit-id"
   | "event-operation-id"
   | "grant-code-digest";

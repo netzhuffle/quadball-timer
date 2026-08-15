@@ -37,6 +37,7 @@ import type {
 import type { EventGameRecordRoot } from "@/lib/foundation-record-types";
 import { createInMemoryFoundationStorage } from "@/lib/foundation-storage-memory";
 import { canonicalizeJson, sha256 } from "@/lib/event-game-action-json";
+import { DEFAULT_HEAT_STOPPAGE_CONFIGURATION } from "@/lib/heat-stoppage-configuration";
 
 export type EventPublicationStatus = "unpublished" | "published" | "cancelled";
 export type EventPublicationWarning =
@@ -773,6 +774,7 @@ export function createEventCatalog(
           gameDayId: ids.next("game-day"),
           eventId: event.eventId,
           date: date.value,
+          heatStoppageConfiguration: DEFAULT_HEAT_STOPPAGE_CONFIGURATION,
           createdAtMs: nowMs,
           updatedAtMs: nowMs,
         };
