@@ -18,6 +18,12 @@ import {
 } from "@/lib/sqlite-foundation-probe";
 import { isAllowedWebSocketOrigin } from "@/lib/ws-origin";
 import { parseClientWsMessage, type ServerWsMessage } from "@/lib/ws-protocol";
+import { createLiveEventGameControlTransport } from "@/lib/live-event-game-transport";
+import {
+  openLiveEventGameRuntime,
+  readLiveEventGrantKeyRing,
+  type LiveEventGameRuntime,
+} from "@/lib/live-event-game-runtime";
 import {
   clearTechnicalAdminCookie,
   clearTechnicalAdminCsrfCookie,
@@ -180,6 +186,26 @@ async function startServer() {
         eventAdministration = null;
       }
     }
+    let liveEventRuntime: LiveEventGameRuntime | null = null;
+    const liveEventDatabasePath =
+      process.env.EVENT_GAME_DATABASE ?? `data/${environment}/event-game.sqlite`;
+    const liveEventKeyRing = readLiveEventGrantKeyRing();
+    if (liveEventKeyRing !== null) {
+      try {
+        liveEventRuntime = await openLiveEventGameRuntime({
+          databasePath: liveEventDatabasePath,
+          environmentId: environment,
+          keyRing: liveEventKeyRing,
+        });
+        startupCleanup.add(() => liveEventRuntime?.close());
+      } catch (error) {
+        console.warn("Durable Event Game Controller is unavailable.", error);
+      }
+    }
+    const liveEventControlTransport = createLiveEventGameControlTransport(
+      () => liveEventRuntime?.control ?? null,
+      (request) => technicalAdminAuth.isExpectedBinding(requestBinding(request)),
+    );
     const adminGrantMutationRoute =
       (
         operation:
@@ -261,12 +287,47 @@ async function startServer() {
         "/api/games/:gameId": {
           GET(req: Request) {
             const gameId = new URL(req.url).pathname.replace("/api/games/", "");
-            const game = games.get(gameId);
-            if (game === undefined) {
+            const game = readAdHocGame(gameId);
+            if (game === null) {
               return json({ error: "Game not found." }, 404);
             }
 
-            return json({ game: projectGameView(game.state, Date.now()) });
+            return json({ game });
+          },
+        },
+        "/api/event-control/open": {
+          POST(req: Request) {
+            return liveEventControlTransport.openController(req);
+          },
+        },
+        "/api/event-control/intent": {
+          POST(req: Request) {
+            return liveEventControlTransport.submitControllerIntent(req);
+          },
+        },
+        "/api/event-control/refresh": {
+          POST(req: Request) {
+            return liveEventControlTransport.refreshController(req);
+          },
+        },
+        "/api/event-control/switch": {
+          POST(req: Request) {
+            return liveEventControlTransport.switchController(req);
+          },
+        },
+        "/api/event-control/stay": {
+          POST(req: Request) {
+            return liveEventControlTransport.stayController(req);
+          },
+        },
+        "/api/event-control/reveal-qr": {
+          POST(req: Request) {
+            return liveEventControlTransport.revealControllerQr(req);
+          },
+        },
+        "/api/event-control/leave": {
+          POST(req: Request) {
+            return liveEventControlTransport.leaveController(req);
           },
         },
         "/api/admin/enrollment/options": {
@@ -843,7 +904,7 @@ async function runProbeMode(
   }
 }
 
-async function createGame(req: Request) {
+export async function createGame(req: Request) {
   const body = await readJsonBodyWithinLimit(req, SHARED_LIMITS.transport.httpJsonBodyBytes);
   if (!body.ok) {
     return json({ error: body.error }, body.status);
@@ -911,6 +972,23 @@ async function createGame(req: Request) {
     },
     201,
   );
+}
+
+export function readAdHocGame(gameId: string) {
+  const game = games.get(gameId);
+  return game === undefined ? null : projectGameView(game.state, Date.now());
+}
+
+export function applyAdHocCommand(input: {
+  gameId: string;
+  id: string;
+  clientSentAtMs: number;
+  command: GameCommand;
+}) {
+  const managedGame = games.get(input.gameId);
+  if (managedGame === undefined) return false;
+  applyCommandsToGame({ managedGame, commands: [input] });
+  return true;
 }
 
 function createGameId() {

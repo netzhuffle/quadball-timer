@@ -378,7 +378,7 @@ function validateAuditLinkage(
     const rejected = collision.rejectedAttempt;
     const preparedRejected = prepareControlAction(
       rejected.input,
-      root,
+      { ...root, lifecycle: rejected.input.lifecycle },
       registry,
       rejected.input.occurrence.trustedAtMs,
     );

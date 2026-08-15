@@ -1,4 +1,5 @@
 import { validateOpaqueIdentifier, type ValidationResult } from "@/lib/validation-policy";
+import type { FoundationStorageSnapshot } from "@/lib/foundation-storage";
 
 export const GRANT_CREDENTIAL_FORMAT_VERSION = 1 as const;
 export const GRANT_CREDENTIAL_KIND = "qr" as const;
@@ -138,11 +139,15 @@ export type ControlGrantReplayResolution =
 export type ControlGrantSessionDecision = "stay";
 
 export type ControlGrantScopeResolver = {
-  resolve(scope: ControlGrantScope): ControlGrantScopeResolution;
+  resolve(
+    scope: ControlGrantScope,
+    snapshot?: FoundationStorageSnapshot,
+  ): ControlGrantScopeResolution;
   /** Optional lifecycle-aware seam used after a session has already been admitted. */
   resolveSession?: (
     scope: ControlGrantScope,
     sessionEventGameId: string,
+    snapshot?: FoundationStorageSnapshot,
   ) => ControlGrantSessionResolution;
   /** Optional lifecycle-aware seam used by explicit offline replay authorization. */
   resolveReplay?: (
@@ -193,6 +198,7 @@ export type StoredGrantSession = {
   grantId: string;
   grantVersion: string;
   eventGameId: string;
+  stayedOnEventGameId?: string | null;
   browserContextDigest: string;
   browserContextKeyVersion: string;
   bearerMaterialState: "present" | "erased";

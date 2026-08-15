@@ -550,9 +550,13 @@ export function validateStoredControlAction(
   root: EventGameRecordRoot,
   registry: ControlActionCodecRegistry,
 ): ActionHistoryReadiness {
-  const prepared = prepareControlAction(action, root, registry, action.occurrence.trustedAtMs, {
-    allowConcurrentTeamAssignment: true,
-  });
+  const prepared = prepareControlAction(
+    action,
+    { ...root, lifecycle: action.lifecycle },
+    registry,
+    action.occurrence.trustedAtMs,
+    { allowConcurrentTeamAssignment: true },
+  );
   if (!prepared.ok) return { ok: false, detail: prepared.error };
   if (prepared.value.canonicalContent !== canonicalContent) {
     return { ok: false, detail: "Stored Control Action canonical content is inconsistent." };

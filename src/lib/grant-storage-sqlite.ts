@@ -97,6 +97,7 @@ const GRANT_SELECT_COLUMNS = `
 const SESSION_SELECT_COLUMNS = `
   sessions.session_id AS session_id, sessions.grant_id AS grant_id,
   sessions.grant_version AS grant_version, sessions.event_game_id AS event_game_id,
+  sessions.stayed_on_event_game_id AS stayed_on_event_game_id,
   sessions.browser_context_digest AS browser_context_digest,
   sessions.browser_context_key_version AS browser_context_key_version,
   sessions.bearer_material_state AS bearer_material_state,
@@ -193,13 +194,13 @@ export function createGrantSqliteStatements(database: Database): GrantSqliteStat
     insertSession: database.query(`
       INSERT INTO foundation_grant_sessions (
         session_id, grant_id, grant_version, event_game_id, browser_context_digest,
-        browser_context_key_version, bearer_material_state, bearer_lookup_verifier, bearer_lookup_key_version,
+        stayed_on_event_game_id, browser_context_key_version, bearer_material_state, bearer_lookup_verifier, bearer_lookup_key_version,
         status, created_at_ms, last_active_at_ms, revoked_at_ms, device_class, browser_class
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `),
     updateSession: database.query(`
       UPDATE foundation_grant_sessions SET
-        grant_id = ?, grant_version = ?, event_game_id = ?, browser_context_digest = ?,
+        grant_id = ?, grant_version = ?, event_game_id = ?, stayed_on_event_game_id = ?, browser_context_digest = ?,
         browser_context_key_version = ?, bearer_material_state = ?, bearer_lookup_verifier = ?,
         bearer_lookup_key_version = ?, status = ?, created_at_ms = ?,
         last_active_at_ms = ?, revoked_at_ms = ?, device_class = ?, browser_class = ?
@@ -575,6 +576,7 @@ export function insertGrantSession(
     session.grantVersion,
     session.eventGameId,
     session.browserContextDigest,
+    session.stayedOnEventGameId ?? null,
     session.browserContextKeyVersion,
     session.bearerMaterialState,
     session.bearerLookupVerifier,
@@ -596,6 +598,7 @@ export function updateGrantSession(
     session.grantId,
     session.grantVersion,
     session.eventGameId,
+    session.stayedOnEventGameId ?? null,
     session.browserContextDigest,
     session.browserContextKeyVersion,
     session.bearerMaterialState,
@@ -1073,6 +1076,7 @@ function readStoredGrantSession(row: GrantRow): StoredGrantSession {
     grantId: readText(row.grant_id),
     grantVersion: readText(row.grant_version),
     eventGameId: readText(row.event_game_id),
+    stayedOnEventGameId: readNullableText(row.stayed_on_event_game_id),
     browserContextDigest: readText(row.browser_context_digest),
     browserContextKeyVersion: readText(row.browser_context_key_version),
     bearerMaterialState: bearerMaterialState as "present" | "erased",
