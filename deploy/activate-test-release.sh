@@ -138,6 +138,19 @@ check_health() {
   done
   return 1
 }
+
+check_representative_behavior() {
+  curl --fail --silent --show-error --max-time 2 "http://127.0.0.1:${port}/api/audience/events" >/dev/null || return 1
+  local websocket_headers
+  websocket_headers="$(curl --silent --show-error --max-time 2 \
+    -H "Origin: http://127.0.0.1:${port}" \
+    -H "Connection: Upgrade" \
+    -H "Upgrade: websocket" \
+    -H "Sec-WebSocket-Version: 13" \
+    -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
+    -D - -o /dev/null "http://127.0.0.1:${port}/ws" || true)"
+  grep -Eq '^HTTP/[0-9.]+ 101 ' <<<"$websocket_headers"
+}
 compatible_previous_release() {
   local previous_manifest="${previous_release}/release-manifest.json" candidate_schema previous_schema
   [[ -s "$previous_manifest" ]] || return 1
@@ -157,7 +170,7 @@ prune_releases() {
   done
 }
 
-if restart_service && check_health "$release_id" "$release_dir"; then
+if restart_service && check_health "$release_id" "$release_dir" && check_representative_behavior; then
   prune_releases "$release_dir" "$previous_release"
   echo "Activated immutable Test release attempt ${release_id}."
   exit 0

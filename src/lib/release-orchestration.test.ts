@@ -22,7 +22,7 @@ const manifest = makeReleaseManifest({
 function adapter(
   environment: "production" | "test",
   events: string[],
-  failurePhase?: "verify" | "finalize",
+  failurePhase?: "stage" | "verify" | "finalize",
 ): ReleaseEnvironmentAdapter {
   return {
     environment,
@@ -37,6 +37,7 @@ function adapter(
     },
     async stage() {
       events.push(`${environment}:stage`);
+      if (failurePhase === "stage") throw new Error("stage failed");
     },
     async finalize() {
       events.push(`${environment}:finalize`);
@@ -72,6 +73,7 @@ describe("release orchestration", () => {
     expect(report.status).toBe("succeeded");
     expect(report.environments.production.status).toBe("succeeded");
     expect(report.environments.test.status).toBe("succeeded");
+    expect(report.environments.production.phase).toBe("verified");
     expect(events).toContain("production:prune");
     expect(events).toContain("test:prune");
   });
@@ -84,9 +86,73 @@ describe("release orchestration", () => {
     });
     expect(report.status).toBe("failed");
     expect(report.environments.production.status).toBe("failed");
+    expect(report.environments.production.phase).toBe("verification");
     expect(report.environments.production.rollbackReleaseAttemptId).toBe("production-prior");
     expect(report.environments.test.status).toBe("succeeded");
     expect(events).toContain("production:rollback:production-prior");
     expect(events).toContain("test:prune");
+  });
+
+  test("keeps a Test-only failure independent from Production", async () => {
+    const events: string[] = [];
+    const report = await runReleaseAttempt({
+      manifest,
+      environments: [adapter("production", events), adapter("test", events, "verify")],
+    });
+
+    expect(report.status).toBe("failed");
+    expect(report.environments.production.status).toBe("succeeded");
+    expect(report.environments.test.status).toBe("failed");
+    expect(report.environments.test.rollbackReleaseAttemptId).toBe("test-prior");
+    expect(events).toContain("production:prune");
+    expect(events).toContain("test:rollback:test-prior");
+  });
+
+  test("reports both failures and rolls each environment back independently", async () => {
+    const events: string[] = [];
+    const report = await runReleaseAttempt({
+      manifest,
+      environments: [adapter("production", events, "verify"), adapter("test", events, "verify")],
+    });
+
+    expect(report.status).toBe("failed");
+    expect(report.environments.production.status).toBe("failed");
+    expect(report.environments.test.status).toBe("failed");
+    expect(events).toContain("production:rollback:production-prior");
+    expect(events).toContain("test:rollback:test-prior");
+  });
+
+  test("does not roll back or disturb the current release after lock or staging failure", async () => {
+    const events: string[] = [];
+    const lockContended: ReleaseEnvironmentAdapter = {
+      ...adapter("production", events),
+      async acquireLock() {
+        events.push("production:lock-contention");
+        throw new Error("lock busy");
+      },
+    };
+    const report = await runReleaseAttempt({
+      manifest,
+      environments: [lockContended, adapter("test", events, "stage")],
+    });
+
+    expect(report.status).toBe("failed");
+    expect(report.environments.production.phase).toBe("lock-acquisition");
+    expect(report.environments.test.phase).toBe("staging");
+    expect(report.environments.production.rollbackReleaseAttemptId).toBeNull();
+    expect(report.environments.test.rollbackReleaseAttemptId).toBeNull();
+    expect(events).not.toContain("production:rollback:production-prior");
+    expect(events).not.toContain("test:rollback:test-prior");
+  });
+
+  test("always releases each environment lock after a failed activation", async () => {
+    const events: string[] = [];
+    await runReleaseAttempt({
+      manifest,
+      environments: [adapter("production", events, "verify"), adapter("test", events)],
+    });
+
+    expect(events).toContain("production:unlock");
+    expect(events).toContain("test:unlock");
   });
 });
