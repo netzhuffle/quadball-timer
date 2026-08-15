@@ -277,6 +277,27 @@ describe("Event Game Controller reconnect browser seam", () => {
     expect(stored.pendingActions).toHaveLength(1);
   });
 
+  test("renders stable fact identity and sends a contextual Correction from the browser seam", async () => {
+    await enterAndOpen();
+    expect(container.querySelector('[data-game-fact-id="fact-goal"]')).not.toBeNull();
+    const correctButton = container
+      .querySelector('[data-game-fact-id="fact-goal"]')
+      ?.querySelector("button");
+    await act(async () => {
+      correctButton?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const correction = replayBodies
+      .flatMap((body) => body.actions ?? [])
+      .find((action) => action.intent.type === "correct-fact");
+    expect(correction?.intent).toMatchObject({
+      type: "correct-fact",
+      targetFactId: "fact-goal",
+      effective: false,
+    });
+  });
+
   test("revalidates a fresh same-Game authority before foreground replay", async () => {
     replayMode = "success";
     await act(async () => {
@@ -733,6 +754,18 @@ function projection(eventGameId = "game-browser"): ControllerProjection {
     phase: "scheduled",
     scoreByGameSide: { "side-a": 0, "side-b": 0 },
     goalCount: 0,
+    gameFacts: [
+      {
+        factId: "fact-goal",
+        factType: "goal",
+        gameSideId: "side-a",
+        gameTimeMs: 12_000,
+        sportingOrder: 12_000,
+        synchronizationOrder: 1,
+        effective: true,
+        data: { points: 10 },
+      },
+    ],
     clock: projectClockBaseline(baseline, 0),
     commencement: {
       status: "provisional",

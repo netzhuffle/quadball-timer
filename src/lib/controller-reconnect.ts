@@ -1,8 +1,14 @@
 import type {
+  ControllerGameFact,
   ControllerSessionAttachment,
   ControllerProjection,
   LiveEventControllerIntent,
+  LiveHeatState,
+  LiveResultState,
+  LiveStoppageState,
+  LiveTimeoutState,
 } from "@/lib/live-event-game-control";
+import { parseJsonValue } from "@/lib/event-game-action-codecs";
 import {
   applyClockProjectionAction,
   createInitialClockBaseline,
@@ -605,16 +611,73 @@ function applyOptimisticAction(
   if (intent.type === "record-goal") {
     const current = state.projection.scoreByGameSide[intent.gameSideId];
     if (current === undefined) return state;
+    const nextFacts = appendOptimisticFact(state.projection, {
+      factId: intent.factId,
+      factType: "goal",
+      gameSideId: intent.gameSideId,
+      gameTimeMs: intent.gameTimeMs,
+      sportingOrder: intent.sportingOrder ?? intent.gameTimeMs,
+      data: { points: 10, sportingOrder: intent.sportingOrder ?? intent.gameTimeMs },
+    });
     return {
       ...state,
       projection: {
         ...state.projection,
         scoreByGameSide: { ...state.projection.scoreByGameSide, [intent.gameSideId]: current + 10 },
         goalCount: state.projection.goalCount + 1,
+        gameFacts: nextFacts,
+      },
+    };
+  }
+  if (intent.type === "correct-fact") {
+    const gameFacts = (state.projection.gameFacts ?? []).map((fact) =>
+      fact.factId === intent.targetFactId ? { ...fact, effective: intent.effective } : fact,
+    );
+    const scoreByGameSide = Object.fromEntries(
+      Object.keys(state.projection.scoreByGameSide).map((side) => [side, 0]),
+    );
+    const dependentState = deriveOptimisticDependentState(gameFacts);
+    let goalCount = 0;
+    for (const fact of gameFacts) {
+      if (!fact.effective || fact.factType !== "goal") continue;
+      if (fact.gameSideId !== null && fact.gameSideId in scoreByGameSide) {
+        scoreByGameSide[fact.gameSideId] = (scoreByGameSide[fact.gameSideId] ?? 0) + 10;
+      }
+      goalCount += 1;
+    }
+    return {
+      ...state,
+      projection: {
+        ...state.projection,
+        gameFacts,
+        scoreByGameSide,
+        goalCount,
+        phase: gameFacts.some((fact) => fact.effective && fact.factType === "result")
+          ? "finished"
+          : state.projection.phase === "finished"
+            ? "in-progress"
+            : state.projection.phase,
+        ...(state.projection.timeout === undefined ? {} : { timeout: dependentState.timeout }),
+        ...(state.projection.stoppage === undefined ? {} : { stoppage: dependentState.stoppage }),
+        ...(state.projection.heat === undefined ? {} : { heat: dependentState.heat }),
+        ...(state.projection.result === undefined ? {} : { result: dependentState.result }),
       },
     };
   }
   if (intent.type === "substantive") {
+    const nextFacts = appendOptimisticFact(state.projection, {
+      factId: intent.factId,
+      factType: intent.trigger,
+      gameSideId: null,
+      gameTimeMs: intent.gameTimeMs,
+      sportingOrder: intent.sportingOrder ?? intent.gameTimeMs,
+      data: {
+        trigger: intent.trigger,
+        sportingOrder: intent.sportingOrder ?? intent.gameTimeMs,
+        ...(intent.heatAction === undefined ? {} : { heatAction: intent.heatAction }),
+      },
+    });
+    const dependentState = deriveOptimisticDependentState(nextFacts);
     const commencement =
       state.projection.commencement.status === "commenced"
         ? state.projection.commencement
@@ -635,6 +698,11 @@ function applyOptimisticAction(
               ? "in-progress"
               : state.projection.phase,
         commencement,
+        gameFacts: nextFacts,
+        ...(state.projection.timeout === undefined ? {} : { timeout: dependentState.timeout }),
+        ...(state.projection.stoppage === undefined ? {} : { stoppage: dependentState.stoppage }),
+        ...(state.projection.heat === undefined ? {} : { heat: dependentState.heat }),
+        ...(state.projection.result === undefined ? {} : { result: dependentState.result }),
       },
     };
   }
@@ -751,6 +819,20 @@ function validateDerivedProjection(state: ControllerReplicaState) {
 function sameProjection(left: ControllerProjection, right: ControllerProjection): boolean {
   const leftScores = Object.entries(left.scoreByGameSide).sort(([a], [b]) => a.localeCompare(b));
   const rightScores = Object.entries(right.scoreByGameSide).sort(([a], [b]) => a.localeCompare(b));
+  const leftFacts = JSON.stringify(left.gameFacts ?? []);
+  const rightFacts = JSON.stringify(right.gameFacts ?? []);
+  const leftDependent = JSON.stringify([
+    left.timeout ?? null,
+    left.stoppage ?? null,
+    left.heat ?? null,
+    left.result ?? null,
+  ]);
+  const rightDependent = JSON.stringify([
+    right.timeout ?? null,
+    right.stoppage ?? null,
+    right.heat ?? null,
+    right.result ?? null,
+  ]);
   return (
     left.eventGameId === right.eventGameId &&
     left.phase === right.phase &&
@@ -760,6 +842,8 @@ function sameProjection(left: ControllerProjection, right: ControllerProjection)
     left.commencement.provisionalRunningSinceMs === right.commencement.provisionalRunningSinceMs &&
     left.commencement.provisionalElapsedMs === right.commencement.provisionalElapsedMs &&
     JSON.stringify(left.clock) === JSON.stringify(right.clock) &&
+    leftFacts === rightFacts &&
+    leftDependent === rightDependent &&
     leftScores.length === rightScores.length &&
     leftScores.every(
       ([side, score], index) =>
@@ -882,11 +966,23 @@ function parseProjection(value: unknown): ControllerProjection {
   const clock = isRecord(value.clock)
     ? (structuredClone(value.clock) as ControllerProjection["clock"])
     : projectClockBaseline(createInitialClockBaseline(), 0);
+  const gameFacts = parseGameFacts(value.gameFacts);
+  const guardrails = parseGuardrails(value.guardrails);
+  const timeout = value.timeout === undefined ? undefined : parseTimeoutState(value.timeout);
+  const stoppage = value.stoppage === undefined ? undefined : parseStoppageState(value.stoppage);
+  const heat = value.heat === undefined ? undefined : parseHeatState(value.heat);
+  const result = value.result === undefined ? undefined : parseResultState(value.result);
   return {
     eventGameId,
     phase,
     scoreByGameSide: scores,
     goalCount: goalCount.value,
+    ...(value.timeout === undefined ? {} : { timeout }),
+    ...(value.stoppage === undefined ? {} : { stoppage }),
+    ...(value.heat === undefined ? {} : { heat }),
+    ...(value.result === undefined ? {} : { result }),
+    ...(value.gameFacts === undefined ? {} : { gameFacts }),
+    ...(value.guardrails === undefined ? {} : { guardrails }),
     clock,
     commencement: {
       status: commencementStatus,
@@ -895,6 +991,111 @@ function parseProjection(value: unknown): ControllerProjection {
       provisionalElapsedMs: elapsed.value,
     },
   };
+}
+
+function parseTimeoutState(value: unknown): LiveTimeoutState {
+  if (!isRecord(value) || (value.status !== "inactive" && value.status !== "started")) {
+    throw new Error("Projection timeout state is invalid.");
+  }
+  return { status: value.status, factId: parseNullableFactId(value.factId, "timeout.factId") };
+}
+
+function parseStoppageState(value: unknown): LiveStoppageState {
+  if (
+    !isRecord(value) ||
+    (value.status !== "none" && value.status !== "suspension" && value.status !== "heat-stoppage")
+  ) {
+    throw new Error("Projection stoppage state is invalid.");
+  }
+  return {
+    status: value.status,
+    factId: parseNullableFactId(value.factId, "stoppage.factId"),
+  };
+}
+
+function parseHeatState(value: unknown): LiveHeatState {
+  if (
+    !isRecord(value) ||
+    (value.status !== "inactive" &&
+      value.status !== "started" &&
+      value.status !== "ended" &&
+      value.status !== "skipped" &&
+      value.status !== "extended")
+  ) {
+    throw new Error("Projection heat state is invalid.");
+  }
+  const startedAtGameTimeMs = parseNullableBoundedNumber(
+    value.startedAtGameTimeMs,
+    "heat.startedAtGameTimeMs",
+  );
+  const nominalDurationMs = parseNullableBoundedNumber(
+    value.nominalDurationMs,
+    "heat.nominalDurationMs",
+  );
+  return {
+    status: value.status,
+    factId: parseNullableFactId(value.factId, "heat.factId"),
+    startedAtGameTimeMs,
+    nominalDurationMs,
+  };
+}
+
+function parseResultState(value: unknown): LiveResultState {
+  if (value === null) return null;
+  if (!isRecord(value)) throw new Error("Projection result state is invalid.");
+  const factId = requireIdentifier(value.factId, "result.factId");
+  const data = parseJsonValue(value.data, "result.data");
+  if (!data.ok) throw new Error(data.error);
+  return { factId, data: data.value };
+}
+
+function parseNullableFactId(value: unknown, field: string): string | null {
+  return value === null ? null : requireIdentifier(value, field);
+}
+
+function parseNullableBoundedNumber(value: unknown, field: string): number | null {
+  if (value === undefined || value === null) return null;
+  const parsed = validateIntegerInRange(value, 0, SHARED_LIMITS.clock.maxMs, field);
+  if (!parsed.ok) throw new Error(parsed.error);
+  return parsed.value;
+}
+
+function parseGuardrails(value: unknown): ControllerProjection["guardrails"] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.length > 20) {
+    throw new Error("Projection guardrails are invalid.");
+  }
+  return structuredClone(value) as ControllerProjection["guardrails"];
+}
+
+function parseGameFacts(value: unknown): ControllerProjection["gameFacts"] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.length > SHARED_LIMITS.replay.maxControlActions) {
+    throw new Error("Projection game facts are invalid.");
+  }
+  return value.map((candidate) => {
+    if (!isRecord(candidate)) throw new Error("Projection game fact is invalid.");
+    const factId = requireIdentifier(candidate.factId, "gameFacts.factId");
+    const factType = requireIdentifier(candidate.factType, "gameFacts.factType");
+    const gameSideId =
+      candidate.gameSideId === null
+        ? null
+        : requireIdentifier(candidate.gameSideId, "gameFacts.gameSideId");
+    if (!Number.isSafeInteger(candidate.gameTimeMs) && candidate.gameTimeMs !== null)
+      throw new Error("Projection game fact time is invalid.");
+    if (
+      !Number.isSafeInteger(candidate.sportingOrder) ||
+      !Number.isSafeInteger(candidate.synchronizationOrder) ||
+      typeof candidate.effective !== "boolean"
+    )
+      throw new Error("Projection game fact ordering is invalid.");
+    return {
+      ...(structuredClone(candidate) as ControllerGameFact),
+      factId,
+      factType,
+      gameSideId,
+    };
+  });
 }
 
 function parseIdentity(value: unknown): ControllerReplicaState["identity"] {
@@ -992,6 +1193,116 @@ function requireIdentifier(value: unknown, field: string): string {
 
 function cloneProjection(projection: ControllerProjection): ControllerProjection {
   return structuredClone(projection);
+}
+
+function appendOptimisticFact(
+  projection: ControllerProjection,
+  fact: {
+    factId: string;
+    factType: string;
+    gameSideId: string | null;
+    gameTimeMs: number;
+    sportingOrder: number;
+    data: unknown;
+  },
+) {
+  const facts = [...(projection.gameFacts ?? [])];
+  const synchronizationOrder =
+    facts.reduce((highest, candidate) => Math.max(highest, candidate.synchronizationOrder), 0) + 1;
+  facts.push({
+    factId: fact.factId,
+    factType: fact.factType,
+    gameSideId: fact.gameSideId,
+    gameTimeMs: fact.gameTimeMs,
+    sportingOrder: fact.sportingOrder,
+    synchronizationOrder,
+    effective: true,
+    data: fact.data as ControllerGameFact["data"],
+  });
+  return facts.sort(
+    (left, right) =>
+      left.sportingOrder - right.sportingOrder ||
+      left.synchronizationOrder - right.synchronizationOrder,
+  );
+}
+
+function deriveOptimisticDependentState(facts: readonly ControllerGameFact[]): {
+  timeout: LiveTimeoutState;
+  stoppage: LiveStoppageState;
+  heat: LiveHeatState;
+  result: LiveResultState;
+} {
+  const latest = (factType: string) =>
+    facts.filter((fact) => fact.effective && fact.factType === factType).at(-1) ?? null;
+  const timeoutFact = latest("timeout");
+  const suspensionFact = latest("suspension");
+  const heatFact = latest("heat-stoppage");
+  const resultFact = latest("result");
+  const heatData =
+    heatFact !== null && isRecord(heatFact.data)
+      ? (heatFact.data as Record<string, unknown>)
+      : null;
+  const heatAction =
+    heatData !== null &&
+    (heatData.heatAction === "end" ||
+      heatData.heatAction === "skip-required" ||
+      heatData.heatAction === "extend-permitted")
+      ? heatData.heatAction
+      : null;
+  const heatStatus: LiveHeatState["status"] =
+    heatFact === null
+      ? "inactive"
+      : heatAction === "end"
+        ? "ended"
+        : heatAction === "skip-required"
+          ? "skipped"
+          : heatAction === "extend-permitted"
+            ? "extended"
+            : "started";
+  const effectiveHeatStarts = facts.filter((fact) => {
+    const data = isRecord(fact.data) ? (fact.data as unknown as Record<string, unknown>) : null;
+    return (
+      fact.effective &&
+      fact.factType === "heat-stoppage" &&
+      (data === null ||
+        (data.heatAction !== "end" &&
+          data.heatAction !== "skip-required" &&
+          data.heatAction !== "extend-permitted"))
+    );
+  });
+  const nominalDurationMs =
+    heatStatus === "started" || heatStatus === "extended"
+      ? effectiveHeatStarts.length <= 1
+        ? 4 * 60 * 1000
+        : 2 * 60 * 1000
+      : null;
+  const startedAtGameTimeMs =
+    nominalDurationMs === null || heatFact?.gameTimeMs === null
+      ? null
+      : (heatFact?.gameTimeMs ?? null);
+  const heat: LiveHeatState = {
+    status: heatStatus,
+    factId: heatFact?.factId ?? null,
+    startedAtGameTimeMs,
+    nominalDurationMs,
+  };
+  return {
+    timeout: {
+      status: timeoutFact === null ? "inactive" : "started",
+      factId: timeoutFact?.factId ?? null,
+    },
+    stoppage:
+      suspensionFact !== null
+        ? { status: "suspension", factId: suspensionFact.factId }
+        : heat.status === "started" || heat.status === "extended"
+          ? { status: "heat-stoppage", factId: heat.factId }
+          : { status: "none", factId: null },
+    heat,
+    result:
+      resultFact === null
+        ? null
+        : { factId: resultFact.factId, data: structuredClone(resultFact.data) },
+  };
 }
 
 function isRecord(value: unknown): value is Record<string, any> {

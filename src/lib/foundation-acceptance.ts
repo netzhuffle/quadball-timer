@@ -932,7 +932,10 @@ export function createFoundationAcceptance(
       "action-accepted",
       ACCEPTED_AUDIT_DETAIL,
       action.acceptedAtMs,
-      { interpretation: prepared.interpretation, relatedOperationIds: [] },
+      {
+        interpretation: prepared.interpretation,
+        relatedOperationIds: relatedFactOperationIds(transaction, root, prepared.interpretation),
+      },
     );
     return writeAcceptedOutcome(
       transaction,
@@ -1126,7 +1129,10 @@ export function createFoundationAcceptance(
       "action-duplicate",
       "The Control Action was already committed.",
       nowMs,
-      { interpretation: existing.interpretation },
+      {
+        interpretation: existing.interpretation,
+        relatedOperationIds: relatedFactOperationIds(transaction, root, existing.interpretation),
+      },
     );
     controlAudit.outcome = "accepted";
     const acceptanceId = `accept-${sha256(`${root.recordId}:${prepared.input.operationId}:duplicate`)}`;
@@ -2076,6 +2082,17 @@ function readNow(clock: () => number): number {
     throw new Error("Acceptance clock returned an invalid timestamp.");
   return nowMs;
 }
+
+function relatedFactOperationIds(
+  transaction: FoundationStorageSnapshot,
+  root: EventGameRecordRoot,
+  interpretation: ControlAction["interpretation"],
+): readonly string[] {
+  if (interpretation.type !== "correction") return [];
+  const target = findFactById(transaction.listActions(root.recordId), interpretation.targetFactId);
+  return target === null ? [] : [target.action.operationId];
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }

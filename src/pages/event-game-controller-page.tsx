@@ -424,6 +424,19 @@ export function EventGameControllerPage() {
     });
   }
 
+  function correctFact(factId: string, effective: boolean) {
+    queueIntent({
+      version: LIVE_EVENT_CONTROL_INTENT_VERSION,
+      type: "correct-fact",
+      operationId: crypto.randomUUID(),
+      factId: crypto.randomUUID(),
+      targetFactId: factId,
+      effective,
+      gameTimeMs: projection?.clock.gameTimeMs ?? 0,
+      occurrence: { clientOriginAtMs: Date.now() },
+    });
+  }
+
   function trigger(type: "card" | "timeout" | "suspension" | "result") {
     queueIntent({
       version: LIVE_EVENT_CONTROL_INTENT_VERSION,
@@ -1033,6 +1046,14 @@ export function EventGameControllerPage() {
                   <p className="text-sm text-muted-foreground">
                     Phase: {projection.phase} · Goals: {projection.goalCount}
                   </p>
+                  <p className="text-xs text-muted-foreground">
+                    Timeout: {projection.timeout?.status ?? "inactive"} · Stoppage:{" "}
+                    {projection.stoppage?.status ?? "none"} · Heat:{" "}
+                    {projection.heat?.status ?? "inactive"}
+                    {projection.result === null || projection.result === undefined
+                      ? ""
+                      : " · Result recorded"}
+                  </p>
                   {Object.entries(projection.scoreByGameSide).map(([gameSideId, score]) => (
                     <div key={gameSideId} className="flex items-center justify-between gap-3">
                       <span className="font-medium">Game Side {gameSideId}</span>
@@ -1044,6 +1065,38 @@ export function EventGameControllerPage() {
                       </div>
                     </div>
                   ))}
+                  <div className="space-y-2 rounded-lg border p-3">
+                    <p className="text-sm font-medium">Game Facts</p>
+                    {(projection.gameFacts ?? []).length === 0 ? (
+                      <p className="text-sm text-muted-foreground">No Game Facts recorded.</p>
+                    ) : (
+                      (projection.gameFacts ?? []).map((fact) => (
+                        <div
+                          key={fact.factId}
+                          data-game-fact-id={fact.factId}
+                          className="flex items-center justify-between gap-3 text-sm"
+                        >
+                          <span className="min-w-0">
+                            <span className="font-medium">{fact.factType}</span>
+                            <code className="ml-2 text-xs text-muted-foreground">
+                              {fact.factId}
+                            </code>
+                            <span className="ml-2 text-xs text-muted-foreground">
+                              sporting {fact.sportingOrder} · sync {fact.synchronizationOrder}
+                            </span>
+                          </span>
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            onClick={() => correctFact(fact.factId, !fact.effective)}
+                            disabled={busy}
+                          >
+                            {fact.effective ? "Correct" : "Reinstate"}
+                          </Button>
+                        </div>
+                      ))
+                    )}
+                  </div>
                 </div>
               )}
               {replica !== null && replica.pendingActions.length > 0 ? (
