@@ -1,5 +1,11 @@
 # Planned control and recovery security design audit
 
+> **Superseded restore-policy note (issue #81):** PDS-3 below records an earlier planning
+> decision. The accepted implementation contract now excludes all Technical Admin authentication
+> state from Event foundation backups, retains eligible non-Technical-Admin Grants and Grant
+> Sessions, and re-evaluates their current expiry, Game Day, and Game Lock facts during staged
+> restore. PDS-3 remains here only as historical research context.
+
 Audit date: 11 August 2026
 
 Planning ticket: [Audit planned control and recovery security design](https://github.com/netzhuffle/quadball-timer/issues/39)

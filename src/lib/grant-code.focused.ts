@@ -11,6 +11,9 @@ import type { GrantAdmissionMode } from "@/lib/grant-types";
 import type { GrantAuthorityOptions } from "@/lib/grant-authority";
 import { lockControlGrantEventGame } from "@/lib/grant-management-sessions";
 import { validateGrantState } from "@/lib/grant-state-validation";
+import { FOUNDATION_MIGRATIONS } from "@/lib/foundation-migrations";
+
+const CURRENT_SCHEMA_VERSION = String(FOUNDATION_MIGRATIONS.at(-1)?.schemaVersion ?? 0);
 
 describe("focused SQLite Grant Code integration", () => {
   test("survives restart and freezes same-length ciphertext and anchor tampering", async () => {
@@ -43,7 +46,10 @@ describe("focused SQLite Grant Code integration", () => {
 
       const restarted = openSqliteFoundationStorage(databasePath, { grantKeyRing: keyRing });
       createTypedGrantAuthority(restarted, createOptions(keyRing, 902));
-      expect(await restarted.readiness()).toMatchObject({ ok: true, schemaVersion: "21" });
+      expect(await restarted.readiness()).toMatchObject({
+        ok: true,
+        schemaVersion: CURRENT_SCHEMA_VERSION,
+      });
       const stored = await restarted.transaction((transaction) =>
         transaction.findGrantById(grantId),
       );
@@ -244,7 +250,10 @@ describe("focused SQLite Grant Code integration", () => {
         ...createOptions(keyRing, 910),
         clock: { nowMs: () => nowMs },
       });
-      expect(await restarted.readiness()).toMatchObject({ ok: true, schemaVersion: "21" });
+      expect(await restarted.readiness()).toMatchObject({
+        ok: true,
+        schemaVersion: CURRENT_SCHEMA_VERSION,
+      });
       const state = await restarted.transaction((transaction) => ({
         grant: transaction.findGrantById(created.grantId),
         audit: transaction.listGrantAudit(created.grantId),
@@ -343,7 +352,10 @@ describe("focused SQLite Grant Code integration", () => {
         restarted,
         createOptions(keyRing, 912, () => nowMs),
       );
-      expect(await restarted.readiness()).toMatchObject({ ok: true, schemaVersion: "21" });
+      expect(await restarted.readiness()).toMatchObject({
+        ok: true,
+        schemaVersion: CURRENT_SCHEMA_VERSION,
+      });
       expect(
         await reopened.admitGrant({
           qrCredential: created.qrCredential,
@@ -449,7 +461,10 @@ describe("focused SQLite Grant Code integration", () => {
         ...options,
         randomness: createGrantTestRandomness(9999),
       });
-      expect(await restarted.readiness()).toMatchObject({ ok: true, schemaVersion: "21" });
+      expect(await restarted.readiness()).toMatchObject({
+        ok: true,
+        schemaVersion: CURRENT_SCHEMA_VERSION,
+      });
 
       expect(await reopened.reactivateGrant(reactivation.grantId, management)).toMatchObject({
         status: "updated",
@@ -577,7 +592,10 @@ describe("focused SQLite Grant Code integration", () => {
           ...options,
           randomness: createGrantTestRandomness(915),
         });
-        expect(await finalRestart.readiness()).toMatchObject({ ok: true, schemaVersion: "21" });
+        expect(await finalRestart.readiness()).toMatchObject({
+          ok: true,
+          schemaVersion: CURRENT_SCHEMA_VERSION,
+        });
         expect(
           await finalRestart.transaction((transaction) =>
             transaction.findGrantById(dueLock.grantId),
@@ -681,7 +699,10 @@ describe("focused SQLite Grant Code integration", () => {
 
       const restarted = openSqliteFoundationStorage(databasePath, { grantKeyRing: keyRing });
       const reopened = createTypedGrantAuthority(restarted, createOptions(keyRing, 1307));
-      expect(await restarted.readiness()).toMatchObject({ ok: true, schemaVersion: "21" });
+      expect(await restarted.readiness()).toMatchObject({
+        ok: true,
+        schemaVersion: CURRENT_SCHEMA_VERSION,
+      });
       expect(
         await reopened.admitGrantCode({ grantCode: scenario.code, browserContext: "old-code" }),
       ).toMatchObject({ status: "rejected" });
@@ -714,7 +735,10 @@ describe("focused SQLite Grant Code integration", () => {
 
       const restartedAgain = openSqliteFoundationStorage(databasePath, { grantKeyRing: keyRing });
       const reopenedAgain = createTypedGrantAuthority(restartedAgain, createOptions(keyRing, 1308));
-      expect(await restartedAgain.readiness()).toMatchObject({ ok: true, schemaVersion: "21" });
+      expect(await restartedAgain.readiness()).toMatchObject({
+        ok: true,
+        schemaVersion: CURRENT_SCHEMA_VERSION,
+      });
       expect(
         await reopenedAgain.admitGrantCode({
           grantCode: scenario.code,
@@ -943,7 +967,10 @@ describe("focused SQLite Grant Code integration", () => {
 
         const restarted = openSqliteFoundationStorage(databasePath, { grantKeyRing: keyRing });
         createTypedGrantAuthority(restarted, options);
-        expect(await restarted.readiness()).toMatchObject({ ok: true, schemaVersion: "21" });
+        expect(await restarted.readiness()).toMatchObject({
+          ok: true,
+          schemaVersion: CURRENT_SCHEMA_VERSION,
+        });
         const state = await restarted.transaction((transaction) => ({
           grant: transaction.findGrantById(scenario.grantId),
           sessions: transaction.listGrantSessions(scenario.grantId),
@@ -1004,7 +1031,10 @@ describe("focused SQLite Grant Code integration", () => {
 
         const restarted = openSqliteFoundationStorage(databasePath, { grantKeyRing: keyRing });
         createTypedGrantAuthority(restarted, createOptions(keyRing, 1601 + index));
-        expect(await restarted.readiness()).toMatchObject({ ok: true, schemaVersion: "21" });
+        expect(await restarted.readiness()).toMatchObject({
+          ok: true,
+          schemaVersion: CURRENT_SCHEMA_VERSION,
+        });
         const state = await restarted.transaction((transaction) => ({
           grant: transaction.findGrantById(scenario.grantId),
           sessions: transaction.listGrantSessions(scenario.grantId),
@@ -1166,7 +1196,10 @@ describe("focused SQLite Grant Code integration", () => {
       storage.close();
       storage = openSqliteFoundationStorage(databasePath, { grantKeyRing: keyRing });
       const reopened = createTypedGrantAuthority(storage, createOptions(keyRing, 1313));
-      expect(await storage.readiness()).toMatchObject({ ok: true, schemaVersion: "21" });
+      expect(await storage.readiness()).toMatchObject({
+        ok: true,
+        schemaVersion: CURRENT_SCHEMA_VERSION,
+      });
       const fresh = await reopened.createGrantCode(scenario.grantId, {
         kind: "grant-session",
         sessionBearer: scenario.adminBearer,
@@ -1255,7 +1288,10 @@ describe("focused SQLite Grant Code integration", () => {
 
       const restarted = openSqliteFoundationStorage(databasePath, { grantKeyRing: keyRing });
       const reopened = createTypedGrantAuthority(restarted, createOptions(keyRing, 1001));
-      expect(await restarted.readiness()).toMatchObject({ ok: true, schemaVersion: "21" });
+      expect(await restarted.readiness()).toMatchObject({
+        ok: true,
+        schemaVersion: CURRENT_SCHEMA_VERSION,
+      });
       expect(
         await reopened.admitGrant({
           qrCredential: scenario.qrCredential,
@@ -1340,9 +1376,10 @@ async function createGrantCodeScenario(
   expiresAtMs?: number,
   suffix = "",
 ): Promise<{ grantId: string; qrCredential: string; code: string; adminBearer: string }> {
+  const eventId = `event-focused-code${suffix}`;
   const admin = await authority.createEventAdminGrant({
     authority: { kind: "technical-admin", id: "tech" },
-    scope: { eventId: "event-focused-code", eventTimeZone: "UTC", finalGameDayDate: "2026-03-20" },
+    scope: { eventId, eventTimeZone: "UTC", finalGameDayDate: "2026-03-20" },
   });
   if (admin.status !== "created") throw new Error("Expected Event Admin Grant.");
   const session = await authority.admitGrant({
@@ -1353,7 +1390,7 @@ async function createGrantCodeScenario(
   const grant = await authority.createControlGrant({
     authority: { kind: "grant-session", sessionBearer: session.sessionBearer },
     scope: {
-      eventId: "event-focused-code",
+      eventId,
       gameDayId: "day",
       pitchId: `pitch${suffix}`,
       pitchSlotId: `slot${suffix}`,

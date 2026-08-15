@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite";
 import {
   closeSync,
+  chmodSync,
   fsyncSync,
   lstatSync,
   openSync,
@@ -51,6 +52,12 @@ import {
   type MigrationReadiness,
 } from "@/lib/foundation-migrations";
 import { verifyFoundationSchema, readValidatedFoundationRoot } from "@/lib/foundation-schema";
+import {
+  FOUNDATION_BACKUP_POLICY,
+  inspectRecoveryDatabase,
+  quoteRecoverySqliteString,
+  type RecoverySnapshotFacts,
+} from "@/lib/foundation-recovery-sqlite";
 import {
   FoundationStorageClosedError,
   FoundationStorageConstraintError,
@@ -368,10 +375,6 @@ function emptyKeyCounts(): FoundationStorageKeyCounts {
   return { encryption: 0, lookup: 0, audit: 0 };
 }
 
-function keyCategory(kind: "e" | "l" | "a"): FoundationStorageKeyCategory {
-  return kind === "e" ? "encryption" : kind === "l" ? "lookup" : "audit";
-}
-
 function extractIntegrityKeyVersion(value: unknown): string | null {
   if (typeof value !== "string") return null;
   const match = /^hmac-sha256-v1:([^:]{1,64}):[^:]{1,256}$/.exec(value);
@@ -628,6 +631,58 @@ export class SqliteFoundationStorage implements FoundationStorage {
     if (this.closed) return;
     this.closed = true;
     this.database.close();
+  }
+
+  /**
+   * Recovery-only seam. The writer queue drains before the snapshot and remains
+   * held until VACUUM INTO has fixed the complete SQLite image.
+   */
+  createRecoveryVacuumSnapshot(destinationPath: string): Promise<RecoverySnapshotFacts> {
+    return this.enqueue(() => {
+      if (this.databasePath === ":memory:") {
+        throw new Error("A file-backed database is required for recovery snapshots.");
+      }
+      if (this.unsafeFailure === "corruption") {
+        throw new FoundationStorageNotReadyError(this.readinessSync());
+      }
+      const facts = inspectRecoveryDatabase(this.database, FOUNDATION_BACKUP_POLICY);
+      const previousUmask = process.umask(0o177);
+      try {
+        this.database.exec(`VACUUM INTO ${quoteRecoverySqliteString(destinationPath)};`);
+      } finally {
+        process.umask(previousUmask);
+      }
+      // The destination lives in the recovery-owned 0700 workspace. Tighten
+      // and verify the raw unsanitized image before yielding the writer queue.
+      chmodSync(destinationPath, 0o600);
+      return facts;
+    });
+  }
+
+  /** Drain authoritative work and close the handle before a staged replacement. */
+  quiesceForRecovery(): Promise<void> {
+    const queued = this.writerTail.then(() => {
+      this.assertOpen();
+      if (this.unsafeFailure !== "corruption") {
+        const checkpoint = this.database.query("PRAGMA wal_checkpoint(TRUNCATE)").get() as {
+          busy?: number | bigint;
+        } | null;
+        if (Number(checkpoint?.busy ?? 0) !== 0) {
+          throw new Error("SQLite recovery quiescence could not checkpoint the WAL.");
+        }
+        const journalMode = readText(this.database.query("PRAGMA journal_mode = DELETE").get());
+        if (journalMode.toLowerCase() !== "delete") {
+          throw new Error("SQLite recovery quiescence could not seal a portable database image.");
+        }
+      }
+      this.closed = true;
+      this.database.close();
+    });
+    this.writerTail = queued.then(
+      () => undefined,
+      () => undefined,
+    );
+    return queued;
   }
 
   setGrantKeyRing(keyRing: GrantKeyRing): void {
@@ -1856,7 +1911,7 @@ export class SqliteFoundationStorage implements FoundationStorage {
     const keyRing = this.grantValidationContext.keyRing;
     const required = new Set<string>();
     const requiredCategories = emptyKeyCounts();
-    const addRequired = (kind: "e" | "l" | "a", version: string | null): void => {
+    const addRequired = (category: FoundationStorageKeyCategory, version: string | null): void => {
       if (
         typeof version !== "string" ||
         version.length === 0 ||
@@ -1864,66 +1919,63 @@ export class SqliteFoundationStorage implements FoundationStorage {
         !/^[A-Za-z0-9._-]+$/.test(version)
       )
         return;
-      const key = `${kind}:${version}`;
+      const key = `${category}:${version}`;
       if (required.has(key)) return;
       required.add(key);
-      requiredCategories[keyCategory(kind)] += 1;
+      requiredCategories[category] += 1;
     };
     for (const grant of listGrants(this.getGrantStatements().allGrants)) {
       if (grant.credential.materialState === "present") {
-        addRequired("e", grant.credential.encryptionKeyVersion);
-        addRequired("l", grant.credential.lookupKeyVersion);
+        addRequired("encryption", grant.credential.encryptionKeyVersion);
+        addRequired("lookup", grant.credential.lookupKeyVersion);
       }
       if (grant.code !== null && grant.code !== undefined && grant.code.state !== "erased") {
-        addRequired("e", grant.code.encryptionKeyVersion);
-        addRequired("a", grant.code.lookupKeyVersion);
+        addRequired("encryption", grant.code.encryptionKeyVersion);
+        addRequired("audit", grant.code.lookupKeyVersion);
       }
       for (const session of listGrantSessions(
         this.getGrantStatements().sessionsByGrant,
         grant.grantId,
       )) {
-        addRequired("l", session.browserContextKeyVersion);
+        addRequired("lookup", session.browserContextKeyVersion);
         if (session.bearerMaterialState === "present")
-          addRequired("l", session.bearerLookupKeyVersion);
+          addRequired("lookup", session.bearerLookupKeyVersion);
       }
     }
     for (const row of this.database
       .query("SELECT audit_integrity_tag FROM foundation_grant_audit")
       .all() as unknown[]) {
-      addRequired("a", extractIntegrityKeyVersion(asRecord(row).audit_integrity_tag));
+      addRequired("audit", extractIntegrityKeyVersion(asRecord(row).audit_integrity_tag));
     }
     for (const row of this.database
       .query("SELECT integrity_tag FROM foundation_grant_state_anchors")
       .all() as unknown[]) {
-      addRequired("a", extractIntegrityKeyVersion(asRecord(row).integrity_tag));
+      addRequired("audit", extractIntegrityKeyVersion(asRecord(row).integrity_tag));
     }
     for (const row of this.database
       .query("SELECT integrity_tag FROM foundation_grant_admission_state_anchors")
       .all() as unknown[]) {
-      addRequired("a", extractIntegrityKeyVersion(asRecord(row).integrity_tag));
+      addRequired("audit", extractIntegrityKeyVersion(asRecord(row).integrity_tag));
     }
     for (const row of this.database
       .query("SELECT key_version FROM foundation_acceptance_integrity_anchors")
       .all() as unknown[]) {
-      addRequired("a", readNullableTextValue(asRecord(row).key_version));
+      addRequired("audit", readNullableTextValue(asRecord(row).key_version));
     }
     for (const row of this.database
       .query("SELECT receipt_key_version FROM foundation_replay_receipts")
       .all() as unknown[]) {
-      addRequired("a", readNullableTextValue(asRecord(row).receipt_key_version));
+      addRequired("audit", readNullableTextValue(asRecord(row).receipt_key_version));
     }
     const availableCategories = emptyKeyCounts();
     const available = [...required].filter((key) => {
-      const [kind, version] = key.split(":");
+      const [category, version] = key.split(":") as [
+        FoundationStorageKeyCategory,
+        string | undefined,
+      ];
       if (version === undefined) return false;
-      const available =
-        keyRing !== undefined &&
-        (kind === "e"
-          ? keyRing.encryption.keys.has(version)
-          : kind === "a"
-            ? keyRing.audit.keys.has(version)
-            : keyRing.lookup.keys.has(version));
-      if (available) availableCategories[keyCategory(kind as "e" | "l" | "a")] += 1;
+      const available = keyRing !== undefined && keyRing[category].keys.has(version);
+      if (available) availableCategories[category] += 1;
       return available;
     }).length;
     const missingCategories = emptyKeyCounts();

@@ -1424,6 +1424,105 @@ describe("Grant Codes", () => {
     ).toBeNull();
   });
 
+  test("terminates reused Control Grant sessions for multiple exact Game locks and erases its Code once", async () => {
+    const storage = createInMemoryFoundationStorage();
+    let currentEventGameId = "game-a";
+    let lockEventGameId = "game-a";
+    const options = createOptions({
+      resolve: () => ({ status: "eligible" as const, eventGameId: currentEventGameId }),
+      resolveSession: (_scope, sessionEventGameId) => ({
+        status: "current" as const,
+        eventGameId: sessionEventGameId,
+      }),
+      resolveEventGameLock: () => ({ eventGameId: lockEventGameId, apply: () => {} }),
+    });
+    const authority = createTypedGrantAuthority(storage, options);
+    const admin = await authority.createEventAdminGrant({
+      authority: { kind: "technical-admin", id: "tech" },
+      scope: {
+        eventId: "event-multi-lock",
+        eventTimeZone: "UTC",
+        finalGameDayDate: "2026-03-20",
+      },
+    });
+    if (admin.status !== "created") throw new Error("Expected Event Admin Grant.");
+    const adminSession = await authority.admitGrant({
+      qrCredential: admin.qrCredential,
+      browserContext: "multi-lock-admin",
+    });
+    if (adminSession.status !== "admitted") throw new Error("Expected Event Admin Session.");
+    const grant = await authority.createControlGrant({
+      authority: { kind: "grant-session", sessionBearer: adminSession.sessionBearer },
+      scope: {
+        eventId: "event-multi-lock",
+        gameDayId: "day-multi-lock",
+        pitchId: "pitch-multi-lock",
+        pitchSlotId: "slot-multi-lock",
+      },
+    });
+    if (grant.status !== "created") throw new Error("Expected Control Grant.");
+    const code = await authority.createGrantCode(grant.grantId, {
+      kind: "grant-session",
+      sessionBearer: adminSession.sessionBearer,
+    });
+    if (code.status !== "created") throw new Error("Expected Grant Code.");
+    const gameA = await authority.admitGrant({
+      qrCredential: grant.qrCredential,
+      browserContext: "multi-lock-game-a",
+    });
+    if (gameA.status !== "admitted") throw new Error("Expected Game A Session.");
+    currentEventGameId = "game-b";
+    const gameB = await authority.admitGrant({
+      qrCredential: grant.qrCredential,
+      browserContext: "multi-lock-game-b",
+    });
+    if (gameB.status !== "admitted") throw new Error("Expected Game B Session.");
+
+    currentEventGameId = "game-a";
+    lockEventGameId = "game-a";
+    expect(await lockControlGrantEventGame(storage, options, { accepted: true })).toMatchObject({
+      status: "locked",
+      eventGameId: "game-a",
+      terminatedSessionCount: 1,
+    });
+    currentEventGameId = "game-b";
+    lockEventGameId = "game-b";
+    expect(await lockControlGrantEventGame(storage, options, { accepted: true })).toMatchObject({
+      status: "locked",
+      eventGameId: "game-b",
+      terminatedSessionCount: 1,
+    });
+    const state = await storage.transaction((transaction) => ({
+      grant: transaction.findGrantById(grant.grantId),
+      sessions: transaction.listGrantSessions(grant.grantId),
+      audit: transaction.listGrantAudit(grant.grantId),
+    }));
+    expect(
+      state.sessions
+        .filter(
+          (session) =>
+            session.sessionId === gameA.grantSessionId ||
+            session.sessionId === gameB.grantSessionId,
+        )
+        .map((session) => [session.eventGameId, session.status]),
+    ).toEqual(
+      expect.arrayContaining([
+        ["game-a", "expired"],
+        ["game-b", "expired"],
+      ]),
+    );
+    expect(state.grant?.code).toMatchObject({ state: "erased", ciphertext: null });
+    expect(state.audit.filter((entry) => entry.action === "grant-code-erased-game-lock")).toEqual([
+      expect.objectContaining({ eventGameId: "game-a", codeState: "erased" }),
+    ]);
+    expect(
+      validateGrantState([state.grant!], state.sessions, state.audit, {
+        environmentId: options.environmentId,
+        keyRing: options.keyRing,
+      }),
+    ).toBeNull();
+  });
+
   test("terminates the active session after a same-version key rewrap", async () => {
     const storage = createInMemoryFoundationStorage();
     const options = createOptions({
