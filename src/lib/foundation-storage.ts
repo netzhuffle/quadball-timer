@@ -16,6 +16,11 @@ import type {
   StoredGrantSession,
 } from "@/lib/grant-types";
 import type { GrantStateValidationContext } from "@/lib/grant-state-validation";
+import type {
+  StoredGamePresentationAuditEntry,
+  StoredGamePresentationAuditRevision,
+  StoredGamePresentationChange,
+} from "@/lib/game-presentation";
 
 export type StoredEventGameRecordRoot = {
   root: EventGameRecordRoot;
@@ -389,6 +394,12 @@ export type FoundationStorageSnapshot = {
   listIdempotencyEntries(recordId: string): StoredControlIdempotencyEntry[];
   readRecordMetadata(recordId: string): StoredEventGameRecordMetadata | null;
   listAuditEntries(recordId: string): StoredControlAuditEntry[];
+  findPresentationChangeByOperationId?(
+    recordId: string,
+    operationId: string,
+  ): StoredGamePresentationChange | null;
+  listPresentationChanges?(recordId: string): StoredGamePresentationChange[];
+  listPresentationAuditEntries?(recordId: string): StoredGamePresentationAuditEntry[];
   findGrantById(grantId: string): StoredGrant | null;
   listGrants(): StoredGrant[];
   findGrantByCredentialLookupDigest(lookupDigest: string): StoredGrant | null;
@@ -461,6 +472,10 @@ export type FoundationStorageTransaction = FoundationStorageSnapshot & {
   insertAction(action: StoredControlAction): void;
   upsertRecordMetadata(metadata: StoredEventGameRecordMetadata): void;
   appendAuditEntry(entry: StoredControlAuditEntry): void;
+  insertPresentationChange?(change: StoredGamePresentationChange): void;
+  appendPresentationAuditEntry?(entry: StoredGamePresentationAuditEntry): void;
+  appendPresentationAuditRevision?(entry: StoredGamePresentationAuditRevision): void;
+  sealPresentationEvidence?(recordId: string): void;
   insertGrant(grant: StoredGrant): void;
   updateGrant(grant: StoredGrant): void;
   insertGrantSession(session: StoredGrantSession): void;
@@ -636,6 +651,7 @@ export type FoundationStorageConstraint =
   | "pitch-slot-id"
   | "game-side-id"
   | "operation-id"
+  | "presentation-change-id"
   | "audit-id"
   | "grant-id"
   | "grant-version"

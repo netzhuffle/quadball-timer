@@ -1883,6 +1883,75 @@ export const FOUNDATION_EVENT_SCHEDULE_EXPECTED_DELAYS_MIGRATION_SQL = `
   ${FOUNDATION_EVENT_CATALOG_GAMES_INDEX_SQL};
 `;
 
+/** Schema-27 publishes the Foundation-owned Game Presentation evidence contract. */
+export const FOUNDATION_PRESENTATION_INTEGRITY_MIGRATION_SQL = `
+  CREATE TABLE foundation_event_game_presentation_changes (
+    record_id TEXT NOT NULL REFERENCES foundation_event_game_record_roots(record_id) ON DELETE CASCADE,
+    event_game_id TEXT NOT NULL,
+    operation_id TEXT NOT NULL,
+    presentation_change_id TEXT NOT NULL,
+    change_json TEXT NOT NULL CHECK (json_valid(change_json)),
+    causal_predecessor_ids_json TEXT NOT NULL CHECK (json_valid(causal_predecessor_ids_json)),
+    occurrence_json TEXT NOT NULL CHECK (json_valid(occurrence_json)),
+    grant_json TEXT NOT NULL CHECK (json_valid(grant_json)),
+    accepted_at_ms INTEGER NOT NULL,
+    canonical_content TEXT NOT NULL,
+    content_fingerprint TEXT NOT NULL CHECK (length(content_fingerprint) = 64),
+    PRIMARY KEY (record_id, operation_id),
+    UNIQUE (record_id, presentation_change_id),
+    UNIQUE (record_id, content_fingerprint),
+    CHECK (event_game_id <> '')
+  ) STRICT;
+  CREATE INDEX foundation_event_game_presentation_changes_record_id
+    ON foundation_event_game_presentation_changes (record_id, accepted_at_ms, operation_id);
+  CREATE TABLE foundation_event_game_presentation_audit (
+    audit_id TEXT PRIMARY KEY,
+    record_id TEXT NOT NULL REFERENCES foundation_event_game_record_roots(record_id) ON DELETE CASCADE,
+    event_game_id TEXT NOT NULL,
+    operation_id TEXT,
+    presentation_change_id TEXT,
+    audit_kind TEXT NOT NULL CHECK (audit_kind IN ('presentation-accepted', 'presentation-duplicate', 'presentation-conflict', 'presentation-rejected')),
+    outcome TEXT NOT NULL CHECK (outcome IN ('accepted', 'duplicate-accepted', 'rejected')),
+    created_at_ms INTEGER NOT NULL,
+    redacted_detail TEXT NOT NULL,
+    change_json TEXT,
+    grant_json TEXT,
+    supersedes_audit_id TEXT,
+    audit_json TEXT NOT NULL CHECK (json_valid(audit_json)),
+    CHECK (event_game_id <> '')
+  ) STRICT;
+  CREATE INDEX foundation_event_game_presentation_audit_record_id
+    ON foundation_event_game_presentation_audit (record_id, created_at_ms, audit_id);
+  CREATE INDEX foundation_event_game_presentation_audit_supersedes
+    ON foundation_event_game_presentation_audit (record_id, supersedes_audit_id);
+  CREATE TABLE foundation_event_game_presentation_integrity (
+    record_id TEXT NOT NULL REFERENCES foundation_event_game_record_roots(record_id) ON DELETE CASCADE,
+    state_revision INTEGER NOT NULL CHECK (state_revision > 0),
+    key_version TEXT NOT NULL,
+    canonical_value TEXT NOT NULL CHECK (json_valid(canonical_value)),
+    integrity_tag TEXT NOT NULL,
+    PRIMARY KEY (record_id, state_revision)
+  ) STRICT;
+  CREATE TRIGGER foundation_event_game_presentation_changes_no_update
+    BEFORE UPDATE ON foundation_event_game_presentation_changes
+    BEGIN SELECT RAISE(ABORT, 'Game Presentation Changes are immutable.'); END;
+  CREATE TRIGGER foundation_event_game_presentation_changes_no_delete
+    BEFORE DELETE ON foundation_event_game_presentation_changes
+    BEGIN SELECT RAISE(ABORT, 'Game Presentation Changes are immutable.'); END;
+  CREATE TRIGGER foundation_event_game_presentation_audit_no_update
+    BEFORE UPDATE ON foundation_event_game_presentation_audit
+    BEGIN SELECT RAISE(ABORT, 'Game Presentation audit evidence is immutable.'); END;
+  CREATE TRIGGER foundation_event_game_presentation_audit_no_delete
+    BEFORE DELETE ON foundation_event_game_presentation_audit
+    BEGIN SELECT RAISE(ABORT, 'Game Presentation audit evidence is immutable.'); END;
+  CREATE TRIGGER foundation_event_game_presentation_integrity_no_update
+    BEFORE UPDATE ON foundation_event_game_presentation_integrity
+    BEGIN SELECT RAISE(ABORT, 'Game Presentation evidence anchors are immutable.'); END;
+  CREATE TRIGGER foundation_event_game_presentation_integrity_no_delete
+    BEFORE DELETE ON foundation_event_game_presentation_integrity
+    BEGIN SELECT RAISE(ABORT, 'Game Presentation evidence anchors are immutable.'); END;
+`;
+
 export const FOUNDATION_MIGRATIONS: readonly FoundationMigration[] = Object.freeze([
   createMigration({
     id: "001-foundation-event-game-record-roots",
@@ -2039,6 +2108,12 @@ export const FOUNDATION_MIGRATIONS: readonly FoundationMigration[] = Object.free
     ordinal: 26,
     schemaVersion: 26,
     sql: FOUNDATION_EVENT_SCHEDULE_EXPECTED_DELAYS_MIGRATION_SQL,
+  }),
+  createMigration({
+    id: "027-event-game-presentation-integrity",
+    ordinal: 27,
+    schemaVersion: 27,
+    sql: FOUNDATION_PRESENTATION_INTEGRITY_MIGRATION_SQL,
   }),
 ]);
 

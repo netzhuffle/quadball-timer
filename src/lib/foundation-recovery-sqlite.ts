@@ -22,6 +22,9 @@ const INCLUDED_RELATIONS = Object.freeze([
   "foundation_event_catalog_gameplay_slots",
   "foundation_event_catalog_pitch_slots",
   "foundation_event_catalog_games",
+  "foundation_event_game_presentation_changes",
+  "foundation_event_game_presentation_audit",
+  "foundation_event_game_presentation_integrity",
   "foundation_event_game_record_actions",
   "foundation_event_game_record_audit",
   "foundation_event_game_record_idempotency",
@@ -215,6 +218,12 @@ export function readRepresentedKeyVersions(database: Database): RepresentedKeyVe
   if (relations.has("foundation_replay_receipts")) {
     for (const row of database
       .query("SELECT receipt_key_version AS value FROM foundation_replay_receipts")
+      .all() as Array<{ value: unknown }>)
+      add(audit, row.value);
+  }
+  if (relations.has("foundation_event_game_presentation_integrity")) {
+    for (const row of database
+      .query("SELECT key_version AS value FROM foundation_event_game_presentation_integrity")
       .all() as Array<{ value: unknown }>)
       add(audit, row.value);
   }

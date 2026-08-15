@@ -611,6 +611,7 @@ export function registerGrantAuthorityContract(
         grantId: created.grantId,
         grantVersion: created.grantVersion,
         grantSessionId: admitted.grantSessionId,
+        replayProvenanceProof: admitted.replayProvenanceProof,
         previousEventGameId: "game-1",
         eventGameId: "game-2",
       });
@@ -846,6 +847,7 @@ export function registerGrantAuthorityContract(
           await authority.authorizeControlGrantReplay({
             sessionBearer: replacement.sessionBearer,
             originatingSessionId: replacement.grantSessionId,
+            originatingSessionProof: replacement.replayProvenanceProof,
             eventGameId: "game-1",
             replayEvidenceId,
           }),
@@ -854,6 +856,7 @@ export function registerGrantAuthorityContract(
           await authority.authorizeControlGrantReplay({
             sessionBearer: replacement.sessionBearer,
             originatingSessionId: originating.grantSessionId,
+            originatingSessionProof: originating.replayProvenanceProof,
             eventGameId: "game-1",
             replayEvidenceId,
           }),
@@ -871,6 +874,7 @@ export function registerGrantAuthorityContract(
           await authority.authorizeControlGrantReplay({
             sessionBearer: replacement.sessionBearer,
             originatingSessionId: unrelated.grantSessionId,
+            originatingSessionProof: unrelated.replayProvenanceProof,
             eventGameId: "game-1",
             replayEvidenceId: "unrelated-content",
           }),
@@ -879,6 +883,7 @@ export function registerGrantAuthorityContract(
           await authority.authorizeControlGrantReplay({
             sessionBearer: replacement.sessionBearer,
             originatingSessionId: originating.grantSessionId,
+            originatingSessionProof: originating.replayProvenanceProof,
             eventGameId: "game-1",
             replayEvidenceId,
           }),
@@ -937,6 +942,7 @@ export function registerGrantAuthorityContract(
           await authority.authorizeControlGrantReplay({
             sessionBearer: replacement.sessionBearer,
             originatingSessionId: originating.grantSessionId,
+            originatingSessionProof: originating.replayProvenanceProof,
             eventGameId: "game-1",
             replayEvidenceId,
           }),
@@ -968,6 +974,7 @@ export function registerGrantAuthorityContract(
           await authority.authorizeControlGrantReplay({
             sessionBearer: postRotation.sessionBearer,
             originatingSessionId: originating.grantSessionId,
+            originatingSessionProof: originating.replayProvenanceProof,
             eventGameId: "game-1",
             replayEvidenceId,
           }),
@@ -976,6 +983,7 @@ export function registerGrantAuthorityContract(
           await authority.authorizeControlGrantReplay({
             sessionBearer: postRotation.sessionBearer,
             originatingSessionId: originating.grantSessionId,
+            originatingSessionProof: originating.replayProvenanceProof,
             eventGameId: "game-2",
             replayEvidenceId,
           }),
@@ -996,6 +1004,7 @@ export function registerGrantAuthorityContract(
           await authority.authorizeControlGrantReplay({
             sessionBearer: postRotation.sessionBearer,
             originatingSessionId: otherOrigin.grantSessionId,
+            originatingSessionProof: otherOrigin.replayProvenanceProof,
             eventGameId: "game-1",
             replayEvidenceId,
           }),
@@ -1024,6 +1033,7 @@ export function registerGrantAuthorityContract(
           await authority.authorizeControlGrantReplay({
             sessionBearer: revokedReplacement.sessionBearer,
             originatingSessionId: revokedOrigin.grantSessionId,
+            originatingSessionProof: revokedOrigin.replayProvenanceProof,
             eventGameId: "game-1",
             replayEvidenceId,
           }),
@@ -1035,6 +1045,7 @@ export function registerGrantAuthorityContract(
           await unavailableReplayAuthority.authorizeControlGrantReplay({
             sessionBearer: postRotation.sessionBearer,
             originatingSessionId: originating.grantSessionId,
+            originatingSessionProof: originating.replayProvenanceProof,
             eventGameId: "game-1",
             replayEvidenceId,
           }),

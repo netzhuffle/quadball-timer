@@ -368,6 +368,7 @@ export async function admitGrantCode(
         eventGameId,
         grantSessionId: session.sessionId,
         sessionBearer: bearer,
+        replayProvenanceProof: session.bearerLookupVerifier!,
         sessionExpiresAtMs: sessionExpiresAtMsForGrant(grant, nowMs),
       };
     });
