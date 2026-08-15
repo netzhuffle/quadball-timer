@@ -10,8 +10,10 @@ import {
   type FoundationStorage,
   type FoundationStorageSnapshot,
   type FoundationStorageTransaction,
+  type EventCatalogAuditEntry,
   type StoredControlAction,
 } from "@/lib/foundation-storage";
+import type { StoredGrantAuditEntry } from "@/lib/grant-types";
 import {
   ACCEPTED_AUDIT_DETAIL,
   acceptedAuditId,
@@ -48,6 +50,7 @@ import {
   type EffectiveGameSideAssignment,
   type IqaGameRulesInterpreter,
   sha256,
+  type PreparedControlAction,
 } from "@/lib/event-game-actions";
 import {
   canonicalizeGamePresentationChange,
@@ -163,6 +166,45 @@ export type EventGameRecordOptions = {
   actionCodecRegistry?: ControlActionCodecRegistry;
   interpreter?: IqaGameRulesInterpreter;
   auditAuthorityVerifier?: ControlAuditAuthorityVerifier;
+  actionAcceptanceGuard?: (
+    transaction: FoundationStorageTransaction,
+    root: EventGameRecordRoot,
+    input: unknown,
+  ) =>
+    | { status: "accepted" }
+    | {
+        status: "rejected";
+        reason: Extract<ControlActionAcceptanceOutcome, { status: "rejected" }>["reason"];
+        detail: string;
+      };
+  acceptedLifecycleTransition?: (input: {
+    transaction: FoundationStorageTransaction;
+    root: EventGameRecordRoot;
+    action: ControlAction;
+    audit: ControlAuditEntry;
+  }) =>
+    | {
+        status: "updated";
+        root: EventGameRecordRoot;
+        applyAfterRootUpdate?: (transaction: FoundationStorageTransaction) => void;
+        eventAudit?: EventCatalogAuditEntry;
+        eventAuditId?: string;
+        grantAudits?: readonly StoredGrantAuditEntry[];
+      }
+    | { status: "rejected"; detail: string };
+  acceptedDuplicateActionResolver?: (
+    transaction: FoundationStorageTransaction,
+    root: EventGameRecordRoot,
+    input: unknown,
+    prepared: PreparedControlAction | null,
+  ) => ControlActionAcceptanceOutcome | null;
+  acceptedActionAuditContext?: (input: { root: EventGameRecordRoot; action: ControlAction }) => {
+    linkAcceptance?: boolean;
+    valueChange?: {
+      before: import("@/lib/event-game-actions").ActionJsonValue;
+      after: import("@/lib/event-game-actions").ActionJsonValue;
+    };
+  };
 };
 
 export type RootRegistrationOutcome =
@@ -212,6 +254,7 @@ export type ControlActionAcceptanceOutcome =
       status: "accepted" | "duplicate-accepted";
       action: ControlAction;
       auditId: string;
+      eventAuditId?: string;
     }
   | {
       status: "rejected";
@@ -810,6 +853,20 @@ export function createEventGameRecord(
             } satisfies ControlActionAcceptanceOutcome;
           }
 
+          const earlyPreparation = prepareControlAction(input, root, codecRegistry, nowMs, {
+            allowConcurrentTeamAssignment: true,
+          });
+          const earlyDuplicate = options.acceptedDuplicateActionResolver?.(
+            transaction,
+            root,
+            input,
+            earlyPreparation.ok ? earlyPreparation.value : null,
+          );
+          if (earlyDuplicate !== null && earlyDuplicate !== undefined) return earlyDuplicate;
+
+          const guard = options.actionAcceptanceGuard?.(transaction, root, input);
+          if (guard?.status === "rejected") return guard;
+
           const historyReady =
             verifiedRevision === transaction.revision ||
             rebuildRecordSnapshot(root, transaction, codecRegistry, options.interpreter).status ===
@@ -988,6 +1045,60 @@ export function createEventGameRecord(
               } satisfies ControlActionAcceptanceOutcome;
             }
           }
+          const acceptedAuditContext = options.acceptedActionAuditContext?.({ root, action });
+          const audit = createAuditEntry(
+            prepared.value.input,
+            "action-accepted",
+            ACCEPTED_AUDIT_DETAIL,
+            nowMs,
+            {
+              interpretation: prepared.value.interpretation,
+              relatedOperationIds:
+                correctionTarget === null ? [] : [correctionTarget.action.operationId],
+              valueChange: acceptedAuditContext?.valueChange,
+            },
+          );
+          if (acceptedAuditContext?.linkAcceptance === true) {
+            audit.links ??= {
+              actionId: null,
+              targetFactId: null,
+              causalPredecessorIds: [],
+              relatedOperationIds: [],
+              ordering: null,
+            };
+            audit.links.acceptanceId = `accept-${audit.auditId}`;
+            audit.links.contentFingerprint = prepared.value.contentFingerprint;
+          }
+          const lifecycle = options.acceptedLifecycleTransition?.({
+            transaction,
+            root,
+            action,
+            audit,
+          });
+          if (lifecycle?.status === "rejected") {
+            return {
+              status: "rejected",
+              reason: "invalid-action",
+              detail: lifecycle.detail,
+            } satisfies ControlActionAcceptanceOutcome;
+          }
+          if (lifecycle !== undefined) {
+            const validatedRoot = validateEventGameRecordRoot(lifecycle.root);
+            if (!validatedRoot.ok) {
+              return {
+                status: "rejected",
+                reason: "invalid-action",
+                detail: validatedRoot.error,
+              } satisfies ControlActionAcceptanceOutcome;
+            }
+            if (!sameLifecycleContext(root.lifecycle, validatedRoot.value.lifecycle)) {
+              transaction.updateRoot({
+                root: validatedRoot.value,
+                canonicalContent: canonicalizeEventGameRecordRoot(validatedRoot.value),
+              });
+            }
+            lifecycle.applyAfterRootUpdate?.(transaction);
+          }
           transaction.insertAction({
             action,
             canonicalContent: prepared.value.canonicalContent,
@@ -1006,18 +1117,13 @@ export function createEventGameRecord(
             lastAcceptedAtMs,
             updatedAtMs: lastAcceptedAtMs,
           });
-          const audit = createAuditEntry(
-            prepared.value.input,
-            "action-accepted",
-            ACCEPTED_AUDIT_DETAIL,
-            nowMs,
-            {
-              interpretation: prepared.value.interpretation,
-              relatedOperationIds:
-                correctionTarget === null ? [] : [correctionTarget.action.operationId],
-            },
-          );
           transaction.appendAuditEntry(audit);
+          if (lifecycle?.eventAudit !== undefined) {
+            transaction.appendEventAudit(lifecycle.eventAudit);
+          }
+          for (const grantAudit of lifecycle?.grantAudits ?? []) {
+            transaction.appendGrantAudit(grantAudit);
+          }
           if (
             action.interpretation.type === "correction" ||
             action.interpretation.type === "team-assignment-correction"
@@ -1029,6 +1135,7 @@ export function createEventGameRecord(
             status: "accepted",
             action,
             auditId: audit.auditId,
+            eventAuditId: lifecycle?.eventAuditId,
           } satisfies ControlActionAcceptanceOutcome;
         });
         if (outcome.status === "accepted" && nextVerifiedRevision !== undefined) {

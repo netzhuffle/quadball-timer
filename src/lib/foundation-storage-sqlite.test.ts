@@ -10,7 +10,11 @@ import {
   type FoundationMigration,
 } from "@/lib/foundation-migrations";
 import type { EventGameRecordRoot } from "@/lib/foundation-record-types";
-import { createDeterministicTestIqaInterpreter } from "@/lib/event-game-actions";
+import type { StoredControlAuditEntry } from "@/lib/foundation-storage";
+import {
+  CONTROL_AUDIT_VERSION,
+  createDeterministicTestIqaInterpreter,
+} from "@/lib/event-game-actions";
 import { createFoundationAcceptance } from "@/lib/foundation-acceptance";
 import type { ControlActionInput } from "@/lib/event-game-actions";
 import { createEventGameRecord, type ExternalScopeResolver } from "@/lib/event-game-record";
@@ -36,6 +40,69 @@ async function withDatabase<T>(work: (databasePath: string) => Promise<T>): Prom
 }
 
 describe("SQLite foundation storage", () => {
+  test("round-trips locked correction value-change links through SQLite reopen", async () => {
+    await withDatabase(async (databasePath) => {
+      const entry: StoredControlAuditEntry = {
+        auditVersion: CONTROL_AUDIT_VERSION,
+        auditId: "audit-locked-correction",
+        recordId: "record-locked-correction",
+        eventGameId: "game-locked-correction",
+        operationId: "operation-locked-correction",
+        kind: "action-accepted",
+        outcome: "accepted",
+        createdAtMs: 42,
+        redactedDetail: "",
+        links: {
+          actionId: "action-locked-correction",
+          targetFactId: null,
+          causalPredecessorIds: [],
+          relatedOperationIds: ["operation-locked-correction"],
+          ordering: { trustedAtMs: 42, operationId: "operation-locked-correction" },
+          grantAuditId: "grant-audit-locked-correction",
+          valueChange: {
+            before: { scoreByGameSide: { "side-a": 20, "side-b": 10 }, endTimeMs: 1_000 },
+            after: { scoreByGameSide: { "side-a": 30, "side-b": 10 }, endTimeMs: 1_000 },
+          },
+        },
+        provenance: {
+          occurrence: { trustedAtMs: 42, clientOriginAtMs: 42, source: "online" },
+          grant: null,
+          origin: "event-admin",
+          lifecycle: {
+            phase: "scheduled",
+            commencedAtMs: null,
+            finishedAtMs: null,
+            lockedAtMs: null,
+            lockReason: null,
+          },
+          override: null,
+          recoveryProvenance: null,
+        },
+      };
+      const storage = openSqliteFoundationStorage(databasePath);
+      await storage.applyMigrations({ requireCandidate: false });
+      const root = createRoot(entry.recordId);
+      const record = createEventGameRecord(storage, {
+        externalScopeResolver: createScopeResolver(root),
+        interpreter: createDeterministicTestIqaInterpreter("rules-v1"),
+      });
+      expect(await record.registerRoot(root)).toMatchObject({ status: "registered" });
+      await storage.transaction((transaction) => transaction.appendAuditEntry(entry));
+      expect((await storage.readAuditEntries(entry.recordId))[0]).toMatchObject({
+        auditId: entry.auditId,
+        links: entry.links,
+      });
+      storage.close();
+
+      const reopened = openSqliteFoundationStorage(databasePath, { requireReplayContext: false });
+      expect((await reopened.readAuditEntries(entry.recordId))[0]).toMatchObject({
+        auditId: entry.auditId,
+        links: entry.links,
+      });
+      reopened.close();
+    });
+  });
+
   test("latches an after-COMMIT boundary failure without claiming readiness", async () => {
     await withDatabase(async (databasePath) => {
       let injected = true;
@@ -564,7 +631,7 @@ describe("SQLite foundation storage", () => {
       expect(await reopenedRecord.registerRoot(root)).toMatchObject({ status: "idempotent" });
       expect(await reopened.readiness()).toMatchObject({
         ok: true,
-        schemaVersion: "31",
+        schemaVersion: "32",
         evidence: { replay: { result: "passed", rootCount: 1, durationMs: expect.any(Number) } },
       });
       reopened.close();
@@ -612,21 +679,21 @@ describe("SQLite foundation storage", () => {
       const storage = openSqliteFoundationStorage(databasePath);
       const candidate = await storage.validateCandidate();
       expect(candidate.ready).toBe(true);
-      expect(candidate.readiness).toMatchObject({ ok: true, schemaVersion: "31" });
+      expect(candidate.readiness).toMatchObject({ ok: true, schemaVersion: "32" });
       expect(existsSync(candidate.candidatePath)).toBe(false);
       expect(await storage.readiness()).toMatchObject({ ok: false, status: "pending" });
 
       const migration = await storage.applyMigrations({ requireCandidate: true });
-      expect(migration.schemaVersion).toBe(31);
+      expect(migration.schemaVersion).toBe(32);
       expect(await storage.readiness()).toMatchObject({ ok: true });
       storage.close();
     });
   });
 
-  test("preserves prior Event Catalog audit rows, shape, ordering, index, and FK behavior through Access Sheet migration", async () => {
+  test("preserves prior Event Catalog audit rows, shape, ordering, index, and FK behavior through appended audit migrations", async () => {
     await withDatabase(async (databasePath) => {
       const prior = openSqliteFoundationStorage(databasePath, {
-        migrations: FOUNDATION_MIGRATIONS.slice(0, 27),
+        migrations: FOUNDATION_MIGRATIONS.slice(0, 30),
       });
       await prior.applyMigrations({ requireCandidate: false });
       prior.close();
@@ -723,20 +790,53 @@ describe("SQLite foundation storage", () => {
           JSON.stringify({ kind: "event", eventId: "event-missing-parent-is-allowed" }),
           JSON.stringify(null),
         );
+      const insertNewActions = after.query(
+        `INSERT INTO foundation_event_catalog_audit
+           (audit_id, operation_id, action, event_id, game_day_id, actor_reference,
+            occurred_at_ms, before_json, after_json)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      );
+      for (const [auditId, action] of [
+        ["audit-locked-correction", "locked-game-corrected"],
+        ["audit-game-reopened", "game-reopened"],
+      ] as const) {
+        insertNewActions.run(
+          auditId,
+          `operation-${auditId}`,
+          action,
+          "event-prior",
+          null,
+          "actor-redacted",
+          10_002,
+          JSON.stringify({ controlAuditId: `control-${auditId}` }),
+          JSON.stringify({ controlAuditId: `control-${auditId}` }),
+        );
+      }
+      const newActions = after
+        .query(
+          `SELECT action FROM foundation_event_catalog_audit
+            WHERE audit_id IN (?, ?)
+            ORDER BY audit_id`,
+        )
+        .all("audit-game-reopened", "audit-locked-correction");
       const rows = after
         .query(
           `SELECT audit_id AS auditId, action, event_id AS eventId, occurred_at_ms AS occurredAtMs
              FROM foundation_event_catalog_audit
-            WHERE event_id = ?
+            WHERE event_id = ? AND audit_id IN (?, ?)
             ORDER BY occurred_at_ms, audit_id`,
         )
-        .all("event-prior");
+        .all("event-prior", "audit-a", "audit-b");
       after.close();
 
       expect(currentColumns).toEqual(priorColumns);
       expect(currentForeignKeys).toEqual(priorForeignKeys);
       expect(currentIndexes.map((row) => row.name)).toEqual(priorIndexes.map((row) => row.name));
       expect(indexColumns).toEqual(["event_id", "occurred_at_ms", "audit_id"]);
+      expect(newActions).toEqual([
+        { action: "game-reopened" },
+        { action: "locked-game-corrected" },
+      ]);
       expect(rows).toEqual([
         {
           auditId: "audit-a",
@@ -850,15 +950,16 @@ describe("SQLite foundation storage", () => {
         "029-access-sheet-generated-audit-action",
         heatStoppageConfigurationMigration.id,
         "031-heat-stoppage-audit-action",
+        "032-locked-event-game-administration-audit",
       ]);
-      expect(await current.readiness()).toMatchObject({ ok: true, schemaVersion: "31" });
+      expect(await current.readiness()).toMatchObject({ ok: true, schemaVersion: "32" });
       current.close();
     });
   });
 
   test("adds the Access Sheet audit action while preserving prior audit rows and shape", async () => {
     await withDatabase(async (databasePath) => {
-      const priorMigrations = FOUNDATION_MIGRATIONS.slice(0, -3);
+      const priorMigrations = FOUNDATION_MIGRATIONS.slice(0, -4);
       const prior = openSqliteFoundationStorage(databasePath, { migrations: priorMigrations });
       await prior.applyMigrations({ requireCandidate: false });
       prior.close();
@@ -891,7 +992,7 @@ describe("SQLite foundation storage", () => {
       database.close();
 
       const current = openSqliteFoundationStorage(databasePath, {
-        migrations: FOUNDATION_MIGRATIONS.slice(0, -2),
+        migrations: FOUNDATION_MIGRATIONS.slice(0, -3),
       });
       expect(await current.applyMigrations({ requireCandidate: false })).toMatchObject({
         appliedMigrationIds: ["029-access-sheet-generated-audit-action"],
@@ -980,7 +1081,7 @@ describe("SQLite foundation storage", () => {
       });
       expect(await priorBinary.readiness()).toMatchObject({
         ok: true,
-        schemaVersion: "31",
+        schemaVersion: "32",
       });
       priorBinary.close();
 
@@ -1052,7 +1153,7 @@ describe("SQLite foundation storage", () => {
         .query(
           "INSERT INTO foundation_migration_ledger (migration_id, ordinal, schema_version, checksum, status, applied_at_ms) VALUES (?, ?, ?, ?, ?, ?)",
         )
-        .run("future-999", 32, 32, "future-checksum", "complete", 2_000);
+        .run("future-999", 33, 33, "future-checksum", "complete", 2_000);
       futureDatabase.close();
       const future = openSqliteFoundationStorage(databasePath);
       expect(await future.readiness()).toMatchObject({ ok: false });

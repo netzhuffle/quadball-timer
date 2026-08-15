@@ -19,6 +19,7 @@ import {
   validateTimestamp,
   validateInterpretation,
   validateStoredInput,
+  parseJsonValue,
 } from "@/lib/event-game-action-codecs";
 import {
   FoundationStorageConstraintError,
@@ -240,6 +241,8 @@ function readAuditLinks(value: unknown): ControlAuditLinkage {
     value.rejectedCandidate === undefined
       ? undefined
       : readRejectedCandidate(value.rejectedCandidate);
+  const valueChange =
+    value.valueChange === undefined ? undefined : readAuditValueChange(value.valueChange);
   return {
     actionId,
     targetFactId,
@@ -255,10 +258,21 @@ function readAuditLinks(value: unknown): ControlAuditLinkage {
     ...(value.contentFingerprint === undefined
       ? {}
       : { contentFingerprint: readFingerprint(value.contentFingerprint, "contentFingerprint") }),
+    ...(valueChange === undefined ? {} : { valueChange }),
     ...(value.reason === undefined ? {} : { reason: readNonEmptyText(value.reason, "reason") }),
     ...(rejectedCandidate === undefined ? {} : { rejectedCandidate }),
     ...(collision === undefined ? {} : { collision }),
   };
+}
+
+function readAuditValueChange(value: unknown): NonNullable<ControlAuditLinkage["valueChange"]> {
+  if (!isObject(value)) throw new Error("Stored Control Audit value change is invalid.");
+  const before = parseJsonValue(value.before, "valueChange.before");
+  const after = parseJsonValue(value.after, "valueChange.after");
+  if (!before.ok || !after.ok) {
+    throw new Error("Stored Control Audit value change is invalid.");
+  }
+  return { before: before.value, after: after.value };
 }
 
 function readRejectedCandidate(
@@ -367,7 +381,9 @@ function readAuditProvenance(value: unknown): ControlAuditProvenance {
   const origin =
     value.origin === undefined
       ? ({ ok: true, value: undefined } as const)
-      : value.origin === "controller" || value.origin === "system-heat-stoppage"
+      : value.origin === "controller" ||
+          value.origin === "system-heat-stoppage" ||
+          value.origin === "event-admin"
         ? ({ ok: true, value: value.origin } as const)
         : ({ ok: false, error: "Stored Control Audit origin is invalid." } as const);
   const lifecycle = validateLifecycle(value.lifecycle);

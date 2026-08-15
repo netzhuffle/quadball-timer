@@ -193,7 +193,7 @@ describe("Heat Stoppage Configuration SQLite persistence", () => {
     const directory = await mkdtemp(join(tmpdir(), "quadball-timer-heat-config-"));
     const databasePath = join(directory, "foundation.sqlite");
     const before = openSqliteFoundationStorage(databasePath, {
-      migrations: FOUNDATION_MIGRATIONS.slice(0, -2) as readonly FoundationMigration[],
+      migrations: FOUNDATION_MIGRATIONS.slice(0, -3) as readonly FoundationMigration[],
     });
     await before.applyMigrations();
     before.close();
@@ -220,6 +220,7 @@ describe("Heat Stoppage Configuration SQLite persistence", () => {
       expect(migration.appliedMigrationIds).toEqual([
         "030-heat-stoppage-configuration",
         "031-heat-stoppage-audit-action",
+        "032-locked-event-game-administration-audit",
       ]);
       await storage.transaction((transaction) => {
         expect(transaction.listGameDays("legacy-event")).toMatchObject([

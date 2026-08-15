@@ -309,6 +309,70 @@ export function projectLiveEventGameDerivedState(
   return rebuildLiveDerivedState(root, storedActions);
 }
 
+export type LockedGameEndStateRuleInput = {
+  scoreByGameSide: Readonly<Record<string, number>>;
+  winnerGameSideId: string | null;
+  flagCatchingGameSideId: string | null;
+  catchTimeMs: number | null;
+  endTimeMs: number | null;
+};
+
+/**
+ * Validate an externally reconciled end state against the same durable Game Side and scoring
+ * relationships used by the live projection. Event administration calls this seam instead of
+ * maintaining a second end-state heuristic.
+ */
+export function validateLockedGameEndStateAgainstRules(
+  root: EventGameRecordRoot,
+  state: LockedGameEndStateRuleInput,
+): { status: "accepted" } | { status: "rejected"; detail: string } {
+  const sideIds = root.gameSides.map((side) => side.id);
+  const suppliedSideIds = Object.keys(state.scoreByGameSide);
+  if (
+    suppliedSideIds.length !== sideIds.length ||
+    sideIds.some((sideId) => !Object.hasOwn(state.scoreByGameSide, sideId))
+  ) {
+    return { status: "rejected", detail: "The corrected scores must name every Game Side." };
+  }
+  if (
+    Object.values(state.scoreByGameSide).some(
+      (score) =>
+        !Number.isSafeInteger(score) ||
+        score < 0 ||
+        score > SHARED_LIMITS.score.max ||
+        score % 10 !== 0,
+    )
+  ) {
+    return { status: "rejected", detail: "The corrected scores do not follow IQA scoring rules." };
+  }
+  if (state.winnerGameSideId !== null && !sideIds.includes(state.winnerGameSideId)) {
+    return { status: "rejected", detail: "The corrected winner is not a Game Side." };
+  }
+  if (state.flagCatchingGameSideId !== null && !sideIds.includes(state.flagCatchingGameSideId)) {
+    return { status: "rejected", detail: "The corrected catcher is not a Game Side." };
+  }
+  if (
+    (state.flagCatchingGameSideId === null) !== (state.catchTimeMs === null) ||
+    (state.catchTimeMs !== null && state.endTimeMs !== null && state.catchTimeMs > state.endTimeMs)
+  ) {
+    return { status: "rejected", detail: "The corrected catch and end times are inconsistent." };
+  }
+  if (state.endTimeMs === null && state.winnerGameSideId !== null) {
+    return { status: "rejected", detail: "An unfinished result cannot declare a winner." };
+  }
+  if (state.winnerGameSideId !== null) {
+    const winningScore = state.scoreByGameSide[state.winnerGameSideId];
+    const highestScore = Math.max(...Object.values(state.scoreByGameSide));
+    if (
+      winningScore !== highestScore ||
+      Object.values(state.scoreByGameSide).filter((score) => score === highestScore).length !== 1
+    ) {
+      return { status: "rejected", detail: "The corrected winner does not match the result." };
+    }
+  }
+  return { status: "accepted" };
+}
+
 export type LiveTimeoutState = {
   status: "inactive" | "stoppage" | "started" | "completed";
   factId: string | null;
@@ -3153,10 +3217,15 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
       if (derived === null) return null;
       const configuredHeatMode = await readConfiguredHeatMode(root, derived.gameFacts);
       const projectedClock = projectClockBaseline(derived.clock.baseline, clock());
-      const projectedFacts = derived.gameFacts.map((fact) => ({
-        ...fact,
-        data: structuredClone(fact.data),
-      }));
+      const projectedFacts = derived.gameFacts
+        .filter(
+          (fact) =>
+            fact.factType !== "locked-game-correction" && fact.factType !== "game-reopening",
+        )
+        .map((fact) => ({
+          ...fact,
+          data: structuredClone(fact.data),
+        }));
       const projectedHeat = deriveHeatStoppageState(
         derived.gameFacts,
         projectedClock.gameTimeMs,
@@ -3686,6 +3755,47 @@ function sameNumberRecord(
   );
 }
 
+function readLockedGameCorrectionData(value: unknown): {
+  scoreByGameSide: Readonly<Record<string, number>>;
+  winnerGameSideId: string | null;
+  flagCatchingGameSideId: string | null;
+  catchTimeMs: number | null;
+  endTimeMs: number | null;
+} | null {
+  if (!isRecord(value) || !isRecord(value.correction)) return null;
+  const correction = value.correction;
+  if (!isRecord(correction) || !isRecord(correction.scoreByGameSide)) return null;
+  const scores: Record<string, number> = {};
+  for (const [sideId, score] of Object.entries(correction.scoreByGameSide)) {
+    if (typeof score !== "number" || !Number.isFinite(score)) return null;
+    scores[sideId] = score;
+  }
+  const nullableString = (candidate: unknown): string | null | undefined =>
+    candidate === null || typeof candidate === "string" ? candidate : undefined;
+  const nullableNumber = (candidate: unknown): number | null | undefined =>
+    candidate === null || (typeof candidate === "number" && Number.isFinite(candidate))
+      ? candidate
+      : undefined;
+  const winnerGameSideId = nullableString(correction.winnerGameSideId);
+  const flagCatchingGameSideId = nullableString(correction.flagCatchingGameSideId);
+  const catchTimeMs = nullableNumber(correction.catchTimeMs);
+  const endTimeMs = nullableNumber(correction.endTimeMs);
+  if (
+    winnerGameSideId === undefined ||
+    flagCatchingGameSideId === undefined ||
+    catchTimeMs === undefined ||
+    endTimeMs === undefined
+  )
+    return null;
+  return {
+    scoreByGameSide: scores,
+    winnerGameSideId,
+    flagCatchingGameSideId,
+    catchTimeMs,
+    endTimeMs,
+  };
+}
+
 function deriveLiveEventGameState(
   root: EventGameRecordRoot,
   canonicalActions: readonly { action: import("@/lib/event-game-actions").ControlAction }[],
@@ -3942,6 +4052,45 @@ function deriveLiveEventGameState(
   if (suspension.status === "suspended" && clock.running) {
     throw new Error("Effective suspension cannot coexist with a running Game Clock.");
   }
+  const lockedCorrectionFact = [...orderedEffectiveFacts]
+    .reverse()
+    .find((fact) => fact.factType === "locked-game-correction");
+  if (lockedCorrectionFact !== undefined) {
+    const correction = readLockedGameCorrectionData(lockedCorrectionFact.data);
+    if (correction !== null) {
+      for (const sideId of sideIds)
+        scoreByGameSide[sideId] = correction.scoreByGameSide[sideId] ?? 0;
+      winnerGameSideId = correction.winnerGameSideId;
+      winnerFactId = correction.winnerGameSideId === null ? null : lockedCorrectionFact.factId;
+      goalCount = Object.values(scoreByGameSide).reduce(
+        (total, score) => total + Math.floor(score / 10),
+        0,
+      );
+      const nonCatchingGameSideId =
+        correction.flagCatchingGameSideId === null
+          ? null
+          : (sideIds.find((sideId) => sideId !== correction.flagCatchingGameSideId) ?? null);
+      catchState =
+        correction.flagCatchingGameSideId === null || nonCatchingGameSideId === null
+          ? null
+          : {
+              factId: lockedCorrectionFact.factId,
+              catchingGameSideId: correction.flagCatchingGameSideId,
+              nonCatchingGameSideId,
+              gameTimeMs: correction.catchTimeMs ?? lockedCorrectionFact.gameTimeMs ?? 0,
+              targetScore: null,
+            };
+      if (correction.endTimeMs !== null) {
+        resultFact = {
+          ...lockedCorrectionFact,
+          data: {
+            winnerGameSideId: correction.winnerGameSideId,
+            endTimeMs: correction.endTimeMs,
+          },
+        };
+      }
+    }
+  }
   const stoppage: LiveStoppageState =
     suspension.status === "suspended"
       ? { status: "suspension", factId: suspension.factId }
@@ -3960,6 +4109,12 @@ function deriveLiveEventGameState(
             },
           ),
         };
+  const publicGameFacts = gameFacts.flatMap((fact) => {
+    if (fact.factType === "game-reopening") return [];
+    if (fact.factType !== "locked-game-correction") return [fact];
+    if (resultFact === null || resultFact.factId !== fact.factId) return [];
+    return [{ ...resultFact, factType: "result", data: resultFact.data }];
+  });
   const effectiveResult = result !== null || winnerGameSideId !== null;
   const effectiveSuspension = suspension.status === "suspended";
   const phase = effectiveResult
@@ -3983,7 +4138,7 @@ function deriveLiveEventGameState(
     overtimeTarget,
     winnerGameSideId,
     catch: catchState,
-    gameFacts,
+    gameFacts: publicGameFacts,
     penalties: deriveLivePenaltyProjection(gameFacts, clock.gameTimeMs),
     clock,
   };

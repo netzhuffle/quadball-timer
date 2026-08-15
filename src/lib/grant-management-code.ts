@@ -83,7 +83,7 @@ export async function createGrantCode(
       )
         return unauthorizedGrant();
       if (grant.status !== "active") return unauthorizedGrant();
-      if (!hasCurrentAdmissionEligibility(options, grant))
+      if (!hasCurrentAdmissionEligibility(options, grant, transaction))
         return {
           status: "rejected",
           reason: "invalid-state",

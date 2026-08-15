@@ -62,6 +62,15 @@ import {
   type AccessSheetRequest,
   type AccessSheetIds,
 } from "@/lib/access-sheet";
+import {
+  createLockedEventGameAdministration,
+  type GameReopeningInput,
+  type GameReopeningResult,
+  type GameReopeningPreviewInput,
+  type LockedGamePreview,
+  type LockedGameCorrectionInput,
+  type LockedGameCorrectionResult,
+} from "@/lib/locked-event-game-administration";
 
 export const GENERIC_EVENT_HUB_AUTHORIZATION_FAILURE = Object.freeze({
   status: "rejected",
@@ -196,6 +205,8 @@ export type EventAdministrationOptions = {
   controlScopeResolver?: ControlGrantScopeResolver;
   /** Test-only composition seam for proving rollback after typed retirement. */
   removalFailureInjector?: () => void;
+  /** Test-only composition seam for proving locked-game audit rollback. */
+  lockedGameFailureInjector?: () => void;
   environmentId?: string;
   accessSheetRenderer?: AccessSheetRenderer;
   accessSheetIds?: AccessSheetIds;
@@ -582,6 +593,30 @@ export type EventAdministration = {
   openPitchManagerCurrentView(input: {
     authority: EventAdministrationAuthority;
   }): Promise<EventAdministrationOutcome<PitchManagerViewProjection>>;
+  correctLockedEventGame(
+    eventId: unknown,
+    eventGameId: unknown,
+    input: LockedGameCorrectionInput,
+    authority: EventAdministrationAuthority,
+  ): Promise<EventAdministrationOutcome<LockedGameCorrectionResult>>;
+  previewLockedEventGameCorrection(
+    eventId: unknown,
+    eventGameId: unknown,
+    input: LockedGameCorrectionInput,
+    authority: EventAdministrationAuthority,
+  ): Promise<EventAdministrationOutcome<LockedGamePreview>>;
+  reopenEventGame(
+    eventId: unknown,
+    eventGameId: unknown,
+    input: GameReopeningInput,
+    authority: EventAdministrationAuthority,
+  ): Promise<EventAdministrationOutcome<GameReopeningResult>>;
+  previewEventGameReopening(
+    eventId: unknown,
+    eventGameId: unknown,
+    input: GameReopeningPreviewInput,
+    authority: EventAdministrationAuthority,
+  ): Promise<EventAdministrationOutcome<LockedGamePreview>>;
 };
 
 export function createEventAdministration(
@@ -593,6 +628,13 @@ export function createEventAdministration(
     createEventCatalog(createFoundationEventCatalogStorage(options.storage), {
       clock: { nowMs },
     });
+  const lockedEventGames = createLockedEventGameAdministration({
+    storage: options.storage,
+    failureInjector: options.lockedGameFailureInjector,
+    nowMs,
+    authorize: (transaction, eventId, authority, readOnly) =>
+      authorizeEventScopeInTransaction(options, transaction, eventId, authority, readOnly),
+  });
 
   return {
     async previewEventCatalogRemoval(target, authority) {
@@ -1808,6 +1850,27 @@ export function createEventAdministration(
     async openPitchManagerCurrentView(input) {
       return openPitchManagerCurrentProjection(options, input.authority);
     },
+
+    async correctLockedEventGame(eventId, eventGameId, input, authority) {
+      return lockedEventGames.correctLockedEventGame(eventId, eventGameId, input, authority);
+    },
+
+    async previewLockedEventGameCorrection(eventId, eventGameId, input, authority) {
+      return lockedEventGames.previewLockedEventGameCorrection(
+        eventId,
+        eventGameId,
+        input,
+        authority,
+      );
+    },
+
+    async reopenEventGame(eventId, eventGameId, input, authority) {
+      return lockedEventGames.reopenEventGame(eventId, eventGameId, input, authority);
+    },
+
+    async previewEventGameReopening(eventId, eventGameId, input, authority) {
+      return lockedEventGames.previewEventGameReopening(eventId, eventGameId, input, authority);
+    },
   };
 }
 
@@ -1821,6 +1884,7 @@ function authorizeEventScopeInTransaction(
   kind: "technical-admin" | "event-admin";
   sessionId: string | null;
   sessionExpiresAtMs: number | null;
+  grantVersion: string | null;
   actorReference: string;
 } | null {
   if (isTechnicalAdminAuthority(authority))
@@ -1828,6 +1892,7 @@ function authorizeEventScopeInTransaction(
       kind: "technical-admin",
       sessionId: null,
       sessionExpiresAtMs: null,
+      grantVersion: null,
       actorReference: `technical-admin:${authority.environment}:${authority.sessionId}`,
     };
   if (
@@ -1851,6 +1916,7 @@ function authorizeEventScopeInTransaction(
     kind: "event-admin",
     sessionId: result.grantSessionId,
     sessionExpiresAtMs: result.sessionExpiresAtMs ?? null,
+    grantVersion: result.grantVersion,
     actorReference: `event-admin:${result.grantSessionId}`,
   };
 }

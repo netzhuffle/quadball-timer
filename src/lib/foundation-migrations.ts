@@ -2031,6 +2031,28 @@ export const FOUNDATION_HEAT_STOPPAGE_AUDIT_ACTION_MIGRATION_SQL = `
   ${FOUNDATION_EVENT_CATALOG_AUDIT_EVENT_INDEX_SQL};
 `;
 
+/** Schema-32 adds immutable Event Admin Locked Game correction and reopening audit actions. */
+export const FOUNDATION_LOCKED_GAME_ADMINISTRATION_AUDIT_MIGRATION_SQL = `
+  CREATE TABLE foundation_event_catalog_audit_v31 AS SELECT * FROM foundation_event_catalog_audit;
+  DROP TABLE foundation_event_catalog_audit;
+  ${FOUNDATION_EVENT_CATALOG_AUDIT_TABLE_V3_SQL.replace(
+    "CREATE TABLE foundation_event_catalog_audit",
+    "CREATE TABLE foundation_event_catalog_audit_rebuilt",
+  ).replace(
+    "'event-game-teams-confirmed'",
+    "'event-game-teams-confirmed', 'event-publication-changed', 'event-catalog-entry-removed', 'access-sheet-generated', 'game-day-heat-stoppage-configured', 'locked-game-corrected', 'game-reopened'",
+  )};
+  INSERT INTO foundation_event_catalog_audit_rebuilt
+    (audit_id, operation_id, action, event_id, game_day_id, actor_reference,
+     occurred_at_ms, before_json, after_json)
+  SELECT audit_id, operation_id, action, event_id, game_day_id, actor_reference,
+         occurred_at_ms, before_json, after_json
+  FROM foundation_event_catalog_audit_v31;
+  DROP TABLE foundation_event_catalog_audit_v31;
+  ALTER TABLE foundation_event_catalog_audit_rebuilt RENAME TO foundation_event_catalog_audit;
+  ${FOUNDATION_EVENT_CATALOG_AUDIT_EVENT_INDEX_SQL};
+`;
+
 export const FOUNDATION_MIGRATIONS: readonly FoundationMigration[] = Object.freeze([
   createMigration({
     id: "001-foundation-event-game-record-roots",
@@ -2217,6 +2239,12 @@ export const FOUNDATION_MIGRATIONS: readonly FoundationMigration[] = Object.free
     ordinal: 31,
     schemaVersion: 31,
     sql: FOUNDATION_HEAT_STOPPAGE_AUDIT_ACTION_MIGRATION_SQL,
+  }),
+  createMigration({
+    id: "032-locked-event-game-administration-audit",
+    ordinal: 32,
+    schemaVersion: 32,
+    sql: FOUNDATION_LOCKED_GAME_ADMINISTRATION_AUDIT_MIGRATION_SQL,
   }),
 ]);
 

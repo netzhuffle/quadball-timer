@@ -495,6 +495,17 @@ function redactCatalogSnapshot(value: unknown): Record<string, unknown> | null {
     "eventTeamName",
     "sourceLabel",
     "confirmedAtMs",
+    "scoreByGameSide",
+    "winnerGameSideId",
+    "flagCatchingGameSideId",
+    "catchTimeMs",
+    "endTimeMs",
+    "lockRetained",
+    "lockRemoved",
+    "overrideApplied",
+    "phase",
+    "lockedAtMs",
+    "lockReason",
   ]);
   const result: Record<string, unknown> = {};
   for (const key of allowed) {
@@ -502,6 +513,17 @@ function redactCatalogSnapshot(value: unknown): Record<string, unknown> | null {
     const current = value[key];
     if (key === "sideA" || key === "sideB") {
       result[key] = redactCatalogSnapshot(current);
+    } else if (key === "scoreByGameSide" && isRecord(current)) {
+      const scores = Object.entries(current);
+      if (
+        scores.every(
+          ([sideId, score]) =>
+            validateOpaqueIdentifier(sideId, "gameSideId").ok &&
+            typeof score === "number" &&
+            Number.isSafeInteger(score),
+        )
+      )
+        result[key] = Object.fromEntries(scores);
     } else if (
       current === null ||
       typeof current === "string" ||

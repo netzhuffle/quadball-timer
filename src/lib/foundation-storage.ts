@@ -248,7 +248,9 @@ export type EventCatalogAuditEntry = {
     | "event-game-teams-confirmed"
     | "event-publication-changed"
     | "event-catalog-entry-removed"
-    | "access-sheet-generated";
+    | "access-sheet-generated"
+    | "locked-game-corrected"
+    | "game-reopened";
   eventId: string;
   gameDayId: string | null;
   actorReference: string;
