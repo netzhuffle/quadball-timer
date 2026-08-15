@@ -176,6 +176,12 @@ describe("Event Game Controller reconnect browser seam", () => {
             { status: 200, headers: { "content-type": "application/json" } },
           );
         }
+        if (url.endsWith("/api/event-control/reveal-qr")) {
+          return new Response(JSON.stringify({ status: "revealed", qrCredential: "revealed-qr" }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+        }
         if (url.endsWith("/api/event-control/leave")) {
           return new Response(JSON.stringify({ status: "left" }), {
             status: 200,
@@ -252,6 +258,59 @@ describe("Event Game Controller reconnect browser seam", () => {
     input.dispatchEvent(new testWindow.Event("input", { bubbles: true }) as unknown as Event);
     input.dispatchEvent(new testWindow.Event("change", { bubbles: true }) as unknown as Event);
   }
+
+  test("inventories active production Controller controls with contextual names and touch targets", async () => {
+    await enterAndOpen();
+    const activeSurface = container.querySelector<HTMLElement>(
+      "[class*='min-h-0'][class*='overflow-y-auto']",
+    );
+    expect(activeSurface).not.toBeNull();
+    expect(activeSurface?.className).toContain("[&_button]:min-h-11");
+    const buttons = Array.from(activeSurface?.querySelectorAll<HTMLButtonElement>("button") ?? []);
+    expect(buttons.length).toBeGreaterThan(15);
+    for (const button of buttons) {
+      expect(button.getAttribute("aria-label") ?? button.textContent?.trim()).not.toBe("");
+    }
+    expect(
+      container.querySelector('[role="region"][aria-label="Event Game Clock"]'),
+    ).not.toBeNull();
+    const clockButton = container.querySelector<HTMLButtonElement>(
+      'button[aria-label="Start game clock"]',
+    );
+    expect(clockButton?.getAttribute("aria-pressed")).toBe("false");
+    await act(async () => {
+      clockButton?.focus();
+      clockButton?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(testWindow.document.activeElement?.getAttribute("aria-label")).toBe("Pause game clock");
+  });
+
+  test("production Grant QR dialog closes on an outside pointer and returns focus", async () => {
+    await enterAndOpen();
+    const revealButton = container.querySelector<HTMLButtonElement>(
+      'button[aria-label="Reveal active Grant QR"]',
+    );
+    expect(revealButton).not.toBeNull();
+    await act(async () => {
+      revealButton?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const dialog = container.querySelector('[role="dialog"][aria-label="Active Grant QR"]');
+    expect(dialog).not.toBeNull();
+    await act(async () => {
+      dialog?.parentElement?.dispatchEvent(
+        new testWindow.MouseEvent("click", { bubbles: true }) as unknown as Event,
+      );
+      await new Promise((resolve) => testWindow.setTimeout(resolve, 0));
+    });
+    expect(container.querySelector('[role="dialog"][aria-label="Active Grant QR"]')).toBeNull();
+    expect(testWindow.document.activeElement?.getAttribute("aria-label")).toBe(
+      "Show active Grant QR",
+    );
+  });
 
   afterEach(async () => {
     await act(async () => {

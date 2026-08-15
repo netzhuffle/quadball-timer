@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { chromium, type BrowserContext, type Page } from "playwright";
+import { chromium, webkit, type BrowserContext, type Page } from "playwright";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -64,19 +64,24 @@ try {
   });
   await waitForServer(`${origin}/internal/healthz`);
 
-  browser = await chromium.launch({ headless: true });
-  const context = await browser.newContext({ ignoreHTTPSErrors: true });
-  await installControllerApi(context);
-  const controller = await context.newPage();
-  await completeSuspendReviewResume(controller);
+  for (const browserType of [chromium, webkit]) {
+    currentProjection = createProjection();
+    browser = await browserType.launch({ headless: true });
+    const context = await browser.newContext({ ignoreHTTPSErrors: true });
+    await installControllerApi(context);
+    const controller = await context.newPage();
+    await completeSuspendReviewResume(controller);
 
-  const secondContext = await browser.newContext({ ignoreHTTPSErrors: true });
-  await installControllerApi(secondContext);
-  const reviewingController = await secondContext.newPage();
-  await reviewAndResume(reviewingController);
+    const secondContext = await browser.newContext({ ignoreHTTPSErrors: true });
+    await installControllerApi(secondContext);
+    const reviewingController = await secondContext.newPage();
+    await reviewAndResume(reviewingController);
+    await browser.close();
+    browser = null;
+  }
 
   console.log(
-    "Focused Integration Test passed: 360x640 suspend/review/resume with two known balls.",
+    "Focused Integration Test passed: Chromium/WebKit 360x640 Controller interactions and suspend/review/resume.",
   );
 } catch (error) {
   console.error(error instanceof Error ? error.message : String(error));
@@ -100,7 +105,30 @@ async function completeSuspendReviewResume(page: Page) {
   await page.setViewportSize({ width: 360, height: 640 });
   await page.goto(`${origin}/event-control`);
   await page.getByLabel("Active Pitch Slot Control Grant QR").fill("disposable-grant");
-  await page.getByRole("button", { name: "Open Controller Device" }).click();
+  await page.getByRole("button", { name: "Open Event Game Controller" }).click();
+  await assertControllerSurface(page);
+  await page.getByRole("button", { name: "Start game clock" }).click();
+  await page.getByRole("button", { name: "Adjust game clock by plus 10 seconds" }).click();
+  await page.getByLabel("Set game clock (milliseconds)").fill("123000");
+  await page.getByRole("button", { name: "Correct Event Game clock" }).click();
+  await page.locator("#penalty-game-side").selectOption("side-a");
+  await page
+    .getByRole("button", { name: "Accept penalty card for the selected Game Side" })
+    .click();
+  await page.getByRole("button", { name: "Timeout stoppage: side-a" }).click();
+  await page.getByRole("button", { name: "Record 10-point goal for Game Side side-a" }).click();
+  await page.getByRole("button", { name: "Flip Event Game physical ends" }).click();
+  await page.getByRole("button", { name: "Reveal active Grant QR" }).click();
+  await page.getByRole("dialog", { name: "Active Grant QR" }).waitFor();
+  await page.mouse.click(2, 2);
+  await page.getByRole("dialog", { name: "Active Grant QR" }).waitFor({ state: "hidden" });
+  await page.waitForTimeout(50);
+  assert(
+    (await page.evaluate(() => document.activeElement?.getAttribute("aria-label"))) ===
+      "Show active Grant QR",
+    "QR outside-pointer dismissal did not return focus",
+  );
+  await page.getByRole("button", { name: "Record final Event Game result" }).click();
   await page.getByRole("button", { name: "Review suspension recovery" }).click();
   await page.locator("#volleyball-possession").selectOption("side-a");
   await page.locator("#dodgeball-possession-ball-1").selectOption("side-b");
@@ -118,11 +146,27 @@ async function completeSuspendReviewResume(page: Page) {
   await assertNoDocumentScroll(page);
 }
 
+async function assertControllerSurface(page: Page) {
+  const controls = await page.locator("main button").evaluateAll((buttons) =>
+    buttons.map((button) => ({
+      name: button.getAttribute("aria-label") ?? button.textContent?.trim() ?? "",
+      minHeight: Number.parseFloat(getComputedStyle(button).minHeight),
+    })),
+  );
+  assert(controls.length > 15, "production Controller control inventory was unexpectedly small");
+  for (const control of controls) {
+    assert(control.name.length > 0, "production Controller control had no accessible name");
+    assert(control.minHeight >= 44, `Controller control was below 44px: ${control.name}`);
+  }
+  await page.getByRole("region", { name: "Event Game Clock" }).waitFor();
+  await assertNoDocumentScroll(page);
+}
+
 async function reviewAndResume(page: Page) {
   await page.setViewportSize({ width: 360, height: 640 });
   await page.goto(`${origin}/event-control`);
   await page.getByLabel("Active Pitch Slot Control Grant QR").fill("disposable-grant");
-  await page.getByRole("button", { name: "Open Controller Device" }).click();
+  await page.getByRole("button", { name: "Open Event Game Controller" }).click();
   await page.locator('[data-suspension-snapshot="effective"]').waitFor();
   const snapshotText = await page.locator('[data-suspension-snapshot="effective"]').innerText();
   assert(snapshotText.includes("Volleyball: side-a"), "volleyball recovery was not shown");
@@ -176,10 +220,18 @@ async function installControllerApi(context: BrowserContext) {
       });
       return;
     }
+    if (url.pathname.endsWith("/reveal-qr")) {
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({ status: "revealed", qrCredential: "focused-revealed-qr" }),
+      });
+      return;
+    }
     if (url.pathname.endsWith("/replay")) {
       const actions = Array.isArray(body?.actions) ? body.actions.filter(isRecord) : [];
       for (const action of actions) {
         const intent = isRecord(action.intent) ? action.intent : undefined;
+        if (intent !== undefined) applyIntent(intent);
         if (intent?.suspensionAction === "start") {
           const snapshot = intent.suspensionSnapshot as LiveSuspensionSnapshot;
           currentProjection = {
@@ -221,6 +273,7 @@ async function installControllerApi(context: BrowserContext) {
     }
     if (url.pathname.endsWith("/intent")) {
       const intent = isRecord(body?.intent) ? body.intent : undefined;
+      if (intent !== undefined) applyIntent(intent);
       if (intent?.suspensionAction === "start") {
         const snapshot = intent.suspensionSnapshot as LiveSuspensionSnapshot;
         currentProjection = {
@@ -252,6 +305,34 @@ async function installControllerApi(context: BrowserContext) {
     }
     await route.fulfill({ status: 404, body: "not found" });
   });
+}
+
+function applyIntent(intent: Record<string, unknown>) {
+  if (intent.type === "record-goal" && typeof intent.gameSideId === "string") {
+    currentProjection = {
+      ...currentProjection,
+      goalCount: currentProjection.goalCount + 1,
+      scoreByGameSide: {
+        ...currentProjection.scoreByGameSide,
+        [intent.gameSideId]: (currentProjection.scoreByGameSide[intent.gameSideId] ?? 0) + 10,
+      },
+    };
+  }
+  if (intent.type === "set-pitch-orientation" && typeof intent.pitchOrientation === "string") {
+    currentProjection = {
+      ...currentProjection,
+      presentation: {
+        ...(currentProjection.presentation ?? {
+          gameSideIds: ["side-a", "side-b"],
+          displayedTeamColors: { "side-a": "#00afe8", "side-b": "#ef4444" },
+        }),
+        pitchOrientation: intent.pitchOrientation as "side-a-left" | "side-b-left",
+      },
+    };
+  }
+  if (intent.type === "substantive" && intent.trigger === "result") {
+    currentProjection = { ...currentProjection, phase: "finished" };
+  }
 }
 
 async function assertNoDocumentScroll(page: Page) {
@@ -309,6 +390,11 @@ function createProjection(): ControllerProjection {
       provisionalElapsedMs: 0,
     },
     clock: projectClockBaseline(baseline, 0),
+    presentation: {
+      gameSideIds: ["side-a", "side-b"],
+      pitchOrientation: "side-a-left",
+      displayedTeamColors: { "side-a": "#00afe8", "side-b": "#ef4444" },
+    },
   };
 }
 
