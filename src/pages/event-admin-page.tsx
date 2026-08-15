@@ -4,6 +4,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { AdministrativeAuditBrowser } from "@/pages/administrative-audit-browser";
 
 type HubResponse = {
   status: "accepted";
@@ -600,6 +601,7 @@ export function EventAdminPage() {
                   {hub.event.timeZone} · {hub.authority} · {hub.event.publicationStatus}
                 </p>
               </div>
+              <AdministrativeAuditBrowser eventId={hub.event.eventId} route="event-admin" />
               <div className="space-y-3 rounded-lg border p-3">
                 <p className="font-semibold">Publication Status</p>
                 <p className="text-sm text-muted-foreground">

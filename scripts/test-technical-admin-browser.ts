@@ -232,6 +232,15 @@ try {
   await page.goto(`${origin}/admin`);
   await page.getByText("Technical Admin administration").waitFor();
   await page.getByRole("button", { name: /Browser Event Updated/ }).click();
+  await page.getByText("Administrative audit evidence", { exact: true }).waitFor();
+  const technicalAuditResponse = await context.request.get(
+    `${origin}/api/admin/events/${eventId}/audit?projection=event-administration&limit=1`,
+  );
+  assert(
+    technicalAuditResponse.status() === 200 &&
+      technicalAuditResponse.headers()["set-cookie"] === undefined,
+    "Technical Admin audit projection was not a read-only response",
+  );
   await page.getByRole("button", { name: "Create Grant" }).click();
   const revealResponsePromise = page.waitForResponse(
     (response) =>
@@ -262,7 +271,33 @@ try {
   await eventAdminPage.goto(`${origin}/event-admin?eventId=${eventId}`);
   await eventAdminPage.getByLabel("Scanned Event Admin QR value").fill(revealedCredential);
   await eventAdminPage.getByRole("button", { name: "Admit Event Admin" }).click();
-  await eventAdminPage.getByText(/event-admin/u).waitFor();
+  await eventAdminPage.getByText("Event Hub", { exact: true }).waitFor();
+  await eventAdminPage.getByText("Administrative audit evidence", { exact: true }).waitFor();
+  await eventAdminPage.getByText("Event Administration", { exact: true }).waitFor();
+  await eventAdminPage.getByText("Grant Audit", { exact: true }).waitFor();
+  const eventAdminAuditResponse = await eventAdminContext.request.get(
+    `${origin}/api/event-admin/audit?eventId=${eventId}&projection=grant&limit=1`,
+  );
+  assert(
+    eventAdminAuditResponse.status() === 200 &&
+      eventAdminAuditResponse.headers()["set-cookie"] === undefined &&
+      !(await eventAdminAuditResponse.text()).includes(revealedCredential),
+    "Event Admin audit projection was not read-only and redacted",
+  );
+  const unsupportedEventAuditFilter = await eventAdminContext.request.get(
+    `${origin}/api/event-admin/audit?eventId=${eventId}&projection=event-administration&grantId=unsupported`,
+  );
+  assert(
+    unsupportedEventAuditFilter.status() === 400 &&
+      unsupportedEventAuditFilter.headers()["set-cookie"] === undefined,
+    "Event Administration silently accepted its unsupported grantId filter",
+  );
+  const anonymousContext = await browser.newContext({ ignoreHTTPSErrors: true });
+  const anonymousAuditResponse = await anonymousContext.request.get(
+    `${origin}/api/event-admin/audit?eventId=${eventId}&projection=grant`,
+  );
+  assert(anonymousAuditResponse.status() === 401, "anonymous audit enumeration was accepted");
+  await anonymousContext.close();
   const eventAdminGameDaySelector = eventAdminPage.getByLabel("Game Day", { exact: true });
   const firstDayHubResponsePromise = eventAdminPage.waitForResponse(
     (response) =>
@@ -529,7 +564,7 @@ try {
       duplicatePitchManagerGrant.headers()["set-cookie"] === undefined,
     "invalid duplicate Pitch Manager Grant response was not generic and uncached",
   );
-  await eventAdminPage.getByText(/active.*expires/u).waitFor();
+  await eventAdminPage.getByText(/^active · expires/u).waitFor();
   const pitchManagerRevealResponsePromise = eventAdminPage.waitForResponse(
     (response) =>
       response.url().includes("/pitch-manager-grant/reveal") &&
@@ -594,6 +629,14 @@ try {
   await pitchManagerPage.getByText("Pitch Main", { exact: true }).waitFor();
   await pitchManagerPage.getByText(/Pitch Manager.*Game Day/u).waitFor();
   await pitchManagerPage.getByText(/2026-08-15 10:00 Europe\/Zurich/u).waitFor();
+  const pitchManagerAuditResponse = await pitchManagerContext.request.get(
+    `${origin}/api/event-admin/audit?eventId=${eventId}&projection=grant`,
+  );
+  assert(
+    pitchManagerAuditResponse.status() === 401 &&
+      pitchManagerAuditResponse.headers()["set-cookie"] === undefined,
+    "admitted Pitch Manager was not generically denied administrative audit evidence",
+  );
   await pitchManagerPage
     .getByText(/Control Grant:/u)
     .first()
@@ -605,10 +648,17 @@ try {
   const controlSetupPayload = (await controlSetupResponse.json()) as {
     value?: {
       pitchSlots?: Array<{ pitchSlotId: string; pitchId: string; gameDayId: string }>;
+      eventGames?: Array<{ eventGameId: string; pitchSlotId: string; gameCode: string | null }>;
     };
   };
+  const assignedControlSlotId = controlSetupPayload.value?.eventGames?.find(
+    (game) => game.gameCode === "G-01",
+  )?.pitchSlotId;
   const controlSlot = controlSetupPayload.value?.pitchSlots?.find(
-    (slot) => slot.pitchId === pitchManagerPitchId && slot.gameDayId === pitchManagerGameDayId,
+    (slot) =>
+      slot.pitchSlotId === assignedControlSlotId &&
+      slot.pitchId === pitchManagerPitchId &&
+      slot.gameDayId === pitchManagerGameDayId,
   );
   const pitchManagerControlSlot = controlSetupPayload.value?.pitchSlots?.find(
     (slot) =>
@@ -898,7 +948,7 @@ try {
       reactivatedPitchManagerVersion !== rotatedPitchManagerVersion,
     "Pitch Manager reactivation did not settle an active new Grant version",
   );
-  await expect(eventAdminPage.getByText(/active.*expires/u)).toBeVisible();
+  await expect(eventAdminPage.getByText(/^active · expires/u)).toBeVisible();
   const reactivatedPitchManagerRevealResponsePromise = eventAdminPage.waitForResponse(
     (response) =>
       response.url().includes("/pitch-manager-grant/reveal") &&
@@ -1034,6 +1084,57 @@ try {
   );
   await eventAdminPage.reload();
   await eventAdminPage.getByText(/event-admin/u).waitFor();
+  const eventAuditProbe = await eventAdminContext.request.get(
+    `${origin}/api/event-admin/audit?eventId=${eventId}&projection=event-administration&limit=100`,
+  );
+  const eventAuditProbePayload = (await eventAuditProbe.json()) as {
+    status?: string;
+    value?: { entries?: unknown[] };
+  };
+  assert(
+    eventAuditProbe.status() === 200 && (eventAuditProbePayload.value?.entries?.length ?? 0) > 10,
+    `Event Admin audit fixture did not cross ten entries (${eventAuditProbe.status()}: ${eventAuditProbePayload.value?.entries?.length ?? 0})`,
+  );
+  const eventAuditPanel = eventAdminPage.getByLabel("Event Administration audit projection");
+  const eventAuditBeforeLoadMore = await eventAuditPanel.textContent();
+  const eventLoadMore = eventAdminPage.getByRole("button", {
+    name: "Load more Event Administration",
+  });
+  assert(
+    (await eventLoadMore.count()) === 1,
+    "Event Admin audit did not expose bounded pagination",
+  );
+  const eventLoadMoreResponsePromise = eventAdminPage.waitForResponse(
+    (response) =>
+      response.url().includes("/api/event-admin/audit") &&
+      response.url().includes("cursor=") &&
+      response.request().method() === "GET",
+  );
+  await eventLoadMore.click();
+  assert(
+    (await eventLoadMoreResponsePromise).status() === 200 &&
+      (await eventAuditPanel.textContent()) !== eventAuditBeforeLoadMore,
+    "Event Admin audit did not cross its first bounded page",
+  );
+  const eventDirectionResponsePromise = eventAdminPage.waitForResponse(
+    (response) =>
+      response.url().includes("/api/event-admin/audit") &&
+      response.url().includes("direction=ascending") &&
+      response.request().method() === "GET",
+  );
+  await eventAdminPage.getByLabel("Audit ordering").selectOption("ascending");
+  assert(
+    (await eventDirectionResponsePromise).status() === 200,
+    "Event Admin ordering change failed",
+  );
+  const eventFilterResponsePromise = eventAdminPage.waitForResponse(
+    (response) =>
+      response.url().includes("/api/event-admin/audit") &&
+      response.url().includes("action=event-created") &&
+      response.request().method() === "GET",
+  );
+  await eventAdminPage.getByLabel("Audit action filter").fill("event-created");
+  assert((await eventFilterResponsePromise).status() === 200, "Event Admin filter change failed");
   const sessionCookieAfterRefresh = (await eventAdminContext.cookies()).find(
     (cookie) => cookie.name === "__Host-event-admin-session",
   );
@@ -1051,6 +1152,43 @@ try {
   assert(wrongEventResponse.status === 401, "wrong-Event Event Admin authority was accepted");
   await page.goto(`${origin}/admin`);
   await page.getByRole("button", { name: /Browser Event Updated/ }).click();
+  await page.getByText("Administrative audit evidence", { exact: true }).waitFor();
+  const technicalAuditPanel = page.getByLabel("Event Administration audit projection");
+  const technicalLoadMore = technicalAuditPanel.getByRole("button", {
+    name: "Load more Event Administration",
+  });
+  await technicalLoadMore.waitFor();
+  assert(
+    (await technicalLoadMore.count()) === 1,
+    "Technical Admin audit did not expose bounded pagination",
+  );
+  const technicalAuditBeforeLoadMore = await technicalAuditPanel.textContent();
+  assert(
+    technicalAuditBeforeLoadMore?.includes("Load more Event Administration") === true,
+    "Technical Admin audit pagination control was not rendered",
+  );
+  const technicalDirectionResponsePromise = page.waitForResponse(
+    (response) =>
+      response.url().includes(`/api/admin/events/${eventId}/audit`) &&
+      response.url().includes("direction=ascending") &&
+      response.request().method() === "GET",
+  );
+  await page.getByLabel("Audit ordering").selectOption("ascending");
+  assert(
+    (await technicalDirectionResponsePromise).status() === 200,
+    "Technical Admin ordering change failed",
+  );
+  const technicalFilterResponsePromise = page.waitForResponse(
+    (response) =>
+      response.url().includes(`/api/admin/events/${eventId}/audit`) &&
+      response.url().includes("action=event-created") &&
+      response.request().method() === "GET",
+  );
+  await page.getByLabel("Audit action filter").fill("event-created");
+  assert(
+    (await technicalFilterResponsePromise).status() === 200,
+    "Technical Admin filter change failed",
+  );
   const rotateResponsePromise = page.waitForResponse(
     (response) =>
       response.url().includes(`/api/admin/events/${eventId}/event-admin-grant/rotate`) &&
@@ -1085,7 +1223,10 @@ try {
   await revokedEventAdminPage.goto(`${origin}/event-admin?eventId=${eventId}`);
   await revokedEventAdminPage.getByLabel("Scanned Event Admin QR value").fill(freshCredential);
   await revokedEventAdminPage.getByRole("button", { name: "Admit Event Admin" }).click();
-  await revokedEventAdminPage.getByText(/event-admin/u).waitFor();
+  await revokedEventAdminPage
+    .getByText("Europe/Zurich · event-admin", { exact: false })
+    .first()
+    .waitFor();
   const validFreshSession = await fetchFromPage(
     revokedEventAdminPage,
     `${origin}/api/event-admin/hub?eventId=${eventId}`,
@@ -1172,6 +1313,11 @@ try {
       eventAdminGrantHandoff: true,
       qrRender: true,
       eventHubDelegation: true,
+      administrativeAuditPagination: true,
+      administrativeAuditFiltersAndDirection: true,
+      administrativeAuditProjectionFilterValidation: true,
+      pitchManagerAuditDenied: true,
+      anonymousAuditDenied: true,
       eventAdminRotationRevocationIsolation: true,
       pitchManagerHandoff: true,
       pitchManagerScopedView: true,
