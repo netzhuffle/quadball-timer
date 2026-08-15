@@ -237,6 +237,7 @@ function StartAdHocGame() {
   const [homeColor, setHomeColor] = useState(DEFAULT_HOME_TEAM_COLOR);
   const [awayColor, setAwayColor] = useState(DEFAULT_AWAY_TEAM_COLOR);
   const [creationStatus, setCreationStatus] = useState<string | null>(null);
+  const [creationAlert, setCreationAlert] = useState(false);
   const [creationPending, setCreationPending] = useState(false);
   const creationPendingRef = useRef(false);
   const creationRetryTimerRef = useRef<number | null>(null);
@@ -261,6 +262,7 @@ function StartAdHocGame() {
         creationPendingRef.current = true;
         setCreationPending(true);
       }
+      setCreationAlert(false);
       setCreationStatus(attempt === 0 ? "Creating Ad Hoc Game…" : "Retrying Ad Hoc Game…");
 
       let response: Response;
@@ -277,7 +279,10 @@ function StartAdHocGame() {
           }),
         });
       } catch {
-        if (mountedRef.current) setCreationStatus("Ad Hoc Game unavailable. Try again later.");
+        if (mountedRef.current) {
+          setCreationAlert(true);
+          setCreationStatus("Ad Hoc Game unavailable. Try again later.");
+        }
         creationPendingRef.current = false;
         setCreationPending(false);
         return;
@@ -285,10 +290,15 @@ function StartAdHocGame() {
       if (!mountedRef.current) return;
 
       if (!response.ok) {
-        if (response.status === 429 && attempt < 3) {
-          const payload = (await response.json().catch(() => null)) as {
-            retryAfterMs?: unknown;
-          } | null;
+        const payload = (await response.json().catch(() => null)) as {
+          error?: unknown;
+          retryAfterMs?: unknown;
+        } | null;
+        const capacityMessage =
+          typeof payload?.error === "string" && payload.error.startsWith("Ad Hoc capacity")
+            ? payload.error
+            : null;
+        if (response.status === 429 && attempt < 3 && capacityMessage === null) {
           const headerDelayMs = Number(response.headers.get("retry-after")) * 1_000;
           const retryAfterMs = Math.min(
             30_000,
@@ -308,7 +318,8 @@ function StartAdHocGame() {
           }, retryAfterMs);
           return;
         }
-        setCreationStatus("Ad Hoc Game unavailable. Try again later.");
+        setCreationAlert(true);
+        setCreationStatus(capacityMessage ?? "Ad Hoc Game unavailable. Try again later.");
         creationPendingRef.current = false;
         setCreationPending(false);
         return;
@@ -321,6 +332,7 @@ function StartAdHocGame() {
         navigateTo(`/game/${payload.gameId}`);
         return;
       }
+      setCreationAlert(true);
       setCreationStatus("Ad Hoc Game unavailable. Try again later.");
       creationPendingRef.current = false;
       setCreationPending(false);
@@ -383,7 +395,11 @@ function StartAdHocGame() {
           Start an Ad Hoc Game <span className="sr-only">Create new game</span>
         </Button>
         {creationStatus !== null ? (
-          <p className="text-sm text-muted-foreground" role="status" aria-live="polite">
+          <p
+            className={creationAlert ? "text-sm text-destructive" : "text-sm text-muted-foreground"}
+            role={creationAlert ? "alert" : "status"}
+            aria-live="polite"
+          >
             {creationStatus}
           </p>
         ) : null}

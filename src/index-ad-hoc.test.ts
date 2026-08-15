@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  createAdHocLiveSessionTracker,
   createAdHocGamesService,
   createInMemoryAdHocStore,
   type AdHocGamesService,
@@ -69,6 +70,140 @@ describe("Ad Hoc HTTP and WebSocket authority boundaries", () => {
         adHocSocketCeiling: 10,
       }),
     ).toBe(0);
+  });
+
+  test("deduplicates concurrent socket subscriptions and retries a failed final disconnect", async () => {
+    const disconnected: string[] = [];
+    let durable = false;
+    const scheduled: Array<{ delayMs: number; task: () => void }> = [];
+    const tracker = createAdHocLiveSessionTracker(
+      async (identity) => {
+        disconnected.push(`${identity.gameId}:${identity.sessionId}`);
+        return durable;
+      },
+      {
+        scheduleRetry: (delayMs, task) => scheduled.push({ delayMs, task }),
+      },
+    );
+    const identity = { gameId: "adhoc-game", sessionId: "session-token" };
+
+    const subscriptions = await Promise.all([
+      tracker.subscribe("socket-1", identity),
+      tracker.subscribe("socket-1", identity),
+    ]);
+    expect(subscriptions.map((result) => result.attached)).toEqual([true, true]);
+    expect(tracker.count(identity)).toBe(1);
+    expect(await tracker.disconnect("socket-1")).toBe(false);
+    expect(tracker.count(identity)).toBe(0);
+    expect(disconnected).toEqual(["adhoc-game:session-token"]);
+    expect(tracker.pendingCount()).toBe(1);
+    expect(scheduled.map((item) => item.delayMs)).toEqual([100]);
+
+    durable = true;
+    scheduled.shift()!.task();
+    expect(await tracker.retryPending()).toBe(true);
+    expect(tracker.pendingCount()).toBe(0);
+    expect(disconnected).toEqual(["adhoc-game:session-token", "adhoc-game:session-token"]);
+  });
+
+  test("bounds pending disconnect work per injected retry tick and releases socket tombstones", async () => {
+    const scheduled: Array<{ delayMs: number; task: () => void }> = [];
+    let durable = false;
+    let disconnectAttempts = 0;
+    const tracker = createAdHocLiveSessionTracker(
+      async () => {
+        disconnectAttempts += 1;
+        return durable;
+      },
+      {
+        retryBatchSize: 2,
+        retryBaseDelayMs: 40,
+        retryMaxDelayMs: 160,
+        scheduleRetry: (delayMs, task) => scheduled.push({ delayMs, task }),
+      },
+    );
+
+    for (let index = 0; index < 5; index += 1) {
+      const identity = { gameId: `game-${index}`, sessionId: `session-${index}` };
+      await tracker.subscribe(`socket-${index}`, identity);
+      expect(await tracker.disconnect(`socket-${index}`)).toBe(false);
+    }
+    expect(tracker.pendingCount()).toBe(5);
+    expect(scheduled.map((item) => item.delayMs)).toEqual([40]);
+    expect(disconnectAttempts).toBe(5);
+
+    scheduled.shift()!.task();
+    expect(await tracker.retryPending()).toBe(false);
+    expect(disconnectAttempts).toBe(7);
+    expect(tracker.pendingCount()).toBe(5);
+    expect(scheduled.map((item) => item.delayMs)).toEqual([80]);
+
+    durable = true;
+    while (tracker.pendingCount() > 0) {
+      scheduled.shift()!.task();
+      await tracker.retryPending();
+    }
+    expect(tracker.pendingCount()).toBe(0);
+    expect(tracker.tombstoneCount()).toBe(0);
+  });
+
+  test("rotates failed retry entries so a later transient disconnect is not starved", async () => {
+    const scheduled: Array<{ delayMs: number; task: () => void }> = [];
+    let transientAttempts = 0;
+    const tracker = createAdHocLiveSessionTracker(
+      async (identity) => {
+        if (identity.gameId === "transient") {
+          transientAttempts += 1;
+          return transientAttempts > 1;
+        }
+        return false;
+      },
+      {
+        retryBatchSize: 2,
+        scheduleRetry: (delayMs, task) => scheduled.push({ delayMs, task }),
+      },
+    );
+
+    for (const gameId of ["permanent-1", "permanent-2", "permanent-3", "transient"]) {
+      const identity = { gameId, sessionId: `${gameId}-session` };
+      await tracker.subscribe(gameId, identity);
+      expect(await tracker.disconnect(gameId)).toBe(false);
+    }
+    expect(transientAttempts).toBe(1);
+    expect(tracker.pendingCount()).toBe(4);
+
+    scheduled.shift()!.task();
+    await tracker.retryPending();
+    expect(transientAttempts).toBe(1);
+
+    scheduled.shift()!.task();
+    await tracker.retryPending();
+    expect(transientAttempts).toBe(2);
+    expect(tracker.pendingCount()).toBe(3);
+  });
+
+  test("retains a closed socket tombstone until queued disconnect durability drains", async () => {
+    let releaseDisconnect!: (durable: boolean) => void;
+    let markCallbackStarted!: () => void;
+    const callbackStarted = new Promise<void>((resolve) => {
+      markCallbackStarted = resolve;
+    });
+    const tracker = createAdHocLiveSessionTracker(
+      async () =>
+        await new Promise<boolean>((resolve) => {
+          markCallbackStarted();
+          releaseDisconnect = resolve;
+        }),
+      { scheduleRetry: () => undefined },
+    );
+    const identity = { gameId: "game", sessionId: "session" };
+    await tracker.subscribe("socket", identity);
+    const disconnect = tracker.disconnect("socket");
+    await callbackStarted;
+    expect(tracker.tombstoneCount()).toBe(1);
+    releaseDisconnect(true);
+    expect(await disconnect).toBe(true);
+    expect(tracker.tombstoneCount()).toBe(0);
   });
 
   test("retains two Games in one browser authority set and leaving one preserves the other", async () => {
@@ -393,6 +528,33 @@ describe("Ad Hoc HTTP and WebSocket authority boundaries", () => {
     expect(firstResult.sessionId).not.toBe(secondResult.sessionId);
   });
 
+  test("authorizes and protects a WebSocket subscription in one durable mutation", async () => {
+    const baseStore = createInMemoryAdHocStore();
+    const creator = createAdHocGamesService({ store: baseStore, now: () => 1_000 });
+    const created = await creator.create({ homeName: "Home", awayName: "Away" });
+    if (created.status !== "accepted") throw new Error("creation failed");
+
+    const failingStore = {
+      ...baseStore,
+      mutateGame: () => null,
+    };
+    const unavailable = await resolveAdHocWebSocketSubscription({
+      service: createAdHocGamesService({ store: failingStore, now: () => 1_001 }),
+      cookieHeader: `adhoc_session_${created.gameId}=${created.sessionId}`,
+      gameId: created.gameId,
+    });
+    expect(unavailable).toEqual({ status: "unavailable" });
+    expect(baseStore.readGame(created.gameId)?.sessions[0]?.connected).toBe(false);
+
+    const accepted = await resolveAdHocWebSocketSubscription({
+      service: creator,
+      cookieHeader: `adhoc_session_${created.gameId}=${created.sessionId}`,
+      gameId: created.gameId,
+    });
+    expect(accepted.status).toBe("accepted");
+    expect(baseStore.readGame(created.gameId)?.sessions[0]?.connected).toBe(true);
+  });
+
   test("fails creation unavailable without committing a Game when storage is contended", async () => {
     const store = {
       ...createInMemoryAdHocStore(),
@@ -502,6 +664,48 @@ describe("Ad Hoc HTTP and WebSocket authority boundaries", () => {
       games,
     );
     expect(differentSource.status).toBe(201);
+  });
+
+  test("returns a generic HTTP capacity outcome without exposing or removing a Game", async () => {
+    let nowMs = 1_000;
+    const store = createInMemoryAdHocStore();
+    const games = createAdHocGamesService({ store, now: () => nowMs });
+    const created: Array<{ gameId: string; sessionId: string }> = [];
+
+    for (let index = 0; index < 50; index += 1) {
+      nowMs += 60 * 60_000;
+      const result = await games.create({
+        homeName: `Home ${index}`,
+        awayName: "Away",
+        sourceKey: `capacity-source-${index}`,
+      });
+      if (result.status !== "accepted") throw new Error("capacity setup failed");
+      created.push(result);
+      expect(
+        await games.setConnection({
+          gameId: result.gameId,
+          sessionId: result.sessionId,
+          connected: true,
+          nowMs,
+        }),
+      ).toBe(true);
+    }
+
+    const response = await createGame(
+      new Request("http://localhost/api/games", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ homeName: "New", awayName: "Game" }),
+      }),
+      games,
+    );
+
+    expect(response.status).toBe(429);
+    expect(await response.text()).toBe(
+      '{"error":"Ad Hoc capacity is currently full; no game was changed."}',
+    );
+    expect(store.listGames()).toHaveLength(50);
+    expect(store.readGame(created[0]!.gameId)).not.toBeNull();
   });
 });
 

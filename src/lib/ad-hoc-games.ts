@@ -50,6 +50,7 @@ export const AD_HOC_MAX_OPERATIONS_PER_SECOND_PER_GAME = AD_HOC_GAME_BURST;
 
 const SCHEMA_VERSION = 4;
 const GENERIC_UNAVAILABLE = "Ad Hoc Game unavailable.";
+const GENERIC_CAPACITY = "Ad Hoc capacity is currently full; no game was changed.";
 
 export type AdHocGameView = GameView & {
   gameId: string;
@@ -110,6 +111,10 @@ export type AdHocAccessResult =
   | { status: "accepted"; game: AdHocGameView }
   | { status: "unavailable"; detail: string };
 
+export type AdHocSubscriptionResult =
+  | AdHocAccessResult
+  | { status: "capacity"; retryAfterMs: number };
+
 type StoredSession = {
   sessionHash: string;
   browserId: string | null;
@@ -167,12 +172,219 @@ export type AdHocStore = {
     sourceHash: string;
     nowMs: number;
   }):
-    | "accepted"
     | "rate-limited"
     | "capacity"
     | "unavailable"
-    | { status: "rate-limited"; retryAfterMs: number };
+    | { status: "rate-limited"; retryAfterMs: number }
+    | { status: "accepted"; removedGameId: string | null };
   mutateGame<T>(gameId: string, mutation: (game: StoredAdHocGame) => T): T | null;
+};
+
+export type AdHocLiveSessionIdentity = {
+  gameId: string;
+  sessionId: string;
+};
+
+export type AdHocLiveSessionSubscribeResult = {
+  attached: boolean;
+  previousDisconnectDurable: boolean;
+};
+
+export type AdHocLiveSessionTrackerOptions = {
+  retryBatchSize?: number;
+  retryBaseDelayMs?: number;
+  retryMaxDelayMs?: number;
+  scheduleRetry?: (delayMs: number, task: () => void) => void;
+};
+
+export function createAdHocLiveSessionTracker(
+  onLastSocketClosed: (identity: AdHocLiveSessionIdentity) => Promise<boolean>,
+  options: AdHocLiveSessionTrackerOptions = {},
+) {
+  const socketOwners = new Map<string, AdHocLiveSessionIdentity>();
+  const sessionSockets = new Map<string, Set<string>>();
+  const pendingDisconnects = new Map<string, AdHocLiveSessionIdentity>();
+  const closedSockets = new Set<string>();
+  const socketTasks = new Map<string, Promise<unknown>>();
+  const sessionTasks = new Map<string, Promise<unknown>>();
+  const retryBatchSize = Math.max(1, Math.floor(options.retryBatchSize ?? 8));
+  const retryBaseDelayMs = Math.max(1, Math.floor(options.retryBaseDelayMs ?? 100));
+  const retryMaxDelayMs = Math.max(retryBaseDelayMs, Math.floor(options.retryMaxDelayMs ?? 10_000));
+  const schedule =
+    options.scheduleRetry ??
+    ((delayMs: number, task: () => void) => {
+      const timer = setTimeout(task, delayMs);
+      (timer as ReturnType<typeof setTimeout> & { unref?: () => void }).unref?.();
+    });
+  let retryScheduled = false;
+  let retryDelayMs = retryBaseDelayMs;
+  let retryInFlight: Promise<boolean> | null = null;
+  let retryPending: () => Promise<boolean> = async () => true;
+  const keyFor = (identity: AdHocLiveSessionIdentity) =>
+    JSON.stringify([identity.gameId, identity.sessionId]);
+  const enqueue = <T>(
+    tasks: Map<string, Promise<unknown>>,
+    key: string,
+    work: () => Promise<T>,
+  ) => {
+    const previous = tasks.get(key) ?? Promise.resolve();
+    const next = previous.then(work, work);
+    tasks.set(key, next);
+    void next.then(
+      () => {
+        if (tasks.get(key) === next) tasks.delete(key);
+        if (tasks === socketTasks && closedSockets.has(key) && !socketTasks.has(key)) {
+          closedSockets.delete(key);
+        }
+      },
+      () => {
+        if (tasks.get(key) === next) tasks.delete(key);
+        if (tasks === socketTasks && closedSockets.has(key) && !socketTasks.has(key)) {
+          closedSockets.delete(key);
+        }
+      },
+    );
+    return next;
+  };
+  const scheduleRetry = () => {
+    if (retryScheduled || pendingDisconnects.size === 0) return;
+    retryScheduled = true;
+    schedule(retryDelayMs, () => {
+      retryScheduled = false;
+      void retryPending();
+    });
+  };
+  const disconnectIfLast = (identity: AdHocLiveSessionIdentity) => {
+    const key = keyFor(identity);
+    return enqueue(sessionTasks, key, async () => {
+      if (sessionSockets.has(key)) {
+        pendingDisconnects.delete(key);
+        return true;
+      }
+      let durable = false;
+      try {
+        durable = await onLastSocketClosed(identity);
+      } catch {
+        durable = false;
+      }
+      if (sessionSockets.has(key)) {
+        pendingDisconnects.delete(key);
+        return true;
+      }
+      if (durable) pendingDisconnects.delete(key);
+      else pendingDisconnects.set(key, identity);
+      return durable;
+    });
+  };
+  const performRetry = async (): Promise<boolean> => {
+    const batch = [...pendingDisconnects.values()].slice(0, retryBatchSize);
+    if (batch.length === 0) {
+      retryDelayMs = retryBaseDelayMs;
+      return true;
+    }
+    const results = await Promise.all(batch.map((identity) => disconnectIfLast(identity)));
+    for (let index = 0; index < batch.length; index += 1) {
+      if (results[index] === true) continue;
+      const identity = batch[index]!;
+      const key = keyFor(identity);
+      const pending = pendingDisconnects.get(key);
+      if (pending !== undefined) {
+        pendingDisconnects.delete(key);
+        pendingDisconnects.set(key, pending);
+      }
+    }
+    if (pendingDisconnects.size === 0) retryDelayMs = retryBaseDelayMs;
+    else {
+      retryDelayMs = Math.min(retryMaxDelayMs, retryDelayMs * 2);
+      scheduleRetry();
+    }
+    return pendingDisconnects.size === 0 && results.every(Boolean);
+  };
+  const tracker = {
+    async subscribe(
+      socketId: string,
+      identity: AdHocLiveSessionIdentity,
+    ): Promise<AdHocLiveSessionSubscribeResult> {
+      return await enqueue(socketTasks, socketId, async () => {
+        if (closedSockets.has(socketId)) {
+          const durable = await disconnectIfLast(identity);
+          if (!durable) scheduleRetry();
+          return { attached: false, previousDisconnectDurable: durable };
+        }
+        const previous = socketOwners.get(socketId);
+        if (previous !== undefined && keyFor(previous) === keyFor(identity)) {
+          pendingDisconnects.delete(keyFor(identity));
+          return { attached: true, previousDisconnectDurable: true };
+        }
+        let previousDisconnectDurable = true;
+        if (previous !== undefined) {
+          socketOwners.delete(socketId);
+          const previousKey = keyFor(previous);
+          const previousSockets = sessionSockets.get(previousKey);
+          previousSockets?.delete(socketId);
+          if (previousSockets?.size === 0) {
+            sessionSockets.delete(previousKey);
+            previousDisconnectDurable = await disconnectIfLast(previous);
+          }
+        }
+        const key = keyFor(identity);
+        socketOwners.set(socketId, identity);
+        const socketsForSession = sessionSockets.get(key) ?? new Set<string>();
+        socketsForSession.add(socketId);
+        sessionSockets.set(key, socketsForSession);
+        pendingDisconnects.delete(key);
+        if (!previousDisconnectDurable) scheduleRetry();
+        return { attached: true, previousDisconnectDurable };
+      });
+    },
+    async disconnect(socketId: string): Promise<boolean> {
+      closedSockets.add(socketId);
+      const durable = await enqueue(socketTasks, socketId, async () => {
+        const identity = socketOwners.get(socketId);
+        if (identity === undefined) return true;
+        socketOwners.delete(socketId);
+        const key = keyFor(identity);
+        const socketsForSession = sessionSockets.get(key);
+        socketsForSession?.delete(socketId);
+        if (socketsForSession?.size !== 0) return true;
+        sessionSockets.delete(key);
+        return await disconnectIfLast(identity);
+      });
+      if (!durable) scheduleRetry();
+      return durable;
+    },
+    count(identity: AdHocLiveSessionIdentity) {
+      return sessionSockets.get(keyFor(identity))?.size ?? 0;
+    },
+    pendingCount() {
+      return pendingDisconnects.size;
+    },
+    tombstoneCount() {
+      return closedSockets.size;
+    },
+    async retryPending(): Promise<boolean> {
+      if (retryInFlight !== null) return await retryInFlight;
+      const current = performRetry();
+      retryInFlight = current;
+      void current.then(
+        () => {
+          if (retryInFlight === current) retryInFlight = null;
+        },
+        () => {
+          if (retryInFlight === current) retryInFlight = null;
+        },
+      );
+      return await current;
+    },
+  };
+  retryPending = () => tracker.retryPending();
+  return tracker;
+}
+
+export type AdHocSqliteStoreOptions = {
+  reconcileConnectionsAtStartup?: boolean;
+  startupNowMs?: number;
+  beforeCapacityCommit?: () => void;
 };
 
 export type AdHocGamesServiceOptions = {
@@ -246,6 +458,58 @@ export function createAdHocGamesService(options: AdHocGamesServiceOptions = {}) 
     return cancel;
   };
 
+  const updateConnection = (input: {
+    gameId: string;
+    sessionId: string;
+    connected: boolean;
+    connectionId: string;
+    nowMs: number;
+  }): { status: "accepted"; game: StoredAdHocGame } | { status: "capacity" } | null => {
+    const sessionKey = digest(input.sessionId);
+    let connectionChange: "add" | "remove" | null = null;
+    let outcome: StoredAdHocGame | false | { capacity: true; rollback: true } | null;
+    try {
+      outcome = store.mutateGame(input.gameId, (game) => {
+        if (game.environmentIdentity !== environmentIdentity) return false;
+        const session = game.sessions.find((candidate) => candidate.sessionHash === sessionKey);
+        if (session === undefined) return false;
+        if (input.connected && !connections.has(input.connectionId)) {
+          const activeEventConnections = Math.max(0, eventCapacity.activeConnections());
+          const availableForAdHoc = Math.max(
+            0,
+            Math.min(
+              maxConnectedSockets,
+              eventCapacity.totalConnections -
+                Math.max(eventCapacity.reservedConnections, activeEventConnections),
+            ),
+          );
+          if (connections.size >= availableForAdHoc) {
+            return { capacity: true, rollback: true } as const;
+          }
+          connectionChange = "add";
+        }
+        if (!input.connected && connections.has(input.connectionId)) {
+          connectionChange = "remove";
+        }
+        const hasOtherConnection = [...connections].some(
+          ([candidateId, candidateSessionKey]) =>
+            candidateId !== input.connectionId && candidateSessionKey === sessionKey,
+        );
+        session.connected = input.connected || hasOtherConnection;
+        if (input.connected) session.lastConnectedAtMs = input.nowMs;
+        else if (!hasOtherConnection) session.lastDisconnectedAtMs = input.nowMs;
+        return game;
+      });
+    } catch {
+      return null;
+    }
+    if (outcome === null || outcome === false) return null;
+    if ("capacity" in outcome) return { status: "capacity" };
+    if (connectionChange === "add") connections.set(input.connectionId, sessionKey);
+    if (connectionChange === "remove") connections.delete(input.connectionId);
+    return { status: "accepted", game: outcome };
+  };
+
   return {
     async create(input: AdHocCreationInput): Promise<AdHocCreateResult> {
       const home = normalizeTeamInput(input.homeName, "homeName");
@@ -311,7 +575,10 @@ export function createAdHocGamesService(options: AdHocGamesServiceOptions = {}) 
       } catch {
         return { status: "rejected", reason: "unavailable" };
       }
-      if (outcome === "rate-limited" || typeof outcome === "object") {
+      if (
+        outcome === "rate-limited" ||
+        (typeof outcome === "object" && outcome.status === "rate-limited")
+      ) {
         const retryAfterMs = typeof outcome === "object" ? outcome.retryAfterMs : 60 * 60_000;
         metrics.creationDelay += retryAfterMs <= 30_000 ? 1 : 0;
         metrics.creationRateExhausted += retryAfterMs > 30_000 ? 1 : 0;
@@ -323,9 +590,20 @@ export function createAdHocGamesService(options: AdHocGamesServiceOptions = {}) 
         };
       }
       if (outcome === "capacity") {
-        return { status: "rejected", reason: "capacity" };
+        return { status: "rejected", reason: "capacity", detail: GENERIC_CAPACITY };
       }
       if (outcome === "unavailable") return { status: "rejected", reason: "unavailable" };
+
+      if (outcome.removedGameId !== null) {
+        gameActionBuckets.delete(outcome.removedGameId);
+        const prefix = `${outcome.removedGameId}:`;
+        for (const key of controllerActionBuckets.keys()) {
+          if (key.startsWith(prefix)) controllerActionBuckets.delete(key);
+        }
+        for (const key of replayBuckets.keys()) {
+          if (key.startsWith(prefix)) replayBuckets.delete(key);
+        }
+      }
 
       return {
         status: "accepted",
@@ -359,6 +637,31 @@ export function createAdHocGamesService(options: AdHocGamesServiceOptions = {}) 
       return {
         status: "accepted",
         game: projectAuthorizedGame(game, sessionId, null, input.nowMs ?? now(), iqaRules),
+      };
+    },
+
+    async subscribe(input: {
+      gameId: unknown;
+      sessionId: unknown;
+      nowMs?: number;
+    }): Promise<AdHocSubscriptionResult> {
+      const gameId = validateGameId(input.gameId);
+      const sessionId = validateBearer(input.sessionId);
+      if (gameId === null || sessionId === null) return unavailable();
+      const nowMs = input.nowMs ?? now();
+      if (!isSafeTimestamp(nowMs)) return unavailable();
+      const outcome = updateConnection({
+        gameId,
+        sessionId,
+        connected: true,
+        connectionId: digest(sessionId),
+        nowMs,
+      });
+      if (outcome === null) return unavailable();
+      if (outcome.status === "capacity") return { status: "capacity", retryAfterMs: 1_000 };
+      return {
+        status: "accepted",
+        game: projectAuthorizedGame(outcome.game, sessionId, null, nowMs, iqaRules),
       };
     },
 
@@ -441,8 +744,8 @@ export function createAdHocGamesService(options: AdHocGamesServiceOptions = {}) 
           input.operations.length > 0 &&
           input.operations.length <= AD_HOC_REPLAY_MAX_OPERATIONS_PER_BATCH
         ) {
-          const sessionKey = digest(sessionId);
-          if (pendingReplays.has(sessionKey)) {
+          const replaySessionKey = digest(sessionId);
+          if (pendingReplays.has(replaySessionKey)) {
             metrics.replayPressure += 1;
             return {
               status: "rejected",
@@ -515,7 +818,7 @@ export function createAdHocGamesService(options: AdHocGamesServiceOptions = {}) 
             },
           );
           const replayId = random();
-          pendingReplays.set(sessionKey, replayId);
+          pendingReplays.set(replaySessionKey, replayId);
           const chunks = Array.from({ length: Math.ceil(plannedEntries.length / 20) }, (_, index) =>
             plannedEntries.slice(index * 20, (index + 1) * 20),
           );
@@ -526,10 +829,11 @@ export function createAdHocGamesService(options: AdHocGamesServiceOptions = {}) 
             let duplicate = true;
             let retryCount = 0;
             const deadlineMs = nowMs + 30_000;
-            const isCurrentJob = () => !closed && replayJobs.get(sessionKey)?.resolve === resolve;
+            const isCurrentJob = () =>
+              !closed && replayJobs.get(replaySessionKey)?.resolve === resolve;
             const rejectJob = (result: AdHocActionResult) => {
-              pendingReplays.delete(sessionKey);
-              replayJobs.delete(sessionKey);
+              pendingReplays.delete(replaySessionKey);
+              replayJobs.delete(replaySessionKey);
               resolve(result);
             };
             const runChunk = (index: number, scheduledAtMs: number) => {
@@ -562,7 +866,7 @@ export function createAdHocGamesService(options: AdHocGamesServiceOptions = {}) 
                       const cancel = scheduleReplayTask(delayMs, () =>
                         runChunk(index, scheduledAtMs + delayMs),
                       );
-                      const job = replayJobs.get(sessionKey);
+                      const job = replayJobs.get(replaySessionKey);
                       if (job !== undefined) job.cancel = cancel;
                       return;
                     }
@@ -578,11 +882,11 @@ export function createAdHocGamesService(options: AdHocGamesServiceOptions = {}) 
                     const cancel = scheduleReplayTask(1_000, () =>
                       runChunk(index + 1, scheduledAtMs + 1_000),
                     );
-                    const job = replayJobs.get(sessionKey);
+                    const job = replayJobs.get(replaySessionKey);
                     if (job !== undefined) job.cancel = cancel;
                     return;
                   }
-                  replayJobs.delete(sessionKey);
+                  replayJobs.delete(replaySessionKey);
                   resolve({
                     status: duplicate ? "duplicate" : "accepted",
                     game: projectedGame,
@@ -594,7 +898,7 @@ export function createAdHocGamesService(options: AdHocGamesServiceOptions = {}) 
               );
             };
             const job = { cancel: () => {}, resolve };
-            replayJobs.set(sessionKey, job);
+            replayJobs.set(replaySessionKey, job);
             job.cancel = scheduleReplayTask(0, () => runChunk(0, nowMs));
           });
         }
@@ -613,10 +917,11 @@ export function createAdHocGamesService(options: AdHocGamesServiceOptions = {}) 
       const nowMs = input.nowMs ?? now();
       if (!isSafeTimestamp(nowMs)) return { status: "rejected", reason: "invalid-operation" };
       let outcome: AdHocApplyMutationResult | null;
-      const sessionKey = digest(sessionId);
+      const replaySessionKey = digest(sessionId);
+      const sessionBucketKey = `${gameId}:${replaySessionKey}`;
       if (
         preparedChunk === undefined &&
-        (replayInFlight.has(sessionKey) || pendingReplays.has(sessionKey))
+        (replayInFlight.has(replaySessionKey) || pendingReplays.has(replaySessionKey))
       ) {
         metrics.replayPressure += 1;
         return {
@@ -626,7 +931,7 @@ export function createAdHocGamesService(options: AdHocGamesServiceOptions = {}) 
           retryAfterMs: 1_000,
         };
       }
-      replayInFlight.add(sessionKey);
+      replayInFlight.add(replaySessionKey);
       let nextControllerBucket: AdHocTokenBucket | undefined;
       let nextGameBucket: AdHocTokenBucket | undefined;
       let nextReplayBucket: AdHocTokenBucket | undefined;
@@ -691,7 +996,7 @@ export function createAdHocGamesService(options: AdHocGamesServiceOptions = {}) 
                 ).length;
           if (acceptedNewOperationCount > 0) {
             const controller = consumeAdHocTokens(
-              controllerActionBuckets.get(sessionKey),
+              controllerActionBuckets.get(sessionBucketKey),
               nowMs,
               AD_HOC_CONTROLLER_BURST,
               AD_HOC_CONTROLLER_SUSTAINED_PER_SECOND,
@@ -705,7 +1010,7 @@ export function createAdHocGamesService(options: AdHocGamesServiceOptions = {}) 
               acceptedNewOperationCount,
             );
             const replay = consumeAdHocTokens(
-              replayBuckets.get(sessionKey),
+              replayBuckets.get(sessionBucketKey),
               nowMs,
               deferReplayAcknowledgement
                 ? AD_HOC_REPLAY_BURST
@@ -828,7 +1133,7 @@ export function createAdHocGamesService(options: AdHocGamesServiceOptions = {}) 
       } catch {
         return { status: "rejected", reason: "unavailable" };
       } finally {
-        replayInFlight.delete(sessionKey);
+        replayInFlight.delete(replaySessionKey);
       }
       if (outcome === null || outcome === false)
         return { status: "rejected", reason: "unavailable" };
@@ -865,9 +1170,9 @@ export function createAdHocGamesService(options: AdHocGamesServiceOptions = {}) 
       }
       if (game === null) return { status: "rejected", reason: "unavailable" };
       if (nextControllerBucket !== undefined)
-        controllerActionBuckets.set(sessionKey, nextControllerBucket);
+        controllerActionBuckets.set(sessionBucketKey, nextControllerBucket);
       if (nextGameBucket !== undefined) gameActionBuckets.set(gameId, nextGameBucket);
-      if (nextReplayBucket !== undefined) replayBuckets.set(sessionKey, nextReplayBucket);
+      if (nextReplayBucket !== undefined) replayBuckets.set(sessionBucketKey, nextReplayBucket);
       return {
         status: outcome.duplicate ? "duplicate" : "accepted",
         ackedOperationIds: outcome.acknowledged,
@@ -904,50 +1209,16 @@ export function createAdHocGamesService(options: AdHocGamesServiceOptions = {}) 
       if (gameId === null || sessionId === null) return false;
       const nowMs = input.nowMs ?? now();
       if (!isSafeTimestamp(nowMs)) return false;
-      const sessionKey = digest(sessionId);
-      const connectionId = input.connectionId?.trim() || sessionKey;
-      let connectionChange: "add" | "remove" | null = null;
-      try {
-        const changed = store.mutateGame(gameId, (game) => {
-          if (game.environmentIdentity !== environmentIdentity) return false;
-          const session = game.sessions.find(
-            (candidate) => candidate.sessionHash === digest(sessionId),
-          );
-          if (session === undefined) return false;
-          if (input.connected && !connections.has(connectionId)) {
-            const activeEventConnections = Math.max(0, eventCapacity.activeConnections());
-            const availableForAdHoc = Math.max(
-              0,
-              Math.min(
-                maxConnectedSockets,
-                eventCapacity.totalConnections -
-                  Math.max(eventCapacity.reservedConnections, activeEventConnections),
-              ),
-            );
-            if (connections.size >= availableForAdHoc) {
-              metrics.connectionShed += 1;
-              return false;
-            }
-            connectionChange = "add";
-          }
-          if (!input.connected && connections.has(connectionId)) connectionChange = "remove";
-          const hasOtherConnection = [...connections].some(
-            ([candidateId, candidateSessionKey]) =>
-              candidateId !== connectionId && candidateSessionKey === sessionKey,
-          );
-          session.connected = input.connected;
-          if (input.connected) session.lastConnectedAtMs = nowMs;
-          else if (!hasOtherConnection) session.lastDisconnectedAtMs = nowMs;
-          if (!input.connected && hasOtherConnection) session.connected = true;
-          return true;
-        });
-        if (changed === true && connectionChange === "add")
-          connections.set(connectionId, sessionKey);
-        if (changed === true && connectionChange === "remove") connections.delete(connectionId);
-        return changed === true;
-      } catch {
-        return false;
-      }
+      const connectionId = input.connectionId?.trim() || digest(sessionId);
+      const outcome = updateConnection({
+        gameId,
+        sessionId,
+        connected: input.connected,
+        connectionId,
+        nowMs,
+      });
+      if (outcome?.status === "capacity") metrics.connectionShed += 1;
+      return outcome?.status === "accepted";
     },
 
     async leave(input: { gameId: unknown; sessionId: unknown; nowMs?: number }): Promise<boolean> {
@@ -1073,24 +1344,24 @@ export function createInMemoryAdHocStore(): AdHocStore {
           retryAfterMs,
         };
       }
-      if (games.size >= AD_HOC_MAX_RETAINED_GAMES) {
+      let removedGameId: string | null = null;
+      const retainedCount = games.size;
+      if (retainedCount >= AD_HOC_MAX_RETAINED_GAMES) {
         const victim = [...games.values()]
-          .filter((candidate) =>
-            candidate.sessions.every(
-              (session) =>
-                !session.connected &&
-                session.lastDisconnectedAtMs !== null &&
-                session.lastDisconnectedAtMs <= nowMs - AD_HOC_DISCONNECTED_GRACE_MS,
-            ),
+          .filter(
+            (candidate) =>
+              candidate.environmentIdentity === game.environmentIdentity &&
+              candidate.sessions.every((session) => isCleanupEligible(session, nowMs)),
           )
-          .sort((a, b) => a.createdAtMs - b.createdAtMs)[0];
+          .sort((a, b) => a.createdAtMs - b.createdAtMs || a.gameId.localeCompare(b.gameId))[0];
         if (victim === undefined) return "capacity";
         games.delete(victim.gameId);
+        removedGameId = victim.gameId;
       }
       games.set(game.gameId, cloneStoredGame(game));
       successes.push(nowMs);
       attempts.set(sourceHash, [...sourceAttempts, { occurredAtMs: nowMs, successful: true }]);
-      return "accepted";
+      return { status: "accepted", removedGameId };
     },
     mutateGame(gameId, mutation) {
       const game = games.get(gameId);
@@ -1116,6 +1387,7 @@ export function createInMemoryAdHocStore(): AdHocStore {
 export function openSqliteAdHocStore(
   databasePath: string,
   environmentIdentity = "test",
+  options: AdHocSqliteStoreOptions = {},
 ): AdHocStore {
   mkdirSync(dirname(databasePath), { recursive: true });
   const db = new Database(databasePath, { create: true, strict: true });
@@ -1184,6 +1456,33 @@ export function openSqliteAdHocStore(
     db.run("ALTER TABLE adhoc_creation_events ADD COLUMN retry_until_ms INTEGER");
   }
 
+  if (options.reconcileConnectionsAtStartup === true) {
+    const startupNowMs = options.startupNowMs ?? Date.now();
+    if (!isSafeTimestamp(startupNowMs)) throw new Error("Startup timestamp is invalid.");
+    const reconcile = db.transaction(() => {
+      const rows = db
+        .query("SELECT game_id, sessions_json FROM adhoc_games WHERE environment_identity = ?")
+        .all(environmentIdentity) as { game_id: string; sessions_json: string }[];
+      for (const row of rows) {
+        const sessions = JSON.parse(row.sessions_json) as StoredSession[];
+        let changed = false;
+        for (const session of sessions) {
+          if (!session.connected) continue;
+          session.connected = false;
+          session.lastDisconnectedAtMs = startupNowMs;
+          changed = true;
+        }
+        if (changed) {
+          db.run("UPDATE adhoc_games SET sessions_json = ? WHERE game_id = ?", [
+            JSON.stringify(sessions),
+            row.game_id,
+          ]);
+        }
+      }
+    });
+    reconcile.immediate();
+  }
+
   const read = (gameId: string): StoredAdHocGame | null => {
     const row = db.query("SELECT * FROM adhoc_games WHERE game_id = ?").get(gameId) as Record<
       string,
@@ -1206,15 +1505,14 @@ export function openSqliteAdHocStore(
     },
     readGame: read,
     createGame({ game, sourceHash, nowMs }) {
-      return transaction(() => {
-        db.run("DELETE FROM adhoc_creation_events WHERE occurred_at_ms <= ?", [
-          nowMs - AD_HOC_CREATION_GLOBAL_WINDOW_MS,
-        ]);
+      return transaction.immediate(() => {
         const pendingRow = db
           .query(
-            "SELECT retry_until_ms FROM adhoc_creation_events WHERE source_hash = ? AND successful = 0 AND retry_until_ms IS NOT NULL ORDER BY occurred_at_ms DESC LIMIT 1",
+            "SELECT retry_until_ms FROM adhoc_creation_events WHERE source_hash = ? AND successful = 0 AND retry_until_ms IS NOT NULL AND occurred_at_ms > ? ORDER BY occurred_at_ms DESC LIMIT 1",
           )
-          .get(sourceHash) as { retry_until_ms?: number | string } | null;
+          .get(sourceHash, nowMs - AD_HOC_CREATION_GLOBAL_WINDOW_MS) as {
+          retry_until_ms?: number | string;
+        } | null;
         const pendingUntilMs = Number(pendingRow?.retry_until_ms ?? 0);
         if (pendingUntilMs > nowMs) {
           return { status: "rate-limited", retryAfterMs: pendingUntilMs - nowMs } as const;
@@ -1240,15 +1538,21 @@ export function openSqliteAdHocStore(
           } as const;
         }
         const globalCountRow = db
-          .query("SELECT COUNT(*) AS count FROM adhoc_creation_events WHERE successful = 1")
-          .get() as { count?: number | string } | null;
+          .query(
+            "SELECT COUNT(*) AS count FROM adhoc_creation_events WHERE successful = 1 AND occurred_at_ms > ?",
+          )
+          .get(nowMs - AD_HOC_CREATION_GLOBAL_WINDOW_MS) as {
+          count?: number | string;
+        } | null;
         const globalCount = Number(globalCountRow?.count ?? 0);
         if (globalCount >= AD_HOC_MAX_CREATIONS_PER_HOUR) {
           const firstSuccessRow = db
             .query(
-              "SELECT MIN(occurred_at_ms) AS occurred_at_ms FROM adhoc_creation_events WHERE successful = 1",
+              "SELECT MIN(occurred_at_ms) AS occurred_at_ms FROM adhoc_creation_events WHERE successful = 1 AND occurred_at_ms > ?",
             )
-            .get() as { occurred_at_ms?: number | string } | null;
+            .get(nowMs - AD_HOC_CREATION_GLOBAL_WINDOW_MS) as {
+            occurred_at_ms?: number | string;
+          } | null;
           const retryAfterMs = Math.max(
             1_000,
             Number(firstSuccessRow?.occurred_at_ms ?? nowMs) +
@@ -1268,18 +1572,31 @@ export function openSqliteAdHocStore(
           count?: number | string;
         } | null;
         const count = Number(countRow?.count ?? 0);
+        let removedGameId: string | null = null;
         if (count >= AD_HOC_MAX_RETAINED_GAMES) {
           const victim = db
-            .query(`SELECT game_id FROM adhoc_games WHERE NOT EXISTS (
+            .query(`SELECT game_id FROM adhoc_games WHERE environment_identity = ? AND NOT EXISTS (
             SELECT 1 FROM json_each(sessions_json) AS session
             WHERE json_extract(session.value, '$.connected') = 1
-               OR json_extract(session.value, '$.lastDisconnectedAtMs') IS NULL
-               OR json_extract(session.value, '$.lastDisconnectedAtMs') > ?
-          ) ORDER BY created_at_ms ASC LIMIT 1`)
-            .get(nowMs - AD_HOC_DISCONNECTED_GRACE_MS) as { game_id?: string } | null;
+               OR COALESCE(
+                    json_extract(session.value, '$.lastDisconnectedAtMs'),
+                    json_extract(session.value, '$.lastConnectedAtMs')
+                  ) > ?
+          ) ORDER BY created_at_ms ASC, game_id ASC LIMIT 1`)
+            .get(game.environmentIdentity, nowMs - AD_HOC_DISCONNECTED_GRACE_MS) as {
+            game_id?: string;
+          } | null;
           if (victim?.game_id === undefined) return "capacity" as const;
-          db.run("DELETE FROM adhoc_games WHERE game_id = ?", [victim.game_id]);
+          options.beforeCapacityCommit?.();
+          db.run("DELETE FROM adhoc_games WHERE game_id = ? AND environment_identity = ?", [
+            victim.game_id,
+            game.environmentIdentity,
+          ]);
+          removedGameId = victim.game_id;
         }
+        db.run("DELETE FROM adhoc_creation_events WHERE occurred_at_ms <= ?", [
+          nowMs - AD_HOC_CREATION_GLOBAL_WINDOW_MS,
+        ]);
         db.run(
           "INSERT INTO adhoc_games (game_id, environment_identity, created_at_ms, state_json, initial_state_json, replay_baseline_operation_ids_json, control_qr, control_qr_hash, sessions_json, operations_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
           [
@@ -1299,13 +1616,8 @@ export function openSqliteAdHocStore(
           "INSERT INTO adhoc_creation_events (source_hash, successful, occurred_at_ms, retry_until_ms) VALUES (?, 1, ?, NULL)",
           [sourceHash, nowMs],
         );
-        return "accepted" as const;
-      }) as
-        | "accepted"
-        | "rate-limited"
-        | "capacity"
-        | "unavailable"
-        | { status: "rate-limited"; retryAfterMs: number };
+        return { status: "accepted", removedGameId } as const;
+      }) as ReturnType<AdHocStore["createGame"]>;
     },
     mutateGame<T>(gameId: string, mutation: (game: StoredAdHocGame) => T): T | null {
       return transaction(() => {
@@ -1739,6 +2051,12 @@ function validateBrowserId(value: unknown): string | null {
 
 function isSafeTimestamp(value: number): boolean {
   return Number.isSafeInteger(value) && value >= 0;
+}
+
+function isCleanupEligible(session: StoredSession, nowMs: number): boolean {
+  if (session.connected) return false;
+  const lastEvidenceMs = session.lastDisconnectedAtMs ?? session.lastConnectedAtMs;
+  return lastEvidenceMs <= nowMs - AD_HOC_DISCONNECTED_GRACE_MS;
 }
 
 function normalizeTeamInput(value: unknown, field: string) {

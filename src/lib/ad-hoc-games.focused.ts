@@ -1,11 +1,22 @@
 import { describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
+import { existsSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { applyGameCommand, createInitialGameState } from "@/lib/game-engine";
-import { createAdHocGamesService, openSqliteAdHocStore } from "@/lib/ad-hoc-games";
+import { createEventCatalog, createInMemoryEventCatalogStorage } from "@/lib/event-catalog";
+import {
+  MemoryTechnicalAdminAuthRepository,
+  createTechnicalAdminAuth,
+} from "@/lib/technical-admin-auth";
+import {
+  AD_HOC_DISCONNECTED_GRACE_MS,
+  createAdHocGamesService,
+  createInMemoryAdHocStore,
+  openSqliteAdHocStore,
+} from "@/lib/ad-hoc-games";
 
 describe("Ad Hoc SQLite focused integration", () => {
   test("migrates accepted history as a replay baseline and preserves duplicate/conflict outcomes after restart", async () => {
@@ -300,38 +311,326 @@ describe("Ad Hoc SQLite focused integration", () => {
       await rm(root, { recursive: true, force: true });
     }
   });
+
+  test("leaves the complete SQLite snapshot unchanged when capacity is fully protected", async () => {
+    const root = await mkdtemp(join(tmpdir(), "quadball-timer-adhoc-capacity-snapshot-"));
+    const databasePath = join(root, "ad-hoc.sqlite");
+    const nowMs = 10_000_000_000;
+    const store = openSqliteAdHocStore(databasePath, "field-a");
+    const games = createAdHocGamesService({
+      store,
+      environmentIdentity: "field-a",
+      now: () => nowMs,
+    });
+    try {
+      for (let index = 0; index < 50; index += 1) {
+        const created = await games.create({
+          homeName: `Home ${index}`,
+          awayName: "Away",
+          sourceKey: `protected-source-${index}`,
+          nowMs: nowMs - (50 - index) * 2 * 60 * 60_000,
+        });
+        if (created.status !== "accepted") throw new Error("protected capacity setup failed");
+        expect(
+          await games.setConnection({
+            gameId: created.gameId,
+            sessionId: created.sessionId,
+            connected: true,
+            nowMs,
+          }),
+        ).toBe(true);
+      }
+
+      const seed = new Database(databasePath, { strict: true });
+      seed.run(
+        "INSERT INTO adhoc_creation_events (source_hash, successful, occurred_at_ms, retry_until_ms) VALUES (?, 1, ?, NULL)",
+        ["expired-evidence", nowMs - 2 * 60 * 60_000],
+      );
+      seed.close();
+      const snapshot = () => {
+        const database = new Database(databasePath, { strict: true });
+        const value = JSON.stringify({
+          games: database.query("SELECT * FROM adhoc_games ORDER BY game_id").all(),
+          creationEvents: database
+            .query(
+              "SELECT * FROM adhoc_creation_events ORDER BY occurred_at_ms, source_hash, successful, retry_until_ms",
+            )
+            .all(),
+        });
+        database.close();
+        return value;
+      };
+      const before = snapshot();
+
+      expect(
+        await games.create({
+          homeName: "Rejected",
+          awayName: "Capacity",
+          sourceKey: "new-protected-source",
+          nowMs,
+        }),
+      ).toMatchObject({ status: "rejected", reason: "capacity" });
+      expect(snapshot()).toBe(before);
+    } finally {
+      games.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("holds a real SQLite cleanup transaction across a competing connection and survives restart", async () => {
+    const root = await mkdtemp(join(tmpdir(), "quadball-timer-adhoc-capacity-focused-"));
+    const databasePath = join(root, "ad-hoc.sqlite");
+    const worker = join(process.cwd(), "scripts/ad-hoc-capacity-race-worker.ts");
+    const seedStore = openSqliteAdHocStore(databasePath, "field-a");
+    const first = createAdHocGamesService({
+      store: seedStore,
+      environmentIdentity: "field-a",
+      now: () => 10_000_000_000,
+    });
+    const created: Array<{ gameId: string; sessionId: string }> = [];
+    const nowMs = 10_000_000_000;
+    let firstClosed = false;
+    let connectWorker: ReturnType<typeof startWorker> | null = null;
+    let createWorker: ReturnType<typeof startWorker> | null = null;
+    let primaryError: unknown = null;
+
+    try {
+      for (let index = 0; index < 50; index += 1) {
+        const result = await first.create({
+          homeName: `Home ${index}`,
+          awayName: "Away",
+          sourceKey: `focused-source-${index}`,
+          nowMs: nowMs - (50 - index) * 2 * 60 * 60_000,
+        });
+        if (result.status !== "accepted") throw new Error("focused capacity setup failed");
+        created.push(result);
+      }
+
+      const oldest = created[0]!;
+      const connectedBeforeRestart = await first.subscribe({
+        gameId: created[1]!.gameId,
+        sessionId: created[1]!.sessionId,
+        nowMs,
+      });
+      expect(connectedBeforeRestart.status).toBe("accepted");
+      first.close();
+      firstClosed = true;
+
+      const enteredPath = join(root, "create-entered");
+      const releasePath = join(root, "create-release");
+      const connectEnteredPath = join(root, "connect-entered");
+      const connectProceedPath = join(root, "connect-proceed");
+      connectWorker = startWorker(
+        worker,
+        databasePath,
+        "connect",
+        oldest.gameId,
+        oldest.sessionId,
+        String(nowMs),
+        "field-a",
+        connectEnteredPath,
+        connectProceedPath,
+      );
+      await waitForFile(connectEnteredPath);
+      createWorker = startWorker(
+        worker,
+        databasePath,
+        "create",
+        enteredPath,
+        releasePath,
+        String(nowMs),
+        "field-a",
+      );
+      await waitForFile(enteredPath);
+      writeFileSync(connectProceedPath, "proceed");
+      const connectOutput = await connectWorker.result;
+      expect(JSON.parse(connectOutput)).toEqual({ connected: false });
+      writeFileSync(releasePath, "release");
+      const createOutput = await createWorker.result;
+      expect(JSON.parse(createOutput)).toMatchObject({ status: "accepted" });
+
+      const verifyStore = openSqliteAdHocStore(databasePath, "field-a");
+      const retained = verifyStore.listGames();
+      expect(retained).toHaveLength(50);
+      expect(
+        retained.filter((game) => !created.some((item) => item.gameId === game.gameId)),
+      ).toHaveLength(1);
+      expect(verifyStore.readGame(oldest.gameId)).toBeNull();
+
+      const collisionTarget = retained.at(-1)!;
+      const collisionId = collisionTarget.gameId.replace(/^adhoc-/u, "");
+      const collision = createAdHocGamesService({
+        store: verifyStore,
+        environmentIdentity: "field-a",
+        now: () => nowMs,
+        random: () => collisionId,
+      });
+      const failedReplacement = await collision.create({
+        homeName: "Collision",
+        awayName: "Away",
+        sourceKey: "focused-collision",
+        nowMs,
+      });
+      expect(failedReplacement).toMatchObject({ status: "rejected", reason: "unavailable" });
+      expect(verifyStore.listGames()).toHaveLength(50);
+      expect(verifyStore.readGame(collisionTarget.gameId)).not.toBeNull();
+
+      collision.close();
+
+      const replacementStore = openSqliteAdHocStore(databasePath, "field-a", {
+        reconcileConnectionsAtStartup: true,
+        startupNowMs: nowMs + 1,
+      });
+      const restarted = createAdHocGamesService({
+        store: replacementStore,
+        environmentIdentity: "field-a",
+        now: () => nowMs + AD_HOC_DISCONNECTED_GRACE_MS + 1,
+      });
+      const restartedGame = replacementStore
+        .listGames()
+        .find((game) => game.gameId === created[1]!.gameId);
+      expect(restartedGame).toBeDefined();
+      expect(restartedGame?.sessions[0]?.connected).toBe(false);
+      expect(restartedGame?.sessions[0]?.lastDisconnectedAtMs).toBe(nowMs + 1);
+      restarted.close();
+    } catch (error) {
+      primaryError = error;
+    }
+    const cleanupResults = await Promise.allSettled(
+      [createWorker, connectWorker]
+        .filter((worker): worker is ReturnType<typeof startWorker> => worker !== null)
+        .map((worker) => cleanupWorker(worker)),
+    );
+    if (!firstClosed) first.close();
+    const cleanupErrors = cleanupResults
+      .filter((result): result is PromiseRejectedResult => result.status === "rejected")
+      .map((result) => result.reason);
+    if (cleanupErrors.length > 0) {
+      if (primaryError !== null) {
+        throw new AggregateError(
+          [primaryError, ...cleanupErrors],
+          "Focused SQLite race failed and worker cleanup also failed.",
+        );
+      }
+      throw cleanupErrors.length === 1
+        ? cleanupErrors[0]
+        : new AggregateError(cleanupErrors, "Focused SQLite worker cleanup failed.");
+    }
+    await rm(root, { recursive: true, force: true });
+    if (primaryError !== null) throw primaryError;
+  });
+
+  test("keeps Event storage and authority work accepted while Ad Hoc capacity is protected", async () => {
+    const eventAuth = createTechnicalAdminAuth(
+      { environment: "test", origin: "https://timer.example", rpId: "timer.example" },
+      new MemoryTechnicalAdminAuthRepository(),
+    );
+    const authority = eventAuth.resolveHostLocalAuthority();
+    const eventStorage = createInMemoryEventCatalogStorage();
+    let nextEventId = 0;
+    const eventCatalog = createEventCatalog(eventStorage, {
+      clock: { nowMs: () => 1_000 },
+      ids: { next: (kind) => `${kind}-isolation-${++nextEventId}` },
+    });
+    const event = await eventCatalog.createEvent(
+      { name: "SQM isolation", timeZone: "Europe/Zurich" },
+      authority,
+    );
+    expect(event.status).toBe("accepted");
+    if (event.status !== "accepted") return;
+
+    let nowMs = 1_000;
+    const adHocStore = createInMemoryAdHocStore();
+    const adHoc = createAdHocGamesService({ store: adHocStore, now: () => nowMs });
+    for (let index = 0; index < 50; index += 1) {
+      nowMs += 60 * 60_000;
+      const created = await adHoc.create({
+        homeName: `Protected ${index}`,
+        awayName: "Away",
+        sourceKey: `protected-${index}`,
+      });
+      if (created.status !== "accepted") throw new Error("Event isolation setup failed");
+      await adHoc.setConnection({
+        gameId: created.gameId,
+        sessionId: created.sessionId,
+        connected: true,
+        nowMs,
+      });
+    }
+
+    const blocked = await adHoc.create({
+      homeName: "Blocked",
+      awayName: "Ad Hoc",
+      sourceKey: "blocked-isolation",
+      nowMs,
+    });
+    expect(blocked).toMatchObject({ status: "rejected", reason: "capacity" });
+    expect(adHocStore.listGames()).toHaveLength(50);
+
+    const updated = await eventCatalog.updateEvent(
+      event.value.eventId,
+      { name: "SQM isolation updated" },
+      authority,
+    );
+    expect(updated).toMatchObject({ status: "accepted", value: { name: "SQM isolation updated" } });
+    const inspected = await eventCatalog.inspectEvent(event.value.eventId, authority);
+    expect(inspected).toMatchObject({
+      status: "accepted",
+      value: { eventId: event.value.eventId, name: "SQM isolation updated" },
+    });
+    eventAuth.close();
+  });
 });
 
 async function runWorker(worker: string, databasePath: string, mode: string, ...args: string[]) {
+  return await startWorker(worker, databasePath, mode, ...args).result;
+}
+
+async function cleanupWorker(worker: ReturnType<typeof startWorker>) {
+  if (!(await waitForExit(worker.child, 0))) await terminateChild(worker.child);
+}
+
+function startWorker(worker: string, databasePath: string, mode: string, ...args: string[]) {
   const child = Bun.spawn([process.execPath, "run", worker, databasePath, mode, ...args], {
     cwd: process.cwd(),
     stdout: "pipe",
     stderr: "pipe",
   });
-  let timeout: ReturnType<typeof setTimeout> | undefined;
-  try {
-    const output = Promise.all([
-      readBounded(child.stdout, 16 * 1024),
-      readBounded(child.stderr, 16 * 1024),
-      child.exited,
-    ]);
-    const result = await Promise.race([
-      output,
-      new Promise<never>((_, reject) => {
-        timeout = setTimeout(
-          () => reject(new Error("focused worker exceeded 10 second deadline")),
-          10_000,
-        );
-      }),
-    ]);
-    const [stdout, stderr, exitCode] = result;
-    if (exitCode !== 0) throw new Error(`worker failed: ${stderr || stdout}`);
-    return stdout.trim();
-  } catch (error) {
-    await terminateChild(child);
-    throw error;
-  } finally {
-    if (timeout !== undefined) clearTimeout(timeout);
+  const result = (async () => {
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const output = Promise.all([
+        readBounded(child.stdout, 16 * 1024),
+        readBounded(child.stderr, 16 * 1024),
+        child.exited,
+      ]);
+      const result = await Promise.race([
+        output,
+        new Promise<never>((_, reject) => {
+          timeout = setTimeout(
+            () => reject(new Error("focused worker exceeded 10 second deadline")),
+            10_000,
+          );
+        }),
+      ]);
+      const [stdout, stderr, exitCode] = result;
+      if (exitCode !== 0) throw new Error(`worker failed: ${stderr || stdout}`);
+      return stdout.trim();
+    } catch (error) {
+      await terminateChild(child);
+      throw error;
+    } finally {
+      if (timeout !== undefined) clearTimeout(timeout);
+    }
+  })();
+  return { child, result };
+}
+
+async function waitForFile(path: string) {
+  const deadline = Date.now() + 10_000;
+  while (!existsSync(path)) {
+    if (Date.now() >= deadline) throw new Error(`focused barrier did not appear: ${path}`);
+    await Bun.sleep(10);
   }
 }
 

@@ -62,6 +62,7 @@ import type { FoundationStorage } from "@/lib/foundation-storage";
 import { assertProductionStateBoundary } from "@/lib/runtime-storage-config";
 import { createStartupCleanup } from "@/lib/startup-resources";
 import {
+  createAdHocLiveSessionTracker,
   createAdHocGamesService,
   openSqliteAdHocStore,
   type AdHocGameView,
@@ -93,6 +94,8 @@ type SessionData = {
   cookieHeader: string | null;
   sessionId: string | null;
   subscription: SessionSubscription;
+  subscriptionWork: Promise<void>;
+  closed: boolean;
 };
 
 const sockets = new Set<ServerWebSocket<SessionData>>();
@@ -172,8 +175,17 @@ async function startServer() {
       store:
         environment === "test" && !process.env.AD_HOC_DATABASE?.trim()
           ? undefined
-          : openSqliteAdHocStore(adHocDatabasePath, adHocEnvironmentIdentity),
+          : openSqliteAdHocStore(adHocDatabasePath, adHocEnvironmentIdentity, {
+              reconcileConnectionsAtStartup: true,
+            }),
     });
+    const liveAdHocSessions = createAdHocLiveSessionTracker((identity) =>
+      adHocService.setConnection({
+        gameId: identity.gameId,
+        sessionId: identity.sessionId,
+        connected: false,
+      }),
+    );
     startupCleanup.add(() => adHocService.close());
     let runtimeGrantOptions: ReturnType<typeof readGrantAuthorityOptions> | null = null;
     try {
@@ -439,6 +451,8 @@ async function startServer() {
               cookieHeader: req.headers.get("cookie"),
               sessionId: null,
               subscription: { type: "none" },
+              subscriptionWork: Promise.resolve(),
+              closed: false,
             },
           });
 
@@ -1623,14 +1637,16 @@ async function startServer() {
         close(ws) {
           releasePendingSocketReservation(ws.data.id);
           sockets.delete(ws);
-          if (ws.data.subscription.type === "game" && ws.data.sessionId !== null) {
-            void adHocService.setConnection({
-              gameId: ws.data.subscription.gameId,
-              sessionId: ws.data.sessionId,
-              connected: false,
-              connectionId: ws.data.id,
-            });
-          }
+          ws.data.closed = true;
+          void ws.data.subscriptionWork
+            .then(
+              () => liveAdHocSessions.disconnect(ws.data.id),
+              () => liveAdHocSessions.disconnect(ws.data.id),
+            )
+            .then((durable) => {
+              if (!durable) void liveAdHocSessions.retryPending();
+            })
+            .catch(() => undefined);
         },
         async message(ws, message) {
           if (typeof message !== "string") {
@@ -1660,52 +1676,74 @@ async function startServer() {
             }
 
             case "subscribe-game": {
-              const result = await resolveAdHocWebSocketSubscription({
-                service: adHocService,
-                cookieHeader: ws.data.cookieHeader,
-                gameId: parsed.message.gameId,
-              });
-              if (result.status !== "accepted") {
-                sendMessage(ws, { type: "error", message: adHocService.genericUnavailableMessage });
-                ws.close(1008, "Ad Hoc subscription unavailable.");
-                return;
-              }
-              if (ws.data.subscription.type === "game") {
-                await adHocService.setConnection({
-                  gameId: ws.data.subscription.gameId,
-                  sessionId: ws.data.subscription.sessionId,
-                  connected: false,
-                  connectionId: ws.data.id,
+              const subscribeGameId = parsed.message.gameId;
+              const handleSubscription = async () => {
+                const result = await resolveAdHocWebSocketSubscription({
+                  service: adHocService,
+                  cookieHeader: ws.data.cookieHeader,
+                  gameId: subscribeGameId,
                 });
-              }
-              const connected = await adHocService.setConnection({
-                gameId: parsed.message.gameId,
-                sessionId: result.sessionId,
-                connected: true,
-                connectionId: ws.data.id,
-              });
-              if (!connected) {
-                adHocService.recordResourcePressure("connection-shed");
-                sendMessage(ws, {
-                  type: "error",
-                  message: "Ad Hoc connection busy. Try again later.",
-                  retryAfterMs: 1_000,
+                if (result.status === "capacity") {
+                  if (!ws.data.closed) {
+                    adHocService.recordResourcePressure("connection-shed");
+                    sendMessage(ws, {
+                      type: "error",
+                      message: "Ad Hoc connection busy. Try again later.",
+                      retryAfterMs: result.retryAfterMs,
+                    });
+                    setTimeout(() => ws.close(1013, "Ad Hoc connection busy."), 25);
+                  }
+                  return;
+                }
+                if (result.status !== "accepted") {
+                  if (!ws.data.closed) {
+                    sendMessage(ws, {
+                      type: "error",
+                      message: adHocService.genericUnavailableMessage,
+                    });
+                    ws.close(1008, "Ad Hoc subscription unavailable.");
+                  }
+                  return;
+                }
+                const identity = {
+                  gameId: subscribeGameId,
+                  sessionId: result.sessionId,
+                };
+                const tracking = await liveAdHocSessions.subscribe(ws.data.id, {
+                  ...identity,
                 });
-                setTimeout(() => ws.close(1013, "Ad Hoc connection busy."), 25);
-                return;
-              }
-              ws.data.sessionId = result.sessionId;
-              ws.data.subscription = {
-                type: "game",
-                gameId: parsed.message.gameId,
-                sessionId: result.sessionId,
+                if (!tracking.attached) {
+                  if (liveAdHocSessions.count(identity) === 0) {
+                    await adHocService.setConnection({ ...identity, connected: false });
+                  }
+                  if (!ws.data.closed) {
+                    sendMessage(ws, {
+                      type: "error",
+                      message: adHocService.genericUnavailableMessage,
+                    });
+                    ws.close(1008, "Ad Hoc subscription unavailable.");
+                  }
+                  return;
+                }
+                ws.data.sessionId = result.sessionId;
+                ws.data.subscription = {
+                  type: "game",
+                  gameId: subscribeGameId,
+                  sessionId: result.sessionId,
+                };
+                if (!ws.data.closed) {
+                  sendMessage(ws, {
+                    type: "game-snapshot",
+                    game: stripSession(result.game),
+                    serverNowMs: Date.now(),
+                    ackedCommandIds: [],
+                  });
+                }
+                if (!tracking.previousDisconnectDurable) void liveAdHocSessions.retryPending();
               };
-              sendMessage(ws, {
-                type: "game-snapshot",
-                game: stripSession(result.game),
-                serverNowMs: Date.now(),
-                ackedCommandIds: [],
-              });
+              const queued = ws.data.subscriptionWork.then(handleSubscription, handleSubscription);
+              ws.data.subscriptionWork = queued.catch(() => undefined);
+              await queued;
               return;
             }
 
@@ -2019,10 +2057,13 @@ export async function resolveAdHocWebSocketSubscription({
   cookieHeader: string | null;
   gameId: unknown;
 }): Promise<
-  { status: "accepted"; sessionId: string; game: AdHocGameView } | { status: "unavailable" }
+  | { status: "accepted"; sessionId: string; game: AdHocGameView }
+  | { status: "capacity"; retryAfterMs: number }
+  | { status: "unavailable" }
 > {
   const sessionId = readAdHocSession(cookieHeader, gameId);
-  const result = await service.read({ gameId, sessionId });
+  const result = await service.subscribe({ gameId, sessionId });
+  if (result.status === "capacity") return result;
   if (result.status !== "accepted") return { status: "unavailable" };
   return { status: "accepted", sessionId: result.game.sessionId, game: result.game };
 }
