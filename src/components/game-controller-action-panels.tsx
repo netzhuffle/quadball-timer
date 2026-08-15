@@ -68,6 +68,7 @@ export function GameControllerActionPanels({
   suspendGame,
   requestForfeitWin,
   recordDoubleForfeit,
+  correctBackToUnfinished,
   requestTargetScoreWin,
   requestConcedeWin,
   recordOrConfirmFlagCatch,
@@ -117,6 +118,7 @@ export function GameControllerActionPanels({
   suspendGame: () => void;
   requestForfeitWin: (penalizedTeam: TeamId) => void;
   recordDoubleForfeit: () => void;
+  correctBackToUnfinished: () => void;
   requestTargetScoreWin: (team: TeamId) => void;
   requestConcedeWin: (team: TeamId) => void;
   recordOrConfirmFlagCatch: (team: TeamId) => void;
@@ -378,7 +380,18 @@ export function GameControllerActionPanels({
               </div>
             ) : null}
             {state.isFinished ? (
-              <p className="text-[11px] text-slate-600">{finishSummary ?? "Game finished."}</p>
+              <>
+                <p className="text-[11px] text-slate-600">{finishSummary ?? "Game finished."}</p>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="h-8 rounded-xl border-slate-300 bg-white text-slate-900"
+                  onClick={correctBackToUnfinished}
+                  disabled={!controller}
+                >
+                  Correct back to unfinished
+                </Button>
+              </>
             ) : state.isSuspended ? (
               <>
                 <p className="text-[11px] text-slate-600">

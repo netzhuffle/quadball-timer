@@ -139,6 +139,9 @@ export type GameCommand =
       running: boolean;
     }
   | {
+      type: "correct-to-unfinished";
+    }
+  | {
       type: "adjust-game-clock";
       deltaMs: number;
     }

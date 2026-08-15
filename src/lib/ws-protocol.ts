@@ -258,6 +258,20 @@ export function parseGameCommand(payload: Record<string, unknown>):
     };
   }
 
+  if (payload.type === "correct-to-unfinished") {
+    if (Object.keys(payload).some((key) => key !== "type")) {
+      return {
+        ok: false,
+        error: "correct-to-unfinished does not accept fields.",
+      };
+    }
+
+    return {
+      ok: true,
+      command: { type: "correct-to-unfinished" },
+    };
+  }
+
   if (payload.type === "adjust-game-clock") {
     if (typeof payload.deltaMs !== "number") {
       return {

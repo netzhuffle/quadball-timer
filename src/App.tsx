@@ -10,6 +10,12 @@ import { EventOperationsPrototypePage } from "@/pages/event-operations-prototype
 import { EventAdminPage } from "@/pages/event-admin-page";
 import { EventGameControllerPage } from "@/pages/event-game-controller-page";
 import { GamePage } from "@/pages/game-page";
+import {
+  getAdHocBrowserId,
+  hasAdHocHandoffAttempt,
+  parseAdHocHandoffHash,
+  type AdHocHandoff,
+} from "@/lib/ad-hoc-handoff";
 import { TechnicalAdminPage } from "@/pages/technical-admin-page";
 import "./index.css";
 
@@ -37,10 +43,23 @@ type Route =
       type: "game";
       gameId: string;
       role: ControllerRole;
+    }
+  | {
+      type: "ad-hoc-handoff";
+      handoff: AdHocHandoff;
+    }
+  | {
+      type: "ad-hoc-unavailable";
     };
 
-export function App() {
-  const route = useRoute();
+export function App({
+  initialAdHocHandoff = null,
+  initialAdHocHandoffAttempted = false,
+}: {
+  initialAdHocHandoff?: AdHocHandoff | null;
+  initialAdHocHandoffAttempted?: boolean;
+}) {
+  const route = useRoute(initialAdHocHandoff, initialAdHocHandoffAttempted);
 
   if (route.type === "home") {
     return <HomePage />;
@@ -66,6 +85,25 @@ export function App() {
     return <TechnicalAdminPage enrollment={route.enrollment} />;
   }
 
+  if (route.type === "ad-hoc-handoff") {
+    return <AdHocHandoffPage handoff={route.handoff} />;
+  }
+
+  if (route.type === "ad-hoc-unavailable") {
+    return (
+      <div className="mx-auto flex min-h-screen w-full max-w-xl items-center p-6">
+        <Card className="w-full">
+          <CardHeader>
+            <CardTitle>Ad Hoc Game unavailable.</CardTitle>
+            <CardDescription>
+              This Ad Hoc handoff is invalid or no longer available.
+            </CardDescription>
+          </CardHeader>
+        </Card>
+      </div>
+    );
+  }
+
   return <GamePage gameId={route.gameId} role={route.role} />;
 }
 
@@ -84,6 +122,7 @@ function HomePage() {
         awayName,
         homeColor,
         awayColor,
+        browserId: getAdHocBrowserId(),
       }),
     });
 
@@ -121,7 +160,8 @@ function HomePage() {
           <CardHeader>
             <CardTitle>Start an Ad Hoc Game</CardTitle>
             <CardDescription>
-              You are admitted as the initially admitted Ad Hoc Controller.
+              You are admitted as an equal Ad Hoc Controller. Share the reusable Control QR from the
+              game screen with another device.
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-3">
@@ -187,14 +227,57 @@ function HomePage() {
   );
 }
 
-function useRoute(): Route {
+function AdHocHandoffPage({ handoff }: { handoff: AdHocHandoff }) {
+  const [message, setMessage] = useState("Joining Ad Hoc Game…");
+
+  useEffect(() => {
+    let cancelled = false;
+    void fetch(`/api/games/${handoff.gameId}/admit`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ controlQr: handoff.controlQr, browserId: getAdHocBrowserId() }),
+    })
+      .then(async (response) => {
+        if (!response.ok) throw new Error("unavailable");
+        if (cancelled) return;
+        navigateTo(`/game/${handoff.gameId}`);
+      })
+      .catch(() => {
+        if (!cancelled) setMessage("Ad Hoc Game unavailable.");
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [handoff.controlQr, handoff.gameId]);
+
+  return (
+    <div className="mx-auto flex min-h-screen w-full max-w-xl items-center p-6">
+      <Card className="w-full">
+        <CardHeader>
+          <CardTitle>Ad Hoc Controller handoff</CardTitle>
+          <CardDescription>{message}</CardDescription>
+        </CardHeader>
+      </Card>
+    </div>
+  );
+}
+
+function useRoute(
+  initialAdHocHandoff: AdHocHandoff | null,
+  initialAdHocHandoffAttempted: boolean,
+): Route {
   const [route, setRoute] = useState<Route>(() =>
-    parseRoute(window.location.pathname, window.location.search),
+    initialAdHocHandoff !== null
+      ? { type: "ad-hoc-handoff", handoff: initialAdHocHandoff }
+      : initialAdHocHandoffAttempted
+        ? { type: "ad-hoc-unavailable" }
+        : parseRoute(window.location.pathname, window.location.search, window.location.hash),
   );
 
   useEffect(() => {
     const onPopState = () => {
-      setRoute(parseRoute(window.location.pathname, window.location.search));
+      setRoute(parseRoute(window.location.pathname, window.location.search, window.location.hash));
     };
 
     window.addEventListener("popstate", onPopState);
@@ -204,7 +287,15 @@ function useRoute(): Route {
   return route;
 }
 
-export function parseRoute(pathname: string, _search: string): Route {
+export function parseRoute(pathname: string, _search: string, hash = ""): Route {
+  const handoff = parseAdHocHandoffHash(hash);
+  if (handoff !== null) {
+    return { type: "ad-hoc-handoff", handoff };
+  }
+  if (hasAdHocHandoffAttempt(hash)) {
+    return { type: "ad-hoc-unavailable" };
+  }
+
   if (pathname === "/admin" || pathname === "/admin/") {
     return { type: "technical-admin", enrollment: false };
   }

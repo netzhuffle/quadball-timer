@@ -432,6 +432,24 @@ describe("ws-protocol", () => {
     expect(parsed.message.commands[0].command.swapped).toBe(true);
   });
 
+  test("parses the Ad Hoc finished-state Correction", () => {
+    const parsed = parseClientWsMessage(
+      JSON.stringify({
+        type: "apply-commands",
+        gameId: "game-123",
+        commands: [
+          {
+            id: "cmd-correction",
+            clientSentAtMs: 123_456,
+            command: { type: "correct-to-unfinished" },
+          },
+        ],
+      }),
+    );
+
+    expect(parsed.ok).toBe(true);
+  });
+
   test("parses suspend-game command", () => {
     const parsed = parseClientWsMessage(
       JSON.stringify({

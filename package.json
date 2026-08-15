@@ -26,6 +26,7 @@
     "test:focused:event-catalog-cli": "bun test --isolate ./scripts/event-catalog-cli.focused.ts",
     "test:focused:grant-code": "bun test --isolate ./src/lib/grant-code.focused.ts",
     "test:focused:ad-hoc": "bun test --isolate ./src/lib/ad-hoc-games.focused.ts",
+    "test:focused:adhoc-browser": "bun scripts/test-ad-hoc-browser.ts",
     "test:changed": "bun test --changed",
     "format": "bunx --bun oxfmt \"**/*.{js,jsx,ts,tsx,mjs,cjs}\" \"!docs/**\"",
     "format:check": "bunx --bun oxfmt \"**/*.{js,jsx,ts,tsx,mjs,cjs}\" \"!docs/**\" --check",

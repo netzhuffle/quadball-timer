@@ -38,6 +38,7 @@ const RELEASE_EVENT_VISIBLE_MS = 30_000;
 export function useGameConnection({ gameId, role }: { gameId: string; role: ControllerRole }) {
   const wsUrl = useMemo(createWebSocketUrl, []);
   const [baseState, setBaseState] = useState<GameState | null>(null);
+  const [controlQr, setControlQr] = useState<string | null>(null);
   const [clockOffsetMs, setClockOffsetMs] = useState(0);
   const [connectionState, setConnectionState] = useState<ConnectionState>("connecting");
   const [error, setError] = useState<string | null>(null);
@@ -161,13 +162,16 @@ export function useGameConnection({ gameId, role }: { gameId: string; role: Cont
             return;
           }
 
-          setError("Game not found.");
+          setError("Ad Hoc Game unavailable.");
           return;
         }
 
-        const payload = (await response.json()) as { game?: GameView };
+        const payload = (await response.json()) as {
+          game?: GameView & { controlQr?: string | null };
+        };
         if (!cancelled && payload.game !== undefined) {
           setError(null);
+          setControlQr(payload.game.controlQr ?? null);
 
           let reconciled = payload.game.state;
           for (const command of pendingRef.current) {
@@ -185,7 +189,7 @@ export function useGameConnection({ gameId, role }: { gameId: string; role: Cont
             return;
           }
 
-          setError("Unable to fetch game snapshot.");
+          setError("Ad Hoc Game unavailable.");
         }
       }
     };
@@ -243,6 +247,7 @@ export function useGameConnection({ gameId, role }: { gameId: string; role: Cont
           setLocalOnlyState(false);
           setConnectionState("online");
           setError(null);
+          setControlQr(parsed.game.controlQr ?? null);
           reconcileWithServer({
             state: parsed.game.state,
             serverNowMs: parsed.serverNowMs,
@@ -331,6 +336,7 @@ export function useGameConnection({ gameId, role }: { gameId: string; role: Cont
 
   return {
     baseState,
+    controlQr,
     clockOffsetMs,
     dispatchCommand,
     connectionState,

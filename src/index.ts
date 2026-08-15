@@ -1,4 +1,5 @@
 import { serve, type ServerWebSocket } from "bun";
+import { dirname, resolve } from "node:path";
 import index from "./index.html";
 import { readJsonBodyWithinLimit } from "@/lib/http-body";
 import { isInternalHealthHost } from "@/lib/internal-health";
@@ -124,11 +125,14 @@ async function startServer() {
     ) {
       throw new Error("Production Ad Hoc database must use its canonical path.");
     }
+    const adHocEnvironmentIdentity =
+      process.env.AD_HOC_ENVIRONMENT_ID?.trim() || `${environment}:${technicalAdminConfig.origin}`;
     const adHocService = createAdHocGamesService({
+      environmentIdentity: adHocEnvironmentIdentity,
       store:
         environment === "test" && !process.env.AD_HOC_DATABASE?.trim()
           ? undefined
-          : openSqliteAdHocStore(adHocDatabasePath),
+          : openSqliteAdHocStore(adHocDatabasePath, adHocEnvironmentIdentity),
     });
     startupCleanup.add(() => adHocService.close());
     const databasePath = storagePaths.technicalAdminDatabase;
@@ -242,7 +246,10 @@ async function startServer() {
     process.once("SIGTERM", shutdown);
     process.once("SIGINT", shutdown);
 
-    const htmlRoute = environment === "test" ? await createTestHtmlRoute() : index;
+    const htmlRoute =
+      environment === "test" && process.env.NODE_ENV === "production"
+        ? await createTestHtmlRoute()
+        : index;
 
     server = serve<SessionData>({
       hostname: process.env.HOST ?? "127.0.0.1",
@@ -304,18 +311,7 @@ async function startServer() {
         },
         "/api/games/:gameId/admit": {
           async POST(req: Request) {
-            const gameId = new URL(req.url).pathname.split("/").at(-2) ?? "";
-            const body = await readJsonRecord(req);
-            const result = await adHocService.admit({
-              gameId,
-              controlQr: body?.controlQr,
-              browserId: requestSource(req, technicalAdminConfig.trustProxyHeaders),
-            });
-            return result.status === "accepted"
-              ? sensitiveJson({ game: stripSession(result.game) }, 200, [
-                  ["set-cookie", adHocSessionCookie(gameId, result.game.sessionId)],
-                ])
-              : adHocUnavailableResponse();
+            return admitGame(req, adHocService);
           },
         },
         "/api/games/:gameId/leave": {
@@ -757,15 +753,24 @@ async function startServer() {
             return json({ ok: true });
           },
         },
-        "/game/:gameId": {
-          async GET(req: Request) {
-            const gameId = new URL(req.url).pathname.split("/").at(-1) ?? "";
-            const sessionId = readAdHocSession(req.headers.get("cookie"), gameId);
-            const result = await adHocService.read({ gameId, sessionId });
-            return result.status === "accepted" ? htmlRoute : adHocUnavailableResponse();
-          },
-        },
-        "/*": (req: Request) => adHocFallbackRouteFor(req, htmlRoute),
+        "/game/:gameId": htmlRoute,
+        "/": htmlRoute,
+        "/events": htmlRoute,
+        "/events/": htmlRoute,
+        "/admin": htmlRoute,
+        "/admin/": htmlRoute,
+        "/admin/enroll": htmlRoute,
+        "/admin/enroll/": htmlRoute,
+        "/color-test": htmlRoute,
+        "/prototype/event-operations": htmlRoute,
+        "/event-admin": htmlRoute,
+        "/event-admin/": htmlRoute,
+        "/event-control": htmlRoute,
+        "/event-control/": htmlRoute,
+        "/game": () => adHocUnavailableResponse(),
+        "/game/*": () => adHocUnavailableResponse(),
+        "/api/games/*": () => adHocUnavailableResponse(),
+        "/*": htmlRoute,
       },
       development: process.env.NODE_ENV !== "production" && {
         hmr: true,
@@ -932,8 +937,22 @@ async function createTestHtmlRoute() {
     "content-type": "text/html; charset=utf-8",
     "x-robots-tag": "noindex, nofollow, noarchive, noimageindex",
   };
+  const assetDirectory = dirname(index.index);
+  const assetPaths = new Map<string, string>();
+  for (const match of html.matchAll(/(?:href|src)="\.\/([a-zA-Z0-9._-]+)"/gu)) {
+    const assetName = match[1];
+    if (assetName !== undefined)
+      assetPaths.set(`/${assetName}`, resolve(assetDirectory, assetName));
+  }
 
-  return () => new Response(body, { headers });
+  return (req: Request) => {
+    const assetPath = assetPaths.get(new URL(req.url).pathname);
+    return assetPath === undefined
+      ? new Response(body, { headers })
+      : new Response(Bun.file(assetPath), {
+          headers: { "cache-control": "no-store", "x-robots-tag": headers["x-robots-tag"] },
+        });
+  };
 }
 
 if (import.meta.main) void main();
@@ -1000,6 +1019,7 @@ export async function createGame(
     awayName: payload.awayName === undefined ? "Away" : payload.awayName,
     homeColor: payload.homeColor,
     awayColor: payload.awayColor,
+    browserId: payload.browserId,
     sourceKey,
   });
   if (result.status !== "accepted") {
@@ -1018,6 +1038,23 @@ export async function createGame(
     201,
     [["set-cookie", adHocSessionCookie(result.gameId, result.sessionId)]],
   );
+}
+
+export async function admitGame(req: Request, service: AdHocGamesService = defaultAdHocService) {
+  const gameId = new URL(req.url).pathname.split("/").at(-2) ?? "";
+  const body = await readJsonRecord(req);
+  const priorSessionId = readAdHocSession(req.headers.get("cookie"), gameId);
+  const result = await service.admit({
+    gameId,
+    controlQr: body?.controlQr,
+    browserId: body?.browserId,
+    priorSessionId,
+  });
+  return result.status === "accepted"
+    ? sensitiveJson({ game: stripSession(result.game) }, 200, [
+        ["set-cookie", adHocSessionCookie(gameId, result.game.sessionId)],
+      ])
+    : adHocUnavailableResponse(service);
 }
 
 export async function readGame(req: Request, service: AdHocGamesService = defaultAdHocService) {
@@ -1146,9 +1183,15 @@ export function adHocFallbackRoute(req: Request) {
   return adHocFallbackRouteFor(req, index);
 }
 
-function adHocFallbackRouteFor<HtmlRoute>(req: Request, htmlRoute: HtmlRoute) {
+type HtmlRoute = typeof index | ((req: Request) => Response);
+
+function adHocFallbackRouteFor(req: Request, htmlRoute: HtmlRoute) {
   const pathname = new URL(req.url).pathname;
-  return isAdHocPath(pathname) ? adHocUnavailableResponse() : htmlRoute;
+  return isAdHocPath(pathname) ? adHocUnavailableResponse() : resolveHtmlRoute(req, htmlRoute);
+}
+
+function resolveHtmlRoute(req: Request, htmlRoute: HtmlRoute) {
+  return typeof htmlRoute === "function" ? htmlRoute(req) : htmlRoute;
 }
 
 function isAdHocPath(pathname: string): boolean {

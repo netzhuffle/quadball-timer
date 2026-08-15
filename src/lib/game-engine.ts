@@ -247,6 +247,17 @@ export function applyGameCommand({
       return next;
     }
 
+    case "correct-to-unfinished": {
+      if (!next.isFinished) {
+        return next;
+      }
+
+      next.isFinished = false;
+      next.winner = null;
+      next.finishReason = null;
+      return next;
+    }
+
     case "adjust-game-clock": {
       const adjustment = validateClockAdjustmentMs(command.deltaMs);
       const nextGameClockMs = next.gameClockMs + command.deltaMs;

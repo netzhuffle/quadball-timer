@@ -6,6 +6,7 @@ import {
 } from "@/lib/ad-hoc-games";
 import {
   adHocFallbackRoute,
+  admitGame,
   createGame,
   leaveGame,
   readAdHocSession,
@@ -25,12 +26,12 @@ function service(): AdHocGamesService {
   });
 }
 
-async function createViaHttp(games: AdHocGamesService, homeName: string) {
+async function createViaHttp(games: AdHocGamesService, homeName: string, browserId?: string) {
   const response = await createGame(
     new Request("http://localhost/api/games", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ homeName, awayName: "Away" }),
+      body: JSON.stringify({ homeName, awayName: "Away", browserId }),
     }),
     games,
   );
@@ -134,6 +135,129 @@ describe("Ad Hoc HTTP and WebSocket authority boundaries", () => {
     expect(admittedView?.state.isRunning).toBe(true);
     expect(admittedView?.sessionId).toBe(admitted.game.sessionId);
     expect(admittedView?.sessionId).not.toBe(creatorView?.sessionId);
+  });
+
+  test("admits a second browser directly and replaces only its prior persistent session", async () => {
+    const games = service();
+    const created = await createViaHttp(games, "Home", "device-a");
+    const firstAdmission = await admitGame(
+      new Request(`http://localhost/api/games/${created.gameId}/admit`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ controlQr: created.controlQr, browserId: "device-b" }),
+      }),
+      games,
+    );
+    expect(firstAdmission.status).toBe(200);
+    const firstCookie = firstAdmission.headers.get("set-cookie");
+    if (firstCookie === null) throw new Error("first admission did not return a session");
+
+    const secondAdmission = await admitGame(
+      new Request(`http://localhost/api/games/${created.gameId}/admit`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ controlQr: created.controlQr, browserId: "device-b" }),
+      }),
+      games,
+    );
+    expect(secondAdmission.status).toBe(200);
+    const secondCookie = secondAdmission.headers.get("set-cookie");
+    if (secondCookie === null) throw new Error("second admission did not return a session");
+    expect(
+      (
+        await readGame(
+          new Request(`http://localhost/api/games/${created.gameId}`, {
+            headers: { cookie: firstCookie },
+          }),
+          games,
+        )
+      ).status,
+    ).toBe(404);
+    expect(
+      (
+        await readGame(
+          new Request(`http://localhost/api/games/${created.gameId}`, {
+            headers: { cookie: secondCookie },
+          }),
+          games,
+        )
+      ).status,
+    ).toBe(200);
+  });
+
+  test("keeps copied QR admission generic when the runtime environment differs", async () => {
+    const store = createInMemoryAdHocStore();
+    const field = createAdHocGamesService({
+      store,
+      environmentIdentity: "field-a",
+      now: () => 1_000,
+    });
+    const copiedField = createAdHocGamesService({
+      store,
+      environmentIdentity: "field-b",
+      now: () => 1_000,
+    });
+    const created = await createViaHttp(field, "Home");
+    const response = await admitGame(
+      new Request(`http://localhost/api/games/${created.gameId}/admit`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ controlQr: created.controlQr }),
+      }),
+      copiedField,
+    );
+
+    expect(response.status).toBe(404);
+    expect(await response.text()).toBe('{"error":"Ad Hoc Game unavailable."}');
+  });
+
+  test("uses the current HttpOnly Game cookie to replace a session without browser storage", async () => {
+    const games = service();
+    const created = await createViaHttp(games, "Home");
+    const firstAdmission = await admitGame(
+      new Request(`http://localhost/api/games/${created.gameId}/admit`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ controlQr: created.controlQr }),
+      }),
+      games,
+    );
+    const firstCookie = firstAdmission.headers.get("set-cookie");
+    if (firstCookie === null) throw new Error("first admission did not return a session");
+    const secondAdmission = await admitGame(
+      new Request(`http://localhost/api/games/${created.gameId}/admit`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          cookie: firstCookie.split(";")[0]!,
+        },
+        body: JSON.stringify({ controlQr: created.controlQr }),
+      }),
+      games,
+    );
+    const secondCookie = secondAdmission.headers.get("set-cookie");
+    if (secondCookie === null) throw new Error("second admission did not return a session");
+
+    expect(
+      (
+        await readGame(
+          new Request(`http://localhost/api/games/${created.gameId}`, {
+            headers: { cookie: firstCookie },
+          }),
+          games,
+        )
+      ).status,
+    ).toBe(404);
+    expect(
+      (
+        await readGame(
+          new Request(`http://localhost/api/games/${created.gameId}`, {
+            headers: { cookie: secondCookie },
+          }),
+          games,
+        )
+      ).status,
+    ).toBe(200);
   });
 
   test("returns one generic HTTP outcome for known, unknown, malformed, and unauthorized Games", async () => {
