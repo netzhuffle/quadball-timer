@@ -7,6 +7,7 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  readdir,
   readlink,
   realpath as fsRealpath,
   rm,
@@ -79,7 +80,8 @@ describe("disposable activation SQLite integration", () => {
         grantValidationContext: { environmentId: "production", keyRing },
       });
       await legacy.applyMigrations({ requireCandidate: false });
-      legacy.close();
+      await legacy.quiesceForRecovery();
+      Bun.gc(true);
       const adHocEnvironmentIdentity = "production:https://timer.quadball.app";
       const adHocStore = openSqliteAdHocStore(adHocPath, adHocEnvironmentIdentity);
       const adHocService = createAdHocGamesService({
@@ -128,11 +130,14 @@ describe("disposable activation SQLite integration", () => {
       const systemctlStub = join(binDirectory, "systemctl");
       await writeFile(
         systemctlStub,
-        '#!/bin/sh\n[ "$1" = is-active ] && { echo inactive; exit 0; }; exit 0\n',
+        '#!/bin/sh\nif [ "$1" = restart ]; then touch "$QBT_FOCUSED_RESTORE_STARTED"; exit 0; fi\nif [ "$1" = is-active ]; then if [ "$2" = quadball-timer ] && [ -f "$QBT_FOCUSED_RESTORE_STARTED" ]; then echo active; rm -f "$QBT_FOCUSED_RESTORE_STARTED"; else echo inactive; fi; exit 0; fi\nexit 0\n',
       );
       await chmod(systemctlStub, 0o755);
       const runuserStub = join(binDirectory, "runuser");
-      await writeFile(runuserStub, '#!/bin/sh\nshift 3\nexec "$@"\n');
+      await writeFile(
+        runuserStub,
+        '#!/bin/sh\nprintf "runuser\\n" >> "$QBT_FOCUSED_RUNUSER_LOG"\nshift 3\nexec "$@"\n',
+      );
       await chmod(runuserStub, 0o755);
       const flockStub = join(binDirectory, "flock");
       await writeFile(
@@ -146,6 +151,18 @@ describe("disposable activation SQLite integration", () => {
         '#!/bin/sh\n[ "$1" = -e ] && shift\n[ "$1" = -- ] && shift\n/bin/realpath "$@"\n',
       );
       await chmod(realpathStub, 0o755);
+      const installStub = join(binDirectory, "install");
+      await writeFile(
+        installStub,
+        '#!/bin/sh\nprintf "%s\\n" "$*" >> "$QBT_FOCUSED_INSTALL_LOG"\npath=""\nfor arg in "$@"; do path="$arg"; done\nmkdir -p "$path"\nchmod 0700 "$path"\n',
+      );
+      await chmod(installStub, 0o755);
+      const ownerSeam = join(binDirectory, "owner-seam");
+      await writeFile(
+        ownerSeam,
+        '#!/bin/sh\ncase "$1" in *verified-*) identity="root:root:600" ;; *) identity="quadball-timer:quadball-timer:600" ;; esac\ncase "${QBT_FOCUSED_OWNER_SEAM_MODE:-valid}:$1" in source-wrong:*verified-*) identity="quadball-timer:quadball-timer:600" ;; destination-wrong:*) identity="root:root:600" ;; esac\nprintf "%s %s\\n" "$1" "$identity" >> "${QBT_FOCUSED_OWNER_SEAM_LOG:-/dev/null}"\nprintf "%s\\n" "$identity"\n',
+      );
+      await chmod(ownerSeam, 0o755);
 
       const run = async (
         command: string,
@@ -153,6 +170,7 @@ describe("disposable activation SQLite integration", () => {
         manifestPath = "",
         failurePhase = "",
         releasePath = releaseDirectory,
+        ownerMode = "valid",
       ) => {
         const child = Bun.spawn(
           ["bash", wrapper, "production", releasePath, command, manifestPath],
@@ -167,6 +185,13 @@ describe("disposable activation SQLite integration", () => {
               QBT_FOCUSED_TEST_FLOCK: flockStub,
               QBT_FOCUSED_TEST_REALPATH: realpathStub,
               QBT_FOCUSED_TEST_SKIP_CHOWN: "1",
+              QBT_FOCUSED_TEST_INSTALL: installStub,
+              QBT_FOCUSED_TEST_OWNER_SEAM: ownerSeam,
+              QBT_FOCUSED_OWNER_SEAM_LOG: join(root, "owner-seam.log"),
+              QBT_FOCUSED_OWNER_SEAM_MODE: ownerMode,
+              QBT_FOCUSED_RUNUSER_LOG: join(root, "runuser.log"),
+              QBT_FOCUSED_INSTALL_LOG: join(root, "install.log"),
+              QBT_FOCUSED_RESTORE_STARTED: join(root, "restore-started"),
               QBT_ACTIVATION_LOCK_HELD_PATH: heldPath,
               QBT_FOCUSED_FAILURE_PHASE: failurePhase,
             },
@@ -181,10 +206,33 @@ describe("disposable activation SQLite integration", () => {
       };
 
       const canonicalLock = join(root, "srv/quadball-timer/.activation.lock");
-      const preflightDigest = digest(foundationPath);
       const preflight = await run("preflight", canonicalLock);
       expect(preflight.code, preflight.output).toBe(0);
-      expect(digest(foundationPath)).toBe(preflightDigest);
+      const foundationDigestBeforeProbe = digest(foundationPath);
+      const authoritativeOperation = await run("authoritative-operation", canonicalLock);
+      expect(authoritativeOperation.code, authoritativeOperation.output).toBe(0);
+      expect(authoritativeOperation.output).toContain('"operation":"bounded-writeability-probe"');
+      expect(digest(foundationPath)).toBe(foundationDigestBeforeProbe);
+      const probedFoundation = new Database(foundationPath, { readonly: true });
+      expect(
+        probedFoundation
+          .query(
+            "SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = '__quadball_restore_writeability_probe'",
+          )
+          .get(),
+      ).toBeNull();
+      probedFoundation.close();
+      const deniedAuthoritativeOperation = await run(
+        "authoritative-operation",
+        canonicalLock,
+        "",
+        "authoritative-operation-write",
+      );
+      expect(deniedAuthoritativeOperation.code, deniedAuthoritativeOperation.output).toBe(1);
+      expect(deniedAuthoritativeOperation.output).toContain(
+        '"ok":false,"operation":"bounded-writeability-probe"',
+      );
+      expect(digest(foundationPath)).toBe(foundationDigestBeforeProbe);
       expect((await run("readiness", canonicalLock)).code).not.toBe(0);
       expect(
         (await run("backup", join(root, "var/lib/quadball-timer/.activation.lock"))).code,
@@ -193,6 +241,8 @@ describe("disposable activation SQLite integration", () => {
       expect(backup.code, backup.output).toBe(0);
       const manifestPath = JSON.parse(backup.output).manifestPath as string;
       const backupManifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+        snapshotId?: string;
+        databaseFile?: string;
         adHoc?: { databaseFile?: string; facts?: { environmentIdentity?: string } };
       };
       expect(backupManifest.adHoc?.databaseFile).toBeTruthy();
@@ -216,6 +266,121 @@ describe("disposable activation SQLite integration", () => {
           .code,
       ).not.toBe(0);
       expect((await run("promote", canonicalLock, manifestPath)).code).toBe(0);
+      const retainedTarget = await readlink(join(root, "var/backups/quadball-timer/retained"));
+      const retainedManifestPath = join(
+        root,
+        "var/backups/quadball-timer",
+        retainedTarget,
+        basename(manifestPath),
+      );
+      for (const retainedInput of [
+        retainedManifestPath,
+        join(dirname(retainedManifestPath), backupManifest.databaseFile ?? ""),
+        join(dirname(retainedManifestPath), backupManifest.adHoc?.databaseFile ?? ""),
+        join(dirname(retainedManifestPath), `${backupManifest.snapshotId}.deployment.json`),
+      ]) {
+        await chmod(retainedInput, 0o600);
+        expect((await lstat(retainedInput)).mode & 0o777).toBe(0o600);
+      }
+      await writeFile(join(root, "runuser.log"), "");
+      const wrongSourceOwner = await run(
+        "restore",
+        canonicalLock,
+        retainedManifestPath,
+        "",
+        releaseDirectory,
+        "source-wrong",
+      );
+      expect(wrongSourceOwner.code, wrongSourceOwner.output).not.toBe(0);
+      expect(wrongSourceOwner.output).toContain('"outcome":"restore-staging-failed"');
+      expect(await readFile(join(root, "runuser.log"), "utf8")).toBe("");
+
+      const wrongDestinationOwner = await run(
+        "restore",
+        canonicalLock,
+        retainedManifestPath,
+        "",
+        releaseDirectory,
+        "destination-wrong",
+      );
+      expect(wrongDestinationOwner.code, wrongDestinationOwner.output).not.toBe(0);
+      expect(wrongDestinationOwner.output).toContain('"outcome":"restore-staging-failed"');
+      expect(await readFile(join(root, "runuser.log"), "utf8")).toBe("");
+
+      const restore = await run("restore", canonicalLock, retainedManifestPath);
+      expect(restore.code, restore.output).toBe(0);
+      const restoreWorkspaces = (await readdir(join(root, "var/backups/quadball-timer"))).filter(
+        (entry) => entry.startsWith(".restore-lock-test-") && entry !== "retained",
+      );
+      let restoreWorkspace: string | undefined;
+      for (const candidate of restoreWorkspaces) {
+        if (
+          await pathExists(
+            join(root, "var/backups/quadball-timer", candidate, "technical-admin-auth-evidence"),
+          )
+        ) {
+          restoreWorkspace = candidate;
+          break;
+        }
+      }
+      expect(restoreWorkspace).toBeTruthy();
+      if (restoreWorkspace !== undefined) {
+        for (const stagedInput of await readdir(
+          join(root, "var/backups/quadball-timer", restoreWorkspace),
+        )) {
+          if (stagedInput === "technical-admin-auth-evidence") {
+            expect(
+              (await lstat(join(root, "var/backups/quadball-timer", restoreWorkspace, stagedInput)))
+                .mode & 0o777,
+            ).toBe(0o700);
+            continue;
+          }
+          expect(
+            (await lstat(join(root, "var/backups/quadball-timer", restoreWorkspace, stagedInput)))
+              .mode & 0o777,
+          ).toBe(0o600);
+        }
+      }
+      expect(await readFile(join(root, "install.log"), "utf8")).toContain(
+        "-d -o root -g root -m 0700",
+      );
+      const ownerSeamLog = await readFile(join(root, "owner-seam.log"), "utf8");
+      expect(ownerSeamLog).toContain("root:root:600");
+      expect(ownerSeamLog).toContain("quadball-timer:quadball-timer:600");
+      const restoreReport = JSON.parse(restore.output) as {
+        restoreId: string;
+        technicalAdminAuth: {
+          credentialPreserved: boolean;
+          reEnrollmentRequired: boolean;
+        };
+        authorityResurrectionWarning: string;
+      };
+      expect(restoreReport.technicalAdminAuth).toMatchObject({
+        outcome: "re-enrollment-required",
+        credentialPreserved: false,
+        reEnrollmentRequired: true,
+      });
+      expect(restoreReport.authorityResurrectionWarning).toContain("older snapshot");
+      expect(
+        await pathExists(
+          join(root, `var/lib/quadball-timer/foundation.sqlite.failed-${restoreReport.restoreId}`),
+        ),
+      ).toBe(true);
+      await rm(join(root, "var/backups/quadball-timer/.restore-lock-test"), {
+        recursive: true,
+        force: true,
+      });
+      const boundedRestoreFailure = await run(
+        "restore",
+        canonicalLock,
+        retainedManifestPath,
+        "restore",
+      );
+      expect(boundedRestoreFailure.code, boundedRestoreFailure.output).not.toBe(0);
+      expect(boundedRestoreFailure.output).toContain('"outcome":"restore-preparation-failed"');
+      expect(boundedRestoreFailure.output).not.toContain(root);
+      expect(boundedRestoreFailure.output).not.toContain("ENOENT");
+
       const retainedDirectory = join(root, "var/backups/quadball-timer/verified-lock-test");
       expect((await lstat(retainedDirectory)).mode & 0o777).toBe(0o700);
       expect((await lstat(join(retainedDirectory, basename(manifestPath)))).mode & 0o777).toBe(
@@ -263,7 +428,35 @@ describe("disposable activation SQLite integration", () => {
         .get() as { schema_version: number };
       migrated.close();
       expect(latestSchema.schema_version).toBe(Number(schemaVersion));
-      expect(digest(authPath)).toBe(authDigest);
+      expect(digest(authPath)).not.toBe(authDigest);
+      const restoredAuth = new Database(authPath, { readonly: true });
+      expect(
+        restoredAuth
+          .query(
+            "SELECT environment, origin, rp_id FROM technical_admin_storage_identity WHERE id = 1",
+          )
+          .get(),
+      ).toEqual({
+        environment: "production",
+        origin: "https://timer.quadball.app",
+        rp_id: "timer.quadball.app",
+      });
+      restoredAuth.close();
+      expect(restoreWorkspace).toBeTruthy();
+      if (restoreWorkspace !== undefined) {
+        const incompatibleEvidencePath = join(
+          root,
+          "var/backups/quadball-timer",
+          restoreWorkspace,
+          "technical-admin-auth-evidence",
+          "technical-admin.sqlite",
+        );
+        const incompatibleEvidence = new Database(incompatibleEvidencePath, { readonly: true });
+        expect(incompatibleEvidence.query("SELECT value FROM auth_canary").get()).toEqual({
+          value: "private",
+        });
+        incompatibleEvidence.close();
+      }
 
       const expectFocusedFailure = async (
         command: string,
@@ -657,7 +850,7 @@ function createRecovery(
       async quiesce() {},
       adapter: {
         async prepareForFoundationRestore() {
-          throw new Error("Foundation restore is not part of Production activation.");
+          return { outcome: "re-enrollment-required", reason: "missing" as const };
         },
       },
     },

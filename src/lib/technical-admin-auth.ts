@@ -112,6 +112,29 @@ export type TechnicalAdminRestorePreparationResult =
     }
   | { outcome: "sanitation-failed" };
 
+/** The bounded restore outcome exposed after the adapter boundary. */
+export type TechnicalAdminRecoveryResult =
+  | {
+      outcome: "not-attempted";
+      credentialPreserved: false;
+      reEnrollmentRequired: false;
+    }
+  | {
+      outcome: "preserved-transients-invalidated";
+      credentialPreserved: true;
+      reEnrollmentRequired: false;
+    }
+  | {
+      outcome: "re-enrollment-required";
+      credentialPreserved: false;
+      reEnrollmentRequired: true;
+    }
+  | {
+      outcome: "sanitation-failed";
+      credentialPreserved: false;
+      reEnrollmentRequired: false;
+    };
+
 export type TechnicalAdminOperationalLog = {
   atMs: number;
   event:

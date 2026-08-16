@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import { Buffer } from "node:buffer";
 import { readFileSync } from "node:fs";
 import {
@@ -6,6 +7,7 @@ import {
   lstat,
   mkdir,
   mkdtemp,
+  realpath as fsRealpath,
   readFile,
   readlink,
   rm,
@@ -15,6 +17,10 @@ import {
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { resolveAdHocEnvironmentIdentity } from "@/lib/ad-hoc-games";
+import {
+  copyStableRestoreFile,
+  prepareTechnicalAdminStorageForRestore,
+} from "@/lib/production-activation-cli";
 
 const repositoryRoot = process.cwd();
 
@@ -196,7 +202,6 @@ describe("Production deployment contract", () => {
       join(repositoryRoot, "deploy/activation-maintenance-root.sh"),
       "utf8",
     );
-
     expect(wrapper).toContain("configure_promotion_test_hooks()");
     expect(wrapper).toContain('mv_command="mv"');
     expect(wrapper).toContain('stat_command="stat"');
@@ -412,6 +417,359 @@ promote_verified_backup_as_root "$backup_directory/.candidate-$release_attempt_i
       expect(await pathExists(join(failureRoot, "verified-fail"))).toBe(false);
       expect(await pathExists(failureCandidate)).toBe(false);
       expect(await pathExists(join(failureRoot, ".retained-fail.tmp"))).toBe(false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps Production restore host-local with an owned workspace and bounded readiness", () => {
+    const wrapper = readFileSync(
+      join(repositoryRoot, "deploy/activation-maintenance-root.sh"),
+      "utf8",
+    );
+    const operator = readFileSync(join(repositoryRoot, "deploy/restore-production.sh"), "utf8");
+
+    expect(wrapper).toContain('install_command="${QBT_FOCUSED_TEST_INSTALL:-/usr/bin/install}"');
+    expect(wrapper).toContain('mktemp_command="${QBT_FOCUSED_TEST_MKTEMP:-mktemp}"');
+    expect(wrapper).toContain(".restore-${release_attempt_id}-XXXXXX");
+    expect(wrapper).toContain('install_command" -d -o root -g root -m 0700');
+    expect(wrapper).toContain('RESTORE_WORKSPACE_DIRECTORY="$restore_workspace"');
+    expect(wrapper).toContain('source_copy_path="/proc/self/fd/7"');
+    expect(wrapper).toContain("== root:root:600");
+    expect(wrapper).toContain("set -o noclobber");
+    expect(wrapper).toContain('exec 6>"$destination_path"');
+    expect(wrapper).toContain('exec 7<"$source_path"');
+    expect(wrapper).toContain('cat <"$source_copy_path" >&6');
+    expect(wrapper).toContain('sync -f -- "$destination_path"');
+    expect(wrapper).toContain('chown "$service_user:$service_user" -- "$destination_path"');
+    expect(wrapper).toContain('"${service_user}:${service_user}:600"');
+    expect(wrapper).toContain("QBT_FOCUSED_TEST_OWNER_SEAM");
+    expect(wrapper).toContain('"outcome":"cutover-completed-readiness-failed"');
+    expect(operator).toContain('"$operator_identity" != deploy-quadball-timer');
+    expect(operator).toContain('exec 9>"$base_dir/.activation.lock"');
+    expect(operator).toContain('"$sudo_command" systemctl stop "$service_name"');
+    expect(operator).toContain("check_release_identity");
+    expect(operator).toContain("authoritative-operation");
+    expect(operator).toContain('"technicalAdminAuth":{"outcome":"not-attempted"');
+    expect(operator).toContain("/internal/healthz");
+    expect(operator).toContain("https://timer.quadball.app");
+    expect(operator).toContain("/healthz");
+    expect(operator).toContain("/api/audience/events");
+    expect(operator).toContain("check_authoritative_operation");
+    expect(operator).not.toContain('"serviceRecovered"');
+    expect(operator).not.toContain("systemctl restart");
+    expect(operator).not.toContain("/api/games");
+    expect(operator).not.toContain("activate-release.sh");
+  });
+
+  test("defers mutable Technical Admin restore access until snapshot verification", () => {
+    const activationCli = readFileSync(
+      join(repositoryRoot, "src/lib/production-activation-cli.ts"),
+      "utf8",
+    );
+    const verification = activationCli.indexOf(
+      "const verifiedManifest = await recovery.verifyBackup",
+    );
+    const authOpen = activationCli.indexOf(
+      "technicalAdminRepository = createSqliteTechnicalAdminAuthRepository",
+    );
+
+    expect(verification).toBeGreaterThanOrEqual(0);
+    expect(authOpen).toBeGreaterThan(verification);
+    expect(activationCli).toContain('"failed-live-foundation.sqlite"');
+    expect(activationCli.indexOf("prepareTechnicalAdminStorageForRestore(")).toBeGreaterThan(
+      verification,
+    );
+    expect(activationCli).toContain("technicalAdminStoragePresent = technicalAdminStorage.present");
+    expect(activationCli).toContain("reason: technicalAdminStorageReason");
+  });
+
+  test("keeps restore staging copies stable and no-follow at both boundaries", async () => {
+    const root = await mkdtemp(join(tmpdir(), "quadball-restore-copy-"));
+    const source = join(root, "source.sqlite");
+    const outside = join(root, "outside.sqlite");
+    const destination = join(root, "destination.sqlite");
+    const sourceReplacement = join(root, "source-replacement.sqlite");
+    try {
+      await writeFile(source, "candidate", { mode: 0o600 });
+      await writeFile(outside, "outside", { mode: 0o600 });
+      await symlink(outside, destination);
+      await expect(copyStableRestoreFile(source, destination)).rejects.toThrow();
+      expect(await readFile(outside, "utf8")).toBe("outside");
+
+      await rm(destination, { force: true });
+      await writeFile(sourceReplacement, "replacement", { mode: 0o600 });
+      await rm(source, { force: true });
+      await symlink(sourceReplacement, source);
+      await expect(copyStableRestoreFile(source, destination)).rejects.toThrow("canonical");
+      expect(await pathExists(destination)).toBe(false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("displaces invalid and incompatible Technical Admin storage before re-enrollment", async () => {
+    const root = await fsRealpath(await mkdtemp(join(tmpdir(), "quadball-auth-restore-")));
+    const expectedIdentity = {
+      environment: "production" as const,
+      origin: "https://timer.quadball.app",
+      rpId: "timer.quadball.app",
+    };
+    const assertFreshIdentity = (databasePath: string) => {
+      const database = new Database(databasePath, { readonly: true });
+      const identity = database
+        .query(
+          "SELECT environment, origin, rp_id FROM technical_admin_storage_identity WHERE id = 1",
+        )
+        .get();
+      database.close();
+      expect(identity).toEqual({
+        environment: "production",
+        origin: "https://timer.quadball.app",
+        rp_id: "timer.quadball.app",
+      });
+    };
+
+    try {
+      const incompatibleRoot = join(root, "incompatible");
+      const incompatiblePath = join(incompatibleRoot, "technical-admin.sqlite");
+      const incompatibleEvidence = join(incompatibleRoot, "evidence");
+      await mkdir(incompatibleRoot, { recursive: true });
+      const incompatible = new Database(incompatiblePath);
+      incompatible.exec(
+        "CREATE TABLE technical_admin_storage_identity (id INTEGER PRIMARY KEY, environment TEXT, origin TEXT, rp_id TEXT); INSERT INTO technical_admin_storage_identity VALUES (1, 'test', 'https://test.timer.quadball.app', 'test.timer.quadball.app');",
+      );
+      incompatible.close();
+      await expect(
+        prepareTechnicalAdminStorageForRestore(
+          incompatiblePath,
+          incompatibleEvidence,
+          expectedIdentity,
+        ),
+      ).resolves.toEqual({ present: false, reason: "incompatible" });
+      assertFreshIdentity(incompatiblePath);
+      expect(await pathExists(join(incompatibleEvidence, "technical-admin.sqlite"))).toBe(true);
+
+      const malformedRoot = join(root, "malformed");
+      const malformedPath = join(malformedRoot, "technical-admin.sqlite");
+      const malformedEvidence = join(malformedRoot, "evidence");
+      await mkdir(malformedRoot, { recursive: true });
+      const malformed = new Database(malformedPath);
+      malformed.exec(
+        "CREATE TABLE technical_admin_storage_identity (id INTEGER PRIMARY KEY, environment TEXT, origin TEXT, rp_id TEXT); INSERT INTO technical_admin_storage_identity VALUES (1, 'production', 'https://timer.quadball.app', 'timer.quadball.app'); CREATE TABLE technical_admin_credentials (credential_id TEXT PRIMARY KEY);",
+      );
+      malformed.close();
+      await expect(
+        prepareTechnicalAdminStorageForRestore(malformedPath, malformedEvidence, expectedIdentity),
+      ).resolves.toEqual({ present: false, reason: "incompatible" });
+      assertFreshIdentity(malformedPath);
+      const preservedMalformed = new Database(join(malformedEvidence, "technical-admin.sqlite"), {
+        readonly: true,
+      });
+      expect(
+        preservedMalformed.query("PRAGMA table_info(technical_admin_credentials)").all(),
+      ).toHaveLength(1);
+      preservedMalformed.close();
+
+      const symlinkRoot = join(root, "symlink");
+      const symlinkPath = join(symlinkRoot, "technical-admin.sqlite");
+      const symlinkEvidence = join(symlinkRoot, "evidence");
+      const outsidePath = join(root, "outside.sqlite");
+      await mkdir(symlinkRoot, { recursive: true });
+      await writeFile(outsidePath, "outside evidence");
+      await symlink(outsidePath, symlinkPath);
+      await expect(
+        prepareTechnicalAdminStorageForRestore(symlinkPath, symlinkEvidence, expectedIdentity),
+      ).resolves.toEqual({ present: false, reason: "invalid" });
+      assertFreshIdentity(symlinkPath);
+      expect((await lstat(join(symlinkEvidence, "technical-admin.sqlite"))).isSymbolicLink()).toBe(
+        true,
+      );
+      expect(await readFile(outsidePath, "utf8")).toBe("outside evidence");
+
+      const directoryRoot = join(root, "directory");
+      const directoryPath = join(directoryRoot, "technical-admin.sqlite");
+      const directoryEvidence = join(directoryRoot, "evidence");
+      await mkdir(directoryPath, { recursive: true });
+      await writeFile(join(directoryPath, "marker"), "private evidence");
+      await expect(
+        prepareTechnicalAdminStorageForRestore(directoryPath, directoryEvidence, expectedIdentity),
+      ).resolves.toEqual({ present: false, reason: "invalid" });
+      assertFreshIdentity(directoryPath);
+      expect(
+        await readFile(join(directoryEvidence, "technical-admin.sqlite", "marker"), "utf8"),
+      ).toBe("private evidence");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("executes the host-local restore orchestrator fail-closed across service states", async () => {
+    const root = await fsRealpath(await mkdtemp(join(tmpdir(), "quadball-restore-operator-")));
+    const binDirectory = join(root, "bin");
+    const baseDirectory = join(root, "srv/quadball-timer");
+    const releaseDirectory = join(baseDirectory, "releases/restore-attempt");
+    const backupDirectory = join(root, "var/backups/quadball-timer");
+    const verifiedDirectory = join(backupDirectory, "verified-snapshot");
+    const manifestPath = join(verifiedDirectory, "snapshot.manifest.json");
+    const serviceState = join(root, "service-active");
+    const serviceLog = join(root, "service.log");
+    const systemctlStub = join(binDirectory, "systemctl");
+    const sudoStub = join(binDirectory, "sudo");
+    const flockStub = join(binDirectory, "flock");
+    const curlStub = join(binDirectory, "curl");
+    const sleepStub = join(binDirectory, "sleep");
+    const maintenanceStub = join(binDirectory, "maintenance-wrapper");
+    const operator = join(repositoryRoot, "deploy/restore-production.sh");
+
+    const run = async (outcome: string, active: boolean | "failed", curlFailure = false) => {
+      if (active === "failed") await writeFile(serviceState, "failed\n");
+      else if (active) await writeFile(serviceState, "active\n");
+      else await rm(serviceState, { force: true });
+      await writeFile(
+        join(root, "operator-outcome"),
+        `${outcome}\n${curlFailure ? "curl-failure" : "curl-ok"}\n`,
+      );
+      const child = Bun.spawn(["bash", operator, "--manifest", manifestPath], {
+        env: {
+          ...process.env,
+          PATH: `${binDirectory}:${process.env.PATH ?? ""}`,
+          QBT_FOCUSED_TEST_MODE: "1",
+          QBT_FOCUSED_TEST_ROOT: root,
+          QBT_FOCUSED_TEST_OPERATOR: "deploy-quadball-timer",
+          QBT_FOCUSED_TEST_SYSTEMCTL: systemctlStub,
+          QBT_FOCUSED_TEST_SUDO: sudoStub,
+          QBT_FOCUSED_TEST_FLOCK: flockStub,
+          QBT_FOCUSED_TEST_CURL: curlStub,
+          QBT_FOCUSED_TEST_SLEEP: sleepStub,
+          QBT_FOCUSED_TEST_READINESS_ATTEMPTS: "1",
+          QBT_FOCUSED_TEST_MAINTENANCE_WRAPPER: maintenanceStub,
+          QBT_OPERATOR_SERVICE_STATE: serviceState,
+          QBT_OPERATOR_SERVICE_LOG: serviceLog,
+          QBT_OPERATOR_OUTCOME_FILE: join(root, "operator-outcome"),
+        },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      return {
+        code: await child.exited,
+        output: `${await new Response(child.stdout).text()}${await new Response(child.stderr).text()}`,
+      };
+    };
+
+    try {
+      await mkdir(binDirectory, { recursive: true });
+      await mkdir(releaseDirectory, { recursive: true });
+      await mkdir(verifiedDirectory, { recursive: true });
+      await symlink(releaseDirectory, join(baseDirectory, "current"));
+      await writeFile(
+        join(releaseDirectory, "release-manifest.json"),
+        JSON.stringify({
+          releaseAttemptId: "restore-attempt",
+          executableSha256: "a".repeat(64),
+          schemaCompatibility: "foundation-v1",
+        }),
+      );
+      await writeFile(manifestPath, "{}\n");
+      await writeFile(
+        systemctlStub,
+        `#!/bin/sh
+set -eu
+case "\${1:-}" in
+  is-active) if [ -f "$QBT_OPERATOR_SERVICE_STATE" ]; then if grep -q failed "$QBT_OPERATOR_SERVICE_STATE"; then echo failed; else echo active; fi; else echo inactive; fi ;;
+  stop) rm -f "$QBT_OPERATOR_SERVICE_STATE"; echo stop >> "$QBT_OPERATOR_SERVICE_LOG" ;;
+  restart) if grep -q curl-failure "$QBT_OPERATOR_OUTCOME_FILE" && [ "\${QBT_OPERATOR_RESTART_FAIL:-0}" = 1 ]; then exit 1; fi; printf 'active\n' > "$QBT_OPERATOR_SERVICE_STATE"; echo restart >> "$QBT_OPERATOR_SERVICE_LOG" ;;
+  *) exit 0 ;;
+esac
+`,
+      );
+      await writeFile(
+        sudoStub,
+        `#!/bin/sh
+set -eu
+if [ "\${1:-}" = systemctl ]; then shift; exec "$QBT_FOCUSED_TEST_SYSTEMCTL" "$@"; fi
+exec "$@"
+`,
+      );
+      await writeFile(flockStub, "#!/bin/sh\nexit 0\n");
+      await writeFile(sleepStub, "#!/bin/sh\nexit 0\n");
+      await writeFile(
+        curlStub,
+        `#!/bin/sh
+set -eu
+if grep -q curl-failure "$QBT_OPERATOR_OUTCOME_FILE"; then exit 1; fi
+case "$*" in
+  *internal/release*) printf '%s\\n' '{"releaseAttemptId":"restore-attempt","executableSha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","runningExecutableSha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","schemaCompatibility":"foundation-v1"}' ;;
+  */healthz) printf 'healthy\\n' ;;
+  */internal/healthz) printf '%s\\n' '{"ok":true}' ;;
+  */api/audience/events) printf '%s\\n' '{"events":[]}' ;;
+  */) printf '%s\\n' '<!doctype html>' ;;
+  *) exit 1 ;;
+esac
+`,
+      );
+      await writeFile(
+        maintenanceStub,
+        `#!/bin/sh
+set -eu
+if [ "\${3:-}" = authoritative-operation ]; then printf '%s\\n' '{"ok":true}'; exit 0; fi
+outcome="$(head -n1 "$QBT_OPERATOR_OUTCOME_FILE")"
+case "$outcome" in
+  success) touch "$QBT_OPERATOR_SERVICE_STATE"; printf '%s\\n' '{"restored":true,"restoreId":"restore-1","potentiallyNewerWork":false,"technicalAdminAuth":{"outcome":"preserved-transients-invalidated","credentialPreserved":true,"reEnrollmentRequired":false}}'; exit 0 ;;
+  pre-failure) printf '%s\\n' '{"restored":false,"outcome":"restore-preparation-failed","cutoverCompleted":false,"technicalAdminAuth":{"outcome":"not-attempted","credentialPreserved":false,"reEnrollmentRequired":false}}'; exit 1 ;;
+  post-failure) printf '%s\\n' '{"restored":false,"outcome":"foundation-replacement-failed","cutoverCompleted":true,"technicalAdminAuth":{"outcome":"preserved-transients-invalidated","credentialPreserved":true,"reEnrollmentRequired":false}}'; exit 1 ;;
+  *) exit 1 ;;
+esac
+`,
+      );
+      for (const path of [
+        systemctlStub,
+        sudoStub,
+        flockStub,
+        curlStub,
+        sleepStub,
+        maintenanceStub,
+      ]) {
+        await chmod(path, 0o755);
+      }
+
+      const preFailure = await run("pre-failure", true);
+      expect(preFailure.code, preFailure.output).toBe(1);
+      expect(preFailure.output).toContain('"outcome":"restore-preparation-failed"');
+      expect(preFailure.output).toContain('"outcome":"not-attempted"');
+      expect(preFailure.output).toContain('"serviceStopped":true');
+      expect(preFailure.output).not.toContain(root);
+      expect(await pathExists(serviceState)).toBe(false);
+
+      const initiallyInactive = await run("pre-failure", false);
+      expect(initiallyInactive.code, initiallyInactive.output).toBe(1);
+      expect(initiallyInactive.output).toContain('"serviceStopped":true');
+      expect(await pathExists(serviceState)).toBe(false);
+
+      const failedState = await run("pre-failure", "failed");
+      expect(failedState.code, failedState.output).toBe(1);
+      expect(failedState.output).toContain('"outcome":"restore-preparation-failed"');
+      expect(failedState.output).toContain('"technicalAdminAuth":{"outcome":"not-attempted"');
+      expect(failedState.output).toContain('"serviceStopped":true');
+      expect(await pathExists(serviceState)).toBe(false);
+
+      const postFailure = await run("post-failure", true);
+      expect(postFailure.code, postFailure.output).toBe(12);
+      expect(postFailure.output).toContain('"cutoverCompleted":true');
+      expect(postFailure.output).toContain('"outcome":"preserved-transients-invalidated"');
+      expect(await pathExists(serviceState)).toBe(false);
+
+      const success = await run("success", true);
+      expect(success.code, success.output).toBe(0);
+      expect(success.output).toContain('"restored":true');
+      expect(success.output).toContain('"outcome":"preserved-transients-invalidated"');
+      expect(await pathExists(serviceState)).toBe(true);
+
+      const verificationFailure = await run("success", true, true);
+      expect(verificationFailure.code, verificationFailure.output).toBe(12);
+      expect(verificationFailure.output).toContain('"postRestartVerified":false');
+      expect(verificationFailure.output).toContain('"cutoverCompleted":true');
+      expect(await pathExists(serviceState)).toBe(false);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

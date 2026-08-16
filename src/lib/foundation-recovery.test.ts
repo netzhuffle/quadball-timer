@@ -323,8 +323,11 @@ describe("Event foundation recovery", () => {
       });
       await expectRejected(rollback.restore(manifestPath), "fast rollback");
       expect(adHoc.readLive()).toBe("newer-live-state");
-      expect(existsSync(`${adHocPath}.failed-fast-rollback-restore`)).toBe(false);
-      expect(existsSync(`${livePath}.failed-fast-rollback-restore`)).toBe(false);
+      expect(existsSync(`${adHocPath}.failed-fast-rollback-restore`)).toBe(true);
+      expect(await readFile(`${adHocPath}.failed-fast-rollback-restore`, "utf8")).toBe(
+        "newer-live-state",
+      );
+      expect(existsSync(`${livePath}.failed-fast-rollback-restore`)).toBe(true);
       harness.storage.close();
     });
   });
@@ -473,6 +476,9 @@ describe("Event foundation recovery", () => {
       });
       expect(recovery.restore(manifestPath)).rejects.toThrow("injected replacement failure");
       expect(existsSync(livePath)).toBe(true);
+      expect(
+        existsSync(join(backupDirectory, "verify-2.restore-attempt", "foundation.sqlite.staged")),
+      ).toBe(true);
       expect(existsSync(technicalAdminPath)).toBe(true);
       for (const privatePath of [livePath, `${livePath}.quarantine`]) {
         expect(lstatSync(privatePath).mode & 0o777).toBe(0o600);
@@ -507,21 +513,23 @@ describe("Event foundation recovery", () => {
           }
         },
       });
-      const restored = await recovery.restore(manifestPath);
-      expect(restored).toMatchObject({
-        completed: true,
-        completionEvidencePath: null,
-        completionEvidenceStatus: "write-failed",
+      const failure = await recovery.restore(manifestPath).then(
+        () => null,
+        (error: unknown) => error,
+      );
+      expect(failure).toMatchObject({
+        phase: "post-cutover-evidence",
+        cutoverCompleted: true,
       });
-      expect(JSON.parse(readFileSync(restored.evidencePath, "utf8"))).toMatchObject({
-        status: "pending-replacement",
-        restoreId: restored.restoreId,
-        snapshotId: manifest.snapshotId,
-      });
+      if (!(failure instanceof Error)) throw new Error("Expected completion evidence failure.");
+      const restoreId = "restore-completion-io";
+      expect(existsSync(join(backupDirectory, `${restoreId}.restore-completed.json`))).toBe(false);
+      expect(existsSync(`${livePath}.failed-${restoreId}`)).toBe(true);
       expect(
-        existsSync(join(backupDirectory, `${restored.restoreId}.restore-completed.json`)),
-      ).toBe(false);
-      expect(existsSync(restored.failedDatabasePath)).toBe(true);
+        existsSync(
+          join(backupDirectory, `${restoreId}.restore-attempt`, "foundation.sqlite.staged"),
+        ),
+      ).toBe(true);
       const reopened = openSqliteFoundationStorage(livePath, {
         grantKeyRing: initial.keyRing,
         grantValidationContext: { environmentId: "test", keyRing: initial.keyRing },
@@ -543,8 +551,9 @@ describe("Event foundation recovery", () => {
       const manifestPath = join(backupDirectory, `${manifest.snapshotId}.manifest.json`);
       const backupPath = join(backupDirectory, manifest.databaseFile);
       const stagedPath = join(
-        dirname(livePath),
-        ".foundation.sqlite.restore-pre-reevaluation-race.staged",
+        backupDirectory,
+        "restore-pre-reevaluation-race.restore-attempt",
+        "foundation.sqlite.staged",
       );
       const displacedPath = `${stagedPath}.verified-inode`;
       const recovery = createFoundationRecovery(initial.storage, {
@@ -575,7 +584,11 @@ describe("Event foundation recovery", () => {
       const initial = await createHarness(livePath, backupDirectory, () => ids.shift() ?? "extra");
       const manifest = await initial.recovery.createPreDeploymentBackup();
       const manifestPath = join(backupDirectory, `${manifest.snapshotId}.manifest.json`);
-      const stagedPath = join(dirname(livePath), ".foundation.sqlite.restore-stage-race.staged");
+      const stagedPath = join(
+        backupDirectory,
+        "restore-stage-race.restore-attempt",
+        "foundation.sqlite.staged",
+      );
       const displacedPath = `${stagedPath}.verified-inode`;
       const recovery = createFoundationRecovery(initial.storage, {
         ...initial.options,
@@ -610,8 +623,9 @@ describe("Event foundation recovery", () => {
       const manifest = await initial.recovery.createPreDeploymentBackup();
       const manifestPath = join(backupDirectory, `${manifest.snapshotId}.manifest.json`);
       const stagedPath = join(
-        dirname(livePath),
-        ".foundation.sqlite.restore-stage-mutation.staged",
+        backupDirectory,
+        "restore-stage-mutation.restore-attempt",
+        "foundation.sqlite.staged",
       );
       const recovery = createFoundationRecovery(initial.storage, {
         ...initial.options,
@@ -742,9 +756,14 @@ describe("Event foundation recovery", () => {
       if (!(sanitationFailure instanceof Error)) {
         throw new Error("Expected auth sanitation to abort the restore.");
       }
+      expect(sanitationFailure).toMatchObject({
+        phase: "auth-sanitation",
+        cutoverCompleted: false,
+        technicalAdminAuth: { outcome: "sanitation-failed" },
+      });
       expect(sanitationFailure.message).toContain("sanitation failed before replacement");
       expect(replacementAttempted).toBe(false);
-      expect(existsSync(livePath + ".failed-restore")).toBe(false);
+      expect(existsSync(livePath + ".failed-restore")).toBe(true);
       const evidence = JSON.parse(
         readFileSync(join(backupDirectory, "restore.restore-evidence.json"), "utf8"),
       );
@@ -753,6 +772,86 @@ describe("Event foundation recovery", () => {
         technicalAdminAuth: { outcome: "sanitation-failed" },
       });
       expect(JSON.stringify(evidence)).not.toMatch(/credential|origin|session|schema|path/i);
+      harness.storage.close();
+    });
+  });
+
+  test("reports untouched auth and preserves evidence when failure precedes the adapter", async () => {
+    await withRecoveryPaths(async ({ livePath, backupDirectory }) => {
+      const harness = await createHarness(livePath, backupDirectory, () => "before-auth");
+      const manifest = await harness.recovery.createPreDeploymentBackup();
+      let adapterCalled = false;
+      const recovery = createFoundationRecovery(harness.storage, {
+        ...harness.options,
+        technicalAdminAuth: {
+          ...harness.options.technicalAdminAuth,
+          adapter: {
+            async prepareForFoundationRestore() {
+              adapterCalled = true;
+              return { outcome: "preserved-transients-invalidated" as const };
+            },
+          },
+        },
+        faultInjector(phase) {
+          if (phase === "after-authoritative-quiescence") {
+            throw new Error("injected before auth adapter");
+          }
+        },
+      });
+      const failure = await recovery
+        .restore(join(backupDirectory, `${manifest.snapshotId}.manifest.json`))
+        .then(
+          () => null,
+          (error: unknown) => error,
+        );
+      expect(failure).toMatchObject({
+        phase: "auth-sanitation",
+        cutoverCompleted: false,
+        technicalAdminAuth: {
+          outcome: "not-attempted",
+          credentialPreserved: false,
+          reEnrollmentRequired: false,
+        },
+      });
+      expect(adapterCalled).toBe(false);
+      expect(existsSync(`${livePath}.failed-before-auth`)).toBe(true);
+      expect(
+        existsSync(
+          join(backupDirectory, "before-auth.restore-attempt", "foundation.sqlite.staged"),
+        ),
+      ).toBe(true);
+      harness.storage.close();
+    });
+  });
+
+  test("preserves evaluated restore evidence after post-cutover inspection failure", async () => {
+    await withRecoveryPaths(async ({ livePath, backupDirectory }) => {
+      const ids = ["snapshot", "verify-backup", "restore", "verify-restore"];
+      const harness = await createHarness(livePath, backupDirectory, () => ids.shift() ?? "extra");
+      const manifest = await harness.recovery.createPreDeploymentBackup();
+      const recovery = createFoundationRecovery(harness.storage, {
+        ...harness.options,
+        faultInjector(phase) {
+          if (phase === "after-post-cutover-inspection") {
+            throw new Error("injected post-cutover inspection failure");
+          }
+        },
+      });
+
+      const failure = await recovery
+        .restore(join(backupDirectory, `${manifest.snapshotId}.manifest.json`))
+        .then(
+          () => null,
+          (error: unknown) => error,
+        );
+      expect(failure).toMatchObject({
+        phase: "post-cutover-evidence",
+        cutoverCompleted: true,
+      });
+      expect(existsSync(`${livePath}.failed-restore`)).toBe(true);
+      expect(
+        existsSync(join(backupDirectory, "restore.restore-attempt", "foundation.sqlite.staged")),
+      ).toBe(true);
       harness.storage.close();
     });
   });
@@ -793,6 +892,15 @@ describe("Event foundation recovery", () => {
       if (!(replacementFailure instanceof Error)) {
         throw new Error("Expected Foundation replacement to fail.");
       }
+      expect(replacementFailure).toMatchObject({
+        phase: "foundation-replacement",
+        cutoverCompleted: false,
+        technicalAdminAuth: {
+          outcome: "preserved-transients-invalidated",
+          credentialPreserved: true,
+          reEnrollmentRequired: false,
+        },
+      });
       expect(replacementFailure.message).toContain("injected Foundation replacement failure");
       expect(readFileSync(technicalAdminPath, "utf8")).toBe("preserved-credential-no-transients");
       harness.storage.close();

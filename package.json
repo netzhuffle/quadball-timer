@@ -39,7 +39,7 @@
     "format": "bunx --bun oxfmt \"**/*.{js,jsx,ts,tsx,mjs,cjs}\" \"!docs/**\"",
     "format:check": "bunx --bun oxfmt \"**/*.{js,jsx,ts,tsx,mjs,cjs}\" \"!docs/**\" --check",
     "lint": "bunx --bun oxlint --type-aware --type-check --ignore-pattern \"docs/**\"",
-    "lint:shell": "shellcheck deploy/activate-release.sh deploy/activate-test-release.sh deploy/activation-maintenance-root.sh",
+    "lint:shell": "shellcheck deploy/activate-release.sh deploy/activate-test-release.sh deploy/activation-maintenance-root.sh deploy/restore-production.sh",
     "check:bun-version": "bun scripts/check-bun-version.ts",
     "check:testing-policy": "bun scripts/check-testing-policy.ts",
     "check": "bun run check:bun-version && bun run check:testing-policy && bun run format:check && bun run lint && bun run lint:shell"
