@@ -49,16 +49,21 @@ describe("Ad Hoc Controller action UI", () => {
 
     await click(cards);
     expect(container.querySelector('[data-controller-action-panel="true"]')).not.toBeNull();
-    expect(container.querySelector('[role="alert"]')).not.toBeNull();
+    expect(container.querySelector('[data-card-wizard-step="type"]')).not.toBeNull();
     await click(actionButton("Timeout"));
     await click(cards);
-    expect(container.querySelector('[role="alert"]')).not.toBeNull();
-    expect(container.textContent).toContain("Remaining on add: --");
+    expect(container.querySelector('[data-card-wizard-step="type"]')).not.toBeNull();
 
     await click(cards);
     await click(cards);
     await click(panelButton("Blue"));
+    expect(container.querySelector('[data-card-wizard-step="team"]')).not.toBeNull();
     await click(panelButton("Home"));
+    expect(container.querySelector('[data-card-wizard-step="number"]')).not.toBeNull();
+    await click(panelButton("OK"));
+    expect(container.querySelector('[data-controller-action-panel="true"]')).not.toBeNull();
+    expect(container.querySelector('[role="alert"]')).not.toBeNull();
+    await click(panelButton("7"));
     await click(panelButton("OK"));
     expect(container.querySelector('[data-controller-action-panel="true"]')).toBeNull();
     expect(document.activeElement).toBe(cards);
@@ -195,21 +200,26 @@ function AdHocActionHarness() {
         canSelectCardType
         canSelectCardTeam={cardDraft.cardType !== null}
         cardPlayerLabel="no player"
-        cardEntryStarted={cardDraft.cardType !== null}
         cardAddStatusText={
-          cardDraft.cardType === null || cardDraft.team === null ? "Remaining on add: --" : "Ready"
+          cardDraft.cardType === null || cardDraft.team === null
+            ? "Choose a card type and team."
+            : cardDraft.digits.length === 0
+              ? "Enter a player number to record this card."
+              : "Ready"
         }
         canEditCardDigits={cardDraft.cardType !== null && cardDraft.team !== null}
         appendCardDigit={(digit) =>
           setCardDraft((current) => ({ ...current, digits: current.digits + digit }))
         }
-        canSubmitCard={cardDraft.cardType !== null && cardDraft.team !== null}
+        canSubmitCard={
+          cardDraft.cardType !== null && cardDraft.team !== null && cardDraft.digits.length > 0
+        }
         submitCard={() => {
           dispatch({
             type: "add-card",
             team: cardDraft.team ?? "home",
             cardType: cardDraft.cardType ?? "blue",
-            playerNumber: null,
+            playerNumber: cardDraft.digits.length === 0 ? null : Number(cardDraft.digits),
             startedGameClockMs: 0,
           });
           resetDraft();

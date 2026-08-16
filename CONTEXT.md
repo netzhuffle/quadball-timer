@@ -329,6 +329,10 @@ _Avoid_: Game from scratch, unassigned game
 A participant admitted through an unfinished Ad Hoc Game's Control QR. All Ad Hoc Controllers for the Game have equal authority; its creator is not an owner or primary Controller, and an admitted browser retains its authority across ordinary browser and server restarts until its Controller Leave Grace Period expires or capacity cleanup removes the Game.
 _Avoid_: Ad Hoc Game owner, creator role, primary Controller
 
+**Ad Hoc Penalty**:
+A penalty card fact recorded for an Ad Hoc Game Side at an original Game Clock time. Its card type and affected Game Side remain associated with that original entry even when a Controller later assigns or corrects its optional player number or changes its card details.
+_Avoid_: mutable penalty timer, latest card, player-only penalty
+
 **Controller Leave Grace Period**:
 The five-minute interval after a Controller leaves an Ad Hoc Game or Event Game during which the departing browser can resume its most recently left control authority from Home, subject to the Game's current authority rules. The opportunity survives an ordinary browser restart, replaces any earlier Leave Grace Period for that browser, and makes the departure final only when it expires.
 _Avoid_: Undo leave, logout timeout, session expiry

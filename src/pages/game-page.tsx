@@ -128,7 +128,11 @@ export function GamePage({ gameId, role }: { gameId: string; role: ControllerRol
   } | null>(null);
   const leftTeamNameButtonRef = useRef<HTMLButtonElement | null>(null);
   const rightTeamNameButtonRef = useRef<HTMLButtonElement | null>(null);
+  const controllerTopSectionRef = useRef<HTMLDivElement | null>(null);
   const [displayTeamNameHeightPx, setDisplayTeamNameHeightPx] = useState<number | null>(null);
+  const [controllerTopSectionHeightPx, setControllerTopSectionHeightPx] = useState<number | null>(
+    null,
+  );
   const leaveTriggerRef = useRef<HTMLButtonElement | null>(null);
   const adHocQrTriggerRef = useRef<HTMLButtonElement | null>(null);
   const entryTriggerRef = useRef<HTMLButtonElement | null>(null);
@@ -587,6 +591,22 @@ export function GamePage({ gameId, role }: { gameId: string; role: ControllerRol
     };
   }, [liveState?.awayName, liveState?.displaySidesSwapped, liveState?.homeName, renamingTeam]);
 
+  useEffect(() => {
+    const element = controllerTopSectionRef.current;
+    if (element === null || typeof ResizeObserver === "undefined") {
+      return;
+    }
+
+    const observer = new ResizeObserver(([entry]) => {
+      const nextHeight = entry === undefined ? null : Math.ceil(entry.contentRect.height);
+      setControllerTopSectionHeightPx((previous) =>
+        previous === nextHeight ? previous : nextHeight,
+      );
+    });
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [liveState?.homeName, liveState?.awayName, liveState?.displaySidesSwapped]);
+
   const appendCardDigit = useCallback((digit: string) => {
     setCardDraft((previous) => {
       if (previous.digits.length >= 2) {
@@ -686,7 +706,8 @@ export function GamePage({ gameId, role }: { gameId: string; role: ControllerRol
     !state.isFinished &&
     !state.isSuspended &&
     cardDraft.cardType !== null &&
-    cardDraft.team !== null;
+    cardDraft.team !== null &&
+    cardDraft.digits.length > 0;
   const cardPlayerLabel = cardDraft.digits.length > 0 ? `#${cardDraft.digits}` : "No #";
   const cardBasePenaltyMs =
     cardDraft.cardType === "red"
@@ -711,12 +732,14 @@ export function GamePage({ gameId, role }: { gameId: string; role: ControllerRol
   const selectedCardPlayerServingPenalty = hasServingPenalty(selectedCardPlayer);
   const cardAddStatusText =
     cardDraft.cardType === null || cardDraft.team === null
-      ? "Remaining on add: --"
-      : cardDraft.cardType === "ejection"
-        ? "Remaining on add: n/a"
-        : selectedCardPlayerServingPenalty
-          ? `Adds on confirm: +${formatPenaltySlice(cardBasePenaltyMs ?? ONE_MINUTE_MS)}`
-          : `Remaining on add: ${formatRemaining(predictedCardRemainingMs ?? ONE_MINUTE_MS)}${state.isRunning ? " (live)" : ""}`;
+      ? "Choose a card type and team."
+      : cardDraft.digits.length === 0
+        ? "Enter a player number to record this card."
+        : cardDraft.cardType === "ejection"
+          ? "Remaining on add: n/a"
+          : selectedCardPlayerServingPenalty
+            ? `Adds on confirm: +${formatPenaltySlice(cardBasePenaltyMs ?? ONE_MINUTE_MS)}`
+            : `Remaining on add: ${formatRemaining(predictedCardRemainingMs ?? ONE_MINUTE_MS)}${state.isRunning ? " (live)" : ""}`;
   const cardTypeOptions: Array<{
     type: CardType;
     label: string;
@@ -958,80 +981,82 @@ export function GamePage({ gameId, role }: { gameId: string; role: ControllerRol
             />
           ) : null}
 
-          <ControllerTopSection
-            controller={controller}
-            stateIsRunning={state.isRunning}
-            stateIsFinished={state.isFinished}
-            stateIsSuspended={state.isSuspended}
-            statusLabel={statusLabel}
-            gameClockText={formatClock(gameView.state.gameClockMs)}
-            leftScoreColumn={homeScoreColumn}
-            rightScoreColumn={awayScoreColumn}
-            scorePulse={scorePulse}
-            teamNameEditor={{
-              controller,
-              renamingTeam,
-              homeName,
-              awayName,
-              homeColor,
-              awayColor,
-              activeTeamRenameInputRef,
-              leftTeamNameButtonRef,
-              rightTeamNameButtonRef,
-              displayTeamNameHeightPx,
-              onOpenRename: (team) => {
-                if (!controller) {
-                  return;
-                }
+          <div ref={controllerTopSectionRef} className="min-h-0">
+            <ControllerTopSection
+              controller={controller}
+              stateIsRunning={state.isRunning}
+              stateIsFinished={state.isFinished}
+              stateIsSuspended={state.isSuspended}
+              statusLabel={statusLabel}
+              gameClockText={formatClock(gameView.state.gameClockMs)}
+              leftScoreColumn={homeScoreColumn}
+              rightScoreColumn={awayScoreColumn}
+              scorePulse={scorePulse}
+              teamNameEditor={{
+                controller,
+                renamingTeam,
+                homeName,
+                awayName,
+                homeColor,
+                awayColor,
+                activeTeamRenameInputRef,
+                leftTeamNameButtonRef,
+                rightTeamNameButtonRef,
+                displayTeamNameHeightPx,
+                onOpenRename: (team) => {
+                  if (!controller) {
+                    return;
+                  }
 
-                setHomeName(state.homeName);
-                setAwayName(state.awayName);
-                setHomeColor(state.homeColor);
-                setAwayColor(state.awayColor);
-                setRenamingTeam(team);
-              },
-              onRenameInputChange: (team, value) => {
-                if (team === "home") {
-                  setHomeName(value);
-                } else {
-                  setAwayName(value);
-                }
-              },
-              onRenameColorChange: (team, value) => {
-                if (team === "home") {
-                  setHomeColor(value);
-                } else {
-                  setAwayColor(value);
-                }
-              },
-              onRenameInputKeyDown: handleTeamRenameInputKeyDown,
-              onSaveRename: saveTeamRename,
-              onSwapDisplayedTeamSides: swapDisplayedTeamSides,
-            }}
-            onAddScore={(team) =>
-              dispatchCommand({
-                type: "change-score",
-                team,
-                delta: 10,
-                reason: "goal",
-              })
-            }
-            onUndoScore={(team) => dispatchCommand({ type: "undo-last-score", team })}
-            onToggleClockAdjust={() => setClockAdjustOpen((previous) => !previous)}
-            onToggleRunning={() =>
-              dispatchCommand({
-                type: "set-running",
-                running: !state.isRunning,
-              })
-            }
-            clockAdjustOpen={clockAdjustOpen}
-            onAdjustGameClock={adjustGameClock}
-            finishSummary={finishSummary}
-            timeoutReminder={timeoutReminder}
-            flagStatus={flagStatus}
-            seekersStatus={seekersStatus}
-            clockTheme={clockTheme}
-          />
+                  setHomeName(state.homeName);
+                  setAwayName(state.awayName);
+                  setHomeColor(state.homeColor);
+                  setAwayColor(state.awayColor);
+                  setRenamingTeam(team);
+                },
+                onRenameInputChange: (team, value) => {
+                  if (team === "home") {
+                    setHomeName(value);
+                  } else {
+                    setAwayName(value);
+                  }
+                },
+                onRenameColorChange: (team, value) => {
+                  if (team === "home") {
+                    setHomeColor(value);
+                  } else {
+                    setAwayColor(value);
+                  }
+                },
+                onRenameInputKeyDown: handleTeamRenameInputKeyDown,
+                onSaveRename: saveTeamRename,
+                onSwapDisplayedTeamSides: swapDisplayedTeamSides,
+              }}
+              onAddScore={(team) =>
+                dispatchCommand({
+                  type: "change-score",
+                  team,
+                  delta: 10,
+                  reason: "goal",
+                })
+              }
+              onUndoScore={(team) => dispatchCommand({ type: "undo-last-score", team })}
+              onToggleClockAdjust={() => setClockAdjustOpen((previous) => !previous)}
+              onToggleRunning={() =>
+                dispatchCommand({
+                  type: "set-running",
+                  running: !state.isRunning,
+                })
+              }
+              clockAdjustOpen={clockAdjustOpen}
+              onAdjustGameClock={adjustGameClock}
+              finishSummary={finishSummary}
+              timeoutReminder={timeoutReminder}
+              flagStatus={flagStatus}
+              seekersStatus={seekersStatus}
+              clockTheme={clockTheme}
+            />
+          </div>
 
           <PenaltyColumnsSection
             penaltyColumns={penaltyColumns}
@@ -1053,6 +1078,7 @@ export function GamePage({ gameId, role }: { gameId: string; role: ControllerRol
           <GameControllerActionPanels
             activePanel={activePanel}
             setActivePanel={handleActionPanelChange}
+            topOffsetPx={controllerTopSectionHeightPx ?? undefined}
             controller={controller}
             state={state}
             gameView={{
@@ -1078,7 +1104,6 @@ export function GamePage({ gameId, role }: { gameId: string; role: ControllerRol
             canSelectCardType={canSelectCardType}
             canSelectCardTeam={canSelectCardTeam}
             cardPlayerLabel={cardPlayerLabel}
-            cardEntryStarted={cardEntryStarted}
             cardAddStatusText={cardAddStatusText}
             canEditCardDigits={canEditCardDigits}
             appendCardDigit={appendCardDigit}

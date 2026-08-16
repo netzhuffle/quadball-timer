@@ -13,11 +13,13 @@ export function ControllerActionSheet({
   onPanelChange,
   panel,
   tabThemes,
+  topOffsetPx,
 }: {
   activePanel: ControllerActionPanel | null;
   onPanelChange: (panel: ControllerActionPanel | null) => void;
   panel: ReactNode;
   tabThemes?: Partial<Record<ControllerActionPanel, TabTheme>>;
+  topOffsetPx?: number;
 }) {
   const previousPanelRef = useRef<ControllerActionPanel | null>(null);
   const actionButtonRefs = useRef<Partial<Record<ControllerActionPanel, HTMLButtonElement | null>>>(
@@ -39,7 +41,8 @@ export function ControllerActionSheet({
   return (
     <div
       data-controller-action-sheet="true"
-      className="pointer-events-none absolute inset-x-0 bottom-0 z-20 flex flex-col gap-2"
+      className="pointer-events-none absolute inset-x-0 bottom-0 top-[clamp(16rem,38dvh,22rem)] z-20 flex flex-col gap-0"
+      style={topOffsetPx === undefined ? undefined : { top: `${topOffsetPx + 8}px` }}
     >
       {activePanel === null ? null : (
         <section
@@ -47,7 +50,7 @@ export function ControllerActionSheet({
           data-controller-action-panel="true"
           role="region"
           aria-label={`${panelLabel(activePanel)} actions`}
-          className="pointer-events-auto max-h-[min(15dvh,12rem)] overflow-y-auto overscroll-contain rounded-2xl border border-slate-300 bg-white/95 p-2 shadow-[0_12px_30px_rgba(15,23,42,0.2)] backdrop-blur-sm [&_button]:min-h-11"
+          className="pointer-events-auto min-h-0 max-h-[calc(100%_-_4rem)] overflow-y-auto overscroll-contain rounded-t-2xl border border-b-0 border-slate-300 bg-white/95 p-2 shadow-[0_12px_30px_rgba(15,23,42,0.2)] backdrop-blur-sm [&_button]:min-h-11"
         >
           {panel}
         </section>
@@ -55,7 +58,7 @@ export function ControllerActionSheet({
       <nav
         data-controller-action-navigation="true"
         aria-label="Controller actions"
-        className="pointer-events-auto rounded-2xl border border-slate-300 bg-white p-1 pb-[max(0.25rem,env(safe-area-inset-bottom))] shadow-[0_8px_20px_rgba(15,23,42,0.16)]"
+        className="pointer-events-auto rounded-b-2xl border border-slate-300 bg-white p-1 pb-[max(0.25rem,env(safe-area-inset-bottom))] shadow-[0_8px_20px_rgba(15,23,42,0.16)]"
       >
         <div className="grid grid-cols-3 gap-1">
           <ActionTab
