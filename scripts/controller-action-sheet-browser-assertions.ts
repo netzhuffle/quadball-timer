@@ -110,16 +110,17 @@ async function assertAdHocCompletionJourney(
   await cards.click();
   const panel = page.locator('[data-controller-action-panel="true"]');
   const ok = panel.getByRole("button", { name: "OK", exact: true });
-  assert(
-    (await panel.getByRole("alert").count()) > 0,
-    `${stage} invalid Ad Hoc card was not retained`,
-  );
   const blue = panel.getByRole("button", { name: "Blue", exact: true });
   await blue.scrollIntoViewIfNeeded();
   await blue.click();
   const home = panel.getByRole("button", { name: "Home", exact: true });
   await home.scrollIntoViewIfNeeded();
   await home.click();
+  assert(
+    (await panel.getByRole("alert").count()) > 0,
+    `${stage} missing Ad Hoc player number was not retained`,
+  );
+  await panel.getByRole("button", { name: "7", exact: true }).click();
   await ok.scrollIntoViewIfNeeded();
   await ok.click();
   assert(

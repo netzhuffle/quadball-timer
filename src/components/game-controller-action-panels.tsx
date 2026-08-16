@@ -34,6 +34,7 @@ type PanelTabTheme = {
 export function GameControllerActionPanels({
   activePanel,
   setActivePanel,
+  topOffsetPx,
   controller,
   state,
   gameView,
@@ -46,7 +47,6 @@ export function GameControllerActionPanels({
   canSelectCardType,
   canSelectCardTeam,
   cardPlayerLabel,
-  cardEntryStarted,
   cardAddStatusText,
   canEditCardDigits,
   appendCardDigit,
@@ -77,6 +77,7 @@ export function GameControllerActionPanels({
 }: {
   activePanel: ActivePanel;
   setActivePanel: (panel: ActivePanel) => void;
+  topOffsetPx?: number;
   controller: boolean;
   state: GameState;
   gameView: {
@@ -96,7 +97,6 @@ export function GameControllerActionPanels({
   canSelectCardType: boolean;
   canSelectCardTeam: boolean;
   cardPlayerLabel: string;
-  cardEntryStarted: boolean;
   cardAddStatusText: string;
   canEditCardDigits: boolean;
   appendCardDigit: (digit: string) => void;
@@ -130,150 +130,29 @@ export function GameControllerActionPanels({
       activePanel={activePanel}
       onPanelChange={setActivePanel}
       tabThemes={tabThemes}
+      topOffsetPx={topOffsetPx}
       panel={
         <Card className="relative min-h-0 overflow-hidden rounded-[1.5rem] border-0 bg-transparent py-0 shadow-none">
           <CardContent className="overflow-hidden px-2">
-            <div
-              className={`flex min-h-0 flex-col gap-1.5 rounded-2xl border border-slate-200 bg-slate-50 p-2 ${
-                activePanel === "card" ? "animate-in fade-in-0 slide-in-from-bottom-2" : "hidden"
-              }`}
-            >
-              <div className="grid grid-cols-2 gap-1">
-                {cardTypeOptions.map((option) => {
-                  const Icon = option.icon;
-                  const active = cardDraft.cardType === option.type;
-
-                  return (
-                    <Button
-                      key={option.type}
-                      size="sm"
-                      variant="outline"
-                      className={`h-7 justify-start gap-1.5 rounded-xl px-2 text-[10px] ${
-                        active ? option.activeClassName : option.idleClassName
-                      }`}
-                      onClick={() =>
-                        setCardDraft((previous) => ({
-                          ...previous,
-                          cardType: option.type,
-                          startedGameClockMs:
-                            previous.startedGameClockMs === null
-                              ? state.gameClockMs
-                              : previous.startedGameClockMs,
-                        }))
-                      }
-                      disabled={!canSelectCardType}
-                    >
-                      <Icon className="h-3.5 w-3.5" />
-                      {option.label}
-                    </Button>
-                  );
-                })}
-              </div>
-              <div className="grid grid-cols-2 gap-1">
-                {displayTeamOrder.map((team) => (
-                  <Button
-                    key={team}
-                    size="sm"
-                    variant={cardDraft.team === team ? "default" : "outline"}
-                    className="h-7 rounded-xl text-[10px]"
-                    onClick={() =>
-                      setCardDraft((previous) => ({
-                        ...previous,
-                        team,
-                      }))
-                    }
-                    disabled={!canSelectCardTeam}
-                  >
-                    {displayTeamName(team)}
-                  </Button>
-                ))}
-              </div>
-              <div className="grid grid-cols-[auto_1fr_auto] items-center gap-2 rounded-xl border border-slate-300 bg-white px-2 py-1 text-[10px] font-medium">
-                {cardDraft.cardType === null ? (
-                  <span className="text-slate-500">Card?</span>
-                ) : (
-                  <>
-                    <span className="uppercase">{cardDraft.cardType}</span>
-                    <span className="truncate text-slate-600">
-                      {cardDraft.team === null
-                        ? "team?"
-                        : cardDraft.team === "home"
-                          ? state.homeName
-                          : state.awayName}{" "}
-                      • {cardPlayerLabel}
-                    </span>
-                  </>
-                )}
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  className="h-5 px-1.5 text-[10px] text-slate-700"
-                  onClick={() =>
-                    setCardDraft({
-                      cardType: null,
-                      team: null,
-                      digits: "",
-                      startedGameClockMs: null,
-                    })
-                  }
-                  disabled={!controller || !cardEntryStarted}
-                >
-                  Reset
-                </Button>
-              </div>
-              <p
-                role={canSubmitCard ? "status" : "alert"}
-                className="h-4 text-[10px] text-slate-600"
-              >
-                {cardAddStatusText}
-              </p>
-              <div className="grid grid-cols-3 gap-1">
-                {["1", "2", "3", "4", "5", "6", "7", "8", "9"].map((digit) => (
-                  <Button
-                    key={digit}
-                    size="sm"
-                    variant="outline"
-                    className="h-7 rounded-xl border-slate-300 bg-white text-sm text-slate-900"
-                    onClick={() => appendCardDigit(digit)}
-                    disabled={!canEditCardDigits}
-                  >
-                    {digit}
-                  </Button>
-                ))}
-                <Button
-                  size="sm"
-                  variant="outline"
-                  className="h-7 rounded-xl border-slate-300 bg-white text-slate-900"
-                  onClick={() =>
-                    setCardDraft((previous) => ({
-                      ...previous,
-                      digits: previous.digits.slice(0, -1),
-                    }))
-                  }
-                  disabled={!canEditCardDigits || cardDraft.digits.length === 0}
-                >
-                  <Delete className="h-4 w-4" />
-                </Button>
-                <Button
-                  size="sm"
-                  variant="outline"
-                  className="h-7 rounded-xl border-slate-300 bg-white text-sm text-slate-900"
-                  onClick={() => appendCardDigit("0")}
-                  disabled={!canEditCardDigits}
-                >
-                  0
-                </Button>
-                <Button
-                  size="sm"
-                  className="h-7 gap-1 rounded-xl bg-emerald-600 text-white hover:bg-emerald-500"
-                  onClick={submitCard}
-                  disabled={!canSubmitCard}
-                >
-                  <Check className="h-4 w-4" />
-                  OK
-                </Button>
-              </div>
-            </div>
+            <CardWizard
+              active={activePanel === "card"}
+              controller={controller}
+              state={state}
+              displayTeamOrder={displayTeamOrder}
+              displayTeamName={displayTeamName}
+              cardTypeOptions={cardTypeOptions}
+              cardDraft={cardDraft}
+              setCardDraft={setCardDraft}
+              canSelectCardType={canSelectCardType}
+              canSelectCardTeam={canSelectCardTeam}
+              cardPlayerLabel={cardPlayerLabel}
+              cardAddStatusText={cardAddStatusText}
+              canEditCardDigits={canEditCardDigits}
+              appendCardDigit={appendCardDigit}
+              canSubmitCard={canSubmitCard}
+              submitCard={submitCard}
+              closePanel={() => setActivePanel(null)}
+            />
 
             <div
               className={`flex min-h-0 flex-col gap-1.5 rounded-2xl border border-slate-200 bg-slate-50 p-2 ${
@@ -509,5 +388,194 @@ export function GameControllerActionPanels({
         </Card>
       }
     />
+  );
+}
+
+function CardWizard({
+  active,
+  controller,
+  state,
+  displayTeamOrder,
+  displayTeamName,
+  cardTypeOptions,
+  cardDraft,
+  setCardDraft,
+  canSelectCardType,
+  canSelectCardTeam,
+  cardPlayerLabel,
+  cardAddStatusText,
+  canEditCardDigits,
+  appendCardDigit,
+  canSubmitCard,
+  submitCard,
+  closePanel,
+}: {
+  active: boolean;
+  controller: boolean;
+  state: GameState;
+  displayTeamOrder: [TeamId, TeamId];
+  displayTeamName: (team: TeamId) => string;
+  cardTypeOptions: CardTypeOption[];
+  cardDraft: CardDraft;
+  setCardDraft: Dispatch<SetStateAction<CardDraft>>;
+  canSelectCardType: boolean;
+  canSelectCardTeam: boolean;
+  cardPlayerLabel: string;
+  cardAddStatusText: string;
+  canEditCardDigits: boolean;
+  appendCardDigit: (digit: string) => void;
+  canSubmitCard: boolean;
+  submitCard: () => void;
+  closePanel: () => void;
+}) {
+  const step = cardDraft.cardType === null ? "type" : cardDraft.team === null ? "team" : "number";
+
+  if (!active) {
+    return null;
+  }
+
+  const undo = () => {
+    if (step === "number") {
+      setCardDraft((previous) => ({ ...previous, team: null, digits: "" }));
+      return;
+    }
+    if (step === "team") {
+      setCardDraft({ cardType: null, team: null, digits: "", startedGameClockMs: null });
+      return;
+    }
+    setCardDraft({ cardType: null, team: null, digits: "", startedGameClockMs: null });
+    closePanel();
+  };
+
+  return (
+    <div
+      data-card-wizard-step={step}
+      className="flex min-h-0 flex-col gap-1.5 rounded-2xl border border-slate-200 bg-slate-50 p-2 animate-in fade-in-0 slide-in-from-bottom-2"
+    >
+      <div className="flex items-center justify-between gap-2 text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-500">
+        <span>{step === "type" ? "Card type" : step === "team" ? "Team" : "Player number"}</span>
+        {step !== "type" ? (
+          <span className="truncate text-right normal-case tracking-normal text-slate-600">
+            {cardDraft.cardType}{" "}
+            {cardDraft.team === null ? "" : `· ${displayTeamName(cardDraft.team)}`}
+          </span>
+        ) : null}
+      </div>
+
+      {step === "type" ? (
+        <div className="grid grid-cols-2 gap-1">
+          {cardTypeOptions.map((option) => {
+            const Icon = option.icon;
+            return (
+              <Button
+                key={option.type}
+                size="sm"
+                variant="outline"
+                className={`h-9 justify-start gap-1.5 rounded-xl px-2 text-[10px] ${option.idleClassName}`}
+                onClick={() =>
+                  setCardDraft({
+                    cardType: option.type,
+                    team: null,
+                    digits: "",
+                    startedGameClockMs: state.gameClockMs,
+                  })
+                }
+                disabled={!canSelectCardType}
+              >
+                <Icon className="h-3.5 w-3.5" />
+                {option.label}
+              </Button>
+            );
+          })}
+        </div>
+      ) : null}
+
+      {step === "team" ? (
+        <div className="grid grid-cols-2 gap-1">
+          {displayTeamOrder.map((team) => (
+            <Button
+              key={team}
+              size="sm"
+              variant="outline"
+              className="h-10 rounded-xl border-slate-300 bg-white text-slate-900"
+              onClick={() => setCardDraft((previous) => ({ ...previous, team }))}
+              disabled={!canSelectCardTeam}
+            >
+              {displayTeamName(team)}
+            </Button>
+          ))}
+        </div>
+      ) : null}
+
+      {step === "number" ? (
+        <>
+          <div className="grid grid-cols-[auto_1fr] items-center gap-2 rounded-xl border border-slate-300 bg-white px-2 py-1 text-[10px] font-medium">
+            <span className="uppercase">{cardDraft.cardType}</span>
+            <span className="truncate text-slate-600">
+              {cardDraft.team === "home" ? state.homeName : state.awayName} • {cardPlayerLabel}
+            </span>
+          </div>
+          <p
+            role={canSubmitCard ? "status" : "alert"}
+            className="min-h-4 text-[10px] text-slate-600"
+          >
+            {cardAddStatusText}
+          </p>
+          <div className="grid grid-cols-3 gap-1">
+            {["1", "2", "3", "4", "5", "6", "7", "8", "9"].map((digit) => (
+              <Button
+                key={digit}
+                size="sm"
+                variant="outline"
+                className="h-9 rounded-xl border-slate-300 bg-white text-sm text-slate-900"
+                onClick={() => appendCardDigit(digit)}
+                disabled={!canEditCardDigits}
+              >
+                {digit}
+              </Button>
+            ))}
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-9 rounded-xl border-slate-300 bg-white text-slate-900"
+              onClick={() =>
+                setCardDraft((previous) => ({ ...previous, digits: previous.digits.slice(0, -1) }))
+              }
+              disabled={!canEditCardDigits || cardDraft.digits.length === 0}
+            >
+              <Delete className="h-4 w-4" />
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-9 rounded-xl border-slate-300 bg-white text-sm text-slate-900"
+              onClick={() => appendCardDigit("0")}
+              disabled={!canEditCardDigits}
+            >
+              0
+            </Button>
+            <Button
+              size="sm"
+              className="h-9 gap-1 rounded-xl bg-emerald-600 text-white hover:bg-emerald-500"
+              onClick={submitCard}
+              disabled={!canSubmitCard}
+            >
+              <Check className="h-4 w-4" />
+              OK
+            </Button>
+          </div>
+        </>
+      ) : null}
+
+      <Button
+        size="sm"
+        variant="ghost"
+        className="h-8 rounded-xl text-slate-700"
+        onClick={undo}
+        disabled={!controller}
+      >
+        Undo
+      </Button>
+    </div>
   );
 }
