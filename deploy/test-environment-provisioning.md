@@ -177,6 +177,7 @@ set unit_source /srv/quadball-timer-test/releases/$release_id/deploy/systemd/qua
 
 sudo install -o root -g root -m 0644 $unit_source /etc/systemd/system/quadball-timer-test.service
 sudo install -o root -g root -m 0755 /srv/quadball-timer-test/releases/$release_id/deploy/activation-maintenance-root.sh /usr/local/sbin/quadball-timer-activation-maintenance
+sudo install -o root -g root -m 0755 /srv/quadball-timer-test/releases/$release_id/deploy/technical-admin-bootstrap-root.sh /usr/local/sbin/quadball-timer-technical-admin-bootstrap
 sudo systemctl daemon-reload
 sudo systemctl enable quadball-timer-test
 sudo visudo -f /etc/sudoers.d/deploy-quadball-timer-test
@@ -187,6 +188,14 @@ The sudoers file must contain only:
 ```text
 deploy-quadball-timer-test ALL=(root) NOPASSWD: /usr/bin/systemctl stop quadball-timer-test, /usr/bin/systemctl restart quadball-timer-test, /usr/local/sbin/quadball-timer-activation-maintenance
 ```
+
+The Technical Admin bootstrap runner is intentionally absent from this
+deployment permission. A human host operator invokes it through interactive
+sudo, using only the fixed `test` mapping; the runner does not accept paths,
+users, services, origins, or database arguments.
+The root-installed activation-maintenance wrapper pins the trusted runner
+bytes; updating either root-installed file requires the existing human root
+installation boundary and does not change this deployment permission.
 
 Verify the bounded result without printing the key file:
 

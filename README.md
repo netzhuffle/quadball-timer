@@ -45,6 +45,25 @@ Install the root-owned maintenance wrapper once on the host:
 sudo install -o root -g root -m 0755 deploy/activation-maintenance-root.sh /usr/local/sbin/quadball-timer-activation-maintenance
 ```
 
+Technical Admin bootstrap is a separate human-only authority. Install the
+fixed runner from the selected current release as root; do not add it to either
+deployment user's sudoers entry:
+
+```fish
+sudo install -o root -g root -m 0755 /srv/quadball-timer/current/deploy/technical-admin-bootstrap-root.sh /usr/local/sbin/quadball-timer-technical-admin-bootstrap
+sudo install -o root -g root -m 0755 /srv/quadball-timer-test/current/deploy/technical-admin-bootstrap-root.sh /usr/local/sbin/quadball-timer-technical-admin-bootstrap
+```
+
+The runner accepts only an Environment and `status`, `enroll`, or `reset`.
+It maps the service, current release, service user, canonical origin, RP ID,
+and Technical Admin database itself, stops and restarts only that Environment,
+and prints an enrollment URL only after the service is confirmed active. Use it
+from an interactive `sudo` terminal; it never requires Bun or a source checkout.
+The root-installed activation-maintenance wrapper verifies the runner bytes
+before activation updates this shared file. Updating the runner or that wrapper
+requires the existing human root installation boundary; it does not broaden
+deployment sudo authority.
+
 For the bounded first-time or repair bootstrap of the Production/Test host
 contract, use `docs/agents/issue-165-pre-merge-handoff.md`.
 
@@ -68,6 +87,8 @@ never be copied from Production or committed to the repository. Test data is
 persistent across ordinary restarts but explicitly expendable and has no
 standing backup or availability guarantee. See
 `deploy/test-environment-provisioning.md` for the one-time privileged setup.
+The Test Environment Technical Admin verification checklist is in
+`deploy/technical-admin-bootstrap-test-checklist.md`.
 
 Pushes to `main` skip CI and deployment when every changed path is limited to
 `AGENTS.md`, `CONTEXT.md`, `README.md`, `docs/`, or `.github/dependabot.yml`.

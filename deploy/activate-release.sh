@@ -168,6 +168,15 @@ if [[ "${QBT_FOCUSED_TEST_MODE:-}" == 1 ]]; then
   expected_staged_dir="${base_dir}/.staging/${release_id}"
 fi
 
+install_technical_admin_bootstrap() {
+  local source_path="${release_dir}/deploy/technical-admin-bootstrap-root.sh"
+  [[ -f "$source_path" && ! -L "$source_path" && -x "$source_path" ]] || {
+    echo "Verified release is missing the Technical Admin bootstrap runner." >&2
+    return 1
+  }
+  sudo "$maintenance_wrapper" "$expected_environment" "$release_dir" install-technical-admin-bootstrap
+}
+
 realpath_command="${QBT_FOCUSED_TEST_REALPATH:-realpath}"
 
 remove_validated_release() {
@@ -325,6 +334,7 @@ verify_bundle() {
     "deploy/activate-release.sh"
     "deploy/activate-test-release.sh"
     "deploy/activation-maintenance-root.sh"
+    "deploy/technical-admin-bootstrap-root.sh"
     "deploy/systemd/quadball-timer-test.service"
     "deploy/systemd/quadball-timer.service"
     "quadball-timer"
@@ -549,10 +559,13 @@ prune_releases() {
 }
 
 if restart_service && check_health "$release_id" "$release_dir" && check_representative_behavior; then
-  prune_releases "$release_dir" "$previous_release"
   if ! inject_focused_failure final-report; then return 1; fi
-  echo "Activated immutable release attempt ${release_id}."
-  return 0
+  if install_technical_admin_bootstrap; then
+    prune_releases "$release_dir" "$previous_release"
+    echo "Activated immutable release attempt ${release_id}."
+    return 0
+  fi
+  echo "Deploy failed; the verified release runner was not installed." >&2
 fi
 
 report_service_state
