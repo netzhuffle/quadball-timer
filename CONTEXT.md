@@ -248,6 +248,14 @@ _Avoid_: Event Admin, Pitch Manager
 The environment-specific WebAuthn credential that authenticates the Technical Admin without an account, username, or Grant. Each environment has at most one active registered credential; provider-synchronized copies remain one credential rather than separate passkeys.
 _Avoid_: Technical Admin account, Technical Admin Grant, administrator password
 
+**Technical Admin Enrollment Authorization**:
+An environment-bound, ten-minute, single-use authorization issued through host operator authority that permits the browser to register the environment's sole Technical Admin Passkey. It is not a passkey and grants no routine Technical Admin access by itself.
+_Avoid_: Passkey link, setup key, Technical Admin credential
+
+**Technical Admin Bootstrap Authority**:
+The human host authority used to inspect, establish, or deliberately reset an Environment's Technical Admin Passkey before browser authentication is available. It is distinct from deployment automation and routine passkey-authenticated Technical Admin authority.
+_Avoid_: Deployment authority, bootstrap account, emergency administrator
+
 **Production Environment**:
 The live Quadball Timer environment whose Events, authority, and operational records may be used for real event operations.
 _Avoid_: Live database, production instance

@@ -1,0 +1,3 @@
+# Keep Technical Admin bootstrap authority separate from deployment
+
+Technical Admin Enrollment Authorizations and deliberate passkey resets are exercised only by a human host operator through interactive sudo and a root-owned runner that invokes the reviewed compiled release as the selected Environment's service user. Deployment automation may install that runner but cannot invoke it, and no public endpoint, source checkout, Bun installation, file drop, or environment edit substitutes for this bootstrap authority; this keeps deployment compromise from becoming Technical Admin takeover while making enrollment and recovery available on immutable hosts.
