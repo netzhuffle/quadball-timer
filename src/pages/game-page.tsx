@@ -130,7 +130,7 @@ export function GamePage({ gameId, role }: { gameId: string; role: ControllerRol
   const rightTeamNameButtonRef = useRef<HTMLButtonElement | null>(null);
   const controllerTopSectionRef = useRef<HTMLDivElement | null>(null);
   const [displayTeamNameHeightPx, setDisplayTeamNameHeightPx] = useState<number | null>(null);
-  const [controllerTopSectionHeightPx, setControllerTopSectionHeightPx] = useState<number | null>(
+  const [controllerTopSectionBottomPx, setControllerTopSectionBottomPx] = useState<number | null>(
     null,
   );
   const leaveTriggerRef = useRef<HTMLButtonElement | null>(null);
@@ -598,9 +598,10 @@ export function GamePage({ gameId, role }: { gameId: string; role: ControllerRol
     }
 
     const observer = new ResizeObserver(([entry]) => {
-      const nextHeight = entry === undefined ? null : Math.ceil(entry.contentRect.height);
-      setControllerTopSectionHeightPx((previous) =>
-        previous === nextHeight ? previous : nextHeight,
+      const nextBottom =
+        entry === undefined ? null : Math.ceil(element.getBoundingClientRect().bottom);
+      setControllerTopSectionBottomPx((previous) =>
+        previous === nextBottom ? previous : nextBottom,
       );
     });
     observer.observe(element);
@@ -1078,7 +1079,7 @@ export function GamePage({ gameId, role }: { gameId: string; role: ControllerRol
           <GameControllerActionPanels
             activePanel={activePanel}
             setActivePanel={handleActionPanelChange}
-            topOffsetPx={controllerTopSectionHeightPx ?? undefined}
+            topOffsetPx={controllerTopSectionBottomPx ?? undefined}
             controller={controller}
             state={state}
             gameView={{
