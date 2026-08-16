@@ -57,7 +57,7 @@ describe("Production deployment contract", () => {
     expect(monitoring).toContain("`root:quadball-timer-test`");
   });
 
-  test("builds one shared immutable artifact and automatically activates only Test", () => {
+  test("builds one shared immutable artifact and gates Production after Test", () => {
     const workflow = readFileSync(
       join(repositoryRoot, ".github/workflows/deploy-production.yml"),
       "utf8",
@@ -67,12 +67,13 @@ describe("Production deployment contract", () => {
     expect(workflow).toContain("bun scripts/create-release-bundle.ts");
     expect(workflow).toContain("Upload one shared release artifact");
     expect(workflow).toContain("deploy-test:");
-    expect(workflow).not.toContain("deploy-production:");
-    expect(workflow).toContain("needs: [deploy-test]");
-    expect(workflow).not.toContain("name: production");
+    expect(workflow).toContain("deploy-production:");
+    expect(workflow).toContain("needs: [build, deploy-test]");
+    expect(workflow).toContain("name: production");
+    expect(workflow).toContain("Download shared release artifact");
   });
 
-  test("reports the automatic Test outcome with release identity and bounded phase", () => {
+  test("reports independent Test and Production outcomes with release identity", () => {
     const workflow = readFileSync(
       join(repositoryRoot, ".github/workflows/deploy-production.yml"),
       "utf8",
@@ -83,29 +84,29 @@ describe("Production deployment contract", () => {
     expect(workflow).toContain('echo "failureCategory=$failure_category"');
     expect(workflow).toContain('"releaseAttemptId": "${RELEASE_ATTEMPT_ID}"');
     expect(workflow).toContain('"phase": "${TEST_PHASE}"');
-    expect(workflow).not.toContain("PRODUCTION_STATUS");
-    expect(workflow).toContain('if [[ "$TEST_STATUS" != "success" ]]; then');
+    expect(workflow).toContain("Record Production deployment outcome");
+    expect(workflow).toContain("PRODUCTION_STATUS");
+    expect(workflow).toContain("needs: [deploy-test, deploy-production]");
+    expect(workflow).toContain(
+      'if [[ "$TEST_STATUS" != "success" || "$PRODUCTION_STATUS" != "success" ]]; then',
+    );
   });
 
-  test("promotes only an exact successful Test-validated run", () => {
+  test("puts Production approval in the main workflow", async () => {
     const workflow = readFileSync(
-      join(repositoryRoot, ".github/workflows/promote-production.yml"),
+      join(repositoryRoot, ".github/workflows/deploy-production.yml"),
       "utf8",
     );
 
-    expect(workflow).toContain("workflow_dispatch:");
-    expect(workflow).toContain("source_run_id:");
-    expect(workflow).toContain("source_run_attempt:");
-    expect(workflow).toContain(".github/workflows/deploy-production.yml");
-    expect(workflow).toContain('test "$(jq -r \'.head_branch\' <<<"$run_json")" = "main"');
-    expect(workflow).toContain('test "$(jq -r \'.conclusion\' <<<"$run_json")" = "success"');
-    expect(workflow).toContain('select(.name == "deploy-test" and .conclusion == "success")');
-    expect(workflow).toContain("run-id: ${{ inputs.source_run_id }}");
+    expect(workflow).toContain("deploy-production:");
+    expect(workflow).toContain("needs: [build, deploy-test]");
+    expect(workflow).toContain("environment:\n      name: production");
+    expect(workflow).toContain("Download shared release artifact");
+    expect(workflow).toContain("Transfer and activate Production release after approval");
     expect(workflow).toContain("name: production");
-    expect(workflow).toContain(
-      'release_attempt_id="sha-${source_sha}-run-${SOURCE_RUN_ID}-attempt-${SOURCE_RUN_ATTEMPT}"',
+    expect(await pathExists(join(repositoryRoot, ".github/workflows/promote-production.yml"))).toBe(
+      false,
     );
-    expect(workflow).not.toContain("bun run build:executable");
   });
 
   test("preserves executable modes across the GitHub artifact boundary", () => {

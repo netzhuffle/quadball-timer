@@ -8,7 +8,7 @@ The current deployment is a good process-availability baseline, but it is not ye
 
 ## Current SQM promotion policy
 
-The deployment boundary now separates **Test Activation** from **Production Promotion**. An eligible merge to `main` runs `.github/workflows/deploy-production.yml`, which builds one immutable Release Bundle and activates Test only. `.github/workflows/promote-production.yml` is manually dispatched with the exact successful Promotion Source Run and attempt; it validates that the run is on `main`, that its Test Activation job succeeded, downloads the same artifact without rebuilding, and waits for the required `production` Environment Production Approval before activating Production. The promotion concurrency group is non-cancelling, and invalid, missing, or unavailable source runs fail closed.
+The deployment boundary now separates **Test Activation** from **Production Promotion** within `.github/workflows/deploy-production.yml`. An eligible merge to `main` builds one immutable Release Bundle, activates and verifies Test, then pauses the dependent Production job at the required `production` Environment Production Approval. Once approved, Production downloads the exact shared bundle without rebuilding. The deployment concurrency group is non-cancelling, and Test failure prevents Production from starting.
 
 Two deployment properties are nevertheless production blockers:
 
@@ -19,7 +19,7 @@ The remaining gaps are production controls and evidence: the audit snapshot had 
 
 ## Evidence inspected
 
-- `.github/workflows/deploy-production.yml`, `.github/workflows/promote-production.yml`, `deploy/activate-release.sh`, `deploy/systemd/quadball-timer.service`, `package.json`, `src/index.ts`, and the internal-health implementation and tests.
+- `.github/workflows/deploy-production.yml`, `deploy/activate-release.sh`, `deploy/systemd/quadball-timer.service`, `package.json`, `src/index.ts`, and the internal-health implementation and tests.
 - The production GitHub environment, Actions variables and secret names, and recent deployment runs. Secret values were not accessed.
 - The source-of-truth Caddy route and documented server state in `infra-caddy`.
 - The accepted SQM production acceptance and rehearsal plan.
@@ -50,7 +50,7 @@ The remaining gaps are production controls and evidence: the audit snapshot had 
 
 ### 2. Separate production promotion from ordinary `main` pushes
 
-- Keep CI and Test Activation on every eligible push, but require the separate manual Production Promotion of the exact Test-validated Release Bundle. Use a required reviewer on the GitHub `production` Environment; the single-operator SQM setup permits `netzhuffle` self-approval and never promotes on timeout.
+- Keep CI and Test Activation on every eligible push, then require the dependent Production job's manual Production Approval for the exact shared Release Bundle. Use a required reviewer on the GitHub `production` Environment; the single-operator SQM setup permits `netzhuffle` self-approval and never promotes on timeout.
 - Preserve the non-cancelling production concurrency group.
 - Record the exact approved commit, artifact digest, deployment run, and live release identity in the durable acceptance record.
 - From feature freeze through SQM, do not deploy merely because documentation or unrelated code lands on `main`. No event-day deployment is planned; an exceptional event-day deploy or rollback remains the repository maintainer's onsite judgment.

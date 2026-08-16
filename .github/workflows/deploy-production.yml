@@ -1,4 +1,4 @@
-name: Deploy Test environment
+name: Deploy environments
 
 on:
   push:
@@ -227,9 +227,134 @@ jobs:
             echo "failureCategory=$failure_category"
           } >> "$GITHUB_OUTPUT"
 
+  deploy-production:
+    needs: [build, deploy-test]
+    outputs:
+      status: ${{ steps.deployment-outcome.outputs.status }}
+      phase: ${{ steps.deployment-outcome.outputs.phase }}
+      releaseAttemptId: ${{ steps.deployment-outcome.outputs.releaseAttemptId }}
+      failureCategory: ${{ steps.deployment-outcome.outputs.failureCategory }}
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://timer.quadball.app
+    steps:
+      - name: Download shared release artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: ${{ needs.build.outputs.release-artifact }}
+          path: .
+
+      - name: Safely extract and verify release bundle modes
+        run: |
+          set -euo pipefail
+          echo "DEPLOYMENT_PHASE=artifact-verification" >> "$GITHUB_ENV"
+          archive="release-bundle.tar.gz"
+          install -d -m 700 release
+          while IFS= read -r member; do
+            case "$member" in
+              ./) ;;
+              ./*)
+                relative="${member#./}"
+                case "$relative" in
+                  ""|/*|../*|*/../*|*/..) echo "Unsafe archive member: ${member}" >&2; exit 1 ;;
+                esac
+                ;;
+              *) echo "Unsafe archive member: ${member}" >&2; exit 1 ;;
+            esac
+          done < <(tar --list --gzip --file="$archive")
+          tar --extract --gzip --file="$archive" --directory=release --no-same-owner
+          ! find release -type l -print -quit | grep -q .
+          test -x release/quadball-timer
+          test -x release/deploy/activate-test-release.sh
+          test -x release/deploy/activate-release.sh
+          test "$(stat -c '%a' release/quadball-timer)" = 555
+          test "$(stat -c '%a' release/deploy/activate-test-release.sh)" = 555
+          test "$(stat -c '%a' release/deploy/activate-release.sh)" = 555
+
+      - name: Configure temporary Production SSH material
+        env:
+          PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
+          PROD_KNOWN_HOSTS: ${{ secrets.PROD_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          : "${PROD_SSH_KEY:?Missing PROD_SSH_KEY secret}"
+          : "${PROD_KNOWN_HOSTS:?Missing PROD_KNOWN_HOSTS secret}"
+          ssh_dir="${RUNNER_TEMP}/quadball-production-ssh-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          install -m 700 -d "$ssh_dir"
+          printf '%s\n' "$PROD_SSH_KEY" > "$ssh_dir/id_ed25519"
+          chmod 600 "$ssh_dir/id_ed25519"
+          printf '%s\n' "$PROD_KNOWN_HOSTS" > "$ssh_dir/known_hosts"
+          chmod 644 "$ssh_dir/known_hosts"
+          echo "SSH_DIR=$ssh_dir" >> "$GITHUB_ENV"
+
+      - name: Transfer and activate Production release after approval
+        env:
+          DEPLOY_HOST: ${{ secrets.PROD_HOST }}
+          DEPLOY_USER: ${{ secrets.PROD_USER }}
+          DEPLOY_BASE: ${{ vars.PROD_DEPLOY_BASE }}
+          PROD_SERVICE_NAME: ${{ vars.PROD_SERVICE_NAME }}
+          PROD_APP_PORT: ${{ vars.PROD_APP_PORT }}
+        run: |
+          set -euo pipefail
+          echo "DEPLOYMENT_PHASE=staging-and-activation" >> "$GITHUB_ENV"
+          : "${DEPLOY_HOST:?Missing PROD_HOST secret}"
+          : "${DEPLOY_USER:?Missing PROD_USER secret}"
+          base_dir="${DEPLOY_BASE:-/srv/quadball-timer}"
+          service_name="${PROD_SERVICE_NAME:-quadball-timer}"
+          app_port="${PROD_APP_PORT:-3000}"
+          release_id="${RELEASE_ATTEMPT_ID}"
+          stage_dir="${base_dir}/.staging/${release_id}"
+          ssh_opts="-i ${SSH_DIR}/id_ed25519 -o StrictHostKeyChecking=yes -o UserKnownHostsFile=${SSH_DIR}/known_hosts"
+          cleanup_remote_stage() {
+            ssh $ssh_opts "${DEPLOY_USER}@${DEPLOY_HOST}" "chmod -R u+w -- '${stage_dir}' 2>/dev/null || true; rm -rf -- '${stage_dir}'" || true
+            rm -rf -- "$SSH_DIR"
+          }
+          trap cleanup_remote_stage EXIT
+          ssh $ssh_opts "${DEPLOY_USER}@${DEPLOY_HOST}" "test ! -e '${stage_dir}' && install -d -m 750 '${stage_dir}'"
+          rsync -a -e "ssh ${ssh_opts}" release/ "${DEPLOY_USER}@${DEPLOY_HOST}:${stage_dir}/"
+          set +e
+          ssh $ssh_opts "${DEPLOY_USER}@${DEPLOY_HOST}" "'${stage_dir}/deploy/activate-release.sh' --base-dir '${base_dir}' --staged-dir '${stage_dir}' --release '${release_id}' --service '${service_name}' --port '${app_port}'" 2>&1 | tee "$RUNNER_TEMP/quadball-production-deployment.log"
+          activation_status=${PIPESTATUS[0]}
+          set -e
+          phase="$(sed -n 's/^ACTIVATION_PHASE=//p' "$RUNNER_TEMP/quadball-production-deployment.log" | tail -n 1)"
+          echo "DEPLOYMENT_PHASE=${phase:-activation}" >> "$GITHUB_ENV"
+          if (( activation_status != 0 )); then exit "$activation_status"; fi
+          curl --fail --silent --show-error --max-time 10 https://timer.quadball.app/ | grep -qi "<!doctype html"
+
+      - name: Record Production deployment outcome
+        id: deployment-outcome
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+          RELEASE_ATTEMPT: ${{ env.RELEASE_ATTEMPT_ID }}
+          FAILED_PHASE: ${{ env.DEPLOYMENT_PHASE }}
+        run: |
+          set -euo pipefail
+          case "$JOB_STATUS" in
+            success)
+              phase="verified"
+              failure_category="none"
+              ;;
+            cancelled)
+              phase="${FAILED_PHASE:-deployment}"
+              failure_category="cancelled"
+              ;;
+            *)
+              phase="${FAILED_PHASE:-deployment}"
+              failure_category="${phase}-failed"
+              ;;
+          esac
+          {
+            echo "status=$JOB_STATUS"
+            echo "phase=$phase"
+            echo "releaseAttemptId=$RELEASE_ATTEMPT"
+            echo "failureCategory=$failure_category"
+          } >> "$GITHUB_OUTPUT"
+
   report:
     if: always() && github.ref == 'refs/heads/main'
-    needs: [deploy-test]
+    needs: [deploy-test, deploy-production]
     runs-on: ubuntu-latest
     steps:
       - name: Report Test environment outcome
@@ -238,6 +363,9 @@ jobs:
           TEST_STATUS: ${{ needs.deploy-test.outputs.status || needs.deploy-test.result }}
           TEST_PHASE: ${{ needs.deploy-test.outputs.phase || 'deployment' }}
           TEST_FAILURE_CATEGORY: ${{ needs.deploy-test.outputs.failureCategory || 'job-skipped' }}
+          PRODUCTION_STATUS: ${{ needs.deploy-production.outputs.status || needs.deploy-production.result }}
+          PRODUCTION_PHASE: ${{ needs.deploy-production.outputs.phase || 'deployment' }}
+          PRODUCTION_FAILURE_CATEGORY: ${{ needs.deploy-production.outputs.failureCategory || 'job-skipped' }}
         run: |
           set -euo pipefail
           cat > deployment-report.json <<EOF
@@ -247,10 +375,15 @@ jobs:
               "status": "${TEST_STATUS}",
               "phase": "${TEST_PHASE}",
               "failureCategory": "${TEST_FAILURE_CATEGORY}"
+            },
+            "production": {
+              "status": "${PRODUCTION_STATUS}",
+              "phase": "${PRODUCTION_PHASE}",
+              "failureCategory": "${PRODUCTION_FAILURE_CATEGORY}"
             }
           }
           EOF
           cat deployment-report.json
-          if [[ "$TEST_STATUS" != "success" ]]; then
+          if [[ "$TEST_STATUS" != "success" || "$PRODUCTION_STATUS" != "success" ]]; then
             exit 1
           fi

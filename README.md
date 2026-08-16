@@ -80,10 +80,10 @@ The permanent Test Environment is deployed independently at
 `https://test.timer.quadball.app` by the Test job in
 `.github/workflows/deploy-production.yml`. Every eligible merge to `main` builds
 one immutable Release Bundle and performs Test Activation only. Production is
-activated separately through `.github/workflows/promote-production.yml`: manually
-select the successful Promotion Source Run, then approve the `production`
-Environment. That workflow downloads the exact Test-validated bundle and never
-rebuilds it. Follow `deploy/production-promotion.md` for the operator steps.
+activated by the Production job in the same workflow after you approve the
+`production` Environment. It uses the exact shared Test-validated bundle and
+never rebuilds it. Follow `deploy/production-promotion.md` for the operator
+steps.
 Test uses
 the separate `quadball-timer-test` service on `127.0.0.1:3001`, release root
 `/srv/quadball-timer-test`, and state directory `/var/lib/quadball-timer-test`.
