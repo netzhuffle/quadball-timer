@@ -12,6 +12,14 @@ import {
 import type { ControllerProjection } from "@/lib/live-event-game-control";
 import { createInitialClockBaseline, projectClockBaseline } from "@/lib/clock-authority";
 import { deriveLivePenaltyProjection } from "@/lib/live-event-penalties";
+import {
+  CONTROLLER_LEAVE_GRACE_MS,
+  getBrowserControllerDeparture,
+} from "@/lib/controller-departure";
+import {
+  createBrowserEventControllerSessionStorage,
+  readBrowserEventControllerSession,
+} from "@/lib/event-controller-session";
 
 describe("Event Game Controller reconnect browser seam", () => {
   const originalWindow = globalThis.window;
@@ -31,6 +39,7 @@ describe("Event Game Controller reconnect browser seam", () => {
   let openBodies: Record<string, unknown>[];
   let replayCalls: number;
   let refreshCalls: number;
+  let leaveBodies: Record<string, unknown>[];
   let deferredRefresh: ((response: Response) => void) | null;
   let deferredRefreshResponse: Response | null;
   let replayBodies: Record<string, any>[];
@@ -42,6 +51,9 @@ describe("Event Game Controller reconnect browser seam", () => {
   let openProjection: ControllerProjection | null;
   let refreshProjection: ControllerProjection | null;
   let refreshRejected: boolean;
+  let restoreRejected: boolean;
+  let leaveUnavailable: boolean;
+  let refreshConflict: boolean;
   let switchRequested: boolean;
   let deferredReplay: ((response: Response) => void) | null;
   let deferredReplayResponse: Response | null;
@@ -54,6 +66,7 @@ describe("Event Game Controller reconnect browser seam", () => {
     openBodies = [];
     replayCalls = 0;
     refreshCalls = 0;
+    leaveBodies = [];
     deferredRefresh = null;
     deferredRefreshResponse = null;
     replayBodies = [];
@@ -65,6 +78,9 @@ describe("Event Game Controller reconnect browser seam", () => {
     openProjection = null;
     refreshProjection = projection();
     refreshRejected = false;
+    restoreRejected = false;
+    leaveUnavailable = false;
+    refreshConflict = false;
     switchRequested = false;
     deferredReplay = null;
     deferredReplayResponse = null;
@@ -142,6 +158,11 @@ describe("Event Game Controller reconnect browser seam", () => {
         }
         if (url.endsWith("/api/event-control/refresh")) {
           refreshCalls += 1;
+          if (restoreRejected)
+            return new Response(
+              JSON.stringify({ status: "rejected", message: "Grant Session rejected" }),
+              { status: 200, headers: { "content-type": "application/json" } },
+            );
           if (refreshRejected) return new Response("rejected", { status: 401 });
           if (switchRequested) {
             return new Response(
@@ -150,7 +171,10 @@ describe("Event Game Controller reconnect browser seam", () => {
                 previousEventGameId: "game-browser",
                 currentEventGameId: "game-b",
               }),
-              { status: 200, headers: { "content-type": "application/json" } },
+              {
+                status: refreshConflict ? 409 : 200,
+                headers: { "content-type": "application/json" },
+              },
             );
           }
           const refreshResponse = new Response(
@@ -200,6 +224,12 @@ describe("Event Game Controller reconnect browser seam", () => {
           });
         }
         if (url.endsWith("/api/event-control/leave")) {
+          leaveBodies.push(JSON.parse(typeof init?.body === "string" ? init.body : "{}"));
+          if (leaveUnavailable)
+            return new Response(JSON.stringify({ status: "rejected" }), {
+              status: 401,
+              headers: { "content-type": "application/json" },
+            });
           return new Response(JSON.stringify({ status: "left" }), {
             status: 200,
             headers: { "content-type": "application/json" },
@@ -261,9 +291,23 @@ describe("Event Game Controller reconnect browser seam", () => {
       await Promise.resolve();
       await Promise.resolve();
       await Promise.resolve();
-      await Promise.resolve();
-      await Promise.resolve();
     });
+    let continueButton: HTMLButtonElement | undefined;
+    for (let attempt = 0; attempt < 32 && continueButton === undefined; attempt += 1) {
+      continueButton = Array.from(container.getElementsByTagName("button")).find((button) =>
+        button.textContent?.includes("Continue"),
+      );
+      if (continueButton === undefined) await Promise.resolve();
+    }
+    if (continueButton !== undefined) {
+      await act(async () => {
+        continueButton.click();
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+    }
   }
 
   function installControllerIntervalProbe() {
@@ -1351,6 +1395,423 @@ describe("Event Game Controller reconnect browser seam", () => {
     expect(container.textContent).not.toContain("retained for reconnect replay");
   });
 
+  test("restores a persisted Event session only after Controller Departure authorizes Return", async () => {
+    const departureModule = getBrowserControllerDeparture();
+    await departureModule.transition({
+      type: "leave",
+      departure: {
+        workflow: "event",
+        gameId: "game-browser",
+        navigationPath: "/event-control",
+        identity: { title: "Event Game", homeName: "Basel", awayName: "Zurich" },
+      },
+      online: false,
+      nowMs: Date.now(),
+    });
+    testWindow.localStorage.setItem(
+      "quadball:event-controller-session",
+      JSON.stringify({ sessionBearer: "bearer", eventGameId: "game-browser" }),
+    );
+    testWindow.localStorage.setItem(
+      controllerReplicaStorageKey("game-browser"),
+      JSON.stringify(
+        createControllerReplica({
+          eventGameId: "game-browser",
+          projection: projection(),
+          grantSessionId: "session",
+          grantVersion: "version",
+        }),
+      ),
+    );
+
+    await act(async () => {
+      root.render(<EventGameControllerPage />);
+      for (let index = 0; index < 12; index += 1) await Promise.resolve();
+    });
+
+    expect(openBodies).toEqual([]);
+    expect(refreshCalls).toBeGreaterThanOrEqual(2);
+    expect(container.textContent).toContain("Controller Device: game-browser");
+  });
+
+  test("restores a retained Event replica offline and converges after reconnect", async () => {
+    const departureModule = getBrowserControllerDeparture();
+    await departureModule.transition({
+      type: "leave",
+      departure: {
+        workflow: "event",
+        gameId: "game-browser",
+        sessionReferenceId: "legacy-event-session-game-browser",
+        navigationPath: "/event-control",
+        identity: { title: "Event Game", homeName: "Basel", awayName: "Zurich" },
+      },
+      online: false,
+      nowMs: Date.now(),
+    });
+    createBrowserEventControllerSessionStorage().write({
+      sessionBearer: "bearer",
+      eventGameId: "game-browser",
+      sessionReferenceId: "legacy-event-session-game-browser",
+    });
+    testWindow.localStorage.setItem(
+      controllerReplicaStorageKey("game-browser"),
+      JSON.stringify(
+        createControllerReplica({
+          eventGameId: "game-browser",
+          projection: refreshProjection ?? projection(),
+          grantSessionId: "session",
+          grantVersion: "version",
+        }),
+      ),
+    );
+    Object.defineProperty(testWindow.navigator, "onLine", { configurable: true, value: false });
+
+    await act(async () => {
+      root.render(<EventGameControllerPage />);
+      for (let index = 0; index < 12; index += 1) await Promise.resolve();
+    });
+
+    expect(refreshCalls).toBe(0);
+    expect(container.textContent).toContain("Controller Device: game-browser");
+    Object.defineProperty(testWindow.navigator, "onLine", { configurable: true, value: true });
+    await act(async () => {
+      testWindow.dispatchEvent(new testWindow.Event("online"));
+      for (let index = 0; index < 12; index += 1) await Promise.resolve();
+    });
+    expect(refreshCalls).toBeGreaterThan(0);
+    expect(container.textContent).toContain("Controller Device: game-browser");
+  });
+
+  test("renders unavailable when an authorized restore has no retained Event replica", async () => {
+    const departureModule = getBrowserControllerDeparture();
+    await departureModule.transition({
+      type: "leave",
+      departure: {
+        workflow: "event",
+        gameId: "game-browser",
+        sessionReferenceId: "restore-missing",
+        navigationPath: "/event-control",
+        identity: { title: "Event Game", homeName: "Basel", awayName: "Zurich" },
+      },
+      online: false,
+      nowMs: Date.now(),
+    });
+    createBrowserEventControllerSessionStorage().write({
+      sessionBearer: "bearer",
+      eventGameId: "game-browser",
+      sessionReferenceId: "restore-missing",
+    });
+    expect(readBrowserEventControllerSession()).toMatchObject({
+      eventGameId: "game-browser",
+      sessionReferenceId: "restore-missing",
+    });
+
+    await act(async () => {
+      root.render(<EventGameControllerPage />);
+      for (let index = 0; index < 12; index += 1) await Promise.resolve();
+    });
+
+    expect(container.textContent).toContain("Event Game Controller unavailable.");
+    expect(container.textContent).not.toContain("Controller Device: game-browser");
+  });
+
+  test("renders unavailable when an authorized restore has a corrupt Event replica", async () => {
+    const departureModule = getBrowserControllerDeparture();
+    await departureModule.transition({
+      type: "leave",
+      departure: {
+        workflow: "event",
+        gameId: "game-browser",
+        sessionReferenceId: "restore-corrupt",
+        navigationPath: "/event-control",
+        identity: { title: "Event Game", homeName: "Basel", awayName: "Zurich" },
+      },
+      online: false,
+      nowMs: Date.now(),
+    });
+    createBrowserEventControllerSessionStorage().write({
+      sessionBearer: "bearer",
+      eventGameId: "game-browser",
+      sessionReferenceId: "restore-corrupt",
+    });
+    testWindow.localStorage.setItem(controllerReplicaStorageKey("game-browser"), "not-json");
+
+    await act(async () => {
+      root.render(<EventGameControllerPage />);
+      for (let index = 0; index < 12; index += 1) await Promise.resolve();
+    });
+
+    expect(container.textContent).toContain("Event Game Controller unavailable.");
+    expect(container.textContent).not.toContain("Controller Device: game-browser");
+  });
+
+  test("rejected restore clears only its exact Event credential", async () => {
+    const storage = createBrowserEventControllerSessionStorage();
+    storage.write({
+      sessionBearer: "bearer-b",
+      eventGameId: "game-browser",
+      sessionReferenceId: "session-b",
+    });
+    storage.write({
+      sessionBearer: "bearer-a",
+      eventGameId: "game-browser",
+      sessionReferenceId: "session-a",
+    });
+    expect(storage.read()).toMatchObject({
+      sessionBearer: "bearer-a",
+      sessionReferenceId: "session-a",
+    });
+    restoreRejected = true;
+
+    await act(async () => {
+      root.render(<EventGameControllerPage />);
+      for (let index = 0; index < 12; index += 1) await Promise.resolve();
+    });
+
+    expect(container.textContent).toContain("Event Game Controller unavailable.");
+    expect(storage.readForGame("game-browser", "session-a")).toBeNull();
+    expect(storage.readForGame("game-browser", "session-b")).toMatchObject({
+      sessionBearer: "bearer-b",
+    });
+  });
+
+  test("restores the newest same-Game Event session while an older one remains pending", async () => {
+    const departureModule = getBrowserControllerDeparture();
+    const storage = createBrowserEventControllerSessionStorage();
+    storage.write({
+      sessionBearer: "bearer-a",
+      eventGameId: "game-browser",
+      sessionReferenceId: "session-a",
+    });
+    await departureModule.transition({
+      type: "leave",
+      departure: {
+        workflow: "event",
+        gameId: "game-browser",
+        sessionReferenceId: "session-a",
+        navigationPath: "/event-control",
+        identity: { title: "Event Game", homeName: "Basel", awayName: "Zurich" },
+      },
+      online: false,
+      nowMs: 0,
+    });
+    await departureModule.transition({
+      type: "expire",
+      online: false,
+      nowMs: CONTROLLER_LEAVE_GRACE_MS,
+    });
+    storage.write({
+      sessionBearer: "bearer-b",
+      eventGameId: "game-browser",
+      sessionReferenceId: "session-b",
+    });
+    testWindow.localStorage.setItem(
+      controllerReplicaStorageKey("game-browser"),
+      JSON.stringify(
+        createControllerReplica({
+          eventGameId: "game-browser",
+          projection: projection(),
+          grantSessionId: "session-b",
+          grantVersion: "version-b",
+          sessionReferenceId: "session-b",
+        }),
+      ),
+    );
+
+    expect(storage.read()).toMatchObject({
+      sessionBearer: "bearer-b",
+      sessionReferenceId: "session-b",
+    });
+    expect(departureModule.project()).toMatchObject({
+      pendingFinalizations: [{ sessionReferenceId: "session-a" }],
+    });
+    Object.defineProperty(testWindow.navigator, "onLine", { configurable: true, value: false });
+
+    await act(async () => {
+      root.render(<EventGameControllerPage />);
+      for (let index = 0; index < 16; index += 1) await Promise.resolve();
+    });
+
+    expect(container.textContent).toContain("Controller Device: game-browser");
+    expect(storage.read()).toMatchObject({
+      sessionBearer: "bearer-b",
+      sessionReferenceId: "session-b",
+    });
+    expect(departureModule.project()).toMatchObject({
+      pendingFinalizations: [{ sessionReferenceId: "session-a" }],
+    });
+    leaveUnavailable = true;
+    Object.defineProperty(testWindow.navigator, "onLine", { configurable: true, value: true });
+    await act(async () => {
+      testWindow.dispatchEvent(new testWindow.Event("online"));
+      for (let index = 0; index < 16; index += 1) await Promise.resolve();
+    });
+    expect(leaveBodies).toEqual([{ sessionBearer: "bearer-a" }]);
+    expect(
+      testWindow.localStorage.getItem(controllerReplicaStorageKey("game-browser")),
+    ).not.toBeNull();
+    expect(container.textContent).toContain("Controller Device: game-browser");
+  });
+
+  test("restores a production-shaped HTTP 409 switch-required response", async () => {
+    const departureModule = getBrowserControllerDeparture();
+    await departureModule.transition({
+      type: "leave",
+      departure: {
+        workflow: "event",
+        gameId: "game-browser",
+        sessionReferenceId: "restore-conflict",
+        navigationPath: "/event-control",
+        identity: { title: "Event Game", homeName: "Basel", awayName: "Zurich" },
+      },
+      online: false,
+      nowMs: Date.now(),
+    });
+    createBrowserEventControllerSessionStorage().write({
+      sessionBearer: "bearer",
+      eventGameId: "game-browser",
+      sessionReferenceId: "restore-conflict",
+    });
+    testWindow.localStorage.setItem(
+      controllerReplicaStorageKey("game-browser"),
+      JSON.stringify(
+        createControllerReplica({
+          eventGameId: "game-browser",
+          projection: projection(),
+          grantSessionId: "session",
+          grantVersion: "version",
+        }),
+      ),
+    );
+    switchRequested = true;
+    refreshConflict = true;
+
+    await act(async () => {
+      root.render(<EventGameControllerPage />);
+      for (let index = 0; index < 16; index += 1) await Promise.resolve();
+    });
+
+    expect(container.textContent).toContain("Pitch Slot assignment changed.");
+    expect(container.textContent).toContain("Controller Device: game-browser");
+  });
+
+  test("removes an Event replica when its exact departing session owns it", async () => {
+    const departureModule = getBrowserControllerDeparture();
+    const storage = createBrowserEventControllerSessionStorage();
+    storage.write({
+      sessionBearer: "bearer-a",
+      eventGameId: "game-browser",
+      sessionReferenceId: "session-a",
+    });
+    testWindow.localStorage.setItem(
+      controllerReplicaStorageKey("game-browser"),
+      JSON.stringify(
+        createControllerReplica({
+          eventGameId: "game-browser",
+          projection: projection(),
+          grantSessionId: "session-a",
+          grantVersion: "version-a",
+          sessionReferenceId: "session-a",
+        }),
+      ),
+    );
+    Object.defineProperty(testWindow.navigator, "onLine", { configurable: true, value: false });
+    await departureModule.transition({
+      type: "leave",
+      departure: {
+        workflow: "event",
+        gameId: "game-browser",
+        sessionReferenceId: "session-a",
+        navigationPath: "/event-control",
+        identity: { title: "Event Game", homeName: "Basel", awayName: "Zurich" },
+      },
+      online: false,
+      nowMs: 0,
+    });
+    await departureModule.transition({
+      type: "expire",
+      online: false,
+      nowMs: CONTROLLER_LEAVE_GRACE_MS,
+    });
+    leaveUnavailable = true;
+    Object.defineProperty(testWindow.navigator, "onLine", { configurable: true, value: true });
+    await act(async () => {
+      testWindow.dispatchEvent(new testWindow.Event("online"));
+      for (let index = 0; index < 12; index += 1) await Promise.resolve();
+    });
+
+    expect(leaveBodies).toEqual([{ sessionBearer: "bearer-a" }]);
+    expect(testWindow.localStorage.getItem(controllerReplicaStorageKey("game-browser"))).toBeNull();
+  });
+
+  test("mounted Event Controller terminates only after its workflow-qualified lifecycle invalidation", async () => {
+    await enterAndOpen();
+    const departureModule = getBrowserControllerDeparture();
+    const sessionReferenceId =
+      createBrowserEventControllerSessionStorage().readForGame("game-browser")?.sessionReferenceId;
+    await act(async () => {
+      await departureModule.transition({
+        type: "leave",
+        departure: {
+          workflow: "event",
+          gameId: "game-browser",
+          sessionReferenceId,
+          navigationPath: "/event-control",
+          identity: { title: "Event Game", homeName: "Basel", awayName: "Zurich" },
+        },
+        online: false,
+        nowMs: 0,
+      });
+      await departureModule.transition({
+        type: "expire",
+        online: false,
+        nowMs: CONTROLLER_LEAVE_GRACE_MS,
+      });
+    });
+    await act(async () => {
+      for (let index = 0; index < 8; index += 1) await Promise.resolve();
+    });
+
+    expect(container.textContent).toContain("Event Game Controller unavailable.");
+    expect(container.textContent).not.toContain("Controller Device: game-browser");
+    expect(testWindow.localStorage.getItem(controllerReplicaStorageKey("game-browser"))).toBeNull();
+  });
+
+  test("mounted Event expiry retains the bearer until deferred finalization retries", async () => {
+    await enterAndOpen();
+    const departureModule = getBrowserControllerDeparture();
+    const sessionReferenceId =
+      createBrowserEventControllerSessionStorage().readForGame("game-browser")?.sessionReferenceId;
+    Object.defineProperty(testWindow.navigator, "onLine", { configurable: true, value: false });
+    await act(async () => {
+      await departureModule.transition({
+        type: "leave",
+        departure: {
+          workflow: "event",
+          gameId: "game-browser",
+          sessionReferenceId,
+          navigationPath: "/event-control",
+          identity: { title: "Event Game", homeName: "Basel", awayName: "Zurich" },
+        },
+        online: false,
+        nowMs: 0,
+      });
+      await departureModule.transition({
+        type: "expire",
+        online: false,
+        nowMs: CONTROLLER_LEAVE_GRACE_MS,
+      });
+    });
+    expect(leaveBodies).toEqual([]);
+    expect(container.textContent).toContain("Event Game Controller unavailable.");
+    Object.defineProperty(testWindow.navigator, "onLine", { configurable: true, value: true });
+    await act(async () => {
+      testWindow.dispatchEvent(new testWindow.Event("online"));
+      for (let index = 0; index < 12; index += 1) await Promise.resolve();
+    });
+    expect(leaveBodies).toEqual([{ sessionBearer: "bearer" }]);
+  });
+
   test("fresh same-Game scan replays retained work with original evidence", async () => {
     replayMode = "lost";
     await enterAndOpen();
@@ -1369,6 +1830,12 @@ describe("Event Game Controller reconnect browser seam", () => {
     await act(async () => {
       Array.from(container.getElementsByTagName("button"))
         .find((button) => button.textContent?.includes("Leave Controller Session"))
+        ?.click();
+      await Promise.resolve();
+    });
+    await act(async () => {
+      Array.from(container.getElementsByTagName("button"))
+        .find((button) => button.textContent?.includes("Leave game"))
         ?.click();
       await Promise.resolve();
       await Promise.resolve();
@@ -1607,6 +2074,12 @@ describe("Event Game Controller reconnect browser seam", () => {
     await act(async () => {
       Array.from(container.getElementsByTagName("button"))
         .find((button) => button.textContent?.includes("Leave Controller Session"))
+        ?.click();
+      await Promise.resolve();
+    });
+    await act(async () => {
+      Array.from(container.getElementsByTagName("button"))
+        .find((button) => button.textContent?.includes("Leave game"))
         ?.click();
       await Promise.resolve();
       await Promise.resolve();

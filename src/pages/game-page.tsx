@@ -123,7 +123,7 @@ export function GamePage({ gameId, role }: { gameId: string; role: ControllerRol
 
   const departureProjection = departureModule.project();
   const departureBlocked =
-    role === "controller" && controllerDepartureBlocksGame(departureProjection, gameId);
+    role === "controller" && controllerDepartureBlocksGame(departureProjection, "ad-hoc", gameId);
 
   const {
     baseState,
@@ -172,7 +172,7 @@ export function GamePage({ gameId, role }: { gameId: string; role: ControllerRol
     () =>
       departureModule.subscribe(() => {
         const projection = departureModule.project();
-        if (controllerDepartureBlocksGame(projection, gameId)) {
+        if (controllerDepartureBlocksGame(projection, "ad-hoc", gameId)) {
           setEntryReady(false);
           setEntryError("Ad Hoc Game unavailable.");
         }

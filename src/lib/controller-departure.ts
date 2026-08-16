@@ -1,22 +1,32 @@
 import { clearAdHocControllerSession } from "@/lib/ad-hoc-controller-session";
+import {
+  createBrowserEventControllerSessionStorage,
+  legacyEventControllerSessionReference,
+} from "@/lib/event-controller-session";
+import { controllerReplicaStorageKey, parseControllerReplica } from "@/lib/controller-reconnect";
 import { validateOpaqueIdentifier } from "@/lib/validation-policy";
 
 export const CONTROLLER_LEAVE_GRACE_MS = 5 * 60_000;
 export const CONTROLLER_DEPARTURE_STORAGE_KEY = "quadball:controller-departure";
-const CONTROLLER_DEPARTURE_VERSION = "controller-departure-v2" as const;
+const CONTROLLER_DEPARTURE_VERSION = "controller-departure-v3" as const;
+const PREVIOUS_CONTROLLER_DEPARTURE_VERSION = "controller-departure-v2" as const;
 const LEGACY_CONTROLLER_DEPARTURE_VERSION = "controller-departure-v1" as const;
 const AD_HOC_CONTROLLER_STORAGE_PREFIX = "quadball:ad-hoc-controller:";
+export { EVENT_CONTROLLER_SESSION_STORAGE_KEY } from "@/lib/event-controller-session";
 
 export type ControllerDepartureWorkflow = "ad-hoc" | "event";
 
 export type ControllerDepartureReference = {
   workflow: ControllerDepartureWorkflow;
   gameId: string;
+  /** Non-secret local reference to the exact Event Grant Session. */
+  sessionReferenceId?: string;
   navigationPath: string;
   identity: { title: string; homeName: string; awayName: string; detail?: string };
 };
 
 type ControllerDepartureStateFields = {
+  /** Values are workflow-qualified (`ad-hoc:<id>` or `event:<id>`). */
   blockedGameIds: string[];
   pendingFinalizations: ControllerDepartureReference[];
   reconciliationPending: ControllerDepartureReference[];
@@ -42,7 +52,9 @@ export type ControllerDepartureProjection = WithRevision<ControllerDepartureStat
 export type ControllerDepartureDestination =
   | { kind: "new-ad-hoc" }
   | { kind: "admit-ad-hoc"; gameId: string }
-  | { kind: "resume-ad-hoc"; gameId: string };
+  | { kind: "resume-ad-hoc"; gameId: string }
+  | { kind: "admit-event" }
+  | { kind: "resume-event"; gameId: string; sessionReferenceId?: string };
 
 export type ControllerDepartureEntryRequest = {
   id: string;
@@ -114,22 +126,34 @@ export type ControllerDepartureAuthority = {
   ): Promise<"available" | "transient" | "unavailable">;
 };
 
+export type ControllerDepartureAuthorityAdapters = {
+  adHoc: ControllerDepartureAuthority;
+  event: ControllerDepartureAuthority;
+};
+
 export type ControllerDepartureConnectivity = {
   isOnline(): boolean;
   onOnline(callback: () => void): () => void;
 };
 
 export type ControllerDepartureReplica = {
-  clear(gameId: string): void;
+  clear(departure: ControllerDepartureReference): void;
   clearAll(): void;
+};
+
+export type ControllerDepartureReplicaAdapters = {
+  adHoc: ControllerDepartureReplica;
+  event: ControllerDepartureReplica;
 };
 
 export type ControllerDepartureAdapters = {
   clock: ControllerDepartureClock;
   persistence: ControllerDeparturePersistence;
-  authority: ControllerDepartureAuthority;
+  authority?: ControllerDepartureAuthority;
+  authorities?: ControllerDepartureAuthorityAdapters;
   connectivity: ControllerDepartureConnectivity;
-  replica: ControllerDepartureReplica;
+  replica?: ControllerDepartureReplica;
+  replicas?: ControllerDepartureReplicaAdapters;
 };
 
 export type ControllerDepartureModule = {
@@ -141,11 +165,31 @@ export type ControllerDepartureModule = {
 
 export function controllerDepartureBlocksGame(
   projection: ControllerDepartureProjection,
+  workflow: ControllerDepartureWorkflow,
   gameId: string,
+  sessionReferenceId?: string,
+): boolean;
+export function controllerDepartureBlocksGame(
+  projection: ControllerDepartureProjection,
+  gameId: string,
+): boolean;
+export function controllerDepartureBlocksGame(
+  projection: ControllerDepartureProjection,
+  workflowOrGameId: string,
+  maybeGameId?: string,
+  sessionReferenceId?: string,
 ): boolean {
+  const key =
+    maybeGameId === undefined
+      ? lifecycleKey("ad-hoc", workflowOrGameId)
+      : lifecycleKey(
+          workflowOrGameId as ControllerDepartureWorkflow,
+          maybeGameId,
+          sessionReferenceId,
+        );
   return (
     projection.status === "failed-closed" ||
-    (projection.status !== "empty" && projection.blockedGameIds.includes(gameId))
+    (projection.status !== "empty" && projection.blockedGameIds.includes(key))
   );
 }
 
@@ -154,9 +198,17 @@ export function createControllerDeparture(
 ): ControllerDepartureModule {
   const clock = adapters.clock ?? createBrowserClock();
   const persistence = adapters.persistence ?? createBrowserPersistence();
-  const authority = adapters.authority ?? createBrowserAuthority();
+  const authorities =
+    adapters.authorities ??
+    (adapters.authority === undefined
+      ? { adHoc: createBrowserAdHocAuthority(), event: createBrowserEventAuthority() }
+      : { adHoc: adapters.authority, event: adapters.authority });
   const connectivity = adapters.connectivity ?? createBrowserConnectivity();
-  const replica = adapters.replica ?? createBrowserReplica();
+  const replicas =
+    adapters.replicas ??
+    (adapters.replica === undefined
+      ? { adHoc: createBrowserAdHocReplica(), event: createBrowserEventReplica() }
+      : { adHoc: adapters.replica, event: adapters.replica });
   let expiryHandle: unknown = null;
   let disposed = false;
   let lifecycleQueue = Promise.resolve();
@@ -211,16 +263,21 @@ export function createControllerDeparture(
     );
     return next;
   };
-  const clearReplica = (gameId: string) => {
+  const authorityFor = (workflow: ControllerDepartureWorkflow) =>
+    authorities[workflow === "event" ? "event" : "adHoc"];
+  const replicaFor = (workflow: ControllerDepartureWorkflow) =>
+    replicas[workflow === "event" ? "event" : "adHoc"];
+  const clearReplica = (departure: ControllerDepartureReference) => {
     try {
-      replica.clear(gameId);
+      replicaFor(departure.workflow).clear(departure);
     } catch {
       // Persisted fail-closed state remains authoritative for this browser.
     }
   };
   const clearAllReplicas = () => {
     try {
-      replica.clearAll();
+      replicas.adHoc.clearAll();
+      replicas.event.clearAll();
     } catch {
       // The failed-closed projection still prevents retained replicas from being used.
     }
@@ -263,11 +320,11 @@ export function createControllerDeparture(
     for (const departure of departures) {
       let result: "accepted" | "deferred" | "unavailable" = "deferred";
       try {
-        result = await authority.finalize(departure);
+        result = await authorityFor(departure.workflow).finalize(departure);
       } catch {
         result = "deferred";
       }
-      results.set(departure.gameId, result);
+      results.set(departureKey(departure), result);
     }
     return results;
   };
@@ -276,11 +333,11 @@ export function createControllerDeparture(
     for (const departure of departures) {
       let result: "available" | "transient" | "unavailable" = "transient";
       try {
-        result = await authority.reconcile(departure);
+        result = await authorityFor(departure.workflow).reconcile(departure);
       } catch {
         result = "transient";
       }
-      results.set(departure.gameId, result);
+      results.set(departureKey(departure), result);
     }
     return results;
   };
@@ -293,21 +350,24 @@ export function createControllerDeparture(
     const fields = projectionFields(latest);
     const pendingFinalizations = fields.pendingFinalizations.filter(
       (departure) =>
-        finalizations.get(departure.gameId) === "deferred" || !finalizations.has(departure.gameId),
+        finalizations.get(departureKey(departure)) === "deferred" ||
+        !finalizations.has(departureKey(departure)),
     );
     const reconciliationPending = fields.reconciliationPending.filter(
       (departure) =>
-        reconciliations.get(departure.gameId) === "transient" ||
-        !reconciliations.has(departure.gameId),
+        reconciliations.get(departureKey(departure)) === "transient" ||
+        !reconciliations.has(departureKey(departure)),
     );
-    const unavailableGameIds = [
-      ...[...finalizations]
-        .filter(([, result]) => result === "unavailable")
-        .map(([gameId]) => gameId),
-      ...[...reconciliations]
-        .filter(([, result]) => result === "unavailable")
-        .map(([gameId]) => gameId),
+    const unavailableDepartureKeys = [
+      ...[...finalizations].filter(([, result]) => result === "unavailable").map(([key]) => key),
+      ...[...reconciliations].filter(([, result]) => result === "unavailable").map(([key]) => key),
     ];
+    const unavailableGameIds = unavailableDepartureKeys.map((key) => {
+      const departure = [...fields.pendingFinalizations, ...fields.reconciliationPending].find(
+        (candidate) => departureKey(candidate) === key,
+      );
+      return departure === undefined ? key : blockedDepartureKey(departure);
+    });
     const blockedGameIds = unique([...fields.blockedGameIds, ...unavailableGameIds]);
     if (
       sameDepartures(pendingFinalizations, fields.pendingFinalizations) &&
@@ -322,7 +382,12 @@ export function createControllerDeparture(
       reconciliationPending,
     } as ControllerDepartureState);
     if (written !== null) {
-      for (const gameId of unavailableGameIds) clearReplica(gameId);
+      for (const key of unavailableDepartureKeys) {
+        const departure = [...fields.pendingFinalizations, ...fields.reconciliationPending].find(
+          (candidate) => departureKey(candidate) === key,
+        );
+        if (departure !== undefined) clearReplica(departure);
+      }
       return written;
     }
     return readStored();
@@ -352,19 +417,19 @@ export function createControllerDeparture(
     const next = writeFrom(current, {
       status: "blocked",
       gameId: current.departure.gameId,
-      blockedGameIds: unique([...current.blockedGameIds, current.departure.gameId]),
+      blockedGameIds: unique([...current.blockedGameIds, blockedDepartureKey(current.departure)]),
       pendingFinalizations,
       reconciliationPending: current.reconciliationPending,
     });
     if (next === null) return { status: "unavailable" };
     cancelExpiry();
-    clearReplica(current.departure.gameId);
+    clearReplica(current.departure);
     if (!online) return { status: "expired", finalization: "deferred" };
     const results = await callFinalizations(pendingFinalizations);
     settleAuthorityResults(results, new Map());
     return {
       status: "expired",
-      finalization: results.get(current.departure.gameId) ?? "deferred",
+      finalization: results.get(departureKey(current.departure)) ?? "deferred",
     };
   };
 
@@ -387,7 +452,7 @@ export function createControllerDeparture(
     const blockedGameIds =
       superseded === null
         ? fields.blockedGameIds
-        : unique([...fields.blockedGameIds, superseded.gameId]);
+        : unique([...fields.blockedGameIds, blockedDepartureKey(superseded)]);
     const next = writeFrom(current, {
       status: "returnable",
       departure: intent.departure,
@@ -397,13 +462,16 @@ export function createControllerDeparture(
       reconciliationPending: fields.reconciliationPending,
     });
     if (next === null) return { status: "unavailable" };
-    if (superseded !== null) clearReplica(superseded.gameId);
+    if (superseded !== null) clearReplica(superseded);
     if ((intent.online ?? connectivity.isOnline()) && pendingFinalizations.length > 0) {
       const results = await callFinalizations(pendingFinalizations);
       settleAuthorityResults(results, new Map());
     }
     const latest = readStored();
-    if (latest.status === "returnable" && latest.departure.gameId === intent.departure.gameId)
+    if (
+      latest.status === "returnable" &&
+      departureKey(latest.departure) === departureKey(intent.departure)
+    )
       scheduleExpiry(latest.expiresAtMs);
     return { status: "left", projection: latest };
   };
@@ -438,18 +506,18 @@ export function createControllerDeparture(
       latest.departure.gameId !== gameId
     )
       return { status: "unavailable" };
-    const result = results.get(gameId) ?? "transient";
+    const result = results.get(departureKey(departure)) ?? "transient";
     if (result === "unavailable") {
       const next = writeFrom(latest, {
         status: "blocked",
         gameId,
-        blockedGameIds: unique([...latest.blockedGameIds, gameId]),
+        blockedGameIds: unique([...latest.blockedGameIds, blockedDepartureKey(departure)]),
         pendingFinalizations: latest.pendingFinalizations,
         reconciliationPending: latest.reconciliationPending,
       });
       if (next === null) return { status: "unavailable" };
       cancelExpiry();
-      clearReplica(gameId);
+      clearReplica(departure);
       return { status: "unavailable" };
     }
     const next = writeFrom(latest, {
@@ -478,17 +546,25 @@ export function createControllerDeparture(
       current = readStored();
     }
     if (current.status === "failed-closed") {
-      return destination.kind === "resume-ad-hoc"
+      return destination.kind === "resume-ad-hoc" || destination.kind === "resume-event"
         ? { status: "unavailable" }
         : issueAuthorization(destination, current.revision);
     }
     const gameId = destinationGameId(destination);
-    if (gameId !== null && controllerDepartureBlocksGame(current, gameId))
+    if (
+      gameId !== null &&
+      controllerDepartureBlocksGame(
+        current,
+        destination.kind === "resume-event" ? "event" : "ad-hoc",
+        gameId,
+        destination.kind === "resume-event" ? destination.sessionReferenceId : undefined,
+      )
+    )
       return { status: "unavailable" };
     if (
-      destination.kind === "resume-ad-hoc" &&
+      (destination.kind === "resume-ad-hoc" || destination.kind === "resume-event") &&
       current.status === "returnable" &&
-      current.departure.gameId === destination.gameId
+      destinationMatchesDeparture(current.departure, destination)
     ) {
       const returned = await returnToGame(destination.gameId, online);
       if (returned.status !== "resumed") return returned;
@@ -523,13 +599,13 @@ export function createControllerDeparture(
     const next = writeFrom(current, {
       status: "blocked",
       gameId: current.departure.gameId,
-      blockedGameIds: unique([...current.blockedGameIds, current.departure.gameId]),
+      blockedGameIds: unique([...current.blockedGameIds, blockedDepartureKey(current.departure)]),
       pendingFinalizations,
       reconciliationPending: current.reconciliationPending,
     });
     if (next === null) return { status: "unavailable" };
     pendingEntries.delete(request.id);
-    clearReplica(current.departure.gameId);
+    clearReplica(current.departure);
     if (online) {
       const results = await callFinalizations(pendingFinalizations);
       settleAuthorityResults(results, new Map());
@@ -557,7 +633,11 @@ export function createControllerDeparture(
       return { status: "unavailable" };
     if (invalidated !== undefined || current.revision !== authorization.revision)
       return requestEntry(authorization.destination, connectivity.isOnline(), clock.now());
-    if (current.status === "failed-closed" && authorization.destination.kind === "resume-ad-hoc")
+    if (
+      current.status === "failed-closed" &&
+      (authorization.destination.kind === "resume-ad-hoc" ||
+        authorization.destination.kind === "resume-event")
+    )
       return { status: "unavailable" };
     const completion = { ...authorization };
     pendingCompletions.set(completion.id, completion);
@@ -651,7 +731,10 @@ export function createControllerDeparture(
         status: "blocked",
         gameId: projection.departure.gameId,
         revision: projection.revision,
-        blockedGameIds: unique([...projection.blockedGameIds, projection.departure.gameId]),
+        blockedGameIds: unique([
+          ...projection.blockedGameIds,
+          blockedDepartureKey(projection.departure),
+        ]),
         pendingFinalizations: uniqueDepartures([
           ...projection.pendingFinalizations,
           projection.departure,
@@ -696,11 +779,14 @@ export function createInMemoryControllerDepartureAdapters(
     projection?: ControllerDepartureProjection;
     finalize?: ControllerDepartureAuthority["finalize"];
     reconcile?: ControllerDepartureAuthority["reconcile"];
+    eventFinalize?: ControllerDepartureAuthority["finalize"];
+    eventReconcile?: ControllerDepartureAuthority["reconcile"];
   } = {},
 ): ControllerDepartureAdapters & {
   advanceTo(nowMs: number): void;
   setOnline(value: boolean): void;
   clearedReplicas: string[];
+  clearedReplicaReferences: ControllerDepartureReference[];
   clearAllCount: number;
 } {
   let nowMs = options.nowMs ?? 0;
@@ -722,6 +808,7 @@ export function createInMemoryControllerDepartureAdapters(
   const onlineListeners = new Set<() => void>();
   const persistenceListeners = new Set<() => void>();
   const clearedReplicas: string[] = [];
+  const clearedReplicaReferences: ControllerDepartureReference[] = [];
   let clearAllCount = 0;
   let nextHandle = 0;
   const adapters = {
@@ -755,6 +842,17 @@ export function createInMemoryControllerDepartureAdapters(
       finalize: options.finalize ?? (async () => "accepted" as const),
       reconcile: options.reconcile ?? (async () => "available" as const),
     },
+    authorities: {
+      adHoc: {
+        finalize: options.finalize ?? (async () => "accepted" as const),
+        reconcile: options.reconcile ?? (async () => "available" as const),
+      },
+      event: {
+        finalize: options.eventFinalize ?? options.finalize ?? (async () => "accepted" as const),
+        reconcile:
+          options.eventReconcile ?? options.reconcile ?? (async () => "available" as const),
+      },
+    },
     connectivity: {
       isOnline: () => online,
       onOnline(callback: () => void) {
@@ -763,10 +861,32 @@ export function createInMemoryControllerDepartureAdapters(
       },
     },
     replica: {
-      clear: (gameId: string) => clearedReplicas.push(gameId),
+      clear: (departure: ControllerDepartureReference) => {
+        clearedReplicas.push(departure.gameId);
+        clearedReplicaReferences.push(departure);
+      },
       clearAll: () => {
         clearAllCount += 1;
         adapters.clearAllCount = clearAllCount;
+      },
+    },
+    replicas: {
+      adHoc: {
+        clear: (departure: ControllerDepartureReference) => {
+          clearedReplicas.push(departure.gameId);
+          clearedReplicaReferences.push(departure);
+        },
+        clearAll: () => {
+          clearAllCount += 1;
+          adapters.clearAllCount = clearAllCount;
+        },
+      },
+      event: {
+        clear: (departure: ControllerDepartureReference) => {
+          clearedReplicas.push(departure.gameId);
+          clearedReplicaReferences.push(departure);
+        },
+        clearAll: () => undefined,
       },
     },
     advanceTo(value: number) {
@@ -782,11 +902,13 @@ export function createInMemoryControllerDepartureAdapters(
       if (becameOnline) for (const callback of onlineListeners) callback();
     },
     clearedReplicas,
+    clearedReplicaReferences,
     clearAllCount,
   } satisfies ControllerDepartureAdapters & {
     advanceTo(nowMs: number): void;
     setOnline(value: boolean): void;
     clearedReplicas: string[];
+    clearedReplicaReferences: ControllerDepartureReference[];
     clearAllCount: number;
   };
   return adapters;
@@ -827,6 +949,8 @@ function createBrowserPersistence(): ControllerDeparturePersistence {
         if (raw === null) return { status: "empty", revision: 0 };
         const value = JSON.parse(raw) as unknown;
         if (isStoredDeparture(value)) return normalizeProjection(value);
+        if (isPreviousStoredDeparture(value))
+          return normalizeProjection({ ...value, revision: value.revision ?? 0 });
         if (isLegacyStoredDeparture(value)) return normalizeProjection({ ...value, revision: 0 });
         return { status: "failed-closed", revision: 0 };
       } catch {
@@ -863,10 +987,9 @@ function createBrowserPersistence(): ControllerDeparturePersistence {
   };
 }
 
-function createBrowserAuthority(): ControllerDepartureAuthority {
+function createBrowserAdHocAuthority(): ControllerDepartureAuthority {
   return {
     async finalize(departure) {
-      if (departure.workflow !== "ad-hoc") return "deferred";
       try {
         const response = await fetch(`/api/games/${encodeURIComponent(departure.gameId)}/leave`, {
           method: "POST",
@@ -884,7 +1007,6 @@ function createBrowserAuthority(): ControllerDepartureAuthority {
       }
     },
     async reconcile(departure) {
-      if (departure.workflow !== "ad-hoc") return "available";
       try {
         const response = await fetch(`/api/games/${encodeURIComponent(departure.gameId)}`, {
           credentials: "same-origin",
@@ -898,15 +1020,110 @@ function createBrowserAuthority(): ControllerDepartureAuthority {
   };
 }
 
-function createBrowserReplica(): ControllerDepartureReplica {
+function createBrowserEventAuthority(): ControllerDepartureAuthority {
+  const sessionStorage = createBrowserEventControllerSessionStorage();
   return {
-    clear: clearAdHocControllerSession,
+    async finalize(departure) {
+      const persisted = sessionStorage.readForGame(departure.gameId, departure.sessionReferenceId);
+      if (persisted === null) return "unavailable";
+      try {
+        const response = await fetch("/api/event-control/leave", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          credentials: "same-origin",
+          body: JSON.stringify({ sessionBearer: persisted.sessionBearer }),
+        });
+        if (response.ok) {
+          sessionStorage.clear(departure.gameId, departure.sessionReferenceId);
+          return "accepted";
+        }
+        if ([401, 403, 404, 410].includes(response.status)) {
+          sessionStorage.clear(departure.gameId, departure.sessionReferenceId);
+          return "unavailable";
+        }
+        return "deferred";
+      } catch {
+        return "deferred";
+      }
+    },
+    async reconcile(departure) {
+      const persisted = sessionStorage.readForGame(departure.gameId, departure.sessionReferenceId);
+      if (persisted === null) return "unavailable";
+      try {
+        const response = await fetch("/api/event-control/refresh", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          credentials: "same-origin",
+          body: JSON.stringify({
+            sessionBearer: persisted.sessionBearer,
+            eventGameId: departure.gameId,
+          }),
+        });
+        if (response.status === 409) {
+          const value = (await response.json()) as { status?: string };
+          return value.status === "switch-required" ? "available" : "transient";
+        }
+        if (response.ok) {
+          const value = (await response.json()) as { status?: string };
+          // Reassignment is a retained authority choice. The Event page
+          // renders the existing retain-or-switch decision after Return.
+          if (value.status === "authorized" || value.status === "switch-required")
+            return "available";
+          return "unavailable";
+        }
+        if ([401, 403, 404, 410].includes(response.status)) {
+          sessionStorage.clear(departure.gameId, departure.sessionReferenceId);
+          return "unavailable";
+        }
+        return "transient";
+      } catch {
+        return "transient";
+      }
+    },
+  };
+}
+
+function createBrowserAdHocReplica(): ControllerDepartureReplica {
+  return {
+    clear(departure) {
+      clearAdHocControllerSession(departure.gameId);
+    },
     clearAll() {
       try {
         const keys: string[] = [];
         for (let index = 0; index < window.localStorage.length; index += 1) {
           const key = window.localStorage.key(index);
           if (key?.startsWith(AD_HOC_CONTROLLER_STORAGE_PREFIX)) keys.push(key);
+        }
+        for (const key of keys) window.localStorage.removeItem(key);
+      } catch {
+        // The failed-closed lifecycle projection still blocks local control.
+      }
+    },
+  };
+}
+
+function createBrowserEventReplica(): ControllerDepartureReplica {
+  return {
+    clear(departure) {
+      if (departure.sessionReferenceId === undefined) return;
+      try {
+        const storageKey = controllerReplicaStorageKey(departure.gameId);
+        const raw = window.localStorage.getItem(storageKey);
+        if (raw === null) return;
+        const state = parseControllerReplica(JSON.parse(raw), departure.gameId);
+        if (state.sessionReferenceId !== departure.sessionReferenceId) return;
+        window.localStorage.removeItem(storageKey);
+      } catch {
+        // The lifecycle projection remains authoritative if replica storage fails.
+      }
+    },
+    clearAll() {
+      try {
+        const keys: string[] = [];
+        for (let index = 0; index < window.localStorage.length; index += 1) {
+          const key = window.localStorage.key(index);
+          if (key?.startsWith(`${controllerReplicaStorageKey()}:`)) keys.push(key);
         }
         for (const key of keys) window.localStorage.removeItem(key);
       } catch {
@@ -939,26 +1156,108 @@ function normalizeProjection(
   const revision = isSafeTimestamp(projection.revision) ? projection.revision : 0;
   if (projection.status === "empty" || projection.status === "failed-closed")
     return { status: projection.status, revision };
+  const departure =
+    projection.status === "returnable"
+      ? normalizeDepartureReference(projection.departure)
+      : undefined;
+  const pendingFinalizations = projection.pendingFinalizations.map(normalizeDepartureReference);
+  const reconciliationPending = projection.reconciliationPending.map(normalizeDepartureReference);
+  const knownDepartures = [
+    ...(departure === undefined ? [] : [departure]),
+    ...pendingFinalizations,
+    ...reconciliationPending,
+  ];
   return {
     ...projection,
     revision,
-    blockedGameIds: unique(projection.blockedGameIds),
-    pendingFinalizations: uniqueDepartures(projection.pendingFinalizations),
-    reconciliationPending: uniqueDepartures(projection.reconciliationPending),
+    ...(departure === undefined ? {} : { departure }),
+    blockedGameIds: unique(
+      projection.blockedGameIds.flatMap((value) => qualifyStoredGameIds(value, knownDepartures)),
+    ),
+    pendingFinalizations: uniqueDepartures(pendingFinalizations),
+    reconciliationPending: uniqueDepartures(reconciliationPending),
   };
 }
 
+function workflowQualifiedGameId(workflow: ControllerDepartureWorkflow, gameId: string) {
+  return `${workflow}:${gameId}`;
+}
+
+function lifecycleKey(
+  workflow: ControllerDepartureWorkflow,
+  gameId: string,
+  sessionReferenceId?: string,
+) {
+  return workflow === "event"
+    ? `${workflowQualifiedGameId(workflow, gameId)}|${sessionReferenceId ?? legacyEventControllerSessionReference(gameId)}`
+    : workflowQualifiedGameId(workflow, gameId);
+}
+
+function departureKey(departure: ControllerDepartureReference) {
+  return lifecycleKey(departure.workflow, departure.gameId, departure.sessionReferenceId);
+}
+
+function blockedDepartureKey(departure: ControllerDepartureReference) {
+  return departureKey(departure);
+}
+
+function normalizeDepartureReference(
+  departure: ControllerDepartureReference,
+): ControllerDepartureReference {
+  return departure.workflow === "event" && departure.sessionReferenceId === undefined
+    ? { ...departure, sessionReferenceId: legacyEventControllerSessionReference(departure.gameId) }
+    : departure;
+}
+
+function qualifyStoredGameIds(
+  value: string,
+  knownDepartures: ControllerDepartureReference[],
+): string[] {
+  if (value.startsWith("ad-hoc:")) return [value];
+  if (value.startsWith("event:")) {
+    if (value.includes("|")) return [value];
+    const gameId = value.slice("event:".length);
+    const exactReferences = knownDepartures
+      .filter((departure) => departure.workflow === "event" && departure.gameId === gameId)
+      .map(departureKey);
+    return exactReferences.length > 0 ? exactReferences : [lifecycleKey("event", gameId)];
+  }
+  return [workflowQualifiedGameId("ad-hoc", value)];
+}
+
 function destinationGameId(destination: ControllerDepartureDestination) {
-  return destination.kind === "new-ad-hoc" ? null : destination.gameId;
+  return destination.kind === "new-ad-hoc" || destination.kind === "admit-event"
+    ? null
+    : destination.gameId;
 }
 
 function destinationMatches(
   left: ControllerDepartureDestination,
   right: ControllerDepartureDestination,
 ) {
+  if (left.kind !== right.kind) return false;
+  if (left.kind === "new-ad-hoc" || left.kind === "admit-event") return true;
+  if (left.kind === "resume-event" && right.kind === "resume-event") {
+    return left.gameId === right.gameId && left.sessionReferenceId === right.sessionReferenceId;
+  }
   return (
-    left.kind === right.kind &&
-    (left.kind === "new-ad-hoc" || right.kind === "new-ad-hoc" || left.gameId === right.gameId)
+    (left.kind === "resume-ad-hoc" || left.kind === "admit-ad-hoc") &&
+    (right.kind === "resume-ad-hoc" || right.kind === "admit-ad-hoc") &&
+    left.gameId === right.gameId
+  );
+}
+
+function destinationMatchesDeparture(
+  departure: ControllerDepartureReference,
+  destination: ControllerDepartureDestination,
+) {
+  return (
+    (destination.kind === "resume-ad-hoc" || destination.kind === "resume-event") &&
+    departure.workflow === (destination.kind === "resume-event" ? "event" : "ad-hoc") &&
+    departure.gameId === destination.gameId &&
+    (destination.kind !== "resume-event" ||
+      lifecycleKey("event", departure.gameId, departure.sessionReferenceId) ===
+        lifecycleKey("event", destination.gameId, destination.sessionReferenceId))
   );
 }
 
@@ -967,9 +1266,9 @@ function unique(values: string[]) {
 }
 
 function uniqueDepartures(values: ControllerDepartureReference[]) {
-  const byGameId = new Map<string, ControllerDepartureReference>();
-  for (const departure of values) byGameId.set(departure.gameId, departure);
-  return [...byGameId.values()];
+  const byWorkflowGame = new Map<string, ControllerDepartureReference>();
+  for (const departure of values) byWorkflowGame.set(departureKey(departure), departure);
+  return [...byWorkflowGame.values()];
 }
 
 function sameStrings(left: string[], right: string[]) {
@@ -980,10 +1279,7 @@ function sameDepartures(
   left: ControllerDepartureReference[],
   right: ControllerDepartureReference[],
 ) {
-  return sameStrings(
-    left.map((departure) => departure.gameId),
-    right.map((departure) => departure.gameId),
-  );
+  return sameStrings(left.map(departureKey), right.map(departureKey));
 }
 
 function isStoredDeparture(value: unknown): value is ControllerDepartureProjection & {
@@ -993,7 +1289,7 @@ function isStoredDeparture(value: unknown): value is ControllerDepartureProjecti
     isRecord(value) &&
     value.version === CONTROLLER_DEPARTURE_VERSION &&
     isSafeTimestamp(value.revision) &&
-    isProjectionBody(value)
+    isProjectionBody(value, true)
   );
 }
 
@@ -1006,28 +1302,48 @@ function isLegacyStoredDeparture(value: unknown): value is Exclude<
   return (
     isRecord(value) &&
     value.version === LEGACY_CONTROLLER_DEPARTURE_VERSION &&
-    isProjectionBody(value) &&
+    isProjectionBody(value, false) &&
     value.status !== "failed-closed"
   );
 }
 
-function isProjectionBody(value: Record<string, any>) {
+function isPreviousStoredDeparture(value: unknown): value is ControllerDepartureProjection & {
+  version: typeof PREVIOUS_CONTROLLER_DEPARTURE_VERSION;
+} {
+  return (
+    isRecord(value) &&
+    value.version === PREVIOUS_CONTROLLER_DEPARTURE_VERSION &&
+    isSafeTimestamp(value.revision) &&
+    isProjectionBody(value, false)
+  );
+}
+
+function isProjectionBody(value: Record<string, any>, qualifiedIds: boolean) {
   if (value.status === "empty" || value.status === "failed-closed") return true;
-  if (value.status === "returned") return isStateFields(value);
+  if (value.status === "returned") return isStateFields(value, qualifiedIds);
   if (value.status === "blocked")
-    return validateOpaqueIdentifier(value.gameId, "gameId").ok && isStateFields(value);
+    return (
+      validateOpaqueIdentifier(value.gameId, "gameId").ok && isStateFields(value, qualifiedIds)
+    );
   return (
     value.status === "returnable" &&
     isSafeTimestamp(value.expiresAtMs) &&
     isDeparture(value.departure) &&
-    isStateFields(value)
+    isStateFields(value, qualifiedIds)
   );
 }
 
-function isStateFields(value: Record<string, any>) {
+function isStateFields(value: Record<string, any>, qualifiedIds = true) {
   return (
     Array.isArray(value.blockedGameIds) &&
-    value.blockedGameIds.every((id: unknown) => validateOpaqueIdentifier(id, "gameId").ok) &&
+    value.blockedGameIds.every(
+      (id: unknown) =>
+        typeof id === "string" &&
+        (qualifiedIds
+          ? /^(?:ad-hoc|event):.+/u.test(id) &&
+            validateOpaqueIdentifier(id.slice(id.indexOf(":") + 1), "gameId").ok
+          : validateOpaqueIdentifier(id, "gameId").ok),
+    ) &&
     Array.isArray(value.pendingFinalizations) &&
     value.pendingFinalizations.every(isDeparture) &&
     Array.isArray(value.reconciliationPending) &&
@@ -1048,7 +1364,11 @@ function isDeparture(value: unknown): value is ControllerDepartureReference {
     typeof value.identity.title === "string" &&
     typeof value.identity.homeName === "string" &&
     typeof value.identity.awayName === "string" &&
-    (value.identity.detail === undefined || typeof value.identity.detail === "string")
+    (value.identity.detail === undefined || typeof value.identity.detail === "string") &&
+    (value.sessionReferenceId === undefined ||
+      (value.workflow === "event" &&
+        typeof value.sessionReferenceId === "string" &&
+        validateOpaqueIdentifier(value.sessionReferenceId, "sessionReferenceId").ok))
   );
 }
 

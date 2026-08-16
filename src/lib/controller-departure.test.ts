@@ -7,14 +7,128 @@ import {
   type ControllerDepartureReference,
 } from "@/lib/controller-departure";
 
-const departure = (gameId: string): ControllerDepartureReference => ({
-  workflow: "ad-hoc",
+const departure = (
+  gameId: string,
+  workflow: ControllerDepartureReference["workflow"] = "ad-hoc",
+  sessionReferenceId?: string,
+): ControllerDepartureReference => ({
+  workflow,
   gameId,
+  ...(workflow === "event"
+    ? { sessionReferenceId: sessionReferenceId ?? `legacy-event-session-${gameId}` }
+    : {}),
   navigationPath: `/game/${gameId}`,
   identity: { title: "Ad Hoc Game", homeName: "Basel", awayName: "Zurich" },
 });
 
 describe("Controller Departure", () => {
+  test("coordinates the Event adapter through the same newest-only Interface", async () => {
+    const finalized: ControllerDepartureReference[] = [];
+    const reconciled: ControllerDepartureReference[] = [];
+    const adapters = createInMemoryControllerDepartureAdapters({
+      finalize: async (reference) => {
+        finalized.push(reference);
+        return "accepted";
+      },
+      reconcile: async (reference) => {
+        reconciled.push(reference);
+        return "available";
+      },
+    });
+    const module = createControllerDeparture(adapters);
+    const event = departure("event-a", "event");
+
+    adapters.setOnline(false);
+    expect(
+      await module.transition({ type: "leave", departure: event, online: false }),
+    ).toMatchObject({ status: "left", projection: { departure: event } });
+    expect(await module.transition({ type: "return", gameId: "event-a", online: false })).toEqual({
+      status: "resumed",
+      mode: "offline",
+    });
+    adapters.setOnline(true);
+    await flushRetries();
+
+    expect(reconciled).toEqual([event]);
+    expect(finalized).toEqual([]);
+    expect(module.project().status).toBe("returned");
+  });
+
+  test("routes Ad Hoc and Event authority and replica work through distinct adapters", async () => {
+    const calls: string[] = [];
+    const adapters = createInMemoryControllerDepartureAdapters({
+      departure: departure("event-a", "event"),
+    });
+    const module = createControllerDeparture({
+      ...adapters,
+      authorities: {
+        adHoc: {
+          finalize: async () => {
+            calls.push("ad-hoc-finalize");
+            return "accepted";
+          },
+          reconcile: async () => "available",
+        },
+        event: {
+          finalize: async () => {
+            calls.push("event-finalize");
+            return "accepted";
+          },
+          reconcile: async () => "available",
+        },
+      },
+    });
+    await module.transition({ type: "expire", online: true, nowMs: CONTROLLER_LEAVE_GRACE_MS });
+    expect(calls).toEqual(["event-finalize"]);
+  });
+
+  test("expires an offline Event departure through its Event adapter without blocking Ad Hoc", async () => {
+    const finalized: string[] = [];
+    const adapters = createInMemoryControllerDepartureAdapters({
+      departure: departure("shared-id", "event"),
+      eventFinalize: async (reference) => {
+        finalized.push(reference.workflow);
+        return "accepted";
+      },
+    });
+    const module = createControllerDeparture(adapters);
+    adapters.setOnline(false);
+    await module.transition({
+      type: "expire",
+      online: false,
+      nowMs: CONTROLLER_LEAVE_GRACE_MS,
+    });
+    expect(controllerDepartureBlocksGame(module.project(), "event", "shared-id")).toBe(true);
+    expect(controllerDepartureBlocksGame(module.project(), "ad-hoc", "shared-id")).toBe(false);
+    expect(finalized).toEqual([]);
+    adapters.setOnline(true);
+    await flushRetries();
+    expect(finalized).toEqual(["event"]);
+  });
+
+  test("blocks only the exact Event session after same-Game finalization", async () => {
+    const adapters = createInMemoryControllerDepartureAdapters({
+      departure: departure("same-game", "event", "session-a"),
+    });
+    const module = createControllerDeparture(adapters);
+    adapters.setOnline(false);
+    await module.transition({ type: "expire", online: false, nowMs: CONTROLLER_LEAVE_GRACE_MS });
+
+    expect(controllerDepartureBlocksGame(module.project(), "event", "same-game", "session-a")).toBe(
+      true,
+    );
+    expect(controllerDepartureBlocksGame(module.project(), "event", "same-game", "session-b")).toBe(
+      false,
+    );
+    expect(
+      await module.transition({
+        type: "request-entry",
+        destination: { kind: "resume-event", gameId: "same-game", sessionReferenceId: "session-b" },
+        online: false,
+      }),
+    ).toMatchObject({ status: "authorized" });
+  });
+
   test("keeps the newest opportunity and blocks every superseded game", async () => {
     const adapters = createInMemoryControllerDepartureAdapters({ nowMs: 100 });
     const module = createControllerDeparture(adapters);
@@ -275,7 +389,10 @@ describe("Controller Departure", () => {
         },
         clear: () => undefined,
       },
-      replica: { clear: (gameId) => cleared.push(gameId), clearAll: () => undefined },
+      replica: {
+        clear: (value) => cleared.push(value.gameId),
+        clearAll: () => undefined,
+      },
       authority: {
         finalize: async (value) => {
           finalized.push(value.gameId);
@@ -313,7 +430,10 @@ describe("Controller Departure", () => {
         write: () => false,
         clear: () => undefined,
       },
-      replica: { clear: (gameId) => cleared.push(gameId), clearAll: () => undefined },
+      replica: {
+        clear: (value) => cleared.push(value.gameId),
+        clearAll: () => undefined,
+      },
       authority: {
         finalize: async (value) => {
           finalized.push(value.gameId);
@@ -552,6 +672,90 @@ describe("Controller Departure", () => {
     } finally {
       globalThis.fetch = originalFetch;
     }
+  });
+
+  test("qualifies identical Ad Hoc and Event IDs without cross-blocking", async () => {
+    const adapters = createInMemoryControllerDepartureAdapters({
+      departure: departure("shared-id", "ad-hoc"),
+    });
+    const module = createControllerDeparture(adapters);
+
+    await module.transition({ type: "expire", online: false, nowMs: CONTROLLER_LEAVE_GRACE_MS });
+
+    expect(controllerDepartureBlocksGame(module.project(), "ad-hoc", "shared-id")).toBe(true);
+    expect(controllerDepartureBlocksGame(module.project(), "event", "shared-id")).toBe(false);
+    const replacement = await module.transition({
+      type: "request-entry",
+      destination: { kind: "resume-event", gameId: "shared-id" },
+      online: false,
+    });
+    expect(replacement.status).toBe("authorized");
+  });
+
+  test("confirms both cross-workflow replacement directions before mutation", async () => {
+    const adapters = createInMemoryControllerDepartureAdapters({
+      departure: departure("shared-id", "event"),
+    });
+    const module = createControllerDeparture(adapters);
+    const adHocRequest = await module.transition({
+      type: "request-entry",
+      destination: { kind: "new-ad-hoc" },
+      online: false,
+    });
+    expect(adHocRequest).toMatchObject({
+      status: "needs-confirmation",
+      departure: { workflow: "event", gameId: "shared-id" },
+    });
+
+    const eventWriter = createInMemoryControllerDepartureAdapters({
+      departure: departure("shared-id", "ad-hoc"),
+    });
+    const other = createControllerDeparture(eventWriter);
+    const eventRequest = await other.transition({
+      type: "request-entry",
+      destination: { kind: "admit-event" },
+      online: false,
+    });
+    expect(eventRequest).toMatchObject({
+      status: "needs-confirmation",
+      departure: { workflow: "ad-hoc", gameId: "shared-id" },
+    });
+  });
+
+  test("migrates raw #268 Ad Hoc blocked IDs while retaining workflow separation", async () => {
+    const adapters = createInMemoryControllerDepartureAdapters({
+      projection: {
+        status: "blocked",
+        revision: 4,
+        gameId: "shared-id",
+        blockedGameIds: ["shared-id"],
+        pendingFinalizations: [],
+        reconciliationPending: [],
+      },
+    });
+    const module = createControllerDeparture(adapters);
+    expect(controllerDepartureBlocksGame(module.project(), "ad-hoc", "shared-id")).toBe(true);
+    expect(controllerDepartureBlocksGame(module.project(), "event", "shared-id")).toBe(false);
+  });
+
+  test("migrates a legacy Event blocked key to its pending exact session", async () => {
+    const adapters = createInMemoryControllerDepartureAdapters({
+      projection: {
+        status: "blocked",
+        revision: 4,
+        gameId: "shared-id",
+        blockedGameIds: ["event:shared-id"],
+        pendingFinalizations: [departure("shared-id", "event", "session-old")],
+        reconciliationPending: [],
+      },
+    });
+    const module = createControllerDeparture(adapters);
+    expect(
+      controllerDepartureBlocksGame(module.project(), "event", "shared-id", "session-old"),
+    ).toBe(true);
+    expect(
+      controllerDepartureBlocksGame(module.project(), "event", "shared-id", "session-new"),
+    ).toBe(false);
   });
 });
 

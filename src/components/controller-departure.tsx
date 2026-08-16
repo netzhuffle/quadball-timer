@@ -354,6 +354,7 @@ function ControllerReplacementDialog({
 export function controllerDepartureReference(input: {
   workflow: ControllerDepartureReference["workflow"];
   gameId: string;
+  sessionReferenceId?: string;
   homeName: string;
   awayName: string;
   navigationPath?: string;
@@ -362,6 +363,9 @@ export function controllerDepartureReference(input: {
   return {
     workflow: input.workflow,
     gameId: input.gameId,
+    ...(input.sessionReferenceId === undefined
+      ? {}
+      : { sessionReferenceId: input.sessionReferenceId }),
     navigationPath: input.navigationPath ?? `/game/${input.gameId}`,
     identity: {
       title: input.workflow === "ad-hoc" ? "Ad Hoc Game" : "Event Game",

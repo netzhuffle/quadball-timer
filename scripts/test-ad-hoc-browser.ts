@@ -320,6 +320,50 @@ async function run() {
         await waitForGameRoute(second, gameId);
         await first.getByText("Paused", { exact: true }).waitFor();
 
+        // An Ad Hoc returnable session must use the same shared replacement
+        // confirmation before an Event admission transport is touched.
+        await second.getByRole("button", { name: "Leave", exact: true }).click();
+        await second.getByRole("dialog").getByRole("button", { name: "Leave game" }).click();
+        await second.waitForURL(`${origin}/`);
+        let eventOpenCalls = 0;
+        const eventReplacementOrder: string[] = [];
+        const recordEventOpen = (request: import("playwright").Request) => {
+          if (request.method() === "POST" && new URL(request.url()).pathname.endsWith("/leave"))
+            eventReplacementOrder.push("finalize");
+          if (
+            request.method() === "POST" &&
+            new URL(request.url()).pathname.endsWith("/event-control/open")
+          ) {
+            eventOpenCalls += 1;
+            eventReplacementOrder.push("admit");
+          }
+        };
+        second.on("request", recordEventOpen);
+        await second.goto(`${origin}/event-control`);
+        await second.getByLabel("Active Pitch Slot Control Grant QR").fill("event-replacement");
+        await second.getByRole("button", { name: "Open Event Game Controller" }).click();
+        await second.getByRole("dialog", { name: "Leave the previous game?" }).waitFor();
+        if (eventOpenCalls !== 0)
+          throw new Error("Event admission started before the Ad Hoc replacement confirmation.");
+        await second.getByRole("button", { name: "Cancel" }).click();
+        if (eventOpenCalls !== 0)
+          throw new Error("Cancelling Ad Hoc→Event mutated Event admission.");
+        await second.getByRole("button", { name: "Open Event Game Controller" }).click();
+        const eventAdmissionRequest = second.waitForRequest(
+          (request) =>
+            request.method() === "POST" &&
+            new URL(request.url()).pathname.endsWith("/event-control/open"),
+        );
+        await second.getByRole("button", { name: "Continue" }).click();
+        await eventAdmissionRequest;
+        const eventAdmissionIndex = eventReplacementOrder.indexOf("admit");
+        if (
+          eventAdmissionIndex <= 0 ||
+          eventReplacementOrder.slice(0, eventAdmissionIndex).some((entry) => entry !== "finalize")
+        )
+          throw new Error(`Ad Hoc→Event replacement order was ${eventReplacementOrder.join(",")}.`);
+        second.off("request", recordEventOpen);
+
         const creationContext = await browser!.newContext({
           ignoreHTTPSErrors: true,
           storageState: postLeaveStorageState,
