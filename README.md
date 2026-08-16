@@ -78,8 +78,13 @@ release when the installed unit does not provide this state contract.
 
 The permanent Test Environment is deployed independently at
 `https://test.timer.quadball.app` by the Test job in
-`.github/workflows/deploy-production.yml`. The workflow builds one immutable
-release attempt and gives Production and Test independent activation jobs. Test uses
+`.github/workflows/deploy-production.yml`. Every eligible merge to `main` builds
+one immutable Release Bundle and performs Test Activation only. Production is
+activated separately through `.github/workflows/promote-production.yml`: manually
+select the successful Promotion Source Run, then approve the `production`
+Environment. That workflow downloads the exact Test-validated bundle and never
+rebuilds it. Follow `deploy/production-promotion.md` for the operator steps.
+Test uses
 the separate `quadball-timer-test` service on `127.0.0.1:3001`, release root
 `/srv/quadball-timer-test`, and state directory `/var/lib/quadball-timer-test`.
 Its root-controlled key file is `/etc/quadball-timer/test.env`; Test keys must
@@ -90,11 +95,11 @@ standing backup or availability guarantee. See
 The Test Environment Technical Admin verification checklist is in
 `deploy/technical-admin-bootstrap-test-checklist.md`.
 
-Pushes to `main` skip CI and deployment when every changed path is limited to
+Pushes to `main` skip CI and Test Activation when every changed path is limited to
 `AGENTS.md`, `CONTEXT.md`, `README.md`, `docs/`, or `.github/dependabot.yml`.
 Files under `docs/` are also excluded from formatting, linting, and type-aware
-validation. Manually dispatch the workflow to force CI; production deployment
-still occurs only when the selected ref is `main`.
+validation. Manually dispatch the Test workflow to force CI/Test Activation; use
+the separate Production promotion workflow for a reviewed Production Approval.
 
 ## Quality checks
 

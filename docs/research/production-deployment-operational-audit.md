@@ -6,16 +6,20 @@ Audit date: 12 July 2026
 
 The current deployment is a good process-availability baseline, but it is not yet safe for SQM game state. GitHub Actions builds and tests the exact compiled Bun executable, deploys through a narrow SSH path, switches a `current` symlink, checks localhost health, attempts rollback, and verifies the public page. Caddy terminates TLS, proxies only to loopback, supplies appropriate security headers, and hides the internal health endpoint.
 
+## Current SQM promotion policy
+
+The deployment boundary now separates **Test Activation** from **Production Promotion**. An eligible merge to `main` runs `.github/workflows/deploy-production.yml`, which builds one immutable Release Bundle and activates Test only. `.github/workflows/promote-production.yml` is manually dispatched with the exact successful Promotion Source Run and attempt; it validates that the run is on `main`, that its Test Activation job succeeded, downloads the same artifact without rebuilding, and waits for the required `production` Environment Production Approval before activating Production. The promotion concurrency group is non-cancelling, and invalid, missing, or unavailable source runs fail closed.
+
 Two deployment properties are nevertheless production blockers:
 
 1. Every activation restarts a server whose complete game registry exists only in memory. A deploy, crash, host reboot, or rollback therefore loses every server-side game and command-id record. Rollback restores an executable, not game state. This violates the accepted server-outage recovery drill and makes deployment during an active Event unsafe.
 2. A release directory is named only by Git commit SHA. Re-running or re-dispatching a deployment for the same commit uploads into that same directory with `rsync --delete`. If it is the current release, the workflow mutates the active rollback target before activation; an interrupted upload or failed activation cannot reliably return to the previous bytes.
 
-The remaining gaps are production controls and evidence: production has no approval rule, live release identity is not observable, smoke coverage is too shallow, the systemd/Caddy installation can drift from source, secret rotation and artifact-audit procedures are undocumented, and neither rollback nor server-loss recovery has a recorded rehearsal.
+The remaining gaps are production controls and evidence: the audit snapshot had no approval rule, live release identity is not observable, smoke coverage is too shallow, the systemd/Caddy installation can drift from source, secret rotation and artifact-audit procedures are undocumented, and neither rollback nor server-loss recovery has a recorded rehearsal.
 
 ## Evidence inspected
 
-- `.github/workflows/deploy-production.yml`, `deploy/activate-release.sh`, `deploy/systemd/quadball-timer.service`, `package.json`, `src/index.ts`, and the internal-health implementation and tests.
+- `.github/workflows/deploy-production.yml`, `.github/workflows/promote-production.yml`, `deploy/activate-release.sh`, `deploy/systemd/quadball-timer.service`, `package.json`, `src/index.ts`, and the internal-health implementation and tests.
 - The production GitHub environment, Actions variables and secret names, and recent deployment runs. Secret values were not accessed.
 - The source-of-truth Caddy route and documented server state in `infra-caddy`.
 - The accepted SQM production acceptance and rehearsal plan.
@@ -46,7 +50,7 @@ The remaining gaps are production controls and evidence: production has no appro
 
 ### 2. Separate production promotion from ordinary `main` pushes
 
-- Keep CI on every push, but require an explicit production promotion of the accepted release candidate after feature completion on the afternoon of 13 August and before the joint go/no-go decision on the evening of 14 August. Use required reviewers on the GitHub `production` environment or an equivalent manual promotion gate if environment reviewers are unavailable.
+- Keep CI and Test Activation on every eligible push, but require the separate manual Production Promotion of the exact Test-validated Release Bundle. Use a required reviewer on the GitHub `production` Environment; the single-operator SQM setup permits `netzhuffle` self-approval and never promotes on timeout.
 - Preserve the non-cancelling production concurrency group.
 - Record the exact approved commit, artifact digest, deployment run, and live release identity in the durable acceptance record.
 - From feature freeze through SQM, do not deploy merely because documentation or unrelated code lands on `main`. No event-day deployment is planned; an exceptional event-day deploy or rollback remains the repository maintainer's onsite judgment.
@@ -122,7 +126,7 @@ These checks require the deployed server and, where noted, a deliberate outage. 
 On 12 July 2026:
 
 - the latest production workflow run for commit `92f49ace0a3f1b1084dd9ba4f325664bfe5e1580` completed successfully;
-- the production environment had no protection rules;
+- the production environment had no protection rules at audit time; the current SQM policy is recorded above;
 - repository Actions variables matched `/srv/quadball-timer`, `quadball-timer`, and port `3000`, and the four expected deploy secret names existed;
 - the public root returned `200` with the expected security headers;
 - `/internal/healthz` returned public `404`;

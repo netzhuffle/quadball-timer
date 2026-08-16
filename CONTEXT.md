@@ -372,3 +372,25 @@ _Avoid_: Finalization, inactivity timeout
 **Official Score Sheet**:
 The paper record signed by referees after a game and treated as authoritative for the event. The app's Game Timeline and Control Audit Trail support live operations but do not replace it.
 _Avoid_: Game Timeline, Control Audit Trail
+
+## Deployment Language
+
+**Release Bundle**:
+An immutable deployable candidate whose bytes and provenance are fixed as one unit. A Release Bundle is identified by its exact source and attempt provenance.
+_Avoid_: build, deployment package, latest artifact
+
+**Test Activation**:
+The automatic validation of a Release Bundle in the disposable Test Environment after an eligible merge to `main`.
+_Avoid_: Test promotion, Test deployment candidate
+
+**Promotion Source Run**:
+The successful validation record whose Test Activation certified the Release Bundle selected for Production Promotion.
+_Avoid_: latest run, source build, production run
+
+**Production Promotion**:
+The manual transfer and activation of the exact Release Bundle validated by a Promotion Source Run, after the required Production Approval.
+_Avoid_: Production deploy, rebuild-and-deploy, hotfix push
+
+**Production Approval**:
+The explicit human review granted before a Production Promotion may activate its selected Release Bundle.
+_Avoid_: automatic approval, deployment confirmation
