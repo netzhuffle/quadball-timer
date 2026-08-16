@@ -1473,6 +1473,9 @@ describe("Event Game Controller reconnect browser seam", () => {
 
     expect(refreshCalls).toBe(0);
     expect(container.textContent).toContain("Controller Device: game-browser");
+    const restoredHeader = container.querySelector('[aria-label="Controller header"]');
+    expect(restoredHeader?.textContent).toContain("Pitch 2 · QF-07");
+    expect(restoredHeader?.textContent).toContain("Championship");
     Object.defineProperty(testWindow.navigator, "onLine", { configurable: true, value: true });
     await act(async () => {
       testWindow.dispatchEvent(new testWindow.Event("online"));
@@ -1884,26 +1887,33 @@ describe("Event Game Controller reconnect browser seam", () => {
   test("observes the literal 5,000 ms status boundary before foreground reconciliation", async () => {
     const probe = installControllerIntervalProbe();
     await enterAndOpen();
-    const status = container.querySelector<HTMLElement>("[data-controller-freshness]");
-    expect(status?.getAttribute("role")).toBe("status");
-    expect(status?.getAttribute("aria-live")).toBe("polite");
+    expect(container.querySelector("[data-controller-freshness]")).toBeNull();
     expect(CONTROLLER_STALE_DISCONNECTED_AFTER_MS).toBe(5_000);
     monotonicNow = 4_999;
     await act(async () => probe.tick());
-    expect(status?.textContent).toContain("fresh");
+    expect(container.querySelector("[data-controller-warning]")).toBeNull();
     monotonicNow = 5_000;
     await act(async () => probe.tick());
-    expect(status?.textContent).toContain("stale");
+    expect(container.querySelector("[data-controller-warning]")?.textContent).toContain(
+      "Connection stale",
+    );
+    expect(container.querySelector("[data-controller-warning]")?.textContent).not.toContain(
+      "Offline",
+    );
     monotonicNow = 5_001;
     await act(async () => probe.tick());
-    expect(status?.textContent).toContain("stale");
+    expect(container.querySelector("[data-controller-warning]")?.textContent).toContain(
+      "Connection stale",
+    );
     refreshMode = "deferred";
     await act(async () => {
       document.dispatchEvent(new testWindow.Event("visibilitychange") as unknown as Event);
       await Promise.resolve();
     });
     expect(refreshCalls).toBe(1);
-    expect(status?.textContent).toContain("stale");
+    expect(container.querySelector("[data-controller-warning]")?.textContent).toContain(
+      "Connection stale",
+    );
     const pendingRefresh = deferredRefresh;
     const pendingResponse = deferredRefreshResponse;
     expect(pendingRefresh).not.toBeNull();
@@ -1913,7 +1923,7 @@ describe("Event Game Controller reconnect browser seam", () => {
       await Promise.resolve();
       await Promise.resolve();
     });
-    expect(status?.textContent).toContain("fresh");
+    expect(container.querySelector("[data-controller-warning]")).toBeNull();
     await act(async () => {
       root.unmount();
       await Promise.resolve();
@@ -1934,10 +1944,12 @@ describe("Event Game Controller reconnect browser seam", () => {
     Object.defineProperty(testWindow.navigator, "onLine", { configurable: true, value: true });
     monotonicNow = 4_999;
     await act(async () => probe.tick());
-    expect(container.querySelector("[data-controller-freshness]")?.textContent).toContain("fresh");
+    expect(container.querySelector("[data-controller-warning]")).toBeNull();
     monotonicNow = 5_000;
     await act(async () => probe.tick());
-    expect(container.querySelector("[data-controller-freshness]")?.textContent).toContain("stale");
+    expect(container.querySelector("[data-controller-warning]")?.textContent).toContain(
+      "Connection stale",
+    );
     await act(async () => {
       root.unmount();
       await Promise.resolve();
@@ -2306,6 +2318,11 @@ function projection(
   if (defaultProjection) baseline.gameTimeMs = 12_000;
   return {
     eventGameId,
+    identity: {
+      pitchName: "Pitch 2",
+      gameCode: "QF-07",
+      gameDesignation: "Championship",
+    },
     phase: defaultProjection || options.commenced !== false ? "in-progress" : "scheduled",
     scoreByGameSide: defaultProjection
       ? { "side-a": 10, "side-b": 0 }

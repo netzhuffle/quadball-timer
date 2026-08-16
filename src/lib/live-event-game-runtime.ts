@@ -293,6 +293,20 @@ export async function openLiveEventGameRuntime(input: {
           const team = transaction.findEventTeam(eventTeamId);
           return team?.eventId === eventId ? team.name : null;
         }),
+      resolveEventGameIdentity: async (root) =>
+        storage.transaction((transaction) => {
+          const game = transaction.findEventGame?.(root.eventGameId);
+          const pitchSlot = transaction.findPitchSlot?.(root.externalScope.pitchSlotId);
+          const pitch =
+            pitchSlot === null || pitchSlot === undefined
+              ? null
+              : transaction.findPitch?.(pitchSlot.pitchId);
+          return {
+            pitchName: pitch?.name ?? null,
+            gameCode: game?.gameCode ?? null,
+            gameDesignation: game?.gameDesignation ?? null,
+          };
+        }),
       acceptance,
       grantAuthority: authority,
       clock,

@@ -490,6 +490,11 @@ export type LiveEventGuardrailExplanation = {
 
 export type ControllerProjection = {
   eventGameId: string;
+  identity?: {
+    pitchName: string | null;
+    gameCode: string | null;
+    gameDesignation: string | null;
+  };
   phase: EventGameLifecyclePhase;
   scoreByGameSide: Readonly<Record<string, number>>;
   goalCount: number;
@@ -631,6 +636,9 @@ export type LiveEventGameControlOptions = {
     eventId: string,
     eventTeamId: string,
   ) => string | null | Promise<string | null>;
+  resolveEventGameIdentity?: (
+    root: EventGameRecordRoot,
+  ) => ControllerProjection["identity"] | null | Promise<ControllerProjection["identity"] | null>;
   /** Production composition seam backed by the Event Admin catalog snapshot. */
   readHeatStoppageConfiguration?: (
     scope: HeatStoppageConfigurationScope,
@@ -3256,6 +3264,7 @@ export function createLiveEventGameControl(options: LiveEventGameControlOptions)
         root.lifecycle.commencedAtMs === null ? latestRunningClockStart(derived.gameFacts) : null;
       const controllerProjection: ControllerProjection = {
         eventGameId: root.eventGameId,
+        identity: (await options.resolveEventGameIdentity?.(root)) ?? undefined,
         phase: derived.phase,
         scoreByGameSide: structuredClone(derived.scoreByGameSide),
         goalCount: derived.goalCount,

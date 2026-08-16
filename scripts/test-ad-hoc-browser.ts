@@ -98,7 +98,7 @@ async function run() {
         second.setDefaultTimeout(15_000);
 
         await first.addInitScript(() => {
-          const evidence = { sawBusy: false, sawOffline: false };
+          const evidence = { sawBusy: false, sawOffline: false, sawInitialQrFocus: false };
           const inspect = () => {
             const text = document.body?.textContent ?? "";
             evidence.sawBusy ||= /Ad Hoc connection busy/u.test(text);
@@ -113,6 +113,14 @@ async function run() {
             });
             inspect();
           };
+          document.addEventListener("focusin", (event) => {
+            if (
+              event.target instanceof HTMLElement &&
+              event.target.getAttribute("aria-label") === "Show Ad Hoc Control QR"
+            ) {
+              evidence.sawInitialQrFocus = true;
+            }
+          });
           if (document.body === null) {
             document.addEventListener("DOMContentLoaded", install, { once: true });
           } else {
@@ -127,13 +135,14 @@ async function run() {
         await first.goto(origin);
         await first.getByRole("button", { name: /Start an Ad Hoc Game/ }).click();
         await first.waitForURL(/\/game\/adhoc-/u);
-        await first.getByText("Live", { exact: true }).waitFor();
+        await waitForHealthyControllerHeader(first);
         const initialConnectionEvidence = await first.evaluate(() => {
           const evidence = (
             window as typeof window & {
               __quadballTimerInitialAdHocConnectionEvidence?: {
                 sawBusy: boolean;
                 sawOffline: boolean;
+                sawInitialQrFocus: boolean;
               };
             }
           ).__quadballTimerInitialAdHocConnectionEvidence;
@@ -143,6 +152,9 @@ async function run() {
         });
         if (initialConnectionEvidence.sawBusy || initialConnectionEvidence.sawOffline) {
           throw new Error("Newly created Test-shaped Ad Hoc Game did not reach Live cleanly.");
+        }
+        if (initialConnectionEvidence.sawInitialQrFocus) {
+          throw new Error("Ad Hoc Control QR trigger received focus during initial page load.");
         }
         await assertAccessibleQr(first, "creator");
 
@@ -226,15 +238,19 @@ async function run() {
         await stopServer();
         await second.getByRole("button", { name: "Pause game" }).click();
         await second.getByRole("button", { name: "Start game" }).click();
-        await second.getByText(/Offline 2/u).waitFor();
+        await second.getByText(/Offline · 2 queued actions/u).waitFor();
         await startServer();
-        await second.getByText("Live", { exact: true }).waitFor();
+        await waitForHealthyControllerHeader(second);
         await first.getByText("Running", { exact: true }).waitFor();
         await second.getByRole("button", { name: "Pause game" }).click();
         await second.getByRole("button", { name: "Game end" }).click();
         await second.getByRole("button", { name: "Double forfeit" }).click();
         await second.getByText("Finished", { exact: true }).waitFor();
-        await first.getByText("new admission is paused.", { exact: false }).waitFor();
+        await first.waitForFunction(
+          () =>
+            document.querySelector('button[aria-label="Show Ad Hoc Control QR"]') === null &&
+            !document.body.textContent?.includes("Share Ad Hoc Control"),
+        );
         await second.getByRole("button", { name: "Correct back to unfinished" }).click();
         await waitForUnfinishedGame(second, gameId);
 
@@ -266,7 +282,7 @@ async function run() {
         await stopServer();
         await secondContext.setOffline(true);
         await second.getByRole("button", { name: "Start game" }).click();
-        await second.getByText(/Offline 1/u).waitFor();
+        await second.getByText(/Offline · 1 queued action/u).waitFor();
         replaceAdHocDatabaseFromSnapshot(recoverySnapshotPath);
         await startServer();
         await first.reload();
@@ -286,11 +302,11 @@ async function run() {
         if (restoredServerState.game?.state?.isRunning !== false) {
           throw new Error("Restored server state was silently overwritten by newer local state.");
         }
-        await second.getByText(/Offline 1/u).waitFor();
+        await second.getByText(/Offline · 1 queued action/u).waitFor();
         await secondContext.setOffline(false);
         await second.reload();
         await waitForGameRoute(second, gameId);
-        await second.getByText("Live", { exact: true }).waitFor();
+        await waitForHealthyControllerHeader(second);
         await first.getByText("Running", { exact: true }).waitFor();
         await second.getByRole("button", { name: "Pause game" }).click();
         await first.getByText("Paused", { exact: true }).waitFor();
@@ -298,7 +314,7 @@ async function run() {
         await second.getByRole("button", { name: "Start game" }).click();
         await first.getByText("Running", { exact: true }).waitFor();
         await second.getByRole("button", { name: "Pause game" }).click();
-        const leaveButton = second.getByRole("button", { name: "Leave", exact: true });
+        const leaveButton = second.getByRole("button", { name: "Leave Ad Hoc Game Controller" });
         await leaveButton.click();
         await second.getByRole("dialog").waitFor();
         await second.getByRole("dialog").press("Escape");
@@ -322,7 +338,7 @@ async function run() {
 
         // An Ad Hoc returnable session must use the same shared replacement
         // confirmation before an Event admission transport is touched.
-        await second.getByRole("button", { name: "Leave", exact: true }).click();
+        await second.getByRole("button", { name: "Leave Ad Hoc Game Controller" }).click();
         await second.getByRole("dialog").getByRole("button", { name: "Leave game" }).click();
         await second.waitForURL(`${origin}/`);
         let eventOpenCalls = 0;
@@ -404,7 +420,7 @@ async function run() {
           creationOrder.slice(0, creationIndex).some((entry) => entry !== "finalize")
         )
           throw new Error(`Ad Hoc creation order was ${creationOrder.join(",")}.`);
-        await creationPage.getByRole("button", { name: "Leave", exact: true }).click();
+        await creationPage.getByRole("button", { name: "Leave Ad Hoc Game Controller" }).click();
         await creationPage.getByRole("dialog").getByRole("button", { name: "Leave game" }).click();
         await creationPage.waitForURL(`${origin}/`);
         const admissionStorageState = await creationContext.storageState();
@@ -457,7 +473,7 @@ async function run() {
         await startServer();
         await first.reload();
         await waitForGameRoute(first, gameId);
-        await first.getByText("Live", { exact: true }).waitFor();
+        await waitForHealthyControllerHeader(first);
         await first.waitForTimeout(250);
         const retryContext = await browser!.newContext({
           ignoreHTTPSErrors: true,
@@ -467,16 +483,34 @@ async function run() {
         retryPage.setDefaultTimeout(15_000);
         await retryPage.goto(handoffUrl);
         await waitForGameRoute(retryPage, gameId);
-        await retryPage.getByText(/Ad Hoc connection busy/u).waitFor();
+        const busyWarning = retryPage.locator('[data-controller-warning="true"]');
+        await busyWarning.waitFor();
+        const busyWarningText = (await busyWarning.textContent()) ?? "";
+        if (
+          !busyWarningText.includes("Offline") ||
+          !busyWarningText.includes("Ad Hoc connection busy")
+        ) {
+          throw new Error(
+            `Busy retry was not composed into the shared warning: ${busyWarningText}`,
+          );
+        }
+        if (
+          (await retryPage
+            .locator('p[role="status"]')
+            .filter({ hasText: /Ad Hoc connection busy/u })
+            .count()) !== 0
+        ) {
+          throw new Error("Busy retry rendered a duplicate Ad Hoc connection status.");
+        }
         await first.close();
-        await retryPage.getByText("Live", { exact: true }).waitFor();
+        await waitForHealthyControllerHeader(retryPage);
 
         await stopServer();
         rmSync(databasePath, { force: true });
         await startServer();
         await retryPage.reload();
         await waitForGameRoute(retryPage, gameId);
-        await retryPage.getByText("Local", { exact: true }).waitFor();
+        await retryPage.locator('[data-controller-warning="true"]').waitFor();
         await retryPage
           .getByText("Server does not know this game", { exact: false })
           .first()
@@ -517,7 +551,7 @@ async function run() {
         victim.setDefaultTimeout(15_000);
         await victim.goto(`${origin}/game/${victimGameId}`);
         await waitForGameRoute(victim, victimGameId);
-        await victim.getByText("Local", { exact: true }).waitFor();
+        await victim.locator('[data-controller-warning="true"]').waitFor();
         await victim
           .getByText("Server does not know this game", { exact: false })
           .first()
@@ -531,7 +565,7 @@ async function run() {
         }
         await victim.reload();
         await waitForGameRoute(victim, victimGameId);
-        await victim.getByText("Local", { exact: true }).waitFor();
+        await victim.locator('[data-controller-warning="true"]').waitFor();
         await victim
           .getByText("Server does not know this game", { exact: false })
           .first()
@@ -726,9 +760,28 @@ async function waitForGameRoute(page: Page, gameId: string) {
   if (page.url() !== `${origin}/game/${gameId}`) await page.waitForURL(`${origin}/game/${gameId}`);
 }
 
+async function waitForHealthyControllerHeader(page: Page) {
+  const header = page.getByRole("region", { name: "Controller header" });
+  await header.waitFor();
+  await page.waitForFunction(() => document.querySelector("[data-controller-warning]") === null);
+}
+
 async function assertAccessibleQr(page: Page, stage: string) {
   try {
+    const viewport = stage.includes("second")
+      ? { width: 412, height: 915 }
+      : { width: 390, height: 844 };
+    await page.setViewportSize(viewport);
     const trigger = page.getByRole("button", { name: "Show Ad Hoc Control QR" });
+    const leave = page.getByRole("button", { name: "Leave Ad Hoc Game Controller" });
+    const triggerBox = await trigger.boundingBox();
+    const leaveBox = await leave.boundingBox();
+    if (triggerBox === null || leaveBox === null)
+      throw new Error("header controls were not laid out");
+    if (triggerBox.width < 44 || triggerBox.height < 44) throw new Error("QR target was too small");
+    if (leaveBox.width < 44 || leaveBox.height < 44) throw new Error("Leave target was too small");
+    if (Math.abs(triggerBox.x + triggerBox.width - leaveBox.x) < 8)
+      throw new Error("QR and Leave controls were directly adjacent");
     await trigger.click();
     const dialog = page.getByRole("dialog", { name: "Ad Hoc Control QR dialog" });
     if ((await dialog.getAttribute("aria-modal")) !== "true")
@@ -746,7 +799,7 @@ async function assertAccessibleQr(page: Page, stage: string) {
     await page.waitForFunction(
       () =>
         document.activeElement?.tagName === "BUTTON" &&
-        document.activeElement?.textContent?.trim() === "Show Ad Hoc Control QR",
+        document.activeElement?.getAttribute("aria-label") === "Show Ad Hoc Control QR",
     );
     if (!(await trigger.evaluate((element) => element === document.activeElement))) {
       throw new Error("Escape did not restore focus to the QR trigger");
@@ -758,7 +811,7 @@ async function assertAccessibleQr(page: Page, stage: string) {
     await page.waitForFunction(
       () =>
         document.activeElement?.tagName === "BUTTON" &&
-        document.activeElement?.textContent?.trim() === "Show Ad Hoc Control QR",
+        document.activeElement?.getAttribute("aria-label") === "Show Ad Hoc Control QR",
     );
     if (!(await trigger.evaluate((element) => element === document.activeElement))) {
       throw new Error("Close did not restore focus to the QR trigger");

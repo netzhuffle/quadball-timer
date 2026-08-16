@@ -503,6 +503,50 @@ describe("Controller reconnect replica", () => {
     );
   });
 
+  test("round-trips and strictly validates projected Event header identity", () => {
+    const state = createReplica();
+    state.authoritativeProjection.identity = {
+      pitchName: "Pitch 2",
+      gameCode: "QF-07",
+      gameDesignation: "Championship",
+    };
+    state.projection.identity = state.authoritativeProjection.identity;
+
+    const restored = parseControllerReplica(
+      JSON.parse(serializeControllerReplica(state)),
+      "game-1",
+    );
+    expect(restored.authoritativeProjection.identity).toEqual({
+      pitchName: "Pitch 2",
+      gameCode: "QF-07",
+      gameDesignation: "Championship",
+    });
+    expect(restored.projection.identity).toEqual(restored.authoritativeProjection.identity);
+
+    const missingField = JSON.parse(serializeControllerReplica(state)) as Record<string, any>;
+    delete missingField.projection.identity.gameCode;
+    expect(() => parseControllerReplica(missingField, "game-1")).toThrow(
+      "projection.identity.gameCode",
+    );
+    const invalidField = JSON.parse(serializeControllerReplica(state)) as Record<string, any>;
+    invalidField.projection.identity.gameCode = 7;
+    expect(() => parseControllerReplica(invalidField, "game-1")).toThrow(
+      "projection.identity.gameCode",
+    );
+
+    const absentIdentity = JSON.parse(serializeControllerReplica(state)) as Record<string, any>;
+    delete absentIdentity.projection.identity;
+    expect(() => parseControllerReplica(absentIdentity, "game-1")).toThrow(
+      "optimistic projection is inconsistent",
+    );
+
+    const differentIdentity = JSON.parse(serializeControllerReplica(state)) as Record<string, any>;
+    differentIdentity.projection.identity.pitchName = "Pitch 9";
+    expect(() => parseControllerReplica(differentIdentity, "game-1")).toThrow(
+      "optimistic projection is inconsistent",
+    );
+  });
+
   test("rejects malformed, duplicate, and unknown causal predecessors without weakening the action", () => {
     const state = createReplica();
     const candidate = goal("goal-a", "fact-a");
