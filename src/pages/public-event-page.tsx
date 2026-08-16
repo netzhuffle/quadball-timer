@@ -354,7 +354,7 @@ export function PublicEventGamePage({
   }, [game]);
 
   if (unavailable) return <GameUnavailablePanel eventId={eventId} />;
-  if (game === null) {
+  if (game === null || game.spectatorAvailable === false) {
     if (event !== null) return <GameUnavailablePanel eventId={eventId} />;
     return (
       <PublicShell title="Live spectator Game" description="Loading public Game information…">
@@ -800,25 +800,29 @@ function GameCard({
         <div className="flex flex-wrap items-start justify-between gap-2">
           <div>
             <h3 className={compact ? "text-base font-semibold" : "text-lg font-semibold"}>
-              <a
-                href={game.canonicalPath}
-                className="rounded-sm underline-offset-4 hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
-                onClick={(click) => {
-                  if (
-                    click.button !== 0 ||
-                    click.metaKey ||
-                    click.ctrlKey ||
-                    click.shiftKey ||
-                    click.altKey
-                  )
-                    return;
-                  click.preventDefault();
-                  navigateTo(game.canonicalPath);
-                }}
-              >
-                {game.gameDesignation ?? game.gameCode ?? "Scheduled Game"}
-                <span className="sr-only"> Open spectator Game</span>
-              </a>
+              {game.spectatorAvailable === false ? (
+                <span>{game.gameDesignation ?? game.gameCode ?? "Scheduled Game"}</span>
+              ) : (
+                <a
+                  href={game.canonicalPath}
+                  className="rounded-sm underline-offset-4 hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+                  onClick={(click) => {
+                    if (
+                      click.button !== 0 ||
+                      click.metaKey ||
+                      click.ctrlKey ||
+                      click.shiftKey ||
+                      click.altKey
+                    )
+                      return;
+                    click.preventDefault();
+                    navigateTo(game.canonicalPath);
+                  }}
+                >
+                  {game.gameDesignation ?? game.gameCode ?? "Scheduled Game"}
+                  <span className="sr-only"> Open spectator Game</span>
+                </a>
+              )}
             </h3>
             {game.gameDesignation !== null && game.gameCode !== null ? (
               <CardDescription>Game {game.gameCode}</CardDescription>

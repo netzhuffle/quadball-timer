@@ -36,6 +36,8 @@ import {
 import { createInitialClockBaseline, projectClockBaseline } from "@/lib/clock-authority";
 import type { ClockProjection } from "@/lib/clock-authority";
 import { createInitialGamePresentation } from "@/lib/game-presentation-projection";
+import { createInitialGameState } from "@/lib/game-engine";
+import type { GameView } from "@/lib/game-types";
 
 const authority = createTechnicalAdminAuth(
   { environment: "test", origin: "https://timer.example", rpId: "timer.example" },
@@ -785,7 +787,44 @@ describe("Audience Publication Projection", () => {
         timeZone: "Europe/Zurich",
         gameDays: ["2026-08-16"],
         lifecycle: "current",
-        schedule: { scheduleGames: [] },
+        schedule: {
+          scheduleGames: [
+            {
+              eventGameId: "secret1",
+              gameDesignation: "9:30",
+              sideA: {
+                name: "Basel Basilisks / Luzern",
+                color: "#16a34a",
+              },
+              sideB: {
+                name: "Berner Boggarts",
+                color: "#7f1d1d",
+              },
+              spectatorAvailable: false,
+            },
+            {
+              eventGameId: "secret2",
+              gameDesignation: "10:30",
+              sideA: { name: "Turicum Thunderbirds", color: "#facc15" },
+              sideB: { name: "Berner Boggarts", color: "#7f1d1d" },
+              spectatorAvailable: false,
+            },
+            {
+              eventGameId: "secret3",
+              gameDesignation: "11:30",
+              sideA: { name: "Turicum Thunderbirds", color: "#facc15" },
+              sideB: { name: "Basel Basilisks / Luzern", color: "#16a34a" },
+              spectatorAvailable: false,
+            },
+            {
+              eventGameId: "secret4",
+              gameDesignation: "13:00",
+              sideA: { name: "Friendlies", color: "#00afe8" },
+              sideB: { name: "Kidditch", color: "#ff4d35" },
+              spectatorAvailable: false,
+            },
+          ],
+        },
       },
     });
 
@@ -794,6 +833,46 @@ describe("Audience Publication Projection", () => {
     });
     const pastResult = await past.read("sqm-2026");
     expect(pastResult).toMatchObject({ status: "accepted", value: { lifecycle: "past" } });
+  });
+
+  test("publishes only created SQM fixture games and keeps uncreated rows anonymous", async () => {
+    const storage = {
+      snapshot: async () => ({ listEvents: () => [] }),
+    } as unknown as EventCatalogFoundationStorage;
+    const game: GameView = {
+      state: createInitialGameState({
+        id: "adhoc-secret2",
+        nowMs: Date.parse("2026-08-16T08:30:00.000Z"),
+        homeName: "Turicum Thunderbirds",
+        awayName: "Berner Boggarts",
+        homeColor: "#facc15",
+        awayColor: "#7f1d1d",
+      }),
+      seekerReleaseCountdownMs: null,
+      seekerReleased: false,
+      timeoutReminderActive: false,
+      timeoutWarningActive: false,
+      timeoutFinalCountdown: false,
+    };
+    const audience = createAudienceProjection(storage, {
+      now: () => Date.parse("2026-08-16T10:00:00.000Z"),
+      sqmFixtureGame: {
+        read: async (fixtureKey) =>
+          fixtureKey === "secret2" ? { gameId: "adhoc-secret2", game } : null,
+      },
+    });
+
+    const accepted = await audience.readGame("sqm-2026", "secret2");
+    expect(accepted).toMatchObject({
+      status: "accepted",
+      value: {
+        eventGameId: "secret2",
+        spectatorAvailable: true,
+        sideA: { name: "Turicum Thunderbirds", color: "#facc15" },
+        sideB: { name: "Berner Boggarts", color: "#7f1d1d" },
+      },
+    });
+    expect(await audience.readGame("sqm-2026", "secret1")).toEqual({ status: "unavailable" });
   });
 
   test("lists only Published Events and classifies them in each Event timezone", async () => {

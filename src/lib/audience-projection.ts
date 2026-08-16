@@ -18,7 +18,15 @@ import {
 } from "@/lib/live-event-game-control";
 import type { ClockProjection } from "@/lib/clock-authority";
 import type { GamePresentation } from "@/lib/game-presentation";
-import { createSqmFixtureEvent, SQM_FIXTURE_EVENT_ID } from "@/lib/sqm-fixture";
+import type { GameView } from "@/lib/game-types";
+import {
+  createSqmFixtureEvent,
+  createSqmFixtureGameProjection,
+  createSqmFixtureSchedule,
+  SQM_FIXTURE_EVENT_ID,
+  SQM_FIXTURE_GAMES,
+  type SqmFixtureKey,
+} from "@/lib/sqm-fixture";
 
 export type PublicAudienceEventLifecycle = "unscheduled" | "current" | "future" | "past";
 
@@ -129,6 +137,7 @@ export type PublicAudienceGameProjection = PublicAudienceGameOperationalProjecti
     displayedTeamColors: { sideA: string | null; sideB: string | null };
   };
   canonicalPath: string;
+  spectatorAvailable?: boolean;
   timeline: readonly PublicAudienceTimelineEntry[];
   /** Temporary neutral notice; correction evidence and provenance stay private. */
   teamAssignmentNotice?: "event-team-assignment-corrected";
@@ -208,6 +217,9 @@ export type AudienceProjectionListOutcome =
 export type AudienceProjectionOptions = {
   now?: () => number;
   gameInput?: AudienceProjectionGameInputReader;
+  sqmFixtureGame?: {
+    read(fixtureKey: SqmFixtureKey): Promise<{ gameId: string; game: GameView } | null>;
+  };
 };
 
 export type AudienceProjectionReader = {
@@ -241,7 +253,10 @@ export function createAudienceProjection(
       if (typeof eventId !== "string" || eventId.trim().length === 0)
         return { status: "unavailable" };
       if (eventId === SQM_FIXTURE_EVENT_ID) {
-        return { status: "accepted", value: createSqmFixtureEvent(now()) };
+        return {
+          status: "accepted",
+          value: await projectSqmFixtureEvent(now(), options.sqmFixtureGame),
+        };
       }
       try {
         const snapshot = await storage.snapshot();
@@ -266,6 +281,15 @@ export function createAudienceProjection(
       )
         return { status: "unavailable" };
       try {
+        if (eventId === SQM_FIXTURE_EVENT_ID) {
+          const event = await projectSqmFixtureEvent(now(), options.sqmFixtureGame);
+          const game = event.schedule.scheduleGames.find(
+            (candidate) => candidate.eventGameId === eventGameId,
+          );
+          return game?.spectatorAvailable === true
+            ? { status: "accepted", value: game }
+            : { status: "unavailable" };
+        }
         const snapshot = await storage.snapshot();
         const event = snapshot.findEvent(eventId);
         const game = snapshot.findEventGame(eventGameId);
@@ -306,7 +330,7 @@ export function createAudienceProjection(
         );
         const events = catalogEvents.some((event) => event.eventId === SQM_FIXTURE_EVENT_ID)
           ? catalogEvents
-          : [...catalogEvents, createSqmFixtureEvent(nowMs)];
+          : [...catalogEvents, await projectSqmFixtureEvent(nowMs, options.sqmFixtureGame)];
         return {
           status: "accepted",
           value: { events: sortPublicEvents(events) },
@@ -316,6 +340,24 @@ export function createAudienceProjection(
       }
     },
   };
+}
+
+async function projectSqmFixtureEvent(
+  nowMs: number,
+  reader: AudienceProjectionOptions["sqmFixtureGame"],
+): Promise<PublicAudienceEventProjection> {
+  const games = await Promise.all(
+    SQM_FIXTURE_GAMES.map(async (definition) => {
+      const current = reader === undefined ? null : await reader.read(definition.key);
+      return createSqmFixtureGameProjection(
+        definition,
+        current?.game ?? null,
+        current?.gameId ?? null,
+        nowMs,
+      );
+    }),
+  );
+  return createSqmFixtureEvent(nowMs, createSqmFixtureSchedule(games, nowMs));
 }
 
 async function projectPublicEvent(
