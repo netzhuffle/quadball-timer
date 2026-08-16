@@ -725,6 +725,57 @@ describe("Ad Hoc SQLite focused integration", () => {
     }
   });
 
+  test("backs up a previous compatible schema before the next activation migration", async () => {
+    const root = await mkdtemp(join(tmpdir(), "quadball-timer-adhoc-legacy-recovery-focused-"));
+    const databasePath = join(root, "ad-hoc.sqlite");
+    const snapshotPath = join(root, "snapshot.sqlite");
+    try {
+      const database = new Database(databasePath, { create: true, strict: true });
+      database.exec(`
+        CREATE TABLE adhoc_schema (id INTEGER PRIMARY KEY CHECK (id = 1), version INTEGER NOT NULL);
+        INSERT INTO adhoc_schema (id, version) VALUES (1, 4);
+        CREATE TABLE adhoc_games (
+          game_id TEXT PRIMARY KEY,
+          environment_identity TEXT NOT NULL DEFAULT '',
+          created_at_ms INTEGER NOT NULL,
+          state_json TEXT NOT NULL,
+          initial_state_json TEXT NOT NULL,
+          replay_baseline_operation_ids_json TEXT NOT NULL DEFAULT '[]',
+          control_qr TEXT NOT NULL,
+          control_qr_hash TEXT NOT NULL,
+          sessions_json TEXT NOT NULL,
+          operations_json TEXT NOT NULL
+        );
+        CREATE TABLE adhoc_creation_events (
+          source_hash TEXT NOT NULL,
+          successful INTEGER NOT NULL,
+          occurred_at_ms INTEGER NOT NULL,
+          retry_until_ms INTEGER
+        );
+      `);
+      database.close();
+
+      const recovery = createSqliteAdHocRecoveryAdapter(databasePath, "production");
+      const facts = await recovery.createRecoveryVacuumSnapshot(snapshotPath);
+      expect(facts).toMatchObject({
+        schemaVersion: 4,
+        environmentIdentity: "production",
+        retainedGameCount: 0,
+        creationEventCount: 0,
+      });
+      await expect(recovery.verifyRecoverySnapshot(snapshotPath, facts)).resolves.toEqual(facts);
+
+      const futureDatabase = new Database(databasePath, { create: false, strict: true });
+      futureDatabase.run("UPDATE adhoc_schema SET version = 6 WHERE id = 1");
+      futureDatabase.close();
+      await expect(
+        recovery.createRecoveryVacuumSnapshot(join(root, "future.sqlite")),
+      ).rejects.toThrow("Ad Hoc recovery database schema is incompatible.");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("requires authoritative Ad Hoc writeability for readiness", async () => {
     const root = await mkdtemp(join(tmpdir(), "quadball-timer-adhoc-readiness-focused-"));
     const databasePath = join(root, "ad-hoc.sqlite");
