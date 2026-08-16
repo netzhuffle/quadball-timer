@@ -169,6 +169,153 @@ describe("App", () => {
     });
   });
 
+  test("keeps the Home Return card visible when one current Event would auto-redirect", async () => {
+    testWindow.history.pushState(null, "", "/events");
+    testWindow.localStorage.setItem(
+      "quadball:controller-departure",
+      JSON.stringify({
+        version: "controller-departure-v1",
+        status: "returnable",
+        departure: {
+          workflow: "ad-hoc",
+          gameId: "adhoc-return",
+          navigationPath: "/game/adhoc-return",
+          identity: { title: "Ad Hoc Game", homeName: "Home", awayName: "Away" },
+        },
+        expiresAtMs: Date.now() + 300_000,
+        blockedGameIds: [],
+        pendingFinalizations: [],
+        reconciliationPending: [],
+      }),
+    );
+    const eventFetch = Object.assign(
+      async () =>
+        new Response(
+          JSON.stringify({
+            status: "accepted",
+            value: { events: [publishedEventProjection("event-1", "Current Event")] },
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      { preconnect: () => undefined },
+    );
+    globalThis.fetch = eventFetch as typeof fetch;
+    await act(async () => {
+      root.render(<App />);
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    });
+    expect(testWindow.location.pathname).toBe("/events");
+    expect(container.textContent).toContain("Return to Ad Hoc Game");
+  });
+
+  test("terminates the rendered Controller when Return reconciliation proves the Game unavailable", async () => {
+    testWindow.localStorage.setItem(
+      "quadball:controller-departure",
+      JSON.stringify({
+        version: "controller-departure-v1",
+        status: "returned",
+        blockedGameIds: [],
+        pendingFinalizations: [],
+        reconciliationPending: [
+          {
+            workflow: "ad-hoc",
+            gameId: "test-game",
+            navigationPath: "/game/test-game",
+            identity: { title: "Ad Hoc Game", homeName: "Home", awayName: "Away" },
+          },
+        ],
+      }),
+    );
+    const unavailableFetch = Object.assign(async () => new Response("Not found", { status: 404 }), {
+      preconnect: () => undefined,
+    });
+    globalThis.fetch = unavailableFetch as typeof fetch;
+    await act(async () => {
+      root.render(<App />);
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    });
+    expect(container.textContent).toContain("Ad Hoc Game unavailable.");
+    expect(container.querySelector('button[name="Start game"]')).toBeNull();
+  });
+
+  test("renders replacement confirmation on a different direct Game route before connecting", async () => {
+    testWindow.localStorage.setItem(
+      "quadball:controller-departure",
+      JSON.stringify({
+        version: "controller-departure-v1",
+        status: "returnable",
+        departure: {
+          workflow: "ad-hoc",
+          gameId: "adhoc-previous",
+          navigationPath: "/game/adhoc-previous",
+          identity: { title: "Ad Hoc Game", homeName: "Basel", awayName: "Zurich" },
+        },
+        expiresAtMs: Date.now() + 300_000,
+        blockedGameIds: [],
+        pendingFinalizations: [],
+        reconciliationPending: [],
+      }),
+    );
+    await act(async () => {
+      root.render(<App />);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(container.querySelector('[role="dialog"]')?.textContent).toContain(
+      "Leave the previous game?",
+    );
+    expect(container.textContent).toContain("Basel vs Zurich");
+    expect(MockWebSocket.instances).toHaveLength(0);
+  });
+
+  test("treats a direct route to the returnable Game as Return before connecting", async () => {
+    testWindow.localStorage.setItem(
+      "quadball:controller-departure",
+      JSON.stringify({
+        version: "controller-departure-v1",
+        status: "returnable",
+        departure: {
+          workflow: "ad-hoc",
+          gameId: "test-game",
+          navigationPath: "/game/test-game",
+          identity: { title: "Ad Hoc Game", homeName: "Home", awayName: "Away" },
+        },
+        expiresAtMs: Date.now() + 300_000,
+        blockedGameIds: [],
+        pendingFinalizations: [],
+        reconciliationPending: [],
+      }),
+    );
+    await act(async () => {
+      root.render(<App />);
+      for (let attempt = 0; attempt < 5; attempt += 1)
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    });
+
+    const stored = JSON.parse(
+      testWindow.localStorage.getItem("quadball:controller-departure") ?? "null",
+    ) as { status?: unknown } | null;
+    expect(stored?.status).toBe("returned");
+    expect(container.querySelector('[role="dialog"]')).toBeNull();
+    expect(container.textContent).toContain("Tap game time or team names to adjust.");
+  });
+
+  test("fails closed and clears a retained Ad Hoc replica when lifecycle storage is corrupt", async () => {
+    testWindow.localStorage.setItem("quadball:controller-departure", "{truncated");
+    testWindow.localStorage.setItem("quadball:ad-hoc-controller:test-game", "retained replica");
+    await act(async () => {
+      root.render(<App />);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(container.textContent).toContain("Ad Hoc Game unavailable.");
+    expect(testWindow.localStorage.getItem("quadball:ad-hoc-controller:test-game")).toBeNull();
+    expect(MockWebSocket.instances).toHaveLength(0);
+  });
+
   test("parses the stable public Event route", () => {
     expect(parseRoute("/events/event-123", "")).toEqual({
       type: "event",

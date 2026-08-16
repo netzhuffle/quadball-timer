@@ -33,6 +33,7 @@ const environment = {
 let server: Bun.Subprocess | null = null;
 let browser: Awaited<ReturnType<typeof chromium.launch>> | null = null;
 let currentProjection = createProjection();
+let openCalls = 0;
 
 try {
   const certificate = Bun.spawnSync([
@@ -71,6 +72,7 @@ try {
     await installControllerApi(context);
     const controller = await context.newPage();
     await completeSuspendReviewResume(controller);
+    await eventDepartureLifecycleEvidence(controller);
 
     const secondContext = await browser.newContext({ ignoreHTTPSErrors: true });
     await installControllerApi(secondContext);
@@ -106,7 +108,8 @@ async function completeSuspendReviewResume(page: Page) {
   await page.goto(`${origin}/event-control`);
   await page.getByLabel("Active Pitch Slot Control Grant QR").fill("disposable-grant");
   await page.getByRole("button", { name: "Open Event Game Controller" }).click();
-  await assertControllerSurface(page);
+  await page.getByText("Controller Device: game-browser-focused").waitFor();
+  await assertControllerSurface(page, "initial");
   await page.getByRole("button", { name: "Start game clock" }).click();
   await page.getByRole("button", { name: "Adjust game clock by plus 10 seconds" }).click();
   await page.getByLabel("Set game clock (milliseconds)").fill("123000");
@@ -146,16 +149,89 @@ async function completeSuspendReviewResume(page: Page) {
   await assertNoDocumentScroll(page);
 }
 
-async function assertControllerSurface(page: Page) {
-  const controls = await page.locator("main button").evaluateAll((buttons) =>
-    buttons.map((button) => ({
-      name: button.getAttribute("aria-label") ?? button.textContent?.trim() ?? "",
-      minHeight: Number.parseFloat(getComputedStyle(button).minHeight),
-    })),
+async function eventDepartureLifecycleEvidence(page: Page) {
+  const initialOpenCalls = openCalls;
+  await page.getByRole("button", { name: "Leave Event Game Controller session" }).click();
+  await page.getByRole("button", { name: "Leave game" }).click();
+  await page.waitForURL((url) => url.pathname === "/");
+  await page.getByRole("button", { name: "Return to game" }).click();
+  await page.waitForURL((url) => url.pathname === "/event-control");
+  await page.getByText("Controller Device: game-browser-focused").waitFor();
+  await assertControllerSurface(page, "returned");
+
+  // Admission into another Event Game must show the shared confirmation before
+  // the Event open transport can mutate authority.
+  await page.getByRole("button", { name: "Leave Event Game Controller session" }).click();
+  await page.getByRole("button", { name: "Leave game" }).click();
+  await page.waitForURL((url) => url.pathname === "/");
+  await page.evaluate(() => {
+    localStorage.removeItem("quadball:event-controller-session");
+    sessionStorage.removeItem("quadball:event-controller-session");
+  });
+  await page.goto(`${origin}/event-control`);
+  await page.getByLabel("Active Pitch Slot Control Grant QR").fill("replacement-grant");
+  await page.getByRole("button", { name: "Open Event Game Controller" }).click();
+  await page.getByRole("dialog", { name: "Leave the previous game?" }).waitFor();
+  assert(openCalls === initialOpenCalls, "confirmation did not precede the Event admission seam");
+  await page.getByRole("button", { name: "Cancel" }).click();
+  assert(openCalls === initialOpenCalls, "cancel mutated Event admission");
+  await page.getByRole("button", { name: "Open Event Game Controller" }).click();
+  await page.getByRole("button", { name: "Continue" }).click();
+  assert(openCalls === initialOpenCalls + 1, "confirmed Event admission did not reach transport");
+  await page.getByText("Controller Device: game-browser-focused").waitFor();
+  await assertControllerSurface(page, "replacement");
+
+  // Event→Ad Hoc replacement must finalize the Event bearer before the new
+  // Ad Hoc creation transport is allowed to run.
+  await page.getByRole("button", { name: "Leave Event Game Controller session" }).click();
+  await page.getByRole("button", { name: "Leave game" }).click();
+  await page.waitForURL((url) => url.pathname === "/");
+  const replacementOrder: string[] = [];
+  const recordReplacementRequest = (request: import("playwright").Request) => {
+    if (request.method() !== "POST") return;
+    const pathname = new URL(request.url()).pathname;
+    if (pathname.endsWith("/leave")) replacementOrder.push("finalize");
+    if (pathname === "/api/games") replacementOrder.push("create");
+  };
+  page.on("request", recordReplacementRequest);
+  const startAdHoc = page.getByRole("button", { name: /Start an Ad Hoc Game/ });
+  await startAdHoc.click();
+  await page.getByRole("dialog", { name: "Leave the previous game?" }).waitFor();
+  assert(
+    replacementOrder.length === 0,
+    "Event finalization started before replacement confirmation",
   );
-  assert(controls.length > 15, "production Controller control inventory was unexpectedly small");
+  await page.getByRole("dialog").getByRole("button", { name: "Cancel" }).click();
+  assert(replacementOrder.length === 0, "Cancelling Event→Ad Hoc mutated transport");
+  await startAdHoc.click();
+  const createRequest = page.waitForRequest(
+    (request) => request.method() === "POST" && new URL(request.url()).pathname === "/api/games",
+  );
+  await page.getByRole("dialog").getByRole("button", { name: "Continue" }).click();
+  await createRequest;
+  const createIndex = replacementOrder.indexOf("create");
+  assert(
+    createIndex > 0 &&
+      replacementOrder.slice(0, createIndex).every((entry) => entry === "finalize"),
+    `Event→Ad Hoc replacement order was ${replacementOrder.join(",")}`,
+  );
+  page.off("request", recordReplacementRequest);
+}
+
+async function assertControllerSurface(page: Page, label = "surface") {
+  const controls = await page.locator("button").evaluateAll((buttons) =>
+    buttons
+      .map((button) => ({
+        name: button.getAttribute("aria-label") ?? button.textContent?.trim() ?? "",
+        minHeight: Number.parseFloat(getComputedStyle(button).minHeight),
+      }))
+      .filter((control) => control.name.length > 0),
+  );
+  assert(
+    controls.length > 15,
+    `production Controller control inventory was unexpectedly small (${controls.length}) at ${page.url()} (${label})`,
+  );
   for (const control of controls) {
-    assert(control.name.length > 0, "production Controller control had no accessible name");
     assert(control.minHeight >= 44, `Controller control was below 44px: ${control.name}`);
   }
   await page.getByRole("region", { name: "Event Game Clock" }).waitFor();
@@ -188,6 +264,7 @@ async function installControllerApi(context: BrowserContext) {
     const url = new URL(route.request().url());
     const body = route.request().postDataJSON() as Record<string, unknown> | null;
     if (url.pathname.endsWith("/open")) {
+      openCalls += 1;
       await route.fulfill({
         contentType: "application/json",
         body: JSON.stringify({
@@ -224,6 +301,13 @@ async function installControllerApi(context: BrowserContext) {
       await route.fulfill({
         contentType: "application/json",
         body: JSON.stringify({ status: "revealed", qrCredential: "focused-revealed-qr" }),
+      });
+      return;
+    }
+    if (url.pathname.endsWith("/leave")) {
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({ status: "left" }),
       });
       return;
     }

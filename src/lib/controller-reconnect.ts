@@ -101,6 +101,8 @@ export type ControllerReplicaState = {
   version: typeof CONTROLLER_REPLICA_VERSION;
   workflow?: "event";
   eventGameId: string;
+  /** Non-secret local reference to the exact Event Grant Session owner. */
+  sessionReferenceId?: string;
   authoritativeProjection: ControllerProjection;
   projection: ControllerProjection;
   pendingActions: readonly PendingControllerAction[];
@@ -166,6 +168,7 @@ export function createControllerReplica(input: {
   projection: ControllerProjection;
   grantSessionId: string;
   grantVersion: string;
+  sessionReferenceId?: string;
   deviceId?: string;
   replicaGeneration?: string;
 }): ControllerReplicaState {
@@ -179,6 +182,9 @@ export function createControllerReplica(input: {
     version: CONTROLLER_REPLICA_VERSION,
     workflow: "event",
     eventGameId,
+    ...(input.sessionReferenceId === undefined
+      ? {}
+      : { sessionReferenceId: requireIdentifier(input.sessionReferenceId, "sessionReferenceId") }),
     authoritativeProjection: cloneProjection(input.projection),
     projection: cloneProjection(input.projection),
     pendingActions: [],
@@ -455,12 +461,14 @@ export function rebindControllerReplica(
   state: ControllerReplicaState,
   session: ControllerSessionAttachment,
   projection: ControllerProjection | null,
+  sessionReferenceId = state.sessionReferenceId,
 ): ControllerReplicaState {
   if (session.eventGameId !== state.eventGameId) {
     throw new Error("Controller session belongs to another Event Game.");
   }
   return reapplyPendingOptimisticActions({
     ...state,
+    ...(sessionReferenceId === undefined ? {} : { sessionReferenceId }),
     authoritativeProjection:
       projection === null ? state.authoritativeProjection : cloneProjection(projection),
     session: structuredClone(session),
@@ -524,6 +532,10 @@ export function parseControllerReplica(
   if (value.workflow !== undefined && value.workflow !== "event")
     throw new Error("Controller replica workflow is invalid.");
   const eventGameId = requireIdentifier(value.eventGameId, "eventGameId");
+  const sessionReferenceId =
+    value.sessionReferenceId === undefined
+      ? undefined
+      : requireIdentifier(value.sessionReferenceId, "sessionReferenceId");
   if (expectedEventGameId !== undefined && eventGameId !== expectedEventGameId) {
     throw new Error("Controller replica belongs to another Event Game.");
   }
@@ -557,6 +569,7 @@ export function parseControllerReplica(
     version: CONTROLLER_REPLICA_VERSION,
     workflow: "event",
     eventGameId,
+    ...(sessionReferenceId === undefined ? {} : { sessionReferenceId }),
     authoritativeProjection,
     projection,
     pendingActions,
@@ -643,6 +656,8 @@ export function validateControllerReplica(state: ControllerReplicaState): void {
   if (state.workflow !== undefined && state.workflow !== "event")
     throw new Error("Controller replica workflow is invalid.");
   requireIdentifier(state.eventGameId, "eventGameId");
+  if (state.sessionReferenceId !== undefined)
+    requireIdentifier(state.sessionReferenceId, "sessionReferenceId");
   parseProjection(state.authoritativeProjection);
   parseProjection(state.projection);
   if (

@@ -53,8 +53,23 @@ import {
   type ControllerReplayBatchResponse,
   type ControllerReplicaStorage,
 } from "@/lib/controller-reconnect";
+import {
+  ControllerLeaveDialog,
+  controllerDepartureReference,
+  useControllerDepartureEntry,
+} from "@/components/controller-departure";
+import {
+  controllerDepartureBlocksGame,
+  getBrowserControllerDeparture,
+} from "@/lib/controller-departure";
+import {
+  createBrowserEventControllerSessionStorage,
+  createEventControllerSessionReference,
+  readBrowserEventControllerSession,
+  type PersistedEventControllerSession,
+} from "@/lib/event-controller-session";
 
-type PersistedControllerSession = { sessionBearer: string; eventGameId: string };
+type PersistedControllerSession = PersistedEventControllerSession;
 type ControllerOpenResponse = {
   status: "opened";
   eventGameId: string;
@@ -117,15 +132,13 @@ type ClockReceiptAnchor = {
 };
 
 export function EventGameControllerPage() {
-  const persisted = readPersistedControllerSession();
+  const persisted = readBrowserEventControllerSession();
   const [qrCredential, setQrCredential] = useState("");
   const [grantCode, setGrantCode] = useState("");
   const qrCredentialInputRef = useRef<HTMLInputElement>(null);
   const grantCodeInputRef = useRef<HTMLInputElement>(null);
-  const [sessionBearer, setSessionBearer] = useState<string | null>(
-    persisted?.sessionBearer ?? null,
-  );
-  const [eventGameId, setEventGameId] = useState<string | null>(persisted?.eventGameId ?? null);
+  const [sessionBearer, setSessionBearer] = useState<string | null>(null);
+  const [eventGameId, setEventGameId] = useState<string | null>(null);
   const [projection, setProjection] = useState<ControllerProjection | null>(null);
   const [projectionStatus, setProjectionStatus] = useState<"available" | "unavailable">(
     "unavailable",
@@ -163,11 +176,12 @@ export function EventGameControllerPage() {
   const [pendingFlagCatchBoundaryOverride, setPendingFlagCatchBoundaryOverride] =
     useState<PendingFlagCatchBoundaryOverride | null>(null);
   const [persistedReplicaLoad] = useState<ControllerReplicaLoad>(() =>
-    readPersistedControllerReplica(persisted?.eventGameId),
+    readPersistedControllerReplica(undefined),
   );
   const [replica, setReplica] = useState<ControllerReplicaState | null>(persistedReplicaLoad.state);
   const replicaRef = useRef<ControllerReplicaState | null>(replica);
   const bearerGenerationRef = useRef(0);
+  const lifecycleGenerationRef = useRef(0);
   const installedReplayAuthorityRef = useRef<ReplayAuthority | null>(null);
   const activeReplayRef = useRef<ActiveReplay | null>(null);
   const queuedReplayRef = useRef<ReplayRequest | null>(null);
@@ -177,9 +191,75 @@ export function EventGameControllerPage() {
   const [durabilityWarning, setDurabilityWarning] = useState<string | null>(
     persistedReplicaLoad.warning,
   );
+  const [leaveDialogOpen, setLeaveDialogOpen] = useState(false);
+  const [restorePending, setRestorePending] = useState(persisted !== null);
+  const [controllerUnavailable, setControllerUnavailable] = useState(false);
   const [browserContext] = useState(() => readControllerDeviceContext());
   const qrTriggerRef = useRef<HTMLButtonElement>(null);
   const qrDialogRef = useRef<HTMLDivElement>(null);
+  const leaveTriggerRef = useRef<HTMLButtonElement>(null);
+  const entryTriggerRef = useRef<HTMLButtonElement>(null);
+  const switchTriggerRef = useRef<HTMLButtonElement>(null);
+  const restoreTriggerRef = useRef<HTMLButtonElement>(null);
+  const persistedSessionRef = useRef<PersistedControllerSession | null>(persisted);
+  const sessionReferenceIdRef = useRef<string | null>(persisted?.sessionReferenceId ?? null);
+  const restoreStartedRef = useRef(false);
+  const departureModule = getBrowserControllerDeparture();
+
+  const eventEntry = useControllerDepartureEntry({
+    destination: { kind: "admit-event" },
+    triggerRef: entryTriggerRef,
+    onCommitted: openController,
+    onUnavailable: () => setMessage("Unable to open Controller experience."),
+    onCancelled: () => setMessage("Entry cancelled. Your Controller return is still available."),
+  });
+  const switchEntry = useControllerDepartureEntry({
+    destination: {
+      kind: "resume-event",
+      gameId: switchTarget ?? "event-game-switch-pending",
+      sessionReferenceId: sessionReferenceIdRef.current ?? undefined,
+    },
+    triggerRef: switchTriggerRef,
+    onCommitted: switchController,
+    onUnavailable: () => setMessage("Unable to switch Controller Device."),
+    onCancelled: () => setMessage("Switch cancelled. Your Controller return is still available."),
+  });
+
+  const restoreEntry = useControllerDepartureEntry({
+    destination: {
+      kind: "resume-event",
+      gameId: persisted?.eventGameId ?? "event-restore-pending",
+      sessionReferenceId: persisted?.sessionReferenceId,
+    },
+    triggerRef: restoreTriggerRef,
+    onCommitted: restoreController,
+    onUnavailable: () => {
+      setRestorePending(false);
+      setControllerUnavailable(true);
+      setMessage("Event Game Controller is unavailable.");
+    },
+    onCancelled: () => {
+      setRestorePending(false);
+      setMessage("Restore cancelled. Your Controller return is still available.");
+    },
+  });
+
+  useEffect(() => {
+    return departureModule.subscribe(() => {
+      const currentEventGameId = eventGameId;
+      if (
+        currentEventGameId !== null &&
+        controllerDepartureBlocksGame(
+          departureModule.project(),
+          "event",
+          currentEventGameId,
+          sessionReferenceIdRef.current ?? undefined,
+        )
+      ) {
+        terminateMountedController();
+      }
+    });
+  }, [departureModule, eventGameId]);
 
   useEffect(() => {
     const timer = window.setInterval(() => {
@@ -249,13 +329,26 @@ export function EventGameControllerPage() {
 
   useEffect(() => {
     if (sessionBearer === null || eventGameId === null) {
-      window.sessionStorage.removeItem("quadball:event-controller-session");
       return;
     }
-    window.sessionStorage.setItem(
-      "quadball:event-controller-session",
-      JSON.stringify({ sessionBearer, eventGameId } satisfies PersistedControllerSession),
-    );
+    const sessionStorage = createBrowserEventControllerSessionStorage();
+    if (
+      !sessionStorage.write({
+        sessionBearer,
+        eventGameId,
+        ...(sessionReferenceIdRef.current === null
+          ? {}
+          : { sessionReferenceId: sessionReferenceIdRef.current }),
+      })
+    ) {
+      setDurabilityWarning(
+        "Controller recovery storage is full or unavailable; changes remain in memory.",
+      );
+    } else {
+      const current = sessionStorage.read();
+      sessionReferenceIdRef.current =
+        current?.eventGameId === eventGameId ? current.sessionReferenceId : null;
+    }
   }, [eventGameId, sessionBearer]);
 
   useEffect(() => {
@@ -271,8 +364,12 @@ export function EventGameControllerPage() {
   }, [replica]);
 
   useEffect(() => {
-    if (persisted !== null) void refreshController(true);
-    // Persisted authority is deliberately revalidated after browser restore.
+    if (persisted !== null && !restoreStartedRef.current) {
+      restoreStartedRef.current = true;
+      void restoreEntry.begin();
+    } else {
+      setRestorePending(false);
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -307,15 +404,95 @@ export function EventGameControllerPage() {
     return clockProjection?.gameTimeMs ?? projection?.clock.gameTimeMs ?? 0;
   }
 
-  async function openController() {
+  async function restoreController(): Promise<boolean> {
+    const saved = persistedSessionRef.current;
+    if (saved === null) return false;
+    setBusy(true);
+    sessionReferenceIdRef.current = saved.sessionReferenceId;
+    try {
+      if (navigator.onLine === false) {
+        const restored = restoreLocalController(saved);
+        if (!restored) setControllerUnavailable(true);
+        return restored;
+      }
+      const response = await postJson<ControllerRefreshResponse>(
+        "/api/event-control/refresh",
+        { sessionBearer: saved.sessionBearer, eventGameId: saved.eventGameId },
+        { allowConflict: true },
+      );
+      if (response.status === "switch-required") {
+        const restoredLoad = loadControllerReplica(
+          browserReplicaStorage(saved.eventGameId),
+          saved.eventGameId,
+        );
+        if (restoredLoad.warning !== null) setDurabilityWarning(restoredLoad.warning);
+        if (restoredLoad.state === null) {
+          setControllerUnavailable(true);
+          return false;
+        }
+        setSessionBearer(saved.sessionBearer);
+        setEventGameId(saved.eventGameId);
+        setControllerUnavailable(false);
+        setSwitchTarget(response.currentEventGameId);
+        commitReplica(restoredLoad.state);
+        return true;
+      }
+      if (response.status === "rejected") {
+        clearSession({ eventSession: saved });
+        setControllerUnavailable(true);
+        return false;
+      }
+      setSwitchTarget(null);
+      const restoredLoad = loadControllerReplica(
+        browserReplicaStorage(saved.eventGameId),
+        saved.eventGameId,
+      );
+      if (restoredLoad.warning !== null) setDurabilityWarning(restoredLoad.warning);
+      if (restoredLoad.state === null) {
+        setControllerUnavailable(true);
+        return false;
+      }
+      setSessionBearer(saved.sessionBearer);
+      setEventGameId(saved.eventGameId);
+      setControllerUnavailable(false);
+      receiveProjection(response.projection, { resynchronized: true });
+      const nextReplica = rebindControllerReplica(
+        restoredLoad.state,
+        {
+          eventGameId: saved.eventGameId,
+          grantSessionId: response.session.grantSessionId,
+          grantVersion: response.session.grantVersion,
+        },
+        response.projection,
+        sessionReferenceIdRef.current ?? undefined,
+      );
+      commitReplica(nextReplica);
+      await flushReplica(nextReplica, saved.sessionBearer);
+      return true;
+    } catch {
+      // A retained Event replica is an offline Return, not an authority loss.
+      // Keep the credential for the Event adapter's pending finalization and
+      // let the foreground/online seam reconcile it later.
+      if (restoreLocalController(saved)) return true;
+      setControllerUnavailable(true);
+      return false;
+    } finally {
+      setRestorePending(false);
+      setBusy(false);
+    }
+  }
+
+  async function openController(): Promise<boolean> {
     const hasQrCredential = qrCredential.length > 0;
     const hasGrantCode = grantCode.length > 0;
     if (hasQrCredential === hasGrantCode) {
       setMessage("Enter exactly one Controller QR credential or Grant Code.");
-      return;
+      return false;
     }
     setBusy(true);
     setMessage(null);
+    setControllerUnavailable(false);
+    sessionReferenceIdRef.current = null;
     clearReplayAuthority();
     if (replicaRef.current !== null) {
       const invalidated = invalidateControllerReplica(replicaRef.current);
@@ -328,6 +505,7 @@ export function EventGameControllerPage() {
         browserContext,
       });
       if (response.status !== "opened") throw new Error("open failed");
+      sessionReferenceIdRef.current = createEventControllerSessionReference();
       setQrCredential("");
       setGrantCode("");
       if (qrCredentialInputRef.current !== null) qrCredentialInputRef.current.value = "";
@@ -355,20 +533,24 @@ export function EventGameControllerPage() {
                 grantVersion: response.session.grantVersion,
               },
               response.projection,
+              sessionReferenceIdRef.current ?? undefined,
             )
           : createControllerReplica({
               eventGameId: response.eventGameId,
               projection: response.projection ?? emptyProjection(response.eventGameId),
               grantSessionId: response.session.grantSessionId,
               grantVersion: response.session.grantVersion,
+              sessionReferenceId: sessionReferenceIdRef.current ?? undefined,
             });
       commitReplica(nextReplica);
       await flushReplica(nextReplica, response.session.sessionBearer);
+      return true;
     } catch {
       clearSession();
       setMessage(
         "Unable to open Controller experience. A fresh device cannot reconstruct Clock Authority during a server outage; use manual timing.",
       );
+      return false;
     } finally {
       setBusy(false);
     }
@@ -376,13 +558,16 @@ export function EventGameControllerPage() {
 
   async function refreshController(silent = false): Promise<boolean> {
     if (sessionBearer === null || eventGameId === null) return false;
+    const requestGeneration = lifecycleGenerationRef.current;
     projectClockImmediately();
     if (!silent) setBusy(true);
     try {
-      const response = await postJson<ControllerRefreshResponse>("/api/event-control/refresh", {
-        sessionBearer,
-        eventGameId,
-      });
+      const response = await postJson<ControllerRefreshResponse>(
+        "/api/event-control/refresh",
+        { sessionBearer, eventGameId },
+        { allowConflict: true },
+      );
+      if (requestGeneration !== lifecycleGenerationRef.current) return false;
       if (response.status === "switch-required") {
         setSwitchTarget(
           stayedOnAssignment === response.currentEventGameId ? null : response.currentEventGameId,
@@ -405,12 +590,18 @@ export function EventGameControllerPage() {
         currentReplica.session.grantVersion === response.session.grantVersion
           ? acknowledgeControllerProjection(currentReplica, response.projection)
           : currentReplica?.eventGameId === response.session.eventGameId
-            ? rebindControllerReplica(currentReplica, refreshedSession, response.projection)
+            ? rebindControllerReplica(
+                currentReplica,
+                refreshedSession,
+                response.projection,
+                sessionReferenceIdRef.current ?? undefined,
+              )
             : createControllerReplica({
                 eventGameId: response.session.eventGameId,
                 projection: response.projection ?? emptyProjection(response.session.eventGameId),
                 grantSessionId: response.session.grantSessionId,
                 grantVersion: response.session.grantVersion,
+                sessionReferenceId: sessionReferenceIdRef.current ?? undefined,
               });
       commitReplica(nextReplica);
       await flushReplica(nextReplica, sessionBearer);
@@ -423,8 +614,9 @@ export function EventGameControllerPage() {
     }
   }
 
-  async function switchController() {
-    if (sessionBearer === null) return;
+  async function switchController(): Promise<boolean> {
+    if (sessionBearer === null) return false;
+    const requestGeneration = lifecycleGenerationRef.current;
     setBusy(true);
     clearReplayAuthority();
     const current = replicaRef.current;
@@ -437,6 +629,7 @@ export function EventGameControllerPage() {
       const response = await postJson<ControllerRefreshResponse>("/api/event-control/switch", {
         sessionBearer,
       });
+      if (requestGeneration !== lifecycleGenerationRef.current) return false;
       if (response.status !== "authorized") throw new Error("switch failed");
       setEventGameId(response.session.eventGameId);
       receiveProjection(response.projection);
@@ -453,6 +646,7 @@ export function EventGameControllerPage() {
               projection: response.projection ?? emptyProjection(response.session.eventGameId),
               grantSessionId: response.session.grantSessionId,
               grantVersion: response.session.grantVersion,
+              sessionReferenceId: sessionReferenceIdRef.current ?? undefined,
             })
           : rebindControllerReplica(
               restored,
@@ -462,14 +656,17 @@ export function EventGameControllerPage() {
                 grantVersion: response.session.grantVersion,
               },
               response.projection,
+              sessionReferenceIdRef.current ?? undefined,
             );
       commitReplica(nextReplica);
       await flushReplica(nextReplica, sessionBearer);
       setSwitchTarget(null);
       setStayedOnAssignment(null);
       setMessage("Controller Device switched to the newly assigned Event Game.");
+      return true;
     } catch {
       setMessage("Unable to switch Controller Device.");
+      return false;
     } finally {
       setBusy(false);
     }
@@ -497,6 +694,7 @@ export function EventGameControllerPage() {
             grantVersion: response.session.grantVersion,
           },
           response.projection,
+          sessionReferenceIdRef.current ?? undefined,
         );
         commitReplica(nextReplica);
         await flushReplica(nextReplica, sessionBearer);
@@ -528,20 +726,32 @@ export function EventGameControllerPage() {
   }
 
   async function leaveController() {
-    if (sessionBearer === null) return;
+    if (sessionBearer === null || eventGameId === null) return;
     setBusy(true);
-    try {
-      const response = await postJson<{ status: "left" }>("/api/event-control/leave", {
-        sessionBearer,
-      });
-      if (response.status !== "left") throw new Error("leave failed");
-      clearSession();
-      setMessage("Controller Session left. Pending evidence remains on the Event Game Record.");
-    } catch {
+    const sessionReferenceId =
+      sessionReferenceIdRef.current ??
+      createBrowserEventControllerSessionStorage().readForGame(eventGameId)?.sessionReferenceId;
+    const outcome = await departureModule.transition({
+      type: "leave",
+      departure: controllerDepartureReference({
+        workflow: "event",
+        gameId: eventGameId,
+        sessionReferenceId,
+        homeName: eventTeamName(projection, 0),
+        awayName: eventTeamName(projection, 1),
+        navigationPath: "/event-control",
+        detail: `Event Game ${eventGameId}`,
+      }),
+      online: navigator.onLine !== false,
+    });
+    if (outcome.status === "left") {
+      clearSession({ preserveEventSession: true });
+      setLeaveDialogOpen(false);
+      navigateTo("/");
+    } else {
       setMessage("Unable to leave Controller session.");
-    } finally {
-      setBusy(false);
     }
+    setBusy(false);
   }
 
   function recordGoal(gameSideId: string) {
@@ -1185,6 +1395,43 @@ export function EventGameControllerPage() {
   function clearReplayAuthority() {
     installedReplayAuthorityRef.current = null;
     queuedReplayRef.current = null;
+    bearerGenerationRef.current += 1;
+  }
+
+  function terminateMountedController() {
+    lifecycleGenerationRef.current += 1;
+    clearReplayAuthority();
+    activeReplayRef.current = null;
+    if (resynchronizationTimerRef.current !== null) {
+      window.clearTimeout(resynchronizationTimerRef.current);
+      resynchronizationTimerRef.current = null;
+    }
+    // Controller Departure owns the finalization decision. Keep this Event
+    // credential until its distinct authority adapter accepts or rejects the
+    // deferred /leave, while the mounted UI and replica become unusable now.
+    clearSession({ preserveEventSession: true, discardReplica: true });
+    setControllerUnavailable(true);
+    setMessage("Event Game Controller is unavailable.");
+  }
+
+  function restoreLocalController(saved: PersistedControllerSession): boolean {
+    const restoredLoad = loadControllerReplica(
+      browserReplicaStorage(saved.eventGameId),
+      saved.eventGameId,
+    );
+    if (restoredLoad.warning !== null) setDurabilityWarning(restoredLoad.warning);
+    if (restoredLoad.state === null) return false;
+    sessionReferenceIdRef.current = saved.sessionReferenceId;
+    setSessionBearer(saved.sessionBearer);
+    setEventGameId(saved.eventGameId);
+    setSwitchTarget(null);
+    setControllerUnavailable(false);
+    commitReplica(restoredLoad.state);
+    receiveProjection(restoredLoad.state.projection, { markSynchronized: false });
+    controllerConnectionStatusRef.current = "disconnected";
+    setControllerConnectionStatus("disconnected");
+    setMessage("Controller restored offline; reconnecting when connectivity returns.");
+    return true;
   }
 
   function commitReplica(state: ControllerReplicaState) {
@@ -1402,12 +1649,14 @@ export function EventGameControllerPage() {
     bearer: string,
     currentEventGameId: string,
   ) {
+    const requestGeneration = lifecycleGenerationRef.current;
     try {
       const response = await postJson<LiveEventGameControlResult>("/api/event-control/intent", {
         sessionBearer: bearer,
         eventGameId: currentEventGameId,
         intent,
       });
+      if (requestGeneration !== lifecycleGenerationRef.current) return;
       if (response.status !== "accepted" && response.status !== "duplicate-accepted") {
         setMessage("The online Controller action was not accepted.");
         return;
@@ -1435,9 +1684,32 @@ export function EventGameControllerPage() {
     }
   }
 
-  function clearSession() {
+  function clearSession(
+    options: {
+      preserveEventSession?: boolean;
+      discardReplica?: boolean;
+      eventSession?: Pick<PersistedControllerSession, "eventGameId" | "sessionReferenceId">;
+    } = {},
+  ) {
+    const currentEventGameId = eventGameId;
+    const currentSessionReferenceId = sessionReferenceIdRef.current;
+    const eventSessionToClear =
+      options.eventSession ??
+      (currentEventGameId === null
+        ? null
+        : { eventGameId: currentEventGameId, sessionReferenceId: currentSessionReferenceId });
     clearReplayAuthority();
-    if (replicaRef.current !== null) {
+    if (options.discardReplica) {
+      replicaRef.current = null;
+      setReplica(null);
+      if (currentEventGameId !== null) {
+        try {
+          window.localStorage.removeItem(controllerReplicaStorageKey(currentEventGameId));
+        } catch {
+          // The mounted UI is still terminated; the lifecycle projection remains authoritative.
+        }
+      }
+    } else if (replicaRef.current !== null) {
       const invalidated = invalidateControllerReplica(replicaRef.current);
       replicaRef.current = invalidated;
       setReplica(invalidated);
@@ -1456,6 +1728,17 @@ export function EventGameControllerPage() {
     setQrDialogOpen(false);
     setSwitchTarget(null);
     setStayedOnAssignment(null);
+    if (!options.preserveEventSession) {
+      if (eventSessionToClear !== null) {
+        createBrowserEventControllerSessionStorage().clear(
+          eventSessionToClear.eventGameId,
+          eventSessionToClear.sessionReferenceId ?? undefined,
+        );
+        if (currentSessionReferenceId === eventSessionToClear.sessionReferenceId) {
+          sessionReferenceIdRef.current = null;
+        }
+      }
+    }
   }
 
   useEffect(() => {
@@ -1510,7 +1793,26 @@ export function EventGameControllerPage() {
           </CardDescription>
         </CardHeader>
         <CardContent className="flex min-h-0 flex-1 flex-col overflow-hidden px-3 pb-3 sm:px-6">
-          {sessionBearer === null ? (
+          {restorePending ? (
+            <div className="space-y-3 rounded-lg border bg-muted/30 p-4" role="status">
+              <p className="font-medium">Restoring Event Game Controller…</p>
+              <p className="text-sm text-muted-foreground">
+                The saved Event authority is being confirmed before this device reconnects.
+              </p>
+              <button ref={restoreTriggerRef} className="sr-only" tabIndex={-1} />
+            </div>
+          ) : controllerUnavailable ? (
+            <div
+              className="space-y-3 rounded-lg border border-rose-300 bg-rose-50 p-4"
+              role="alert"
+            >
+              <p className="font-medium text-rose-950">Event Game Controller unavailable.</p>
+              <p className="text-sm text-rose-900">
+                This Event authority or Game is no longer valid. Start a fresh Controller admission
+                to continue.
+              </p>
+            </div>
+          ) : sessionBearer === null ? (
             <>
               <div className="space-y-2">
                 <Label htmlFor="control-grant">Active Pitch Slot Control Grant QR</Label>
@@ -1540,10 +1842,11 @@ export function EventGameControllerPage() {
                 />
               </div>
               <Button
+                ref={entryTriggerRef}
                 className="min-h-11 w-full"
                 aria-label="Open Event Game Controller"
-                onClick={() => void openController()}
-                disabled={busy}
+                onClick={() => void eventEntry.begin()}
+                disabled={busy || eventEntry.busy}
               >
                 Open Controller Device
               </Button>
@@ -1601,7 +1904,8 @@ export function EventGameControllerPage() {
                 <Button
                   variant="outline"
                   aria-label="Leave Event Game Controller session"
-                  onClick={() => void leaveController()}
+                  ref={leaveTriggerRef}
+                  onClick={() => setLeaveDialogOpen(true)}
                   disabled={busy}
                 >
                   Leave Controller Session
@@ -1615,9 +1919,10 @@ export function EventGameControllerPage() {
                   </p>
                   <div className="mt-3 flex flex-wrap gap-2">
                     <Button
+                      ref={switchTriggerRef}
                       aria-label={`Switch to Event Game ${switchTarget}`}
-                      onClick={() => void switchController()}
-                      disabled={busy}
+                      onClick={() => void switchEntry.begin()}
+                      disabled={busy || switchEntry.busy}
                     >
                       Switch Event Game
                     </Button>
@@ -2519,6 +2824,17 @@ export function EventGameControllerPage() {
           </div>
         </div>
       ) : null}
+      {leaveDialogOpen ? (
+        <ControllerLeaveDialog
+          triggerRef={leaveTriggerRef}
+          busy={busy}
+          onCancel={() => setLeaveDialogOpen(false)}
+          onConfirm={() => void leaveController()}
+        />
+      ) : null}
+      {eventEntry.dialog}
+      {switchEntry.dialog}
+      {restoreEntry.dialog}
     </main>
   );
 }
@@ -2585,14 +2901,29 @@ function readMonotonicNow(): number {
   return typeof performance === "undefined" ? 0 : performance.now();
 }
 
-async function postJson<T>(path: string, body: unknown): Promise<T> {
+function eventTeamName(projection: ControllerProjection | null, sideIndex: number): string {
+  const assignment = projection?.teamAssignments?.[sideIndex];
+  return assignment?.eventTeamName ?? `Game Side ${assignment?.gameSideId ?? sideIndex + 1}`;
+}
+
+function navigateTo(path: string) {
+  window.history.pushState(null, "", path);
+  window.dispatchEvent(new window.Event("popstate"));
+}
+
+async function postJson<T>(
+  path: string,
+  body: unknown,
+  options: { allowConflict?: boolean } = {},
+): Promise<T> {
   const response = await fetch(path, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
   });
   const result = (await response.json()) as T;
-  if (!response.ok) throw new Error("request failed");
+  if (!response.ok && !(options.allowConflict === true && response.status === 409))
+    throw new Error("request failed");
   return result;
 }
 
@@ -2606,19 +2937,6 @@ function replicaMatchesAuthority(
     state.session.grantSessionId === authority.grantSessionId &&
     state.session.grantVersion === authority.grantVersion
   );
-}
-
-function readPersistedControllerSession(): PersistedControllerSession | null {
-  try {
-    const raw = window.sessionStorage.getItem("quadball:event-controller-session");
-    if (raw === null) return null;
-    const value = JSON.parse(raw) as Partial<PersistedControllerSession>;
-    return typeof value.sessionBearer === "string" && typeof value.eventGameId === "string"
-      ? { sessionBearer: value.sessionBearer, eventGameId: value.eventGameId }
-      : null;
-  } catch {
-    return null;
-  }
 }
 
 function readPersistedControllerReplica(eventGameId: string | undefined): ControllerReplicaLoad {
