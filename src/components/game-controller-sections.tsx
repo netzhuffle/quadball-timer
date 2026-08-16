@@ -361,6 +361,8 @@ function TeamScoreColumn({
       <Button
         size="sm"
         className="h-8 w-full rounded-2xl border shadow-sm"
+        data-primary-score="up"
+        aria-label={`Increase ${column.name} score`}
         style={column.scoreBoxStyle}
         onClick={() => onAddScore(column.team)}
         disabled={scoreUpDisabled}
@@ -387,6 +389,8 @@ function TeamScoreColumn({
         size="sm"
         variant="outline"
         className="h-8 w-full rounded-2xl bg-white"
+        data-primary-score="down"
+        aria-label={`Decrease ${column.name} score`}
         style={column.scoreDownButtonStyle}
         onClick={() => onUndoScore(column.team)}
         disabled={scoreDownDisabled}
