@@ -22,6 +22,50 @@ function service(): AdHocGamesService {
 }
 
 describe("Ad Hoc Games service", () => {
+  test("creates and reuses date-gated protected SQM fixture games with canonical values", async () => {
+    let nowMs = Date.parse("2026-08-16T10:00:00.000Z");
+    const store = createInMemoryAdHocStore();
+    const games = createAdHocGamesService({ store, now: () => nowMs });
+
+    const first = await games.create({
+      homeName: "secret1",
+      awayName: null,
+      homeColor: "not-a-color",
+      awayColor: { ignored: true },
+      browserId: "browser-1",
+    });
+    expect(first).toMatchObject({ status: "accepted" });
+    if (first.status !== "accepted") return;
+    expect(first.game.state).toMatchObject({
+      homeName: "Basel Basilisks / Luzern",
+      awayName: "Berner Boggarts",
+      homeColor: "#16a34a",
+      awayColor: "#7f1d1d",
+    });
+
+    const second = await games.create({
+      homeName: "secret1",
+      awayName: "ignored",
+      homeColor: "ignored",
+      awayColor: "ignored",
+      browserId: "browser-2",
+    });
+    expect(second).toMatchObject({ status: "accepted", gameId: first.gameId });
+    if (second.status === "accepted") {
+      expect(
+        await games.read({ gameId: second.gameId, sessionId: second.sessionId }),
+      ).toMatchObject({
+        status: "accepted",
+      });
+    }
+    expect(store.listGames()).toHaveLength(1);
+    expect(store.listGames()[0]?.fixtureKey).toBe("secret1");
+
+    nowMs += 24 * 60 * 60_000;
+    const publicRead = await games.readFixture({ fixtureKey: "secret1" });
+    expect(publicRead).toMatchObject({ status: "accepted", gameId: first.gameId });
+  });
+
   test("derives multiple offline operations once from the authoritative base and rebases on reconciliation", () => {
     const authoritative = createInitialGameState({ id: "adhoc-optimistic", nowMs: 1_000 });
     const pending: AdHocPendingOperation[] = [
@@ -508,6 +552,67 @@ describe("Ad Hoc Games service", () => {
     expect(replacement.status).toBe("accepted");
     expect(store.listGames()).toHaveLength(50);
     expect(store.readGame(created[0]!.gameId)).toBeNull();
+  });
+
+  test("keeps the four protected SQM games in addition to the fifty-game Ad Hoc capacity", async () => {
+    let nowMs = Date.parse("2026-08-16T00:00:00.000Z");
+    const store = createInMemoryAdHocStore();
+    const games = createAdHocGamesService({ store, now: () => nowMs });
+    let firstOrdinary: { gameId: string; sessionId: string } | undefined;
+
+    for (const fixtureKey of ["secret1", "secret2", "secret3", "secret4"] as const) {
+      const result = await games.create({ homeName: fixtureKey, awayName: "ignored", nowMs });
+      expect(result.status).toBe("accepted");
+    }
+    for (let index = 0; index < 50; index += 1) {
+      nowMs += 60 * 60_000;
+      const result = await games.create({
+        homeName: `Home ${index}`,
+        awayName: "Away",
+        sourceKey: `ordinary-source-${index}`,
+        nowMs,
+      });
+      if (result.status !== "accepted") throw new Error("ordinary capacity setup failed");
+      firstOrdinary ??= result;
+      await games.setConnection({
+        gameId: result.gameId,
+        sessionId: result.sessionId,
+        connected: true,
+        nowMs,
+      });
+    }
+
+    const protectedIds = store
+      .listGames()
+      .filter((game) => game.fixtureKey !== undefined)
+      .map((game) => game.gameId);
+    expect(store.listGames()).toHaveLength(54);
+    expect(protectedIds).toHaveLength(4);
+
+    if (firstOrdinary === undefined) throw new Error("Expected an ordinary game.");
+    expect(
+      await games.setConnection({
+        gameId: firstOrdinary.gameId,
+        sessionId: firstOrdinary.sessionId,
+        connected: false,
+        nowMs,
+      }),
+    ).toBe(true);
+    nowMs += AD_HOC_DISCONNECTED_GRACE_MS;
+    const replacement = await games.create({
+      homeName: "Replacement",
+      awayName: "Game",
+      sourceKey: "replacement-source",
+      nowMs,
+    });
+    expect(replacement.status).toBe("accepted");
+    expect(store.listGames()).toHaveLength(54);
+    expect(
+      store
+        .listGames()
+        .filter((game) => game.fixtureKey !== undefined)
+        .map((game) => game.gameId),
+    ).toEqual(expect.arrayContaining(protectedIds));
   });
 
   test("protects newly admitted sessions and enforces the exact five-minute boundary", async () => {

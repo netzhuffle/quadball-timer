@@ -325,6 +325,14 @@ _Avoid_: Official game record, mutable Game State, Official Score Sheet
 A controller-only, disposable game created without an account or Event Grant for a friendly or spontaneous session. Its current state and control authority survive ordinary restarts and return as ordinary data after a full restore, but it has neither a spectator experience, a Game Lock, nor a durable Control Audit Trail; it cannot be manually removed and remains retained until capacity cleanup prunes it. Its rate-limit state and resource budget are separate from Event operations: exhausting an Ad Hoc limit may affect only Ad Hoc work and never throttles, rejects, disconnects, or otherwise degrades an ongoing Event operation.
 _Avoid_: Game from scratch, unassigned game
 
+**Protected Fixture Ad Hoc Game**:
+An Ad Hoc Game temporarily bound to a named public fixture slot, whose state and spectator view remain durable beyond ordinary Ad Hoc cleanup and whose public access is allowlisted by that fixture's Event and slot. It remains an Ad Hoc Game for authority, operation, and audit purposes rather than becoming an Event Game.
+_Avoid_: Fake Event Game, permanent Ad Hoc Game, public Ad Hoc Game
+
+**SQM Fixture Event**:
+The temporary Published Event projection for Schweizer Quadball Meisterschaft 2026 on 16 August 2026 in Europe/Zurich. It supplies a public schedule for four Protected Fixture Ad Hoc Games without creating ordinary Event Catalog records.
+_Avoid_: SQM tournament record, seeded Event, production Event
+
 **Ad Hoc Controller**:
 A participant admitted through an unfinished Ad Hoc Game's Control QR. All Ad Hoc Controllers for the Game have equal authority; its creator is not an owner or primary Controller, and an admitted browser retains its authority across ordinary browser and server restarts until its Controller Leave Grace Period expires or capacity cleanup removes the Game.
 _Avoid_: Ad Hoc Game owner, creator role, primary Controller

@@ -32,6 +32,53 @@ import {
 } from "@/lib/ad-hoc-games";
 
 describe("Ad Hoc SQLite focused integration", () => {
+  test("persists a protected SQM fixture game and its public lookup across restart", async () => {
+    const root = await mkdtemp(join(tmpdir(), "quadball-timer-adhoc-sqm-restart-"));
+    const databasePath = join(root, "ad-hoc.sqlite");
+    const nowMs = Date.parse("2026-08-16T10:00:00.000Z");
+    try {
+      const store = openSqliteAdHocStore(databasePath, "sqm-test");
+      const games = createAdHocGamesService({
+        store,
+        environmentIdentity: "sqm-test",
+        now: () => nowMs,
+      });
+      const created = await games.create({
+        homeName: "secret4",
+        awayName: "ignored",
+        homeColor: "ignored",
+        awayColor: "ignored",
+      });
+      expect(created).toMatchObject({ status: "accepted" });
+      if (created.status !== "accepted") return;
+      games.close();
+
+      const reopenedStore = openSqliteAdHocStore(databasePath, "sqm-test");
+      const reopened = createAdHocGamesService({
+        store: reopenedStore,
+        environmentIdentity: "sqm-test",
+        now: () => nowMs + 24 * 60 * 60_000,
+      });
+      const publicRead = await reopened.readFixture({ fixtureKey: "secret4" });
+      expect(publicRead).toMatchObject({
+        status: "accepted",
+        gameId: created.gameId,
+        fixtureKey: "secret4",
+        game: {
+          state: {
+            homeName: "Friendlies",
+            awayName: "Kidditch",
+          },
+        },
+      });
+      expect(reopenedStore.listGames()).toHaveLength(1);
+      expect(reopenedStore.listGames()[0]?.fixtureKey).toBe("secret4");
+      reopened.close();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("migrates accepted history as a replay baseline and preserves duplicate/conflict outcomes after restart", async () => {
     const root = await mkdtemp(join(tmpdir(), "quadball-timer-adhoc-migration-focused-"));
     const databasePath = join(root, "ad-hoc.sqlite");

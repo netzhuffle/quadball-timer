@@ -7,6 +7,12 @@ import type { GameCommand, GameState, GameView } from "@/lib/game-types";
 import { parseGameCommand } from "@/lib/ws-protocol";
 import { DEFAULT_IQA_SPORTING_RULES, type IqaSportingRules } from "@/lib/iqa-game-rules";
 import {
+  getSqmFixtureGame,
+  isSqmFixtureActivationDate,
+  isSqmFixtureKey,
+  type SqmFixtureKey,
+} from "@/lib/sqm-fixture";
+import {
   orderControllerOperations,
   createControllerReplayAcknowledgement,
   resolveControllerBatch,
@@ -52,7 +58,7 @@ export const AD_HOC_MAX_CREATIONS_PER_HOUR = 30;
 export const AD_HOC_MAX_OPERATIONS_PER_SECOND_PER_CONTROLLER = AD_HOC_CONTROLLER_BURST;
 export const AD_HOC_MAX_OPERATIONS_PER_SECOND_PER_GAME = AD_HOC_GAME_BURST;
 
-const SCHEMA_VERSION = 4;
+const SCHEMA_VERSION = 5;
 const GENERIC_UNAVAILABLE = "Ad Hoc Game unavailable.";
 const GENERIC_CAPACITY = "Ad Hoc capacity is currently full; no game was changed.";
 
@@ -115,6 +121,10 @@ export type AdHocAccessResult =
   | { status: "accepted"; game: AdHocGameView }
   | { status: "unavailable"; detail: string };
 
+export type AdHocFixtureAccessResult =
+  | { status: "accepted"; gameId: string; fixtureKey: SqmFixtureKey; game: GameView }
+  | { status: "unavailable" };
+
 export type AdHocSubscriptionResult =
   | AdHocAccessResult
   | { status: "capacity"; retryAfterMs: number };
@@ -141,6 +151,7 @@ export type StoredAdHocGame = {
   gameId: string;
   environmentIdentity: string;
   createdAtMs: number;
+  fixtureKey?: SqmFixtureKey;
   state: GameState;
   initialState?: GameState;
   replayBaselineOperationIds?: readonly string[];
@@ -574,18 +585,6 @@ export function createAdHocGamesService(options: AdHocGamesServiceOptions = {}) 
 
   return {
     async create(input: AdHocCreationInput): Promise<AdHocCreateResult> {
-      const home = normalizeTeamInput(input.homeName, "homeName");
-      const away = normalizeTeamInput(input.awayName, "awayName");
-      if (!home.ok) return { status: "rejected", reason: "invalid-input", detail: home.error };
-      if (!away.ok) return { status: "rejected", reason: "invalid-input", detail: away.error };
-
-      const homeColor = validateColor(input.homeColor, DEFAULT_HOME_TEAM_COLOR, "homeColor");
-      const awayColor = validateColor(input.awayColor, DEFAULT_AWAY_TEAM_COLOR, "awayColor");
-      if (!homeColor.ok)
-        return { status: "rejected", reason: "invalid-input", detail: homeColor.error };
-      if (!awayColor.ok)
-        return { status: "rejected", reason: "invalid-input", detail: awayColor.error };
-
       const nowMs = input.nowMs ?? now();
       if (!Number.isSafeInteger(nowMs) || nowMs < 0) {
         return {
@@ -595,9 +594,89 @@ export function createAdHocGamesService(options: AdHocGamesServiceOptions = {}) 
         };
       }
 
+      const fixture = isSqmFixtureActivationDate(nowMs) ? getSqmFixtureGame(input.homeName) : null;
+      const home =
+        fixture === null
+          ? normalizeTeamInput(input.homeName, "homeName")
+          : { ok: true as const, value: fixture.homeName };
+      const away =
+        fixture === null
+          ? normalizeTeamInput(input.awayName, "awayName")
+          : { ok: true as const, value: fixture.awayName };
+      if (!home.ok) return { status: "rejected", reason: "invalid-input", detail: home.error };
+      if (!away.ok) return { status: "rejected", reason: "invalid-input", detail: away.error };
+
+      const homeColor =
+        fixture === null
+          ? validateColor(input.homeColor, DEFAULT_HOME_TEAM_COLOR, "homeColor")
+          : { ok: true as const, value: fixture.homeColor };
+      const awayColor =
+        fixture === null
+          ? validateColor(input.awayColor, DEFAULT_AWAY_TEAM_COLOR, "awayColor")
+          : { ok: true as const, value: fixture.awayColor };
+      if (!homeColor.ok)
+        return { status: "rejected", reason: "invalid-input", detail: homeColor.error };
+      if (!awayColor.ok)
+        return { status: "rejected", reason: "invalid-input", detail: awayColor.error };
+
       const sourceKey =
         typeof input.sourceKey === "string" ? input.sourceKey.trim() : "anonymous-browser";
       const browserId = validateBrowserId(input.browserId);
+      if (fixture !== null) {
+        let existing: StoredAdHocGame | undefined;
+        try {
+          existing = store
+            .listGames()
+            .find(
+              (candidate) =>
+                candidate.environmentIdentity === environmentIdentity &&
+                candidate.fixtureKey === fixture.key,
+            );
+        } catch {
+          return { status: "rejected", reason: "unavailable" };
+        }
+        if (existing !== undefined) {
+          const sessionId = random();
+          let joined: boolean | null;
+          try {
+            joined = store.mutateGame(existing.gameId, (game) => {
+              if (
+                game.environmentIdentity !== environmentIdentity ||
+                game.fixtureKey !== fixture.key
+              )
+                return false;
+              game.sessions = game.sessions.filter(
+                (session) => browserId === null || session.browserId !== browserId,
+              );
+              game.sessions.push({
+                sessionHash: digest(sessionId),
+                browserId,
+                connected: false,
+                lastConnectedAtMs: nowMs,
+                lastDisconnectedAtMs: null,
+              });
+              return true;
+            });
+          } catch {
+            return { status: "rejected", reason: "unavailable" };
+          }
+          if (joined !== true) return { status: "rejected", reason: "unavailable" };
+          let game: StoredAdHocGame | null;
+          try {
+            game = store.readGame(existing.gameId);
+          } catch {
+            return { status: "rejected", reason: "unavailable" };
+          }
+          if (game === null) return { status: "rejected", reason: "unavailable" };
+          return {
+            status: "accepted",
+            gameId: game.gameId,
+            sessionId,
+            controlQr: game.controlQr,
+            game: projectAuthorizedGame(game, sessionId, game.controlQr, nowMs, iqaRules),
+          };
+        }
+      }
       const sourceHash = digest(sourceKey || "anonymous-browser");
       const gameId = `adhoc-${random()}`;
       const sessionId = random();
@@ -614,6 +693,7 @@ export function createAdHocGamesService(options: AdHocGamesServiceOptions = {}) 
         gameId,
         environmentIdentity,
         createdAtMs: nowMs,
+        ...(fixture === null ? {} : { fixtureKey: fixture.key }),
         state,
         initialState: structuredClone(state),
         replayBaselineOperationIds: [],
@@ -699,6 +779,32 @@ export function createAdHocGamesService(options: AdHocGamesServiceOptions = {}) 
       return {
         status: "accepted",
         game: projectAuthorizedGame(game, sessionId, null, input.nowMs ?? now(), iqaRules),
+      };
+    },
+
+    async readFixture(input: {
+      fixtureKey: unknown;
+      nowMs?: number;
+    }): Promise<AdHocFixtureAccessResult> {
+      if (!isSqmFixtureKey(input.fixtureKey)) return { status: "unavailable" };
+      let game: StoredAdHocGame | undefined;
+      try {
+        game = store
+          .listGames()
+          .find(
+            (candidate) =>
+              candidate.environmentIdentity === environmentIdentity &&
+              candidate.fixtureKey === input.fixtureKey,
+          );
+      } catch {
+        return { status: "unavailable" };
+      }
+      if (game === undefined) return { status: "unavailable" };
+      return {
+        status: "accepted",
+        gameId: game.gameId,
+        fixtureKey: input.fixtureKey,
+        game: iqaRules.project(game.state, input.nowMs ?? now()),
       };
     },
 
@@ -1405,12 +1511,15 @@ export function createInMemoryAdHocStore(): AdHocStore {
         };
       }
       let removedGameId: string | null = null;
-      const retainedCount = games.size;
+      const retainedCount = [...games.values()].filter(
+        (candidate) => candidate.fixtureKey === undefined,
+      ).length;
       if (retainedCount >= AD_HOC_MAX_RETAINED_GAMES) {
         const victim = [...games.values()]
           .filter(
             (candidate) =>
               candidate.environmentIdentity === game.environmentIdentity &&
+              candidate.fixtureKey === undefined &&
               candidate.sessions.every((session) => isCleanupEligible(session, nowMs)),
           )
           .sort((a, b) => a.createdAtMs - b.createdAtMs || a.gameId.localeCompare(b.gameId))[0];
@@ -1572,6 +1681,7 @@ export function openSqliteAdHocStore(
     game_id TEXT PRIMARY KEY,
     environment_identity TEXT NOT NULL DEFAULT '',
     created_at_ms INTEGER NOT NULL,
+    fixture_key TEXT,
     state_json TEXT NOT NULL,
     initial_state_json TEXT NOT NULL,
     replay_baseline_operation_ids_json TEXT NOT NULL DEFAULT '[]',
@@ -1583,6 +1693,9 @@ export function openSqliteAdHocStore(
   const columns = db.query("PRAGMA table_info(adhoc_games)").all() as { name?: string }[];
   if (!columns.some((column) => column.name === "environment_identity")) {
     db.run("ALTER TABLE adhoc_games ADD COLUMN environment_identity TEXT NOT NULL DEFAULT ''");
+  }
+  if (!columns.some((column) => column.name === "fixture_key")) {
+    db.run("ALTER TABLE adhoc_games ADD COLUMN fixture_key TEXT");
   }
   const legacyStateColumnWasMissing = !columns.some(
     (column) => column.name === "initial_state_json",
@@ -1612,6 +1725,9 @@ export function openSqliteAdHocStore(
     });
     migrate();
   }
+  db.run(
+    "CREATE UNIQUE INDEX IF NOT EXISTS adhoc_games_fixture_key_unique ON adhoc_games(environment_identity, fixture_key) WHERE fixture_key IS NOT NULL",
+  );
   db.run(
     "CREATE TABLE IF NOT EXISTS adhoc_creation_events (source_hash TEXT NOT NULL, successful INTEGER NOT NULL, occurred_at_ms INTEGER NOT NULL, retry_until_ms INTEGER)",
   );
@@ -1736,14 +1852,16 @@ export function openSqliteAdHocStore(
             retryAfterMs,
           } as const;
         }
-        const countRow = db.query("SELECT COUNT(*) AS count FROM adhoc_games").get() as {
+        const countRow = db
+          .query("SELECT COUNT(*) AS count FROM adhoc_games WHERE fixture_key IS NULL")
+          .get() as {
           count?: number | string;
         } | null;
         const count = Number(countRow?.count ?? 0);
         let removedGameId: string | null = null;
         if (count >= AD_HOC_MAX_RETAINED_GAMES) {
           const victim = db
-            .query(`SELECT game_id FROM adhoc_games WHERE environment_identity = ? AND NOT EXISTS (
+            .query(`SELECT game_id FROM adhoc_games WHERE environment_identity = ? AND fixture_key IS NULL AND NOT EXISTS (
             SELECT 1 FROM json_each(sessions_json) AS session
             WHERE json_extract(session.value, '$.connected') = 1
                OR COALESCE(
@@ -1766,11 +1884,12 @@ export function openSqliteAdHocStore(
           nowMs - AD_HOC_CREATION_GLOBAL_WINDOW_MS,
         ]);
         db.run(
-          "INSERT INTO adhoc_games (game_id, environment_identity, created_at_ms, state_json, initial_state_json, replay_baseline_operation_ids_json, control_qr, control_qr_hash, sessions_json, operations_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          "INSERT INTO adhoc_games (game_id, environment_identity, created_at_ms, fixture_key, state_json, initial_state_json, replay_baseline_operation_ids_json, control_qr, control_qr_hash, sessions_json, operations_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
           [
             game.gameId,
             game.environmentIdentity,
             game.createdAtMs,
+            game.fixtureKey ?? null,
             JSON.stringify(game.state),
             JSON.stringify(game.initialState ?? game.state),
             JSON.stringify(game.replayBaselineOperationIds ?? []),
@@ -1830,6 +1949,9 @@ function parseStoredRow(row: Record<string, string | number>): StoredAdHocGame {
     gameId: String(row.game_id),
     environmentIdentity: String(row.environment_identity ?? ""),
     createdAtMs: Number(row.created_at_ms),
+    ...(row.fixture_key === null || row.fixture_key === undefined
+      ? {}
+      : { fixtureKey: String(row.fixture_key) as SqmFixtureKey }),
     state: JSON.parse(String(row.state_json)) as GameState,
     initialState: JSON.parse(String(row.initial_state_json ?? row.state_json)) as GameState,
     replayBaselineOperationIds: JSON.parse(
@@ -1957,6 +2079,7 @@ function inspectAdHocRecoveryDatabaseHandle(
       JSON.stringify({
         gameId: game.gameId,
         createdAtMs: game.createdAtMs,
+        fixtureKey: game.fixtureKey ?? null,
         sessions: game.sessions,
       }),
     );
@@ -2025,6 +2148,8 @@ function validateStoredGame(game: StoredAdHocGame): StoredAdHocGame {
   if (typeof game.environmentIdentity !== "string" || game.environmentIdentity.length === 0)
     throw new Error("Stored Ad Hoc environment identity is invalid.");
   requireSafeNonNegative(game.createdAtMs, "createdAtMs");
+  if (game.fixtureKey !== undefined && !isSqmFixtureKey(game.fixtureKey))
+    throw new Error("Stored Ad Hoc fixture key is invalid.");
   validateGameState(game.state, game.gameId);
   if (game.initialState !== undefined) validateGameState(game.initialState, game.gameId);
   if (!Array.isArray(game.replayBaselineOperationIds))

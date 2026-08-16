@@ -360,10 +360,15 @@ async function startServer() {
                 : await liveEventRuntime.readAudienceProjectionGameInput(eventGameId);
             },
           };
-    const audienceProjection = createAudienceProjection(
-      eventCatalogStorage,
-      liveAudienceGameInput === undefined ? {} : { gameInput: liveAudienceGameInput },
-    );
+    const audienceProjection = createAudienceProjection(eventCatalogStorage, {
+      ...(liveAudienceGameInput === undefined ? {} : { gameInput: liveAudienceGameInput }),
+      sqmFixtureGame: {
+        async read(fixtureKey) {
+          const result = await adHocService.readFixture({ fixtureKey });
+          return result.status === "accepted" ? { gameId: result.gameId, game: result.game } : null;
+        },
+      },
+    });
     const publicEventStream = createPublicAudienceEventStream(audienceProjection);
     let reconcilePublicSpectators = () => {};
     const publicEventWebSocketHub = createPublicAudienceEventWebSocketHub({

@@ -354,7 +354,7 @@ export function PublicEventGamePage({
   }, [game]);
 
   if (unavailable) return <GameUnavailablePanel eventId={eventId} />;
-  if (game === null) {
+  if (game === null || game.spectatorAvailable === false) {
     if (event !== null) return <GameUnavailablePanel eventId={eventId} />;
     return (
       <PublicShell title="Live spectator Game" description="Loading public Game information…">
@@ -800,25 +800,29 @@ function GameCard({
         <div className="flex flex-wrap items-start justify-between gap-2">
           <div>
             <h3 className={compact ? "text-base font-semibold" : "text-lg font-semibold"}>
-              <a
-                href={game.canonicalPath}
-                className="rounded-sm underline-offset-4 hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
-                onClick={(click) => {
-                  if (
-                    click.button !== 0 ||
-                    click.metaKey ||
-                    click.ctrlKey ||
-                    click.shiftKey ||
-                    click.altKey
-                  )
-                    return;
-                  click.preventDefault();
-                  navigateTo(game.canonicalPath);
-                }}
-              >
-                {game.gameDesignation ?? game.gameCode ?? "Scheduled Game"}
-                <span className="sr-only"> Open spectator Game</span>
-              </a>
+              {game.spectatorAvailable === false ? (
+                <span>{game.gameDesignation ?? game.gameCode ?? "Scheduled Game"}</span>
+              ) : (
+                <a
+                  href={game.canonicalPath}
+                  className="rounded-sm underline-offset-4 hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+                  onClick={(click) => {
+                    if (
+                      click.button !== 0 ||
+                      click.metaKey ||
+                      click.ctrlKey ||
+                      click.shiftKey ||
+                      click.altKey
+                    )
+                      return;
+                    click.preventDefault();
+                    navigateTo(game.canonicalPath);
+                  }}
+                >
+                  {game.gameDesignation ?? game.gameCode ?? "Scheduled Game"}
+                  <span className="sr-only"> Open spectator Game</span>
+                </a>
+              )}
             </h3>
             {game.gameDesignation !== null && game.gameCode !== null ? (
               <CardDescription>Game {game.gameCode}</CardDescription>
@@ -1038,18 +1042,12 @@ function clockStatusLabel(
 function EventDiscovery({ events }: { events: readonly PublicAudienceEventProjection[] }) {
   const current = events.filter((event) => event.lifecycle === "current");
   const future = events.filter((event) => event.lifecycle === "future");
-  const unscheduled = events.filter((event) => event.lifecycle === "unscheduled");
   const past = events.filter((event) => event.lifecycle === "past");
 
   return (
     <div className="space-y-6">
       <EventGroup title="Current Events" events={current} empty="No Event is current today." />
       <EventGroup title="Upcoming Events" events={future} empty="No upcoming Published Events." />
-      <EventGroup
-        title="Unscheduled Events"
-        events={unscheduled}
-        empty="No unscheduled Published Events."
-      />
       <StartAdHocGame />
       <EventGroup title="Past Events" events={past} empty="No past Published Events." />
     </div>
