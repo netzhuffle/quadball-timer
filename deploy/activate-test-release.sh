@@ -266,7 +266,9 @@ verify_bundle() {
   local -a members expected_members
   [[ -d "$directory" && ! -L "$directory" && -s "$manifest_path" ]] || { echo "Test release staging directory or manifest is missing." >&2; return 1; }
   if find "$directory" -type l -print -quit | grep -q .; then echo "Test bundle contains a symlink." >&2; return 1; fi
-  mapfile -t members < <(find "$directory" -type f -printf '%P\n' | sort)
+  while IFS= read -r member; do members+=("${member}"); done < <(
+    cd "$directory" && find . -type f -print | LC_ALL=C sort | sed 's#^\./##'
+  )
   expected_members=(
     "deploy/activate-release.sh"
     "deploy/activate-test-release.sh"
@@ -277,7 +279,7 @@ verify_bundle() {
     "quadball-timer"
     "release-manifest.json"
   )
-  [[ "${members[*]}" == "${expected_members[*]}" ]] || { echo "Test bundle members do not match the allowlist." >&2; return 1; }
+  [[ "$(printf '%s\n' "${members[@]}" | LC_ALL=C sort)" == "$(printf '%s\n' "${expected_members[@]}" | LC_ALL=C sort)" ]] || { echo "Test bundle members do not match the allowlist." >&2; return 1; }
   grep -Fq "\"releaseAttemptId\":\"${release_id}\"" "$manifest_path" || { echo "Test manifest has the wrong release identity." >&2; return 1; }
   expected_digest="$(sed -n 's/.*"executableSha256":"\([0-9a-f]\{64\}\)".*/\1/p' "$manifest_path")"
   actual_digest="$(sha256sum "${directory}/quadball-timer" | awk '{print $1}')"

@@ -340,7 +340,7 @@ verify_bundle() {
     "quadball-timer"
     "release-manifest.json"
   )
-  if [[ "${members[*]}" != "${expected_members[*]}" ]]; then
+  if [[ "$(printf '%s\n' "${members[@]}" | LC_ALL=C sort)" != "$(printf '%s\n' "${expected_members[@]}" | LC_ALL=C sort)" ]]; then
     echo "Release bundle members do not match the allowlist." >&2
     return 1
   fi
