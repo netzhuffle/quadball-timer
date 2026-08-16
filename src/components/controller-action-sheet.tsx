@@ -41,7 +41,7 @@ export function ControllerActionSheet({
   return (
     <div
       data-controller-action-sheet="true"
-      className="pointer-events-none absolute inset-x-0 bottom-0 top-[clamp(16rem,38dvh,22rem)] z-20 flex flex-col gap-0"
+      className="pointer-events-none fixed inset-x-0 bottom-0 top-[clamp(16rem,38dvh,22rem)] z-20 mx-auto flex w-full max-w-[460px] flex-col gap-0"
       style={topOffsetPx === undefined ? undefined : { top: `${topOffsetPx + 8}px` }}
     >
       {activePanel === null ? null : (
