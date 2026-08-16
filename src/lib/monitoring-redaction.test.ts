@@ -6,6 +6,7 @@ import {
   sendRedactedEvent,
   serializeBrowserMonitoringConfig,
 } from "@/lib/monitoring-redaction";
+import { redactServerEventForTest } from "@/lib/monitoring-server";
 
 describe("monitoring redaction boundary", () => {
   test("sends only the reviewed event shape to a fake transport", async () => {
@@ -19,6 +20,8 @@ describe("monitoring redaction boundary", () => {
         tags: {
           category: "server",
           operation: "open",
+          environment: "test",
+          releaseAttempt: "sha-safe-release-attempt",
           grantCode: "raw-grant-code",
           userInput: "private team name",
         },
@@ -107,6 +110,8 @@ describe("monitoring redaction boundary", () => {
           Environment: "request-environment",
           Release: "request-release",
           BrowserCorrelation: "request-alias",
+          environment: "production",
+          releaseAttempt: "request-release",
         },
         message: "safe failure",
       },
@@ -129,6 +134,87 @@ describe("monitoring redaction boundary", () => {
         BrowserCorrelation: "release-trusted-alias",
       },
     });
+  });
+
+  test("composes a real operational event through the reviewed server redaction boundary", () => {
+    const redacted = redactServerEventForTest(
+      {
+        timestamp: 123,
+        tags: {
+          operationalEvent: "1",
+          Environment: "test",
+          ReleaseAttempt: "sha-safe-release-attempt",
+          operation: "restore",
+          phase: "staged-restore",
+          outcome: "failed",
+          category: "staged-restore",
+        },
+        request: { url: "https://timer.example/private" },
+        extra: { secret: "never-send" },
+      },
+      {
+        environment: "test",
+        release: "sha-safe-release-attempt",
+        browserCorrelation: "release-safe-alias",
+      },
+    );
+
+    expect(redacted).toMatchObject({
+      timestamp: 123,
+      tags: {
+        Environment: "test",
+        ReleaseAttempt: "sha-safe-release-attempt",
+        operation: "restore",
+        phase: "staged-restore",
+        outcome: "failed",
+        category: "staged-restore",
+      },
+    });
+    expect(redacted).not.toHaveProperty("request");
+    expect(redacted).not.toHaveProperty("extra");
+  });
+
+  test("keeps operational events to the fixed allowlist", () => {
+    const redacted = redactServerEventForTest(
+      {
+        platform: "javascript",
+        logger: "attacker-controlled",
+        message: "secret command /var/lib/private token=secret",
+        tags: {
+          operationalEvent: "1",
+          Environment: "test",
+          ReleaseAttempt: "sha-safe-release-attempt",
+          operation: "restore",
+          phase: "staged-restore",
+          outcome: "failed",
+          category: "technical-admin-auth-sanitization",
+          BrowserCorrelation: "must-not-leave",
+        },
+        request: { url: "https://timer.example/private" },
+        extra: { stdout: "secret" },
+      },
+      {
+        environment: "test",
+        release: "sha-safe-release-attempt",
+        browserCorrelation: "release-safe-alias",
+      },
+    );
+
+    expect(redacted).toEqual({
+      timestamp: undefined,
+      level: "error",
+      message: "Quadball Timer operational failure",
+      tags: {
+        operation: "restore",
+        Environment: "test",
+        ReleaseAttempt: "sha-safe-release-attempt",
+        phase: "staged-restore",
+        outcome: "failed",
+        category: "technical-admin-auth-sanitization",
+      },
+    });
+    expect(JSON.stringify(redacted)).not.toContain("secret");
+    expect(JSON.stringify(redacted)).not.toContain("BrowserCorrelation");
   });
 
   test("redacts Basic credentials and plausible key material before rewrites", () => {

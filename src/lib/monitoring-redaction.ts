@@ -1,4 +1,10 @@
 import type { Event, Stacktrace, StackFrame } from "@sentry/core";
+import {
+  OPERATIONAL_CATEGORIES,
+  OPERATIONAL_OPERATIONS,
+  OPERATIONAL_PHASES,
+  OPERATIONAL_OUTCOMES,
+} from "@/lib/operational-monitoring";
 
 type ExceptionValue = NonNullable<NonNullable<Event["exception"]>["values"]>[number];
 
@@ -65,6 +71,9 @@ const SAFE_EXCEPTION_TYPES = new Set([
  * not part of this application's privacy boundary.
  */
 export function redactSentryEvent(event: Event, identity: MonitoringIdentity): Event {
+  if (event.tags?.operationalEvent === "1") {
+    return redactOperationalSentryEvent(event, identity);
+  }
   const exceptionValues = event.exception?.values
     ?.map((value) => redactExceptionValue(value))
     .filter((value): value is ExceptionValue => value !== null);
@@ -84,11 +93,49 @@ export function redactSentryEvent(event: Event, identity: MonitoringIdentity): E
       ReleaseAttempt: identity.release,
       BrowserCorrelation: identity.browserCorrelation,
       ...safeTags(event.tags),
+      ...safeOperationalIdentityTags(event.tags, identity),
     },
     exception:
       exceptionValues === undefined || exceptionValues.length === 0
         ? undefined
         : { values: exceptionValues },
+  };
+}
+
+/** Rebuild operational events using only their reviewed fixed allowlist. */
+export function redactOperationalSentryEvent(event: Event, identity: MonitoringIdentity): Event {
+  const tags = event.tags ?? {};
+  const operation = allowlistedTag(tags.operation, OPERATIONAL_OPERATIONS);
+  const phase = allowlistedTag(tags.phase, OPERATIONAL_PHASES);
+  const outcome = allowlistedTag(tags.outcome, OPERATIONAL_OUTCOMES);
+  const category = allowlistedTag(tags.category, OPERATIONAL_CATEGORIES);
+  const eventEnvironment = tags.Environment ?? tags.environment;
+  const eventRelease = tags.ReleaseAttempt ?? tags.releaseAttempt;
+
+  return {
+    timestamp: Number.isFinite(event.timestamp) ? event.timestamp : undefined,
+    level: "error",
+    message: "Quadball Timer operational failure",
+    tags: {
+      ...(operation === undefined ? {} : { operation }),
+      ...(eventEnvironment === identity.environment ? { Environment: identity.environment } : {}),
+      ...(eventRelease === identity.release ? { ReleaseAttempt: identity.release } : {}),
+      ...(phase === undefined ? {} : { phase }),
+      ...(outcome === undefined ? {} : { outcome }),
+      ...(category === undefined ? {} : { category }),
+    },
+  };
+}
+
+function safeOperationalIdentityTags(
+  tags: Record<string, unknown> | undefined,
+  identity: MonitoringIdentity,
+): Record<string, string> {
+  const environment = tags?.environment;
+  const releaseAttempt = tags?.releaseAttempt;
+  return {
+    ...(environment === identity.environment ? { Environment: identity.environment } : {}),
+    ...(releaseAttempt === identity.release ? { ReleaseAttempt: identity.release } : {}),
   };
 }
 
@@ -166,6 +213,13 @@ function safeTags(tags: Record<string, unknown> | undefined) {
     }
   }
   return output;
+}
+
+function allowlistedTag<const Values extends readonly string[]>(
+  value: unknown,
+  values: Values,
+): Values[number] | undefined {
+  return typeof value === "string" && values.includes(value as Values[number]) ? value : undefined;
 }
 
 function isEventId(value: string | undefined): value is string {

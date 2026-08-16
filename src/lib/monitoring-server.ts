@@ -8,11 +8,13 @@ import {
   type MonitoringContext,
   type MonitoringIdentity,
 } from "@/lib/monitoring-redaction";
+import type { OperationalEvent } from "@/lib/operational-monitoring";
 
 export type ServerMonitoring = {
   enabled: boolean;
   captureException(error: unknown, context?: MonitoringContext): void;
   captureMessage(message: string, context?: MonitoringContext): void;
+  captureOperationalFailure(event: OperationalEvent): boolean;
   flush(timeoutMs?: number): Promise<boolean>;
 };
 
@@ -58,36 +60,92 @@ export function createBrowserCorrelation(release: string): string {
 export function initializeServerMonitoring(options: ServerMonitoringOptions): ServerMonitoring {
   if (options.dsn === undefined || options.dsn.length === 0) return createDisabledMonitoring();
 
-  Sentry.init({
-    dsn: options.dsn,
-    environment: options.environment,
-    release: options.release,
-    defaultIntegrations: false,
-    sendDefaultPii: false,
-    tracesSampleRate: 0,
-    beforeSend(event) {
-      return redactSentryEvent(event, options) as typeof event;
-    },
-  });
+  try {
+    Sentry.init({
+      dsn: options.dsn,
+      environment: options.environment,
+      release: options.release,
+      defaultIntegrations: false,
+      sendDefaultPii: false,
+      tracesSampleRate: 0,
+      beforeSend(event) {
+        return redactSentryEvent(event, options) as typeof event;
+      },
+    });
+  } catch {
+    return createDisabledMonitoring();
+  }
 
   return {
     enabled: true,
     captureException(error, context) {
-      Sentry.withScope((scope) => {
-        scope.setTags(safeMonitoringTags(context));
-        Sentry.captureException(error);
+      safelyCapture(() => {
+        Sentry.withScope((scope) => {
+          scope.setTags(safeMonitoringTags(context));
+          Sentry.captureException(error);
+        });
       });
     },
     captureMessage(message, context) {
-      Sentry.withScope((scope) => {
-        scope.setTags(safeMonitoringTags(context));
-        Sentry.captureMessage(message);
+      safelyCapture(() => {
+        Sentry.withScope((scope) => {
+          scope.setTags(safeMonitoringTags(context));
+          Sentry.captureMessage(message);
+        });
+      });
+    },
+    captureOperationalFailure(event) {
+      return captureOperationalFailureEvent(event, options, (captured) => {
+        Sentry.captureEvent(captured);
       });
     },
     flush(timeoutMs = 2_000) {
       return Sentry.flush(timeoutMs).catch(() => false);
     },
   };
+}
+
+export function captureOperationalFailureEvent(
+  event: OperationalEvent,
+  identity: Pick<MonitoringIdentity, "environment" | "release">,
+  capture: (event: Event) => void,
+): boolean {
+  if (event.environment !== identity.environment) return false;
+  if (event.releaseAttempt !== undefined && event.releaseAttempt !== identity.release) return false;
+  const timestampMs =
+    Number.isSafeInteger(event.timestampMs) && event.timestampMs >= 0
+      ? event.timestampMs
+      : Date.now();
+  return tryCapture(() => {
+    capture({
+      level: "error",
+      message: "Quadball Timer operational failure",
+      timestamp: timestampMs / 1_000,
+      tags: {
+        operationalEvent: "1",
+        Environment: event.environment,
+        ...(event.releaseAttempt === undefined ? {} : { ReleaseAttempt: event.releaseAttempt }),
+        operation: event.operation,
+        phase: event.phase,
+        outcome: event.outcome,
+        category: event.category,
+      },
+    });
+  });
+}
+
+function safelyCapture(capture: () => void): void {
+  tryCapture(capture);
+}
+
+function tryCapture(capture: () => void): boolean {
+  try {
+    capture();
+    return true;
+  } catch {
+    // Monitoring is observational and must never alter application behavior.
+    return false;
+  }
 }
 
 export function redactServerEventForTest(event: Event, identity: MonitoringIdentity): Event {
@@ -99,6 +157,9 @@ function createDisabledMonitoring(): ServerMonitoring {
     enabled: false,
     captureException() {},
     captureMessage() {},
+    captureOperationalFailure() {
+      return false;
+    },
     flush: async () => true,
   };
 }

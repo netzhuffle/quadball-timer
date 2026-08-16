@@ -10,32 +10,77 @@ keep_releases=5
 expected_environment="production"
 maintenance_wrapper="/usr/local/sbin/quadball-timer-activation-maintenance"
 
+report_operational_failure() {
+  local operation="deployment"
+  if (( $# >= 3 )); then
+    case "${1:-}" in
+      deployment|backup|migration|restore|readiness) operation="$1"; shift ;;
+    esac
+  fi
+  local phase="$1" category="$2" outcome="${3:-failed}"
+  local reporter_release="${base_dir}/releases/${release_id}" reporter_command="report-operational"
+  [[ -x "$maintenance_wrapper" && -n "$release_id" ]] || return 0
+  if [[ ! -x "$reporter_release/quadball-timer" || ! -f "$reporter_release/release-manifest.json" ]]; then
+    reporter_release="$(realpath "${base_dir}/current" 2>/dev/null || true)"
+    [[ "$reporter_release" == "${base_dir}/releases/"* && -x "$reporter_release/quadball-timer" && -f "$reporter_release/release-manifest.json" ]] || return 0
+    reporter_command="report-operational-attempt"
+  fi
+  if [[ "$reporter_command" == report-operational-attempt ]]; then
+    nohup sudo "$maintenance_wrapper" production "$reporter_release" "$reporter_command" \
+      "$operation" "$phase" "$outcome" "$category" "$release_id" 9>&- </dev/null >/dev/null 2>&1 &
+  else
+    nohup sudo "$maintenance_wrapper" production "$reporter_release" "$reporter_command" \
+      "$operation" "$phase" "$outcome" "$category" 9>&- </dev/null >/dev/null 2>&1 &
+  fi
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --base-dir) base_dir="${2:-}"; shift 2 ;;
-    --release) release_id="${2:-}"; shift 2 ;;
-    --staged-dir) staged_dir="${2:-}"; shift 2 ;;
-    --service) service_name="${2:-}"; shift 2 ;;
-    --port) port="${2:-}"; shift 2 ;;
-    --keep-releases) keep_releases="${2:-}"; shift 2 ;;
-    *) echo "Unknown argument: $1" >&2; exit 1 ;;
+    --base-dir|--release|--staged-dir|--service|--port|--keep-releases)
+      option="$1"
+      if (( $# < 2 )) || [[ -z "${2:-}" ]]; then
+        echo "Missing value for ${option}." >&2
+        report_operational_failure preflight atomic-install unavailable
+        printf 'unavailable\n' >&2
+        exit 1
+      fi
+      case "$option" in
+        --base-dir) base_dir="$2" ;;
+        --release) release_id="$2" ;;
+        --staged-dir) staged_dir="$2" ;;
+        --service) service_name="$2" ;;
+        --port) port="$2" ;;
+        --keep-releases) keep_releases="$2" ;;
+      esac
+      shift 2
+      ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      report_operational_failure preflight atomic-install unavailable
+      printf 'unavailable\n' >&2
+      exit 1
+      ;;
   esac
 done
 
 if [[ ! "$release_id" =~ ^sha-[A-Za-z0-9._-]+-run-[A-Za-z0-9._-]+-attempt-[A-Za-z0-9._-]+$ ]]; then
   echo "Invalid release-attempt identity." >&2
+  printf 'unavailable\n' >&2
   exit 1
 fi
 if [[ ! "$service_name" =~ ^[A-Za-z0-9_.@-]+$ ]]; then
   echo "Invalid service value: ${service_name}" >&2
+  report_operational_failure preflight atomic-install
   exit 1
 fi
 if [[ ! "$port" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
   echo "Invalid port value: ${port}" >&2
+  report_operational_failure preflight atomic-install
   exit 1
 fi
 if [[ ! "$keep_releases" =~ ^[1-9][0-9]*$ ]]; then
   echo "Invalid release retention value." >&2
+  report_operational_failure preflight atomic-install
   exit 1
 fi
 
@@ -255,13 +300,18 @@ candidate_dir=""
 service_stopped=0
 migration_attempted=0
 focused_failure_phase="${QBT_FOCUSED_FAILURE_PHASE:-}"
+export QBT_FOCUSED_FAILURE_PHASE="$focused_failure_phase"
 if [[ "${QBT_FOCUSED_TEST_BATCH:-}" != 1 || "$focused_failure_phase" == preflight ]]; then
-  check_environment_identity
+  if ! check_environment_identity; then
+    report_operational_failure preflight readiness
+    return 1
+  fi
 fi
 
 if [[ -n "$staged_dir" ]]; then
   if [[ "$staged_dir" != "$expected_staged_dir" ]]; then
     echo "Staging directory is outside the environment staging root." >&2
+    report_operational_failure preflight atomic-install
     return 1
   fi
   cleanup_staged=1
@@ -278,16 +328,25 @@ cleanup() {
     rm -rf -- "$candidate_dir"
   fi
   if (( service_stopped == 1 && migration_attempted == 0 )); then
-    sudo systemctl restart "$service_name" >/dev/null 2>&1 || true
+    if ! sudo systemctl restart "$service_name" >/dev/null 2>&1; then
+      report_operational_failure rollback-restart binary-rollback
+    fi
   fi
 }
 trap cleanup EXIT
 
 if [[ "${QBT_FOCUSED_TEST_BATCH:-}" != 1 ]]; then
-  mkdir -p -- "${base_dir}/releases" "${base_dir}/.staging"
-  exec 9>"${base_dir}/.activation.lock"
+  if ! mkdir -p -- "${base_dir}/releases" "${base_dir}/.staging"; then
+    report_operational_failure preflight atomic-install
+    return 1
+  fi
+  if ! exec 9>"${base_dir}/.activation.lock"; then
+    report_operational_failure preflight atomic-install
+    return 1
+  fi
   if ! flock -n 9; then
     echo "Another ${service_name} activation is already running." >&2
+    report_operational_failure preflight atomic-install
     return 1
   fi
 fi
@@ -358,28 +417,43 @@ verify_bundle() {
 if [[ -n "$staged_dir" ]]; then
   if [[ -e "$release_dir" ]]; then
     echo "Release-attempt identity already exists and cannot be overwritten: ${release_id}" >&2
+    report_operational_failure preflight atomic-install
     return 1
   fi
-  if [[ "${QBT_FOCUSED_TEST_RELEASE_VERIFIED:-}" != 1 ]]; then verify_bundle "$staged_dir"; fi
-  chmod u+w -- "$staged_dir"
-  mv -- "$staged_dir" "$release_dir"
+  if [[ "${QBT_FOCUSED_TEST_RELEASE_VERIFIED:-}" != 1 ]] && ! verify_bundle "$staged_dir"; then
+    report_operational_failure preflight atomic-install
+    return 1
+  fi
+  if ! chmod u+w -- "$staged_dir" || ! mv -- "$staged_dir" "$release_dir"; then
+    report_operational_failure preflight atomic-install
+    return 1
+  fi
   cleanup_staged=0
-  chmod -R a-w -- "$release_dir"
+  if ! chmod -R a-w -- "$release_dir"; then
+    report_operational_failure preflight atomic-install
+    return 1
+  fi
 else
   if [[ ! -d "$release_dir" ]]; then
     echo "Release directory does not exist: ${release_dir}" >&2
+    report_operational_failure preflight atomic-install
     return 1
   fi
-  if [[ "${QBT_FOCUSED_TEST_RELEASE_VERIFIED:-}" != 1 ]]; then verify_bundle "$release_dir"; fi
+  if [[ "${QBT_FOCUSED_TEST_RELEASE_VERIFIED:-}" != 1 ]] && ! verify_bundle "$release_dir"; then
+    report_operational_failure preflight atomic-install
+    return 1
+  fi
 fi
 
 if [[ "${QBT_FOCUSED_TEST_BATCH:-}" != 1 || "$focused_failure_phase" == preflight ]]; then
   if [[ ! -x "${release_dir}/quadball-timer" ]]; then
     echo "Compiled executable is missing or not executable: ${release_dir}/quadball-timer" >&2
+    report_operational_failure preflight atomic-install
     return 1
   fi
   if [[ "${QBT_FOCUSED_TEST_MODE:-}" != 1 ]] && ! grep -qw avx2 /proc/cpuinfo; then
     echo "Server CPU does not support AVX2, but this release uses bun-linux-x64-modern." >&2
+    report_operational_failure preflight atomic-install
     return 1
   fi
 
@@ -388,6 +462,7 @@ if [[ "${QBT_FOCUSED_TEST_BATCH:-}" != 1 || "$focused_failure_phase" == prefligh
   if [[ "$actual_exec_start" != *"$expected_exec_start"* ]]; then
     echo "Systemd service ${service_name} does not run ${expected_exec_start}." >&2
     echo "Current ExecStart: ${actual_exec_start:-<unavailable>}" >&2
+    report_operational_failure preflight atomic-install
     return 1
   fi
 fi
@@ -409,64 +484,92 @@ check_service_state_contract() {
   fi
 }
 if [[ "${QBT_FOCUSED_TEST_BATCH:-}" != 1 || "$focused_failure_phase" == preflight ]]; then
-  check_service_state_contract
-  schema_compatibility="$(sed -n 's/.*"schemaCompatibility":"\([^"]*\)".*/\1/p' "${release_dir}/release-manifest.json")"
-  [[ -n "$schema_compatibility" ]] || { echo "Release schema compatibility is missing." >&2; return 1; }
-  [[ -x "$maintenance_wrapper" ]] || { echo "Root maintenance boundary is not installed." >&2; return 1; }
-  available_kb="$(df -Pk /var/lib/quadball-timer | awk 'NR == 2 {print $4}')"
+  if ! check_service_state_contract; then
+    report_operational_failure preflight atomic-install
+    return 1
+  fi
+  schema_compatibility="$(sed -n 's/.*"schemaCompatibility":"\([^"]*\)".*/\1/p' "${release_dir}/release-manifest.json" || true)"
+  if [[ -z "$schema_compatibility" ]]; then
+    echo "Release schema compatibility is missing." >&2
+    report_operational_failure preflight schema-incompatibility
+    return 1
+  fi
+  if [[ ! -x "$maintenance_wrapper" ]]; then
+    echo "Root maintenance boundary is not installed." >&2
+    report_operational_failure preflight atomic-install
+    return 1
+  fi
+  available_kb="$(df -Pk /var/lib/quadball-timer 2>/dev/null | awk 'NR == 2 {print $4}' || true)"
   if [[ ! "$available_kb" =~ ^[0-9]+$ ]] || (( available_kb < 131072 )); then
     echo "Production state directory lacks the required disk reserve." >&2
+    report_operational_failure preflight atomic-install
     return 1
   fi
 fi
 echo "ACTIVATION_PHASE=migration"
-if ! inject_focused_failure preflight; then return 1; fi
 if ! sudo "$maintenance_wrapper" production "$release_dir" preflight >/dev/null; then
   echo "Production Foundation preflight/readiness failed; service was not stopped." >&2
+  # The maintenance CLI owns the semantic failure event. This shell-owned
+  # boundary only reports when the command cannot be entered at all.
   return 1
 fi
 echo "ACTIVATION_PHASE=backup"
 
 # The service owns the writer boundary. The compiled maintenance mode reuses
 # #81's Foundation recovery operation; it never opens the Technical Admin DB.
-if ! inject_focused_failure quiesce-stop; then return 1; fi
-sudo systemctl stop "$service_name"
+if ! inject_focused_failure quiesce-stop; then report_operational_failure quiesce-stop atomic-install; return 1; fi
+if ! sudo systemctl stop "$service_name"; then
+  report_operational_failure quiesce-stop atomic-install
+  return 1
+fi
 service_stopped=1
-if ! inject_focused_failure backup-create; then return 1; fi
 maintenance_json="$(sudo "$maintenance_wrapper" production "$release_dir" backup)" || {
   echo "Production backup creation failed; previous verified backup preserved." >&2
   return 1
 }
 manifest_path="$(sed -n 's/.*"manifestPath":"\([^"]*\)".*/\1/p' <<<"$maintenance_json")"
-[[ -n "$manifest_path" ]] || { echo "Production backup did not return a manifest." >&2; return 1; }
-if ! inject_focused_failure backup-verify; then return 1; fi
+if [[ -z "$manifest_path" ]]; then
+  echo "Production backup did not return a manifest." >&2
+  report_operational_failure backup backup-create backup-candidate
+  return 1
+fi
 if ! sudo "$maintenance_wrapper" production "$release_dir" verify-backup "$manifest_path"; then
   echo "Production backup independent verification failed; previous verified backup preserved." >&2
   return 1
 fi
-if ! inject_focused_failure backup-promote; then return 1; fi
 if ! sudo "$maintenance_wrapper" production "$release_dir" promote "$manifest_path"; then
   echo "Verified backup promotion failed; previous retained backup preserved." >&2
   return 1
 fi
 echo "ACTIVATION_PHASE=migration"
-if ! inject_focused_failure candidate-validation; then return 1; fi
 if ! sudo "$maintenance_wrapper" production "$release_dir" validate-migration; then
   echo "Disposable migration candidate did not reach readiness." >&2
   return 1
 fi
 migration_attempted=1
-if ! inject_focused_failure live-migration; then return 1; fi
 if ! sudo "$maintenance_wrapper" production "$release_dir" apply-migrations; then
   echo "Live migration failed; database preserved without automatic restore." >&2
   return 1
 fi
 
 echo "ACTIVATION_PHASE=activation"
-if ! inject_focused_failure release-switch; then return 1; fi
-ln -sfn -- "$release_dir" "$current_link"
+if ! inject_focused_failure release-switch; then report_operational_failure release-switch atomic-install; return 1; fi
+if ! ln -sfn -- "$release_dir" "$current_link"; then
+  report_operational_failure release-switch atomic-install
+  return 1
+fi
 
-restart_service() { inject_focused_failure rollback-restart || return 1; sudo systemctl restart "$service_name"; }
+restart_service() {
+  local phase="$1" category="$2"
+  if ! inject_focused_failure rollback-restart; then
+    report_operational_failure "$phase" "$category"
+    return 1
+  fi
+  if ! sudo systemctl restart "$service_name"; then
+    report_operational_failure "$phase" "$category"
+    return 1
+  fi
+}
 
 report_service_state() {
   local property value
@@ -549,24 +652,39 @@ prune_releases() {
   fi
 }
 
-if restart_service && check_health "$release_id" "$release_dir" && check_representative_behavior; then
-  prune_releases "$release_dir" "$previous_release"
-  if ! inject_focused_failure final-report; then return 1; fi
-  echo "Activated immutable release attempt ${release_id}."
-  return 0
+if restart_service startup atomic-install; then
+  if check_health "$release_id" "$release_dir" && check_representative_behavior; then
+    if ! prune_releases "$release_dir" "$previous_release"; then
+      report_operational_failure final-report atomic-install
+      return 1
+    fi
+    if ! inject_focused_failure final-report; then report_operational_failure final-report atomic-install; return 1; fi
+    echo "Activated immutable release attempt ${release_id}."
+    return 0
+  fi
+  report_operational_failure readiness readiness
 fi
 
 report_service_state
 echo "Deploy failed; attempting compatible binary rollback without restoring database state." >&2
 if [[ -n "$previous_release" && -d "$previous_release" ]] && compatible_previous_release; then
   previous_release_id="${previous_release##*/}"
-  ln -sfn -- "$previous_release" "$current_link"
-  if restart_service && check_health "$previous_release_id" "$previous_release"; then
-    echo "Rolled back to ${previous_release}." >&2
+  if ! ln -sfn -- "$previous_release" "$current_link"; then
+    report_operational_failure rollback-restart binary-rollback
+    return 1
+  fi
+  if restart_service rollback-restart binary-rollback; then
+    if check_health "$previous_release_id" "$previous_release"; then
+      echo "Rolled back to ${previous_release}." >&2
+    else
+      report_operational_failure rollback-restart binary-rollback
+      echo "Rollback of ${previous_release} failed health checks." >&2
+    fi
   else
     echo "Rollback of ${previous_release} failed health checks." >&2
   fi
 else
+  report_operational_failure rollback-restart binary-rollback
   echo "No compatible previous release available for rollback." >&2
 fi
 return 1
@@ -613,6 +731,7 @@ if [[ "${QBT_FOCUSED_TEST_BATCH:-}" == 1 ]]; then
     fi
     cleanup >>"${focused_batch_directory}/output" 2>&1 || true
     trap - EXIT
+    wait
     printf '%s\n' "$focused_batch_status" >"${focused_batch_directory}/status"
     readlink "$current_link" >"${focused_batch_directory}/current"
     printf '%s\n' "$(<"$QBT_FAST_POINTER")" >"${focused_batch_directory}/pointer"

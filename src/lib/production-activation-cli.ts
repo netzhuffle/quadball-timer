@@ -9,6 +9,7 @@ import {
   readSqliteFoundationStorageReadiness,
 } from "./foundation-storage-sqlite";
 import { readGrantAuthorityOptions } from "./grant-runtime";
+import { GrantKeyRingCustodyError } from "./grant-key-ring-custody";
 import { readRuntimeConfig } from "./runtime-config";
 import {
   createSqliteTechnicalAdminAuthRepository,
@@ -35,6 +36,12 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import type {
+  OperationalCategory,
+  OperationalMonitoringAdapter,
+  OperationalOperation,
+  OperationalPhase,
+} from "./operational-monitoring";
 
 type MaintenanceCommand =
   | "backup"
@@ -68,7 +75,23 @@ function injectFocusedFailure(phase: FocusedFailurePhase): void {
 }
 
 /** Host-local maintenance entrypoint used by the shipped compiled executable. */
-export async function runProductionActivationCli(argv: readonly string[]): Promise<number> {
+export async function runProductionActivationCli(
+  argv: readonly string[],
+  operationalMonitoring?: OperationalMonitoringAdapter,
+): Promise<number> {
+  const reportFailure = createFailureReporter(operationalMonitoring);
+  try {
+    return await runProductionActivationCliInternal(argv, reportFailure);
+  } catch (error) {
+    reportFailure(classifyFailure(argv[0], error));
+    throw error;
+  }
+}
+
+async function runProductionActivationCliInternal(
+  argv: readonly string[],
+  reportFailure: (failure: OperationalFailure) => void,
+): Promise<number> {
   const command = argv[0] as MaintenanceCommand | undefined;
   const rootPromotionRequested =
     process.env.QBT_ROOT_PROMOTION === "1" || argv.includes("--root-promotion");
@@ -95,6 +118,7 @@ export async function runProductionActivationCli(argv: readonly string[]): Promi
     grant = readGrantAuthorityOptions(technicalAdmin.environment);
   } catch (error) {
     if (command === "restore") {
+      reportFailure(classifyFailure(command, error));
       emitBoundedRestoreFailure(error);
       return 1;
     }
@@ -122,6 +146,12 @@ export async function runProductionActivationCli(argv: readonly string[]): Promi
         migration: readiness.evidence?.migration ?? null,
       }),
     );
+    if (!readiness.ok) {
+      reportFailure({
+        ...classifyFailure("readiness", undefined),
+        category: (readiness.evidence?.keys.missingCount ?? 0) > 0 ? "key-version" : "readiness",
+      });
+    }
     return readiness.ok ? 0 : 1;
   }
   if (command === "authoritative-operation") {
@@ -201,12 +231,33 @@ export async function runProductionActivationCli(argv: readonly string[]): Promi
       console.log(
         JSON.stringify({ compatible, schemaVersion: migration.schemaVersion, migration }),
       );
+      if (!compatible) {
+        const schemaIncompatible = !["ready", "pending", "missing"].includes(migration.status);
+        reportFailure({
+          ...classifyFailure("preflight", undefined),
+          category: schemaIncompatible ? "schema-incompatibility" : "migration-candidate",
+          outcome: schemaIncompatible ? "incompatible" : "failed",
+        });
+      }
       return compatible ? 0 : 1;
     }
     if (command === "validate-migration") {
       injectFocusedFailure("candidate-validation");
       const candidate = await storage.validateCandidate();
       console.log(JSON.stringify({ ready: candidate.ready, migration: candidate.migration }));
+      if (!candidate.ready) {
+        const schemaIncompatible = [
+          "future",
+          "reordered",
+          "changed-checksum",
+          "incomplete",
+        ].includes(candidate.readiness.ok ? "" : candidate.readiness.status);
+        reportFailure({
+          ...classifyFailure("validate-migration", undefined),
+          category: schemaIncompatible ? "schema-incompatibility" : "migration-candidate",
+          outcome: schemaIncompatible ? "incompatible" : "failed",
+        });
+      }
       return candidate.ready ? 0 : 1;
     }
     if (command === "apply-migrations") {
@@ -547,6 +598,13 @@ export async function runProductionActivationCli(argv: readonly string[]): Promi
           authorityResurrectionWarning: restored.authorityResurrectionWarning,
         }),
       );
+      if (restored.technicalAdminAuth.reEnrollmentRequired) {
+        reportFailure({
+          ...classifyFailure("restore", undefined),
+          outcome: "degraded",
+          category: "re-enrollment-required",
+        });
+      }
       return 0;
     }
     const schemaCompatibility = process.env.SCHEMA_COMPATIBILITY;
@@ -602,6 +660,7 @@ export async function runProductionActivationCli(argv: readonly string[]): Promi
     return 0;
   } catch (error) {
     if (command !== "restore") throw error;
+    reportFailure(classifyFailure(command, error));
     emitBoundedRestoreFailure(error);
     return 1;
   } finally {
@@ -909,4 +968,113 @@ function boundedRestoreFailureOutcome(
   if (failure?.phase === "foundation-replacement") return "foundation-replacement-failed";
   if (failure?.phase === "post-cutover-evidence") return "cutover-completed-evidence-failed";
   return "restore-preparation-failed";
+}
+
+type OperationalFailure = {
+  operation: OperationalOperation;
+  environment: "production" | "test";
+  releaseAttempt?: string;
+  phase: OperationalPhase;
+  outcome: "failed" | "degraded" | "blocked" | "incompatible" | "rolled-back" | "unavailable";
+  category: OperationalCategory;
+};
+
+function createFailureReporter(
+  adapter: OperationalMonitoringAdapter | undefined,
+): (failure: OperationalFailure) => void {
+  let reported = false;
+  return (failure) => {
+    if (reported || adapter === undefined) return;
+    reported = true;
+    adapter.reportFailure(failure);
+  };
+}
+
+function classifyFailure(command: string | undefined, error: unknown): OperationalFailure {
+  const releaseAttempt = safeReleaseAttempt(process.env.RELEASE_ATTEMPT_ID);
+  const environment = process.env.QUADBALL_ENVIRONMENT === "production" ? "production" : "test";
+  const message = error instanceof Error ? error.message : "";
+  if (command === "restore") {
+    return {
+      operation: "restore",
+      environment,
+      ...(releaseAttempt === undefined ? {} : { releaseAttempt }),
+      phase: "staged-restore",
+      outcome: "failed",
+      category: classifyRestoreOperationalCategory(error),
+    };
+  }
+  if (error instanceof GrantKeyRingCustodyError && error.category === "missing-key-version") {
+    return {
+      operation: command === "readiness" ? "readiness" : "deployment",
+      environment,
+      ...(releaseAttempt === undefined ? {} : { releaseAttempt }),
+      phase: command === "readiness" ? "readiness" : "startup",
+      outcome: "failed",
+      category: "key-version",
+    };
+  }
+  if (command === "backup" || command === "verify-backup" || command === "promote") {
+    return {
+      operation: "backup",
+      environment,
+      ...(releaseAttempt === undefined ? {} : { releaseAttempt }),
+      phase:
+        command === "backup"
+          ? "backup-create"
+          : command === "verify-backup"
+            ? "backup-verify"
+            : "backup-promote",
+      outcome: "failed",
+      category: "backup-candidate",
+    };
+  }
+  if (command === "validate-migration" || command === "apply-migrations") {
+    return {
+      operation: "migration",
+      environment,
+      ...(releaseAttempt === undefined ? {} : { releaseAttempt }),
+      phase: command === "validate-migration" ? "candidate-validation" : "live-migration",
+      outcome: message.includes("incompatible") ? "incompatible" : "failed",
+      category: message.includes("incompatible") ? "schema-incompatibility" : "migration-candidate",
+    };
+  }
+  if (command === "readiness" || command === "preflight") {
+    return {
+      operation: command === "readiness" ? "readiness" : "deployment",
+      environment,
+      ...(releaseAttempt === undefined ? {} : { releaseAttempt }),
+      phase: command === "readiness" ? "readiness" : "preflight",
+      outcome: "failed",
+      category: "readiness",
+    };
+  }
+  return {
+    operation: "deployment",
+    environment,
+    ...(releaseAttempt === undefined ? {} : { releaseAttempt }),
+    phase: "preflight",
+    outcome: "failed",
+    category: "atomic-install",
+  };
+}
+
+export function classifyRestoreOperationalCategory(error: unknown): OperationalCategory {
+  if (error instanceof GrantKeyRingCustodyError && error.category === "missing-key-version") {
+    return "key-version";
+  }
+  if (error instanceof FoundationRestoreFailure && error.phase === "foundation-replacement") {
+    return "atomic-install";
+  }
+  const technicalAdminOutcome =
+    error instanceof FoundationRestoreFailure ? error.technicalAdminAuth.outcome : null;
+  if (technicalAdminOutcome === "sanitation-failed") {
+    return "technical-admin-auth-sanitization";
+  }
+  if (technicalAdminOutcome === "re-enrollment-required") return "re-enrollment-required";
+  return "staged-restore";
+}
+
+function safeReleaseAttempt(value: string | undefined): string | undefined {
+  return value !== undefined && /^[A-Za-z0-9._-]{1,128}$/u.test(value) ? value : undefined;
 }

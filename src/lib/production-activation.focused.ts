@@ -136,7 +136,7 @@ describe("disposable activation SQLite integration", () => {
       const runuserStub = join(binDirectory, "runuser");
       await writeFile(
         runuserStub,
-        '#!/bin/sh\nprintf "runuser\\n" >> "$QBT_FOCUSED_RUNUSER_LOG"\nshift 3\nexec "$@"\n',
+        '#!/bin/sh\ncase "$*" in *"--production-activation restore"*) printf "restore-maintenance\\n" >> "$QBT_FOCUSED_RUNUSER_LOG" ;; *"--emit-operational-failure"*) printf "operational-report\\n" >> "$QBT_FOCUSED_RUNUSER_LOG" ;; esac\nshift 3\nexec "$@"\n',
       );
       await chmod(runuserStub, 0o755);
       const flockStub = join(binDirectory, "flock");
@@ -293,7 +293,9 @@ describe("disposable activation SQLite integration", () => {
       );
       expect(wrongSourceOwner.code, wrongSourceOwner.output).not.toBe(0);
       expect(wrongSourceOwner.output).toContain('"outcome":"restore-staging-failed"');
-      expect(await readFile(join(root, "runuser.log"), "utf8")).toBe("");
+      expect(await readFile(join(root, "runuser.log"), "utf8")).not.toContain(
+        "restore-maintenance",
+      );
 
       const wrongDestinationOwner = await run(
         "restore",
@@ -305,7 +307,9 @@ describe("disposable activation SQLite integration", () => {
       );
       expect(wrongDestinationOwner.code, wrongDestinationOwner.output).not.toBe(0);
       expect(wrongDestinationOwner.output).toContain('"outcome":"restore-staging-failed"');
-      expect(await readFile(join(root, "runuser.log"), "utf8")).toBe("");
+      expect(await readFile(join(root, "runuser.log"), "utf8")).not.toContain(
+        "restore-maintenance",
+      );
 
       const restore = await run("restore", canonicalLock, retainedManifestPath);
       expect(restore.code, restore.output).toBe(0);

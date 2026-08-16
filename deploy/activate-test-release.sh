@@ -10,22 +10,65 @@ keep_releases=5
 expected_environment="test"
 maintenance_wrapper="/usr/local/sbin/quadball-timer-activation-maintenance"
 
+report_operational_failure() {
+  local operation="deployment"
+  if (( $# >= 3 )); then
+    case "${1:-}" in
+      deployment|backup|migration|restore|readiness) operation="$1"; shift ;;
+    esac
+  fi
+  local phase="$1" category="$2" outcome="${3:-failed}"
+  local reporter_release="${base_dir}/releases/${release_id}" reporter_command="report-operational"
+  [[ -x "$maintenance_wrapper" && -n "$release_id" ]] || return 0
+  if [[ ! -x "$reporter_release/quadball-timer" || ! -f "$reporter_release/release-manifest.json" ]]; then
+    reporter_release="$(realpath "${base_dir}/current" 2>/dev/null || true)"
+    [[ "$reporter_release" == "${base_dir}/releases/"* && -x "$reporter_release/quadball-timer" && -f "$reporter_release/release-manifest.json" ]] || return 0
+    reporter_command="report-operational-attempt"
+  fi
+  if [[ "$reporter_command" == report-operational-attempt ]]; then
+    nohup sudo "$maintenance_wrapper" test "$reporter_release" "$reporter_command" \
+      "$operation" "$phase" "$outcome" "$category" "$release_id" 9>&- </dev/null >/dev/null 2>&1 &
+  else
+    nohup sudo "$maintenance_wrapper" test "$reporter_release" "$reporter_command" \
+      "$operation" "$phase" "$outcome" "$category" 9>&- </dev/null >/dev/null 2>&1 &
+  fi
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --base-dir) base_dir="${2:-}"; shift 2 ;;
-    --release) release_id="${2:-}"; shift 2 ;;
-    --staged-dir) staged_dir="${2:-}"; shift 2 ;;
-    --keep-releases) keep_releases="${2:-}"; shift 2 ;;
-    *) echo "Unknown argument: $1" >&2; exit 1 ;;
+    --base-dir|--release|--staged-dir|--keep-releases)
+      option="$1"
+      if (( $# < 2 )) || [[ -z "${2:-}" ]]; then
+        echo "Missing value for ${option}." >&2
+        report_operational_failure preflight atomic-install unavailable
+        printf 'unavailable\n' >&2
+        exit 1
+      fi
+      case "$option" in
+        --base-dir) base_dir="$2" ;;
+        --release) release_id="$2" ;;
+        --staged-dir) staged_dir="$2" ;;
+        --keep-releases) keep_releases="$2" ;;
+      esac
+      shift 2
+      ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      report_operational_failure preflight atomic-install unavailable
+      printf 'unavailable\n' >&2
+      exit 1
+      ;;
   esac
 done
 
 if [[ ! "$release_id" =~ ^sha-[A-Za-z0-9._-]+-run-[A-Za-z0-9._-]+-attempt-[A-Za-z0-9._-]+$ ]]; then
   echo "Invalid Test release-attempt identity." >&2
+  printf 'unavailable\n' >&2
   exit 1
 fi
 if [[ ! "$keep_releases" =~ ^[1-9][0-9]*$ ]]; then
   echo "Invalid release retention value." >&2
+  printf 'unavailable\n' >&2
   exit 1
 fi
 
@@ -37,12 +80,19 @@ cleanup_staged=0
 service_stopped=0
 migration_attempted=0
 focused_failure_phase="${QBT_FOCUSED_FAILURE_PHASE:-}"
+export QBT_FOCUSED_FAILURE_PHASE="$focused_failure_phase"
 
 inject_focused_failure() {
   if [[ "${QBT_FOCUSED_TEST_MODE:-}" == 1 && "$EUID" -ne 0 && -n "${QBT_FOCUSED_TEST_ROOT:-}" && "$focused_failure_phase" == "$1" ]]; then
     echo "Focused activation failure at $1." >&2
     return 1
   fi
+}
+
+rollback_failure_reported=0
+report_binary_rollback_failure() {
+  rollback_failure_reported=1
+  report_operational_failure rollback-restart binary-rollback
 }
 if [[ "${QBT_FOCUSED_TEST_MODE:-}" == 1 ]]; then
   focused_test_root="${QBT_FOCUSED_TEST_ROOT:-}"
@@ -216,7 +266,11 @@ activation_wait_seconds() {
 }
 
 if [[ -n "$staged_dir" ]]; then
-  [[ "$staged_dir" == "$expected_staged_dir" ]] || { echo "Invalid Test staging directory." >&2; exit 1; }
+  if [[ "$staged_dir" != "$expected_staged_dir" ]]; then
+    echo "Invalid Test staging directory." >&2
+    report_operational_failure preflight atomic-install
+    exit 1
+  fi
   cleanup_staged=1
 fi
 
@@ -232,7 +286,10 @@ check_environment_identity() {
     return 1
   }
 }
-check_environment_identity
+if ! check_environment_identity; then
+  report_operational_failure preflight readiness
+  exit 1
+fi
 # shellcheck disable=SC2329
 cleanup() {
   if (( cleanup_staged == 1 )) && [[ -d "$staged_dir" ]]; then
@@ -240,14 +297,26 @@ cleanup() {
     rm -rf -- "$staged_dir"
   fi
   if (( service_stopped == 1 && migration_attempted == 0 )); then
-    sudo systemctl restart "$service_name" >/dev/null 2>&1 || true
+    if ! sudo systemctl restart "$service_name" >/dev/null 2>&1; then
+      report_binary_rollback_failure
+    fi
   fi
 }
 trap cleanup EXIT
 
-mkdir -p -- "${base_dir}/releases" "${base_dir}/.staging"
-exec 9>"${base_dir}/.activation.lock"
-if ! flock -n 9; then echo "Another ${service_name} activation is already running." >&2; exit 1; fi
+if ! mkdir -p -- "${base_dir}/releases" "${base_dir}/.staging"; then
+  report_operational_failure preflight atomic-install
+  exit 1
+fi
+if ! exec 9>"${base_dir}/.activation.lock"; then
+  report_operational_failure preflight atomic-install
+  exit 1
+fi
+if ! flock -n 9; then
+  echo "Another ${service_name} activation is already running." >&2
+  report_operational_failure preflight atomic-install
+  exit 1
+fi
 if [[ -L "$current_link" || -d "$current_link" ]]; then previous_release="$(readlink -f "$current_link" || true)"; fi
 
 verify_bundle() {
@@ -281,21 +350,44 @@ verify_bundle() {
 }
 
 if [[ -n "$staged_dir" ]]; then
-  [[ ! -e "$release_dir" ]] || { echo "Test release identity already exists and cannot be overwritten." >&2; exit 1; }
-  if [[ "${QBT_FOCUSED_TEST_RELEASE_VERIFIED:-}" != 1 ]]; then verify_bundle "$staged_dir"; fi
-  chmod u+w -- "$staged_dir"
-  mv -- "$staged_dir" "$release_dir"
+  [[ ! -e "$release_dir" ]] || { echo "Test release identity already exists and cannot be overwritten." >&2; report_operational_failure preflight atomic-install; exit 1; }
+  if [[ "${QBT_FOCUSED_TEST_RELEASE_VERIFIED:-}" != 1 ]] && ! verify_bundle "$staged_dir"; then
+    report_operational_failure preflight atomic-install
+    exit 1
+  fi
+  if ! chmod u+w -- "$staged_dir" || ! mv -- "$staged_dir" "$release_dir"; then
+    report_operational_failure preflight atomic-install
+    exit 1
+  fi
   cleanup_staged=0
-  chmod -R a-w -- "$release_dir"
+  if ! chmod -R a-w -- "$release_dir"; then
+    report_operational_failure preflight atomic-install
+    exit 1
+  fi
 else
-  [[ -d "$release_dir" ]] || { echo "Test release directory does not exist." >&2; exit 1; }
-  if [[ "${QBT_FOCUSED_TEST_RELEASE_VERIFIED:-}" != 1 ]]; then verify_bundle "$release_dir"; fi
+  [[ -d "$release_dir" ]] || {
+    echo "Test release directory does not exist." >&2
+    report_operational_failure preflight atomic-install
+    exit 1
+  }
+  if [[ "${QBT_FOCUSED_TEST_RELEASE_VERIFIED:-}" != 1 ]] && ! verify_bundle "$release_dir"; then
+    report_operational_failure preflight atomic-install
+    exit 1
+  fi
 fi
 
-grep -qw avx2 /proc/cpuinfo || { echo "Server CPU does not support AVX2, but this release uses bun-linux-x64-modern." >&2; exit 1; }
+if [[ "${QBT_FOCUSED_TEST_MODE:-}" != 1 ]] && ! grep -qw avx2 /proc/cpuinfo; then
+  echo "Server CPU does not support AVX2, but this release uses bun-linux-x64-modern." >&2
+  report_operational_failure preflight atomic-install
+  exit 1
+fi
 expected_exec_start="${current_link}/quadball-timer"
 actual_exec_start="$(systemctl show "$service_name" --property=ExecStart --value 2>/dev/null || true)"
-[[ "$actual_exec_start" == *"$expected_exec_start"* ]] || { echo "Test service does not run ${expected_exec_start}." >&2; exit 1; }
+if [[ "$actual_exec_start" != *"$expected_exec_start"* ]]; then
+  echo "Test service does not run ${expected_exec_start}." >&2
+  report_operational_failure preflight atomic-install
+  exit 1
+fi
 
 check_service_contract() {
   local state_directory state_directory_mode effective_environment
@@ -315,40 +407,65 @@ check_service_contract() {
     return 1
   fi
 }
-check_service_contract
+if ! check_service_contract; then
+  report_operational_failure preflight atomic-install
+  exit 1
+fi
 
-schema_compatibility="$(sed -n 's/.*"schemaCompatibility":"\([^"]*\)".*/\1/p' "${release_dir}/release-manifest.json")"
-[[ -n "$schema_compatibility" ]] || { echo "Release schema compatibility is missing." >&2; exit 1; }
-[[ -x "$maintenance_wrapper" ]] || { echo "Root maintenance boundary is not installed." >&2; exit 1; }
-available_kb="$(df -Pk /var/lib/quadball-timer-test | awk 'NR == 2 {print $4}')"
+schema_compatibility="$(sed -n 's/.*"schemaCompatibility":"\([^"]*\)".*/\1/p' "${release_dir}/release-manifest.json" || true)"
+if [[ -z "$schema_compatibility" ]]; then
+  echo "Release schema compatibility is missing." >&2
+  report_operational_failure preflight schema-incompatibility
+  exit 1
+fi
+if [[ ! -x "$maintenance_wrapper" ]]; then
+  echo "Root maintenance boundary is not installed." >&2
+  report_operational_failure preflight atomic-install
+  exit 1
+fi
+available_kb="$(df -Pk /var/lib/quadball-timer-test 2>/dev/null | awk 'NR == 2 {print $4}' || true)"
 if [[ ! "$available_kb" =~ ^[0-9]+$ ]] || (( available_kb < 16384 )); then
   echo "Test state directory lacks the required disk reserve." >&2
+  report_operational_failure preflight atomic-install
   exit 1
 fi
 echo "ACTIVATION_PHASE=migration"
-if ! inject_focused_failure preflight; then exit 1; fi
 if ! sudo "$maintenance_wrapper" test "$release_dir" preflight >/dev/null; then
   echo "Test Foundation preflight/readiness failed; service was not stopped." >&2
   exit 1
 fi
-if ! inject_focused_failure quiesce-stop; then exit 1; fi
-sudo systemctl stop "$service_name"
+if ! inject_focused_failure quiesce-stop; then report_operational_failure quiesce-stop atomic-install; exit 1; fi
+if ! sudo systemctl stop "$service_name"; then
+  report_operational_failure quiesce-stop atomic-install
+  exit 1
+fi
 service_stopped=1
-if ! inject_focused_failure candidate-validation; then exit 1; fi
 if ! sudo "$maintenance_wrapper" test "$release_dir" validate-migration; then
   echo "Disposable Test migration candidate did not reach readiness." >&2
   exit 1
 fi
-if ! inject_focused_failure live-migration; then exit 1; fi
 migration_attempted=1
 if ! sudo "$maintenance_wrapper" test "$release_dir" apply-migrations; then
   echo "Test migration failed; no backup was created or retained." >&2
   exit 1
 fi
 echo "ACTIVATION_PHASE=activation"
-if ! inject_focused_failure release-switch; then exit 1; fi
-ln -sfn -- "$release_dir" "$current_link"
-restart_service() { inject_focused_failure rollback-restart || return 1; sudo systemctl restart "$service_name"; }
+if ! inject_focused_failure release-switch; then report_operational_failure release-switch atomic-install; exit 1; fi
+if ! ln -sfn -- "$release_dir" "$current_link"; then
+  report_operational_failure release-switch atomic-install
+  exit 1
+fi
+restart_service() {
+  local phase="$1" category="$2"
+  if ! inject_focused_failure rollback-restart; then
+    report_operational_failure "$phase" "$category"
+    return 1
+  fi
+  if ! sudo systemctl restart "$service_name"; then
+    report_operational_failure "$phase" "$category"
+    return 1
+  fi
+}
 
 check_release_identity() {
   local selected_release_id="$1"
@@ -405,12 +522,12 @@ compatible_previous_release() {
 prune_releases() {
   local current_release="$1" rollback_release="$2" release_path release_root
   local -a all_releases
-  release_root="$("$realpath_command" -e -- "${base_dir}/releases")" || return 1
-  find "$release_root" -mindepth 1 -maxdepth 1 -type d -name '.prune-*' -print >&2
-  all_releases=()
-  while IFS= read -r release_path; do all_releases+=("$release_path"); done < <(
-    list_selectable_releases "$release_root"
-  )
+ release_root="$("$realpath_command" -e -- "${base_dir}/releases")" || return 1
+ find "$release_root" -mindepth 1 -maxdepth 1 -type d -name '.prune-*' -print >&2
+ all_releases=()
+ while IFS= read -r release_path; do all_releases+=("$release_path"); done < <(
+   list_selectable_releases "$release_root"
+ )
   local release_count=0
   if ((${#all_releases[@]} > 0)); then
     for release_path in "${all_releases[@]}"; do
@@ -421,25 +538,41 @@ prune_releases() {
   fi
 }
 
-if restart_service && check_health "$release_id" "$release_dir"; then
-  prune_releases "$release_dir" "$previous_release"
-  if ! inject_focused_failure final-report; then exit 1; fi
-  echo "Activated immutable Test release attempt ${release_id}."
-  exit 0
+if restart_service startup atomic-install; then
+  if check_health "$release_id" "$release_dir"; then
+    if ! prune_releases "$release_dir" "$previous_release"; then
+      report_operational_failure final-report atomic-install
+      exit 1
+    fi
+    if ! inject_focused_failure final-report; then report_operational_failure final-report atomic-install; exit 1; fi
+    echo "Activated immutable Test release attempt ${release_id}."
+    exit 0
+  fi
+  report_operational_failure readiness readiness
 fi
 echo "Test deployment failed; attempting compatible binary rollback without restoring data." >&2
 if [[ -n "$previous_release" && -d "$previous_release" ]] && compatible_previous_release; then
   previous_release_id="${previous_release##*/}"
-  ln -sfn -- "$previous_release" "$current_link"
-  if restart_service && check_health "$previous_release_id" "$previous_release"; then
-    echo "Rolled back Test to ${previous_release}." >&2
-    exit 1
+  if ! ln -sfn -- "$previous_release" "$current_link"; then
+    report_binary_rollback_failure
+  elif restart_service rollback-restart binary-rollback; then
+    if check_health "$previous_release_id" "$previous_release"; then
+      echo "Rolled back Test to ${previous_release}." >&2
+    else
+      report_binary_rollback_failure
+      echo "Test rollback failed health checks; stopping Test service fail-closed." >&2
+    fi
+  else
+    echo "Test rollback failed health checks; stopping Test service fail-closed." >&2
   fi
-  echo "Test rollback failed health checks; stopping Test service fail-closed." >&2
 else
+  report_binary_rollback_failure
   echo "No compatible previous Test release available for rollback." >&2
 fi
 if ! sudo systemctl stop "$service_name"; then
+  if [[ "$rollback_failure_reported" == 0 ]]; then
+    report_operational_failure quiesce-stop atomic-install
+  fi
   echo "Test fail-closed stop failed; service state is not trusted." >&2
 else
   echo "Test service stopped after failed activation." >&2

@@ -1,7 +1,17 @@
 import { describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { Buffer } from "node:buffer";
-import { readFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import {
   chmod,
   lstat,
@@ -18,9 +28,11 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { resolveAdHocEnvironmentIdentity } from "@/lib/ad-hoc-games";
 import {
+  classifyRestoreOperationalCategory,
   copyStableRestoreFile,
   prepareTechnicalAdminStorageForRestore,
 } from "@/lib/production-activation-cli";
+import { FoundationRestoreFailure } from "@/lib/foundation-recovery";
 
 const repositoryRoot = process.cwd();
 
@@ -34,6 +46,21 @@ async function pathExists(path: string): Promise<boolean> {
 }
 
 describe("Production deployment contract", () => {
+  test("classifies Foundation replacement as an atomic restore installation failure", () => {
+    const failure = new FoundationRestoreFailure(
+      new Error("secret path must remain private"),
+      {
+        outcome: "re-enrollment-required",
+        credentialPreserved: false,
+        reEnrollmentRequired: true,
+      },
+      "foundation-replacement",
+      true,
+    );
+
+    expect(classifyRestoreOperationalCategory(failure)).toBe("atomic-install");
+  });
+
   test("gives the service one private persistent state directory", () => {
     const unit = readFileSync(
       join(repositoryRoot, "deploy/systemd/quadball-timer.service"),
@@ -81,6 +108,11 @@ describe("Production deployment contract", () => {
     expect(workflow).toContain('"releaseAttemptId": "${RELEASE_ATTEMPT_ID}"');
     expect(workflow).toContain('"phase": "${TEST_PHASE}"');
     expect(workflow).toContain('"phase": "${PRODUCTION_PHASE}"');
+    expect(workflow).toContain('"monitoringDelivery": "${TEST_MONITORING_DELIVERY}"');
+    expect(workflow).toContain('"monitoringDelivery": "${PRODUCTION_MONITORING_DELIVERY}"');
+    expect(workflow).toContain("timeout --signal=KILL 5s ssh");
+    expect(workflow).toContain("read-operational-delivery");
+    expect(workflow).not.toContain("OPERATIONAL_REPORT=");
     expect(workflow).toContain(
       'if [[ "$TEST_STATUS" != "success" || "$PRODUCTION_STATUS" != "success" ]]; then',
     );
@@ -789,6 +821,446 @@ esac
     expect(handoff.match(/\/usr\/bin\/sudo -v/gu)).toHaveLength(1);
     expect(handoff).toContain("rm -rf -- $remote_dir");
     expect(handoff).toContain("test ! -e $remote_dir");
+  });
+
+  test("keeps activation recovery independent from monitoring delivery", () => {
+    const source = readFileSync(join(repositoryRoot, "src/index.ts"), "utf8");
+    const maintenanceStart = source.indexOf("if (maintenanceIndex !== -1)");
+    const maintenanceEnd = source.indexOf('if (grantKeyRingInvocation.kind === "invalid")');
+    const maintenanceLifecycle = source.slice(maintenanceStart, maintenanceEnd);
+    const adapterStart = source.indexOf("function createOperationalMonitoringAdapterForServer");
+    const adapterEnd = source.indexOf("async function createHtmlRoute", adapterStart);
+    const serverAdapter = source.slice(adapterStart, adapterEnd);
+
+    expect(maintenanceLifecycle).not.toContain("await monitoring.flush");
+    expect(serverAdapter).toContain("send: async (event) =>");
+    expect(serverAdapter).toContain(
+      "if (!monitoring.captureOperationalFailure(event)) return false",
+    );
+    expect(serverAdapter).toContain("return await monitoring.flush(250)");
+    expect(source).toContain("await monitoring.flush(250);");
+    expect(source).toContain("const delivery = await adapter.deliverFailure");
+    expect(source).toContain("console.log(delivery)");
+  });
+
+  test("composes Production and Test reporting through the root-controlled DSN seam", async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "quadball-monitoring-root-")));
+    try {
+      const releaseId = "sha-root-run-test-attempt-1";
+      const runuser = join(root, "runuser");
+      writeFileSync(
+        runuser,
+        '#!/usr/bin/env bash\nwhile [[ "$1" != "--" ]]; do shift; done\nshift\nexec "$@"\n',
+      );
+      chmodSync(runuser, 0o755);
+      const realpath = join(root, "realpath");
+      writeFileSync(
+        realpath,
+        '#!/usr/bin/env bash\n[[ "$1" == "-e" ]] && shift\n[[ "$1" == "--" ]] && shift\nif [[ -d "$1" ]]; then cd "$1" && pwd -P; else cd "$(dirname "$1")" && printf "%s/%s\\n" "$(pwd -P)" "$(basename "$1")"; fi\n',
+      );
+      chmodSync(realpath, 0o755);
+      const redactionHelper = join(root, "operational-redaction.ts");
+      writeFileSync(
+        redactionHelper,
+        [
+          `import { captureOperationalFailureEvent, redactServerEventForTest } from ${JSON.stringify(join(repositoryRoot, "src/lib/monitoring-server.ts"))};`,
+          "const identity = { environment: process.env.QUADBALL_ENVIRONMENT as 'production' | 'test', release: process.env.RELEASE_ATTEMPT_ID!, browserCorrelation: 'release-test' };",
+          "let redacted: unknown = null;",
+          "captureOperationalFailureEvent({ operation: 'deployment', environment: identity.environment, releaseAttempt: identity.release, phase: 'readiness', outcome: 'failed', category: 'readiness', timestampMs: 123_000 }, identity, (event) => { redacted = redactServerEventForTest({ ...event, request: { url: 'https://timer.example/private' }, extra: { stdout: 'secret command /var/lib/private token=secret' } }, identity); });",
+          "console.log(JSON.stringify(redacted));",
+          "",
+        ].join("\n"),
+      );
+      const bunPath = Bun.which("bun") ?? process.execPath;
+      const executableContents = [
+        "#!/usr/bin/env bash",
+        'if [[ "$1" == "--emit-operational-failure" ]]; then',
+        '  printf "%s %s %s %s\\n" "$QUADBALL_ENVIRONMENT" "$RELEASE_ATTEMPT_ID" "$3" "${GLITCHTIP_DSN:+configured}" > "$0.observed"',
+        `  ${bunPath} ${redactionHelper} > "$0.redacted"`,
+        '  [[ -n "${GLITCHTIP_DSN:-}" ]] && printf "sent\\n" || printf "unavailable\\n"',
+        "fi",
+        "",
+      ].join("\n");
+      for (const environment of ["production", "test"] as const) {
+        const serviceRoot =
+          environment === "production" ? "srv/quadball-timer" : "srv/quadball-timer-test";
+        const release = join(root, serviceRoot, "releases", releaseId);
+        mkdirSync(release, { recursive: true });
+        const executable = join(release, "quadball-timer");
+        writeFileSync(executable, executableContents);
+        chmodSync(executable, 0o755);
+        writeFileSync(
+          join(release, "release-manifest.json"),
+          JSON.stringify({ releaseAttemptId: releaseId, schemaCompatibility: "26" }),
+        );
+      }
+      const installedReleaseId = "sha-root-installed-attempt-1";
+      const installedRelease = join(root, "srv/quadball-timer/releases", installedReleaseId);
+      mkdirSync(installedRelease, { recursive: true });
+      writeFileSync(join(installedRelease, "quadball-timer"), executableContents);
+      chmodSync(join(installedRelease, "quadball-timer"), 0o755);
+      writeFileSync(
+        join(installedRelease, "release-manifest.json"),
+        JSON.stringify({ releaseAttemptId: installedReleaseId, schemaCompatibility: "26" }),
+      );
+      const environmentDirectory = join(root, "etc", "quadball-timer");
+      mkdirSync(environmentDirectory, { recursive: true });
+      writeFileSync(
+        join(environmentDirectory, "production.env"),
+        "GLITCHTIP_DSN=https://prod.example/1\n",
+      );
+      writeFileSync(
+        join(environmentDirectory, "test.env"),
+        "GLITCHTIP_DSN=https://test.example/1\n",
+      );
+      const serviceOwnedState = join(root, "var/lib/quadball-timer");
+      mkdirSync(serviceOwnedState, { recursive: true });
+      writeFileSync(
+        join(serviceOwnedState, `.operational-status-${releaseId}-readiness-readiness`),
+        "failed\n",
+      );
+      const wrapper = join(repositoryRoot, "deploy/activation-maintenance-root.sh");
+      const runReport = (
+        environment: "production" | "test",
+        operation: "deployment" | "restore",
+        phase = "readiness",
+        category = "readiness",
+        reporterReleaseId = releaseId,
+        eventReleaseId = releaseId,
+      ) => {
+        const serviceRoot = environment === "production" ? "quadball-timer" : "quadball-timer-test";
+        const commonEnvironment = {
+          ...process.env,
+          QBT_FOCUSED_TEST_MODE: "1",
+          QBT_FOCUSED_TEST_ROOT: root,
+          QBT_FOCUSED_TEST_RUNUSER: runuser,
+          QBT_FOCUSED_TEST_REALPATH: realpath,
+          SUDO_USER:
+            environment === "production" ? "deploy-quadball-timer" : "deploy-quadball-timer-test",
+          GLITCHTIP_DSN: "https://attacker.example/should-not-be-used",
+        };
+        const result = Bun.spawnSync({
+          cmd: [
+            "bash",
+            wrapper,
+            environment,
+            join(root, "srv", serviceRoot, "releases", reporterReleaseId),
+            reporterReleaseId === eventReleaseId
+              ? "report-operational"
+              : "report-operational-attempt",
+            operation,
+            phase,
+            "failed",
+            category,
+            ...(reporterReleaseId === eventReleaseId ? [] : [eventReleaseId]),
+          ],
+          env: commonEnvironment,
+          stdout: "pipe",
+          stderr: "pipe",
+        });
+        const status = Bun.spawnSync({
+          cmd: [
+            "bash",
+            wrapper,
+            environment,
+            join(root, "srv", serviceRoot, "releases", reporterReleaseId),
+            "read-operational-delivery",
+            eventReleaseId,
+          ],
+          env: commonEnvironment,
+          stdout: "pipe",
+          stderr: "pipe",
+        });
+        const executablePath = join(
+          root,
+          "srv",
+          serviceRoot,
+          "releases",
+          reporterReleaseId,
+          "quadball-timer",
+        );
+        const observedPath = `${executablePath}.observed`;
+        const redactedPath = `${executablePath}.redacted`;
+        return {
+          output: status.stdout.toString().trim(),
+          status: result.exitCode,
+          observed: existsSync(observedPath)
+            ? readFileSync(observedPath, "utf8").trim()
+            : `missing:${result.stderr.toString()}`,
+          redacted: existsSync(redactedPath) ? readFileSync(redactedPath, "utf8").trim() : "",
+        };
+      };
+
+      const productionReport = runReport("production", "deployment");
+      expect(productionReport).toMatchObject({
+        output: "sent",
+        status: 0,
+        observed: `production ${releaseId} deployment configured`,
+      });
+      expect(productionReport.redacted).toContain("Quadball Timer operational failure");
+      expect(productionReport.redacted).not.toContain("secret");
+      const statusDirectory = join(root, "run/quadball-timer-operational-status");
+      const statusPath = join(statusDirectory, `status-${releaseId}-readiness-readiness`);
+      expect(statSync(statusDirectory).mode & 0o777).toBe(0o700);
+      expect(statSync(statusPath).mode & 0o777).toBe(0o600);
+      expect(readFileSync(statusPath, "utf8")).toBe("sent\n");
+      const restoreReport = runReport("production", "restore", "staged-restore", "staged-restore");
+      expect(restoreReport).toMatchObject({
+        output: "sent",
+        status: 0,
+        observed: `production ${releaseId} restore configured`,
+      });
+      const preInstallReport = runReport(
+        "production",
+        "deployment",
+        "preflight",
+        "atomic-install",
+        installedReleaseId,
+        releaseId,
+      );
+      expect(preInstallReport).toMatchObject({
+        output: "sent",
+        status: 0,
+        observed: `production ${releaseId} deployment configured`,
+      });
+      const testReport = runReport("test", "deployment");
+      expect(testReport).toMatchObject({
+        output: "sent",
+        status: 0,
+        observed: `test ${releaseId} deployment configured`,
+      });
+      expect(testReport.redacted).toContain('"Environment":"test"');
+      expect(testReport.redacted).not.toContain("/var/lib/private");
+      rmSync(join(environmentDirectory, "test.env"));
+      expect(runReport("test", "deployment")).toEqual({
+        output: "unavailable",
+        status: 0,
+        observed: `test ${releaseId} deployment`,
+        redacted: testReport.redacted,
+      });
+
+      const productionRelease = join(root, "srv/quadball-timer/releases", releaseId);
+      const productionExecutable = join(productionRelease, "quadball-timer");
+      rmSync(`${productionExecutable}.observed`, { force: true });
+      writeFileSync(
+        join(productionRelease, "release-manifest.json"),
+        JSON.stringify({ releaseAttemptId: releaseId }),
+      );
+      const rejectedPreflight = Bun.spawnSync({
+        cmd: ["bash", wrapper, "production", productionRelease, "readiness"],
+        env: {
+          ...process.env,
+          QBT_FOCUSED_TEST_MODE: "1",
+          QBT_FOCUSED_TEST_ROOT: root,
+          QBT_FOCUSED_TEST_RUNUSER: runuser,
+          QBT_FOCUSED_TEST_REALPATH: realpath,
+          SUDO_USER: "deploy-quadball-timer",
+        },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      expect(rejectedPreflight.exitCode).not.toBe(0);
+      for (
+        let attempt = 0;
+        attempt < 50 && !existsSync(`${productionExecutable}.observed`);
+        attempt++
+      ) {
+        await Bun.sleep(10);
+      }
+      expect(readFileSync(`${productionExecutable}.observed`, "utf8")).toContain(
+        `production ${releaseId} deployment configured`,
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("bounds missing activation option values and reports prune failures", () => {
+    for (const scriptName of ["activate-release.sh", "activate-test-release.sh"]) {
+      const script = join(repositoryRoot, "deploy", scriptName);
+      const missingValue = Bun.spawnSync({
+        cmd: ["bash", script, "--release"],
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      expect(missingValue.exitCode).not.toBe(0);
+      expect(missingValue.stderr.toString()).toContain("Missing value for --release.");
+      expect(missingValue.stderr.toString()).toContain("unavailable");
+
+      const source = readFileSync(script, "utf8");
+      expect(source).toContain("if ! prune_releases");
+      expect(source).toContain("report_operational_failure final-report atomic-install");
+      expect(source).toContain("report-operational-attempt");
+      expect(source).not.toContain("OPERATIONAL_REPORT=");
+    }
+
+    const rootWrapper = readFileSync(
+      join(repositoryRoot, "deploy/activation-maintenance-root.sh"),
+      "utf8",
+    );
+    expect(rootWrapper).toContain("fail_root_preflight_validation");
+    expect(rootWrapper).toContain(
+      'operational_status_directory="/run/quadball-timer-operational-status"',
+    );
+    expect(rootWrapper).toContain('expected_owner="0:0:600"');
+  });
+
+  test("detaches CLI-owned reporting from the authoritative maintenance process", async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "quadball-maintenance-spool-")));
+    try {
+      const releaseId = "sha-spool-run-test-attempt-1";
+      const release = join(root, "srv/quadball-timer/releases", releaseId);
+      const runuser = join(root, "runuser");
+      const realpath = join(root, "realpath");
+      const systemctl = join(root, "systemctl");
+      const flock = join(root, "flock");
+      const reportGate = join(root, "report-gate");
+      const reportStarted = join(root, "report-started");
+      const reportDone = join(root, "report-done");
+      const operationalMonitoringHelper = join(root, "emit-operational.ts");
+      for (const fifo of [reportGate, reportStarted, reportDone]) {
+        expect(Bun.spawnSync({ cmd: ["mkfifo", fifo] }).exitCode).toBe(0);
+      }
+      writeFileSync(
+        runuser,
+        [
+          "#!/usr/bin/env bash",
+          'while [[ "$1" != "--" ]]; do shift; done',
+          "shift",
+          'if [[ "$*" == *"--emit-operational-failure"* ]]; then',
+          '  printf "started\\n" > "$QBT_REPORT_STARTED"',
+          '  read -r _ < "$QBT_REPORT_GATE"',
+          '  "$@"; status=$?',
+          '  printf "done\\n" > "$QBT_REPORT_DONE"',
+          "  exit $status",
+          "fi",
+          'exec "$@"',
+          "",
+        ].join("\n"),
+      );
+      chmodSync(runuser, 0o755);
+      writeFileSync(
+        realpath,
+        '#!/usr/bin/env bash\n[[ "$1" == "-e" ]] && shift\n[[ "$1" == "--" ]] && shift\nif [[ -d "$1" ]]; then cd "$1" && pwd -P; else cd "$(dirname "$1")" && printf "%s/%s\\n" "$(pwd -P)" "$(basename "$1")"; fi\n',
+      );
+      chmodSync(realpath, 0o755);
+      writeFileSync(
+        systemctl,
+        '#!/usr/bin/env bash\nif [[ "$1" == "is-active" ]]; then printf "inactive\\n"; else exit 1; fi\n',
+      );
+      chmodSync(systemctl, 0o755);
+      writeFileSync(flock, "#!/usr/bin/env bash\nexit 1\n");
+      chmodSync(flock, 0o755);
+      writeFileSync(
+        operationalMonitoringHelper,
+        [
+          `import { createOperationalMonitoringAdapterForMaintenance } from ${JSON.stringify(join(repositoryRoot, "src/lib/operational-monitoring.ts"))};`,
+          "const [operation, phase, category] = process.argv.slice(2);",
+          "const adapter = createOperationalMonitoringAdapterForMaintenance(process.env.QBT_OPERATIONAL_REPORT_FILE!);",
+          "adapter.reportFailure({ operation, environment: process.env.QUADBALL_ENVIRONMENT, releaseAttempt: process.env.RELEASE_ATTEMPT_ID, phase, outcome: 'failed', category, error: 'Bearer secret /var/lib/private stdout=do-not-send' } as never);",
+          "await Promise.resolve();",
+          "",
+        ].join("\n"),
+      );
+      const bunPath = Bun.which("bun") ?? process.execPath;
+      const executable = join(release, "quadball-timer");
+      mkdirSync(release, { recursive: true });
+      writeFileSync(
+        executable,
+        [
+          "#!/usr/bin/env bash",
+          'if [[ "$1" == "--production-activation" ]]; then',
+          '  printf "activation %s\\n" "$2" >> "$0.calls"',
+          `  ${bunPath} ${operationalMonitoringHelper} deployment preflight readiness`,
+          "  exit 1",
+          "fi",
+          'if [[ "$1" == "--emit-operational-failure" ]]; then',
+          '  printf "%s %s %s %s %s %s\\n" "$QUADBALL_ENVIRONMENT" "$RELEASE_ATTEMPT_ID" "$3" "$5" "$7" "$9" > "$0.reported.$3.$5"',
+          '  printf "unavailable\\n"',
+          "fi",
+          "",
+        ].join("\n"),
+      );
+      chmodSync(executable, 0o755);
+      writeFileSync(
+        join(release, "release-manifest.json"),
+        JSON.stringify({ releaseAttemptId: releaseId, schemaCompatibility: "26" }),
+      );
+      const wrapper = join(repositoryRoot, "deploy/activation-maintenance-root.sh");
+      const startedReader = Bun.spawn({
+        cmd: ["bash", "-c", 'read -r _ < "$QBT_REPORT_STARTED"'],
+        env: { ...process.env, QBT_REPORT_STARTED: reportStarted },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const activationProcess = Bun.spawn({
+        cmd: ["bash", wrapper, "production", release, "preflight"],
+        env: {
+          ...process.env,
+          QBT_FOCUSED_TEST_MODE: "1",
+          QBT_FOCUSED_TEST_ROOT: root,
+          QBT_FOCUSED_TEST_REALPATH: realpath,
+          QBT_FOCUSED_TEST_RUNUSER: runuser,
+          QBT_FOCUSED_TEST_SYSTEMCTL: systemctl,
+          QBT_FOCUSED_TEST_FLOCK: flock,
+          QBT_FOCUSED_FAILURE_PHASE: "preflight",
+          QBT_REPORT_DONE: reportDone,
+          QBT_REPORT_GATE: reportGate,
+          QBT_REPORT_STARTED: reportStarted,
+          SUDO_USER: "deploy-quadball-timer",
+        },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      expect(await activationProcess.exited).toBe(1);
+      expect(await startedReader.exited).toBe(0);
+      expect(readFileSync(`${executable}.calls`, "utf8")).toBe("activation preflight\n");
+      // The reporter is still blocked on its injected gate. Reading the
+      // authoritative process streams to EOF here proves that the detached
+      // child retained none of the SSH/workflow pipe descriptors.
+      expect(await new Response(activationProcess.stdout).text()).toBe("");
+      expect(await new Response(activationProcess.stderr).text()).not.toContain("Bearer secret");
+      const doneReader = Bun.spawn({
+        cmd: ["bash", "-c", 'read -r _ < "$QBT_REPORT_DONE"'],
+        env: { ...process.env, QBT_REPORT_DONE: reportDone },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      expect(
+        Bun.spawnSync({
+          cmd: ["bash", "-c", 'printf "release\\n" > "$QBT_REPORT_GATE"'],
+          env: { ...process.env, QBT_REPORT_GATE: reportGate },
+        }).exitCode,
+      ).toBe(0);
+      expect(await doneReader.exited).toBe(0);
+      expect(readFileSync(`${executable}.reported.deployment.preflight`, "utf8")).toBe(
+        "production sha-spool-run-test-attempt-1 deployment preflight failed readiness\n",
+      );
+      const delivery = Bun.spawnSync({
+        cmd: [
+          "bash",
+          wrapper,
+          "production",
+          release,
+          "read-operational-status",
+          "preflight",
+          "readiness",
+        ],
+        env: {
+          ...process.env,
+          QBT_FOCUSED_TEST_MODE: "1",
+          QBT_FOCUSED_TEST_ROOT: root,
+          QBT_FOCUSED_TEST_REALPATH: realpath,
+          QBT_FOCUSED_TEST_RUNUSER: runuser,
+          SUDO_USER: "deploy-quadball-timer",
+        },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      expect(delivery.stdout.toString()).toBe("unavailable\n");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   test("includes the canonical Production Ad Hoc database in backup verification", () => {
