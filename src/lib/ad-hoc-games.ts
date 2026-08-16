@@ -2053,7 +2053,10 @@ function inspectAdHocRecoveryDatabaseHandle(
     version?: number | string;
   } | null;
   const schemaVersion = Number(schema?.version ?? NaN);
-  if (schemaVersion !== SCHEMA_VERSION) {
+  // Backups run before the activation migration. Older schema versions are
+  // valid inputs because `openSqliteAdHocStore` upgrades them on restart;
+  // future or malformed versions must still fail closed.
+  if (!Number.isSafeInteger(schemaVersion) || schemaVersion < 1 || schemaVersion > SCHEMA_VERSION) {
     throw new Error("Ad Hoc recovery database schema is incompatible.");
   }
   const games = database.query("SELECT * FROM adhoc_games ORDER BY game_id").all() as Record<
