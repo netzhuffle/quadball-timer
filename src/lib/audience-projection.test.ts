@@ -760,10 +760,40 @@ describe("Audience Publication Projection", () => {
     );
 
     const result = await audience.list();
-    expect(result).toMatchObject({
-      status: "accepted",
-      value: { events: [{ name: "Unscheduled", lifecycle: "unscheduled" }] },
+    expect(result.status).toBe("accepted");
+    if (result.status !== "accepted") return;
+    expect(result.value.events).toContainEqual(
+      expect.objectContaining({ name: "Unscheduled", lifecycle: "unscheduled" }),
+    );
+  });
+
+  test("projects the temporary SQM fixture as current on its Game Day and past afterward", async () => {
+    const storage = {
+      snapshot: async () => ({
+        listEvents: () => [],
+      }),
+    } as unknown as EventCatalogFoundationStorage;
+    const current = createAudienceProjection(storage, {
+      now: () => Date.parse("2026-08-16T10:00:00.000Z"),
     });
+    const currentResult = await current.read("sqm-2026");
+    expect(currentResult).toMatchObject({
+      status: "accepted",
+      value: {
+        eventId: "sqm-2026",
+        name: "Schweizer Quadball Meisterschaft 2026",
+        timeZone: "Europe/Zurich",
+        gameDays: ["2026-08-16"],
+        lifecycle: "current",
+        schedule: { scheduleGames: [] },
+      },
+    });
+
+    const past = createAudienceProjection(storage, {
+      now: () => Date.parse("2026-08-17T10:00:00.000Z"),
+    });
+    const pastResult = await past.read("sqm-2026");
+    expect(pastResult).toMatchObject({ status: "accepted", value: { lifecycle: "past" } });
   });
 
   test("lists only Published Events and classifies them in each Event timezone", async () => {
@@ -798,6 +828,7 @@ describe("Audience Publication Projection", () => {
     expect(result.value.events.map((event) => [event.name, event.lifecycle])).toEqual([
       ["Current", "current"],
       ["Future", "future"],
+      ["Schweizer Quadball Meisterschaft 2026", "future"],
       ["Past", "past"],
     ]);
     expect(result.value.events[0]).toMatchObject({
@@ -877,7 +908,10 @@ describe("Audience Publication Projection", () => {
 
     const list = await audience.list();
     if (list.status !== "accepted") throw new Error("Expected discovery list.");
-    expect(list.value.events.map((event) => event.name)).toEqual(["Visible Event"]);
+    expect(list.value.events.map((event) => event.name)).toEqual([
+      "Visible Event",
+      "Schweizer Quadball Meisterschaft 2026",
+    ]);
 
     const sitemap = await readAudienceSitemap(
       new Request("https://timer.example/sitemap.xml"),

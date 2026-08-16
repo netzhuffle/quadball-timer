@@ -1186,7 +1186,7 @@ describe("App", () => {
     expect(previews).toHaveLength(100);
   });
 
-  test("lists public Events with the Ad Hoc handoff between upcoming and past content", async () => {
+  test("lists public Events without an unscheduled section", async () => {
     testWindow.history.replaceState(null, "", "/events");
     (globalThis.fetch as typeof fetch) = (async (input: string | URL | Request) => {
       const url =
@@ -1269,7 +1269,7 @@ describe("App", () => {
     const text = container.textContent ?? "";
     expect(text).toContain("Current Event");
     expect(text).toContain("Future Event");
-    expect(text).toContain("Unscheduled Events");
+    expect(text).not.toContain("Unscheduled Events");
     expect(text).toContain("Start Ad Hoc Game");
     expect(text).toContain("Past Event");
     expect(text.indexOf("Future Event")).toBeLessThan(text.indexOf("Start Ad Hoc Game"));

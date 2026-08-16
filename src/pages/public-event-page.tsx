@@ -1038,18 +1038,12 @@ function clockStatusLabel(
 function EventDiscovery({ events }: { events: readonly PublicAudienceEventProjection[] }) {
   const current = events.filter((event) => event.lifecycle === "current");
   const future = events.filter((event) => event.lifecycle === "future");
-  const unscheduled = events.filter((event) => event.lifecycle === "unscheduled");
   const past = events.filter((event) => event.lifecycle === "past");
 
   return (
     <div className="space-y-6">
       <EventGroup title="Current Events" events={current} empty="No Event is current today." />
       <EventGroup title="Upcoming Events" events={future} empty="No upcoming Published Events." />
-      <EventGroup
-        title="Unscheduled Events"
-        events={unscheduled}
-        empty="No unscheduled Published Events."
-      />
       <StartAdHocGame />
       <EventGroup title="Past Events" events={past} empty="No past Published Events." />
     </div>

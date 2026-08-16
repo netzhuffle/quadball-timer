@@ -18,6 +18,7 @@ import {
 } from "@/lib/live-event-game-control";
 import type { ClockProjection } from "@/lib/clock-authority";
 import type { GamePresentation } from "@/lib/game-presentation";
+import { createSqmFixtureEvent, SQM_FIXTURE_EVENT_ID } from "@/lib/sqm-fixture";
 
 export type PublicAudienceEventLifecycle = "unscheduled" | "current" | "future" | "past";
 
@@ -239,6 +240,9 @@ export function createAudienceProjection(
     async read(eventId: unknown): Promise<AudienceProjectionOutcome> {
       if (typeof eventId !== "string" || eventId.trim().length === 0)
         return { status: "unavailable" };
+      if (eventId === SQM_FIXTURE_EVENT_ID) {
+        return { status: "accepted", value: createSqmFixtureEvent(now()) };
+      }
       try {
         const snapshot = await storage.snapshot();
         const event = snapshot.findEvent(eventId);
@@ -294,12 +298,15 @@ export function createAudienceProjection(
       try {
         const snapshot = await storage.snapshot();
         const nowMs = now();
-        const events = await Promise.all(
+        const catalogEvents = await Promise.all(
           snapshot
             .listEvents()
             .filter((event) => event.publicationStatus === "published")
             .map((event) => projectPublicEvent(snapshot, event, nowMs, options.gameInput)),
         );
+        const events = catalogEvents.some((event) => event.eventId === SQM_FIXTURE_EVENT_ID)
+          ? catalogEvents
+          : [...catalogEvents, createSqmFixtureEvent(nowMs)];
         return {
           status: "accepted",
           value: { events: sortPublicEvents(events) },
