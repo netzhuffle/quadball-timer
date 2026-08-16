@@ -298,9 +298,115 @@ async function run() {
         await second.getByRole("button", { name: "Start game" }).click();
         await first.getByText("Running", { exact: true }).waitFor();
         await second.getByRole("button", { name: "Pause game" }).click();
-        await second.getByRole("button", { name: "Leave", exact: true }).click();
+        const leaveButton = second.getByRole("button", { name: "Leave", exact: true });
+        await leaveButton.click();
+        await second.getByRole("dialog").waitFor();
+        await second.getByRole("dialog").press("Escape");
+        await second.waitForFunction(() => document.activeElement?.textContent?.includes("Leave"));
+        await leaveButton.click();
+        await second.getByRole("dialog").getByRole("button", { name: "Stay in game" }).click();
+        await second.waitForFunction(() => document.activeElement?.textContent?.includes("Leave"));
+        await leaveButton.click();
+        const leaveDialog = second.getByRole("dialog");
+        await leaveDialog.locator("..").click({ position: { x: 1, y: 1 } });
+        await second.waitForFunction(() => document.activeElement?.textContent?.includes("Leave"));
+        await leaveButton.click();
+        await second.getByRole("dialog").getByRole("button", { name: "Leave game" }).click();
         if (new URL(second.url()).pathname !== "/") await second.waitForURL(`${origin}/`);
+
+        const postLeaveStorageState = await secondContext.storageState();
+        await second.goto(origin);
+        await second.getByRole("button", { name: "Return to game" }).click();
+        await waitForGameRoute(second, gameId);
         await first.getByText("Paused", { exact: true }).waitFor();
+
+        const creationContext = await browser!.newContext({
+          ignoreHTTPSErrors: true,
+          storageState: postLeaveStorageState,
+        });
+        const creationPage = await creationContext.newPage();
+        creationPage.setDefaultTimeout(15_000);
+        const creationOrder: string[] = [];
+        creationPage.on("request", (request) => {
+          if (request.method() !== "POST") return;
+          const pathname = new URL(request.url()).pathname;
+          if (pathname === "/api/games") creationOrder.push("create");
+          if (pathname.endsWith("/leave")) creationOrder.push("finalize");
+        });
+        await creationPage.goto(origin);
+        const startButton = creationPage.getByRole("button", { name: /Start an Ad Hoc Game/ });
+        await startButton.click();
+        await creationPage.getByRole("dialog").waitFor();
+        if (creationOrder.length !== 0)
+          throw new Error(
+            "Ad Hoc creation or finalization started before replacement confirmation.",
+          );
+        await creationPage.getByRole("dialog").getByRole("button", { name: "Cancel" }).click();
+        await creationPage.waitForFunction(() =>
+          document.activeElement?.textContent?.includes("Start an Ad Hoc Game"),
+        );
+        await startButton.click();
+        await creationPage.getByRole("dialog").getByRole("button", { name: "Continue" }).click();
+        try {
+          await creationPage.waitForURL(/\/game\/adhoc-/u);
+        } catch (error) {
+          throw new Error(
+            `Creation did not navigate; order=${creationOrder.join(",")}; url=${creationPage.url()}; text=${(await creationPage.locator("body").textContent()) ?? ""}; cause=${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+        const creationIndex = creationOrder.indexOf("create");
+        if (
+          creationIndex <= 0 ||
+          creationOrder.slice(0, creationIndex).some((entry) => entry !== "finalize")
+        )
+          throw new Error(`Ad Hoc creation order was ${creationOrder.join(",")}.`);
+        await creationPage.getByRole("button", { name: "Leave", exact: true }).click();
+        await creationPage.getByRole("dialog").getByRole("button", { name: "Leave game" }).click();
+        await creationPage.waitForURL(`${origin}/`);
+        const admissionStorageState = await creationContext.storageState();
+        await creationContext.close();
+
+        const alternateSnapshot = await first.evaluate(async (id) => {
+          const response = await fetch(`/api/games/${id}`);
+          return (await response.json()) as { game?: { controlQr?: string | null } };
+        }, creationRetryGameId);
+        const alternateQr = alternateSnapshot.game?.controlQr;
+        if (typeof alternateQr !== "string")
+          throw new Error("Alternate Ad Hoc handoff QR was unavailable.");
+        const admissionContext = await browser!.newContext({
+          ignoreHTTPSErrors: true,
+          storageState: admissionStorageState,
+        });
+        const admissionPage = await admissionContext.newPage();
+        admissionPage.setDefaultTimeout(15_000);
+        const admissionOrder: string[] = [];
+        admissionPage.on("request", (request) => {
+          if (request.method() !== "POST") return;
+          const pathname = new URL(request.url()).pathname;
+          if (pathname.endsWith("/admit")) admissionOrder.push("admit");
+          if (pathname.endsWith("/leave")) admissionOrder.push("finalize");
+        });
+        await admissionPage.goto(
+          `${origin}/#adhoc-game=${encodeURIComponent(creationRetryGameId)}&adhoc-control=${encodeURIComponent(alternateQr)}`,
+        );
+        await admissionPage.getByRole("dialog").waitFor();
+        if (admissionOrder.length !== 0)
+          throw new Error("Ad Hoc admission started before replacement confirmation.");
+        await admissionPage.getByRole("dialog").getByRole("button", { name: "Continue" }).click();
+        try {
+          await waitForGameRoute(admissionPage, creationRetryGameId);
+        } catch (error) {
+          throw new Error(
+            `Admission did not navigate; order=${admissionOrder.join(",")}; url=${admissionPage.url()}; text=${(await admissionPage.locator("body").textContent()) ?? ""}; cause=${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+        const admissionIndex = admissionOrder.indexOf("admit");
+        if (
+          admissionIndex <= 0 ||
+          admissionOrder.slice(0, admissionIndex).some((entry) => entry !== "finalize")
+        )
+          throw new Error(`Ad Hoc admission order was ${admissionOrder.join(",")}.`);
+        await admissionContext.close();
 
         environment.AD_HOC_MAX_CONNECTED_SOCKETS = "1";
         await stopServer();

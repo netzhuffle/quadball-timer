@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Card, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import type { ControllerRole } from "@/lib/game-types";
 import { ColorTestPage } from "@/pages/color-test-page";
@@ -19,6 +19,7 @@ import {
   PublicEventPage,
 } from "@/pages/public-event-page";
 import { TechnicalAdminPage } from "@/pages/technical-admin-page";
+import { useControllerDepartureEntry } from "@/components/controller-departure";
 import "./index.css";
 
 type Route =
@@ -136,27 +137,38 @@ export function App({
 
 function AdHocHandoffPage({ handoff }: { handoff: AdHocHandoff }) {
   const [message, setMessage] = useState("Joining Ad Hoc Game…");
+  const handoffTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const startedRef = useRef(false);
+
+  const admit = useCallback(async () => {
+    setMessage("Joining Ad Hoc Game…");
+    try {
+      const response = await fetch(`/api/games/${handoff.gameId}/admit`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ controlQr: handoff.controlQr, browserId: getAdHocBrowserId() }),
+      });
+      if (!response.ok) throw new Error("unavailable");
+      navigateTo(`/game/${handoff.gameId}`);
+      return true;
+    } catch {
+      setMessage("Ad Hoc Game unavailable.");
+      return false;
+    }
+  }, [handoff.controlQr, handoff.gameId]);
+  const entry = useControllerDepartureEntry({
+    destination: { kind: "admit-ad-hoc", gameId: handoff.gameId },
+    triggerRef: handoffTriggerRef,
+    onCommitted: admit,
+    onUnavailable: () => setMessage("Ad Hoc Game unavailable."),
+    onCancelled: () => setMessage("Join cancelled. Your Controller return is still available."),
+  });
 
   useEffect(() => {
-    let cancelled = false;
-    void fetch(`/api/games/${handoff.gameId}/admit`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ controlQr: handoff.controlQr, browserId: getAdHocBrowserId() }),
-    })
-      .then(async (response) => {
-        if (!response.ok) throw new Error("unavailable");
-        if (cancelled) return;
-        navigateTo(`/game/${handoff.gameId}`);
-      })
-      .catch(() => {
-        if (!cancelled) setMessage("Ad Hoc Game unavailable.");
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [handoff.controlQr, handoff.gameId]);
+    if (startedRef.current) return;
+    startedRef.current = true;
+    void entry.begin().catch(() => setMessage("Ad Hoc Game unavailable."));
+  }, [entry]);
 
   return (
     <div className="mx-auto flex min-h-screen w-full max-w-xl items-center p-6">
@@ -164,8 +176,18 @@ function AdHocHandoffPage({ handoff }: { handoff: AdHocHandoff }) {
         <CardHeader>
           <CardTitle>Ad Hoc Controller handoff</CardTitle>
           <CardDescription>{message}</CardDescription>
+          <button
+            ref={handoffTriggerRef}
+            type="button"
+            className="mt-4 rounded-md border px-3 py-2 text-sm font-medium"
+            disabled={entry.busy}
+            onClick={() => void entry.begin()}
+          >
+            Join this Ad Hoc Game
+          </button>
         </CardHeader>
       </Card>
+      {entry.dialog}
     </div>
   );
 }

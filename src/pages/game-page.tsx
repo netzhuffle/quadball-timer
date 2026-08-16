@@ -34,7 +34,15 @@ import {
   willFlagCatchWin,
 } from "@/lib/game-page-support";
 import { buildAdHocControlQrPayload } from "@/lib/ad-hoc-handoff";
-import { clearAdHocControllerSession } from "@/lib/ad-hoc-controller-session";
+import {
+  ControllerLeaveDialog,
+  controllerDepartureReference,
+  useControllerDepartureEntry,
+} from "@/components/controller-departure";
+import {
+  controllerDepartureBlocksGame,
+  getBrowserControllerDeparture,
+} from "@/lib/controller-departure";
 import {
   DEFAULT_AWAY_TEAM_COLOR,
   DEFAULT_HOME_TEAM_COLOR,
@@ -83,6 +91,10 @@ export function GamePage({ gameId, role }: { gameId: string; role: ControllerRol
   const [renamingTeam, setRenamingTeam] = useState<TeamId | null>(null);
   const [pendingWinConfirmation, setPendingWinConfirmation] =
     useState<PendingWinConfirmation | null>(null);
+  const [leaveDialogOpen, setLeaveDialogOpen] = useState(false);
+  const [leavePending, setLeavePending] = useState(false);
+  const [entryReady, setEntryReady] = useState(role !== "controller");
+  const [entryError, setEntryError] = useState<string | null>(null);
   const [scorePulse, setScorePulse] = useState<{ home: -1 | 0 | 1; away: -1 | 0 | 1 }>({
     home: 0,
     away: 0,
@@ -102,8 +114,16 @@ export function GamePage({ gameId, role }: { gameId: string; role: ControllerRol
   const leftTeamNameButtonRef = useRef<HTMLButtonElement | null>(null);
   const rightTeamNameButtonRef = useRef<HTMLButtonElement | null>(null);
   const [displayTeamNameHeightPx, setDisplayTeamNameHeightPx] = useState<number | null>(null);
+  const leaveTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const entryTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const entryStartedForRef = useRef<string | null>(null);
+  const departureModule = getBrowserControllerDeparture();
 
   const nowMs = useNow(250);
+
+  const departureProjection = departureModule.project();
+  const departureBlocked =
+    role === "controller" && controllerDepartureBlocksGame(departureProjection, gameId);
 
   const {
     baseState,
@@ -117,20 +137,69 @@ export function GamePage({ gameId, role }: { gameId: string; role: ControllerRol
   } = useGameConnection({
     gameId,
     role,
+    blocked: departureBlocked || !entryReady,
   });
   const [leaveMessage, setLeaveMessage] = useState<string | null>(null);
+  const entry = useControllerDepartureEntry({
+    destination: { kind: "resume-ad-hoc", gameId },
+    triggerRef: entryTriggerRef,
+    onCommitted: () => {
+      setEntryError(null);
+      setEntryReady(true);
+    },
+    onUnavailable: () => {
+      setEntryReady(false);
+      setEntryError("Ad Hoc Game unavailable.");
+    },
+    onCancelled: () => {
+      setEntryReady(false);
+      setEntryError("Entry cancelled. Your Controller return is still available.");
+    },
+  });
+
+  useEffect(() => {
+    if (role !== "controller") {
+      setEntryReady(true);
+      return;
+    }
+    if (entryStartedForRef.current === gameId) return;
+    entryStartedForRef.current = gameId;
+    setEntryReady(false);
+    void entry.begin();
+  }, [entry, gameId, role]);
+
+  useEffect(
+    () =>
+      departureModule.subscribe(() => {
+        const projection = departureModule.project();
+        if (controllerDepartureBlocksGame(projection, gameId)) {
+          setEntryReady(false);
+          setEntryError("Ad Hoc Game unavailable.");
+        }
+      }),
+    [departureModule, gameId],
+  );
 
   const leaveAdHocGame = useCallback(async () => {
     setLeaveMessage(null);
-    try {
-      const response = await fetch(`/api/games/${gameId}/leave`, { method: "POST" });
-      if (!response.ok) throw new Error("leave failed");
-      clearAdHocControllerSession(gameId);
+    setLeavePending(true);
+    const outcome = await departureModule.transition({
+      type: "leave",
+      departure: controllerDepartureReference({
+        workflow: "ad-hoc",
+        gameId,
+        homeName,
+        awayName,
+      }),
+    });
+    setLeavePending(false);
+    if (outcome.status === "left") {
+      setLeaveDialogOpen(false);
       navigateTo("/");
-    } catch {
+    } else {
       setLeaveMessage("Ad Hoc Game unavailable.");
     }
-  }, [gameId]);
+  }, [awayName, departureModule, gameId, homeName]);
 
   useEffect(() => {
     if (baseState !== null) {
@@ -511,21 +580,26 @@ export function GamePage({ gameId, role }: { gameId: string; role: ControllerRol
 
   if (gameView === null || liveState === null) {
     return (
-      <div className="mx-auto flex min-h-screen w-full max-w-3xl items-center justify-center p-6">
-        <Card className="w-full">
-          <CardHeader>
-            <CardTitle>{error ?? "Loading game"}</CardTitle>
-            <CardDescription>
-              {error === null ? "Waiting for snapshot from server." : "Return to the Games page."}
-            </CardDescription>
-          </CardHeader>
-          <CardContent>
-            <Button variant="outline" onClick={() => navigateTo("/")}>
-              Back to games
-            </Button>
-          </CardContent>
-        </Card>
-      </div>
+      <>
+        {entry.dialog}
+        <div className="mx-auto flex min-h-screen w-full max-w-3xl items-center justify-center p-6">
+          <Card className="w-full">
+            <CardHeader>
+              <CardTitle>{entryError ?? error ?? "Loading game"}</CardTitle>
+              <CardDescription>
+                {entryError === null && error === null
+                  ? "Waiting for snapshot from server."
+                  : "Return to the Games page."}
+              </CardDescription>
+            </CardHeader>
+            <CardContent>
+              <Button ref={entryTriggerRef} variant="outline" onClick={() => navigateTo("/")}>
+                Back to games
+              </Button>
+            </CardContent>
+          </Card>
+        </div>
+      </>
     );
   }
 
@@ -795,6 +869,17 @@ export function GamePage({ gameId, role }: { gameId: string; role: ControllerRol
 
   return (
     <div className="h-[100dvh] overflow-hidden bg-slate-100 p-2 text-slate-900">
+      {entry.dialog}
+      {leaveDialogOpen ? (
+        <ControllerLeaveDialog
+          triggerRef={leaveTriggerRef}
+          busy={leavePending}
+          onCancel={() => {
+            setLeaveDialogOpen(false);
+          }}
+          onConfirm={() => void leaveAdHocGame()}
+        />
+      ) : null}
       <div className="mx-auto grid h-full w-full max-w-[460px] grid-rows-[auto_auto_minmax(0,1fr)_auto_auto] gap-2">
         <section className="rounded-2xl border border-slate-300 bg-white px-3 py-2 shadow-[0_8px_18px_rgba(15,23,42,0.08)]">
           <div className="flex items-start justify-between gap-2">
@@ -838,10 +923,11 @@ export function GamePage({ gameId, role }: { gameId: string; role: ControllerRol
               </Button>
               {controller ? (
                 <Button
+                  ref={leaveTriggerRef}
                   variant="outline"
                   size="sm"
                   className="h-7 border-slate-300 bg-white px-2 text-[11px] text-slate-800 hover:bg-slate-100"
-                  onClick={() => void leaveAdHocGame()}
+                  onClick={() => setLeaveDialogOpen(true)}
                 >
                   Leave
                 </Button>

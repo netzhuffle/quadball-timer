@@ -37,7 +37,15 @@ export const FLAG_STATUS_SHOW_FROM_MS = 18 * ONE_MINUTE_MS;
 export const FLAG_STATUS_HIDE_AFTER_MS = FLAG_RELEASE_MS + 30_000;
 const RELEASE_EVENT_VISIBLE_MS = 30_000;
 
-export function useGameConnection({ gameId, role }: { gameId: string; role: ControllerRole }) {
+export function useGameConnection({
+  gameId,
+  role,
+  blocked = false,
+}: {
+  gameId: string;
+  role: ControllerRole;
+  blocked?: boolean;
+}) {
   const wsUrl = useMemo(createWebSocketUrl, []);
   const [baseState, setBaseState] = useState<GameState | null>(null);
   const authoritativeStateRef = useRef<GameState | null>(null);
@@ -140,6 +148,24 @@ export function useGameConnection({ gameId, role }: { gameId: string; role: Cont
 
   useEffect(() => {
     let cancelled = false;
+    if (blocked) {
+      wsRef.current?.close();
+      wsRef.current = null;
+      subscribedToServerGameRef.current = false;
+      pendingRef.current = [];
+      outcomesRef.current = {};
+      authoritativeStateRef.current = null;
+      replayInFlightRef.current = false;
+      setBaseState(null);
+      setControlQr(null);
+      setPendingCommands([]);
+      setLocalOnlyState(false);
+      setConnectionState("offline");
+      setError("Ad Hoc Game unavailable.");
+      return () => {
+        cancelled = true;
+      };
+    }
     let recoveredFromLocal = false;
     if (role === "controller") {
       const persisted = loadPersistedControllerSession(gameId);
@@ -287,6 +313,7 @@ export function useGameConnection({ gameId, role }: { gameId: string; role: Cont
     };
   }, [
     flushPendingCommands,
+    blocked,
     gameId,
     persistControllerSession,
     reconcileWithServer,
@@ -298,7 +325,7 @@ export function useGameConnection({ gameId, role }: { gameId: string; role: Cont
 
   const dispatchCommand = useCallback(
     (command: GameCommand) => {
-      if (role !== "controller") return;
+      if (role !== "controller" || blocked) return;
       setBaseState((previous) => {
         if (authoritativeStateRef.current === null && previous === null) return previous;
         commandCounterRef.current += 1;
@@ -321,7 +348,14 @@ export function useGameConnection({ gameId, role }: { gameId: string; role: Cont
         return next;
       });
     },
-    [clockOffsetMs, flushPendingCommands, persistControllerSession, role, setPendingCommands],
+    [
+      blocked,
+      clockOffsetMs,
+      flushPendingCommands,
+      persistControllerSession,
+      role,
+      setPendingCommands,
+    ],
   );
   return {
     baseState,
