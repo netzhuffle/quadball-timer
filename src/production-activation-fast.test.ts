@@ -14,6 +14,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
+import { RELEASE_BUNDLE_ALLOWLIST } from "@/lib/release-manifest";
 
 const repositoryRoot = process.cwd();
 const roots: string[] = [];
@@ -51,15 +52,7 @@ async function exists(path: string): Promise<boolean> {
 
 async function createRelease(base: string): Promise<string> {
   const release = join(base, "releases", releaseId);
-  const members = [
-    "deploy/activate-release.sh",
-    "deploy/activate-test-release.sh",
-    "deploy/activation-maintenance-root.sh",
-    "deploy/technical-admin-bootstrap-root.sh",
-    "deploy/systemd/quadball-timer.service",
-    "deploy/systemd/quadball-timer-test.service",
-    "quadball-timer",
-  ];
+  const members = [...RELEASE_BUNDLE_ALLOWLIST];
   const records: Array<{ path: string; sha256: string }> = [];
   for (const member of members) {
     const contents =
@@ -255,7 +248,10 @@ test("installs the verified shared bootstrap runner for Production and Test acti
   }
 }, 30_000);
 
-function runProductionActivation(fixture: Awaited<ReturnType<typeof createHarness>>) {
+function runProductionActivation(
+  fixture: Awaited<ReturnType<typeof createHarness>>,
+  verifyBundle = false,
+) {
   const result = Bun.spawnSync({
     cmd: [
       "bash",
@@ -282,7 +278,7 @@ function runProductionActivation(fixture: Awaited<ReturnType<typeof createHarnes
       QBT_FAST_STATE: fixture.state,
       QBT_FOCUSED_TEST_MAINTENANCE_WRAPPER: fixture.wrapper,
       QBT_FOCUSED_TEST_MODE: "1",
-      QBT_FOCUSED_TEST_RELEASE_VERIFIED: "1",
+      ...(verifyBundle ? {} : { QBT_FOCUSED_TEST_RELEASE_VERIFIED: "1" }),
       QBT_FOCUSED_TEST_ROOT: fixture.root,
     },
     stderr: "pipe",
@@ -611,25 +607,34 @@ async function createTestActivationHarness(registerRoot = true): Promise<{
   const previous = join(base, "releases", "sha-prior-test-activation-attempt-1");
   const release = join(base, "releases", testActivationReleaseId);
   const maintenance = join(root, "maintenance");
+  const members = [...RELEASE_BUNDLE_ALLOWLIST];
+  const records: Array<{ path: string; sha256: string }> = [];
   await mkdir(join(release, "deploy/systemd"), { recursive: true });
   await mkdir(previous, { recursive: true });
   await mkdir(join(base, ".staging"), { recursive: true });
   await mkdir(bin, { recursive: true });
-  await writeFile(join(release, "deploy/systemd/quadball-timer-test.service"), "[Unit]\n");
-  await writeFile(
-    join(release, "deploy/technical-admin-bootstrap-root.sh"),
-    await readFile(join(repositoryRoot, "deploy/technical-admin-bootstrap-root.sh"), "utf8"),
-  );
-  await chmod(join(release, "deploy/technical-admin-bootstrap-root.sh"), 0o555);
-  await writeFile(join(release, "quadball-timer"), "test executable\n");
-  await chmod(join(release, "quadball-timer"), 0o555);
-  const executableDigest = digest("test executable\n");
+  for (const member of members) {
+    const contents =
+      member === "deploy/technical-admin-bootstrap-root.sh"
+        ? await readFile(join(repositoryRoot, member), "utf8")
+        : member === "quadball-timer"
+          ? "test executable\n"
+          : `[Unit]\n${member}\n`;
+    const path = join(release, member);
+    await writeFile(path, contents);
+    if (member === "deploy/technical-admin-bootstrap-root.sh" || member === "quadball-timer") {
+      await chmod(path, 0o555);
+    }
+    records.push({ path: member, sha256: digest(contents) });
+  }
+  const executableDigest = records.find((record) => record.path === "quadball-timer")?.sha256;
   await writeFile(
     join(release, "release-manifest.json"),
     JSON.stringify({
       releaseAttemptId: testActivationReleaseId,
       executableSha256: executableDigest,
       schemaCompatibility: "31",
+      members: records,
     }),
   );
   await writeFile(
@@ -745,6 +750,7 @@ esac
 function runTestActivation(
   fixture: Awaited<ReturnType<typeof createTestActivationHarness>>,
   extra: Record<string, string>,
+  verifyBundle = false,
 ) {
   const result = Bun.spawnSync({
     cmd: [
@@ -765,7 +771,7 @@ function runTestActivation(
       QBT_FOCUSED_TEST_MODE: "1",
       QBT_FOCUSED_TEST_PROBE_LOG: fixture.probeLog,
       QBT_FOCUSED_TEST_PROBE_SECONDS: extra.QBT_FOCUSED_TEST_PROBE_SECONDS ?? "2",
-      QBT_FOCUSED_TEST_RELEASE_VERIFIED: "1",
+      ...(verifyBundle ? {} : { QBT_FOCUSED_TEST_RELEASE_VERIFIED: "1" }),
       QBT_FOCUSED_TEST_REALPATH: join(fixture.root, "bin", "realpath"),
       QBT_FOCUSED_TEST_ROOT: fixture.root,
       QBT_TEST_BASE: fixture.base,
@@ -783,6 +789,16 @@ function runTestActivation(
     output: `${new TextDecoder().decode(result.stdout)}${new TextDecoder().decode(result.stderr)}`,
   };
 }
+
+test("accepts the generated member order at both shipped activation boundaries", async () => {
+  const production = await createHarness();
+  const productionRun = runProductionActivation(production, true);
+  expect(productionRun.exitCode, productionRun.output).toBe(0);
+
+  const test = await createTestActivationHarness();
+  const testRun = runTestActivation(test, {}, true);
+  expect(testRun.exitCode, testRun.output).toBe(0);
+});
 
 async function createPruneHarness(): Promise<{
   base: string;
