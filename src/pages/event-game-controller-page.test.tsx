@@ -310,6 +310,15 @@ describe("Event Game Controller reconnect browser seam", () => {
     }
   }
 
+  async function openActionPanel(label: "Cards" | "Timeout" | "Game end") {
+    await act(async () => {
+      Array.from(container.getElementsByTagName("button"))
+        .find((button) => button.textContent?.trim() === label)
+        ?.click();
+      await Promise.resolve();
+    });
+  }
+
   function installControllerIntervalProbe() {
     let tick: (() => void) | null = null;
     const cleared: number[] = [];
@@ -367,7 +376,7 @@ describe("Event Game Controller reconnect browser seam", () => {
     expect(activeSurface).not.toBeNull();
     expect(activeSurface?.className).toContain("[&_button]:min-h-11");
     const buttons = Array.from(activeSurface?.querySelectorAll<HTMLButtonElement>("button") ?? []);
-    expect(buttons.length).toBeGreaterThan(15);
+    expect(buttons.length).toBeGreaterThan(14);
     for (const button of buttons) {
       expect(button.getAttribute("aria-label") ?? button.textContent?.trim()).not.toBe("");
     }
@@ -385,6 +394,97 @@ describe("Event Game Controller reconnect browser seam", () => {
       await Promise.resolve();
     });
     expect(testWindow.document.activeElement?.getAttribute("aria-label")).toBe("Pause game clock");
+  });
+
+  test("renders nullable sheet actions, clears drafts on switch, and keeps core controls usable", async () => {
+    await enterAndOpen();
+    const cardsButton = Array.from(container.getElementsByTagName("button")).find(
+      (button) => button.textContent?.trim() === "Cards",
+    );
+    const timeoutButton = Array.from(container.getElementsByTagName("button")).find(
+      (button) => button.textContent?.trim() === "Timeout",
+    );
+    const gameButton = Array.from(container.getElementsByTagName("button")).find(
+      (button) => button.textContent?.trim() === "Game end",
+    );
+    expect(cardsButton?.getAttribute("aria-expanded")).toBe("false");
+    expect(container.querySelector('[data-controller-action-panel="true"]')).toBeNull();
+    await act(async () => {
+      cardsButton?.click();
+      await Promise.resolve();
+    });
+    expect(cardsButton?.getAttribute("aria-expanded")).toBe("true");
+    await act(async () => {
+      container
+        .querySelector<HTMLButtonElement>(
+          'button[aria-label="Accept penalty card for the selected Game Side"]',
+        )
+        ?.click();
+      await Promise.resolve();
+    });
+    expect(container.querySelector('[data-controller-action-panel="true"]')).not.toBeNull();
+    const sideSelect = container.querySelector<HTMLSelectElement>("#penalty-game-side");
+    const cardTypeSelect = container.querySelector<HTMLSelectElement>("#penalty-card-type");
+    if (sideSelect === null || cardTypeSelect === null)
+      throw new Error("Card sheet did not render.");
+    await act(async () => {
+      sideSelect.value = "side-a";
+      sideSelect.dispatchEvent(
+        new testWindow.Event("change", { bubbles: true }) as unknown as Event,
+      );
+      cardTypeSelect.value = "yellow";
+      cardTypeSelect.dispatchEvent(
+        new testWindow.Event("change", { bubbles: true }) as unknown as Event,
+      );
+      await Promise.resolve();
+    });
+    await act(async () => {
+      timeoutButton?.click();
+      await Promise.resolve();
+    });
+    await act(async () => {
+      Array.from(container.getElementsByTagName("button"))
+        .find((button) => button.textContent?.includes("Timeout stoppage: side-a"))
+        ?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(container.querySelector('[data-controller-action-panel="true"]')).not.toBeNull();
+    await act(async () => {
+      cardsButton?.click();
+      await Promise.resolve();
+    });
+    expect(container.querySelector<HTMLSelectElement>("#penalty-game-side")?.value).toBe("");
+    expect(container.querySelector<HTMLSelectElement>("#penalty-card-type")?.value).toBe("blue");
+    await act(async () => {
+      cardsButton?.click();
+      await Promise.resolve();
+    });
+    expect(container.querySelector('[data-controller-action-panel="true"]')).toBeNull();
+    await act(async () => {
+      cardsButton?.click();
+      await Promise.resolve();
+      container.querySelector<HTMLButtonElement>('button[aria-label="Start game clock"]')?.click();
+      container.querySelector<HTMLButtonElement>('button[data-primary-score="up"]')?.click();
+      container.querySelectorAll<HTMLButtonElement>('button[data-primary-score="up"]')[1]?.click();
+      await Promise.resolve();
+    });
+    expect(container.querySelector('[data-controller-action-panel="true"]')).not.toBeNull();
+    await act(async () => {
+      gameButton?.click();
+      await Promise.resolve();
+    });
+    await act(async () => {
+      Array.from(container.getElementsByTagName("button"))
+        .find((button) => button.textContent?.trim() === "Review final result")
+        ?.click();
+      await Promise.resolve();
+      Array.from(container.getElementsByTagName("button"))
+        .find((button) => button.textContent?.trim() === "Confirm game end")
+        ?.click();
+      await Promise.resolve();
+    });
+    expect(container.querySelector('[data-controller-action-panel="true"]')).toBeNull();
   });
 
   test("acknowledges only the current corrected Event Team identity before team actions", async () => {
@@ -494,8 +594,8 @@ describe("Event Game Controller reconnect browser seam", () => {
       await Promise.resolve();
       await Promise.resolve();
     });
-    const goalButton = Array.from(container.getElementsByTagName("button")).find((button) =>
-      button.textContent?.includes("Record 10-point goal"),
+    const goalButton = Array.from(container.getElementsByTagName("button")).find(
+      (button) => button.getAttribute("aria-label")?.startsWith("Record 10-point goal") === true,
     );
     expect(goalButton).not.toBeNull();
     await act(async () => {
@@ -615,8 +715,8 @@ describe("Event Game Controller reconnect browser seam", () => {
     });
     expect(container.textContent).toContain("SEEKER RELEASED at 20:00");
 
-    const goalButton = Array.from(container.getElementsByTagName("button")).find((button) =>
-      button.textContent?.includes("Record 10-point goal"),
+    const goalButton = Array.from(container.getElementsByTagName("button")).find(
+      (button) => button.getAttribute("aria-label")?.startsWith("Record 10-point goal") === true,
     );
     await act(async () => {
       goalButton?.click();
@@ -641,6 +741,7 @@ describe("Event Game Controller reconnect browser seam", () => {
     });
     replayMode = "lost";
     await enterAndOpen();
+    await openActionPanel("Cards");
     Object.defineProperty(testWindow.navigator, "onLine", { configurable: true, value: false });
     const sideSelect = container.querySelector("select#penalty-game-side") as HTMLSelectElement;
     await act(async () => {
@@ -657,6 +758,17 @@ describe("Event Game Controller reconnect browser seam", () => {
     await act(async () => {
       acceptCard()?.click();
       await Promise.resolve();
+      await Promise.resolve();
+    });
+    await openActionPanel("Cards");
+    const reopenedSideSelect = container.querySelector(
+      "select#penalty-game-side",
+    ) as HTMLSelectElement;
+    await act(async () => {
+      reopenedSideSelect.value = "side-b";
+      reopenedSideSelect.dispatchEvent(
+        new testWindow.Event("change", { bubbles: true }) as unknown as Event,
+      );
       await Promise.resolve();
     });
     const seekerLabel = Array.from(container.getElementsByTagName("label")).find((label) =>
@@ -692,6 +804,7 @@ describe("Event Game Controller reconnect browser seam", () => {
   test("disables foul-before-score for ejection cards and omits it from offline intent", async () => {
     replayMode = "lost";
     await enterAndOpen();
+    await openActionPanel("Cards");
     Object.defineProperty(testWindow.navigator, "onLine", { configurable: true, value: false });
     const sideSelect = container.querySelector("select#penalty-game-side") as HTMLSelectElement;
     const cardTypeSelect = container.querySelector("select#penalty-card-type") as HTMLSelectElement;
@@ -727,6 +840,7 @@ describe("Event Game Controller reconnect browser seam", () => {
   test("projects offline card and reason taps, then converges after reconnect", async () => {
     replayMode = "lost";
     await enterAndOpen();
+    await openActionPanel("Cards");
     Object.defineProperty(testWindow.navigator, "onLine", { configurable: true, value: false });
 
     const sideSelect = container.querySelector("select#penalty-game-side") as HTMLSelectElement;
@@ -868,8 +982,8 @@ describe("Event Game Controller reconnect browser seam", () => {
     replayMode = "lost";
     await enterAndOpen();
     Object.defineProperty(testWindow.navigator, "onLine", { configurable: true, value: false });
-    const goalButton = Array.from(container.getElementsByTagName("button")).find((button) =>
-      button.textContent?.includes("Record 10-point goal"),
+    const goalButton = Array.from(container.getElementsByTagName("button")).find(
+      (button) => button.getAttribute("aria-label")?.startsWith("Record 10-point goal") === true,
     );
     await act(async () => {
       goalButton?.click();
@@ -1011,6 +1125,7 @@ describe("Event Game Controller reconnect browser seam", () => {
 
   test("uses a contextual Head Referee choice for close-play catch ordering", async () => {
     await enterAndOpen();
+    await openActionPanel("Game end");
     const catchButtons = Array.from(container.getElementsByTagName("button")).filter((button) =>
       button.textContent?.includes("Record flag catch"),
     );
@@ -1042,6 +1157,7 @@ describe("Event Game Controller reconnect browser seam", () => {
       await Promise.resolve();
       await Promise.resolve();
     });
+    expect(container.querySelector('[data-controller-action-panel="true"]')).toBeNull();
     const selected = replayBodies
       .flatMap((body) => body.actions ?? [])
       .find((action) => action.intent.type === "record-flag-catch");
@@ -1071,6 +1187,55 @@ describe("Event Game Controller reconnect browser seam", () => {
     });
   });
 
+  test("preserves an unrelated Card draft after accepting close-play goal ordering", async () => {
+    const initial = projection();
+    const existingFlagCatch = initial.gameFacts?.[0];
+    if (existingFlagCatch === undefined) throw new Error("Expected a close-play fixture.");
+    openProjection = {
+      ...initial,
+      gameFacts: [{ ...existingFlagCatch, factId: "fact-flag-catch", factType: "flag-catch" }],
+    };
+    await enterAndOpen();
+    await openActionPanel("Cards");
+    const sideSelect = container.querySelector<HTMLSelectElement>("#penalty-game-side");
+    const cardTypeSelect = container.querySelector<HTMLSelectElement>("#penalty-card-type");
+    if (sideSelect === null || cardTypeSelect === null)
+      throw new Error("Card sheet did not render.");
+    await act(async () => {
+      sideSelect.value = "side-a";
+      sideSelect.dispatchEvent(
+        new testWindow.Event("change", { bubbles: true }) as unknown as Event,
+      );
+      cardTypeSelect.value = "yellow";
+      cardTypeSelect.dispatchEvent(
+        new testWindow.Event("change", { bubbles: true }) as unknown as Event,
+      );
+      await Promise.resolve();
+    });
+
+    await act(async () => {
+      Array.from(container.getElementsByTagName("button"))
+        .find(
+          (button) =>
+            button.getAttribute("aria-label")?.startsWith("Record 10-point goal") === true,
+        )
+        ?.click();
+      await Promise.resolve();
+    });
+    expect(container.querySelector('[data-close-play-adjudication="true"]')).not.toBeNull();
+    await act(async () => {
+      Array.from(container.getElementsByTagName("button"))
+        .find((button) => button.textContent?.includes("Goal before catch"))
+        ?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(container.querySelector('[data-controller-action-panel="true"]')).not.toBeNull();
+    expect(container.querySelector<HTMLSelectElement>("#penalty-game-side")?.value).toBe("side-a");
+    expect(container.querySelector<HTMLSelectElement>("#penalty-card-type")?.value).toBe("yellow");
+  });
+
   test("causally retains a close-play fact behind its optimistic paired predecessor", async () => {
     replayMode = "retryable";
     const initial = projection();
@@ -1081,10 +1246,14 @@ describe("Event Game Controller reconnect browser seam", () => {
       gameFacts: [],
     };
     await enterAndOpen();
+    await openActionPanel("Game end");
 
     await act(async () => {
       Array.from(container.getElementsByTagName("button"))
-        .find((button) => button.textContent?.includes("Record 10-point goal"))
+        .find(
+          (button) =>
+            button.getAttribute("aria-label")?.startsWith("Record 10-point goal") === true,
+        )
         ?.click();
       await Promise.resolve();
       await Promise.resolve();
@@ -1125,6 +1294,7 @@ describe("Event Game Controller reconnect browser seam", () => {
     openProjection = { ...initial, gameFacts: [] };
     refreshProjection = openProjection;
     await enterAndOpen();
+    await openActionPanel("Game end");
     await act(async () => {
       Array.from(container.getElementsByTagName("button"))
         .find((button) => button.textContent?.includes("Record flag catch"))
@@ -1139,6 +1309,7 @@ describe("Event Game Controller reconnect browser seam", () => {
       await Promise.resolve();
       await Promise.resolve();
     });
+    expect(container.querySelector('[data-controller-action-panel="true"]')).toBeNull();
     const selected = replayBodies
       .flatMap((body) => body.actions ?? [])
       .find((action) => action.intent.type === "record-flag-catch");
@@ -1173,6 +1344,7 @@ describe("Event Game Controller reconnect browser seam", () => {
       ],
     };
     await enterAndOpen();
+    await openActionPanel("Game end");
     await act(async () => {
       Array.from(container.getElementsByTagName("button"))
         .find((button) => button.textContent?.includes("Record flag catch"))
@@ -1229,6 +1401,7 @@ describe("Event Game Controller reconnect browser seam", () => {
       })),
     };
     await enterAndOpen();
+    await openActionPanel("Game end");
     await act(async () => {
       Array.from(container.getElementsByTagName("button"))
         .find((button) => button.textContent?.includes("Record flag catch"))
@@ -1282,6 +1455,7 @@ describe("Event Game Controller reconnect browser seam", () => {
       })),
     };
     await enterAndOpen();
+    await openActionPanel("Game end");
     expect(container.textContent).not.toContain("Concede");
     await act(async () => {
       Array.from(container.getElementsByTagName("button"))
@@ -1315,6 +1489,7 @@ describe("Event Game Controller reconnect browser seam", () => {
 
   test("shows overtime concession and communicates winner or double-forfeit results", async () => {
     await enterAndOpen();
+    await openActionPanel("Game end");
     const current = projection();
     refreshProjection = {
       ...current,
@@ -1382,8 +1557,8 @@ describe("Event Game Controller reconnect browser seam", () => {
       await Promise.resolve();
       await Promise.resolve();
     });
-    const goalButton = Array.from(container.getElementsByTagName("button")).find((button) =>
-      button.textContent?.includes("Record 10-point goal"),
+    const goalButton = Array.from(container.getElementsByTagName("button")).find(
+      (button) => button.getAttribute("aria-label")?.startsWith("Record 10-point goal") === true,
     );
     await act(async () => {
       goalButton?.click();
@@ -1818,9 +1993,16 @@ describe("Event Game Controller reconnect browser seam", () => {
   test("fresh same-Game scan replays retained work with original evidence", async () => {
     replayMode = "lost";
     await enterAndOpen();
+    await openActionPanel("Cards");
+    const draftSide = container.querySelector<HTMLSelectElement>("#penalty-game-side");
+    if (draftSide === null)
+      throw new Error("Expected Event Card draft controls before session clear.");
+    draftSide.value = "side-a";
+    draftSide.dispatchEvent(new testWindow.Event("change", { bubbles: true }) as unknown as Event);
+    expect(container.querySelector('[data-controller-action-panel="true"]')).not.toBeNull();
     Object.defineProperty(testWindow.navigator, "onLine", { configurable: true, value: false });
-    const goalButton = Array.from(container.getElementsByTagName("button")).find((button) =>
-      button.textContent?.includes("Record 10-point goal"),
+    const goalButton = Array.from(container.getElementsByTagName("button")).find(
+      (button) => button.getAttribute("aria-label")?.startsWith("Record 10-point goal") === true,
     );
     await act(async () => {
       goalButton?.click();
@@ -1843,6 +2025,8 @@ describe("Event Game Controller reconnect browser seam", () => {
       await Promise.resolve();
       await Promise.resolve();
     });
+    expect(container.querySelector('[data-controller-action-panel="true"]')).toBeNull();
+    expect(container.querySelector("#penalty-game-side")).toBeNull();
     openGrantSessionId = "session-fresh";
     openGrantVersion = "version-fresh";
     replayMode = "success";
@@ -1862,8 +2046,8 @@ describe("Event Game Controller reconnect browser seam", () => {
     replayMode = "lost";
     await enterAndOpen();
     Object.defineProperty(testWindow.navigator, "onLine", { configurable: true, value: false });
-    const goalButton = Array.from(container.getElementsByTagName("button")).find((button) =>
-      button.textContent?.includes("Record 10-point goal"),
+    const goalButton = Array.from(container.getElementsByTagName("button")).find(
+      (button) => button.getAttribute("aria-label")?.startsWith("Record 10-point goal") === true,
     );
     await act(async () => {
       goalButton?.click();
@@ -1962,8 +2146,8 @@ describe("Event Game Controller reconnect browser seam", () => {
     replayMode = "lost";
     await enterAndOpen();
     Object.defineProperty(testWindow.navigator, "onLine", { configurable: true, value: false });
-    const goalButton = Array.from(container.getElementsByTagName("button")).find((button) =>
-      button.textContent?.includes("Record 10-point goal"),
+    const goalButton = Array.from(container.getElementsByTagName("button")).find(
+      (button) => button.getAttribute("aria-label")?.startsWith("Record 10-point goal") === true,
     );
     await act(async () => {
       goalButton?.click();
@@ -1993,7 +2177,10 @@ describe("Event Game Controller reconnect browser seam", () => {
     Object.defineProperty(testWindow.navigator, "onLine", { configurable: true, value: false });
     await act(async () => {
       Array.from(container.getElementsByTagName("button"))
-        .find((button) => button.textContent?.includes("Record 10-point goal"))
+        .find(
+          (button) =>
+            button.getAttribute("aria-label")?.startsWith("Record 10-point goal") === true,
+        )
         ?.click();
       await Promise.resolve();
       await Promise.resolve();
@@ -2072,8 +2259,8 @@ describe("Event Game Controller reconnect browser seam", () => {
   test("fresh authority supersedes an in-flight replay and starts exactly one newest-bearer replay", async () => {
     replayMode = "deferred";
     await enterAndOpen();
-    const goalButton = Array.from(container.getElementsByTagName("button")).find((button) =>
-      button.textContent?.includes("Record 10-point goal"),
+    const goalButton = Array.from(container.getElementsByTagName("button")).find(
+      (button) => button.getAttribute("aria-label")?.startsWith("Record 10-point goal") === true,
     );
     await act(async () => {
       goalButton?.click();
@@ -2195,8 +2382,8 @@ describe("Event Game Controller reconnect browser seam", () => {
     });
     await enterAndOpen();
     expect(container.querySelector('[role="alert"]')?.textContent).toContain("full or unavailable");
-    const goalButton = Array.from(container.getElementsByTagName("button")).find((button) =>
-      button.textContent?.includes("Record 10-point goal"),
+    const goalButton = Array.from(container.getElementsByTagName("button")).find(
+      (button) => button.getAttribute("aria-label")?.startsWith("Record 10-point goal") === true,
     );
     await act(async () => {
       goalButton?.click();
@@ -2224,8 +2411,8 @@ describe("Event Game Controller reconnect browser seam", () => {
       await Promise.resolve();
       await Promise.resolve();
     });
-    const goalButton = Array.from(container.getElementsByTagName("button")).find((button) =>
-      button.textContent?.includes("Record 10-point goal"),
+    const goalButton = Array.from(container.getElementsByTagName("button")).find(
+      (button) => button.getAttribute("aria-label")?.startsWith("Record 10-point goal") === true,
     );
     await act(async () => {
       goalButton?.click();
@@ -2261,8 +2448,14 @@ describe("Event Game Controller reconnect browser seam", () => {
       await Promise.resolve();
       await Promise.resolve();
     });
-    const goalButton = Array.from(container.getElementsByTagName("button")).find((button) =>
-      button.textContent?.includes("Record 10-point goal"),
+    await openActionPanel("Cards");
+    const draftSide = container.querySelector<HTMLSelectElement>("#penalty-game-side");
+    if (draftSide === null)
+      throw new Error("Expected Event Card draft controls before Game switch.");
+    draftSide.value = "side-a";
+    draftSide.dispatchEvent(new testWindow.Event("change", { bubbles: true }) as unknown as Event);
+    const goalButton = Array.from(container.getElementsByTagName("button")).find(
+      (button) => button.getAttribute("aria-label")?.startsWith("Record 10-point goal") === true,
     );
     await act(async () => {
       goalButton?.click();
@@ -2291,6 +2484,8 @@ describe("Event Game Controller reconnect browser seam", () => {
       await Promise.resolve();
     });
     expect(container.textContent).toContain("Controller Device: game-b");
+    expect(container.querySelector('[data-controller-action-panel="true"]')).toBeNull();
+    expect(container.querySelector("#penalty-game-side")).toBeNull();
     const oldGame = JSON.parse(
       testWindow.localStorage.getItem(controllerReplicaStorageKey("game-browser")) ?? "null",
     ) as { pendingActions?: unknown[] };

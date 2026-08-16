@@ -10,6 +10,7 @@ import {
   openSqliteAdHocStore,
 } from "@/lib/ad-hoc-games";
 import { createGrantKeyRingDocument, writeGrantKeyRingFile } from "@/lib/grant-key-ring-custody";
+import { assertControllerActionSheet } from "./controller-action-sheet-browser-assertions";
 
 let directory = "";
 let certificatePath = "";
@@ -160,6 +161,15 @@ async function run() {
 
         const gameId = new URL(first.url()).pathname.split("/").at(-1);
         if (gameId === undefined) throw new Error("Game route did not contain a Game ID.");
+        const actionSheetContext = await browser!.newContext({ ignoreHTTPSErrors: true });
+        const actionSheetPage = await actionSheetContext.newPage();
+        actionSheetPage.setDefaultTimeout(15_000);
+        await actionSheetPage.goto(origin);
+        await actionSheetPage.getByRole("button", { name: /Start an Ad Hoc Game/ }).click();
+        await actionSheetPage.waitForURL(/\/game\/adhoc-/u);
+        await waitForHealthyControllerHeader(actionSheetPage);
+        await assertControllerActionSheet(actionSheetPage, "Ad Hoc initial Controller");
+        await actionSheetContext.close();
         for (let index = 0; index < 4; index += 1) {
           await first.goto(origin);
           await first.getByRole("button", { name: /Start an Ad Hoc Game/ }).click();
@@ -233,7 +243,8 @@ async function run() {
         await waitForGameRoute(second, gameId);
         await assertAccessibleQr(second, "second browser");
 
-        await second.getByRole("button", { name: "Start game" }).click();
+        const startGame = second.getByRole("button", { name: "Start game" });
+        if ((await startGame.count()) > 0) await startGame.click();
         await first.getByText("Running", { exact: true }).waitFor();
         await stopServer();
         await second.getByRole("button", { name: "Pause game" }).click();
@@ -243,7 +254,7 @@ async function run() {
         await waitForHealthyControllerHeader(second);
         await first.getByText("Running", { exact: true }).waitFor();
         await second.getByRole("button", { name: "Pause game" }).click();
-        await second.getByRole("button", { name: "Game end" }).click();
+        await second.getByRole("button", { name: "Game end", exact: true }).click();
         await second.getByRole("button", { name: "Double forfeit" }).click();
         await second.getByText("Finished", { exact: true }).waitFor();
         await first.waitForFunction(
@@ -251,6 +262,7 @@ async function run() {
             document.querySelector('button[aria-label="Show Ad Hoc Control QR"]') === null &&
             !document.body.textContent?.includes("Share Ad Hoc Control"),
         );
+        await second.getByRole("button", { name: "Game end", exact: true }).click();
         await second.getByRole("button", { name: "Correct back to unfinished" }).click();
         await waitForUnfinishedGame(second, gameId);
 
@@ -484,7 +496,7 @@ async function run() {
         await retryPage.goto(handoffUrl);
         await waitForGameRoute(retryPage, gameId);
         const busyWarning = retryPage.locator('[data-controller-warning="true"]');
-        await busyWarning.waitFor();
+        await busyWarning.filter({ hasText: /Ad Hoc connection busy/u }).waitFor();
         const busyWarningText = (await busyWarning.textContent()) ?? "";
         if (
           !busyWarningText.includes("Offline") ||

@@ -1,12 +1,13 @@
 #!/usr/bin/env bun
 import { chromium, webkit, type BrowserContext, type Page } from "playwright";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createGrantKeyRingDocument, writeGrantKeyRingFile } from "@/lib/grant-key-ring-custody";
 import { createInitialClockBaseline, projectClockBaseline } from "@/lib/clock-authority";
 import type { ControllerProjection, LiveSuspensionSnapshot } from "@/lib/live-event-game-control";
 import type { LivePenaltyProjection } from "@/lib/live-event-penalties";
+import { assertControllerActionSheet } from "./controller-action-sheet-browser-assertions";
 
 const directory = mkdtempSync(join(tmpdir(), "quadball-timer-controller-browser-"));
 const certificatePath = join(directory, "localhost.crt");
@@ -34,75 +35,95 @@ let server: Bun.Subprocess | null = null;
 let browser: Awaited<ReturnType<typeof chromium.launch>> | null = null;
 let currentProjection = createProjection();
 let openCalls = 0;
+const lifecycleController = new AbortController();
+const lifecycleTimer = setTimeout(() => lifecycleController.abort(), 52_000);
+let primaryError: Error | null = null;
+let cleanupError: Error | null = null;
+let serverDiagnostics = "";
+
+lifecycleController.signal.addEventListener(
+  "abort",
+  () => {
+    void browser?.close().catch(() => undefined);
+  },
+  { once: true },
+);
 
 try {
-  const certificate = Bun.spawnSync([
-    "openssl",
-    "req",
-    "-x509",
-    "-newkey",
-    "rsa:2048",
-    "-nodes",
-    "-subj",
-    "/CN=localhost",
-    "-addext",
-    "subjectAltName=DNS:localhost",
-    "-days",
-    "1",
-    "-keyout",
-    keyPath,
-    "-out",
-    certificatePath,
-  ]);
-  if (certificate.exitCode !== 0)
-    throw new Error("openssl could not create a temporary certificate.");
-  writeGrantKeyRingFile(grantKeyRingPath, createGrantKeyRingDocument("test"));
-  server = Bun.spawn(["bun", "run", "src/index.ts"], {
-    cwd: process.cwd(),
-    env: environment,
-    stdout: "pipe",
-    stderr: "pipe",
-  });
-  await waitForServer(`${origin}/internal/healthz`);
+  await raceWithDeadline(
+    (async () => {
+      const certificate = Bun.spawnSync([
+        "openssl",
+        "req",
+        "-x509",
+        "-newkey",
+        "rsa:2048",
+        "-nodes",
+        "-subj",
+        "/CN=localhost",
+        "-addext",
+        "subjectAltName=DNS:localhost",
+        "-days",
+        "1",
+        "-keyout",
+        keyPath,
+        "-out",
+        certificatePath,
+      ]);
+      if (certificate.exitCode !== 0)
+        throw new Error("openssl could not create a temporary certificate.");
+      writeGrantKeyRingFile(grantKeyRingPath, createGrantKeyRingDocument("test"));
+      server = Bun.spawn(["bun", "run", "src/index.ts"], {
+        cwd: process.cwd(),
+        env: environment,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      await waitForServer(`${origin}/internal/healthz`);
 
-  for (const browserType of [chromium, webkit]) {
-    currentProjection = createProjection();
-    browser = await browserType.launch({ headless: true });
-    const context = await browser.newContext({ ignoreHTTPSErrors: true });
-    await installControllerApi(context);
-    const controller = await context.newPage();
-    await completeSuspendReviewResume(controller);
-    await eventDepartureLifecycleEvidence(controller);
+      for (const browserType of [chromium, webkit]) {
+        assertLifecycleActive();
+        currentProjection = createProjection();
+        browser = await browserType.launch({ headless: true });
+        const context = await browser.newContext({ ignoreHTTPSErrors: true });
+        await installControllerApi(context);
+        const controller = await context.newPage();
+        await completeSuspendReviewResume(controller);
+        await eventDepartureLifecycleEvidence(controller);
 
-    const secondContext = await browser.newContext({ ignoreHTTPSErrors: true });
-    await installControllerApi(secondContext);
-    const reviewingController = await secondContext.newPage();
-    await reviewAndResume(reviewingController);
-    await browser.close();
-    browser = null;
-  }
+        const secondContext = await browser.newContext({ ignoreHTTPSErrors: true });
+        await installControllerApi(secondContext);
+        const reviewingController = await secondContext.newPage();
+        await reviewAndResume(reviewingController);
+        await browser.close();
+        browser = null;
+        assertLifecycleActive();
+      }
 
-  console.log(
-    "Focused Integration Test passed: Chromium/WebKit 390x844 and 412x915 Controller interactions and suspend/review/resume.",
+      console.log(
+        "Focused Integration Test passed: Chromium/WebKit 390x844 and 412x915 Controller interactions and suspend/review/resume.",
+      );
+    })(),
+    lifecycleController.signal,
   );
 } catch (error) {
-  console.error(error instanceof Error ? error.message : String(error));
-  if (server !== null) {
-    server.kill("SIGTERM");
-    const stderr = await new Response(server.stderr as unknown as BodyInit).text();
-    if (stderr.trim() !== "") console.error(stderr.slice(-2_000));
-  }
-  process.exitCode = 1;
+  primaryError = error instanceof Error ? error : new Error(String(error));
 } finally {
-  await browser?.close();
-  if (server !== null) {
-    server.kill("SIGTERM");
-    await server.exited;
-  }
-  rmSync(directory, { recursive: true, force: true });
+  clearTimeout(lifecycleTimer);
+  cleanupError = await cleanupEventLifecycle();
 }
 
+if (primaryError !== null) {
+  console.error(`Focused Integration primary failure: ${primaryError.message}`);
+  if (serverDiagnostics.trim() !== "") console.error(serverDiagnostics);
+}
+if (cleanupError !== null) {
+  console.error(`Focused Integration cleanup failure: ${cleanupError.message}`);
+}
+if (primaryError !== null || cleanupError !== null) process.exitCode = 1;
+
 async function completeSuspendReviewResume(page: Page) {
+  assertLifecycleActive();
   page.setDefaultTimeout(5_000);
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto(`${origin}/event-control`);
@@ -110,17 +131,29 @@ async function completeSuspendReviewResume(page: Page) {
   await page.getByRole("button", { name: "Open Event Game Controller" }).click();
   await page.getByText("Controller Device: game-browser-focused").waitFor();
   await assertControllerSurface(page, "initial");
+  await assertControllerActionSheet(page, "Event initial Controller");
   await assertControllerHeaderGeometry(page, "initial");
-  await page.getByRole("button", { name: "Start game clock" }).click();
+  const startClock = page.getByRole("button", { name: "Start game clock" });
+  if ((await startClock.count()) > 0) await startClock.click();
   await page.getByRole("button", { name: "Adjust game clock by plus 10 seconds" }).click();
   await page.getByLabel("Set game clock (milliseconds)").fill("123000");
   await page.getByRole("button", { name: "Correct Event Game clock" }).click();
+  await page.getByRole("button", { name: "Cards", exact: true }).click();
   await page.locator("#penalty-game-side").selectOption("side-a");
   await page
     .getByRole("button", { name: "Accept penalty card for the selected Game Side" })
     .click();
+  await page.getByRole("button", { name: "Timeout", exact: true }).click();
   await page.getByRole("button", { name: "Timeout stoppage: side-a" }).click();
-  await page.getByRole("button", { name: "Record 10-point goal for Game Side side-a" }).click();
+  await page.getByRole("button", { name: "Start timeout minute: side-a" }).click();
+  assert(
+    (await page.locator('[data-controller-action-panel="true"]').count()) === 0,
+    "Event timeout completion did not close the action sheet",
+  );
+  await page
+    .getByRole("button", { name: "Record 10-point goal for Game Side side-a" })
+    .first()
+    .click();
   await page.getByRole("button", { name: "Flip Event Game physical ends" }).click();
   await page.getByRole("button", { name: "Reveal active Grant QR" }).click();
   await page.getByRole("dialog", { name: "Active Grant QR" }).waitFor();
@@ -132,7 +165,21 @@ async function completeSuspendReviewResume(page: Page) {
       "Show active Grant QR",
     "QR outside-pointer dismissal did not return focus",
   );
-  await page.getByRole("button", { name: "Record final Event Game result" }).click();
+  await page.getByRole("button", { name: "Game end", exact: true }).click();
+  assert(
+    (await page.locator('[data-controller-action-panel="true"]').count()) === 1,
+    "Event Game end action did not open",
+  );
+  const gameEndPanel = page.locator('[data-controller-action-panel="true"]');
+  await gameEndPanel.evaluate((element) => {
+    element.scrollTop = element.scrollHeight;
+  });
+  const reviewResult = gameEndPanel.locator("button").filter({ hasText: "Review final result" });
+  await reviewResult.scrollIntoViewIfNeeded();
+  await reviewResult.click();
+  const confirmResult = gameEndPanel.locator("button").filter({ hasText: "Confirm game end" });
+  await confirmResult.scrollIntoViewIfNeeded();
+  await confirmResult.click();
   await page.getByRole("button", { name: "Review suspension recovery" }).click();
   await page.locator("#volleyball-possession").selectOption("side-a");
   await page.locator("#dodgeball-possession-ball-1").selectOption("side-b");
@@ -151,6 +198,7 @@ async function completeSuspendReviewResume(page: Page) {
 }
 
 async function eventDepartureLifecycleEvidence(page: Page) {
+  assertLifecycleActive();
   const initialOpenCalls = openCalls;
   await page.getByRole("button", { name: "Leave Event Game Controller session" }).click();
   await page.getByRole("button", { name: "Leave game" }).click();
@@ -256,6 +304,7 @@ async function assertControllerSurface(page: Page, label = "surface") {
 }
 
 async function reviewAndResume(page: Page) {
+  assertLifecycleActive();
   await page.setViewportSize({ width: 412, height: 915 });
   await page.goto(`${origin}/event-control`);
   await page.getByLabel("Active Pitch Slot Control Grant QR").fill("disposable-grant");
@@ -454,6 +503,33 @@ function applyIntent(intent: Record<string, unknown>) {
   if (intent.type === "substantive" && intent.trigger === "result") {
     currentProjection = { ...currentProjection, phase: "finished" };
   }
+  if (
+    intent.type === "substantive" &&
+    intent.trigger === "timeout" &&
+    typeof intent.timeoutGameSideId === "string" &&
+    (intent.timeoutAction === "stoppage" || intent.timeoutAction === "start")
+  ) {
+    currentProjection = {
+      ...currentProjection,
+      timeout:
+        intent.timeoutAction === "stoppage"
+          ? {
+              ...currentProjection.timeout,
+              factId: "fact-focused-timeout-stoppage",
+              status: "stoppage",
+              gameSideId: intent.timeoutGameSideId,
+              remainingMs: 60_000,
+            }
+          : {
+              ...currentProjection.timeout,
+              factId: "fact-focused-timeout-start",
+              status: "started",
+              gameSideId: intent.timeoutGameSideId,
+              startedAtMs: 0,
+              remainingMs: 60_000,
+            },
+    };
+  }
 }
 
 async function assertNoDocumentScroll(page: Page) {
@@ -470,6 +546,7 @@ async function assertNoDocumentScroll(page: Page) {
     metrics.scrollHeight <= metrics.clientHeight,
     `document overflowed the viewport (${JSON.stringify(metrics)})`,
   );
+  assertLifecycleActive();
 }
 
 function createProjection(): ControllerProjection {
@@ -542,6 +619,132 @@ async function waitForServer(url: string) {
     await Bun.sleep(50);
   }
   throw new Error("Focused browser server did not become ready.");
+}
+
+async function raceWithDeadline<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) throw new Error("Focused Integration lifecycle deadline exceeded.");
+  let rejectDeadline: (() => void) | null = null;
+  const deadline = new Promise<never>((_, reject) => {
+    const onAbort = () => reject(new Error("Focused Integration lifecycle deadline exceeded."));
+    rejectDeadline = onAbort;
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+  try {
+    return await Promise.race([promise, deadline]);
+  } finally {
+    if (rejectDeadline !== null) signal.removeEventListener("abort", rejectDeadline);
+  }
+}
+
+function assertLifecycleActive() {
+  if (lifecycleController.signal.aborted) {
+    throw new Error("Focused Integration work deadline exceeded.");
+  }
+}
+
+async function cleanupEventLifecycle(): Promise<Error | null> {
+  const failures: string[] = [];
+  const cleanupBrowser = browser as Awaited<ReturnType<typeof chromium.launch>> | null;
+  if (cleanupBrowser !== null) {
+    try {
+      await withTimeout(cleanupBrowser.close(), 1_500, "browser close");
+      browser = null;
+    } catch (error) {
+      failures.push(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  const cleanupServer = server as Bun.Subprocess | null;
+  if (cleanupServer !== null) {
+    try {
+      cleanupServer.kill("SIGTERM");
+      let exitCode = await waitForSubprocessExit(cleanupServer, 1_000);
+      if (exitCode === null) {
+        cleanupServer.kill("SIGKILL");
+        exitCode = await waitForSubprocessExit(cleanupServer, 1_000);
+      }
+      if (exitCode === null) throw new Error("server did not exit after TERM/KILL");
+      await withTimeout(cleanupServer.exited, 500, "server reap");
+      const stderr = cleanupServer.stderr;
+      serverDiagnostics = await readBoundedDiagnostics(
+        stderr !== undefined && typeof stderr !== "number" ? stderr : null,
+        4_000,
+        500,
+      );
+      server = null;
+    } catch (error) {
+      failures.push(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  if (failures.length > 0) {
+    return new Error(failures.join("; "));
+  }
+  try {
+    rmSync(directory, { recursive: true, force: true });
+    if (existsSync(directory)) throw new Error("temporary directory remained after cleanup");
+  } catch (error) {
+    return error instanceof Error ? error : new Error(String(error));
+  }
+  return null;
+}
+
+async function waitForSubprocessExit(child: Bun.Subprocess, timeoutMs: number) {
+  return await Promise.race([child.exited, Bun.sleep(timeoutMs).then(() => null)]);
+}
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} exceeded ${timeoutMs} ms`)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+async function readBoundedDiagnostics<T extends Uint8Array>(
+  stream: ReadableStream<T> | null,
+  limit: number,
+  timeoutMs: number,
+) {
+  if (stream === null) return "";
+  return await withTimeout(
+    (async () => {
+      const reader = stream.getReader();
+      const chunks: Uint8Array[] = [];
+      let length = 0;
+      try {
+        while (length < limit) {
+          const result = await reader.read();
+          if (result.done) break;
+          const remaining = limit - length;
+          const chunk = result.value.subarray(0, remaining);
+          chunks.push(chunk);
+          length += chunk.length;
+          if (chunk.length < result.value.length) break;
+        }
+      } finally {
+        reader.releaseLock();
+      }
+      const combined = new Uint8Array(length);
+      let offset = 0;
+      for (const chunk of chunks) {
+        combined.set(chunk, offset);
+        offset += chunk.length;
+      }
+      return new TextDecoder().decode(combined).trim();
+    })(),
+    timeoutMs,
+    "diagnostics read",
+  ).catch(
+    (error) =>
+      `[diagnostics unavailable: ${error instanceof Error ? error.message : String(error)}]`,
+  );
 }
 
 function assert(condition: boolean, message: string): asserts condition {

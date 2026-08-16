@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { ControllerHeader } from "@/components/controller-header";
+import { ControllerActionSheet } from "@/components/controller-action-sheet";
+import type { ControllerActionPanel } from "@/lib/controller-action-sheet";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -177,6 +179,8 @@ export function EventGameControllerPage() {
     useState<PendingClosePlayAdjudication | null>(null);
   const [pendingFlagCatchBoundaryOverride, setPendingFlagCatchBoundaryOverride] =
     useState<PendingFlagCatchBoundaryOverride | null>(null);
+  const [activeActionPanel, setActiveActionPanel] = useState<ControllerActionPanel | null>(null);
+  const [pendingEventResultConfirmation, setPendingEventResultConfirmation] = useState(false);
   const [persistedReplicaLoad] = useState<ControllerReplicaLoad>(() =>
     readPersistedControllerReplica(undefined),
   );
@@ -207,6 +211,22 @@ export function EventGameControllerPage() {
   const sessionReferenceIdRef = useRef<string | null>(persisted?.sessionReferenceId ?? null);
   const restoreStartedRef = useRef(false);
   const departureModule = getBrowserControllerDeparture();
+
+  function changeActionPanel(panel: ControllerActionPanel | null) {
+    resetActionSheetDrafts();
+    setActiveActionPanel(panel);
+  }
+
+  function resetActionSheetDrafts() {
+    setCardGameSideId("");
+    setCardPlayerNumber("");
+    setCardType("blue");
+    setCardFoulBeforeScore(false);
+    setCardSeekerPenaltyConfirmed(false);
+    setPendingEventResultConfirmation(false);
+    setPendingClosePlayAdjudication(null);
+    setPendingFlagCatchBoundaryOverride(null);
+  }
 
   const eventEntry = useControllerDepartureEntry({
     destination: { kind: "admit-event" },
@@ -618,6 +638,8 @@ export function EventGameControllerPage() {
 
   async function switchController(): Promise<boolean> {
     if (sessionBearer === null) return false;
+    resetActionSheetDrafts();
+    setActiveActionPanel(null);
     const requestGeneration = lifecycleGenerationRef.current;
     setBusy(true);
     clearReplayAuthority();
@@ -757,16 +779,16 @@ export function EventGameControllerPage() {
   }
 
   function recordGoal(gameSideId: string) {
-    recordScoringFact("record-goal", gameSideId);
+    return recordScoringFact("record-goal", gameSideId);
   }
 
   function recordFlagCatch(gameSideId: string) {
-    recordScoringFact("record-flag-catch", gameSideId);
+    return recordScoringFact("record-flag-catch", gameSideId);
   }
 
   function recordScoringFact(intentType: "record-goal" | "record-flag-catch", gameSideId: string) {
     const gameTimeMs = currentSportingTimeMs();
-    if (gameTimeMs === null) return;
+    if (gameTimeMs === null) return false;
     const running = clockProjection?.running ?? projection?.clock.running ?? false;
     const flagCatchBoundaryRunning =
       intentType === "record-flag-catch" && (gameTimeMs < SEEKER_RELEASE_MS || running)
@@ -793,16 +815,16 @@ export function EventGameControllerPage() {
         })),
       });
       setMessage("Head Referee adjudication is required to order this close goal and flag catch.");
-      return;
+      return false;
     }
     if (flagCatchBoundaryRunning !== null) {
       setPendingFlagCatchBoundaryOverride({ gameSideId, gameTimeMs, running });
       setMessage(
         "Head Referee confirmation is required for a flag catch before seeker release or while play is running.",
       );
-      return;
+      return false;
     }
-    queueIntent({
+    return queueIntent({
       version: LIVE_EVENT_CONTROL_INTENT_VERSION,
       type: intentType,
       operationId: crypto.randomUUID(),
@@ -816,9 +838,9 @@ export function EventGameControllerPage() {
 
   function submitClosePlayAdjudication(order: "before" | "after", relatedFactId: string) {
     const pending = pendingClosePlayAdjudication;
-    if (pending === null) return;
+    if (pending === null) return false;
     const relatedFact = pending.relatedFacts.find((fact) => fact.factId === relatedFactId);
-    if (relatedFact === undefined) return;
+    if (relatedFact === undefined) return false;
     const override: OfficialOverrideMetadata = {
       guardrail: "sporting-order-adjudication",
       direction: "head-referee-adjudicated-sporting-order",
@@ -851,9 +873,9 @@ export function EventGameControllerPage() {
       setMessage(
         "Sporting Order recorded. Separately confirm the flag-catch boundary override before submission.",
       );
-      return;
+      return false;
     }
-    queueIntent({
+    const accepted = queueIntent({
       version: LIVE_EVENT_CONTROL_INTENT_VERSION,
       type: pending.intentType,
       operationId: crypto.randomUUID(),
@@ -867,13 +889,15 @@ export function EventGameControllerPage() {
       override,
       occurrence: { clientOriginAtMs: Date.now() },
     });
-    setPendingClosePlayAdjudication(null);
+    if (!accepted) return false;
+    if (pending.intentType === "record-flag-catch") changeActionPanel(null);
+    return true;
   }
 
   function submitFlagCatchBoundaryOverride() {
     const pending = pendingFlagCatchBoundaryOverride;
-    if (pending === null) return;
-    queueIntent({
+    if (pending === null) return false;
+    const accepted = queueIntent({
       version: LIVE_EVENT_CONTROL_INTENT_VERSION,
       type: "record-flag-catch",
       operationId: crypto.randomUUID(),
@@ -889,13 +913,15 @@ export function EventGameControllerPage() {
           }),
       occurrence: { clientOriginAtMs: Date.now() },
     });
-    setPendingFlagCatchBoundaryOverride(null);
+    if (!accepted) return false;
+    changeActionPanel(null);
+    return true;
   }
 
   function recordConcession(gameSideId: string) {
     const gameTimeMs = currentSportingTimeMs();
-    if (gameTimeMs === null) return;
-    queueIntent({
+    if (gameTimeMs === null) return false;
+    return queueIntent({
       version: LIVE_EVENT_CONTROL_INTENT_VERSION,
       type: "record-concession",
       operationId: crypto.randomUUID(),
@@ -909,8 +935,8 @@ export function EventGameControllerPage() {
 
   function recordForfeit(gameSideId: string) {
     const gameTimeMs = currentSportingTimeMs();
-    if (gameTimeMs === null) return;
-    queueIntent({
+    if (gameTimeMs === null) return false;
+    return queueIntent({
       version: LIVE_EVENT_CONTROL_INTENT_VERSION,
       type: "record-forfeit",
       operationId: crypto.randomUUID(),
@@ -924,8 +950,11 @@ export function EventGameControllerPage() {
 
   function recordDoubleForfeit() {
     const gameTimeMs = currentSportingTimeMs();
-    if (gameTimeMs === null) return;
-    queueIntent({
+    if (gameTimeMs === null) {
+      setMessage("Game Clock time is unavailable; action remains open.");
+      return false;
+    }
+    return queueIntent({
       version: LIVE_EVENT_CONTROL_INTENT_VERSION,
       type: "record-double-forfeit",
       operationId: crypto.randomUUID(),
@@ -937,10 +966,16 @@ export function EventGameControllerPage() {
   }
 
   function recordCard() {
-    if (cardGameSideId === "") return;
+    if (cardGameSideId === "") {
+      setMessage("Choose a Game Side before accepting the card.");
+      return false;
+    }
     const parsedPlayerNumber = cardPlayerNumber === "" ? null : Number(cardPlayerNumber);
-    if (parsedPlayerNumber !== null && !Number.isSafeInteger(parsedPlayerNumber)) return;
-    queueIntent({
+    if (parsedPlayerNumber !== null && !Number.isSafeInteger(parsedPlayerNumber)) {
+      setMessage("Player number must be a whole number.");
+      return false;
+    }
+    const queued = queueIntent({
       version: LIVE_EVENT_CONTROL_INTENT_VERSION,
       type: "record-card",
       operationId: crypto.randomUUID(),
@@ -955,6 +990,7 @@ export function EventGameControllerPage() {
       gameTimeMs: controllerGameTimeMs(),
       occurrence: { clientOriginAtMs: Date.now() },
     });
+    return queued;
   }
 
   function flipPitchOrientation() {
@@ -1062,21 +1098,24 @@ export function EventGameControllerPage() {
       suspensionAction?: "start" | "resume";
       resumesSuspensionFactId?: string;
     } = {},
-  ) {
+  ): boolean {
     const gameTimeMs = currentSportingTimeMs();
-    if (gameTimeMs === null) return;
+    if (gameTimeMs === null) {
+      setMessage("Game Clock time is unavailable; action remains open.");
+      return false;
+    }
     if (type === "suspension" && options.suspensionAction !== "resume") {
       if (projection === null || projection.penalties === undefined) {
         setMessage("A current authoritative projection is required before suspending.");
-        return;
+        return false;
       }
       if (volleyballPossession === "") {
         setMessage("Confirm volleyball possession before suspending.");
-        return;
+        return false;
       }
       if ((projection.knownDodgeballIds ?? []).some((ballId) => !(ballId in dodgeballPossession))) {
         setMessage("Confirm every known dodgeball possession before suspending.");
-        return;
+        return false;
       }
     }
     const suspensionSnapshot =
@@ -1090,7 +1129,7 @@ export function EventGameControllerPage() {
             dodgeballPossession,
           }
         : undefined;
-    queueIntent({
+    return queueIntent({
       version: LIVE_EVENT_CONTROL_INTENT_VERSION,
       type: "substantive",
       trigger: type,
@@ -1207,9 +1246,9 @@ export function EventGameControllerPage() {
   function queueIntent(
     candidate: LiveEventControllerIntent,
     options: { causalPredecessorIds?: readonly string[] } = {},
-  ) {
+  ): boolean {
     const current = replicaRef.current;
-    if (current === null) return;
+    if (current === null) return false;
     try {
       const relatedFactId = candidate.sportingOrderAdjudication?.relatedFactId;
       const relatedPendingOperationId =
@@ -1241,8 +1280,10 @@ export function EventGameControllerPage() {
       setProjection(dispatched.state.projection);
       setProjectionStatus("available");
       void flushReplica(dispatched.state);
+      return true;
     } catch {
       setMessage("The Controller action could not be retained safely.");
+      return false;
     }
   }
 
@@ -1693,6 +1734,8 @@ export function EventGameControllerPage() {
       eventSession?: Pick<PersistedControllerSession, "eventGameId" | "sessionReferenceId">;
     } = {},
   ) {
+    resetActionSheetDrafts();
+    setActiveActionPanel(null);
     const currentEventGameId = eventGameId;
     const currentSessionReferenceId = sessionReferenceIdRef.current;
     const eventSessionToClear =
@@ -1854,936 +1897,862 @@ export function EventGameControllerPage() {
               </Button>
             </>
           ) : (
-            <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain [&_button]:min-h-11">
-              <ControllerHeader
-                identity={eventControllerHeaderIdentity(projection)}
-                warning={
-                  controllerConnectionStatus === "fresh"
-                    ? null
-                    : {
-                        queuedActions: replica?.pendingActions.length ?? 0,
-                        kind: controllerConnectionStatus === "stale" ? "stale" : "offline",
-                        retryDetail:
-                          controllerConnectionStatus === "stale"
-                            ? "Reconnect to reconcile."
-                            : "Reconnect to sync.",
-                      }
-                }
-                qr={{
-                  triggerRef: qrTriggerRef,
-                  label: revealedQr === null ? "Reveal active Grant QR" : "Show active Grant QR",
-                  expanded: qrDialogOpen,
-                  controls: "active-grant-qr-dialog",
-                  onClick: () => {
-                    if (revealedQr === null) void revealQr();
-                    else setQrDialogOpen(true);
-                  },
-                  disabled: busy,
-                }}
-                onLeave={() => setLeaveDialogOpen(true)}
-                leaveTriggerRef={leaveTriggerRef}
-                leaveLabel="Leave Event Game Controller session"
-                leaveDisabled={busy}
-              />
-              <div className="mt-2 rounded-lg border bg-muted/30 p-3 text-sm">
-                <p className="font-medium">Controller Device: {eventGameId}</p>
-                <p className="mt-1 text-muted-foreground">
-                  {projection?.commencement.status === "commenced"
-                    ? "Game Commencement is irreversible."
-                    : "Game remains provisional until genuine play is recognized."}
-                </p>
-                {projectionStatus === "unavailable" ? (
-                  <p className="mt-1 text-muted-foreground">Projection temporarily unavailable.</p>
-                ) : null}
-              </div>
-              <div className="flex shrink-0 flex-wrap gap-2">
-                <Button
-                  variant="outline"
-                  aria-label="Refresh Event Game assignment"
-                  onClick={() => void refreshController()}
-                  disabled={busy}
-                >
-                  Refresh assignment
-                </Button>
-              </div>
-              {switchTarget === null ? null : (
-                <div className="rounded-lg border border-amber-500/50 bg-amber-50 p-3 text-sm">
-                  <p className="font-medium">Pitch Slot assignment changed.</p>
-                  <p className="mt-1">
-                    Switch to {switchTarget}, or stay on {eventGameId}.
+            <div className="relative min-h-0 flex-1 overflow-hidden">
+              <div className="h-full min-h-0 overflow-y-auto overscroll-contain pb-40 [&_button]:min-h-11">
+                <ControllerHeader
+                  identity={eventControllerHeaderIdentity(projection)}
+                  warning={
+                    controllerConnectionStatus === "fresh"
+                      ? null
+                      : {
+                          queuedActions: replica?.pendingActions.length ?? 0,
+                          kind: controllerConnectionStatus === "stale" ? "stale" : "offline",
+                          retryDetail:
+                            controllerConnectionStatus === "stale"
+                              ? "Reconnect to reconcile."
+                              : "Reconnect to sync.",
+                        }
+                  }
+                  qr={{
+                    triggerRef: qrTriggerRef,
+                    label: revealedQr === null ? "Reveal active Grant QR" : "Show active Grant QR",
+                    expanded: qrDialogOpen,
+                    controls: "active-grant-qr-dialog",
+                    onClick: () => {
+                      if (revealedQr === null) void revealQr();
+                      else setQrDialogOpen(true);
+                    },
+                    disabled: busy,
+                  }}
+                  onLeave={() => setLeaveDialogOpen(true)}
+                  leaveTriggerRef={leaveTriggerRef}
+                  leaveLabel="Leave Event Game Controller session"
+                  leaveDisabled={busy}
+                />
+                <div className="mt-2 rounded-lg border bg-muted/30 p-3 text-sm">
+                  <p className="font-medium">Controller Device: {eventGameId}</p>
+                  <p className="mt-1 text-muted-foreground">
+                    {projection?.commencement.status === "commenced"
+                      ? "Game Commencement is irreversible."
+                      : "Game remains provisional until genuine play is recognized."}
                   </p>
-                  <div className="mt-3 flex flex-wrap gap-2">
-                    <Button
-                      ref={switchTriggerRef}
-                      aria-label={`Switch to Event Game ${switchTarget}`}
-                      onClick={() => void switchEntry.begin()}
-                      disabled={busy || switchEntry.busy}
-                    >
-                      Switch Event Game
-                    </Button>
-                    <Button
-                      variant="outline"
-                      aria-label={`Stay on Event Game ${eventGameId}`}
-                      onClick={stayOnCurrentAssignment}
-                      disabled={busy}
-                    >
-                      Stay here
-                    </Button>
-                  </div>
-                </div>
-              )}
-              <div
-                className="sticky top-0 z-10 flex shrink-0 items-center justify-between gap-2 rounded-lg border bg-slate-950 p-3 text-white"
-                role="region"
-                aria-label="Event Game Clock"
-                aria-live="polite"
-              >
-                <div className="min-w-0 text-center">
-                  <p className="text-xs uppercase tracking-[0.2em] text-slate-300">Game Clock</p>
-                  <p className="mt-1 text-4xl font-semibold tabular-nums">
-                    {clockProjection === null || clockProjection.synchronization === "unavailable"
-                      ? "--:--"
-                      : formatClock(clockProjection.gameTimeMs)}
-                  </p>
-                  <p className="mt-1 text-xs text-slate-300">
-                    {clockProjection?.running ? "Play" : "Paused"} · Controller projection
-                  </p>
-                  <p className="mt-2 text-xs text-slate-300" data-clock-freshness="true">
-                    {clockProjection === null
-                      ? "Unavailable · manual timing required"
-                      : `${clockProjection.synchronization} · last synchronization: ${formatSynchronizationTime(clockProjection.lastSynchronizedAtMs)}`}
-                  </p>
-                </div>
-                <Button
-                  aria-label={clockRunning ? "Pause game clock" : "Start game clock"}
-                  aria-pressed={clockRunning}
-                  onClick={toggleClock}
-                  disabled={busy}
-                >
-                  {clockRunning ? "Pause clock" : "Start clock"}
-                </Button>
-              </div>
-              {clockProjection === null ? null : (
-                <div className="space-y-1 rounded-lg border border-amber-500/50 bg-amber-50 p-3 text-sm text-amber-950">
-                  <p data-clock-cue="flag-runner">
-                    {clockProjection.cues.flagRunnerEntry === "pending"
-                      ? "Flag-runner entry pending at 19:00"
-                      : clockProjection.cues.flagRunnerEntry === "due"
-                        ? "FLAG-RUNNER ENTRY NOW"
-                        : "Flag-runner entry complete"}
-                  </p>
-                  <p data-clock-cue="seeker-warning">
-                    {clockProjection.cues.seekerWarning === "pending"
-                      ? "Seeker warning pending"
-                      : clockProjection.cues.seekerWarning === "due"
-                        ? "SEEKER WARNING: release countdown active"
-                        : "Seeker warning complete"}
-                  </p>
-                  <p data-clock-cue="seeker-countdown">
-                    {clockProjection.cues.seekerCountdownMs === null
-                      ? "Seeker countdown: complete"
-                      : `SEEKER COUNTDOWN: ${formatClock(clockProjection.cues.seekerCountdownMs)}`}
-                  </p>
-                  <p data-clock-cue="seeker-release">
-                    {clockProjection.cues.seekerRelease === "released"
-                      ? "SEEKER RELEASED at 20:00"
-                      : "Seeker release pending at 20:00"}
-                  </p>
-                </div>
-              )}
-              {displayedHeat === undefined ? null : (
-                <div className="space-y-3 rounded-lg border border-orange-500/50 bg-orange-50 p-3 text-sm text-orange-950">
-                  <div className="flex flex-wrap items-center justify-between gap-2">
-                    <div>
-                      <p className="font-medium">Heat Stoppage Controller workflow</p>
-                      <p>
-                        Mode: {displayedHeat.mode ?? "disabled"} · status: {displayedHeat.status}
-                      </p>
-                    </div>
-                    <div className="flex gap-2">
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        onClick={() => submitHeatAction("enable")}
-                        disabled={busy || displayedHeat.mode === "enabled"}
-                      >
-                        Enable mode
-                      </Button>
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        onClick={() => submitHeatAction("disable")}
-                        disabled={busy || displayedHeat.mode !== "enabled"}
-                      >
-                        Disable mode
-                      </Button>
-                    </div>
-                  </div>
-                  <p>
-                    {displayedHeat.pendingTrigger === null ||
-                    displayedHeat.pendingTrigger === undefined
-                      ? "No Heat Stoppage cue is pending."
-                      : `Pending cue at ${formatClock(displayedHeat.pendingTrigger.gameTimeMs)} · the Game Clock remains running until a Controller decision.`}
-                  </p>
-                  {displayedHeat.status === "started" || displayedHeat.status === "extended" ? (
-                    <div className="rounded border bg-white/70 p-2">
-                      <p>
-                        Timer: {formatClock(displayedHeat.actualDurationMs ?? 0)} elapsed · nominal{" "}
-                        {formatClock(displayedHeat.nominalDurationMs ?? 0)} · allowed{" "}
-                        {formatClock(
-                          displayedHeat.allowedDurationMs ?? displayedHeat.nominalDurationMs ?? 0,
-                        )}
-                      </p>
-                      <p className="text-xs">
-                        Start game time: {formatClock(displayedHeat.startedAtGameTimeMs ?? 0)}
-                      </p>
-                    </div>
-                  ) : null}
-                  {displayedHeat.status === "ended" && displayedHeat.completedAtAllowed === true ? (
-                    <div className="rounded border bg-white/70 p-2">
-                      <p>
-                        Heat Stoppage complete at the allowed duration; the Game Clock remains
-                        stopped.
-                      </p>
-                      <Button size="sm" onClick={() => submitHeatAction("end")} disabled={busy}>
-                        Acknowledge completion
-                      </Button>
-                    </div>
-                  ) : null}
-                  <label className="flex items-center gap-2">
-                    <input
-                      type="checkbox"
-                      checked={heatOverrideConfirmed}
-                      onChange={(event) => setHeatOverrideConfirmed(event.target.checked)}
-                    />
-                    Head Referee Official Override confirmed
-                  </label>
-                  {displayedHeat.pendingTriggerId === null ? null : (
-                    <div className="flex flex-wrap gap-2">
-                      {(
-                        [
-                          ["end-of-drive", "End of drive"],
-                          ["dead-volleyball", "Dead volleyball"],
-                          ["other-stoppage", "Other stoppage"],
-                          ["skip-required", "Required skip"],
-                          ["start", "Start Heat Stoppage"],
-                        ] as const
-                      ).map(([action, label]) => (
-                        <Button
-                          key={action}
-                          size="sm"
-                          variant="outline"
-                          onClick={() => submitHeatAction(action)}
-                          disabled={busy}
-                        >
-                          {label}
-                        </Button>
-                      ))}
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        onClick={() => submitHeatAction("skip")}
-                        disabled={busy || !heatOverrideConfirmed}
-                      >
-                        Skip (Official Override)
-                      </Button>
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        onClick={() => submitHeatAction("suppress")}
-                        disabled={busy || !heatOverrideConfirmed}
-                      >
-                        Suppress cue (override)
-                      </Button>
-                    </div>
-                  )}
-                  {displayedHeat.status === "started" || displayedHeat.status === "extended" ? (
-                    <div className="flex flex-wrap gap-2">
-                      <Button size="sm" onClick={() => submitHeatAction("end")} disabled={busy}>
-                        End Heat Stoppage
-                      </Button>
-                      {displayedHeat.permittedExtensionTriggerId ===
-                      displayedHeat.activeTriggerId ? (
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          onClick={() => submitHeatAction("extend-permitted")}
-                          disabled={busy}
-                        >
-                          Permitted extension
-                        </Button>
-                      ) : null}
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        onClick={() => submitHeatAction("extend")}
-                        disabled={busy || !heatOverrideConfirmed}
-                      >
-                        Extend (override)
-                      </Button>
-                    </div>
+                  {projectionStatus === "unavailable" ? (
+                    <p className="mt-1 text-muted-foreground">
+                      Projection temporarily unavailable.
+                    </p>
                   ) : null}
                 </div>
-              )}
-              {projection === null ? null : (
-                <div className="flex flex-wrap items-center gap-2 rounded-lg border p-3">
+                <div className="flex shrink-0 flex-wrap gap-2">
                   <Button
                     variant="outline"
-                    aria-label="Flip Event Game physical ends"
-                    onClick={flipPitchOrientation}
+                    aria-label="Refresh Event Game assignment"
+                    onClick={() => void refreshController()}
                     disabled={busy}
                   >
-                    Flip physical ends
+                    Refresh assignment
                   </Button>
-                  <span className="text-sm text-muted-foreground">
-                    Game Side{" "}
-                    {projection.presentation?.pitchOrientation === "side-b-left"
-                      ? "side-b"
-                      : "side-a"}{" "}
-                    left
-                  </span>
-                  {Object.keys(projection.scoreByGameSide).map((gameSideId) => (
-                    <label key={gameSideId} className="flex items-center gap-2 text-sm">
-                      <input
-                        type="color"
-                        aria-label={`Game Side ${gameSideId} displayed team color`}
-                        value={
-                          projection.presentation?.displayedTeamColors[gameSideId] ?? "#00afe8"
-                        }
-                        onInput={(event) =>
-                          changeDisplayedTeamColor(
-                            gameSideId,
-                            (event.target as HTMLInputElement).value,
-                          )
-                        }
+                </div>
+                {switchTarget === null ? null : (
+                  <div className="rounded-lg border border-amber-500/50 bg-amber-50 p-3 text-sm">
+                    <p className="font-medium">Pitch Slot assignment changed.</p>
+                    <p className="mt-1">
+                      Switch to {switchTarget}, or stay on {eventGameId}.
+                    </p>
+                    <div className="mt-3 flex flex-wrap gap-2">
+                      <Button
+                        ref={switchTriggerRef}
+                        aria-label={`Switch to Event Game ${switchTarget}`}
+                        onClick={() => void switchEntry.begin()}
+                        disabled={busy || switchEntry.busy}
+                      >
+                        Switch Event Game
+                      </Button>
+                      <Button
+                        variant="outline"
+                        aria-label={`Stay on Event Game ${eventGameId}`}
+                        onClick={stayOnCurrentAssignment}
                         disabled={busy}
-                        className="h-11 w-11 cursor-pointer rounded border border-slate-300 bg-white p-1"
-                      />
-                      {gameSideId}
-                    </label>
-                  ))}
-                </div>
-              )}
-              {projection?.teamAssignmentCorrections?.map((correction) =>
-                acknowledgedTeamCorrections[correction.gameSideId] ===
-                correction.operationId ? null : (
-                  <div
-                    key={correction.operationId}
-                    className="flex items-center justify-between gap-3 rounded border border-amber-300 bg-amber-50 p-2 text-sm"
-                  >
-                    <span>
-                      Game Side {correction.gameSideId} now uses {correction.eventTeamName} (Event
-                      Team {correction.eventTeamId}). Acknowledge the corrected identity before
-                      recording another team action.
-                    </span>
-                    <Button
-                      variant="outline"
-                      onClick={() => acknowledgeTeamAssignment(correction)}
-                      disabled={busy}
-                    >
-                      Acknowledge identity
-                    </Button>
-                  </div>
-                ),
-              )}
-              <div className="flex flex-wrap gap-2">
-                {[-60_000, -10_000, 10_000, 60_000].map((adjustmentMs) => (
-                  <Button
-                    key={adjustmentMs}
-                    variant="outline"
-                    aria-label={`Adjust game clock by ${adjustmentMs < 0 ? "minus" : "plus"} ${Math.abs(adjustmentMs) / 1000} seconds`}
-                    onClick={() => adjustClock(adjustmentMs)}
-                    disabled={busy}
-                  >
-                    {adjustmentMs < 0 ? "−" : "+"}
-                    {Math.abs(adjustmentMs) / 1000}s
-                  </Button>
-                ))}
-                <div className="flex w-full flex-wrap items-end gap-2 rounded border p-2 text-left">
-                  <div className="min-w-48 flex-1 space-y-1">
-                    <Label htmlFor="clock-correction">Set game clock (milliseconds)</Label>
-                    <Input
-                      id="clock-correction"
-                      inputMode="numeric"
-                      value={clockCorrectionInput}
-                      onChange={(event) => setClockCorrectionInput(event.target.value)}
-                      placeholder="0–7200000"
-                      disabled={busy}
-                    />
-                  </div>
-                  <Button
-                    variant="outline"
-                    aria-label="Correct Event Game clock"
-                    data-clock-correction="true"
-                    onClick={correctClock}
-                    disabled={busy}
-                  >
-                    Correct clock
-                  </Button>
-                </div>
-                <div className="flex w-full flex-wrap items-end gap-2 rounded border border-amber-500/50 p-2 text-left">
-                  <div className="min-w-48 flex-1 space-y-1">
-                    <Label htmlFor="clock-takeover-adjustment">
-                      Emergency takeover adjustment (ms)
-                    </Label>
-                    <Input
-                      id="clock-takeover-adjustment"
-                      inputMode="numeric"
-                      value={takeoverAdjustmentInput}
-                      onChange={(event) => setTakeoverAdjustmentInput(event.target.value)}
-                      placeholder="optional, e.g. -1000"
-                      disabled={busy}
-                    />
-                  </div>
-                  <Button
-                    variant="outline"
-                    aria-label="Apply emergency Event Game clock takeover"
-                    data-clock-takeover="true"
-                    onClick={emergencyClockTakeover}
-                    disabled={busy}
-                  >
-                    Emergency clock takeover
-                  </Button>
-                </div>
-                <div className="flex w-full flex-wrap items-end gap-2 rounded border p-2 text-left">
-                  <div className="min-w-32 flex-1 space-y-1">
-                    <Label htmlFor="penalty-game-side">Penalized Game Side</Label>
-                    <select
-                      id="penalty-game-side"
-                      className="h-10 w-full rounded-md border bg-background px-3 text-sm"
-                      value={cardGameSideId}
-                      onChange={(event) => setCardGameSideId(event.target.value)}
-                      disabled={busy}
-                    >
-                      <option value="">Choose side</option>
-                      {Object.keys(projection?.scoreByGameSide ?? {}).map((sideId) => (
-                        <option key={sideId} value={sideId}>
-                          {sideId}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-                  <div className="w-24 space-y-1">
-                    <Label htmlFor="penalty-player-number">Player #</Label>
-                    <Input
-                      id="penalty-player-number"
-                      inputMode="numeric"
-                      value={cardPlayerNumber}
-                      onChange={(event) => setCardPlayerNumber(event.target.value)}
-                      placeholder="optional"
-                      disabled={busy}
-                    />
-                  </div>
-                  <div className="min-w-24 space-y-1">
-                    <Label htmlFor="penalty-card-type">Card</Label>
-                    <select
-                      id="penalty-card-type"
-                      className="h-10 w-full rounded-md border bg-background px-3 text-sm"
-                      value={cardType}
-                      onChange={(event) => {
-                        const nextCardType = event.target.value as LiveCardType;
-                        setCardType(nextCardType);
-                        if (nextCardType === "red" || nextCardType === "ejection") {
-                          setCardFoulBeforeScore(false);
-                        }
-                      }}
-                      disabled={busy}
-                    >
-                      <option value="blue">Blue</option>
-                      <option value="yellow">Yellow</option>
-                      <option value="red">Red</option>
-                      <option value="ejection">Ejection</option>
-                    </select>
-                  </div>
-                  <p className="max-w-52 self-center text-xs text-muted-foreground">
-                    Timing follows the live Game Clock: pregame cards begin at sticks up and
-                    confirmed seeker penalties during the seeker floor begin at 20:00.
-                  </p>
-                  <Button
-                    variant="outline"
-                    aria-label="Accept penalty card for the selected Game Side"
-                    onClick={recordCard}
-                    disabled={busy || cardGameSideId === ""}
-                  >
-                    Accept card
-                  </Button>
-                  <label className="flex items-center gap-2 text-xs">
-                    <input
-                      type="checkbox"
-                      checked={cardFoulBeforeScore}
-                      onChange={(event) => setCardFoulBeforeScore(event.target.checked)}
-                      disabled={busy || cardType === "red" || cardType === "ejection"}
-                    />
-                    Foul before score
-                  </label>
-                  <label className="flex items-center gap-2 text-xs">
-                    <input
-                      type="checkbox"
-                      checked={cardSeekerPenaltyConfirmed}
-                      onChange={(event) => setCardSeekerPenaltyConfirmed(event.target.checked)}
-                      disabled={busy}
-                    />
-                    Penalized player is the seeker (Head Referee confirmed)
-                  </label>
-                </div>
-                {projection === null
-                  ? null
-                  : Object.keys(projection.scoreByGameSide).map((gameSideId) => {
-                      const timeout = projection.timeout;
-                      const isStoppageForSide =
-                        timeout?.status === "stoppage" && timeout.gameSideId === gameSideId;
-                      const used = timeout?.usedGameSideIds?.includes(gameSideId) === true;
-                      const anotherSideActive =
-                        (timeout?.status === "stoppage" || timeout?.status === "started") &&
-                        timeout.gameSideId !== gameSideId;
-                      return (
-                        <Button
-                          key={gameSideId}
-                          variant="outline"
-                          onClick={() =>
-                            trigger("timeout", {
-                              timeoutAction: isStoppageForSide ? "start" : "stoppage",
-                              timeoutGameSideId: gameSideId,
-                            })
-                          }
-                          disabled={busy || anotherSideActive || (used && !isStoppageForSide)}
-                        >
-                          {isStoppageForSide
-                            ? `Start timeout minute: ${gameSideId}`
-                            : used
-                              ? `Timeout used: ${gameSideId}`
-                              : `Timeout stoppage: ${gameSideId}`}
-                        </Button>
-                      );
-                    })}
-                <Button
-                  variant="outline"
-                  onClick={() => setShowSuspensionRecovery(true)}
-                  disabled={busy}
-                >
-                  Review suspension recovery
-                </Button>
-                {showSuspensionRecovery || projection?.suspension?.status === "suspended" ? (
-                  <div className="w-full space-y-2 rounded-lg border p-3 text-left">
-                    <p className="text-sm font-medium">Suspension recovery review</p>
-                    <p className="text-xs text-muted-foreground">
-                      Verify the effective snapshot with another Controller before resuming.
-                    </p>
-                    {projection?.suspension?.snapshot === null ||
-                    projection?.suspension?.snapshot === undefined ? (
-                      <div className="grid gap-2 sm:grid-cols-2">
-                        <div className="space-y-1">
-                          <Label htmlFor="volleyball-possession">Volleyball possession</Label>
-                          <select
-                            id="volleyball-possession"
-                            className="h-9 w-full rounded-md border bg-background px-3 text-sm"
-                            value={volleyballPossession}
-                            onChange={(event) => setVolleyballPossession(event.target.value)}
-                            disabled={busy}
-                          >
-                            <option value="">Select Game Side</option>
-                            {Object.keys(projection?.scoreByGameSide ?? {}).map((sideId) => (
-                              <option key={sideId} value={sideId}>
-                                {sideId}
-                              </option>
-                            ))}
-                          </select>
-                        </div>
-                        <div className="space-y-1">
-                          <p className="text-sm font-medium">Dodgeball possession</p>
-                          {(projection?.knownDodgeballIds ?? []).map((ballId) => (
-                            <div key={ballId} className="space-y-1">
-                              <Label htmlFor={`dodgeball-possession-${ballId}`}>{ballId}</Label>
-                              <select
-                                id={`dodgeball-possession-${ballId}`}
-                                className="h-9 w-full rounded-md border bg-background px-3 text-sm"
-                                value={dodgeballPossession[ballId] ?? ""}
-                                onChange={(event) =>
-                                  setDodgeballPossession((current) => ({
-                                    ...current,
-                                    [ballId]: event.target.value || null,
-                                  }))
-                                }
-                                disabled={busy}
-                              >
-                                <option value="">No confirmed side</option>
-                                {Object.keys(projection?.scoreByGameSide ?? {}).map((sideId) => (
-                                  <option key={sideId} value={sideId}>
-                                    {sideId}
-                                  </option>
-                                ))}
-                              </select>
-                            </div>
-                          ))}
-                        </div>
-                        <Button
-                          variant="outline"
-                          onClick={() => trigger("suspension", { suspensionAction: "start" })}
-                          disabled={busy}
-                        >
-                          Suspend with verified snapshot
-                        </Button>
-                      </div>
-                    ) : (
-                      <div className="space-y-2">
-                        <div
-                          data-suspension-snapshot="effective"
-                          className="rounded-md bg-muted p-2 text-xs"
-                        >
-                          <p>Volleyball: {projection.suspension.snapshot.volleyballPossession}</p>
-                          {Object.entries(projection.suspension.snapshot.dodgeballPossession).map(
-                            ([ballId, gameSideId]) => (
-                              <p key={ballId} data-dodgeball-id={ballId}>
-                                {ballId}={gameSideId ?? "unconfirmed"}
-                              </p>
-                            ),
-                          )}
-                          <p>
-                            Penalty segments:{" "}
-                            {projection.suspension.snapshot.penalties.segments.length}
-                          </p>
-                        </div>
-                        <Button
-                          variant="outline"
-                          onClick={() =>
-                            trigger("suspension", {
-                              suspensionAction: "resume",
-                              resumesSuspensionFactId: projection.suspension?.factId ?? undefined,
-                            })
-                          }
-                          disabled={busy || projection.suspension?.factId === null}
-                        >
-                          Resume verified suspension
-                        </Button>
-                      </div>
-                    )}
-                  </div>
-                ) : null}
-                <Button
-                  variant="outline"
-                  aria-label="Record final Event Game result"
-                  onClick={() => trigger("result")}
-                  disabled={busy}
-                >
-                  Record result
-                </Button>
-              </div>
-              {projection === null ? null : (
-                <div className="space-y-3">
-                  <p className="text-sm text-muted-foreground">
-                    Phase: {projection.phase} · Goals: {projection.goalCount}
-                    {projection.overtime ? " · Overtime" : ""}
-                  </p>
-                  {projection.overtime ? (
-                    <p data-overtime-target="true" className="text-sm font-semibold">
-                      Overtime target: {projection.overtimeTarget ?? projection.targetScore ?? "—"}
-                    </p>
-                  ) : null}
-                  {pendingClosePlayAdjudication === null ? null : (
-                    <div
-                      data-close-play-adjudication="true"
-                      className="space-y-2 rounded-lg border border-amber-500/60 bg-amber-50 p-3 text-sm text-amber-950"
-                    >
-                      <p className="font-medium">Head Referee close goal/catch ordering</p>
-                      <p>
-                        The{" "}
-                        {pendingClosePlayAdjudication.intentType === "record-goal"
-                          ? "goal"
-                          : "flag catch"}{" "}
-                        has {pendingClosePlayAdjudication.relatedFacts.length} opposing close-play
-                        candidate
-                        {pendingClosePlayAdjudication.relatedFacts.length === 1 ? "" : "s"}. Choose
-                        the exact paired fact and adjudicated sporting order without changing either
-                        Game Clock time.
-                      </p>
-                      {pendingClosePlayAdjudication.relatedFacts.map((relatedFact) => (
-                        <div
-                          key={relatedFact.factId}
-                          data-close-play-related-fact-id={relatedFact.factId}
-                          className="space-y-1"
-                        >
-                          <p>
-                            Existing {relatedFact.factType} at {relatedFact.gameTimeMs}
-                          </p>
-                          <div className="flex flex-wrap gap-2">
-                            <Button
-                              variant="outline"
-                              onClick={() =>
-                                submitClosePlayAdjudication("before", relatedFact.factId)
-                              }
-                              disabled={busy}
-                            >
-                              {pendingClosePlayAdjudication.intentType === "record-goal"
-                                ? "Goal before catch"
-                                : "Catch before goal"}
-                            </Button>
-                            <Button
-                              variant="outline"
-                              onClick={() =>
-                                submitClosePlayAdjudication("after", relatedFact.factId)
-                              }
-                              disabled={busy}
-                            >
-                              {pendingClosePlayAdjudication.intentType === "record-goal"
-                                ? "Goal after catch"
-                                : "Catch after goal"}
-                            </Button>
-                          </div>
-                        </div>
-                      ))}
-                      <div>
-                        <Button
-                          variant="ghost"
-                          aria-label="Cancel close-play adjudication"
-                          onClick={() => setPendingClosePlayAdjudication(null)}
-                          disabled={busy}
-                        >
-                          Cancel
-                        </Button>
-                      </div>
+                      >
+                        Stay here
+                      </Button>
                     </div>
-                  )}
-                  {pendingFlagCatchBoundaryOverride === null ? null : (
-                    <div
-                      data-flag-catch-boundary-override="true"
-                      className="space-y-2 rounded-lg border border-amber-500/60 bg-amber-50 p-3 text-sm text-amber-950"
-                    >
-                      <p className="font-medium">Head Referee flag-catch boundary override</p>
-                      <p>
-                        Confirm the catch despite unreleased seekers or running play. This records
-                        the affected guardrail separately from any Sporting Order decision.
-                      </p>
-                      <div className="flex flex-wrap gap-2">
-                        <Button onClick={submitFlagCatchBoundaryOverride} disabled={busy}>
-                          Confirm boundary override
-                        </Button>
-                        <Button
-                          variant="ghost"
-                          aria-label="Cancel flag-catch boundary override"
-                          onClick={() => setPendingFlagCatchBoundaryOverride(null)}
-                          disabled={busy}
-                        >
-                          Cancel
-                        </Button>
-                      </div>
-                    </div>
-                  )}
-                  <p className="text-xs text-muted-foreground">
-                    Timeout: {projection.timeout?.status ?? "inactive"} · Stoppage:{" "}
-                    {projection.stoppage?.status ?? "none"} · Heat:{" "}
-                    {projection.heat?.status ?? "inactive"}
-                    {projection.result === null || projection.result === undefined
-                      ? ""
-                      : projection.winnerGameSideId !== null &&
-                          projection.winnerGameSideId !== undefined
-                        ? ` · Winner: Game Side ${projection.winnerGameSideId}`
-                        : isDoubleForfeitResult(projection.result)
-                          ? " · Double-forfeit: no winner"
-                          : " · Result recorded"}
-                  </p>
-                  {Object.entries(projection.scoreByGameSide).map(([gameSideId, score]) => (
-                    <div key={gameSideId} className="flex items-center justify-between gap-3">
-                      <span className="font-medium">Game Side {gameSideId}</span>
-                      <div className="flex items-center gap-3">
+                  </div>
+                )}
+                <div
+                  className="sticky top-0 z-10 flex shrink-0 items-center justify-between gap-2 rounded-lg border bg-slate-950 p-3 text-white"
+                  role="region"
+                  aria-label="Event Game Clock"
+                  aria-live="polite"
+                >
+                  <div className="min-w-0 text-center">
+                    <p className="text-xs uppercase tracking-[0.2em] text-slate-300">Game Clock</p>
+                    <p className="mt-1 text-4xl font-semibold tabular-nums">
+                      {clockProjection === null || clockProjection.synchronization === "unavailable"
+                        ? "--:--"
+                        : formatClock(clockProjection.gameTimeMs)}
+                    </p>
+                    <p className="mt-1 text-xs text-slate-300">
+                      {clockProjection?.running ? "Play" : "Paused"} · Controller projection
+                    </p>
+                    <p className="mt-2 text-xs text-slate-300" data-clock-freshness="true">
+                      {clockProjection === null
+                        ? "Unavailable · manual timing required"
+                        : `${clockProjection.synchronization} · last synchronization: ${formatSynchronizationTime(clockProjection.lastSynchronizedAtMs)}`}
+                    </p>
+                  </div>
+                  <Button
+                    aria-label={clockRunning ? "Pause game clock" : "Start game clock"}
+                    aria-pressed={clockRunning}
+                    onClick={toggleClock}
+                    disabled={busy}
+                  >
+                    {clockRunning ? "Pause clock" : "Start clock"}
+                  </Button>
+                </div>
+                {projection === null ? null : (
+                  <section
+                    aria-label="Event Game Score"
+                    className="mt-2 grid grid-cols-2 gap-2 rounded-lg border bg-white p-2"
+                  >
+                    {Object.entries(projection.scoreByGameSide).map(([gameSideId, score]) => (
+                      <div
+                        key={gameSideId}
+                        className="grid gap-1 rounded-lg border p-2 text-center"
+                      >
+                        <span className="text-xs font-medium">Game Side {gameSideId}</span>
                         <span className="text-2xl font-semibold tabular-nums">{score}</span>
                         <Button
+                          data-primary-score="up"
                           aria-label={`Record 10-point goal for Game Side ${gameSideId}`}
                           onClick={() => recordGoal(gameSideId)}
                           disabled={busy}
                         >
-                          Record 10-point goal
+                          +10 goal
+                        </Button>
+                      </div>
+                    ))}
+                  </section>
+                )}
+                {clockProjection === null ? null : (
+                  <div className="space-y-1 rounded-lg border border-amber-500/50 bg-amber-50 p-3 text-sm text-amber-950">
+                    <p data-clock-cue="flag-runner">
+                      {clockProjection.cues.flagRunnerEntry === "pending"
+                        ? "Flag-runner entry pending at 19:00"
+                        : clockProjection.cues.flagRunnerEntry === "due"
+                          ? "FLAG-RUNNER ENTRY NOW"
+                          : "Flag-runner entry complete"}
+                    </p>
+                    <p data-clock-cue="seeker-warning">
+                      {clockProjection.cues.seekerWarning === "pending"
+                        ? "Seeker warning pending"
+                        : clockProjection.cues.seekerWarning === "due"
+                          ? "SEEKER WARNING: release countdown active"
+                          : "Seeker warning complete"}
+                    </p>
+                    <p data-clock-cue="seeker-countdown">
+                      {clockProjection.cues.seekerCountdownMs === null
+                        ? "Seeker countdown: complete"
+                        : `SEEKER COUNTDOWN: ${formatClock(clockProjection.cues.seekerCountdownMs)}`}
+                    </p>
+                    <p data-clock-cue="seeker-release">
+                      {clockProjection.cues.seekerRelease === "released"
+                        ? "SEEKER RELEASED at 20:00"
+                        : "Seeker release pending at 20:00"}
+                    </p>
+                  </div>
+                )}
+                {displayedHeat === undefined ? null : (
+                  <div className="space-y-3 rounded-lg border border-orange-500/50 bg-orange-50 p-3 text-sm text-orange-950">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div>
+                        <p className="font-medium">Heat Stoppage Controller workflow</p>
+                        <p>
+                          Mode: {displayedHeat.mode ?? "disabled"} · status: {displayedHeat.status}
+                        </p>
+                      </div>
+                      <div className="flex gap-2">
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          onClick={() => submitHeatAction("enable")}
+                          disabled={busy || displayedHeat.mode === "enabled"}
+                        >
+                          Enable mode
                         </Button>
                         <Button
+                          size="sm"
                           variant="outline"
-                          aria-label={`Record flag catch for Game Side ${gameSideId}`}
-                          onClick={() => recordFlagCatch(gameSideId)}
-                          disabled={busy}
+                          onClick={() => submitHeatAction("disable")}
+                          disabled={busy || displayedHeat.mode !== "enabled"}
                         >
-                          Record flag catch
-                        </Button>
-                        {projection.overtime &&
-                        projection.phase !== "finished" &&
-                        projection.winnerGameSideId === null ? (
-                          <Button
-                            variant="outline"
-                            aria-label={`Concede Event Game for Game Side ${gameSideId}`}
-                            onClick={() => recordConcession(gameSideId)}
-                            disabled={busy}
-                          >
-                            Concede
-                          </Button>
-                        ) : null}
-                        <Button
-                          variant="outline"
-                          aria-label={`Record directed forfeit for Game Side ${gameSideId}`}
-                          onClick={() => recordForfeit(gameSideId)}
-                          disabled={busy}
-                        >
-                          Directed forfeit
+                          Disable mode
                         </Button>
                       </div>
                     </div>
-                  ))}
-                  <Button
-                    variant="outline"
-                    aria-label="Record directed double-forfeit"
-                    onClick={recordDoubleForfeit}
-                    disabled={busy}
-                  >
-                    Record double-forfeit
-                  </Button>
-                  <div className="space-y-3 rounded-lg border p-3">
-                    <p className="text-sm font-medium">Penalties</p>
-                    {(livePenalties?.players ?? []).length === 0 ? (
-                      <p className="text-sm text-muted-foreground">No active penalties.</p>
-                    ) : (
-                      (livePenalties?.players ?? []).map((player) => (
-                        <div
-                          key={player.playerKey}
-                          className="flex items-center justify-between gap-3 text-sm"
-                        >
-                          <span>{formatPenaltyPlayerLabel(player.playerKey, livePenalties)}</span>
-                          <span className="tabular-nums">
-                            {formatClock(
-                              player.segments.reduce(
-                                (sum, segment) => sum + segment.remainingMs,
-                                0,
-                              ),
-                            )}
-                          </span>
-                        </div>
-                      ))
-                    )}
-                    {(livePenalties?.pendingExpirations ?? []).map((pending) => (
-                      <div
-                        key={pending.id}
-                        className="space-y-2 rounded border border-amber-500/50 bg-amber-50 p-2 text-sm"
-                      >
+                    <p>
+                      {displayedHeat.pendingTrigger === null ||
+                      displayedHeat.pendingTrigger === undefined
+                        ? "No Heat Stoppage cue is pending."
+                        : `Pending cue at ${formatClock(displayedHeat.pendingTrigger.gameTimeMs)} · the Game Clock remains running until a Controller decision.`}
+                    </p>
+                    {displayedHeat.status === "started" || displayedHeat.status === "extended" ? (
+                      <div className="rounded border bg-white/70 p-2">
                         <p>
-                          Goal release: choose a penalty ({formatClock(pending.serviceDurationMs)}).
-                          {pending.requiresOfficialChoice
-                            ? " Complete tie requires official choice."
-                            : ""}
+                          Timer: {formatClock(displayedHeat.actualDurationMs ?? 0)} elapsed ·
+                          nominal {formatClock(displayedHeat.nominalDurationMs ?? 0)} · allowed{" "}
+                          {formatClock(
+                            displayedHeat.allowedDurationMs ?? displayedHeat.nominalDurationMs ?? 0,
+                          )}
                         </p>
-                        <div className="flex flex-wrap gap-2">
-                          {pending.candidatePlayerKeys.map((playerKey) => (
-                            <Button
-                              key={playerKey}
-                              size="sm"
-                              variant="outline"
-                              onClick={() =>
-                                resolvePenaltyExpiration(pending.id, pending.scoreFactId, playerKey)
-                              }
-                              disabled={busy}
-                            >
-                              Release {formatPenaltyPlayerLabel(playerKey, livePenalties)}
-                            </Button>
-                          ))}
-                        </div>
+                        <p className="text-xs">
+                          Start game time: {formatClock(displayedHeat.startedAtGameTimeMs ?? 0)}
+                        </p>
                       </div>
-                    ))}
-                    {(livePenalties?.releases ?? []).map((release) => (
-                      <p key={release.id} className="text-xs text-emerald-700">
-                        Released {formatPenaltyPlayerLabel(release.playerKey, livePenalties)} after
-                        {release.releaseCause === "foul-before-score"
-                          ? " foul-before-score"
-                          : " opposing score"}{" "}
-                        at {formatClock(release.releasedMs)}.
-                      </p>
-                    ))}
-                    {(livePenalties?.cards ?? []).map((card) => (
-                      <div key={card.factId} className="flex flex-wrap items-center gap-2 text-xs">
-                        <span>
-                          {card.cardType} ·{" "}
-                          {formatPenaltyPlayerLabel(card.playerKey, livePenalties, {
-                            gameSideId: card.gameSideId,
-                            playerNumber: card.playerNumber,
-                          })}
-                        </span>
-                        <span>
-                          {card.reason === null
-                            ? skippedPenaltyReasonCardIds.has(card.factId)
-                              ? "reason skipped; add later"
-                              : "reason later/skipped"
-                            : `reason: ${card.reason}`}
-                        </span>
-                        {card.reason === null ? (
-                          <>
-                            {(
-                              [
-                                ["contact-safety", "Contact/Safety"],
-                                ["ball-interaction", "Ball Interaction"],
-                                ["position-boundary", "Position/Boundary"],
-                                ["procedure-substitution", "Procedure/Substitution"],
-                                ["conduct", "Conduct"],
-                                ["skip", "Skip"],
-                              ] as const
-                            ).map(([reason, label]) => (
-                              <Button
-                                key={reason}
-                                size="sm"
-                                variant="ghost"
-                                onClick={() =>
-                                  reason === "skip"
-                                    ? skipPenaltyReason(card.factId)
-                                    : recordPenaltyReason(card.factId, reason as LivePenaltyReason)
-                                }
-                                disabled={busy}
-                              >
-                                {label}
-                              </Button>
-                            ))}
-                          </>
-                        ) : null}
+                    ) : null}
+                    {displayedHeat.status === "ended" &&
+                    displayedHeat.completedAtAllowed === true ? (
+                      <div className="rounded border bg-white/70 p-2">
+                        <p>
+                          Heat Stoppage complete at the allowed duration; the Game Clock remains
+                          stopped.
+                        </p>
+                        <Button size="sm" onClick={() => submitHeatAction("end")} disabled={busy}>
+                          Acknowledge completion
+                        </Button>
                       </div>
-                    ))}
-                  </div>
-                  <div className="space-y-2 rounded-lg border p-3">
-                    <p className="text-sm font-medium">Game Facts</p>
-                    {(projection.gameFacts ?? []).length === 0 ? (
-                      <p className="text-sm text-muted-foreground">No Game Facts recorded.</p>
-                    ) : (
-                      (projection.gameFacts ?? []).map((fact) => (
-                        <div
-                          key={fact.factId}
-                          data-game-fact-id={fact.factId}
-                          className="flex items-center justify-between gap-3 text-sm"
+                    ) : null}
+                    <label className="flex items-center gap-2">
+                      <input
+                        type="checkbox"
+                        checked={heatOverrideConfirmed}
+                        onChange={(event) => setHeatOverrideConfirmed(event.target.checked)}
+                      />
+                      Head Referee Official Override confirmed
+                    </label>
+                    {displayedHeat.pendingTriggerId === null ? null : (
+                      <div className="flex flex-wrap gap-2">
+                        {(
+                          [
+                            ["end-of-drive", "End of drive"],
+                            ["dead-volleyball", "Dead volleyball"],
+                            ["other-stoppage", "Other stoppage"],
+                            ["skip-required", "Required skip"],
+                            ["start", "Start Heat Stoppage"],
+                          ] as const
+                        ).map(([action, label]) => (
+                          <Button
+                            key={action}
+                            size="sm"
+                            variant="outline"
+                            onClick={() => submitHeatAction(action)}
+                            disabled={busy}
+                          >
+                            {label}
+                          </Button>
+                        ))}
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          onClick={() => submitHeatAction("skip")}
+                          disabled={busy || !heatOverrideConfirmed}
                         >
-                          <span className="min-w-0">
-                            <span className="font-medium">{fact.factType}</span>
-                            <code className="ml-2 text-xs text-muted-foreground">
-                              {fact.factId}
-                            </code>
-                            <span className="ml-2 text-xs text-muted-foreground">
-                              sporting {fact.sportingOrder} · sync {fact.synchronizationOrder}
-                            </span>
-                          </span>
+                          Skip (Official Override)
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          onClick={() => submitHeatAction("suppress")}
+                          disabled={busy || !heatOverrideConfirmed}
+                        >
+                          Suppress cue (override)
+                        </Button>
+                      </div>
+                    )}
+                    {displayedHeat.status === "started" || displayedHeat.status === "extended" ? (
+                      <div className="flex flex-wrap gap-2">
+                        <Button size="sm" onClick={() => submitHeatAction("end")} disabled={busy}>
+                          End Heat Stoppage
+                        </Button>
+                        {displayedHeat.permittedExtensionTriggerId ===
+                        displayedHeat.activeTriggerId ? (
                           <Button
                             size="sm"
                             variant="outline"
-                            aria-label={`${fact.effective ? "Correct" : "Reinstate"} Game Fact ${fact.factId}`}
-                            onClick={() => correctFact(fact.factId, !fact.effective)}
+                            onClick={() => submitHeatAction("extend-permitted")}
                             disabled={busy}
                           >
-                            {fact.effective ? "Correct" : "Reinstate"}
+                            Permitted extension
+                          </Button>
+                        ) : null}
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          onClick={() => submitHeatAction("extend")}
+                          disabled={busy || !heatOverrideConfirmed}
+                        >
+                          Extend (override)
+                        </Button>
+                      </div>
+                    ) : null}
+                  </div>
+                )}
+                {projection === null ? null : (
+                  <div className="flex flex-wrap items-center gap-2 rounded-lg border p-3">
+                    <Button
+                      variant="outline"
+                      aria-label="Flip Event Game physical ends"
+                      onClick={flipPitchOrientation}
+                      disabled={busy}
+                    >
+                      Flip physical ends
+                    </Button>
+                    <span className="text-sm text-muted-foreground">
+                      Game Side{" "}
+                      {projection.presentation?.pitchOrientation === "side-b-left"
+                        ? "side-b"
+                        : "side-a"}{" "}
+                      left
+                    </span>
+                    {Object.keys(projection.scoreByGameSide).map((gameSideId) => (
+                      <label key={gameSideId} className="flex items-center gap-2 text-sm">
+                        <input
+                          type="color"
+                          aria-label={`Game Side ${gameSideId} displayed team color`}
+                          value={
+                            projection.presentation?.displayedTeamColors[gameSideId] ?? "#00afe8"
+                          }
+                          onInput={(event) =>
+                            changeDisplayedTeamColor(
+                              gameSideId,
+                              (event.target as HTMLInputElement).value,
+                            )
+                          }
+                          disabled={busy}
+                          className="h-11 w-11 cursor-pointer rounded border border-slate-300 bg-white p-1"
+                        />
+                        {gameSideId}
+                      </label>
+                    ))}
+                  </div>
+                )}
+                {projection?.teamAssignmentCorrections?.map((correction) =>
+                  acknowledgedTeamCorrections[correction.gameSideId] ===
+                  correction.operationId ? null : (
+                    <div
+                      key={correction.operationId}
+                      className="flex items-center justify-between gap-3 rounded border border-amber-300 bg-amber-50 p-2 text-sm"
+                    >
+                      <span>
+                        Game Side {correction.gameSideId} now uses {correction.eventTeamName} (Event
+                        Team {correction.eventTeamId}). Acknowledge the corrected identity before
+                        recording another team action.
+                      </span>
+                      <Button
+                        variant="outline"
+                        onClick={() => acknowledgeTeamAssignment(correction)}
+                        disabled={busy}
+                      >
+                        Acknowledge identity
+                      </Button>
+                    </div>
+                  ),
+                )}
+                <div className="flex flex-wrap gap-2">
+                  {[-60_000, -10_000, 10_000, 60_000].map((adjustmentMs) => (
+                    <Button
+                      key={adjustmentMs}
+                      variant="outline"
+                      aria-label={`Adjust game clock by ${adjustmentMs < 0 ? "minus" : "plus"} ${Math.abs(adjustmentMs) / 1000} seconds`}
+                      onClick={() => adjustClock(adjustmentMs)}
+                      disabled={busy}
+                    >
+                      {adjustmentMs < 0 ? "−" : "+"}
+                      {Math.abs(adjustmentMs) / 1000}s
+                    </Button>
+                  ))}
+                  <div className="flex w-full flex-wrap items-end gap-2 rounded border p-2 text-left">
+                    <div className="min-w-48 flex-1 space-y-1">
+                      <Label htmlFor="clock-correction">Set game clock (milliseconds)</Label>
+                      <Input
+                        id="clock-correction"
+                        inputMode="numeric"
+                        value={clockCorrectionInput}
+                        onChange={(event) => setClockCorrectionInput(event.target.value)}
+                        placeholder="0–7200000"
+                        disabled={busy}
+                      />
+                    </div>
+                    <Button
+                      variant="outline"
+                      aria-label="Correct Event Game clock"
+                      data-clock-correction="true"
+                      onClick={correctClock}
+                      disabled={busy}
+                    >
+                      Correct clock
+                    </Button>
+                  </div>
+                  <div className="flex w-full flex-wrap items-end gap-2 rounded border border-amber-500/50 p-2 text-left">
+                    <div className="min-w-48 flex-1 space-y-1">
+                      <Label htmlFor="clock-takeover-adjustment">
+                        Emergency takeover adjustment (ms)
+                      </Label>
+                      <Input
+                        id="clock-takeover-adjustment"
+                        inputMode="numeric"
+                        value={takeoverAdjustmentInput}
+                        onChange={(event) => setTakeoverAdjustmentInput(event.target.value)}
+                        placeholder="optional, e.g. -1000"
+                        disabled={busy}
+                      />
+                    </div>
+                    <Button
+                      variant="outline"
+                      aria-label="Apply emergency Event Game clock takeover"
+                      data-clock-takeover="true"
+                      onClick={emergencyClockTakeover}
+                      disabled={busy}
+                    >
+                      Emergency clock takeover
+                    </Button>
+                  </div>
+                  <Button
+                    variant="outline"
+                    onClick={() => setShowSuspensionRecovery(true)}
+                    disabled={busy}
+                  >
+                    Review suspension recovery
+                  </Button>
+                  {showSuspensionRecovery || projection?.suspension?.status === "suspended" ? (
+                    <div className="w-full space-y-2 rounded-lg border p-3 text-left">
+                      <p className="text-sm font-medium">Suspension recovery review</p>
+                      <p className="text-xs text-muted-foreground">
+                        Verify the effective snapshot with another Controller before resuming.
+                      </p>
+                      {projection?.suspension?.snapshot === null ||
+                      projection?.suspension?.snapshot === undefined ? (
+                        <div className="grid gap-2 sm:grid-cols-2">
+                          <div className="space-y-1">
+                            <Label htmlFor="volleyball-possession">Volleyball possession</Label>
+                            <select
+                              id="volleyball-possession"
+                              className="h-9 w-full rounded-md border bg-background px-3 text-sm"
+                              value={volleyballPossession}
+                              onChange={(event) => setVolleyballPossession(event.target.value)}
+                              disabled={busy}
+                            >
+                              <option value="">Select Game Side</option>
+                              {Object.keys(projection?.scoreByGameSide ?? {}).map((sideId) => (
+                                <option key={sideId} value={sideId}>
+                                  {sideId}
+                                </option>
+                              ))}
+                            </select>
+                          </div>
+                          <div className="space-y-1">
+                            <p className="text-sm font-medium">Dodgeball possession</p>
+                            {(projection?.knownDodgeballIds ?? []).map((ballId) => (
+                              <div key={ballId} className="space-y-1">
+                                <Label htmlFor={`dodgeball-possession-${ballId}`}>{ballId}</Label>
+                                <select
+                                  id={`dodgeball-possession-${ballId}`}
+                                  className="h-9 w-full rounded-md border bg-background px-3 text-sm"
+                                  value={dodgeballPossession[ballId] ?? ""}
+                                  onChange={(event) =>
+                                    setDodgeballPossession((current) => ({
+                                      ...current,
+                                      [ballId]: event.target.value || null,
+                                    }))
+                                  }
+                                  disabled={busy}
+                                >
+                                  <option value="">No confirmed side</option>
+                                  {Object.keys(projection?.scoreByGameSide ?? {}).map((sideId) => (
+                                    <option key={sideId} value={sideId}>
+                                      {sideId}
+                                    </option>
+                                  ))}
+                                </select>
+                              </div>
+                            ))}
+                          </div>
+                          <Button
+                            variant="outline"
+                            onClick={() => trigger("suspension", { suspensionAction: "start" })}
+                            disabled={busy}
+                          >
+                            Suspend with verified snapshot
                           </Button>
                         </div>
-                      ))
-                    )}
-                  </div>
+                      ) : (
+                        <div className="space-y-2">
+                          <div
+                            data-suspension-snapshot="effective"
+                            className="rounded-md bg-muted p-2 text-xs"
+                          >
+                            <p>Volleyball: {projection.suspension.snapshot.volleyballPossession}</p>
+                            {Object.entries(projection.suspension.snapshot.dodgeballPossession).map(
+                              ([ballId, gameSideId]) => (
+                                <p key={ballId} data-dodgeball-id={ballId}>
+                                  {ballId}={gameSideId ?? "unconfirmed"}
+                                </p>
+                              ),
+                            )}
+                            <p>
+                              Penalty segments:{" "}
+                              {projection.suspension.snapshot.penalties.segments.length}
+                            </p>
+                          </div>
+                          <Button
+                            variant="outline"
+                            onClick={() =>
+                              trigger("suspension", {
+                                suspensionAction: "resume",
+                                resumesSuspensionFactId: projection.suspension?.factId ?? undefined,
+                              })
+                            }
+                            disabled={busy || projection.suspension?.factId === null}
+                          >
+                            Resume verified suspension
+                          </Button>
+                        </div>
+                      )}
+                    </div>
+                  ) : null}
                 </div>
-              )}
-              {replica !== null && replica.pendingActions.length > 0 ? (
-                <p className="text-sm text-amber-700">
-                  {replica.pendingActions.length} Controller action(s) retained for reconnect
-                  replay.
-                </p>
-              ) : null}
-              {durabilityWarning === null ? null : (
-                <p role="alert" className="text-sm font-medium text-amber-700">
-                  {durabilityWarning}
-                </p>
-              )}
+                {projection === null ? null : (
+                  <div className="space-y-3">
+                    <p className="text-sm text-muted-foreground">
+                      Phase: {projection.phase} · Goals: {projection.goalCount}
+                      {projection.overtime ? " · Overtime" : ""}
+                    </p>
+                    {projection.overtime ? (
+                      <p data-overtime-target="true" className="text-sm font-semibold">
+                        Overtime target:{" "}
+                        {projection.overtimeTarget ?? projection.targetScore ?? "—"}
+                      </p>
+                    ) : null}
+                    {pendingClosePlayAdjudication === null ? null : (
+                      <div
+                        data-close-play-adjudication="true"
+                        className="space-y-2 rounded-lg border border-amber-500/60 bg-amber-50 p-3 text-sm text-amber-950"
+                      >
+                        <p className="font-medium">Head Referee close goal/catch ordering</p>
+                        <p>
+                          The{" "}
+                          {pendingClosePlayAdjudication.intentType === "record-goal"
+                            ? "goal"
+                            : "flag catch"}{" "}
+                          has {pendingClosePlayAdjudication.relatedFacts.length} opposing close-play
+                          candidate
+                          {pendingClosePlayAdjudication.relatedFacts.length === 1 ? "" : "s"}.
+                          Choose the exact paired fact and adjudicated sporting order without
+                          changing either Game Clock time.
+                        </p>
+                        {pendingClosePlayAdjudication.relatedFacts.map((relatedFact) => (
+                          <div
+                            key={relatedFact.factId}
+                            data-close-play-related-fact-id={relatedFact.factId}
+                            className="space-y-1"
+                          >
+                            <p>
+                              Existing {relatedFact.factType} at {relatedFact.gameTimeMs}
+                            </p>
+                            <div className="flex flex-wrap gap-2">
+                              <Button
+                                variant="outline"
+                                onClick={() =>
+                                  submitClosePlayAdjudication("before", relatedFact.factId)
+                                }
+                                disabled={busy}
+                              >
+                                {pendingClosePlayAdjudication.intentType === "record-goal"
+                                  ? "Goal before catch"
+                                  : "Catch before goal"}
+                              </Button>
+                              <Button
+                                variant="outline"
+                                onClick={() =>
+                                  submitClosePlayAdjudication("after", relatedFact.factId)
+                                }
+                                disabled={busy}
+                              >
+                                {pendingClosePlayAdjudication.intentType === "record-goal"
+                                  ? "Goal after catch"
+                                  : "Catch after goal"}
+                              </Button>
+                            </div>
+                          </div>
+                        ))}
+                        <div>
+                          <Button
+                            variant="ghost"
+                            aria-label="Cancel close-play adjudication"
+                            onClick={() => setPendingClosePlayAdjudication(null)}
+                            disabled={busy}
+                          >
+                            Cancel
+                          </Button>
+                        </div>
+                      </div>
+                    )}
+                    {pendingFlagCatchBoundaryOverride === null ? null : (
+                      <div
+                        data-flag-catch-boundary-override="true"
+                        className="space-y-2 rounded-lg border border-amber-500/60 bg-amber-50 p-3 text-sm text-amber-950"
+                      >
+                        <p className="font-medium">Head Referee flag-catch boundary override</p>
+                        <p>
+                          Confirm the catch despite unreleased seekers or running play. This records
+                          the affected guardrail separately from any Sporting Order decision.
+                        </p>
+                        <div className="flex flex-wrap gap-2">
+                          <Button onClick={submitFlagCatchBoundaryOverride} disabled={busy}>
+                            Confirm boundary override
+                          </Button>
+                          <Button
+                            variant="ghost"
+                            aria-label="Cancel flag-catch boundary override"
+                            onClick={() => setPendingFlagCatchBoundaryOverride(null)}
+                            disabled={busy}
+                          >
+                            Cancel
+                          </Button>
+                        </div>
+                      </div>
+                    )}
+                    <p className="text-xs text-muted-foreground">
+                      Timeout: {projection.timeout?.status ?? "inactive"} · Stoppage:{" "}
+                      {projection.stoppage?.status ?? "none"} · Heat:{" "}
+                      {projection.heat?.status ?? "inactive"}
+                      {projection.result === null || projection.result === undefined
+                        ? ""
+                        : projection.winnerGameSideId !== null &&
+                            projection.winnerGameSideId !== undefined
+                          ? ` · Winner: Game Side ${projection.winnerGameSideId}`
+                          : isDoubleForfeitResult(projection.result)
+                            ? " · Double-forfeit: no winner"
+                            : " · Result recorded"}
+                    </p>
+                    {Object.entries(projection.scoreByGameSide).map(([gameSideId, score]) => (
+                      <div key={gameSideId} className="flex items-center justify-between gap-3">
+                        <span className="font-medium">Game Side {gameSideId}</span>
+                        <span className="text-2xl font-semibold tabular-nums">{score}</span>
+                      </div>
+                    ))}
+                    <div className="space-y-3 rounded-lg border p-3">
+                      <p className="text-sm font-medium">Penalties</p>
+                      {(livePenalties?.players ?? []).length === 0 ? (
+                        <p className="text-sm text-muted-foreground">No active penalties.</p>
+                      ) : (
+                        (livePenalties?.players ?? []).map((player) => (
+                          <div
+                            key={player.playerKey}
+                            className="flex items-center justify-between gap-3 text-sm"
+                          >
+                            <span>{formatPenaltyPlayerLabel(player.playerKey, livePenalties)}</span>
+                            <span className="tabular-nums">
+                              {formatClock(
+                                player.segments.reduce(
+                                  (sum, segment) => sum + segment.remainingMs,
+                                  0,
+                                ),
+                              )}
+                            </span>
+                          </div>
+                        ))
+                      )}
+                      {(livePenalties?.pendingExpirations ?? []).map((pending) => (
+                        <div
+                          key={pending.id}
+                          className="space-y-2 rounded border border-amber-500/50 bg-amber-50 p-2 text-sm"
+                        >
+                          <p>
+                            Goal release: choose a penalty ({formatClock(pending.serviceDurationMs)}
+                            ).
+                            {pending.requiresOfficialChoice
+                              ? " Complete tie requires official choice."
+                              : ""}
+                          </p>
+                          <div className="flex flex-wrap gap-2">
+                            {pending.candidatePlayerKeys.map((playerKey) => (
+                              <Button
+                                key={playerKey}
+                                size="sm"
+                                variant="outline"
+                                onClick={() =>
+                                  resolvePenaltyExpiration(
+                                    pending.id,
+                                    pending.scoreFactId,
+                                    playerKey,
+                                  )
+                                }
+                                disabled={busy}
+                              >
+                                Release {formatPenaltyPlayerLabel(playerKey, livePenalties)}
+                              </Button>
+                            ))}
+                          </div>
+                        </div>
+                      ))}
+                      {(livePenalties?.releases ?? []).map((release) => (
+                        <p key={release.id} className="text-xs text-emerald-700">
+                          Released {formatPenaltyPlayerLabel(release.playerKey, livePenalties)}{" "}
+                          after
+                          {release.releaseCause === "foul-before-score"
+                            ? " foul-before-score"
+                            : " opposing score"}{" "}
+                          at {formatClock(release.releasedMs)}.
+                        </p>
+                      ))}
+                      {(livePenalties?.cards ?? []).map((card) => (
+                        <div
+                          key={card.factId}
+                          className="flex flex-wrap items-center gap-2 text-xs"
+                        >
+                          <span>
+                            {card.cardType} ·{" "}
+                            {formatPenaltyPlayerLabel(card.playerKey, livePenalties, {
+                              gameSideId: card.gameSideId,
+                              playerNumber: card.playerNumber,
+                            })}
+                          </span>
+                          <span>
+                            {card.reason === null
+                              ? skippedPenaltyReasonCardIds.has(card.factId)
+                                ? "reason skipped; add later"
+                                : "reason later/skipped"
+                              : `reason: ${card.reason}`}
+                          </span>
+                          {card.reason === null ? (
+                            <>
+                              {(
+                                [
+                                  ["contact-safety", "Contact/Safety"],
+                                  ["ball-interaction", "Ball Interaction"],
+                                  ["position-boundary", "Position/Boundary"],
+                                  ["procedure-substitution", "Procedure/Substitution"],
+                                  ["conduct", "Conduct"],
+                                  ["skip", "Skip"],
+                                ] as const
+                              ).map(([reason, label]) => (
+                                <Button
+                                  key={reason}
+                                  size="sm"
+                                  variant="ghost"
+                                  onClick={() =>
+                                    reason === "skip"
+                                      ? skipPenaltyReason(card.factId)
+                                      : recordPenaltyReason(
+                                          card.factId,
+                                          reason as LivePenaltyReason,
+                                        )
+                                  }
+                                  disabled={busy}
+                                >
+                                  {label}
+                                </Button>
+                              ))}
+                            </>
+                          ) : null}
+                        </div>
+                      ))}
+                    </div>
+                    <div className="space-y-2 rounded-lg border p-3">
+                      <p className="text-sm font-medium">Game Facts</p>
+                      {(projection.gameFacts ?? []).length === 0 ? (
+                        <p className="text-sm text-muted-foreground">No Game Facts recorded.</p>
+                      ) : (
+                        (projection.gameFacts ?? []).map((fact) => (
+                          <div
+                            key={fact.factId}
+                            data-game-fact-id={fact.factId}
+                            className="flex items-center justify-between gap-3 text-sm"
+                          >
+                            <span className="min-w-0">
+                              <span className="font-medium">{fact.factType}</span>
+                              <code className="ml-2 text-xs text-muted-foreground">
+                                {fact.factId}
+                              </code>
+                              <span className="ml-2 text-xs text-muted-foreground">
+                                sporting {fact.sportingOrder} · sync {fact.synchronizationOrder}
+                              </span>
+                            </span>
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              aria-label={`${fact.effective ? "Correct" : "Reinstate"} Game Fact ${fact.factId}`}
+                              onClick={() => correctFact(fact.factId, !fact.effective)}
+                              disabled={busy}
+                            >
+                              {fact.effective ? "Correct" : "Reinstate"}
+                            </Button>
+                          </div>
+                        ))
+                      )}
+                    </div>
+                  </div>
+                )}
+                {replica !== null && replica.pendingActions.length > 0 ? (
+                  <p className="text-sm text-amber-700">
+                    {replica.pendingActions.length} Controller action(s) retained for reconnect
+                    replay.
+                  </p>
+                ) : null}
+                {durabilityWarning === null ? null : (
+                  <p role="alert" className="text-sm font-medium text-amber-700">
+                    {durabilityWarning}
+                  </p>
+                )}
+              </div>
+              <ControllerActionSheet
+                activePanel={activeActionPanel}
+                onPanelChange={changeActionPanel}
+                tabThemes={{
+                  card: { activeStyle: { backgroundColor: "#0284c7", color: "white" } },
+                  timeout: { activeStyle: { backgroundColor: "#0f766e", color: "white" } },
+                  game: { activeStyle: { backgroundColor: "#7c3aed", color: "white" } },
+                }}
+                panel={
+                  <EventControllerActionPanel
+                    activePanel={activeActionPanel}
+                    busy={busy}
+                    projection={projection}
+                    cardGameSideId={cardGameSideId}
+                    setCardGameSideId={setCardGameSideId}
+                    cardPlayerNumber={cardPlayerNumber}
+                    setCardPlayerNumber={setCardPlayerNumber}
+                    cardType={cardType}
+                    setCardType={setCardType}
+                    cardFoulBeforeScore={cardFoulBeforeScore}
+                    setCardFoulBeforeScore={setCardFoulBeforeScore}
+                    cardSeekerPenaltyConfirmed={cardSeekerPenaltyConfirmed}
+                    setCardSeekerPenaltyConfirmed={setCardSeekerPenaltyConfirmed}
+                    recordCard={() => {
+                      const accepted = recordCard();
+                      if (accepted) changeActionPanel(null);
+                      return accepted;
+                    }}
+                    trigger={trigger}
+                    recordFlagCatch={recordFlagCatch}
+                    recordConcession={recordConcession}
+                    recordForfeit={recordForfeit}
+                    recordDoubleForfeit={() => {
+                      const accepted = recordDoubleForfeit();
+                      if (accepted) changeActionPanel(null);
+                      return accepted;
+                    }}
+                    onAccepted={() => changeActionPanel(null)}
+                    pendingResultConfirmation={pendingEventResultConfirmation}
+                    setPendingResultConfirmation={setPendingEventResultConfirmation}
+                    recordResult={() => {
+                      const accepted = trigger("result");
+                      if (accepted) changeActionPanel(null);
+                      return accepted;
+                    }}
+                  />
+                }
+              />
             </div>
           )}
           {message === null ? null : (
@@ -2831,6 +2800,274 @@ export function EventGameControllerPage() {
       {switchEntry.dialog}
       {restoreEntry.dialog}
     </main>
+  );
+}
+
+function EventControllerActionPanel({
+  activePanel,
+  busy,
+  projection,
+  cardGameSideId,
+  setCardGameSideId,
+  cardPlayerNumber,
+  setCardPlayerNumber,
+  cardType,
+  setCardType,
+  cardFoulBeforeScore,
+  setCardFoulBeforeScore,
+  cardSeekerPenaltyConfirmed,
+  setCardSeekerPenaltyConfirmed,
+  recordCard,
+  trigger,
+  recordDoubleForfeit,
+  recordFlagCatch,
+  recordConcession,
+  recordForfeit,
+  onAccepted,
+  pendingResultConfirmation,
+  setPendingResultConfirmation,
+  recordResult,
+}: {
+  activePanel: ControllerActionPanel | null;
+  busy: boolean;
+  projection: ControllerProjection | null;
+  cardGameSideId: string;
+  setCardGameSideId: (value: string) => void;
+  cardPlayerNumber: string;
+  setCardPlayerNumber: (value: string) => void;
+  cardType: LiveCardType;
+  setCardType: (value: LiveCardType) => void;
+  cardFoulBeforeScore: boolean;
+  setCardFoulBeforeScore: (value: boolean) => void;
+  cardSeekerPenaltyConfirmed: boolean;
+  setCardSeekerPenaltyConfirmed: (value: boolean) => void;
+  recordCard: () => boolean;
+  trigger: (
+    type: "card" | "timeout" | "suspension" | "result",
+    options?: {
+      timeoutAction?: "stoppage" | "start" | "complete";
+      timeoutGameSideId?: string;
+    },
+  ) => boolean;
+  recordDoubleForfeit: () => boolean;
+  recordFlagCatch: (gameSideId: string) => boolean;
+  recordConcession: (gameSideId: string) => boolean;
+  recordForfeit: (gameSideId: string) => boolean;
+  onAccepted: () => void;
+  pendingResultConfirmation: boolean;
+  setPendingResultConfirmation: (value: boolean) => void;
+  recordResult: () => boolean;
+}) {
+  const sideIds = Object.keys(projection?.scoreByGameSide ?? {});
+  if (activePanel === "card") {
+    return (
+      <div className="grid gap-2">
+        <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_8rem_minmax(0,1fr)]">
+          <label className="grid gap-1 text-xs font-medium">
+            Penalized Game Side
+            <select
+              id="penalty-game-side"
+              aria-label="Penalized Game Side"
+              className="h-11 rounded-md border bg-white px-3 text-sm"
+              value={cardGameSideId}
+              onChange={(event) => setCardGameSideId(event.target.value)}
+              disabled={busy}
+            >
+              <option value="">Choose side</option>
+              {sideIds.map((sideId) => (
+                <option key={sideId} value={sideId}>
+                  {sideId}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="grid gap-1 text-xs font-medium">
+            Player #
+            <input
+              id="penalty-player-number"
+              aria-label="Player number"
+              className="h-11 rounded-md border bg-white px-3 text-sm"
+              inputMode="numeric"
+              value={cardPlayerNumber}
+              onChange={(event) => setCardPlayerNumber(event.target.value)}
+              placeholder="optional"
+              disabled={busy}
+            />
+          </label>
+          <label className="grid gap-1 text-xs font-medium">
+            Card
+            <select
+              id="penalty-card-type"
+              aria-label="Card type"
+              className="h-11 rounded-md border bg-white px-3 text-sm"
+              value={cardType}
+              onChange={(event) => setCardType(event.target.value as LiveCardType)}
+              disabled={busy}
+            >
+              <option value="blue">Blue</option>
+              <option value="yellow">Yellow</option>
+              <option value="red">Red</option>
+              <option value="ejection">Ejection</option>
+            </select>
+          </label>
+        </div>
+        <label className="flex min-h-11 items-center gap-2 text-xs">
+          <input
+            type="checkbox"
+            checked={cardFoulBeforeScore}
+            onChange={(event) => setCardFoulBeforeScore(event.target.checked)}
+            disabled={busy || cardType === "red" || cardType === "ejection"}
+          />
+          Foul before score
+        </label>
+        <label className="flex min-h-11 items-center gap-2 text-xs">
+          <input
+            type="checkbox"
+            checked={cardSeekerPenaltyConfirmed}
+            onChange={(event) => setCardSeekerPenaltyConfirmed(event.target.checked)}
+            disabled={busy}
+          />
+          Penalized player is the seeker (Head Referee confirmed)
+        </label>
+        {cardGameSideId === "" ? (
+          <p role="alert" className="text-xs text-amber-800">
+            Choose a Game Side before accepting the card.
+          </p>
+        ) : null}
+        <Button
+          variant="outline"
+          aria-label="Accept penalty card for the selected Game Side"
+          onClick={recordCard}
+          disabled={busy}
+        >
+          Accept card
+        </Button>
+      </div>
+    );
+  }
+
+  if (activePanel === "timeout") {
+    return (
+      <div className="grid gap-2">
+        <p className="text-xs text-slate-600">
+          Choose a Game Side, then start or complete its timeout.
+        </p>
+        {sideIds.map((sideId) => {
+          const timeout = projection?.timeout;
+          const isStoppageForSide = timeout?.status === "stoppage" && timeout.gameSideId === sideId;
+          const used = timeout?.usedGameSideIds?.includes(sideId) === true;
+          const anotherSideActive =
+            (timeout?.status === "stoppage" || timeout?.status === "started") &&
+            timeout.gameSideId !== sideId;
+          return (
+            <Button
+              key={sideId}
+              variant="outline"
+              onClick={() => {
+                const accepted = trigger("timeout", {
+                  timeoutAction: isStoppageForSide ? "start" : "stoppage",
+                  timeoutGameSideId: sideId,
+                });
+                if (accepted && isStoppageForSide) {
+                  // A locally retained timeout is complete enough to return to the core.
+                  onAccepted();
+                }
+              }}
+              disabled={busy || anotherSideActive || (used && !isStoppageForSide)}
+            >
+              {isStoppageForSide
+                ? `Start timeout minute: ${sideId}`
+                : used
+                  ? `Timeout used: ${sideId}`
+                  : `Timeout stoppage: ${sideId}`}
+            </Button>
+          );
+        })}
+      </div>
+    );
+  }
+
+  return (
+    <div className="grid gap-2">
+      <p className="text-xs text-slate-600">
+        Game-end actions require local acceptance before the sheet closes.
+      </p>
+      <div className="grid gap-2 sm:grid-cols-2">
+        {sideIds.map((sideId) => (
+          <div key={sideId} className="grid gap-2 rounded-xl border p-2">
+            <p className="text-xs font-semibold">Game Side {sideId}</p>
+            <Button
+              variant="outline"
+              aria-label={`Record flag catch for Game Side ${sideId}`}
+              onClick={() => {
+                if (recordFlagCatch(sideId)) onAccepted();
+              }}
+              disabled={busy}
+            >
+              Record flag catch
+            </Button>
+            {projection?.overtime &&
+            projection.phase !== "finished" &&
+            projection.winnerGameSideId === null ? (
+              <Button
+                variant="outline"
+                aria-label={`Concede Event Game for Game Side ${sideId}`}
+                onClick={() => {
+                  if (recordConcession(sideId)) onAccepted();
+                }}
+                disabled={busy}
+              >
+                Concede
+              </Button>
+            ) : null}
+            <Button
+              variant="outline"
+              aria-label={`Record directed forfeit for Game Side ${sideId}`}
+              onClick={() => {
+                if (recordForfeit(sideId)) onAccepted();
+              }}
+              disabled={busy}
+            >
+              Directed forfeit
+            </Button>
+          </div>
+        ))}
+      </div>
+      {!pendingResultConfirmation ? (
+        <Button
+          variant="outline"
+          aria-label="Record final Event Game result"
+          onClick={() => setPendingResultConfirmation(true)}
+          disabled={busy}
+        >
+          Review final result
+        </Button>
+      ) : (
+        <div className="grid gap-2 rounded-xl border border-amber-300 bg-amber-50 p-2 text-sm text-amber-950">
+          <p className="font-medium">Confirm final Event Game result?</p>
+          <div className="grid grid-cols-2 gap-2">
+            <Button onClick={recordResult} disabled={busy}>
+              Confirm game end
+            </Button>
+            <Button
+              variant="outline"
+              onClick={() => setPendingResultConfirmation(false)}
+              disabled={busy}
+            >
+              Cancel
+            </Button>
+          </div>
+        </div>
+      )}
+      <Button
+        variant="outline"
+        aria-label="Record directed double-forfeit"
+        onClick={recordDoubleForfeit}
+        disabled={busy}
+      >
+        Record directed double-forfeit
+      </Button>
+    </div>
   );
 }
 

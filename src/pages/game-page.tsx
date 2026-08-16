@@ -16,6 +16,7 @@ import type { CardType, ControllerRole, GameCommand, TeamId } from "@/lib/game-t
 import { GameControllerActionPanels } from "@/components/game-controller-action-panels";
 import { ControllerTopSection, PenaltyColumnsSection } from "@/components/game-controller-sections";
 import { ControllerHeader } from "@/components/controller-header";
+import type { ControllerActionPanel } from "@/lib/controller-action-sheet";
 import {
   FLAG_RELEASE_MS,
   FLAG_STATUS_HIDE_AFTER_MS,
@@ -79,7 +80,7 @@ type PendingWinConfirmation = {
 
 export function GamePage({ gameId, role }: { gameId: string; role: ControllerRole }) {
   const controller = role === "controller";
-  const [activePanel, setActivePanel] = useState<"card" | "timeout" | "game">("card");
+  const [activePanel, setActivePanel] = useState<ControllerActionPanel | null>(null);
   const [homeName, setHomeName] = useState("Home");
   const [awayName, setAwayName] = useState("Away");
   const [homeColor, setHomeColor] = useState(DEFAULT_HOME_TEAM_COLOR);
@@ -99,6 +100,11 @@ export function GamePage({ gameId, role }: { gameId: string; role: ControllerRol
   const [renamingTeam, setRenamingTeam] = useState<TeamId | null>(null);
   const [pendingWinConfirmation, setPendingWinConfirmation] =
     useState<PendingWinConfirmation | null>(null);
+  const handleActionPanelChange = useCallback((panel: ControllerActionPanel | null) => {
+    setCardDraft({ cardType: null, team: null, digits: "", startedGameClockMs: null });
+    setPendingWinConfirmation(null);
+    setActivePanel(panel);
+  }, []);
   const [leaveDialogOpen, setLeaveDialogOpen] = useState(false);
   const [leavePending, setLeavePending] = useState(false);
   const [adHocQrOpen, setAdHocQrOpen] = useState(false);
@@ -293,7 +299,7 @@ export function GamePage({ gameId, role }: { gameId: string; role: ControllerRol
       cardDraft.team === null ||
       liveState === null
     ) {
-      return;
+      return false;
     }
 
     const playerNumber = cardDraft.digits.length === 0 ? null : Number(cardDraft.digits);
@@ -311,6 +317,7 @@ export function GamePage({ gameId, role }: { gameId: string; role: ControllerRol
       digits: "",
       startedGameClockMs: null,
     });
+    return true;
   }, [cardDraft, controller, dispatchCommand, liveState]);
 
   const adjustGameClock = useCallback(
@@ -883,7 +890,7 @@ export function GamePage({ gameId, role }: { gameId: string; role: ControllerRol
     : null;
 
   return (
-    <div className="h-[100dvh] overflow-hidden bg-slate-100 p-2 text-slate-900">
+    <div className="relative h-[100dvh] overflow-hidden bg-slate-100 p-2 text-slate-900">
       {entry.dialog}
       {leaveDialogOpen ? (
         <ControllerLeaveDialog
@@ -895,7 +902,7 @@ export function GamePage({ gameId, role }: { gameId: string; role: ControllerRol
           onConfirm={() => void leaveAdHocGame()}
         />
       ) : null}
-      <div className="mx-auto grid h-full w-full max-w-[460px] grid-rows-[auto_auto_minmax(0,1fr)_auto_auto] gap-2">
+      <div className="mx-auto grid h-full w-full max-w-[460px] grid-rows-[auto_minmax(0,1fr)] gap-2">
         <ControllerHeader
           identity={{
             eyebrow: "Ad Hoc Game",
@@ -940,202 +947,231 @@ export function GamePage({ gameId, role }: { gameId: string; role: ControllerRol
           ) : null}
         </ControllerHeader>
 
-        {controller ? (
-          <AdHocControlHandoff
-            gameId={gameId}
-            controlQr={controlQr}
-            qrOpen={adHocQrOpen}
-            triggerRef={adHocQrTriggerRef}
-            onClose={() => setAdHocQrOpen(false)}
-          />
-        ) : null}
+        <div className="relative min-h-0 grid grid-rows-[auto_minmax(0,1fr)] gap-2">
+          {controller ? (
+            <AdHocControlHandoff
+              gameId={gameId}
+              controlQr={controlQr}
+              qrOpen={adHocQrOpen}
+              triggerRef={adHocQrTriggerRef}
+              onClose={() => setAdHocQrOpen(false)}
+            />
+          ) : null}
 
-        <ControllerTopSection
-          controller={controller}
-          stateIsRunning={state.isRunning}
-          stateIsFinished={state.isFinished}
-          stateIsSuspended={state.isSuspended}
-          statusLabel={statusLabel}
-          gameClockText={formatClock(gameView.state.gameClockMs)}
-          leftScoreColumn={homeScoreColumn}
-          rightScoreColumn={awayScoreColumn}
-          scorePulse={scorePulse}
-          teamNameEditor={{
-            controller,
-            renamingTeam,
-            homeName,
-            awayName,
-            homeColor,
-            awayColor,
-            activeTeamRenameInputRef,
-            leftTeamNameButtonRef,
-            rightTeamNameButtonRef,
-            displayTeamNameHeightPx,
-            onOpenRename: (team) => {
-              if (!controller) {
+          <ControllerTopSection
+            controller={controller}
+            stateIsRunning={state.isRunning}
+            stateIsFinished={state.isFinished}
+            stateIsSuspended={state.isSuspended}
+            statusLabel={statusLabel}
+            gameClockText={formatClock(gameView.state.gameClockMs)}
+            leftScoreColumn={homeScoreColumn}
+            rightScoreColumn={awayScoreColumn}
+            scorePulse={scorePulse}
+            teamNameEditor={{
+              controller,
+              renamingTeam,
+              homeName,
+              awayName,
+              homeColor,
+              awayColor,
+              activeTeamRenameInputRef,
+              leftTeamNameButtonRef,
+              rightTeamNameButtonRef,
+              displayTeamNameHeightPx,
+              onOpenRename: (team) => {
+                if (!controller) {
+                  return;
+                }
+
+                setHomeName(state.homeName);
+                setAwayName(state.awayName);
+                setHomeColor(state.homeColor);
+                setAwayColor(state.awayColor);
+                setRenamingTeam(team);
+              },
+              onRenameInputChange: (team, value) => {
+                if (team === "home") {
+                  setHomeName(value);
+                } else {
+                  setAwayName(value);
+                }
+              },
+              onRenameColorChange: (team, value) => {
+                if (team === "home") {
+                  setHomeColor(value);
+                } else {
+                  setAwayColor(value);
+                }
+              },
+              onRenameInputKeyDown: handleTeamRenameInputKeyDown,
+              onSaveRename: saveTeamRename,
+              onSwapDisplayedTeamSides: swapDisplayedTeamSides,
+            }}
+            onAddScore={(team) =>
+              dispatchCommand({
+                type: "change-score",
+                team,
+                delta: 10,
+                reason: "goal",
+              })
+            }
+            onUndoScore={(team) => dispatchCommand({ type: "undo-last-score", team })}
+            onToggleClockAdjust={() => setClockAdjustOpen((previous) => !previous)}
+            onToggleRunning={() =>
+              dispatchCommand({
+                type: "set-running",
+                running: !state.isRunning,
+              })
+            }
+            clockAdjustOpen={clockAdjustOpen}
+            onAdjustGameClock={adjustGameClock}
+            finishSummary={finishSummary}
+            timeoutReminder={timeoutReminder}
+            flagStatus={flagStatus}
+            seekersStatus={seekersStatus}
+            clockTheme={clockTheme}
+          />
+
+          <PenaltyColumnsSection
+            penaltyColumns={penaltyColumns}
+            displayTeamName={displayTeamName}
+            pendingReleaseByPlayer={pendingReleaseByPlayer}
+            controller={controller}
+            onConfirmPenaltyExpiration={(pendingId, playerKey) =>
+              dispatchCommand({
+                type: "confirm-penalty-expiration",
+                pendingId,
+                playerKey,
+              })
+            }
+            getPendingReleaseActionLabel={(action, playerKey) =>
+              formatPendingReleaseActionLabel(action, state.players[playerKey] ?? null)
+            }
+          />
+
+          <GameControllerActionPanels
+            activePanel={activePanel}
+            setActivePanel={handleActionPanelChange}
+            controller={controller}
+            state={state}
+            gameView={{
+              timeoutFinalCountdown: gameView.timeoutFinalCountdown,
+              timeoutWarningActive: gameView.timeoutWarningActive,
+            }}
+            displayTeamOrder={displayTeamOrder}
+            displayTeamName={displayTeamName}
+            tabThemes={{
+              card: homeTabTheme,
+              timeout: awayTabTheme,
+              game: {
+                activeStyle: buildActionPanelTabStyle(
+                  "game",
+                  teamColorsByTeam.home,
+                  teamColorsByTeam.away,
+                ),
+              },
+            }}
+            cardTypeOptions={cardTypeOptions}
+            cardDraft={cardDraft}
+            setCardDraft={setCardDraft}
+            canSelectCardType={canSelectCardType}
+            canSelectCardTeam={canSelectCardTeam}
+            cardPlayerLabel={cardPlayerLabel}
+            cardEntryStarted={cardEntryStarted}
+            cardAddStatusText={cardAddStatusText}
+            canEditCardDigits={canEditCardDigits}
+            appendCardDigit={appendCardDigit}
+            canSubmitCard={canSubmitCard}
+            submitCard={() => {
+              if (submitCard()) handleActionPanelChange(null);
+            }}
+            activeTimeout={activeTimeout}
+            formatRemaining={formatRemaining}
+            pendingWinConfirmation={
+              pendingWinConfirmation === null ? null : { label: pendingWinConfirmation.label }
+            }
+            confirmWinAction={() => {
+              confirmWinAction();
+              handleActionPanelChange(null);
+            }}
+            clearPendingWinConfirmation={() => setPendingWinConfirmation(null)}
+            finishSummary={finishSummary}
+            canResumeGame={canResumeGame}
+            canSuspendGame={canSuspendGame}
+            canUseEndingActions={canUseEndingActions}
+            canRecordFlagCatch={canRecordFlagCatch}
+            startTimeout={(team) => {
+              dispatchCommand({ type: "start-timeout", team });
+            }}
+            setTimeoutRunning={(running) => {
+              dispatchCommand({
+                type: "set-timeout-running",
+                running,
+              });
+              handleActionPanelChange(null);
+            }}
+            undoTimeoutStart={() => {
+              dispatchCommand({ type: "undo-timeout-start" });
+              handleActionPanelChange(null);
+            }}
+            cancelTimeout={() => {
+              dispatchCommand({ type: "cancel-timeout" });
+              handleActionPanelChange(null);
+            }}
+            resumeGame={() => {
+              dispatchCommand({ type: "resume-game" });
+              handleActionPanelChange(null);
+            }}
+            suspendGame={() => {
+              dispatchCommand({ type: "suspend-game" });
+              handleActionPanelChange(null);
+            }}
+            requestForfeitWin={(team) => {
+              const winner = team === "home" ? "away" : "home";
+              requestWinConfirmation(`${displayTeamName(winner)} wins by forfeit penalty.`, {
+                type: "record-forfeit",
+                team,
+              });
+            }}
+            recordDoubleForfeit={() => {
+              dispatchCommand({ type: "record-double-forfeit" });
+              handleActionPanelChange(null);
+            }}
+            correctBackToUnfinished={() => {
+              dispatchCommand({ type: "correct-to-unfinished" });
+              handleActionPanelChange(null);
+            }}
+            requestTargetScoreWin={(team) =>
+              requestWinConfirmation(`${displayTeamName(team)} reached target score and wins.`, {
+                type: "record-target-score",
+                team,
+              })
+            }
+            requestConcedeWin={(team) => {
+              const winner = team === "home" ? "away" : "home";
+              requestWinConfirmation(
+                `${displayTeamName(team)} conceded. ${displayTeamName(winner)} wins.`,
+                {
+                  type: "record-concede",
+                  team,
+                },
+              );
+            }}
+            recordOrConfirmFlagCatch={(team) => {
+              if (willFlagCatchWin(state, team)) {
+                requestWinConfirmation(`${displayTeamName(team)} wins on flag catch.`, {
+                  type: "record-flag-catch",
+                  team,
+                });
                 return;
               }
 
-              setHomeName(state.homeName);
-              setAwayName(state.awayName);
-              setHomeColor(state.homeColor);
-              setAwayColor(state.awayColor);
-              setRenamingTeam(team);
-            },
-            onRenameInputChange: (team, value) => {
-              if (team === "home") {
-                setHomeName(value);
-              } else {
-                setAwayName(value);
-              }
-            },
-            onRenameColorChange: (team, value) => {
-              if (team === "home") {
-                setHomeColor(value);
-              } else {
-                setAwayColor(value);
-              }
-            },
-            onRenameInputKeyDown: handleTeamRenameInputKeyDown,
-            onSaveRename: saveTeamRename,
-            onSwapDisplayedTeamSides: swapDisplayedTeamSides,
-          }}
-          onAddScore={(team) =>
-            dispatchCommand({
-              type: "change-score",
-              team,
-              delta: 10,
-              reason: "goal",
-            })
-          }
-          onUndoScore={(team) => dispatchCommand({ type: "undo-last-score", team })}
-          onToggleClockAdjust={() => setClockAdjustOpen((previous) => !previous)}
-          onToggleRunning={() =>
-            dispatchCommand({
-              type: "set-running",
-              running: !state.isRunning,
-            })
-          }
-          clockAdjustOpen={clockAdjustOpen}
-          onAdjustGameClock={adjustGameClock}
-          finishSummary={finishSummary}
-          timeoutReminder={timeoutReminder}
-          flagStatus={flagStatus}
-          seekersStatus={seekersStatus}
-          clockTheme={clockTheme}
-        />
-
-        <PenaltyColumnsSection
-          penaltyColumns={penaltyColumns}
-          displayTeamName={displayTeamName}
-          pendingReleaseByPlayer={pendingReleaseByPlayer}
-          controller={controller}
-          onConfirmPenaltyExpiration={(pendingId, playerKey) =>
-            dispatchCommand({
-              type: "confirm-penalty-expiration",
-              pendingId,
-              playerKey,
-            })
-          }
-          getPendingReleaseActionLabel={(action, playerKey) =>
-            formatPendingReleaseActionLabel(action, state.players[playerKey] ?? null)
-          }
-        />
-
-        <GameControllerActionPanels
-          activePanel={activePanel}
-          setActivePanel={setActivePanel}
-          controller={controller}
-          state={state}
-          gameView={{
-            timeoutFinalCountdown: gameView.timeoutFinalCountdown,
-            timeoutWarningActive: gameView.timeoutWarningActive,
-          }}
-          displayTeamOrder={displayTeamOrder}
-          displayTeamName={displayTeamName}
-          tabThemes={{
-            card: homeTabTheme,
-            timeout: awayTabTheme,
-            game: {
-              activeStyle: buildActionPanelTabStyle(
-                "game",
-                teamColorsByTeam.home,
-                teamColorsByTeam.away,
-              ),
-            },
-          }}
-          cardTypeOptions={cardTypeOptions}
-          cardDraft={cardDraft}
-          setCardDraft={setCardDraft}
-          canSelectCardType={canSelectCardType}
-          canSelectCardTeam={canSelectCardTeam}
-          cardPlayerLabel={cardPlayerLabel}
-          cardEntryStarted={cardEntryStarted}
-          cardAddStatusText={cardAddStatusText}
-          canEditCardDigits={canEditCardDigits}
-          appendCardDigit={appendCardDigit}
-          canSubmitCard={canSubmitCard}
-          submitCard={submitCard}
-          activeTimeout={activeTimeout}
-          formatRemaining={formatRemaining}
-          pendingWinConfirmation={
-            pendingWinConfirmation === null ? null : { label: pendingWinConfirmation.label }
-          }
-          confirmWinAction={confirmWinAction}
-          clearPendingWinConfirmation={() => setPendingWinConfirmation(null)}
-          finishSummary={finishSummary}
-          canResumeGame={canResumeGame}
-          canSuspendGame={canSuspendGame}
-          canUseEndingActions={canUseEndingActions}
-          canRecordFlagCatch={canRecordFlagCatch}
-          startTimeout={(team) => dispatchCommand({ type: "start-timeout", team })}
-          setTimeoutRunning={(running) =>
-            dispatchCommand({
-              type: "set-timeout-running",
-              running,
-            })
-          }
-          undoTimeoutStart={() => dispatchCommand({ type: "undo-timeout-start" })}
-          cancelTimeout={() => dispatchCommand({ type: "cancel-timeout" })}
-          resumeGame={() => dispatchCommand({ type: "resume-game" })}
-          suspendGame={() => dispatchCommand({ type: "suspend-game" })}
-          requestForfeitWin={(team) => {
-            const winner = team === "home" ? "away" : "home";
-            requestWinConfirmation(`${displayTeamName(winner)} wins by forfeit penalty.`, {
-              type: "record-forfeit",
-              team,
-            });
-          }}
-          recordDoubleForfeit={() => dispatchCommand({ type: "record-double-forfeit" })}
-          correctBackToUnfinished={() => dispatchCommand({ type: "correct-to-unfinished" })}
-          requestTargetScoreWin={(team) =>
-            requestWinConfirmation(`${displayTeamName(team)} reached target score and wins.`, {
-              type: "record-target-score",
-              team,
-            })
-          }
-          requestConcedeWin={(team) => {
-            const winner = team === "home" ? "away" : "home";
-            requestWinConfirmation(
-              `${displayTeamName(team)} conceded. ${displayTeamName(winner)} wins.`,
-              {
-                type: "record-concede",
-                team,
-              },
-            );
-          }}
-          recordOrConfirmFlagCatch={(team) => {
-            if (willFlagCatchWin(state, team)) {
-              requestWinConfirmation(`${displayTeamName(team)} wins on flag catch.`, {
-                type: "record-flag-catch",
-                team,
-              });
-              return;
-            }
-
-            dispatchCommand({ type: "record-flag-catch", team });
-          }}
-        />
+              dispatchCommand({ type: "record-flag-catch", team });
+              handleActionPanelChange(null);
+            }}
+          />
+        </div>
       </div>
     </div>
   );
