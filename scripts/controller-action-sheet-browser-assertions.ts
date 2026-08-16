@@ -117,10 +117,9 @@ async function assertAdHocCompletionJourney(
   await home.scrollIntoViewIfNeeded();
   await home.click();
   assert(
-    (await panel.getByRole("alert").count()) > 0,
-    `${stage} missing Ad Hoc player number was not retained`,
+    await panel.getByRole("button", { name: "OK", exact: true }).isEnabled(),
+    `${stage} Ad Hoc card without a number was not immediately committed`,
   );
-  await panel.getByRole("button", { name: "7", exact: true }).click();
   await ok.scrollIntoViewIfNeeded();
   await ok.click();
   assert(
@@ -130,6 +129,24 @@ async function assertAdHocCompletionJourney(
   assert(
     (await page.evaluate(() => document.activeElement?.textContent?.trim())) === "Cards",
     `${stage} accepted Ad Hoc card did not restore Cards focus`,
+  );
+
+  const visiblePenalty = page.locator("[data-penalty-card-id]").first();
+  await visiblePenalty.waitFor();
+  await visiblePenalty.focus();
+  await visiblePenalty.press("Enter");
+  const editor = page.locator('[data-controller-action-panel="true"]');
+  await editor.waitFor();
+  const editorStep = await editor
+    .locator("[data-card-wizard-step]")
+    .getAttribute("data-card-wizard-step");
+  if (editorStep !== "number")
+    throw new Error(`${stage} penalty edit opened at ${editorStep ?? "unknown"} step`);
+  await editor.getByRole("button", { name: "8", exact: true }).click();
+  await editor.getByRole("button", { name: "OK", exact: true }).click();
+  assert(
+    (await page.locator('[data-controller-action-panel="true"]').count()) === 0,
+    `${stage} Ad Hoc card number edit did not close its panel`,
   );
 
   await timeout.click();

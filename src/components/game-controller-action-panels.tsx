@@ -13,6 +13,8 @@ type CardDraft = {
   team: TeamId | null;
   digits: string;
   startedGameClockMs: number | null;
+  editingCardId: string | null;
+  wizardStep: "type" | "team" | "number";
 };
 
 type CardTypeOption = {
@@ -49,6 +51,8 @@ export function GameControllerActionPanels({
   cardPlayerLabel,
   cardAddStatusText,
   canEditCardDigits,
+  cardCreationPending,
+  commitCardWithoutNumber,
   appendCardDigit,
   canSubmitCard,
   submitCard,
@@ -99,6 +103,8 @@ export function GameControllerActionPanels({
   cardPlayerLabel: string;
   cardAddStatusText: string;
   canEditCardDigits: boolean;
+  cardCreationPending: boolean;
+  commitCardWithoutNumber: (team: TeamId) => void;
   appendCardDigit: (digit: string) => void;
   canSubmitCard: boolean;
   submitCard: () => void;
@@ -148,6 +154,8 @@ export function GameControllerActionPanels({
               cardPlayerLabel={cardPlayerLabel}
               cardAddStatusText={cardAddStatusText}
               canEditCardDigits={canEditCardDigits}
+              cardCreationPending={cardCreationPending}
+              commitCardWithoutNumber={commitCardWithoutNumber}
               appendCardDigit={appendCardDigit}
               canSubmitCard={canSubmitCard}
               submitCard={submitCard}
@@ -405,6 +413,8 @@ function CardWizard({
   cardPlayerLabel,
   cardAddStatusText,
   canEditCardDigits,
+  cardCreationPending,
+  commitCardWithoutNumber,
   appendCardDigit,
   canSubmitCard,
   submitCard,
@@ -423,12 +433,14 @@ function CardWizard({
   cardPlayerLabel: string;
   cardAddStatusText: string;
   canEditCardDigits: boolean;
+  cardCreationPending: boolean;
+  commitCardWithoutNumber: (team: TeamId) => void;
   appendCardDigit: (digit: string) => void;
   canSubmitCard: boolean;
   submitCard: () => void;
   closePanel: () => void;
 }) {
-  const step = cardDraft.cardType === null ? "type" : cardDraft.team === null ? "team" : "number";
+  const step = cardDraft.wizardStep;
 
   if (!active) {
     return null;
@@ -436,14 +448,21 @@ function CardWizard({
 
   const undo = () => {
     if (step === "number") {
-      setCardDraft((previous) => ({ ...previous, team: null, digits: "" }));
+      setCardDraft((previous) => ({ ...previous, wizardStep: "team" }));
       return;
     }
     if (step === "team") {
-      setCardDraft({ cardType: null, team: null, digits: "", startedGameClockMs: null });
+      setCardDraft((previous) => ({ ...previous, team: null, digits: "", wizardStep: "type" }));
       return;
     }
-    setCardDraft({ cardType: null, team: null, digits: "", startedGameClockMs: null });
+    setCardDraft({
+      cardType: null,
+      team: null,
+      digits: "",
+      startedGameClockMs: null,
+      editingCardId: null,
+      wizardStep: "type",
+    });
     closePanel();
   };
 
@@ -477,7 +496,9 @@ function CardWizard({
                     cardType: option.type,
                     team: null,
                     digits: "",
-                    startedGameClockMs: state.gameClockMs,
+                    startedGameClockMs: cardDraft.startedGameClockMs ?? state.gameClockMs,
+                    editingCardId: cardDraft.editingCardId,
+                    wizardStep: "team",
                   })
                 }
                 disabled={!canSelectCardType}
@@ -498,7 +519,13 @@ function CardWizard({
               size="sm"
               variant="outline"
               className="h-10 rounded-xl border-slate-300 bg-white text-slate-900"
-              onClick={() => setCardDraft((previous) => ({ ...previous, team }))}
+              onClick={() => {
+                if (cardDraft.editingCardId === null) {
+                  commitCardWithoutNumber(team);
+                } else {
+                  setCardDraft((previous) => ({ ...previous, team, wizardStep: "number" }));
+                }
+              }}
               disabled={!canSelectCardTeam}
             >
               {displayTeamName(team)}
@@ -529,7 +556,7 @@ function CardWizard({
                 variant="outline"
                 className="h-9 rounded-xl border-slate-300 bg-white text-sm text-slate-900"
                 onClick={() => appendCardDigit(digit)}
-                disabled={!canEditCardDigits}
+                disabled={!canEditCardDigits || cardCreationPending}
               >
                 {digit}
               </Button>
@@ -541,7 +568,7 @@ function CardWizard({
               onClick={() =>
                 setCardDraft((previous) => ({ ...previous, digits: previous.digits.slice(0, -1) }))
               }
-              disabled={!canEditCardDigits || cardDraft.digits.length === 0}
+              disabled={!canEditCardDigits || cardCreationPending || cardDraft.digits.length === 0}
             >
               <Delete className="h-4 w-4" />
             </Button>
@@ -550,7 +577,7 @@ function CardWizard({
               variant="outline"
               className="h-9 rounded-xl border-slate-300 bg-white text-sm text-slate-900"
               onClick={() => appendCardDigit("0")}
-              disabled={!canEditCardDigits}
+              disabled={!canEditCardDigits || cardCreationPending}
             >
               0
             </Button>
@@ -558,7 +585,7 @@ function CardWizard({
               size="sm"
               className="h-9 gap-1 rounded-xl bg-emerald-600 text-white hover:bg-emerald-500"
               onClick={submitCard}
-              disabled={!canSubmitCard}
+              disabled={!canSubmitCard || cardCreationPending}
             >
               <Check className="h-4 w-4" />
               OK
@@ -574,7 +601,7 @@ function CardWizard({
         onClick={undo}
         disabled={!controller}
       >
-        Undo
+        {cardDraft.editingCardId === null ? "Undo" : "Back"}
       </Button>
     </div>
   );

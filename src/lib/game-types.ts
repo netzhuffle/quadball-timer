@@ -18,6 +18,7 @@ export type PenaltySegment = {
   cardType: Exclude<CardType, "ejection">;
   remainingMs: number;
   expirableByScore: boolean;
+  cardEventId?: string;
 };
 
 export type PlayerPenaltyState = {
@@ -56,6 +57,7 @@ export type CardEvent = {
   playerNumber: number | null;
   cardType: CardType;
   createdAtMs: number;
+  gameClockMs: number;
 };
 
 export type TeamTimeoutState = {
@@ -165,6 +167,13 @@ export type GameCommand =
       playerNumber: number | null;
       cardType: CardType;
       startedGameClockMs?: number;
+    }
+  | {
+      type: "update-card";
+      cardId: string;
+      team: TeamId;
+      playerNumber: number | null;
+      cardType: CardType;
     }
   | {
       type: "confirm-penalty-expiration";

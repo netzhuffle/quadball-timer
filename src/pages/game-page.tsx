@@ -90,18 +90,33 @@ export function GamePage({ gameId, role }: { gameId: string; role: ControllerRol
     team: TeamId | null;
     digits: string;
     startedGameClockMs: number | null;
+    editingCardId: string | null;
+    wizardStep: "type" | "team" | "number";
   }>({
     cardType: null,
     team: null,
     digits: "",
     startedGameClockMs: null,
+    editingCardId: null,
+    wizardStep: "type",
   });
+  const [cardCreationPending, setCardCreationPending] = useState(false);
+  const pendingCardCreationIdsRef = useRef<Set<string> | null>(null);
   const [clockAdjustOpen, setClockAdjustOpen] = useState(false);
   const [renamingTeam, setRenamingTeam] = useState<TeamId | null>(null);
   const [pendingWinConfirmation, setPendingWinConfirmation] =
     useState<PendingWinConfirmation | null>(null);
   const handleActionPanelChange = useCallback((panel: ControllerActionPanel | null) => {
-    setCardDraft({ cardType: null, team: null, digits: "", startedGameClockMs: null });
+    setCardDraft({
+      cardType: null,
+      team: null,
+      digits: "",
+      startedGameClockMs: null,
+      editingCardId: null,
+      wizardStep: "type",
+    });
+    setCardCreationPending(false);
+    pendingCardCreationIdsRef.current = null;
     setPendingWinConfirmation(null);
     setActivePanel(panel);
   }, []);
@@ -307,22 +322,91 @@ export function GamePage({ gameId, role }: { gameId: string; role: ControllerRol
     }
 
     const playerNumber = cardDraft.digits.length === 0 ? null : Number(cardDraft.digits);
-    dispatchCommand({
-      type: "add-card",
-      team: cardDraft.team,
-      cardType: cardDraft.cardType,
-      playerNumber,
-      startedGameClockMs: cardDraft.startedGameClockMs ?? liveState.gameClockMs,
-    });
+    dispatchCommand(
+      cardDraft.editingCardId === null
+        ? {
+            type: "add-card",
+            team: cardDraft.team,
+            cardType: cardDraft.cardType,
+            playerNumber,
+            startedGameClockMs: cardDraft.startedGameClockMs ?? liveState.gameClockMs,
+          }
+        : {
+            type: "update-card",
+            cardId: cardDraft.editingCardId,
+            team: cardDraft.team,
+            cardType: cardDraft.cardType,
+            playerNumber,
+          },
+    );
 
     setCardDraft({
       cardType: null,
       team: null,
       digits: "",
       startedGameClockMs: null,
+      editingCardId: null,
+      wizardStep: "type",
     });
+    setCardCreationPending(false);
+    pendingCardCreationIdsRef.current = null;
     return true;
   }, [cardDraft, controller, dispatchCommand, liveState]);
+
+  const commitCardWithoutNumber = useCallback(
+    (team: TeamId) => {
+      if (!controller || liveState === null || cardDraft.cardType === null) return;
+      pendingCardCreationIdsRef.current = new Set(liveState.cardEvents.map((event) => event.id));
+      dispatchCommand({
+        type: "add-card",
+        team,
+        cardType: cardDraft.cardType,
+        playerNumber: null,
+        startedGameClockMs: cardDraft.startedGameClockMs ?? liveState.gameClockMs,
+      });
+      setCardDraft((previous) => ({ ...previous, team, digits: "" }));
+      setCardCreationPending(true);
+    },
+    [cardDraft.cardType, cardDraft.startedGameClockMs, controller, dispatchCommand, liveState],
+  );
+
+  useEffect(() => {
+    const previousIds = pendingCardCreationIdsRef.current;
+    if (!cardCreationPending || previousIds === null || liveState === null) return;
+    const created = [...liveState.cardEvents].reverse().find((event) => !previousIds.has(event.id));
+    if (created === undefined) return;
+    setCardDraft((previous) => ({
+      ...previous,
+      cardType: created.cardType,
+      team: created.team,
+      editingCardId: created.id,
+      digits: created.playerNumber === null ? "" : String(created.playerNumber),
+      wizardStep: "number",
+    }));
+    setCardCreationPending(false);
+    pendingCardCreationIdsRef.current = null;
+  }, [cardCreationPending, liveState]);
+
+  const openCardEditor = useCallback(
+    (cardEventId: string) => {
+      if (!controller || liveState === null) return;
+      const event = liveState.cardEvents.find((candidate) => candidate.id === cardEventId);
+      if (event === undefined) return;
+      setCardDraft({
+        cardType: event.cardType,
+        team: event.team,
+        digits: event.playerNumber === null ? "" : String(event.playerNumber),
+        startedGameClockMs: event.gameClockMs,
+        editingCardId: event.id,
+        wizardStep: "number",
+      });
+      setCardCreationPending(false);
+      pendingCardCreationIdsRef.current = null;
+      setPendingWinConfirmation(null);
+      setActivePanel("card");
+    },
+    [controller, liveState],
+  );
 
   const adjustGameClock = useCallback(
     (deltaMs: number) => {
@@ -708,7 +792,8 @@ export function GamePage({ gameId, role }: { gameId: string; role: ControllerRol
     !state.isSuspended &&
     cardDraft.cardType !== null &&
     cardDraft.team !== null &&
-    cardDraft.digits.length > 0;
+    (cardDraft.editingCardId !== null || cardDraft.digits.length > 0) &&
+    !cardCreationPending;
   const cardPlayerLabel = cardDraft.digits.length > 0 ? `#${cardDraft.digits}` : "No #";
   const cardBasePenaltyMs =
     cardDraft.cardType === "red"
@@ -735,7 +820,9 @@ export function GamePage({ gameId, role }: { gameId: string; role: ControllerRol
     cardDraft.cardType === null || cardDraft.team === null
       ? "Choose a card type and team."
       : cardDraft.digits.length === 0
-        ? "Enter a player number to record this card."
+        ? cardDraft.editingCardId === null
+          ? "Waiting for the card to be committed."
+          : "No player number — OK keeps this card unknown."
         : cardDraft.cardType === "ejection"
           ? "Remaining on add: n/a"
           : selectedCardPlayerServingPenalty
@@ -1074,6 +1161,7 @@ export function GamePage({ gameId, role }: { gameId: string; role: ControllerRol
             getPendingReleaseActionLabel={(action, playerKey) =>
               formatPendingReleaseActionLabel(action, state.players[playerKey] ?? null)
             }
+            onEditPenalty={openCardEditor}
           />
 
           <GameControllerActionPanels
@@ -1107,6 +1195,8 @@ export function GamePage({ gameId, role }: { gameId: string; role: ControllerRol
             cardPlayerLabel={cardPlayerLabel}
             cardAddStatusText={cardAddStatusText}
             canEditCardDigits={canEditCardDigits}
+            cardCreationPending={cardCreationPending}
+            commitCardWithoutNumber={commitCardWithoutNumber}
             appendCardDigit={appendCardDigit}
             canSubmitCard={canSubmitCard}
             submitCard={() => {

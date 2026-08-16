@@ -3,7 +3,7 @@ import { ArrowLeftRight, ChevronDown, ChevronUp } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
-import type { TeamId } from "@/lib/game-types";
+import type { CardType, TeamId } from "@/lib/game-types";
 
 type ScoreColumnView = {
   team: TeamId;
@@ -30,6 +30,10 @@ type TimeoutReminderView = null | {
 
 type PenaltyEntryView = {
   playerKey: string;
+  cardEventId: string | null;
+  cardType: CardType | null;
+  team: TeamId;
+  playerNumber: number | null;
   label: string;
   remaining: string;
   highlight: boolean;
@@ -418,6 +422,7 @@ export function PenaltyColumnsSection({
   pendingReleaseByPlayer,
   controller,
   onConfirmPenaltyExpiration,
+  onEditPenalty,
   getPendingReleaseActionLabel,
 }: {
   penaltyColumns: PenaltyColumnView[];
@@ -425,6 +430,7 @@ export function PenaltyColumnsSection({
   pendingReleaseByPlayer: Record<string, PendingReleaseActionView[]>;
   controller: boolean;
   onConfirmPenaltyExpiration: (pendingId: string, playerKey: string) => void;
+  onEditPenalty: (cardEventId: string) => void;
   getPendingReleaseActionLabel: (action: PendingReleaseActionView, playerKey: string) => string;
 }) {
   return (
@@ -457,18 +463,35 @@ export function PenaltyColumnsSection({
                   return (
                     <div
                       key={entry.playerKey}
+                      data-penalty-card-id={entry.cardEventId ?? undefined}
+                      role={controller && entry.cardEventId !== null ? "button" : undefined}
+                      tabIndex={controller && entry.cardEventId !== null ? 0 : undefined}
                       className={`rounded-xl border px-2 py-1 text-[10px] ${
                         releaseActions.length > 0
                           ? "animate-pulse border-red-300 bg-red-100 text-red-900"
                           : entry.highlight
                             ? "border-amber-300 bg-amber-100 text-amber-900"
                             : ""
-                      }`}
+                      } ${controller && entry.cardEventId !== null ? "cursor-pointer" : ""}`}
                       style={
                         releaseActions.length > 0 || entry.highlight
                           ? undefined
                           : column.neutralChipStyle
                       }
+                      onClick={() => {
+                        if (controller && entry.cardEventId !== null)
+                          onEditPenalty(entry.cardEventId);
+                      }}
+                      onKeyDown={(event) => {
+                        if (
+                          controller &&
+                          entry.cardEventId !== null &&
+                          (event.key === "Enter" || event.key === " ")
+                        ) {
+                          event.preventDefault();
+                          onEditPenalty(entry.cardEventId);
+                        }
+                      }}
                     >
                       <div className="flex items-center justify-between gap-1">
                         <span>{entry.label}</span>
@@ -481,9 +504,10 @@ export function PenaltyColumnsSection({
                               key={action.pendingId}
                               size="sm"
                               className="h-6 justify-start rounded-lg bg-red-500 px-1.5 text-[10px] text-white hover:bg-red-600"
-                              onClick={() =>
-                                onConfirmPenaltyExpiration(action.pendingId, entry.playerKey)
-                              }
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                onConfirmPenaltyExpiration(action.pendingId, entry.playerKey);
+                              }}
                               disabled={!controller}
                             >
                               {getPendingReleaseActionLabel(action, entry.playerKey)}

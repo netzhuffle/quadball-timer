@@ -7,6 +7,7 @@ import {
 } from "@/lib/ad-hoc-controller-session";
 import { applyGameCommand } from "@/lib/game-engine";
 import type {
+  CardType,
   ControllerRole,
   GameCommand,
   GameState,
@@ -538,6 +539,10 @@ export function formatPenaltySlice(ms: number) {
 
 export type PlayerPenaltyView = {
   playerKey: string;
+  cardEventId: string | null;
+  cardType: CardType | null;
+  team: TeamId;
+  playerNumber: number | null;
   label: string;
   remaining: string;
   remainingMs: number;
@@ -559,23 +564,50 @@ export function getTeamPenalties(
     return [];
   }
 
-  return Object.values(state.players)
-    .filter((player) => player.team === team)
-    .map((player) => {
-      const remainingMs = player.segments.reduce(
-        (total, segment) => total + segment.remainingMs,
-        0,
+  const linkedRows: PlayerPenaltyView[] = state.cardEvents
+    .filter((event) => event.team === team)
+    .map((event): PlayerPenaltyView | null => {
+      const player = event.playerKey === null ? null : state.players[event.playerKey];
+      const segments = Object.values(state.players).flatMap((candidate) =>
+        candidate.segments.filter((segment) => segment.cardEventId === event.id),
       );
-
+      if (segments.length === 0) return null;
+      const remainingMs = segments.reduce((total, segment) => total + segment.remainingMs, 0);
       return {
-        playerKey: player.key,
+        playerKey: event.playerKey ?? `${event.team}:card:${event.id}`,
+        cardEventId: event.id,
+        cardType: event.cardType,
+        team: event.team,
+        playerNumber: event.playerNumber,
         label: formatPlayerLabel(player),
         remaining: formatRemaining(remainingMs),
         remainingMs,
         highlight: remainingMs > 0 && remainingMs <= 10_000,
       };
     })
-    .sort((a, b) => a.remainingMs - b.remainingMs || a.label.localeCompare(b.label));
+    .filter((entry): entry is PlayerPenaltyView => entry !== null);
+  const legacyRows = Object.values(state.players)
+    .filter((player) => player.team === team)
+    .map((player): PlayerPenaltyView | null => {
+      const segments = player.segments.filter((segment) => segment.cardEventId === undefined);
+      if (segments.length === 0) return null;
+      const remainingMs = segments.reduce((total, segment) => total + segment.remainingMs, 0);
+      return {
+        playerKey: player.key,
+        cardEventId: null,
+        cardType: null,
+        team: player.team,
+        playerNumber: player.playerNumber,
+        label: formatPlayerLabel(player),
+        remaining: formatRemaining(remainingMs),
+        remainingMs,
+        highlight: remainingMs > 0 && remainingMs <= 10_000,
+      };
+    })
+    .filter((entry): entry is PlayerPenaltyView => entry !== null);
+  return [...linkedRows, ...legacyRows].sort(
+    (a, b) => a.remainingMs - b.remainingMs || a.label.localeCompare(b.label),
+  );
 }
 
 export function selectVisiblePenalties(
