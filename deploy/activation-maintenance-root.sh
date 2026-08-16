@@ -42,6 +42,23 @@ skip_chown=0
 before_previous_rm_command=""
 ad_hoc_database="$database_dir/ad-hoc.sqlite"
 ad_hoc_environment_identity="$environment:$public_origin"
+technical_admin_bootstrap_path="/usr/local/sbin/quadball-timer-technical-admin-bootstrap"
+TECHNICAL_ADMIN_BOOTSTRAP_SHA256="4bff44f74229c8626f60fba2cff5b042f51b50ab03c9fe19fb36af33ef7abfba"
+temporary_bootstrap_path=""
+temporary_bootstrap_directory=""
+
+# shellcheck disable=SC2329
+cleanup_bootstrap_temporary_state() {
+  if [[ -n "$temporary_bootstrap_path" ]]; then
+    rm -f -- "$temporary_bootstrap_path" 2>/dev/null || true
+    temporary_bootstrap_path=""
+  fi
+  if [[ "$focused_test_mode" == 1 && -n "$temporary_bootstrap_directory" ]]; then
+    rmdir -- "$temporary_bootstrap_directory" 2>/dev/null || true
+    temporary_bootstrap_directory=""
+  fi
+}
+trap cleanup_bootstrap_temporary_state EXIT
 
 configure_promotion_test_hooks() {
   if [[ "$test_harness_mode" != 1 ]]; then
@@ -274,6 +291,7 @@ if [[ "$focused_test_mode" == 1 ]]; then
   technical_admin_database="$focused_test_root${technical_admin_database}"
   foundation_database="$focused_test_root${foundation_database}"
   key_ring_file="$focused_test_root${key_ring_file}"
+  technical_admin_bootstrap_path="$focused_test_root$technical_admin_bootstrap_path"
   [[ -n "$backup_directory" ]] && backup_directory="$focused_test_root${backup_directory}"
 fi
 configure_promotion_test_hooks || exit 2
@@ -281,6 +299,10 @@ systemctl_command="${QBT_FOCUSED_TEST_SYSTEMCTL:-systemctl}"
 runuser_command="${QBT_FOCUSED_TEST_RUNUSER:-/usr/sbin/runuser}"
 flock_command="${QBT_FOCUSED_TEST_FLOCK:-flock}"
 realpath_command="${QBT_FOCUSED_TEST_REALPATH:-realpath}"
+install_command="${QBT_FOCUSED_TEST_INSTALL:-/usr/bin/install}"
+mktemp_command="${QBT_FOCUSED_TEST_MKTEMP:-/usr/bin/mktemp}"
+sha256sum_command="${QBT_FOCUSED_TEST_SHA256SUM:-/usr/bin/sha256sum}"
+stat_command="${QBT_FOCUSED_TEST_STAT:-/usr/bin/stat}"
 [[ "$release_dir" == "$release_base"/releases/* ]] || { echo "Unsafe release path." >&2; exit 2; }
 [[ "$release_dir" != *..* && "$release_dir" != *//* ]] || { echo "Unsafe release path." >&2; exit 2; }
 [[ -d "$release_dir" && ! -L "$release_dir" ]] || { echo "Unsafe release path." >&2; exit 2; }
@@ -308,6 +330,71 @@ schema_compatibility="$(sed -n 's/.*"schemaCompatibility":"\([^"]*\)".*/\1/p' "$
   exit 2
 }
 case "$command" in
+  install-technical-admin-bootstrap)
+    [[ "$focused_test_mode" == 1 || "${SUDO_USER:-}" == "$expected_caller" ]] || {
+      echo "Invalid maintenance caller." >&2
+      exit 2
+    }
+    current_link="${release_base}/current"
+    [[ -L "$current_link" && "$($realpath_command -e -- "$current_link")" == "$release_dir" ]] || {
+      echo "Technical Admin bootstrap installation requires the active release." >&2
+      exit 1
+    }
+    source_path="$release_dir/deploy/technical-admin-bootstrap-root.sh"
+    [[ -f "$source_path" && ! -L "$source_path" && -x "$source_path" ]] || {
+      echo "Maintenance release is missing the Technical Admin bootstrap runner." >&2
+      exit 1
+    }
+    if [[ "$focused_test_mode" == 1 ]]; then
+      temporary_bootstrap_directory="$focused_test_root/run"
+      "$install_command" -d -m 0700 -- "$temporary_bootstrap_directory"
+    else
+      temporary_bootstrap_directory="/run"
+      [[ -d "$temporary_bootstrap_directory" && ! -L "$temporary_bootstrap_directory" ]] || {
+        echo "Technical Admin bootstrap temporary root is unavailable." >&2
+        exit 1
+      }
+    fi
+    temporary_bootstrap_path="$("$mktemp_command" "$temporary_bootstrap_directory/quadball-timer-technical-admin-bootstrap.XXXXXX")" || {
+      echo "Technical Admin bootstrap temporary file could not be created." >&2
+      exit 1
+    }
+    [[ -f "$temporary_bootstrap_path" && ! -L "$temporary_bootstrap_path" ]] || {
+      echo "Technical Admin bootstrap temporary file is unsafe." >&2
+      exit 2
+    }
+    if [[ "$focused_test_mode" == 1 ]]; then
+      "$install_command" -m 0600 -- "$source_path" "$temporary_bootstrap_path"
+    else
+      "$install_command" -o root -g root -m 0600 -- "$source_path" "$temporary_bootstrap_path"
+      [[ "$("$stat_command" -c '%U:%G:%a' "$temporary_bootstrap_path")" == "root:root:600" ]] || {
+        echo "Technical Admin bootstrap temporary file ownership or mode drifted." >&2
+        exit 2
+      }
+    fi
+    temporary_digest="$("$sha256sum_command" "$temporary_bootstrap_path" | awk '{print $1}')"
+    [[ "$temporary_digest" == "$TECHNICAL_ADMIN_BOOTSTRAP_SHA256" ]] || {
+      echo "Technical Admin bootstrap runner trust verification failed." >&2
+      exit 1
+    }
+    if [[ "$focused_test_mode" == 1 ]]; then
+      "$install_command" -d -m 0755 -- "$(dirname -- "$technical_admin_bootstrap_path")"
+      "$install_command" -m 0755 -- "$temporary_bootstrap_path" "$technical_admin_bootstrap_path"
+    else
+      "$install_command" -o root -g root -m 0755 -- "$temporary_bootstrap_path" "$technical_admin_bootstrap_path"
+    fi
+    [[ "$("$sha256sum_command" "$technical_admin_bootstrap_path" | awk '{print $1}')" == "$TECHNICAL_ADMIN_BOOTSTRAP_SHA256" ]] || {
+      echo "Technical Admin bootstrap runner digest verification failed." >&2
+      exit 2
+    }
+    if [[ "$focused_test_mode" != 1 ]]; then
+      [[ "$("$stat_command" -c '%U:%G:%a' "$technical_admin_bootstrap_path")" == "root:root:755" ]] || {
+        echo "Technical Admin bootstrap runner ownership or mode drifted." >&2
+        exit 2
+      }
+    fi
+    exit 0
+    ;;
   backup|verify-backup|promote)
     [[ "$environment" == production ]] || { echo "Production backup operations only." >&2; exit 2; }
     [[ "${SUDO_USER:-}" == "$expected_caller" ]] || { echo "Invalid maintenance caller." >&2; exit 2; }

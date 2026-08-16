@@ -55,16 +55,21 @@ async function createRelease(base: string): Promise<string> {
     "deploy/activate-release.sh",
     "deploy/activate-test-release.sh",
     "deploy/activation-maintenance-root.sh",
+    "deploy/technical-admin-bootstrap-root.sh",
     "deploy/systemd/quadball-timer.service",
     "deploy/systemd/quadball-timer-test.service",
     "quadball-timer",
   ];
   const records: Array<{ path: string; sha256: string }> = [];
   for (const member of members) {
-    const contents = `fast fixture ${member}\n`;
+    const contents =
+      member === "deploy/technical-admin-bootstrap-root.sh"
+        ? await readFile(join(repositoryRoot, member), "utf8")
+        : `fast fixture ${member}\n`;
     const path = join(release, member);
     await mkdir(join(path, ".."), { recursive: true });
     await writeFile(path, contents);
+    if (member === "deploy/technical-admin-bootstrap-root.sh") await chmod(path, 0o555);
     records.push({ path: member, sha256: digest(contents) });
   }
   await chmod(join(release, "quadball-timer"), 0o555);
@@ -81,9 +86,10 @@ async function createRelease(base: string): Promise<string> {
   return release;
 }
 
-async function createHarness(): Promise<{
+async function createHarness(registerRoot = true): Promise<{
   base: string;
   bin: string;
+  bootstrapPath: string;
   database: string;
   log: string;
   pointer: string;
@@ -94,7 +100,7 @@ async function createHarness(): Promise<{
   wrapper: string;
 }> {
   const root = await realpath(await mkdtemp(join(tmpdir(), "quadball-activation-fast-")));
-  roots.push(root);
+  if (registerRoot) roots.push(root);
   const base = join(root, "srv", "quadball-timer");
   const bin = join(root, "bin");
   const state = join(root, "state");
@@ -104,6 +110,7 @@ async function createHarness(): Promise<{
   const pointer = join(state, "retained-pointer");
   const probe = join(state, "probe-results");
   const testCanary = join(root, "srv", "quadball-timer-test", "canary");
+  const bootstrapPath = join(root, "usr/local/sbin/quadball-timer-technical-admin-bootstrap");
   await Promise.all([
     mkdir(bin, { recursive: true }),
     mkdir(previous, { recursive: true }),
@@ -182,6 +189,10 @@ set -euo pipefail
 echo "maintenance $1 $3" >> "$QBT_FAST_LOG"
 operation="$3"
 case "$operation" in
+  install-technical-admin-bootstrap)
+    mkdir -p "$(dirname -- "$QBT_FAST_BOOTSTRAP_PATH")"
+    install -m 0755 -- "$2/deploy/technical-admin-bootstrap-root.sh" "$QBT_FAST_BOOTSTRAP_PATH"
+    ;;
   preflight) printf '{"schemaVersion":26}\\n' ;;
   backup)
     candidate="$QBT_FAST_STATE/backup-candidate"
@@ -202,7 +213,85 @@ case "$operation" in
 esac
 `,
   );
-  return { base, bin, database, log, pointer, probe, root, state, testCanary, wrapper };
+  return {
+    base,
+    bin,
+    bootstrapPath,
+    database,
+    log,
+    pointer,
+    probe,
+    root,
+    state,
+    testCanary,
+    wrapper,
+  };
+}
+
+test("installs the verified shared bootstrap runner for Production and Test activation", async () => {
+  const production = await createHarness(false);
+  let test: Awaited<ReturnType<typeof createTestActivationHarness>> | undefined;
+  try {
+    const productionRun = runProductionActivation(production);
+    expect(productionRun.exitCode, productionRun.output).toBe(0);
+    expect(await readFile(production.bootstrapPath, "utf8")).toBe(
+      await readFile(
+        join(production.base, "releases", releaseId, "deploy/technical-admin-bootstrap-root.sh"),
+        "utf8",
+      ),
+    );
+    expect((await lstat(production.bootstrapPath)).mode & 0o777).toBe(0o755);
+
+    test = await createTestActivationHarness(false);
+    const testRun = runTestActivation(test, {});
+    expect(testRun.exitCode, testRun.output).toBe(0);
+    expect(await readFile(test.bootstrapPath, "utf8")).toBe(
+      await readFile(join(test.release, "deploy/technical-admin-bootstrap-root.sh"), "utf8"),
+    );
+    expect((await lstat(test.bootstrapPath)).mode & 0o777).toBe(0o755);
+  } finally {
+    if (test !== undefined) await rm(test.root, { force: true, recursive: true });
+    await rm(production.root, { force: true, recursive: true });
+  }
+}, 30_000);
+
+function runProductionActivation(fixture: Awaited<ReturnType<typeof createHarness>>) {
+  const result = Bun.spawnSync({
+    cmd: [
+      "bash",
+      join(repositoryRoot, "deploy/activate-release.sh"),
+      "--base-dir",
+      fixture.base,
+      "--release",
+      releaseId,
+      "--service",
+      "quadball-timer",
+      "--port",
+      "3099",
+    ],
+    env: {
+      ...process.env,
+      PATH: `${fixture.bin}:${process.env.PATH ?? ""}`,
+      QBT_FAST_BASE: fixture.base,
+      QBT_FAST_BOOTSTRAP_PATH: fixture.bootstrapPath,
+      QBT_FAST_DATABASE: fixture.database,
+      QBT_FAST_LOG: fixture.log,
+      QBT_FAST_POINTER: fixture.pointer,
+      QBT_FAST_PREVIOUS: join(fixture.base, "releases", previousReleaseId),
+      QBT_FAST_RELEASE: releaseId,
+      QBT_FAST_STATE: fixture.state,
+      QBT_FOCUSED_TEST_MAINTENANCE_WRAPPER: fixture.wrapper,
+      QBT_FOCUSED_TEST_MODE: "1",
+      QBT_FOCUSED_TEST_RELEASE_VERIFIED: "1",
+      QBT_FOCUSED_TEST_ROOT: fixture.root,
+    },
+    stderr: "pipe",
+    stdout: "pipe",
+  });
+  return {
+    exitCode: result.exitCode,
+    output: `${new TextDecoder().decode(result.stdout)}${new TextDecoder().decode(result.stderr)}`,
+  };
 }
 
 describe("Production activation Fast phase matrix", () => {
@@ -497,9 +586,10 @@ describe("Production activation Fast phase matrix", () => {
   }, 10_000);
 });
 
-async function createTestActivationHarness(): Promise<{
+async function createTestActivationHarness(registerRoot = true): Promise<{
   base: string;
   bin: string;
+  bootstrapPath: string;
   clock: string;
   count: string;
   maintenance: string;
@@ -510,13 +600,14 @@ async function createTestActivationHarness(): Promise<{
   transitions: string;
 }> {
   const root = await realpath(await mkdtemp(join(tmpdir(), "quadball-test-activation-fast-")));
-  roots.push(root);
+  if (registerRoot) roots.push(root);
   const base = join(root, "srv", "quadball-timer-test");
   const bin = join(root, "bin");
   const count = join(root, "curl-count");
   const clock = join(root, "logical-clock");
   const probeLog = join(root, "probe-log");
   const transitions = join(root, "service-transitions");
+  const bootstrapPath = join(root, "usr/local/sbin/quadball-timer-technical-admin-bootstrap");
   const previous = join(base, "releases", "sha-prior-test-activation-attempt-1");
   const release = join(base, "releases", testActivationReleaseId);
   const maintenance = join(root, "maintenance");
@@ -525,6 +616,11 @@ async function createTestActivationHarness(): Promise<{
   await mkdir(join(base, ".staging"), { recursive: true });
   await mkdir(bin, { recursive: true });
   await writeFile(join(release, "deploy/systemd/quadball-timer-test.service"), "[Unit]\n");
+  await writeFile(
+    join(release, "deploy/technical-admin-bootstrap-root.sh"),
+    await readFile(join(repositoryRoot, "deploy/technical-admin-bootstrap-root.sh"), "utf8"),
+  );
+  await chmod(join(release, "deploy/technical-admin-bootstrap-root.sh"), 0o555);
   await writeFile(join(release, "quadball-timer"), "test executable\n");
   await chmod(join(release, "quadball-timer"), 0o555);
   const executableDigest = digest("test executable\n");
@@ -620,6 +716,10 @@ esac
     `#!/usr/bin/env bash
 set -euo pipefail
 case "$3" in
+  install-technical-admin-bootstrap)
+    mkdir -p "$(dirname -- "$QBT_TEST_BOOTSTRAP_PATH")"
+    install -m 0755 -- "$2/deploy/technical-admin-bootstrap-root.sh" "$QBT_TEST_BOOTSTRAP_PATH"
+    ;;
   preflight) printf '{"schemaVersion":31}\\n' ;;
   validate-migration) printf '{"ready":true}\\n' ;;
   apply-migrations) printf '{"schemaVersion":31}\\n' ;;
@@ -627,7 +727,19 @@ case "$3" in
 esac
 `,
   );
-  return { base, bin, clock, count, maintenance, previous, probeLog, release, root, transitions };
+  return {
+    base,
+    bin,
+    bootstrapPath,
+    clock,
+    count,
+    maintenance,
+    previous,
+    probeLog,
+    release,
+    root,
+    transitions,
+  };
 }
 
 function runTestActivation(
@@ -657,6 +769,7 @@ function runTestActivation(
       QBT_FOCUSED_TEST_REALPATH: join(fixture.root, "bin", "realpath"),
       QBT_FOCUSED_TEST_ROOT: fixture.root,
       QBT_TEST_BASE: fixture.base,
+      QBT_TEST_BOOTSTRAP_PATH: fixture.bootstrapPath,
       QBT_TEST_CURL_COUNT: fixture.count,
       QBT_TEST_DIGEST: digest("test executable\n"),
       QBT_TEST_RELEASE: testActivationReleaseId,

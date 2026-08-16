@@ -6,8 +6,6 @@
   "scripts": {
     "dev": "bun --hot src/index.ts",
     "start": "cd dist && NODE_ENV=production bun index.js",
-    "admin:enroll": "bun scripts/enroll-technical-admin.ts",
-    "admin:reset": "bun scripts/reset-technical-admin.ts",
     "grant:key-ring": "bun scripts/grant-key-ring.ts",
     "monitoring:test": "bun src/index.ts --emit-test-monitoring-error",
     "event:catalog": "bun scripts/event-catalog.ts",
@@ -18,6 +16,7 @@
     "test:focused:event-game-controller-browser": "bun scripts/test-event-game-controller-browser.ts",
     "test:focused:event-game-routes": "bun test --isolate ./src/lib/live-event-game-transport.focused.ts",
     "test:focused:technical-admin": "bun test --isolate ./src/lib/technical-admin-auth-sqlite.focused.ts",
+    "test:focused:technical-admin-bootstrap": "bun test --isolate ./src/lib/technical-admin-bootstrap.focused.ts",
     "test:focused:startup": "bun test --isolate ./src/index-startup.focused.ts",
     "build": "bun run build.ts",
     "build:executable": "bun run build.ts --compile --compile-target=bun-linux-x64-modern --outfile=dist/quadball-timer",
@@ -39,7 +38,7 @@
     "format": "bunx --bun oxfmt \"**/*.{js,jsx,ts,tsx,mjs,cjs}\" \"!docs/**\"",
     "format:check": "bunx --bun oxfmt \"**/*.{js,jsx,ts,tsx,mjs,cjs}\" \"!docs/**\" --check",
     "lint": "bunx --bun oxlint --type-aware --type-check --ignore-pattern \"docs/**\"",
-    "lint:shell": "shellcheck deploy/activate-release.sh deploy/activate-test-release.sh deploy/activation-maintenance-root.sh",
+    "lint:shell": "shellcheck deploy/activate-release.sh deploy/activate-test-release.sh deploy/activation-maintenance-root.sh deploy/technical-admin-bootstrap-root.sh",
     "check:bun-version": "bun scripts/check-bun-version.ts",
     "check:testing-policy": "bun scripts/check-testing-policy.ts",
     "check": "bun run check:bun-version && bun run check:testing-policy && bun run format:check && bun run lint && bun run lint:shell"

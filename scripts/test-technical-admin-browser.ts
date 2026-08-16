@@ -109,12 +109,15 @@ try {
   serverStderr = new Response(server.stderr as unknown as BodyInit).text();
   await waitForServer(`${origin}/internal/healthz`);
 
-  const enrollmentProcess = Bun.spawn(["bun", "scripts/enroll-technical-admin.ts"], {
-    cwd: process.cwd(),
-    env: environment,
-    stdout: "pipe",
-    stderr: "pipe",
-  });
+  const enrollmentProcess = Bun.spawn(
+    [process.execPath, "run", "src/index.ts", "--", "--technical-admin-bootstrap", "enroll"],
+    {
+      cwd: process.cwd(),
+      env: environment,
+      stdout: "pipe",
+      stderr: "pipe",
+    },
+  );
   if (typeof enrollmentProcess.stdout === "number" || enrollmentProcess.stdout === undefined) {
     throw new Error("Enrollment command did not expose stdout.");
   }

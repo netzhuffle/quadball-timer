@@ -10,6 +10,7 @@ import {
   type TechnicalAdminRetentionScheduler,
   type WebAuthnVerifier,
 } from "@/lib/technical-admin-auth";
+import { createTechnicalAdminBootstrapOperations } from "@/lib/technical-admin-bootstrap";
 
 const binding = { origin: "https://localhost:39421", host: "localhost:39421" };
 const identity = { environment: "test" as const, origin: binding.origin, rpId: "localhost" };
@@ -92,36 +93,6 @@ function createManualRetentionScheduler(now: () => number) {
       }
     },
   };
-}
-
-async function runResetCli(databasePath: string, input: string) {
-  const child = Bun.spawn(["bun", "scripts/reset-technical-admin.ts"], {
-    cwd: process.cwd(),
-    env: {
-      ...Object.fromEntries(
-        Object.entries(process.env).filter(
-          (entry): entry is [string, string] => entry[1] !== undefined,
-        ),
-      ),
-      NODE_ENV: "test",
-      QUADBALL_ENVIRONMENT: "test",
-      PORT: "39421",
-      PUBLIC_ORIGIN: binding.origin,
-      WEBAUTHN_RP_ID: "localhost",
-      TECHNICAL_ADMIN_DATABASE: databasePath,
-    },
-    stdin: "pipe",
-    stdout: "pipe",
-    stderr: "pipe",
-  });
-  await child.stdin.write(input);
-  await child.stdin.end();
-  const [stdout, stderr, exitCode] = await Promise.all([
-    new Response(child.stdout).text(),
-    new Response(child.stderr).text(),
-    child.exited,
-  ]);
-  return { stdout, stderr, exitCode };
 }
 
 async function withTempDirectory<T>(
@@ -637,22 +608,37 @@ describe("focused Technical Admin SQLite boundary", () => {
     });
   });
 
-  test("reset CLI requires confirmation, fails safely, and emits URL only after commit", async () => {
+  test("bootstrap reset requires confirmation, fails safely, and emits URL only after commit", async () => {
     await withTempDirectory("technical-admin-cli-focused-", async (directory) => {
       const mismatchPath = join(directory, "mismatch.sqlite");
-      const mismatch = await runResetCli(mismatchPath, "wrong\n");
-      expect(mismatch.exitCode).toBe(1);
-      expect(mismatch.stdout).not.toContain("#token=");
-      expect(mismatch.stderr).toContain("Reset cancelled.");
+      const mismatchRepository = new SqliteTechnicalAdminAuthRepository(mismatchPath, identity);
+      const mismatchAuth = createTechnicalAdminAuth(
+        identity,
+        mismatchRepository,
+        createVerifier(),
+        () => 1_000,
+      );
+      const mismatch = createTechnicalAdminBootstrapOperations(identity, mismatchAuth).reset(
+        "wrong",
+      );
+      expect(mismatch).toEqual({ ok: false, error: "invalid-confirmation" });
+      mismatchRepository.close();
 
       const successPath = join(directory, "success.sqlite");
       const successRepository = new SqliteTechnicalAdminAuthRepository(successPath, identity);
       successRepository.close();
       insertCredential(successPath);
-      const success = await runResetCli(successPath, "test\n");
-      expect(success.exitCode).toBe(0);
-      expect(success.stdout).toContain("https://localhost:39421/admin/enroll#token=");
       const afterSuccess = new SqliteTechnicalAdminAuthRepository(successPath, identity);
+      const successAuth = createTechnicalAdminAuth(
+        identity,
+        afterSuccess,
+        createVerifier(),
+        () => 1_000,
+      );
+      const success = createTechnicalAdminBootstrapOperations(identity, successAuth).reset("test");
+      expect(success.ok).toBe(true);
+      if (success.ok)
+        expect(success.value.url).toContain("https://localhost:39421/admin/enroll#token=");
       expect(afterSuccess.getCredential()).toBeNull();
       afterSuccess.close();
 
@@ -660,10 +646,13 @@ describe("focused Technical Admin SQLite boundary", () => {
       const unsafeRepository = new SqliteTechnicalAdminAuthRepository(corruptPath, identity);
       unsafeRepository.close();
       insertCredential(corruptPath, 2);
-      const unsafe = await runResetCli(corruptPath, "");
-      expect(unsafe.exitCode).toBe(1);
-      expect(unsafe.stdout).not.toContain("#token=");
-      expect(unsafe.stderr).toContain("not safe to reset");
+      const unsafe = new SqliteTechnicalAdminAuthRepository(corruptPath, identity);
+      const unsafeAuth = createTechnicalAdminAuth(identity, unsafe, createVerifier(), () => 1_000);
+      expect(createTechnicalAdminBootstrapOperations(identity, unsafeAuth).reset("test")).toEqual({
+        ok: false,
+        error: "storage-failure",
+      });
+      unsafe.close();
 
       const readOnlyPath = join(directory, "readonly-cli.sqlite");
       const readOnlyRepository = new SqliteTechnicalAdminAuthRepository(readOnlyPath, identity);
@@ -671,9 +660,19 @@ describe("focused Technical Admin SQLite boundary", () => {
       insertCredential(readOnlyPath);
       chmodSync(readOnlyPath, 0o444);
       try {
-        const readOnly = await runResetCli(readOnlyPath, "test\n");
-        expect(readOnly.exitCode).toBe(1);
-        expect(readOnly.stdout).not.toContain("#token=");
+        const readOnly = new SqliteTechnicalAdminAuthRepository(readOnlyPath, identity, {
+          readwrite: false,
+        });
+        const readOnlyAuth = createTechnicalAdminAuth(
+          identity,
+          readOnly,
+          createVerifier(),
+          () => 1_000,
+        );
+        expect(
+          createTechnicalAdminBootstrapOperations(identity, readOnlyAuth).reset("test"),
+        ).toEqual({ ok: false, error: "storage-failure" });
+        readOnly.close();
       } finally {
         chmodSync(readOnlyPath, 0o600);
       }

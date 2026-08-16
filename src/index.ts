@@ -117,6 +117,10 @@ import {
 } from "@/lib/monitoring-redaction";
 import { runProductionActivationCli } from "@/lib/production-activation-cli";
 import { createPublicHealthRoute } from "@/lib/public-health";
+import {
+  parseTechnicalAdminBootstrapCli,
+  runTechnicalAdminBootstrapCli,
+} from "@/lib/technical-admin-bootstrap";
 
 type SessionSubscription =
   | {
@@ -150,6 +154,7 @@ const pendingSocketReservations = new Map<string, ReturnType<typeof setTimeout>>
 
 const probeInvocation = parseSqliteProbeInvocation(process.argv.slice(1));
 const grantKeyRingInvocation = parseGrantKeyRingCli(process.argv.slice(1));
+const technicalAdminBootstrapInvocation = parseTechnicalAdminBootstrapCli(process.argv.slice(1));
 
 async function main() {
   if (process.argv.includes("--release-runtime-identity")) {
@@ -159,6 +164,16 @@ async function main() {
 
   if (process.argv.includes("--emit-test-monitoring-error")) {
     await emitTestMonitoringError();
+    return;
+  }
+
+  if (technicalAdminBootstrapInvocation.kind === "invalid") {
+    console.error(technicalAdminBootstrapInvocation.error);
+    process.exitCode = 2;
+    return;
+  }
+  if (technicalAdminBootstrapInvocation.kind === "operation") {
+    process.exitCode = await runTechnicalAdminBootstrapCli(technicalAdminBootstrapInvocation);
     return;
   }
 
