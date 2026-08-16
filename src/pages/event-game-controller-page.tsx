@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
+import { ControllerHeader } from "@/components/controller-header";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -68,6 +69,7 @@ import {
   readBrowserEventControllerSession,
   type PersistedEventControllerSession,
 } from "@/lib/event-controller-session";
+import { eventControllerHeaderIdentity } from "@/lib/controller-header-identity";
 
 type PersistedControllerSession = PersistedEventControllerSession;
 type ControllerOpenResponse = {
@@ -1853,20 +1855,38 @@ export function EventGameControllerPage() {
             </>
           ) : (
             <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain [&_button]:min-h-11">
-              <div className="rounded-lg border bg-muted/30 p-3 text-sm">
+              <ControllerHeader
+                identity={eventControllerHeaderIdentity(projection)}
+                warning={
+                  controllerConnectionStatus === "fresh"
+                    ? null
+                    : {
+                        queuedActions: replica?.pendingActions.length ?? 0,
+                        kind: controllerConnectionStatus === "stale" ? "stale" : "offline",
+                        retryDetail:
+                          controllerConnectionStatus === "stale"
+                            ? "Reconnect to reconcile."
+                            : "Reconnect to sync.",
+                      }
+                }
+                qr={{
+                  triggerRef: qrTriggerRef,
+                  label: revealedQr === null ? "Reveal active Grant QR" : "Show active Grant QR",
+                  expanded: qrDialogOpen,
+                  controls: "active-grant-qr-dialog",
+                  onClick: () => {
+                    if (revealedQr === null) void revealQr();
+                    else setQrDialogOpen(true);
+                  },
+                  disabled: busy,
+                }}
+                onLeave={() => setLeaveDialogOpen(true)}
+                leaveTriggerRef={leaveTriggerRef}
+                leaveLabel="Leave Event Game Controller session"
+                leaveDisabled={busy}
+              />
+              <div className="mt-2 rounded-lg border bg-muted/30 p-3 text-sm">
                 <p className="font-medium">Controller Device: {eventGameId}</p>
-                <p
-                  role="status"
-                  aria-live="polite"
-                  data-controller-freshness="true"
-                  className="mt-1 text-muted-foreground"
-                >
-                  {controllerConnectionStatus === "fresh"
-                    ? "Controller connection: fresh"
-                    : controllerConnectionStatus === "stale"
-                      ? "Controller connection: stale; reconnect to reconcile"
-                      : "Controller connection: disconnected; reconnect to reconcile"}
-                </p>
                 <p className="mt-1 text-muted-foreground">
                   {projection?.commencement.status === "commenced"
                     ? "Game Commencement is irreversible."
@@ -1878,37 +1898,12 @@ export function EventGameControllerPage() {
               </div>
               <div className="flex shrink-0 flex-wrap gap-2">
                 <Button
-                  ref={qrTriggerRef}
-                  variant="outline"
-                  aria-label={
-                    revealedQr === null ? "Reveal active Grant QR" : "Show active Grant QR"
-                  }
-                  aria-expanded={qrDialogOpen}
-                  aria-controls="active-grant-qr-dialog"
-                  onClick={() => {
-                    if (revealedQr === null) void revealQr();
-                    else setQrDialogOpen(true);
-                  }}
-                  disabled={busy}
-                >
-                  {revealedQr === null ? "Reveal active Grant QR" : "Show active Grant QR"}
-                </Button>
-                <Button
                   variant="outline"
                   aria-label="Refresh Event Game assignment"
                   onClick={() => void refreshController()}
                   disabled={busy}
                 >
                   Refresh assignment
-                </Button>
-                <Button
-                  variant="outline"
-                  aria-label="Leave Event Game Controller session"
-                  ref={leaveTriggerRef}
-                  onClick={() => setLeaveDialogOpen(true)}
-                  disabled={busy}
-                >
-                  Leave Controller Session
                 </Button>
               </div>
               {switchTarget === null ? null : (

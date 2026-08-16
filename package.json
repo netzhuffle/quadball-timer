@@ -14,6 +14,7 @@
     "test:focused:event-admin-browser-webkit": "bun scripts/test-event-admin-webkit.ts",
     "test:focused:public-event-browser": "bun scripts/test-public-event-browser.ts",
     "test:focused:event-game-controller-browser": "bun scripts/test-event-game-controller-browser.ts",
+    "test:focused:controller-header-mobile": "bun scripts/test-controller-header-mobile-focused.ts",
     "test:focused:event-game-routes": "bun test --isolate ./src/lib/live-event-game-transport.focused.ts",
     "test:focused:technical-admin": "bun test --isolate ./src/lib/technical-admin-auth-sqlite.focused.ts",
     "test:focused:technical-admin-bootstrap": "bun test --isolate ./src/lib/technical-admin-bootstrap.focused.ts",

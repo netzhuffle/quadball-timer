@@ -26,8 +26,11 @@ import {
 } from "@/lib/live-event-game-control";
 import {
   SHARED_LIMITS,
+  validateGameCode,
+  validateGameDesignation,
   validateIntegerInRange,
   validateOpaqueIdentifier,
+  validateTeamOrPitchName,
 } from "@/lib/validation-policy";
 import {
   projectControllerReplayRetry,
@@ -1073,6 +1076,7 @@ function sameProjection(left: ControllerProjection, right: ControllerProjection)
   ]);
   return (
     left.eventGameId === right.eventGameId &&
+    sameProjectionIdentity(left.identity, right.identity) &&
     left.phase === right.phase &&
     left.goalCount === right.goalCount &&
     left.commencement.status === right.commencement.status &&
@@ -1087,6 +1091,18 @@ function sameProjection(left: ControllerProjection, right: ControllerProjection)
       ([side, score], index) =>
         rightScores[index]?.[0] === side && rightScores[index]?.[1] === score,
     )
+  );
+}
+
+function sameProjectionIdentity(
+  left: ControllerProjection["identity"],
+  right: ControllerProjection["identity"],
+): boolean {
+  if (left === undefined || right === undefined) return left === right;
+  return (
+    left.pitchName === right.pitchName &&
+    left.gameCode === right.gameCode &&
+    left.gameDesignation === right.gameDesignation
   );
 }
 
@@ -1176,6 +1192,7 @@ function parsePendingAction(
 function parseProjection(value: unknown): ControllerProjection {
   if (!isRecord(value)) throw new Error("Controller projection is invalid.");
   const eventGameId = requireIdentifier(value.eventGameId, "projection.eventGameId");
+  const identity = parseProjectionIdentity(value.identity);
   const phase = value.phase;
   if (
     phase !== "scheduled" &&
@@ -1241,6 +1258,7 @@ function parseProjection(value: unknown): ControllerProjection {
         );
   return {
     eventGameId,
+    ...(identity === undefined ? {} : { identity }),
     phase,
     scoreByGameSide: scores,
     goalCount: goalCount.value,
@@ -1265,6 +1283,39 @@ function parseProjection(value: unknown): ControllerProjection {
       provisionalElapsedMs: elapsed.value,
     },
   };
+}
+
+function parseProjectionIdentity(value: unknown): ControllerProjection["identity"] | undefined {
+  if (value === undefined) return undefined;
+  if (!isRecord(value)) throw new Error("Projection identity is invalid.");
+  return {
+    pitchName: parseNullableProjectionText(
+      value.pitchName,
+      "projection.identity.pitchName",
+      validateTeamOrPitchName,
+    ),
+    gameCode: parseNullableProjectionText(
+      value.gameCode,
+      "projection.identity.gameCode",
+      validateGameCode,
+    ),
+    gameDesignation: parseNullableProjectionText(
+      value.gameDesignation,
+      "projection.identity.gameDesignation",
+      validateGameDesignation,
+    ),
+  };
+}
+
+function parseNullableProjectionText(
+  value: unknown,
+  field: string,
+  validate: (value: unknown) => { ok: true; value: string } | { ok: false; error: string },
+): string | null {
+  if (value === null) return null;
+  const parsed = validate(value);
+  if (!parsed.ok) throw new Error(`${field}: ${parsed.error}`);
+  return parsed.value;
 }
 
 function parseBoolean(value: unknown, field: string): boolean {

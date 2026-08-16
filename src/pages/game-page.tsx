@@ -1,17 +1,25 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+  type RefObject,
+} from "react";
 import QRCode from "qrcode/lib/browser";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { CloudOff, Eye, OctagonX, Shield, TriangleAlert, UserX, Wifi, WifiOff } from "lucide-react";
+import { Eye, OctagonX, Shield, TriangleAlert, UserX } from "lucide-react";
 import { projectGameView } from "@/lib/game-engine";
 import type { CardType, ControllerRole, GameCommand, TeamId } from "@/lib/game-types";
 import { GameControllerActionPanels } from "@/components/game-controller-action-panels";
 import { ControllerTopSection, PenaltyColumnsSection } from "@/components/game-controller-sections";
+import { ControllerHeader } from "@/components/controller-header";
 import {
   FLAG_RELEASE_MS,
   FLAG_STATUS_HIDE_AFTER_MS,
   FLAG_STATUS_SHOW_FROM_MS,
-  LOCAL_ONLY_MESSAGE,
   ONE_MINUTE_MS,
   SEEKER_RELEASE_MS,
   SEEKER_STATUS_HIDE_AFTER_MS,
@@ -93,6 +101,7 @@ export function GamePage({ gameId, role }: { gameId: string; role: ControllerRol
     useState<PendingWinConfirmation | null>(null);
   const [leaveDialogOpen, setLeaveDialogOpen] = useState(false);
   const [leavePending, setLeavePending] = useState(false);
+  const [adHocQrOpen, setAdHocQrOpen] = useState(false);
   const [entryReady, setEntryReady] = useState(role !== "controller");
   const [entryError, setEntryError] = useState<string | null>(null);
   const [scorePulse, setScorePulse] = useState<{ home: -1 | 0 | 1; away: -1 | 0 | 1 }>({
@@ -115,6 +124,7 @@ export function GamePage({ gameId, role }: { gameId: string; role: ControllerRol
   const rightTeamNameButtonRef = useRef<HTMLButtonElement | null>(null);
   const [displayTeamNameHeightPx, setDisplayTeamNameHeightPx] = useState<number | null>(null);
   const leaveTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const adHocQrTriggerRef = useRef<HTMLButtonElement | null>(null);
   const entryTriggerRef = useRef<HTMLButtonElement | null>(null);
   const entryStartedForRef = useRef<string | null>(null);
   const departureModule = getBrowserControllerDeparture();
@@ -139,6 +149,11 @@ export function GamePage({ gameId, role }: { gameId: string; role: ControllerRol
     role,
     blocked: departureBlocked || !entryReady,
   });
+  const controllerWarningRetryDetail = localOnlyMode
+    ? "Server does not know this game; retry when the server returns."
+    : error !== null && /busy|retry|reconnect|reach server/iu.test(error)
+      ? error
+      : undefined;
   const [leaveMessage, setLeaveMessage] = useState<string | null>(null);
   const entry = useControllerDepartureEntry({
     destination: { kind: "resume-ad-hoc", gameId },
@@ -881,87 +896,57 @@ export function GamePage({ gameId, role }: { gameId: string; role: ControllerRol
         />
       ) : null}
       <div className="mx-auto grid h-full w-full max-w-[460px] grid-rows-[auto_auto_minmax(0,1fr)_auto_auto] gap-2">
-        <section className="rounded-2xl border border-slate-300 bg-white px-3 py-2 shadow-[0_8px_18px_rgba(15,23,42,0.08)]">
-          <div className="flex items-start justify-between gap-2">
-            <div className="min-w-0">
-              <p className="truncate text-xs font-semibold tracking-wide text-slate-900">
-                {state.homeName} vs {state.awayName}
-              </p>
-              <p className="text-[10px] text-slate-500">{role}</p>
-            </div>
-            <div className="flex items-center gap-1.5">
-              {controller ? (
-                localOnlyMode ? (
-                  <span className="inline-flex items-center gap-1 rounded bg-amber-100 px-2 py-1 text-[10px] font-semibold text-amber-800">
-                    <CloudOff className="h-3 w-3" />
-                    Local
-                  </span>
-                ) : connectionState !== "online" ? (
-                  <span className="inline-flex items-center gap-1 rounded bg-amber-100 px-2 py-1 text-[10px] font-semibold text-amber-800">
-                    <WifiOff className="h-3 w-3" />
-                    Offline {pendingCommands}
-                  </span>
-                ) : (
-                  <span className="inline-flex items-center gap-1 rounded bg-emerald-100 px-2 py-1 text-[10px] font-semibold text-emerald-800">
-                    <Wifi className="h-3 w-3" />
-                    Live
-                  </span>
-                )
-              ) : (
-                <span className="inline-flex items-center gap-1 rounded bg-sky-100 px-2 py-1 text-[10px] font-semibold text-sky-800">
-                  <Eye className="h-3 w-3" />
-                  Read only
-                </span>
-              )}
-              <Button
-                variant="outline"
-                size="sm"
-                className="h-7 border-slate-300 bg-white px-2 text-[11px] text-slate-800 hover:bg-slate-100"
-                onClick={() => navigateTo("/")}
-              >
-                Games
-              </Button>
-              {controller ? (
-                <Button
-                  ref={leaveTriggerRef}
-                  variant="outline"
-                  size="sm"
-                  className="h-7 border-slate-300 bg-white px-2 text-[11px] text-slate-800 hover:bg-slate-100"
-                  onClick={() => setLeaveDialogOpen(true)}
-                >
-                  Leave
-                </Button>
-              ) : null}
-            </div>
-          </div>
+        <ControllerHeader
+          identity={{
+            eyebrow: "Ad Hoc Game",
+            title: `${state.homeName} vs ${state.awayName}`,
+          }}
+          warning={
+            controller && connectionState !== "online"
+              ? {
+                  kind: "offline",
+                  queuedActions: pendingCommands,
+                  retryDetail: controllerWarningRetryDetail,
+                }
+              : null
+          }
+          qr={
+            controller && controlQr !== null && !state.isFinished
+              ? {
+                  label: "Show Ad Hoc Control QR",
+                  expanded: adHocQrOpen,
+                  controls: "ad-hoc-control-qr-dialog",
+                  triggerRef: adHocQrTriggerRef,
+                  onClick: () => setAdHocQrOpen(true),
+                }
+              : undefined
+          }
+          onLeave={controller ? () => setLeaveDialogOpen(true) : undefined}
+          leaveTriggerRef={controller ? leaveTriggerRef : undefined}
+          leaveLabel="Leave Ad Hoc Game Controller"
+        >
           {leaveMessage ? (
             <p className="mt-1 text-[10px] font-medium text-rose-700">{leaveMessage}</p>
           ) : null}
-          {error !== null ? (
-            <p
-              className="mt-1 text-[10px] font-medium text-amber-700"
-              role="status"
-              aria-live="polite"
-            >
+          {!controller && error === null ? (
+            <p className="mt-1 inline-flex items-center gap-1 text-[10px] text-slate-500">
+              <Eye className="size-3" aria-hidden="true" /> Read only
+            </p>
+          ) : null}
+          {controller && error !== null && connectionState === "online" ? (
+            <p className="mt-1 text-[10px] font-medium text-amber-700" role="status">
               {error}
             </p>
           ) : null}
-          {controller ? (
-            localOnlyMode ? (
-              <p className="mt-1 text-[10px] font-medium text-amber-700">{LOCAL_ONLY_MESSAGE}</p>
-            ) : connectionState !== "online" ? (
-              <p className="mt-1 text-[10px] font-medium text-amber-700">
-                Offline mode active. {pendingCommands} local change(s) queued.
-              </p>
-            ) : null
-          ) : null}
-        </section>
+        </ControllerHeader>
 
         {controller ? (
           <AdHocControlHandoff
             gameId={gameId}
             controlQr={controlQr}
-            isFinished={state.isFinished}
+            qrOpen={adHocQrOpen}
+            triggerRef={adHocQrTriggerRef}
+            onClose={() => setAdHocQrOpen(false)}
           />
         ) : null}
 
@@ -1159,24 +1144,22 @@ export function GamePage({ gameId, role }: { gameId: string; role: ControllerRol
 function AdHocControlHandoff({
   gameId,
   controlQr,
-  isFinished,
+  qrOpen,
+  triggerRef,
+  onClose,
 }: {
   gameId: string;
   controlQr: string | null;
-  isFinished: boolean;
+  qrOpen: boolean;
+  triggerRef: RefObject<HTMLButtonElement | null>;
+  onClose: () => void;
 }) {
   const [qrDataUrl, setQrDataUrl] = useState<string | null>(null);
   const [qrError, setQrError] = useState(false);
-  const [qrOpen, setQrOpen] = useState(false);
   const dialogRef = useRef<HTMLDivElement | null>(null);
   const closeQrButtonRef = useRef<HTMLButtonElement | null>(null);
-  const showQrButtonRef = useRef<HTMLButtonElement | null>(null);
+  const dialogWasOpenRef = useRef(false);
   const payload = controlQr === null ? null : buildAdHocControlQrPayload(gameId, controlQr);
-
-  const closeQr = useCallback(() => {
-    setQrOpen(false);
-    window.setTimeout(() => showQrButtonRef.current?.focus(), 0);
-  }, []);
 
   useEffect(() => {
     if (!qrOpen) return;
@@ -1187,7 +1170,7 @@ function AdHocControlHandoff({
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         event.preventDefault();
-        closeQr();
+        onClose();
         return;
       }
       if (event.key !== "Tab") return;
@@ -1213,7 +1196,17 @@ function AdHocControlHandoff({
 
     dialog.addEventListener("keydown", onKeyDown);
     return () => dialog.removeEventListener("keydown", onKeyDown);
-  }, [closeQr, qrOpen]);
+  }, [onClose, qrOpen]);
+
+  useEffect(() => {
+    if (qrOpen) {
+      dialogWasOpenRef.current = true;
+      return;
+    }
+    if (!dialogWasOpenRef.current) return;
+    dialogWasOpenRef.current = false;
+    window.setTimeout(() => triggerRef.current?.focus(), 0);
+  }, [qrOpen, triggerRef]);
 
   useEffect(() => {
     if (payload === null) {
@@ -1240,62 +1233,44 @@ function AdHocControlHandoff({
     };
   }, [payload]);
 
+  if (!qrOpen) return null;
   return (
-    <section
-      aria-label="Ad Hoc Controller handoff"
-      className="rounded-2xl border border-slate-300 bg-white p-3 shadow-[0_8px_18px_rgba(15,23,42,0.08)]"
+    <div
+      id="ad-hoc-control-qr-dialog"
+      aria-label="Ad Hoc Control QR dialog"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/50 p-4"
+      aria-modal="true"
+      ref={dialogRef}
+      role="dialog"
+      onClick={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
     >
-      <p className="text-xs font-semibold tracking-wide text-slate-900">Share Ad Hoc Control</p>
-      {isFinished ? (
-        <p className="mt-1 text-[11px] text-slate-600">
-          This Game is finished. Existing Controllers can still make Corrections; new admission is
-          paused.
-        </p>
-      ) : qrOpen ? (
-        <div
-          aria-label="Ad Hoc Control QR dialog"
-          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/50 p-4"
-          aria-modal="true"
-          ref={dialogRef}
-          role="dialog"
-        >
-          <div className="w-full max-w-sm space-y-3 rounded-2xl bg-white p-4 shadow-xl">
-            <div className="flex items-center justify-between gap-2">
-              <p className="text-sm font-semibold text-slate-900">Ad Hoc Control QR</p>
-              <Button ref={closeQrButtonRef} size="sm" variant="outline" onClick={closeQr}>
-                Close Control QR
-              </Button>
-            </div>
-            {qrError ? (
-              <p className="text-[11px] text-rose-700">Unable to display the Control QR.</p>
-            ) : qrDataUrl !== null ? (
-              <>
-                <img
-                  alt="Ad Hoc Control QR code"
-                  className="mx-auto size-64 max-w-full rounded border border-slate-200"
-                  src={qrDataUrl}
-                />
-                <p className="text-center text-[11px] text-slate-600">
-                  Scan this QR on another device to join directly as an equal Controller.
-                </p>
-              </>
-            ) : (
-              <p className="text-[11px] text-slate-600">Preparing the reusable Control QR…</p>
-            )}
-          </div>
+      <div className="w-full max-w-sm space-y-3 rounded-2xl bg-white p-4 shadow-xl">
+        <div className="flex items-center justify-between gap-2">
+          <p className="text-sm font-semibold text-slate-900">Ad Hoc Control QR</p>
+          <Button ref={closeQrButtonRef} size="sm" variant="outline" onClick={onClose}>
+            Close Control QR
+          </Button>
         </div>
-      ) : (
-        <Button
-          ref={showQrButtonRef}
-          size="sm"
-          variant="outline"
-          className="mt-2"
-          onClick={() => setQrOpen(true)}
-        >
-          Show Ad Hoc Control QR
-        </Button>
-      )}
-    </section>
+        {qrError ? (
+          <p className="text-[11px] text-rose-700">Unable to display the Control QR.</p>
+        ) : qrDataUrl !== null ? (
+          <>
+            <img
+              alt="Ad Hoc Control QR code"
+              className="mx-auto size-64 max-w-full rounded border border-slate-200"
+              src={qrDataUrl}
+            />
+            <p className="text-center text-[11px] text-slate-600">
+              Scan this QR on another device to join directly as an equal Controller.
+            </p>
+          </>
+        ) : (
+          <p className="text-[11px] text-slate-600">Preparing the reusable Control QR…</p>
+        )}
+      </div>
+    </div>
   );
 }
 

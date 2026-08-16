@@ -83,7 +83,7 @@ try {
   }
 
   console.log(
-    "Focused Integration Test passed: Chromium/WebKit 360x640 Controller interactions and suspend/review/resume.",
+    "Focused Integration Test passed: Chromium/WebKit 390x844 and 412x915 Controller interactions and suspend/review/resume.",
   );
 } catch (error) {
   console.error(error instanceof Error ? error.message : String(error));
@@ -104,12 +104,13 @@ try {
 
 async function completeSuspendReviewResume(page: Page) {
   page.setDefaultTimeout(5_000);
-  await page.setViewportSize({ width: 360, height: 640 });
+  await page.setViewportSize({ width: 390, height: 844 });
   await page.goto(`${origin}/event-control`);
   await page.getByLabel("Active Pitch Slot Control Grant QR").fill("disposable-grant");
   await page.getByRole("button", { name: "Open Event Game Controller" }).click();
   await page.getByText("Controller Device: game-browser-focused").waitFor();
   await assertControllerSurface(page, "initial");
+  await assertControllerHeaderGeometry(page, "initial");
   await page.getByRole("button", { name: "Start game clock" }).click();
   await page.getByRole("button", { name: "Adjust game clock by plus 10 seconds" }).click();
   await page.getByLabel("Set game clock (milliseconds)").fill("123000");
@@ -219,6 +220,22 @@ async function eventDepartureLifecycleEvidence(page: Page) {
 }
 
 async function assertControllerSurface(page: Page, label = "surface") {
+  const header = page.getByRole("region", { name: "Controller header" });
+  await header.waitFor();
+  const headerText = await header.innerText();
+  const normalizedHeaderText = headerText.toLowerCase();
+  assert(
+    normalizedHeaderText.includes("pitch 2 · qf-07"),
+    `${label} lost Event identity: ${headerText}`,
+  );
+  assert(
+    normalizedHeaderText.includes("championship"),
+    `${label} lost Game Designation: ${headerText}`,
+  );
+  assert(
+    !(await header.innerText()).includes("Controller connection"),
+    `${label} exposed healthy status`,
+  );
   const controls = await page.locator("button").evaluateAll((buttons) =>
     buttons
       .map((button) => ({
@@ -239,10 +256,11 @@ async function assertControllerSurface(page: Page, label = "surface") {
 }
 
 async function reviewAndResume(page: Page) {
-  await page.setViewportSize({ width: 360, height: 640 });
+  await page.setViewportSize({ width: 412, height: 915 });
   await page.goto(`${origin}/event-control`);
   await page.getByLabel("Active Pitch Slot Control Grant QR").fill("disposable-grant");
   await page.getByRole("button", { name: "Open Event Game Controller" }).click();
+  await assertControllerHeaderGeometry(page, "review");
   await page.locator('[data-suspension-snapshot="effective"]').waitFor();
   const snapshotText = await page.locator('[data-suspension-snapshot="effective"]').innerText();
   assert(snapshotText.includes("Volleyball: side-a"), "volleyball recovery was not shown");
@@ -257,6 +275,25 @@ async function reviewAndResume(page: Page) {
   };
   assert(resumed.projection?.suspension?.status === "none", "resume did not clear suspension");
   await assertNoDocumentScroll(page);
+}
+
+async function assertControllerHeaderGeometry(page: Page, stage: string) {
+  const qr = page.getByRole("button", { name: /Grant QR/u });
+  const leave = page.getByRole("button", { name: "Leave Event Game Controller session" });
+  const qrBox = await qr.boundingBox();
+  const leaveBox = await leave.boundingBox();
+  assert(
+    qrBox !== null && qrBox.width >= 44 && qrBox.height >= 44,
+    `${stage} QR target was too small`,
+  );
+  assert(
+    leaveBox !== null && leaveBox.width >= 44 && leaveBox.height >= 44,
+    `${stage} Leave target was too small`,
+  );
+  assert(
+    qrBox !== null && leaveBox !== null && Math.abs(qrBox.x + qrBox.width - leaveBox.x) >= 8,
+    `${stage} QR and Leave controls were directly adjacent`,
+  );
 }
 
 async function installControllerApi(context: BrowserContext) {
@@ -442,6 +479,7 @@ function createProjection(): ControllerProjection {
   baseline.authorityGeneration = 1;
   return {
     eventGameId: "game-browser-focused",
+    identity: { pitchName: "Pitch 2", gameCode: "QF-07", gameDesignation: "Championship" },
     phase: "in-progress",
     scoreByGameSide: { "side-a": 0, "side-b": 0 },
     goalCount: 0,
@@ -474,6 +512,20 @@ function createProjection(): ControllerProjection {
       provisionalElapsedMs: 0,
     },
     clock: projectClockBaseline(baseline, 0),
+    teamAssignments: [
+      {
+        gameSideId: "side-a",
+        eventTeamId: "team-a",
+        eventTeamName: "Basilisks",
+        teamInterpretationRef: "ref-a",
+      },
+      {
+        gameSideId: "side-b",
+        eventTeamId: "team-b",
+        eventTeamName: "Thunderbirds",
+        teamInterpretationRef: "ref-b",
+      },
+    ],
     presentation: {
       gameSideIds: ["side-a", "side-b"],
       pitchOrientation: "side-a-left",
