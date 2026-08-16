@@ -792,15 +792,19 @@ describe("Audience Publication Projection", () => {
             {
               eventGameId: "secret1",
               gameDesignation: "9:30",
+              scheduleStatus: "past",
               sideA: {
                 name: "Basel Basilisks / Luzern",
                 color: "#16a34a",
+                score: 40,
               },
               sideB: {
                 name: "Berner Boggarts",
                 color: "#7f1d1d",
+                score: 140,
               },
-              spectatorAvailable: false,
+              clock: { gameTimeMs: 1_360_000 },
+              spectatorAvailable: true,
             },
             {
               eventGameId: "secret2",
@@ -835,7 +839,7 @@ describe("Audience Publication Projection", () => {
     expect(pastResult).toMatchObject({ status: "accepted", value: { lifecycle: "past" } });
   });
 
-  test("publishes only created SQM fixture games and keeps uncreated rows anonymous", async () => {
+  test("publishes the hardcoded first SQM game and only created tracked games", async () => {
     const storage = {
       snapshot: async () => ({ listEvents: () => [] }),
     } as unknown as EventCatalogFoundationStorage;
@@ -862,6 +866,17 @@ describe("Audience Publication Projection", () => {
       },
     });
 
+    const hardcoded = await audience.readGame("sqm-2026", "secret1");
+    expect(hardcoded).toMatchObject({
+      status: "accepted",
+      value: {
+        eventGameId: "secret1",
+        scheduleStatus: "past",
+        sideA: { score: 40 },
+        sideB: { score: 140 },
+        clock: { gameTimeMs: 1_360_000 },
+      },
+    });
     const accepted = await audience.readGame("sqm-2026", "secret2");
     expect(accepted).toMatchObject({
       status: "accepted",
@@ -872,7 +887,7 @@ describe("Audience Publication Projection", () => {
         sideB: { name: "Berner Boggarts", color: "#7f1d1d" },
       },
     });
-    expect(await audience.readGame("sqm-2026", "secret1")).toEqual({ status: "unavailable" });
+    expect(await audience.readGame("sqm-2026", "secret3")).toEqual({ status: "unavailable" });
   });
 
   test("lists only Published Events and classifies them in each Event timezone", async () => {
