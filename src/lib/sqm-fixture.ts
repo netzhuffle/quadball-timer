@@ -11,6 +11,9 @@ export const SQM_FIXTURE_EVENT_ID = "sqm-2026" as const;
 export const SQM_FIXTURE_EVENT_NAME = "Schweizer Quadball Meisterschaft 2026" as const;
 export const SQM_FIXTURE_TIME_ZONE = "Europe/Zurich" as const;
 export const SQM_FIXTURE_GAME_DAY = "2026-08-16" as const;
+const SQM_FIRST_GAME_HOME_SCORE = 40;
+const SQM_FIRST_GAME_AWAY_SCORE = 140;
+const SQM_FIRST_GAME_TIME_MS = 22 * 60_000 + 40_000;
 
 export type SqmFixtureKey = "secret1" | "secret2" | "secret3" | "secret4";
 
@@ -104,8 +107,9 @@ export function createSqmFixtureGameProjection(
   gameId: string | null,
   nowMs: number,
 ): PublicAudienceGameProjection {
-  const state = game?.state;
-  const isFinished = state?.isFinished === true;
+  const isHardcodedFirstGame = definition.key === "secret1";
+  const state = isHardcodedFirstGame ? undefined : game?.state;
+  const isFinished = isHardcodedFirstGame || state?.isFinished === true;
   const isSuspended = state?.isSuspended === true;
   const isRunning = state?.isRunning === true;
   const operationalProjection = isSuspended
@@ -118,15 +122,27 @@ export function createSqmFixtureGameProjection(
             : ("scheduled" as const),
         gameSuspension: "none" as const,
       };
-  const scheduleStatus = isFinished
+  const scheduleStatus = isHardcodedFirstGame
     ? ("past" as const)
-    : isRunning || isSuspended
-      ? ("running" as const)
-      : definition.scheduledStartMs <= nowMs
-        ? ("awaiting-start" as const)
-        : ("future" as const);
-  const clock = state === undefined ? null : projectFixtureClock(state, nowMs);
-  const winner = state?.winner === "home" ? "side-a" : state?.winner === "away" ? "side-b" : null;
+    : isFinished
+      ? ("past" as const)
+      : isRunning || isSuspended
+        ? ("running" as const)
+        : definition.scheduledStartMs <= nowMs
+          ? ("awaiting-start" as const)
+          : ("future" as const);
+  const clock = isHardcodedFirstGame
+    ? projectFixtureClockValue(SQM_FIRST_GAME_TIME_MS, nowMs)
+    : state === undefined
+      ? null
+      : projectFixtureClock(state, nowMs);
+  const winner = isHardcodedFirstGame
+    ? "side-b"
+    : state?.winner === "home"
+      ? "side-a"
+      : state?.winner === "away"
+        ? "side-b"
+        : null;
   const catchingSide =
     state?.flagCatch?.team === "home"
       ? "side-a"
@@ -151,12 +167,12 @@ export function createSqmFixtureGameProjection(
     sideA: {
       name: state?.homeName ?? definition.homeName,
       color: state?.homeColor ?? definition.homeColor,
-      score: state?.score.home ?? null,
+      score: isHardcodedFirstGame ? SQM_FIRST_GAME_HOME_SCORE : (state?.score.home ?? null),
     },
     sideB: {
       name: state?.awayName ?? definition.awayName,
       color: state?.awayColor ?? definition.awayColor,
-      score: state?.score.away ?? null,
+      score: isHardcodedFirstGame ? SQM_FIRST_GAME_AWAY_SCORE : (state?.score.away ?? null),
     },
     overtimeTarget: null,
     clock,
@@ -197,7 +213,7 @@ export function createSqmFixtureGameProjection(
     },
     canonicalPath: `/events/${encodeURIComponent(SQM_FIXTURE_EVENT_ID)}/games/${encodeURIComponent(definition.key)}`,
     timeline: [],
-    spectatorAvailable: gameId !== null,
+    spectatorAvailable: isHardcodedFirstGame || gameId !== null,
   };
 }
 
@@ -246,12 +262,16 @@ function emptySqmSchedule(nowMs: number): PublicAudienceScheduleProjection {
 }
 
 function projectFixtureClock(state: GameView["state"], nowMs: number) {
+  return projectFixtureClockValue(state.gameClockMs, nowMs, state.updatedAtMs);
+}
+
+function projectFixtureClockValue(gameTimeMs: number, nowMs: number, updatedAtMs = nowMs) {
   const baseline = {
     ...createInitialClockBaseline(),
-    gameTimeMs: state.gameClockMs,
+    gameTimeMs,
     running: false,
-    establishedAtMs: state.updatedAtMs,
-    lastAcceptedAtMs: state.updatedAtMs,
+    establishedAtMs: updatedAtMs,
+    lastAcceptedAtMs: updatedAtMs,
   };
   return projectClockBaseline(baseline, nowMs);
 }
