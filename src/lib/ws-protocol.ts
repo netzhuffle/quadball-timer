@@ -501,6 +501,32 @@ export function parseGameCommand(payload: Record<string, unknown>):
     };
   }
 
+  if (payload.type === "update-card") {
+    const cardId = validateOpaqueIdentifier(payload.cardId, "cardId");
+    if (!cardId.ok) return { ok: false, error: `update-card ${cardId.error}` };
+    if (!isTeam(payload.team) || !isCardType(payload.cardType)) {
+      return { ok: false, error: "update-card requires cardId, team, and cardType." };
+    }
+    if (payload.playerNumber !== null && typeof payload.playerNumber !== "number") {
+      return { ok: false, error: "update-card playerNumber must be number or null." };
+    }
+    const playerNumber =
+      payload.playerNumber === null ? null : validatePlayerNumber(payload.playerNumber);
+    if (playerNumber !== null && !playerNumber.ok) {
+      return { ok: false, error: playerNumber.error };
+    }
+    return {
+      ok: true,
+      command: {
+        type: "update-card",
+        cardId: cardId.value,
+        team: payload.team,
+        playerNumber: playerNumber === null ? null : playerNumber.value,
+        cardType: payload.cardType,
+      },
+    };
+  }
+
   if (payload.type === "confirm-penalty-expiration") {
     const pendingId = validateOpaqueIdentifier(payload.pendingId, "pendingId");
     if (!pendingId.ok) {

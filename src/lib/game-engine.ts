@@ -1,5 +1,4 @@
 import type {
-  CardType,
   GameFinishReason,
   GameCommand,
   GameState,
@@ -11,6 +10,7 @@ import type {
   ScoreEvent,
   TeamId,
 } from "@/lib/game-types";
+import { applyAdHocCardMutation } from "@/lib/ad-hoc-card-facts";
 import {
   DEFAULT_AWAY_TEAM_COLOR,
   DEFAULT_HOME_TEAM_COLOR,
@@ -22,7 +22,6 @@ import {
   validateClockAdjustmentMs,
   validateGameClockMs,
   validateIntegerInRange,
-  validatePlayerNumber,
 } from "@/lib/validation-policy";
 
 const ONE_MINUTE_MS = 60_000;
@@ -120,6 +119,11 @@ export function cloneGameState(state: GameState): GameState {
   }
   cloned.homeColor = normalizeTeamColor(cloned.homeColor, DEFAULT_HOME_TEAM_COLOR);
   cloned.awayColor = normalizeTeamColor(cloned.awayColor, DEFAULT_AWAY_TEAM_COLOR);
+  for (const event of cloned.cardEvents) {
+    if (!Number.isSafeInteger(event.gameClockMs) || event.gameClockMs < 0) {
+      event.gameClockMs = 0;
+    }
+  }
   if (cloned.winner !== "home" && cloned.winner !== "away" && cloned.winner !== null) {
     cloned.winner = null;
   }
@@ -314,12 +318,19 @@ export function applyGameCommand({
     }
 
     case "add-card": {
-      addCardToPlayer({
+      applyAdHocCardMutation({
         state: next,
-        cardType: command.cardType,
-        team: command.team,
-        playerNumber: command.playerNumber,
-        startedGameClockMs: command.startedGameClockMs,
+        mutation: command,
+        nowMs,
+        idGenerator: makeId,
+      });
+      return next;
+    }
+
+    case "update-card": {
+      applyAdHocCardMutation({
+        state: next,
+        mutation: command,
         nowMs,
         idGenerator: makeId,
       });
@@ -652,129 +663,6 @@ function undoLastScoreForTeam(state: GameState, team: TeamId, nowMs: number) {
       );
     }
   }
-}
-
-function addCardToPlayer({
-  state,
-  team,
-  playerNumber,
-  cardType,
-  startedGameClockMs,
-  nowMs,
-  idGenerator,
-}: {
-  state: GameState;
-  team: TeamId;
-  playerNumber: number | null;
-  cardType: CardType;
-  startedGameClockMs?: number;
-  nowMs: number;
-  idGenerator: IdGenerator;
-}) {
-  if (playerNumber !== null && !validatePlayerNumber(playerNumber).ok) {
-    return;
-  }
-  if (startedGameClockMs !== undefined && !validateGameClockMs(startedGameClockMs).ok) {
-    return;
-  }
-
-  let playerKey: string | null = null;
-
-  if (cardType !== "ejection") {
-    playerKey = getPlayerKey(state, team, playerNumber);
-    const existingPlayer = state.players[playerKey];
-    const hadExistingSegments =
-      existingPlayer !== undefined &&
-      existingPlayer.segments.some((segment) => segment.remainingMs > 0);
-    const player = getOrCreatePlayer(state, team, playerNumber, playerKey);
-    const newSegments: PlayerPenaltyState["segments"] = [];
-
-    if (cardType === "red") {
-      newSegments.push(
-        createPenaltySegment({ idGenerator, cardType: "red", expirableByScore: false }),
-        createPenaltySegment({ idGenerator, cardType: "red", expirableByScore: false }),
-      );
-    }
-
-    if (cardType === "blue" || cardType === "yellow") {
-      newSegments.push(createPenaltySegment({ idGenerator, cardType, expirableByScore: true }));
-    }
-
-    const normalizedStartedClockMs = startedGameClockMs ?? state.gameClockMs;
-    const elapsedSinceEntryStartMs = Math.max(0, state.gameClockMs - normalizedStartedClockMs);
-
-    if (!hadExistingSegments && elapsedSinceEntryStartMs > 0) {
-      consumePenaltySegments(newSegments, elapsedSinceEntryStartMs);
-    }
-
-    player.segments.push(...newSegments.filter((segment) => segment.remainingMs > 0));
-
-    if (player.segments.length === 0) {
-      recordReleasedPenalty({
-        state,
-        player,
-        nowMs,
-        reason: "served",
-      });
-      delete state.players[player.key];
-    }
-  } else if (playerNumber !== null) {
-    playerKey = `${team}:${playerNumber}`;
-  }
-
-  state.cardEvents.push({
-    id: idGenerator(),
-    team,
-    playerKey,
-    playerNumber,
-    cardType,
-    createdAtMs: nowMs,
-  });
-}
-
-function createPenaltySegment({
-  idGenerator,
-  cardType,
-  expirableByScore,
-}: {
-  idGenerator: IdGenerator;
-  cardType: "blue" | "yellow" | "red";
-  expirableByScore: boolean;
-}) {
-  return {
-    id: idGenerator(),
-    cardType,
-    remainingMs: ONE_MINUTE_MS,
-    expirableByScore,
-  };
-}
-
-function getPlayerKey(state: GameState, team: TeamId, playerNumber: number | null): string {
-  if (playerNumber !== null) {
-    return `${team}:${playerNumber}`;
-  }
-
-  const unknownIndex = state.nextUnknownPlayerId[team];
-  state.nextUnknownPlayerId[team] += 1;
-  return `${team}:unknown:${unknownIndex}`;
-}
-
-function getOrCreatePlayer(
-  state: GameState,
-  team: TeamId,
-  playerNumber: number | null,
-  key: string,
-): PlayerPenaltyState {
-  if (state.players[key] === undefined) {
-    state.players[key] = {
-      key,
-      team,
-      playerNumber,
-      segments: [],
-    };
-  }
-
-  return state.players[key];
 }
 
 function tickPenaltyClock(state: GameState, deltaMs: number, nowMs: number) {

@@ -61,10 +61,6 @@ describe("Ad Hoc Controller action UI", () => {
     await click(panelButton("Home"));
     expect(container.querySelector('[data-card-wizard-step="number"]')).not.toBeNull();
     await click(panelButton("OK"));
-    expect(container.querySelector('[data-controller-action-panel="true"]')).not.toBeNull();
-    expect(container.querySelector('[role="alert"]')).not.toBeNull();
-    await click(panelButton("7"));
-    await click(panelButton("OK"));
     expect(container.querySelector('[data-controller-action-panel="true"]')).toBeNull();
     expect(document.activeElement).toBe(cards);
 
@@ -130,6 +126,8 @@ function AdHocActionHarness() {
     team: null as TeamId | null,
     digits: "",
     startedGameClockMs: null as number | null,
+    editingCardId: null as string | null,
+    wizardStep: "type" as "type" | "team" | "number",
   });
   const [pendingWinConfirmation, setPendingWinConfirmation] = useState<{ label: string } | null>(
     null,
@@ -141,7 +139,14 @@ function AdHocActionHarness() {
     );
   };
   const resetDraft = () =>
-    setCardDraft({ cardType: null, team: null, digits: "", startedGameClockMs: null });
+    setCardDraft({
+      cardType: null,
+      team: null,
+      digits: "",
+      startedGameClockMs: null,
+      editingCardId: null,
+      wizardStep: "type",
+    });
 
   return (
     <>
@@ -208,11 +213,22 @@ function AdHocActionHarness() {
               : "Ready"
         }
         canEditCardDigits={cardDraft.cardType !== null && cardDraft.team !== null}
+        cardCreationPending={false}
+        commitCardWithoutNumber={(team) =>
+          setCardDraft((current) => ({
+            ...current,
+            team,
+            editingCardId: "ui-action",
+            wizardStep: "number",
+          }))
+        }
         appendCardDigit={(digit) =>
           setCardDraft((current) => ({ ...current, digits: current.digits + digit }))
         }
         canSubmitCard={
-          cardDraft.cardType !== null && cardDraft.team !== null && cardDraft.digits.length > 0
+          cardDraft.cardType !== null &&
+          cardDraft.team !== null &&
+          (cardDraft.editingCardId !== null || cardDraft.digits.length > 0)
         }
         submitCard={() => {
           dispatch({

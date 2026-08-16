@@ -575,6 +575,38 @@ describe("ws-protocol", () => {
     expect(parsed.message.commands[0].command.awayColor).toBe("fedcba");
   });
 
+  test("parses an Ad Hoc exact-card update with an optional number", () => {
+    const parsed = parseClientWsMessage(
+      JSON.stringify({
+        type: "apply-commands",
+        gameId: "game-123",
+        commands: [
+          {
+            id: "cmd-update-card",
+            clientSentAtMs: 42,
+            command: {
+              type: "update-card",
+              cardId: "card-123",
+              team: "away",
+              cardType: "yellow",
+              playerNumber: null,
+            },
+          },
+        ],
+      }),
+    );
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok || parsed.message.type !== "apply-commands") return;
+    expect(parsed.message.commands[0]?.command).toEqual({
+      type: "update-card",
+      cardId: "card-123",
+      team: "away",
+      cardType: "yellow",
+      playerNumber: null,
+    });
+  });
+
   test("rejects rename-teams with invalid color", () => {
     const parsed = parseClientWsMessage(
       JSON.stringify({

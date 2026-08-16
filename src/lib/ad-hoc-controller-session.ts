@@ -280,7 +280,9 @@ function isValidGameState(value: unknown, expectedId: string): value is GameStat
         !validateOpaqueIdentifier(segment.id, "segmentId").ok ||
         !isSafeNumber(segment.remainingMs) ||
         segment.remainingMs < 0 ||
-        typeof segment.expirableByScore !== "boolean"
+        typeof segment.expirableByScore !== "boolean" ||
+        (segment.cardEventId !== undefined &&
+          !validateOpaqueIdentifier(segment.cardEventId, "cardEventId").ok)
       )
         return false;
     }
@@ -314,7 +316,8 @@ function isPersistedCardEvent(value: unknown): boolean {
     (value.playerKey === null || validateOpaqueIdentifier(value.playerKey, "playerKey").ok) &&
     (value.playerNumber === null || isScore(value.playerNumber)) &&
     ["blue", "yellow", "red", "ejection"].includes(value.cardType) &&
-    isSafeNumber(value.createdAtMs)
+    isSafeNumber(value.createdAtMs) &&
+    (value.gameClockMs === undefined || isSafeNumber(value.gameClockMs))
   );
 }
 function isPersistedPending(value: unknown): boolean {

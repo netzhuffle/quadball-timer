@@ -2176,6 +2176,8 @@ function validateGameState(value: unknown, expectedId: string): asserts value is
     if (!["blue", "yellow", "red", "ejection"].includes(event.cardType))
       throw new Error("Stored card type is invalid.");
     requireSafeNonNegative(event.createdAtMs, "card event createdAtMs");
+    if (event.gameClockMs !== undefined)
+      requireInteger(event.gameClockMs, 0, SHARED_LIMITS.clock.maxMs, "card event gameClockMs");
   }
   if (!isRecord(value.players)) throw new Error("Stored players are invalid.");
   for (const [key, player] of Object.entries(value.players)) {
@@ -2192,6 +2194,7 @@ function validateGameState(value: unknown, expectedId: string): asserts value is
       requireInteger(segment.remainingMs, 0, SHARED_LIMITS.clock.maxMs, "penalty remainingMs");
       if (typeof segment.expirableByScore !== "boolean")
         throw new Error("Stored penalty expiration flag is invalid.");
+      if (segment.cardEventId !== undefined) requireOpaque(segment.cardEventId, "cardEventId");
     }
   }
   for (const pending of value.pendingExpirations) {
