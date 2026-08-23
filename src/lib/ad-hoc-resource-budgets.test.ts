@@ -6,6 +6,7 @@ import {
   AD_HOC_CONTROLLER_SUSTAINED_PER_SECOND,
   AD_HOC_GAME_BURST,
   AD_HOC_GAME_SUSTAINED_PER_SECOND,
+  AD_HOC_MAX_RETAINED_REJECTED_OPERATIONS_PER_GAME,
   AD_HOC_REPLAY_BURST,
   AD_HOC_REPLAY_SUSTAINED_PER_SECOND,
   adHocCreationDelayMs,
@@ -32,6 +33,10 @@ async function drainScheduled<T>(promise: Promise<T>, queue: (() => void)[]): Pr
 }
 
 describe("Ad Hoc resource budgets", () => {
+  test("bounds only retained rejected Ad Hoc replay evidence", () => {
+    expect(AD_HOC_MAX_RETAINED_REJECTED_OPERATIONS_PER_GAME).toBe(16);
+  });
+
   test("delays only later source attempts and caps the retry guidance", () => {
     expect(adHocCreationDelayMs(AD_HOC_CREATION_IMMEDIATE_ATTEMPTS - 1)).toBe(0);
     expect(adHocCreationDelayMs(AD_HOC_CREATION_IMMEDIATE_ATTEMPTS)).toBe(1_000);
@@ -202,7 +207,108 @@ describe("Ad Hoc resource budgets", () => {
     ).toBe("accepted");
   });
 
-  test("charges accepted operations only and keeps replay acknowledgement explicit", async () => {
+  test("charges fresh causal rejections and retains nothing after budget exhaustion", async () => {
+    const service = createAdHocGamesService({ now: () => 1_000 });
+    const created = await service.create({ homeName: "Home", awayName: "Away" });
+    if (created.status !== "accepted") throw new Error("creation failed");
+    const retained = await service.apply({
+      gameId: created.gameId,
+      sessionId: created.sessionId,
+      operations: Array.from(
+        { length: AD_HOC_MAX_RETAINED_REJECTED_OPERATIONS_PER_GAME },
+        (_, index) => ({
+          id: `retained-rejected-${index}`,
+          clientSentAtMs: 1_000,
+          causalPredecessorIds: [`retained-missing-${index}`],
+          command: { type: "set-running", running: true },
+        }),
+      ) as never[],
+    });
+    expect(retained.status).toBe("accepted");
+    if (retained.status === "accepted")
+      expect(retained.outcomes.every((outcome) => outcome.status === "rejected")).toBe(true);
+    const beforeLimited = service.store.readGame(created.gameId);
+    for (
+      let index = AD_HOC_MAX_RETAINED_REJECTED_OPERATIONS_PER_GAME;
+      index < AD_HOC_CONTROLLER_BURST;
+      index += 1
+    ) {
+      expect(
+        await service.apply({
+          gameId: created.gameId,
+          sessionId: created.sessionId,
+          operations: [
+            {
+              id: `rejected-over-cap-${index}`,
+              clientSentAtMs: 1_000,
+              causalPredecessorIds: [`missing-over-cap-${index}`],
+              command: { type: "set-running", running: true },
+            },
+          ],
+        }),
+      ).toMatchObject({ status: "rejected", reason: "rate-limited", retryAfterMs: 1_000 });
+    }
+    const exhausted = await service.apply({
+      gameId: created.gameId,
+      sessionId: created.sessionId,
+      operations: [
+        {
+          id: "rejected-after-exhaustion",
+          clientSentAtMs: 1_000,
+          causalPredecessorIds: ["still-missing"],
+          command: { type: "set-running", running: true },
+        },
+      ],
+    });
+    expect(exhausted).toMatchObject({
+      status: "rejected",
+      reason: "rate-limited",
+      retryAfterMs: 50,
+    });
+    expect(service.store.readGame(created.gameId)).toEqual(beforeLimited);
+  });
+
+  test("charges duplicate-only requests while preserving no-write idempotency", async () => {
+    const service = createAdHocGamesService({ now: () => 1_000 });
+    const created = await service.create({ homeName: "Home", awayName: "Away" });
+    if (created.status !== "accepted") throw new Error("creation failed");
+    const operation = {
+      id: "duplicate-budget",
+      clientSentAtMs: 1_000,
+      command: { type: "set-running", running: true } as const,
+    };
+    expect(
+      (
+        await service.apply({
+          gameId: created.gameId,
+          sessionId: created.sessionId,
+          operations: [operation],
+        })
+      ).status,
+    ).toBe("accepted");
+    const retained = service.store.readGame(created.gameId);
+    for (let index = 0; index < AD_HOC_CONTROLLER_BURST - 1; index += 1) {
+      expect(
+        (
+          await service.apply({
+            gameId: created.gameId,
+            sessionId: created.sessionId,
+            operations: [operation],
+          })
+        ).status,
+      ).toBe("duplicate");
+    }
+    expect(
+      await service.apply({
+        gameId: created.gameId,
+        sessionId: created.sessionId,
+        operations: [operation],
+      }),
+    ).toMatchObject({ status: "rejected", reason: "rate-limited" });
+    expect(service.store.readGame(created.gameId)).toEqual(retained);
+  });
+
+  test("keeps scheduled replay acknowledgement explicit", async () => {
     let nowMs = 1_000;
     const scheduled: (() => void)[] = [];
     const service = createAdHocGamesService({

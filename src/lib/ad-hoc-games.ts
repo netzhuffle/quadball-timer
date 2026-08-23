@@ -38,6 +38,7 @@ import {
   AD_HOC_EVENT_RESERVED_CONNECTION_CAPACITY,
   AD_HOC_EVENT_TOTAL_CONNECTION_CAPACITY,
   AD_HOC_MAX_CONNECTED_CONTROLLERS,
+  AD_HOC_MAX_RETAINED_REJECTED_OPERATIONS_PER_GAME,
   AD_HOC_REPLAY_BURST,
   AD_HOC_REPLAY_MAX_OPERATIONS_PER_BATCH,
   AD_HOC_REPLAY_SUSTAINED_PER_SECOND,
@@ -165,11 +166,12 @@ type AdHocApplyMutationResult =
   | false
   | { invalid: true; rollback: true }
   | { conflict: true; operationId: string }
-  | { rateLimited: true; retryAfterMs: number }
+  | { rateLimited: true; retryAfterMs: number; rollback?: true }
   | {
       acknowledged: string[];
       duplicate: boolean;
       outcomes: readonly ControllerOperationOutcome[];
+      rollback?: true;
     };
 
 type PreparedReplayEntry = {
@@ -1107,7 +1109,6 @@ export function createAdHocGamesService(options: AdHocGamesServiceOptions = {}) 
         outcome = store.mutateGame<AdHocApplyMutationResult>(gameId, (game) => {
           if (game.environmentIdentity !== environmentIdentity || !hasSession(game, sessionId))
             return false;
-          const next = structuredClone(game) as StoredAdHocGame;
           const acknowledged: string[] = [];
           let duplicate = false;
           const parsed =
@@ -1118,11 +1119,13 @@ export function createAdHocGamesService(options: AdHocGamesServiceOptions = {}) 
             preparedChunk?.map((entry) => entry.operation) ??
             (parsed as Extract<typeof parsed, { ok: true }>).operations;
           const outcomes: ControllerOperationOutcome[] = [];
+          let conflictingOperationId: string | undefined;
           for (const operation of incoming) {
-            const existing = next.operations[operation.operationId];
+            const existing = game.operations[operation.operationId];
             if (existing !== undefined) {
               if (existing.fingerprint !== operationFingerprint(operation)) {
-                return { conflict: true, operationId: operation.operationId } as const;
+                conflictingOperationId ??= operation.operationId;
+                continue;
               }
               acknowledged.push(operation.operationId);
               duplicate = true;
@@ -1138,44 +1141,25 @@ export function createAdHocGamesService(options: AdHocGamesServiceOptions = {}) 
           const reconciledPreparedChunk =
             preparedChunk === undefined
               ? undefined
-              : reconcilePreparedReplayChunk(preparedChunk, next.operations);
-          const acceptedNewOperationCount =
-            preparedChunk === undefined
-              ? (() => {
-                  const retainedStatuses = new Map(
-                    Object.entries(next.operations).map(
-                      ([operationId, operation]) => [operationId, operation.status] as const,
-                    ),
-                  );
-                  const resolution = resolveControllerBatch({
-                    operations: incoming.filter(
-                      (operation) => next.operations[operation.operationId] === undefined,
-                    ),
-                    retainedStatuses,
-                  });
-                  return resolution.ordered.filter(
-                    (operation) => resolution.statuses.get(operation.operationId) === "accepted",
-                  ).length;
-                })()
-              : reconciledPreparedChunk!.filter(
-                  (entry) =>
-                    entry.status === "accepted" &&
-                    next.operations[entry.operation.operationId] === undefined,
-                ).length;
-          if (acceptedNewOperationCount > 0) {
+              : reconcilePreparedReplayChunk(preparedChunk, game.operations);
+          const unseenOperations = incoming.filter(
+            (operation) => game.operations[operation.operationId] === undefined,
+          );
+          const workCost = Math.max(1, unseenOperations.length);
+          {
             const controller = consumeAdHocTokens(
               controllerActionBuckets.get(sessionBucketKey),
               nowMs,
               AD_HOC_CONTROLLER_BURST,
               AD_HOC_CONTROLLER_SUSTAINED_PER_SECOND,
-              acceptedNewOperationCount,
+              workCost,
             );
             const gameBucket = consumeAdHocTokens(
               gameActionBuckets.get(gameId),
               nowMs,
               AD_HOC_GAME_BURST,
               AD_HOC_GAME_SUSTAINED_PER_SECOND,
-              acceptedNewOperationCount,
+              workCost,
             );
             const replay = consumeAdHocTokens(
               replayBuckets.get(sessionBucketKey),
@@ -1184,7 +1168,7 @@ export function createAdHocGamesService(options: AdHocGamesServiceOptions = {}) 
                 ? AD_HOC_REPLAY_BURST
                 : AD_HOC_REPLAY_MAX_OPERATIONS_PER_BATCH,
               AD_HOC_REPLAY_SUSTAINED_PER_SECOND,
-              acceptedNewOperationCount,
+              workCost,
             );
             if (!controller.accepted || !gameBucket.accepted || !replay.accepted) {
               const retryAfterMs = Math.max(
@@ -1197,6 +1181,53 @@ export function createAdHocGamesService(options: AdHocGamesServiceOptions = {}) 
             nextControllerBucket = controller.bucket;
             nextGameBucket = gameBucket.bucket;
             nextReplayBucket = replay.bucket;
+          }
+          if (conflictingOperationId !== undefined)
+            return { conflict: true, operationId: conflictingOperationId } as const;
+          if (unseenOperations.length === 0) {
+            const acknowledgement = createControllerReplayAcknowledgement({
+              workflow: "ad-hoc",
+              acknowledgedOperationIds: acknowledged,
+              outcomes,
+            });
+            return {
+              acknowledged: [...acknowledgement.acknowledgedOperationIds],
+              duplicate,
+              outcomes: acknowledgement.outcomes,
+              rollback: true,
+            } as const;
+          }
+          const next = structuredClone(game) as StoredAdHocGame;
+          const resolution =
+            preparedChunk === undefined
+              ? resolveControllerBatch({
+                  operations: unseenOperations,
+                  retainedStatuses: new Map(
+                    Object.entries(next.operations).map(
+                      ([operationId, operation]) => [operationId, operation.status] as const,
+                    ),
+                  ),
+                })
+              : undefined;
+          const newRejectedOperationCount =
+            preparedChunk === undefined
+              ? unseenOperations.filter(
+                  (operation) => resolution!.statuses.get(operation.operationId) !== "accepted",
+                ).length
+              : reconciledPreparedChunk!.filter(
+                  (entry) =>
+                    next.operations[entry.operation.operationId] === undefined &&
+                    entry.status !== "accepted" &&
+                    entry.status !== "duplicate",
+                ).length;
+          const retainedRejectedOperationCount = Object.values(next.operations).filter(
+            (operation) => operation.status !== "accepted",
+          ).length;
+          if (
+            retainedRejectedOperationCount + newRejectedOperationCount >
+            AD_HOC_MAX_RETAINED_REJECTED_OPERATIONS_PER_GAME
+          ) {
+            return { rateLimited: true, retryAfterMs: 1_000, rollback: true } as const;
           }
           if (preparedChunk !== undefined) {
             for (const entry of reconciledPreparedChunk!) {
@@ -1224,20 +1255,9 @@ export function createAdHocGamesService(options: AdHocGamesServiceOptions = {}) 
               acknowledged.push(operation.operationId);
             }
           } else {
-            const retainedStatuses = new Map(
-              Object.entries(next.operations).map(
-                ([operationId, operation]) => [operationId, operation.status] as const,
-              ),
-            );
-            const resolution = resolveControllerBatch({
-              operations: incoming.filter(
-                (operation) => next.operations[operation.operationId] === undefined,
-              ),
-              retainedStatuses,
-            });
-            for (const operation of resolution.ordered) {
-              const status = resolution.statuses.get(operation.operationId) ?? "rejected";
-              const detail = resolution.details.get(operation.operationId);
+            for (const operation of resolution!.ordered) {
+              const status = resolution!.statuses.get(operation.operationId) ?? "rejected";
+              const detail = resolution!.details.get(operation.operationId);
               next.operations[operation.operationId] =
                 status === "accepted"
                   ? {
@@ -1264,8 +1284,8 @@ export function createAdHocGamesService(options: AdHocGamesServiceOptions = {}) 
               )
                 continue;
               if (next.operations[operation.operationId] === undefined) {
-                const status = resolution.statuses.get(operation.operationId) ?? "rejected";
-                const detail = resolution.details.get(operation.operationId) ?? "Causal cycle.";
+                const status = resolution!.statuses.get(operation.operationId) ?? "rejected";
+                const detail = resolution!.details.get(operation.operationId) ?? "Causal cycle.";
                 next.operations[operation.operationId] = rejectedOperation(
                   operation,
                   nowMs,
@@ -1305,6 +1325,10 @@ export function createAdHocGamesService(options: AdHocGamesServiceOptions = {}) 
       }
       if (outcome === null || outcome === false)
         return { status: "rejected", reason: "unavailable" };
+      if (nextControllerBucket !== undefined)
+        controllerActionBuckets.set(sessionBucketKey, nextControllerBucket);
+      if (nextGameBucket !== undefined) gameActionBuckets.set(gameId, nextGameBucket);
+      if (nextReplayBucket !== undefined) replayBuckets.set(sessionBucketKey, nextReplayBucket);
       if ("rateLimited" in outcome) {
         metrics.actionRateExhausted += 1;
         metrics.replayPressure += outcome.retryAfterMs > 0 ? 1 : 0;
@@ -1337,10 +1361,6 @@ export function createAdHocGamesService(options: AdHocGamesServiceOptions = {}) 
         return { status: "rejected", reason: "unavailable" };
       }
       if (game === null) return { status: "rejected", reason: "unavailable" };
-      if (nextControllerBucket !== undefined)
-        controllerActionBuckets.set(sessionBucketKey, nextControllerBucket);
-      if (nextGameBucket !== undefined) gameActionBuckets.set(gameId, nextGameBucket);
-      if (nextReplayBucket !== undefined) replayBuckets.set(sessionBucketKey, nextReplayBucket);
       return {
         status: outcome.duplicate ? "duplicate" : "accepted",
         ackedOperationIds: outcome.acknowledged,

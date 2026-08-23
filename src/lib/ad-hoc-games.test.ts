@@ -6,6 +6,7 @@ import {
   type AdHocStore,
   type AdHocGamesService,
 } from "@/lib/ad-hoc-games";
+import { AD_HOC_MAX_RETAINED_REJECTED_OPERATIONS_PER_GAME } from "@/lib/ad-hoc-resource-budgets";
 import { applyGameCommand, createInitialGameState } from "@/lib/game-engine";
 import { deriveAdHocOptimisticState } from "@/lib/game-page-support";
 import type { AdHocPendingOperation } from "@/lib/ad-hoc-controller-session";
@@ -253,6 +254,158 @@ describe("Ad Hoc Games service", () => {
     expect(duplicate.status).toBe("duplicate");
     expect(
       (await games.read({ gameId: created.gameId, sessionId: created.sessionId })).status,
+    ).toBe("accepted");
+  });
+
+  test("returns duplicate acknowledgements without rewriting unchanged Game state", async () => {
+    const base = createInMemoryAdHocStore();
+    let mutationWrites = 0;
+    const store: AdHocStore = {
+      close: () => base.close(),
+      listGames: () => base.listGames(),
+      readGame: (gameId) => base.readGame(gameId),
+      createGame: (input) => base.createGame(input),
+      mutateGame: (gameId, mutation) =>
+        base.mutateGame(gameId, (game) => {
+          const result = mutation(game);
+          const rollsBack =
+            result !== null &&
+            typeof result === "object" &&
+            "rollback" in result &&
+            result.rollback === true;
+          if (result !== null && result !== false && !rollsBack) mutationWrites += 1;
+          return result;
+        }),
+    };
+    const games = createAdHocGamesService({ store, now: () => 1_000 });
+    const created = await games.create({ homeName: "Home", awayName: "Away" });
+    if (created.status !== "accepted") throw new Error("creation failed");
+    const operation = {
+      id: "no-write-duplicate",
+      clientSentAtMs: 1_000,
+      command: { type: "set-running", running: true } as const,
+    };
+    const accepted = await games.apply({
+      gameId: created.gameId,
+      sessionId: created.sessionId,
+      operations: [operation],
+    });
+    expect(accepted.status).toBe("accepted");
+    const beforeDuplicate = store.readGame(created.gameId);
+    const writesBeforeDuplicate = mutationWrites;
+
+    const duplicate = await games.apply({
+      gameId: created.gameId,
+      sessionId: created.sessionId,
+      operations: [operation],
+    });
+
+    expect(duplicate).toMatchObject({
+      status: "duplicate",
+      ackedOperationIds: [operation.id],
+      outcomes: [{ operationId: operation.id, status: "duplicate", workflow: "ad-hoc" }],
+    });
+    expect(mutationWrites).toBe(writesBeforeDuplicate);
+    expect(store.readGame(created.gameId)).toEqual(beforeDuplicate);
+    if (duplicate.status === "duplicate" && beforeDuplicate !== null)
+      expect(duplicate.game.state.updatedAtMs).toBe(beforeDuplicate.state.updatedAtMs);
+  });
+
+  test("bounds retained rejected evidence atomically without blocking accepted replay", async () => {
+    let nowMs = 1_000;
+    const games = createAdHocGamesService({ now: () => nowMs });
+    const created = await games.create({ homeName: "Home", awayName: "Away" });
+    if (created.status !== "accepted") throw new Error("creation failed");
+    const reject = (id: string, predecessorId: string) => ({
+      id,
+      clientSentAtMs: nowMs,
+      causalPredecessorIds: [predecessorId],
+      command: { type: "set-running", running: true } as const,
+    });
+    for (let offset = 0; offset < AD_HOC_MAX_RETAINED_REJECTED_OPERATIONS_PER_GAME; offset += 8) {
+      const operations = Array.from({ length: 8 }, (_, index) => {
+        const operationId = `retained-rejection-${offset + index}`;
+        if (offset === 8 && index === 1)
+          return {
+            id: operationId,
+            clientSentAtMs: nowMs,
+            causalPredecessorIds: ["retained-rejection-8"],
+            command: { type: "set-running", running: true } as const,
+          };
+        return reject(operationId, `missing-${offset + index}`);
+      });
+      const result = await games.apply({
+        gameId: created.gameId,
+        sessionId: created.sessionId,
+        operations,
+      });
+      expect(result.status).toBe("accepted");
+      nowMs += 1_000;
+    }
+    const atLimit = games.store.readGame(created.gameId);
+    expect(
+      Object.values(atLimit?.operations ?? {}).filter(
+        (operation) => operation.status !== "accepted",
+      ),
+    ).toHaveLength(AD_HOC_MAX_RETAINED_REJECTED_OPERATIONS_PER_GAME);
+    expect(atLimit?.operations["retained-rejection-9"]?.status).toBe("causally-blocked");
+
+    const overLimit = await games.apply({
+      gameId: created.gameId,
+      sessionId: created.sessionId,
+      operations: [reject("over-limit", "missing-over-limit")],
+    });
+    expect(overLimit).toMatchObject({ status: "rejected", reason: "rate-limited" });
+    expect(games.store.readGame(created.gameId)).toEqual(atLimit);
+
+    nowMs += 1_000;
+    const duplicateAtLimit = await games.apply({
+      gameId: created.gameId,
+      sessionId: created.sessionId,
+      operations: [
+        {
+          ...reject("retained-rejection-0", "missing-0"),
+          clientSentAtMs: 1_000,
+        },
+      ],
+    });
+    expect(duplicateAtLimit).toMatchObject({
+      status: "duplicate",
+      outcomes: [{ operationId: "retained-rejection-0", status: "rejected" }],
+    });
+
+    nowMs += 1_000;
+    const mixedBefore = games.store.readGame(created.gameId);
+    const mixed = await games.apply({
+      gameId: created.gameId,
+      sessionId: created.sessionId,
+      operations: [
+        {
+          id: "accepted-in-rejected-mix",
+          clientSentAtMs: nowMs,
+          command: { type: "set-running", running: true },
+        },
+        reject("rejected-in-mix", "missing-in-mix"),
+      ],
+    });
+    expect(mixed).toMatchObject({ status: "rejected", reason: "rate-limited" });
+    expect(games.store.readGame(created.gameId)).toEqual(mixedBefore);
+
+    nowMs += 1_000;
+    const accepted = await games.apply({
+      gameId: created.gameId,
+      sessionId: created.sessionId,
+      operations: [
+        {
+          id: "accepted-at-rejected-limit",
+          clientSentAtMs: nowMs,
+          command: { type: "set-running", running: true },
+        },
+      ],
+    });
+    expect(accepted).toMatchObject({ status: "accepted" });
+    expect(
+      games.store.readGame(created.gameId)?.operations["accepted-at-rejected-limit"]?.status,
     ).toBe("accepted");
   });
 
