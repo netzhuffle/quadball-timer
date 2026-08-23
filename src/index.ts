@@ -157,6 +157,12 @@ type SessionData = {
   closed: boolean;
 };
 
+export type AdHocBroadcastSocket = {
+  data: { subscription: SessionSubscription };
+  send(serialized: string): number;
+  close(code: number, reason: string): void;
+};
+
 const sockets = new Set<ServerWebSocket<SessionData>>();
 const defaultAdHocService = createAdHocGamesService();
 const pendingSocketReservations = new Map<string, ReturnType<typeof setTimeout>>();
@@ -367,6 +373,16 @@ async function startServer() {
               return liveEventRuntime === null
                 ? { status: "unavailable" as const }
                 : await liveEventRuntime.readAudienceProjectionGameInput(eventGameId);
+            },
+            async readMany(eventGameIds: readonly string[]) {
+              return liveEventRuntime === null
+                ? new Map(
+                    eventGameIds.map((eventGameId) => [
+                      eventGameId,
+                      { status: "unavailable" as const },
+                    ]),
+                  )
+                : await liveEventRuntime.readAudienceProjectionGameInputs(eventGameIds);
             },
           };
     const audienceProjection = createAudienceProjection(eventCatalogStorage, {
@@ -2987,16 +3003,20 @@ export async function readAuthorizedAdHocGame(
   return result.status === "accepted" ? result.game : null;
 }
 
-async function broadcastGameSnapshot({
+export async function broadcastGameSnapshot({
   gameId,
   service,
   sender,
+  candidates = [...sockets],
   senderAckedCommandIds,
   operationOutcomes,
+  serverNowMs = Date.now(),
+  serialize = (payload) => JSON.stringify(payload),
 }: {
   gameId: string;
   service: AdHocGamesService;
-  sender: ServerWebSocket<SessionData>;
+  sender: AdHocBroadcastSocket;
+  candidates?: readonly AdHocBroadcastSocket[];
   senderAckedCommandIds: string[];
   operationOutcomes: readonly {
     operationId: string;
@@ -3004,32 +3024,63 @@ async function broadcastGameSnapshot({
     status: "accepted" | "duplicate" | "rejected" | "causally-blocked";
     detail?: string;
   }[];
+  serverNowMs?: number;
+  serialize?: (payload: ServerWsMessage) => string;
 }): Promise<boolean> {
-  const delivery = await Promise.all(
-    [...sockets].map(async (ws) => {
-      if (ws.data.subscription.type !== "game" || ws.data.subscription.gameId !== gameId) {
-        return ws === sender ? false : null;
-      }
-      const serverNowMs = Date.now();
-      const game = await readAuthorizedAdHocGame(
-        service,
-        gameId,
-        ws.data.subscription.sessionId,
-        serverNowMs,
-      );
-      if (game === null) return ws === sender ? false : null;
-      const sent = sendMessage(ws, {
+  const matched = candidates.filter(
+    (candidate) =>
+      candidate.data.subscription.type === "game" && candidate.data.subscription.gameId === gameId,
+  );
+  const authorization = await service.authorizeBroadcast({
+    gameId,
+    sessionIds: matched.map((candidate) =>
+      candidate.data.subscription.type === "game" ? candidate.data.subscription.sessionId : null,
+    ),
+    nowMs: serverNowMs,
+  });
+  if (authorization.status !== "accepted") return false;
+
+  let ordinaryEnvelope: string | null = null;
+  let senderEnvelope: string | null = null;
+  let senderDelivered = false;
+  for (let index = 0; index < matched.length; index += 1) {
+    if (authorization.authorized[index] !== true) continue;
+    const candidate = matched[index]!;
+    const isSender = candidate === sender;
+    let envelope: string;
+    if (isSender && senderAckedCommandIds.length > 0) {
+      senderEnvelope ??= serialize({
         type: "game-snapshot",
-        game: stripSession(game),
+        game: authorization.game,
         serverNowMs,
-        ackedCommandIds: ws === sender ? senderAckedCommandIds : [],
+        ackedCommandIds: senderAckedCommandIds,
         operationOutcomes,
       });
-      if (!sent) service.recordResourcePressure("queue-pressure");
-      return ws === sender ? sent : null;
-    }),
-  );
-  return delivery.some((sent) => sent === true);
+      envelope = senderEnvelope;
+    } else {
+      ordinaryEnvelope ??= serialize({
+        type: "game-snapshot",
+        game: authorization.game,
+        serverNowMs,
+        ackedCommandIds: [],
+        operationOutcomes,
+      });
+      envelope = ordinaryEnvelope;
+    }
+    const sent = sendAdHocSerializedEnvelope(candidate, envelope);
+    if (!sent) service.recordResourcePressure("queue-pressure");
+    if (isSender) senderDelivered ||= sent;
+  }
+  return senderDelivered;
+}
+
+function sendAdHocSerializedEnvelope(ws: AdHocBroadcastSocket, serialized: string): boolean {
+  return sendWebSocketText(ws, serialized, {
+    maxBytes: AD_HOC_MAX_QUEUED_OUTPUT_BYTES,
+    overflowCloseReason: "Ad Hoc output limit reached.",
+    shortSendCloseReason: "Ad Hoc output backpressure.",
+    sendErrorCloseReason: "Ad Hoc output unavailable.",
+  });
 }
 
 function sendMessage(ws: ServerWebSocket<SessionData>, payload: ServerWsMessage) {
@@ -3070,7 +3121,7 @@ type WebSocketTextSendPolicy = {
 };
 
 function sendWebSocketText(
-  ws: ServerWebSocket<SessionData>,
+  ws: Pick<ServerWebSocket<SessionData>, "send" | "close">,
   serialized: string,
   policy: WebSocketTextSendPolicy,
 ): boolean {

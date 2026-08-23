@@ -173,6 +173,9 @@ export type AudienceProjectionGameInputOutcome =
 
 export type AudienceProjectionGameInputReader = {
   read(eventGameId: string): Promise<AudienceProjectionGameInputOutcome>;
+  readMany?(
+    eventGameIds: readonly string[],
+  ): Promise<ReadonlyMap<string, AudienceProjectionGameInputOutcome>>;
 };
 
 export type PublicAudienceScheduleProjection = {
@@ -520,10 +523,16 @@ async function projectSchedule(
     }
   }
 
+  const scheduledGames = projectScheduleGames(snapshot, [...gamesById.values()]);
+  const batch = await gameInput?.readMany?.(scheduledGames.map((game) => game.eventGameId));
+
   const projected = (
     await Promise.all(
-      projectScheduleGames(snapshot, [...gamesById.values()]).map(async (game) => {
-        const current = await gameInput?.read(game.eventGameId);
+      scheduledGames.map(async (game) => {
+        const current =
+          batch === undefined
+            ? await gameInput?.read(game.eventGameId)
+            : (batch.get(game.eventGameId) ?? { status: "unavailable" as const });
         if (current !== undefined && current.status !== "accepted") {
           throw new GameInputReadError(current.status);
         }

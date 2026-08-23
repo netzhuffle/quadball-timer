@@ -27,6 +27,7 @@ import {
   FoundationStorageClosedError,
   FoundationStorageConstraintError,
   FoundationStorageNotReadyError,
+  trackFoundationMutationIntent,
   type FoundationStorage,
   type FoundationStorageReadiness,
   type FoundationStorageTransaction,
@@ -178,6 +179,7 @@ class InMemoryFoundationStorage implements FoundationStorage {
   private writerTail: Promise<void> = Promise.resolve();
   private closed = false;
   private revision = 0;
+  private mutationRevision = 0;
   private grantValidationContext: GrantStateValidationContext = {};
 
   transaction<T>(work: FoundationStorageTransactionWork<T>): Promise<T> {
@@ -220,9 +222,21 @@ class InMemoryFoundationStorage implements FoundationStorage {
       const previousAnchors = new Map(this.state.grantStateAnchors);
       const previousAdmissionAnchor = this.state.grantAdmissionStateAnchor;
       const previousAdmissionAnchorInstalled = this.state.grantAdmissionAnchorInstalled;
+      let mutationInvoked = false;
       try {
         const result = work(
-          createTransaction(this.state, undo, this.revision, this.grantValidationContext.keyRing),
+          trackFoundationMutationIntent(
+            createTransaction(
+              this.state,
+              undo,
+              this.revision,
+              this.mutationRevision,
+              this.grantValidationContext.keyRing,
+            ),
+            () => {
+              mutationInvoked = true;
+            },
+          ),
         );
         if (isThenable(result)) {
           throw new TypeError("Foundation storage transactions must complete synchronously.");
@@ -255,6 +269,7 @@ class InMemoryFoundationStorage implements FoundationStorage {
         this.rebuildGrantStateAnchors();
         this.rebuildGrantAdmissionStateAnchor();
         this.revision += 1;
+        if (mutationInvoked) this.mutationRevision += 1;
         return result;
       } catch (error) {
         for (const revert of undo.reverse()) revert();
@@ -1099,10 +1114,12 @@ function createTransaction(
   state: MemoryState,
   undo: (() => void)[],
   revision: number,
+  mutationRevision: number,
   keyRing: GrantKeyRing | undefined,
 ): FoundationStorageTransaction {
   return {
     revision,
+    mutationRevision,
     listRoots() {
       return [...state.roots.values()]
         .sort((left, right) => left.root.recordId.localeCompare(right.root.recordId))

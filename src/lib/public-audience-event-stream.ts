@@ -12,6 +12,11 @@ import {
 export type PublicAudienceEventStream =
   PublicAudienceProjectionStream<PublicAudienceEventProjection> & { close(): void };
 
+function semanticProjectionFingerprint(projection: PublicAudienceEventProjection): string {
+  const { asOfMs: _observationTime, ...semanticSchedule } = projection.schedule;
+  return canonicalizeJson({ ...projection, schedule: semanticSchedule });
+}
+
 /**
  * The adapter owns a process-local monotonic revision for the authoritative
  * Audience Projection it has read. The complete public Timeline is assembled
@@ -27,7 +32,7 @@ export function createPublicAudienceEventStream(
       const result = await projection.read(eventId);
       if (result.status === "retryable-failure") return { status: "retryable-failure" };
       if (result.status !== "accepted") return { status: "unavailable" };
-      const fingerprint = canonicalizeJson(result.value);
+      const fingerprint = semanticProjectionFingerprint(result.value);
       const previous = revisions.get(eventId);
       const version =
         previous === undefined

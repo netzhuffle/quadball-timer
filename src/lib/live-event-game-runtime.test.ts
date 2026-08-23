@@ -258,11 +258,35 @@ describe("Live Event Game SQLite runtime", () => {
       setupStorage.close();
     }
 
+    let audienceEpochReads = 0;
+    let audienceRecordReads = 0;
+    let mutateDuringAudienceRead = false;
     const runtime = await openLiveEventGameRuntime({
       databasePath,
       environmentId,
       keyRing: configured ?? keyRing,
       clock: () => 10_000,
+      audienceInputDiagnostics: {
+        onEpochRead: () => {
+          audienceEpochReads += 1;
+        },
+        onRecordRead: () => {
+          audienceRecordReads += 1;
+          if (mutateDuringAudienceRead) {
+            mutateDuringAudienceRead = false;
+            const external = new Database(databasePath);
+            try {
+              external
+                .query(
+                  "UPDATE foundation_event_catalog_events SET updated_at_ms = updated_at_ms + 1 WHERE event_id = ?",
+                )
+                .run(root.eventId);
+            } finally {
+              external.close();
+            }
+          }
+        },
+      },
     });
     try {
       expect(await runtime.readiness()).toMatchObject({
@@ -307,6 +331,42 @@ describe("Live Event Game SQLite runtime", () => {
           commencement: { status: "commenced", commencedAtMs: 10_000 },
         },
       });
+      expect(
+        await runtime.readAudienceProjectionGameInputs([root.eventGameId, root.eventGameId]),
+      ).toMatchObject(new Map([[root.eventGameId, { status: "accepted" }]]));
+      expect(await runtime.readAudienceProjectionGameInputs([root.eventGameId])).toMatchObject(
+        new Map([[root.eventGameId, { status: "accepted" }]]),
+      );
+      expect({ audienceEpochReads, audienceRecordReads }).toEqual({
+        audienceEpochReads: 4,
+        audienceRecordReads: 1,
+      });
+
+      expect(
+        await runtime.control.submitControllerIntent({
+          sessionBearer: opened.session.sessionBearer,
+          eventGameId: opened.eventGameId,
+          intent: {
+            version: LIVE_EVENT_CONTROL_INTENT_VERSION,
+            type: "clock",
+            operationId: "runtime-clock-running",
+            factId: "runtime-clock-running-fact",
+            running: true,
+            gameTimeMs: 0,
+            occurrence: { clientOriginAtMs: 1_235 },
+          },
+        }),
+      ).toMatchObject({ status: "accepted" });
+      await runtime.readAudienceProjectionGameInputs([root.eventGameId]);
+      await runtime.readAudienceProjectionGameInputs([root.eventGameId]);
+      expect({ audienceEpochReads, audienceRecordReads }).toEqual({
+        audienceEpochReads: 8,
+        audienceRecordReads: 3,
+      });
+      mutateDuringAudienceRead = true;
+      expect(await runtime.readAudienceProjectionGameInputs([root.eventGameId])).toMatchObject(
+        new Map([[root.eventGameId, { status: "unavailable" }]]),
+      );
       const catalogDatabase = new Database(databasePath);
       catalogDatabase
         .query(

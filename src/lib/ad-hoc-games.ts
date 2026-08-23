@@ -69,6 +69,16 @@ export type AdHocGameView = GameView & {
   controlQr: string | null;
 };
 
+export type AuthorizedAdHocGameProjection = Omit<AdHocGameView, "sessionId">;
+
+export type AdHocBroadcastAuthorizationResult =
+  | {
+      status: "accepted";
+      game: AuthorizedAdHocGameProjection;
+      authorized: readonly boolean[];
+    }
+  | { status: "unavailable" };
+
 export type AdHocCreationInput = {
   homeName: unknown;
   awayName: unknown;
@@ -781,6 +791,44 @@ export function createAdHocGamesService(options: AdHocGamesServiceOptions = {}) 
       return {
         status: "accepted",
         game: projectAuthorizedGame(game, sessionId, null, input.nowMs ?? now(), iqaRules),
+      };
+    },
+
+    async authorizeBroadcast(input: {
+      gameId: unknown;
+      sessionIds: unknown;
+      nowMs?: number;
+    }): Promise<AdHocBroadcastAuthorizationResult> {
+      const gameId = validateGameId(input.gameId);
+      const nowMs = input.nowMs ?? now();
+      if (
+        gameId === null ||
+        !isSafeTimestamp(nowMs) ||
+        !Array.isArray(input.sessionIds) ||
+        input.sessionIds.length > AD_HOC_MAX_CONNECTED_CONTROLLERS
+      ) {
+        return { status: "unavailable" };
+      }
+      const sessionIds = input.sessionIds.map(validateBearer);
+      if (sessionIds.some((sessionId) => sessionId === null)) {
+        return { status: "unavailable" };
+      }
+      let game: StoredAdHocGame | null;
+      try {
+        game = store.readGame(gameId);
+      } catch {
+        return { status: "unavailable" };
+      }
+      if (game === null || game.environmentIdentity !== environmentIdentity) {
+        return { status: "unavailable" };
+      }
+      const authorizedSessionHashes = new Set(game.sessions.map((session) => session.sessionHash));
+      return {
+        status: "accepted",
+        game: projectAuthorizedGameShared(game, nowMs, iqaRules),
+        authorized: sessionIds.map(
+          (sessionId) => sessionId !== null && authorizedSessionHashes.has(digest(sessionId)),
+        ),
       };
     },
 
@@ -1757,6 +1805,12 @@ export function openSqliteAdHocStore(
   if (!creationEventColumns.some((column) => column.name === "retry_until_ms")) {
     db.run("ALTER TABLE adhoc_creation_events ADD COLUMN retry_until_ms INTEGER");
   }
+  db.run(
+    "CREATE INDEX IF NOT EXISTS adhoc_creation_events_source_success_occurred_at_idx ON adhoc_creation_events(source_hash, successful, occurred_at_ms)",
+  );
+  db.run(
+    "CREATE INDEX IF NOT EXISTS adhoc_creation_events_success_occurred_at_idx ON adhoc_creation_events(successful, occurred_at_ms)",
+  );
 
   if (options.reconcileConnectionsAtStartup === true) {
     const startupNowMs = options.startupNowMs ?? Date.now();
@@ -1793,6 +1847,15 @@ export function openSqliteAdHocStore(
     return row === null ? null : parseStoredRow(row);
   };
   const transaction = db.transaction((work: () => unknown) => work());
+  const deleteExpiredCreationEvents = (nowMs: number) => {
+    const expiredAtOrBeforeMs = nowMs - AD_HOC_CREATION_GLOBAL_WINDOW_MS;
+    db.run("DELETE FROM adhoc_creation_events WHERE successful = 0 AND occurred_at_ms <= ?", [
+      expiredAtOrBeforeMs,
+    ]);
+    db.run("DELETE FROM adhoc_creation_events WHERE successful = 1 AND occurred_at_ms <= ?", [
+      expiredAtOrBeforeMs,
+    ]);
+  };
   return {
     close() {
       if (closed) return;
@@ -1832,6 +1895,7 @@ export function openSqliteAdHocStore(
         const expiredPendingDelay = pendingUntilMs > 0 && pendingUntilMs <= nowMs;
         if (sourceCount >= AD_HOC_MAX_CREATIONS_PER_SOURCE && !expiredPendingDelay) {
           const retryAfterMs = adHocCreationDelayMs(sourceCount);
+          deleteExpiredCreationEvents(nowMs);
           db.run(
             "INSERT INTO adhoc_creation_events (source_hash, successful, occurred_at_ms, retry_until_ms) VALUES (?, 0, ?, ?)",
             [sourceHash, nowMs, nowMs + retryAfterMs],
@@ -1863,6 +1927,7 @@ export function openSqliteAdHocStore(
               AD_HOC_CREATION_GLOBAL_WINDOW_MS -
               nowMs,
           );
+          deleteExpiredCreationEvents(nowMs);
           db.run(
             "INSERT INTO adhoc_creation_events (source_hash, successful, occurred_at_ms, retry_until_ms) VALUES (?, 0, ?, ?)",
             [sourceHash, nowMs, nowMs + retryAfterMs],
@@ -1900,9 +1965,7 @@ export function openSqliteAdHocStore(
           ]);
           removedGameId = victim.game_id;
         }
-        db.run("DELETE FROM adhoc_creation_events WHERE occurred_at_ms <= ?", [
-          nowMs - AD_HOC_CREATION_GLOBAL_WINDOW_MS,
-        ]);
+        deleteExpiredCreationEvents(nowMs);
         db.run(
           "INSERT INTO adhoc_games (game_id, environment_identity, created_at_ms, fixture_key, state_json, initial_state_json, replay_baseline_operation_ids_json, control_qr, control_qr_hash, sessions_json, operations_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
           [
@@ -2155,12 +2218,24 @@ function projectAuthorizedGame(
   nowMs: number,
   rules: AdHocIqaGameRules = DEFAULT_AD_HOC_IQA_RULES,
 ): AdHocGameView {
+  const shared = projectAuthorizedGameShared(game, nowMs, rules);
+  return {
+    ...shared,
+    sessionId,
+    controlQr: shared.state.isFinished ? null : (controlQr ?? game.controlQr),
+  };
+}
+
+function projectAuthorizedGameShared(
+  game: StoredAdHocGame,
+  nowMs: number,
+  rules: AdHocIqaGameRules = DEFAULT_AD_HOC_IQA_RULES,
+): AuthorizedAdHocGameProjection {
   const view = rules.project(game.state, nowMs);
   return {
     ...view,
     gameId: game.gameId,
-    sessionId,
-    controlQr: view.state.isFinished ? null : (controlQr ?? game.controlQr),
+    controlQr: view.state.isFinished ? null : game.controlQr,
   };
 }
 

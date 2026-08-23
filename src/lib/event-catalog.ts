@@ -3186,7 +3186,13 @@ function validateDelay(value: unknown): { ok: true; value: number } | { ok: fals
 export function projectScheduleGames(
   transaction: Pick<EventCatalogStorageSnapshot, "findGameplaySlot" | "findPitchSlot">,
   games: readonly EventGame[],
+  diagnostics?: { onConflictIndexBuilt?(kind: "pitch" | "team"): void },
 ): ProjectedEventGame[] {
+  const pitchSlotCounts = new Map<string, number>();
+  for (const game of games) {
+    pitchSlotCounts.set(game.pitchSlotId, (pitchSlotCounts.get(game.pitchSlotId) ?? 0) + 1);
+  }
+  diagnostics?.onConflictIndexBuilt?.("pitch");
   const projected = games.map((game) => {
     const gameplay = transaction.findGameplaySlot(game.gameplaySlotId);
     const pitch = transaction.findPitchSlot(game.pitchSlotId);
@@ -3201,12 +3207,12 @@ export function projectScheduleGames(
       startMs: expectedStartMs,
       endMs: expectedStartMs + DEFAULT_EVENT_GAME_PLAYING_DURATION_MS,
     };
-    const scheduleConflict = games.some(
-      (other) => other.eventGameId !== game.eventGameId && other.pitchSlotId === game.pitchSlotId,
-    );
-    const teamIds = [game.sideA.eventTeamId, game.sideB.eventTeamId].filter(
-      (id): id is string => id !== null,
-    );
+    const scheduleConflict = (pitchSlotCounts.get(game.pitchSlotId) ?? 0) > 1;
+    const teamIds = [
+      ...new Set(
+        [game.sideA.eventTeamId, game.sideB.eventTeamId].filter((id): id is string => id !== null),
+      ),
+    ];
     return {
       ...structuredClone(game),
       expectedStartMs,
@@ -3215,16 +3221,35 @@ export function projectScheduleGames(
       teamIds,
     };
   });
-  return projected.map(({ teamIds, ...game }) => ({
+  const teamIntervals = new Map<string, typeof projected>();
+  for (const game of projected) {
+    for (const teamId of game.teamIds) {
+      const key = `${game.gameDayId}\u0000${teamId}`;
+      const group = teamIntervals.get(key) ?? [];
+      group.push(game);
+      teamIntervals.set(key, group);
+    }
+  }
+  diagnostics?.onConflictIndexBuilt?.("team");
+  const teamConflictGameIds = new Set<string>();
+  for (const group of teamIntervals.values()) {
+    group.sort(
+      (left, right) =>
+        left.expectedPlayingPeriod.startMs - right.expectedPlayingPeriod.startMs ||
+        left.eventGameId.localeCompare(right.eventGameId),
+    );
+    for (let index = 1; index < group.length; index += 1) {
+      const previous = group[index - 1]!;
+      const current = group[index]!;
+      if (current.expectedPlayingPeriod.startMs < previous.expectedPlayingPeriod.endMs) {
+        teamConflictGameIds.add(previous.eventGameId);
+        teamConflictGameIds.add(current.eventGameId);
+      }
+    }
+  }
+  return projected.map(({ teamIds: _teamIds, ...game }) => ({
     ...game,
-    teamScheduleConflict: projected.some(
-      (other) =>
-        other.eventGameId !== game.eventGameId &&
-        other.gameDayId === game.gameDayId &&
-        other.teamIds.some((otherTeamId) => teamIds.includes(otherTeamId)) &&
-        other.expectedPlayingPeriod.startMs < game.expectedPlayingPeriod.endMs &&
-        game.expectedPlayingPeriod.startMs < other.expectedPlayingPeriod.endMs,
-    ),
+    teamScheduleConflict: teamConflictGameIds.has(game.eventGameId),
   }));
 }
 

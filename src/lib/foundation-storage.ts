@@ -397,6 +397,8 @@ export type FoundationStorageLiveness = { ok: true; process: "available" };
 
 export type FoundationStorageSnapshot = {
   revision: number;
+  /** Process-local epoch of the last committed Foundation mutation. */
+  mutationRevision: number;
   /** Optional inventory used by lifecycle coordinators; older adapters may omit it. */
   listRoots?(): EventGameRecordRoot[];
   findRootByRecordId(recordId: string): EventGameRecordRoot | null;
@@ -474,13 +476,7 @@ export type FoundationStorageSnapshot = {
   readGrantAdmissionStateAnchor?(): GrantAdmissionStateAnchor | null;
 };
 
-export type FoundationStorageTransaction = FoundationStorageSnapshot & {
-  findGameplaySlot(gameplaySlotId: string): StoredGameplaySlot | null;
-  listGameplaySlots(gameDayId: string): StoredGameplaySlot[];
-  findPitchSlot(pitchSlotId: string): StoredPitchSlot | null;
-  listPitchSlots(gameDayId: string, pitchId?: string): StoredPitchSlot[];
-  findEventGame(eventGameId: string): StoredEventCatalogGame | null;
-  listEventGames(gameDayId: string): StoredEventCatalogGame[];
+export type FoundationStorageMutations = {
   insertRoot(root: StoredEventGameRecordRoot): void;
   updateRoot(root: StoredEventGameRecordRoot): void;
   insertAction(action: StoredControlAction): void;
@@ -534,11 +530,96 @@ export type FoundationStorageTransaction = FoundationStorageSnapshot & {
   writeGrantAdmissionTelemetry?(value: GrantAdmissionTelemetry): void;
   writeGrantAdmissionGlobalWindow?(value: GrantAdmissionGlobalWindow): void;
   pruneGrantAdmissionTelemetry?(beforeMs: number): void;
-  readGrantAdmissionStateAnchor?(): GrantAdmissionStateAnchor | null;
   writeGrantAdmissionStateAnchor?(): void;
 };
 
+export type FoundationStorageTransaction = FoundationStorageSnapshot &
+  FoundationStorageMutations & {
+    findGameplaySlot(gameplaySlotId: string): StoredGameplaySlot | null;
+    listGameplaySlots(gameDayId: string): StoredGameplaySlot[];
+    findPitchSlot(pitchSlotId: string): StoredPitchSlot | null;
+    listPitchSlots(gameDayId: string, pitchId?: string): StoredPitchSlot[];
+    findEventGame(eventGameId: string): StoredEventCatalogGame | null;
+    listEventGames(gameDayId: string): StoredEventCatalogGame[];
+  };
+
 export type FoundationStorageTransactionWork<T> = (transaction: FoundationStorageTransaction) => T;
+
+const FOUNDATION_STORAGE_MUTATION_METHODS: ReadonlySet<PropertyKey> = new Set(
+  Object.keys({
+    insertRoot: true,
+    updateRoot: true,
+    insertAction: true,
+    upsertRecordMetadata: true,
+    appendAuditEntry: true,
+    insertPresentationChange: true,
+    appendPresentationAuditEntry: true,
+    appendPresentationAuditRevision: true,
+    sealPresentationEvidence: true,
+    insertGrant: true,
+    updateGrant: true,
+    insertGrantSession: true,
+    updateGrantSession: true,
+    appendGrantAudit: true,
+    upsertAcceptanceBudget: true,
+    insertReplayReservation: true,
+    updateReplayReservation: true,
+    insertReplayAttempt: true,
+    updateReplayAttempt: true,
+    discardReplayAttempts: true,
+    discardReplayReservation: true,
+    insertReplayReceipt: true,
+    updateReplayReceipt: true,
+    insertAcceptanceIntegrityAnchor: true,
+    insertEvent: true,
+    updateEvent: true,
+    deleteEvent: true,
+    insertGameDay: true,
+    updateGameDay: true,
+    deleteGameDay: true,
+    insertEventTeam: true,
+    updateEventTeam: true,
+    deleteEventTeam: true,
+    insertRosterEntry: true,
+    updateRosterEntry: true,
+    insertPitch: true,
+    updatePitch: true,
+    deletePitch: true,
+    insertGameplaySlot: true,
+    insertPitchSlot: true,
+    updateGameplaySlot: true,
+    updatePitchSlot: true,
+    deleteGameplaySlot: true,
+    deletePitchSlot: true,
+    insertEventGame: true,
+    updateEventGame: true,
+    deleteEventGame: true,
+    appendEventAudit: true,
+    writeGrantAdmissionTelemetry: true,
+    writeGrantAdmissionGlobalWindow: true,
+    pruneGrantAdmissionTelemetry: true,
+    writeGrantAdmissionStateAnchor: true,
+  } satisfies Record<keyof FoundationStorageMutations, true>),
+);
+
+/** Adapter helper: records callback mutation intent without inspecting physical writes. */
+export function trackFoundationMutationIntent(
+  transaction: FoundationStorageTransaction,
+  markMutation: () => void,
+): FoundationStorageTransaction {
+  return new Proxy(transaction, {
+    get(target, property, receiver) {
+      const value = Reflect.get(target, property, receiver);
+      if (!FOUNDATION_STORAGE_MUTATION_METHODS.has(property) || typeof value !== "function") {
+        return value;
+      }
+      return (...args: unknown[]) => {
+        markMutation();
+        return Reflect.apply(value, target, args);
+      };
+    },
+  });
+}
 
 export type CatalogCapableFoundationStorage = FoundationStorage & {
   eventCatalogStorageCapability(): EventCatalogStorageCapability;

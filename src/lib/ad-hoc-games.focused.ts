@@ -24,7 +24,11 @@ import {
   createTechnicalAdminAuth,
 } from "@/lib/technical-admin-auth";
 import {
+  AD_HOC_CREATION_GLOBAL_WINDOW_MS,
+  AD_HOC_CREATION_SOURCE_WINDOW_MS,
   AD_HOC_DISCONNECTED_GRACE_MS,
+  AD_HOC_MAX_CREATIONS_PER_HOUR,
+  AD_HOC_MAX_CREATIONS_PER_SOURCE,
   createAdHocGamesService,
   createSqliteAdHocRecoveryAdapter,
   createInMemoryAdHocStore,
@@ -32,6 +36,264 @@ import {
 } from "@/lib/ad-hoc-games";
 
 describe("Ad Hoc SQLite focused integration", () => {
+  test("creates additive indexes for every creation-ledger window query shape", async () => {
+    const root = await mkdtemp(join(tmpdir(), "quadball-timer-adhoc-ledger-indexes-"));
+    const databasePath = join(root, "ad-hoc.sqlite");
+    const store = openSqliteAdHocStore(databasePath, "field-a");
+    try {
+      const database = new Database(databasePath, { strict: true });
+      const indexes = database.query("PRAGMA index_list(adhoc_creation_events)").all() as {
+        name: string;
+      }[];
+      const expectedIndexes = {
+        adhoc_creation_events_source_success_occurred_at_idx: [
+          "source_hash",
+          "successful",
+          "occurred_at_ms",
+        ],
+        adhoc_creation_events_success_occurred_at_idx: ["successful", "occurred_at_ms"],
+      } as const;
+      for (const [indexName, expectedColumns] of Object.entries(expectedIndexes)) {
+        expect(indexes.some((index) => index.name === indexName)).toBe(true);
+        const columns = database
+          .query("SELECT name FROM pragma_index_info(?) ORDER BY seqno")
+          .all(indexName) as { name: string }[];
+        expect(columns.map(({ name }) => name)).toEqual([...expectedColumns]);
+      }
+
+      expect(
+        (
+          database
+            .query(
+              "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM adhoc_creation_events WHERE source_hash = ? AND successful = 1 AND occurred_at_ms > ?",
+            )
+            .all("source", 0) as { detail: string }[]
+        ).some(({ detail }) =>
+          detail.includes("adhoc_creation_events_source_success_occurred_at_idx"),
+        ),
+      ).toBe(true);
+      expect(
+        (
+          database
+            .query(
+              "EXPLAIN QUERY PLAN SELECT MIN(occurred_at_ms) FROM adhoc_creation_events WHERE successful = 1 AND occurred_at_ms > ?",
+            )
+            .all(0) as { detail: string }[]
+        ).some(({ detail }) => detail.includes("adhoc_creation_events_success_occurred_at_idx")),
+      ).toBe(true);
+      expect(
+        (
+          database
+            .query(
+              "EXPLAIN QUERY PLAN DELETE FROM adhoc_creation_events WHERE successful = 0 AND occurred_at_ms <= ?",
+            )
+            .all(0) as { detail: string }[]
+        ).some(({ detail }) => detail.includes("adhoc_creation_events_success_occurred_at_idx")),
+      ).toBe(true);
+      database.close();
+    } finally {
+      store.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("bounds global rejection evidence to the active window without changing Games", async () => {
+    const root = await mkdtemp(join(tmpdir(), "quadball-timer-adhoc-global-ledger-"));
+    const databasePath = join(root, "ad-hoc.sqlite");
+    let nowMs = 10_000_000_000;
+    const store = openSqliteAdHocStore(databasePath, "field-a");
+    const games = createAdHocGamesService({
+      store,
+      environmentIdentity: "field-a",
+      now: () => nowMs,
+    });
+    const seedSuccesses = (occurredAtMs: number) => {
+      const database = new Database(databasePath, { strict: true });
+      for (let index = 0; index < AD_HOC_MAX_CREATIONS_PER_HOUR; index += 1) {
+        database.run(
+          "INSERT INTO adhoc_creation_events (source_hash, successful, occurred_at_ms, retry_until_ms) VALUES (?, 1, ?, NULL)",
+          [`seed-${occurredAtMs}-${index}`, occurredAtMs + index],
+        );
+      }
+      database.close();
+    };
+    const readLedger = () => {
+      const database = new Database(databasePath, { strict: true });
+      const rows = database
+        .query(
+          "SELECT source_hash, successful, occurred_at_ms, retry_until_ms FROM adhoc_creation_events ORDER BY occurred_at_ms, source_hash",
+        )
+        .all() as { source_hash: string; successful: number; occurred_at_ms: number }[];
+      database.close();
+      return rows;
+    };
+    try {
+      seedSuccesses(nowMs - 1_000);
+      const seed = new Database(databasePath, { strict: true });
+      seed.run(
+        "INSERT INTO adhoc_creation_events (source_hash, successful, occurred_at_ms, retry_until_ms) VALUES ('expired-success', 1, ?, NULL), ('expired-rejection', 0, ?, ?)",
+        [
+          nowMs - AD_HOC_CREATION_GLOBAL_WINDOW_MS,
+          nowMs - AD_HOC_CREATION_GLOBAL_WINDOW_MS - 1,
+          nowMs - 1,
+        ],
+      );
+      seed.close();
+
+      for (let index = 0; index < 40; index += 1) {
+        expect(
+          await games.create({
+            homeName: "Rejected",
+            awayName: "Globally",
+            sourceKey: `fresh-source-${index}`,
+          }),
+        ).toMatchObject({
+          status: "rejected",
+          reason: "rate-limited",
+          retryAfterMs: AD_HOC_CREATION_GLOBAL_WINDOW_MS - 1_000,
+        });
+      }
+      expect(store.listGames()).toEqual([]);
+      expect(
+        readLedger().every(
+          ({ occurred_at_ms }) => occurred_at_ms > nowMs - AD_HOC_CREATION_GLOBAL_WINDOW_MS,
+        ),
+      ).toBe(true);
+
+      nowMs += AD_HOC_CREATION_GLOBAL_WINDOW_MS + 10_000;
+      seedSuccesses(nowMs - 1_000);
+      expect(
+        await games.create({
+          homeName: "Still",
+          awayName: "Rejected",
+          sourceKey: "fresh-source-after-window",
+        }),
+      ).toMatchObject({
+        status: "rejected",
+        reason: "rate-limited",
+        retryAfterMs: AD_HOC_CREATION_GLOBAL_WINDOW_MS - 1_000,
+      });
+      const retainedRows = readLedger();
+      expect(retainedRows).toHaveLength(AD_HOC_MAX_CREATIONS_PER_HOUR + 1);
+      expect(
+        retainedRows.every(
+          ({ occurred_at_ms }) => occurred_at_ms > nowMs - AD_HOC_CREATION_GLOBAL_WINDOW_MS,
+        ),
+      ).toBe(true);
+      expect(store.listGames()).toEqual([]);
+    } finally {
+      games.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("cleans expired evidence on per-source rejection and rolls cleanup back if insertion fails", async () => {
+    const root = await mkdtemp(join(tmpdir(), "quadball-timer-adhoc-source-ledger-"));
+    const databasePath = join(root, "ad-hoc.sqlite");
+    const nowMs = 10_000_000_000;
+    const store = openSqliteAdHocStore(databasePath, "field-a");
+    const games = createAdHocGamesService({
+      store,
+      environmentIdentity: "field-a",
+      now: () => nowMs,
+    });
+    const sourceHash = createHash("sha256").update("limited-source").digest("hex");
+    const repeatedSourceHash = createHash("sha256").update("limited-source-2").digest("hex");
+    const rollbackSourceHash = createHash("sha256").update("limited-source-3").digest("hex");
+    try {
+      const seed = new Database(databasePath, { strict: true });
+      for (let index = 0; index < AD_HOC_MAX_CREATIONS_PER_SOURCE; index += 1) {
+        seed.run(
+          "INSERT INTO adhoc_creation_events (source_hash, successful, occurred_at_ms, retry_until_ms) VALUES (?, 1, ?, NULL)",
+          [sourceHash, nowMs - AD_HOC_CREATION_SOURCE_WINDOW_MS + 1 + index],
+        );
+        seed.run(
+          "INSERT INTO adhoc_creation_events (source_hash, successful, occurred_at_ms, retry_until_ms) VALUES (?, 1, ?, NULL)",
+          [repeatedSourceHash, nowMs - AD_HOC_CREATION_SOURCE_WINDOW_MS + 1 + index],
+        );
+        seed.run(
+          "INSERT INTO adhoc_creation_events (source_hash, successful, occurred_at_ms, retry_until_ms) VALUES (?, 1, ?, NULL)",
+          [rollbackSourceHash, nowMs - AD_HOC_CREATION_SOURCE_WINDOW_MS + 1 + index],
+        );
+      }
+      seed.run(
+        "INSERT INTO adhoc_creation_events (source_hash, successful, occurred_at_ms, retry_until_ms) VALUES ('expired', 0, ?, NULL)",
+        [nowMs - AD_HOC_CREATION_GLOBAL_WINDOW_MS],
+      );
+      seed.close();
+
+      expect(
+        await games.create({
+          homeName: "Source",
+          awayName: "Limited",
+          sourceKey: "limited-source",
+        }),
+      ).toMatchObject({ status: "rejected", reason: "rate-limited", retryAfterMs: 1_000 });
+      const afterCleanup = new Database(databasePath, { strict: true });
+      expect(
+        (
+          afterCleanup
+            .query(
+              "SELECT COUNT(*) AS count FROM adhoc_creation_events WHERE source_hash = 'expired'",
+            )
+            .get() as { count: number }
+        ).count,
+      ).toBe(0);
+      afterCleanup.run(
+        "INSERT INTO adhoc_creation_events (source_hash, successful, occurred_at_ms, retry_until_ms) VALUES ('repeated-expired', 1, ?, NULL)",
+        [nowMs - AD_HOC_CREATION_GLOBAL_WINDOW_MS],
+      );
+      afterCleanup.close();
+
+      expect(
+        await games.create({
+          homeName: "Source",
+          awayName: "Limited",
+          sourceKey: "limited-source-2",
+        }),
+      ).toMatchObject({ status: "rejected", reason: "rate-limited", retryAfterMs: 1_000 });
+      const afterRepeatedCleanup = new Database(databasePath, { strict: true });
+      expect(
+        (
+          afterRepeatedCleanup
+            .query(
+              "SELECT COUNT(*) AS count FROM adhoc_creation_events WHERE source_hash = 'repeated-expired'",
+            )
+            .get() as { count: number }
+        ).count,
+      ).toBe(0);
+      afterRepeatedCleanup.run(
+        "INSERT INTO adhoc_creation_events (source_hash, successful, occurred_at_ms, retry_until_ms) VALUES ('rollback-expired', 0, ?, NULL)",
+        [nowMs - AD_HOC_CREATION_GLOBAL_WINDOW_MS],
+      );
+      afterRepeatedCleanup.run(`CREATE TRIGGER reject_creation_evidence BEFORE INSERT ON adhoc_creation_events
+        WHEN NEW.successful = 0 BEGIN SELECT RAISE(ABORT, 'injected insertion failure'); END`);
+      afterRepeatedCleanup.close();
+
+      expect(
+        await games.create({
+          homeName: "Source",
+          awayName: "Limited",
+          sourceKey: "limited-source-3",
+        }),
+      ).toMatchObject({ status: "rejected", reason: "unavailable" });
+      const verify = new Database(databasePath, { strict: true });
+      expect(
+        (
+          verify
+            .query(
+              "SELECT COUNT(*) AS count FROM adhoc_creation_events WHERE source_hash = 'rollback-expired'",
+            )
+            .get() as { count: number }
+        ).count,
+      ).toBe(1);
+      verify.close();
+    } finally {
+      games.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("persists a protected SQM fixture game and its public lookup across restart", async () => {
     const root = await mkdtemp(join(tmpdir(), "quadball-timer-adhoc-sqm-restart-"));
     const databasePath = join(root, "ad-hoc.sqlite");

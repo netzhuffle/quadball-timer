@@ -72,6 +72,7 @@ import {
   FoundationStorageClosedError,
   FoundationStorageConstraintError,
   FoundationStorageNotReadyError,
+  trackFoundationMutationIntent,
   type FoundationStorageEvidence,
   type FoundationStorageFailureCategory,
   type FoundationStorageKeyCategory,
@@ -673,6 +674,7 @@ export class SqliteFoundationStorage implements FoundationStorage {
   private grantStatements: GrantSqliteStatements | undefined;
   private closed = false;
   private revision = 0;
+  private mutationRevision = 0;
   private dataVersion: number;
   private readinessContext: FoundationStorageReadinessContext | undefined;
   private unsafeFailure: FoundationStorageFailureCategory | undefined;
@@ -714,6 +716,7 @@ export class SqliteFoundationStorage implements FoundationStorage {
       const startedAt = Date.now();
       let transactionStarted = false;
       let commitBoundary = false;
+      let mutationInvoked = false;
       try {
         if (this.unsafeFailure === "corruption") {
           throw new FoundationStorageNotReadyError(this.readinessSync());
@@ -730,7 +733,11 @@ export class SqliteFoundationStorage implements FoundationStorage {
         if (!readiness.ok) {
           throw new FoundationStorageNotReadyError(readiness);
         }
-        const result = work(this.createTransaction());
+        const result = work(
+          trackFoundationMutationIntent(this.createTransaction(), () => {
+            mutationInvoked = true;
+          }),
+        );
         if (isThenable(result)) {
           throw new TypeError("Foundation storage transactions must complete synchronously.");
         }
@@ -763,6 +770,7 @@ export class SqliteFoundationStorage implements FoundationStorage {
         this.lastTransactionLatencyMs = boundedMetric(Date.now() - startedAt);
         this.unsafeFailure = undefined;
         this.revision += 1;
+        if (mutationInvoked) this.mutationRevision += 1;
         this.dataVersion = this.readDataVersion();
         return result;
       } catch (error) {
@@ -1216,6 +1224,7 @@ export class SqliteFoundationStorage implements FoundationStorage {
     const statements = this.getStatements();
     return {
       revision: this.revision,
+      mutationRevision: this.mutationRevision,
       listRoots: () =>
         statements.allRoots
           .all()
@@ -2901,6 +2910,7 @@ export class SqliteFoundationStorage implements FoundationStorage {
     const currentDataVersion = this.readDataVersion();
     if (currentDataVersion !== this.dataVersion) {
       this.revision += 1;
+      this.mutationRevision += 1;
       this.dataVersion = currentDataVersion;
     }
   }
