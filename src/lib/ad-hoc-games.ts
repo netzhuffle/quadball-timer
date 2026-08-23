@@ -1757,6 +1757,12 @@ export function openSqliteAdHocStore(
   if (!creationEventColumns.some((column) => column.name === "retry_until_ms")) {
     db.run("ALTER TABLE adhoc_creation_events ADD COLUMN retry_until_ms INTEGER");
   }
+  db.run(
+    "CREATE INDEX IF NOT EXISTS adhoc_creation_events_source_success_occurred_at_idx ON adhoc_creation_events(source_hash, successful, occurred_at_ms)",
+  );
+  db.run(
+    "CREATE INDEX IF NOT EXISTS adhoc_creation_events_success_occurred_at_idx ON adhoc_creation_events(successful, occurred_at_ms)",
+  );
 
   if (options.reconcileConnectionsAtStartup === true) {
     const startupNowMs = options.startupNowMs ?? Date.now();
@@ -1793,6 +1799,15 @@ export function openSqliteAdHocStore(
     return row === null ? null : parseStoredRow(row);
   };
   const transaction = db.transaction((work: () => unknown) => work());
+  const deleteExpiredCreationEvents = (nowMs: number) => {
+    const expiredAtOrBeforeMs = nowMs - AD_HOC_CREATION_GLOBAL_WINDOW_MS;
+    db.run("DELETE FROM adhoc_creation_events WHERE successful = 0 AND occurred_at_ms <= ?", [
+      expiredAtOrBeforeMs,
+    ]);
+    db.run("DELETE FROM adhoc_creation_events WHERE successful = 1 AND occurred_at_ms <= ?", [
+      expiredAtOrBeforeMs,
+    ]);
+  };
   return {
     close() {
       if (closed) return;
@@ -1832,6 +1847,7 @@ export function openSqliteAdHocStore(
         const expiredPendingDelay = pendingUntilMs > 0 && pendingUntilMs <= nowMs;
         if (sourceCount >= AD_HOC_MAX_CREATIONS_PER_SOURCE && !expiredPendingDelay) {
           const retryAfterMs = adHocCreationDelayMs(sourceCount);
+          deleteExpiredCreationEvents(nowMs);
           db.run(
             "INSERT INTO adhoc_creation_events (source_hash, successful, occurred_at_ms, retry_until_ms) VALUES (?, 0, ?, ?)",
             [sourceHash, nowMs, nowMs + retryAfterMs],
@@ -1863,6 +1879,7 @@ export function openSqliteAdHocStore(
               AD_HOC_CREATION_GLOBAL_WINDOW_MS -
               nowMs,
           );
+          deleteExpiredCreationEvents(nowMs);
           db.run(
             "INSERT INTO adhoc_creation_events (source_hash, successful, occurred_at_ms, retry_until_ms) VALUES (?, 0, ?, ?)",
             [sourceHash, nowMs, nowMs + retryAfterMs],
@@ -1900,9 +1917,7 @@ export function openSqliteAdHocStore(
           ]);
           removedGameId = victim.game_id;
         }
-        db.run("DELETE FROM adhoc_creation_events WHERE occurred_at_ms <= ?", [
-          nowMs - AD_HOC_CREATION_GLOBAL_WINDOW_MS,
-        ]);
+        deleteExpiredCreationEvents(nowMs);
         db.run(
           "INSERT INTO adhoc_games (game_id, environment_identity, created_at_ms, fixture_key, state_json, initial_state_json, replay_baseline_operation_ids_json, control_qr, control_qr_hash, sessions_json, operations_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
           [
