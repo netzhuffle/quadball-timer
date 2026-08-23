@@ -1,4 +1,8 @@
 import { describe, expect, test } from "bun:test";
+import type {
+  PublicAudienceEventProjection,
+  PublicAudienceGameProjection,
+} from "@/lib/audience-projection";
 import { createPublicAudienceEventStream } from "@/lib/public-audience-event-stream";
 import { createPublicAudienceEventWebSocketHub } from "@/lib/public-audience-event-websocket";
 import { PUBLIC_EVENT_STREAM_PROTOCOL } from "@/lib/public-event-stream";
@@ -21,6 +25,72 @@ const publishedEvent = {
     focusIndex: null,
   },
 };
+
+const publishedGame: PublicAudienceGameProjection = {
+  eventId: "event-1",
+  eventGameId: "game-1",
+  gameCode: "F1",
+  gameDesignation: "Final",
+  scheduledStartMs: 10_000,
+  expectedStartMs: 10_000,
+  scheduleStatus: "running",
+  phase: "seeker-floor",
+  pitch: "Pitch 1",
+  sideA: { name: "Side A", color: "#112233", score: 10 },
+  sideB: { name: "Side B", color: "#445566", score: 20 },
+  overtimeTarget: null,
+  clock: {
+    gameTimeMs: 5_000,
+    activePenaltyTimeMs: 0,
+    running: true,
+    projectedAtMs: 100,
+    synchronization: "synchronized",
+    lastSynchronizedAtMs: 100,
+    cues: {
+      flagRunnerEntry: "pending",
+      seekerWarning: "pending",
+      seekerCountdownMs: null,
+      seekerRelease: "pending",
+    },
+  },
+  operationalStatus: "running",
+  gameSuspension: "none",
+  teamTimeout: { status: "inactive", side: null, remainingMs: null },
+  heatStoppage: {
+    status: "inactive",
+    mode: null,
+    pending: false,
+    allowedDurationMs: null,
+    actualDurationMs: null,
+    remainingMs: null,
+  },
+  flagState: { catchingSide: null },
+  result: { status: "unfinished", winner: null, locked: false },
+  presentation: {
+    pitchOrientation: "side-a-left",
+    displayedTeamColors: { sideA: "#112233", sideB: "#445566" },
+  },
+  canonicalPath: "/events/event-1/games/game-1",
+  spectatorAvailable: true,
+  timeline: [],
+};
+
+function eventWithGame(
+  game: PublicAudienceGameProjection,
+  focusIndex: number | null = 0,
+): PublicAudienceEventProjection {
+  return {
+    ...publishedEvent,
+    schedule: {
+      ...publishedEvent.schedule,
+      runningGames: game.scheduleStatus === "running" ? [game] : [],
+      upcomingGames:
+        game.scheduleStatus === "future" || game.scheduleStatus === "awaiting-start" ? [game] : [],
+      scheduleGames: [game],
+      focusIndex,
+    },
+  };
+}
 
 function socketHarness() {
   const messages: unknown[] = [];
@@ -57,6 +127,148 @@ function deferred<T>() {
 }
 
 describe("public Event WebSocket adapter", () => {
+  test("keeps one semantic version across an observation-time-only refresh", async () => {
+    let reads = 0;
+    let currentProjection = publishedEvent;
+    const refreshStarted = deferred<void>();
+    const releaseRefresh = deferred<void>();
+    const stream = createPublicAudienceEventStream(
+      {
+        read: async () => {
+          reads += 1;
+          if (reads === 2) {
+            refreshStarted.resolve();
+            await releaseRefresh.promise;
+          }
+          return { status: "accepted" as const, value: currentProjection };
+        },
+      },
+      { refreshIntervalMs: 1 },
+    );
+    const hub = createPublicAudienceEventWebSocketHub({ stream, controllerCapacity: capacity() });
+    const existing = socketHarness();
+    expect((await hub.subscribe("client-1", "event-1", existing.socket)).status).toBe("admitted");
+
+    const refreshedSchedule = Object.freeze({ ...publishedEvent.schedule, asOfMs: 1_000 });
+    currentProjection = {
+      ...publishedEvent,
+      schedule: refreshedSchedule,
+    };
+    await refreshStarted.promise;
+    releaseRefresh.resolve();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(existing.messages).toHaveLength(1);
+    const fresh = socketHarness();
+    expect((await hub.subscribe("client-2", "event-1", fresh.socket)).status).toBe("admitted");
+    expect(fresh.messages).toEqual([
+      {
+        protocol: PUBLIC_EVENT_STREAM_PROTOCOL,
+        type: "snapshot",
+        eventId: "event-1",
+        version: 1,
+        projection: publishedEvent,
+      },
+    ]);
+    expect(fresh.messages[0]).toHaveProperty("projection.schedule.asOfMs", 0);
+    expect(currentProjection.schedule.asOfMs).toBe(1_000);
+    hub.close();
+    stream.close();
+  });
+
+  const futureGame = { ...publishedGame, scheduleStatus: "future" as const, clock: null };
+  const semanticChanges: readonly (readonly [
+    string,
+    PublicAudienceEventProjection,
+    PublicAudienceEventProjection,
+  ])[] = [
+    [
+      "Event metadata",
+      eventWithGame(publishedGame),
+      { ...eventWithGame(publishedGame), name: "Updated Published Event" },
+    ],
+    [
+      "schedule status",
+      eventWithGame(futureGame),
+      eventWithGame({ ...futureGame, scheduleStatus: "awaiting-start" }),
+    ],
+    ["schedule focus", eventWithGame(futureGame, null), eventWithGame(futureGame, 0)],
+    [
+      "running Game clock",
+      eventWithGame(publishedGame),
+      eventWithGame({
+        ...publishedGame,
+        clock: { ...publishedGame.clock!, gameTimeMs: 5_250, projectedAtMs: 350 },
+      }),
+    ],
+    [
+      "Game score",
+      eventWithGame(publishedGame),
+      eventWithGame({
+        ...publishedGame,
+        sideA: { ...publishedGame.sideA, score: 20 },
+      }),
+    ],
+    [
+      "Game presentation",
+      eventWithGame(publishedGame),
+      eventWithGame({
+        ...publishedGame,
+        presentation: { ...publishedGame.presentation, pitchOrientation: "side-b-left" },
+      }),
+    ],
+    [
+      "Game Timeline",
+      eventWithGame(publishedGame),
+      eventWithGame({
+        ...publishedGame,
+        timeline: [
+          {
+            kind: "goal",
+            gameTimeMs: 5_000,
+            lane: "side-a",
+            teamName: "Side A",
+            player: { number: 7, name: "Player Seven" },
+            points: 10,
+          },
+        ],
+      }),
+    ],
+  ];
+
+  test.each(semanticChanges)(
+    "%s changes advance the semantic version and replace the complete Event",
+    async (_name, before, after) => {
+      let currentProjection = before;
+      const stream = createPublicAudienceEventStream(
+        {
+          read: async () => ({ status: "accepted" as const, value: currentProjection }),
+        },
+        { refreshIntervalMs: 60_000 },
+      );
+      const hub = createPublicAudienceEventWebSocketHub({ stream, controllerCapacity: capacity() });
+      const socket = socketHarness();
+      expect((await hub.subscribe("client-1", "event-1", socket.socket)).status).toBe("admitted");
+
+      currentProjection = {
+        ...after,
+        schedule: { ...after.schedule, asOfMs: before.schedule.asOfMs + 1_000 },
+      };
+      expect(await stream.republish("event-1")).toBe("accepted");
+
+      expect(socket.messages).toHaveLength(2);
+      expect(socket.messages.at(-1)).toEqual({
+        protocol: PUBLIC_EVENT_STREAM_PROTOCOL,
+        type: "projection-replaced",
+        eventId: "event-1",
+        version: 2,
+        projection: currentProjection,
+      });
+      hub.close();
+      stream.close();
+    },
+  );
+
   test("delivers the composed authoritative projection and refreshes one upstream feed", async () => {
     const messages: unknown[] = [];
     let reads = 0;
