@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -14,6 +15,7 @@ import { FoundationStorageConstraintError, type FoundationStorage } from "@/lib/
 
 type StorageHarness = {
   storage: FoundationStorage;
+  databasePath?: string;
   cleanup(): Promise<void>;
 };
 
@@ -83,6 +85,7 @@ const sqliteFactory: StorageFactory = async () => {
   await storage.applyMigrations();
   return {
     storage,
+    databasePath,
     cleanup: async () => {
       storage.close();
       await rm(directory, { recursive: true, force: true });
@@ -92,6 +95,91 @@ const sqliteFactory: StorageFactory = async () => {
 
 function runStorageContract(name: string, factory: StorageFactory): void {
   describe(`${name} foundation storage contract`, () => {
+    test("advances only the mutation epoch for committed mutation intent", async () => {
+      const harness = await factory();
+      try {
+        const first = await harness.storage.transaction((snapshot) => ({
+          revision: snapshot.revision,
+          mutationRevision: snapshot.mutationRevision,
+        }));
+        const second = await harness.storage.transaction((snapshot) => ({
+          revision: snapshot.revision,
+          mutationRevision: snapshot.mutationRevision,
+        }));
+        expect(second.revision).toBe(first.revision + 1);
+        expect([first.mutationRevision, second.mutationRevision]).toEqual([0, 0]);
+
+        await harness.storage.transaction((transaction) => {
+          transaction.insertEvent({
+            eventId: "mutation-event",
+            name: "Mutation Event",
+            timeZone: "UTC",
+            publicationStatus: "unpublished",
+            createdAtMs: 1,
+            updatedAtMs: 1,
+          });
+          transaction.updateEvent({
+            eventId: "mutation-event",
+            name: "Mutation Event Updated",
+            timeZone: "UTC",
+            publicationStatus: "unpublished",
+            createdAtMs: 1,
+            updatedAtMs: 2,
+          });
+        });
+        expect(await harness.storage.transaction((snapshot) => snapshot.mutationRevision)).toBe(1);
+      } finally {
+        await harness.cleanup();
+      }
+    });
+
+    test("does not advance the mutation epoch for rolled-back mutation intent", async () => {
+      const harness = await factory();
+      try {
+        let failure: unknown;
+        try {
+          await harness.storage.transaction((transaction) => {
+            transaction.insertEvent({
+              eventId: "rolled-back-event",
+              name: "Rolled Back Event",
+              timeZone: "UTC",
+              publicationStatus: "unpublished",
+              createdAtMs: 1,
+              updatedAtMs: 1,
+            });
+            throw new Error("roll back mutation epoch");
+          });
+        } catch (error) {
+          failure = error;
+        }
+        expect(failure).toMatchObject({ message: "roll back mutation epoch" });
+        expect(await harness.storage.transaction((snapshot) => snapshot.mutationRevision)).toBe(0);
+      } finally {
+        await harness.cleanup();
+      }
+    });
+
+    test("exposes a committed mutation epoch to the next queued snapshot", async () => {
+      const harness = await factory();
+      try {
+        const mutation = harness.storage.transaction((transaction) => {
+          transaction.insertEvent({
+            eventId: "queued-event",
+            name: "Queued Event",
+            timeZone: "UTC",
+            publicationStatus: "unpublished",
+            createdAtMs: 1,
+            updatedAtMs: 1,
+          });
+        });
+        const observed = harness.storage.transaction((snapshot) => snapshot.mutationRevision);
+        await mutation;
+        expect(await observed).toBe(1);
+      } finally {
+        await harness.cleanup();
+      }
+    });
+
     test("registers and reads a semantic Event Game Record root", async () => {
       const harness = await factory();
       try {
@@ -448,3 +536,38 @@ function createScopeResolver(root: EventGameRecordRoot): ExternalScopeResolver {
 
 runStorageContract("in-memory", memoryFactory);
 runStorageContract("SQLite", sqliteFactory);
+
+describe("SQLite Foundation external mutation epoch", () => {
+  test("advances before exposing a snapshot after another connection commits", async () => {
+    const harness = await sqliteFactory();
+    try {
+      const databasePath = harness.databasePath;
+      if (databasePath === undefined) throw new Error("Expected a SQLite database path.");
+      await harness.storage.transaction((transaction) => {
+        transaction.insertEvent({
+          eventId: "external-event",
+          name: "Before External Mutation",
+          timeZone: "UTC",
+          publicationStatus: "unpublished",
+          createdAtMs: 1,
+          updatedAtMs: 1,
+        });
+      });
+      const before = await harness.storage.transaction((snapshot) => snapshot.mutationRevision);
+      const external = new Database(databasePath);
+      try {
+        external
+          .query(
+            "UPDATE foundation_event_catalog_events SET name = ?, updated_at_ms = ? WHERE event_id = ?",
+          )
+          .run("After External Mutation", 2, "external-event");
+      } finally {
+        external.close();
+      }
+      const after = await harness.storage.transaction((snapshot) => snapshot.mutationRevision);
+      expect(after).toBe(before + 1);
+    } finally {
+      await harness.cleanup();
+    }
+  });
+});

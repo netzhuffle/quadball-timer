@@ -368,6 +368,16 @@ async function startServer() {
                 ? { status: "unavailable" as const }
                 : await liveEventRuntime.readAudienceProjectionGameInput(eventGameId);
             },
+            async readMany(eventGameIds: readonly string[]) {
+              return liveEventRuntime === null
+                ? new Map(
+                    eventGameIds.map((eventGameId) => [
+                      eventGameId,
+                      { status: "unavailable" as const },
+                    ]),
+                  )
+                : await liveEventRuntime.readAudienceProjectionGameInputs(eventGameIds);
+            },
           };
     const audienceProjection = createAudienceProjection(eventCatalogStorage, {
       ...(liveAudienceGameInput === undefined ? {} : { gameInput: liveAudienceGameInput }),

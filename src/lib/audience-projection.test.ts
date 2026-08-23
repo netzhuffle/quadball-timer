@@ -138,6 +138,57 @@ describe("Audience Publication Projection", () => {
     }
   });
 
+  test("reads unique scheduled Games in one batch and fails closed on a missing outcome", async () => {
+    const games = [
+      createScheduleGame("batch-a", "2026-08-14T10:00:00.000Z", "Pitch 1"),
+      createScheduleGame("batch-b", "2026-08-14T11:00:00.000Z", "Pitch 1"),
+    ];
+    const roots = new Map(
+      games.map((game) => [game.eventGameId, createScheduleRoot(game.eventGameId, "scheduled")]),
+    );
+    const snapshot = createScheduleSnapshot({ pitches: ["Pitch 1"], games, roots });
+    const outcomes = new Map(
+      [...roots].map(([eventGameId, root]) => [
+        eventGameId,
+        readAudienceProjectionGameInput(
+          root,
+          createAudienceControllerProjection({ phase: "scheduled" }),
+        ),
+      ]),
+    );
+    let batchReads = 0;
+    let scalarReads = 0;
+    const requested: string[][] = [];
+    const storage = {
+      snapshot: async () => snapshot,
+    } as unknown as EventCatalogFoundationStorage;
+    const gameInput = {
+      read: async (eventGameId: string) => {
+        scalarReads += 1;
+        return outcomes.get(eventGameId) ?? ({ status: "unavailable" } as const);
+      },
+      readMany: async (eventGameIds: readonly string[]) => {
+        batchReads += 1;
+        requested.push([...eventGameIds]);
+        return outcomes;
+      },
+    };
+
+    expect(
+      (await createAudienceProjection(storage, { gameInput }).read("event-schedule")).status,
+    ).toBe("accepted");
+    expect({ batchReads, scalarReads, requested }).toEqual({
+      batchReads: 1,
+      scalarReads: 0,
+      requested: [["batch-a", "batch-b"]],
+    });
+
+    outcomes.delete("batch-b");
+    expect(
+      (await createAudienceProjection(storage, { gameInput }).read("event-schedule")).status,
+    ).toBe("unavailable");
+  });
+
   test("uses one runtime snapshot for Timeline semantics and scopes the neutral correction notice", async () => {
     const correctedGame = createScheduleGame(
       "runtime-corrected",

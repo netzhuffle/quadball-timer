@@ -397,6 +397,8 @@ export type FoundationStorageLiveness = { ok: true; process: "available" };
 
 export type FoundationStorageSnapshot = {
   revision: number;
+  /** Process-local epoch of the last committed Foundation mutation. */
+  mutationRevision: number;
   /** Optional inventory used by lifecycle coordinators; older adapters may omit it. */
   listRoots?(): EventGameRecordRoot[];
   findRootByRecordId(recordId: string): EventGameRecordRoot | null;
@@ -539,6 +541,80 @@ export type FoundationStorageTransaction = FoundationStorageSnapshot & {
 };
 
 export type FoundationStorageTransactionWork<T> = (transaction: FoundationStorageTransaction) => T;
+
+const FOUNDATION_STORAGE_MUTATION_METHODS = new Set<PropertyKey>([
+  "insertRoot",
+  "updateRoot",
+  "insertAction",
+  "upsertRecordMetadata",
+  "appendAuditEntry",
+  "insertPresentationChange",
+  "appendPresentationAuditEntry",
+  "appendPresentationAuditRevision",
+  "sealPresentationEvidence",
+  "insertGrant",
+  "updateGrant",
+  "insertGrantSession",
+  "updateGrantSession",
+  "appendGrantAudit",
+  "upsertAcceptanceBudget",
+  "insertReplayReservation",
+  "updateReplayReservation",
+  "insertReplayAttempt",
+  "updateReplayAttempt",
+  "discardReplayAttempts",
+  "discardReplayReservation",
+  "insertReplayReceipt",
+  "updateReplayReceipt",
+  "insertAcceptanceIntegrityAnchor",
+  "insertEvent",
+  "updateEvent",
+  "deleteEvent",
+  "insertGameDay",
+  "updateGameDay",
+  "deleteGameDay",
+  "insertEventTeam",
+  "updateEventTeam",
+  "deleteEventTeam",
+  "insertRosterEntry",
+  "updateRosterEntry",
+  "insertPitch",
+  "updatePitch",
+  "deletePitch",
+  "insertGameplaySlot",
+  "insertPitchSlot",
+  "updateGameplaySlot",
+  "updatePitchSlot",
+  "deleteGameplaySlot",
+  "deletePitchSlot",
+  "insertEventGame",
+  "updateEventGame",
+  "deleteEventGame",
+  "appendEventAudit",
+  "writeGrantAdmissionTelemetry",
+  "writeGrantAdmissionGlobalWindow",
+  "pruneGrantAdmissionTelemetry",
+  "writeGrantAdmissionStateAnchor",
+]);
+
+/** Adapter helper: records callback mutation intent without inspecting physical writes. */
+export function trackFoundationMutationIntent(
+  transaction: FoundationStorageTransaction,
+  markMutation: () => void,
+): FoundationStorageTransaction {
+  return new Proxy(transaction, {
+    get(target, property, receiver) {
+      const value = Reflect.get(target, property, receiver);
+      if (!FOUNDATION_STORAGE_MUTATION_METHODS.has(property) || typeof value !== "function") {
+        return value;
+      }
+      return (...args: unknown[]) => {
+        markMutation();
+        return Reflect.apply(value, target, args);
+      };
+    },
+  });
+}
 
 export type CatalogCapableFoundationStorage = FoundationStorage & {
   eventCatalogStorageCapability(): EventCatalogStorageCapability;

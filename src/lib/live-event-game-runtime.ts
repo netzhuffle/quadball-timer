@@ -39,6 +39,9 @@ import type { FoundationStorage } from "@/lib/foundation-storage";
 export type LiveEventGameRuntime = {
   control: ReturnType<typeof createLiveEventGameControl>;
   readAudienceProjectionGameInput(eventGameId: string): Promise<AudienceProjectionGameInputOutcome>;
+  readAudienceProjectionGameInputs(
+    eventGameIds: readonly string[],
+  ): Promise<ReadonlyMap<string, AudienceProjectionGameInputOutcome>>;
   readiness(): Promise<FoundationStorageReadiness>;
   close(): void;
 };
@@ -135,6 +138,12 @@ export function readAudienceProjectionGameInput(
   return { status: "accepted", value };
 }
 
+function audienceInputIsTimeDependent(input: AudienceProjectionGameInput): boolean {
+  if (input.operationalStatus === "running" || input.clock?.running === true) return true;
+  if (input.teamTimeout.status === "started") return true;
+  return input.heatStoppage.status === "started" || input.heatStoppage.status === "extended";
+}
+
 export async function openLiveEventGameRuntime(input: {
   databasePath: string;
   environmentId: string;
@@ -142,6 +151,10 @@ export async function openLiveEventGameRuntime(input: {
   clock?: () => number;
   knownDodgeballIdsForEventGame?: (eventGameId: string) => readonly string[] | undefined;
   onControllerCapacityChange?: () => void;
+  audienceInputDiagnostics?: {
+    onEpochRead?(): void;
+    onRecordRead?(eventGameId: string): void;
+  };
 }): Promise<LiveEventGameRuntime> {
   const readiness = await readSqliteFoundationStorageReadiness(input.databasePath, {
     grantKeyRing: input.keyRing,
@@ -360,17 +373,89 @@ export async function openLiveEventGameRuntime(input: {
     refreshEventCapacitySnapshot = () => {
       void control.reconcileActiveControllerSessions();
     };
+    const audienceInputCache = new Map<
+      string,
+      {
+        mutationRevision: number;
+        value: AudienceProjectionGameInput;
+        timeDependent: boolean;
+      }
+    >();
+    let audienceInputCacheGeneration = 0;
+    let closed = false;
+    const readCurrentMutationRevision = () => {
+      input.audienceInputDiagnostics?.onEpochRead?.();
+      return storage.transaction((snapshot) => snapshot.mutationRevision);
+    };
+    const readOneAudienceInput = async (eventGameId: string) => {
+      input.audienceInputDiagnostics?.onRecordRead?.(eventGameId);
+      const root = await storage.transaction((transaction) =>
+        transaction.findRootByEventGameId(eventGameId),
+      );
+      const projection = await control.readControllerProjection(eventGameId);
+      return readAudienceProjectionGameInput(root, projection);
+    };
     return {
       control,
-      async readAudienceProjectionGameInput(eventGameId) {
-        const root = await storage.transaction((transaction) =>
-          transaction.findRootByEventGameId(eventGameId),
+      readAudienceProjectionGameInput: readOneAudienceInput,
+      async readAudienceProjectionGameInputs(eventGameIds) {
+        const requestedIds = [...new Set(eventGameIds)];
+        const outcomes = new Map<string, AudienceProjectionGameInputOutcome>();
+        if (requestedIds.length === 0) return outcomes;
+        if (closed) throw new Error("Live Event Game runtime is closed.");
+        const generation = audienceInputCacheGeneration;
+        const beforeRevision = await readCurrentMutationRevision();
+        const refreshIds: string[] = [];
+        for (const eventGameId of requestedIds) {
+          const cached = audienceInputCache.get(eventGameId);
+          if (
+            cached !== undefined &&
+            cached.mutationRevision === beforeRevision &&
+            !cached.timeDependent
+          ) {
+            outcomes.set(eventGameId, { status: "accepted", value: structuredClone(cached.value) });
+          } else {
+            refreshIds.push(eventGameId);
+          }
+        }
+        const refreshed = await Promise.all(
+          refreshIds.map(
+            async (eventGameId) => [eventGameId, await readOneAudienceInput(eventGameId)] as const,
+          ),
         );
-        const projection = await control.readControllerProjection(eventGameId);
-        return readAudienceProjectionGameInput(root, projection);
+        for (const [eventGameId, outcome] of refreshed) outcomes.set(eventGameId, outcome);
+        const afterRevision = await readCurrentMutationRevision();
+        if (
+          closed ||
+          generation !== audienceInputCacheGeneration ||
+          beforeRevision !== afterRevision
+        ) {
+          return new Map(
+            requestedIds.map((eventGameId) => [eventGameId, { status: "unavailable" as const }]),
+          );
+        }
+        if ([...outcomes.values()].some((outcome) => outcome.status !== "accepted")) {
+          for (const [eventGameId, outcome] of outcomes) {
+            if (outcome.status === "unavailable") audienceInputCache.delete(eventGameId);
+          }
+          return outcomes;
+        }
+        for (const eventGameId of refreshIds) {
+          const outcome = outcomes.get(eventGameId);
+          if (outcome?.status !== "accepted") continue;
+          audienceInputCache.set(eventGameId, {
+            mutationRevision: beforeRevision,
+            value: structuredClone(outcome.value),
+            timeDependent: audienceInputIsTimeDependent(outcome.value),
+          });
+        }
+        return outcomes;
       },
       readiness: () => storage.readiness(),
       close() {
+        closed = true;
+        audienceInputCacheGeneration += 1;
+        audienceInputCache.clear();
         clearInterval(lockTimer);
         control.close();
         storage.close();

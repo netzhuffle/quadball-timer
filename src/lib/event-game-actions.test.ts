@@ -513,6 +513,7 @@ async function readSnapshot(
   ]);
   return {
     revision: 0,
+    mutationRevision: 0,
     findRootByRecordId: () => root,
     findRootByEventGameId: () => root,
     findRootByPitchSlotId: () => root,

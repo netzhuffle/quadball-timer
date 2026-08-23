@@ -4,7 +4,10 @@ import {
   createFoundationEventCatalogStorage,
   createInMemoryEventCatalogStorage,
   createUnavailableEventCatalogStorage,
+  projectScheduleGames,
   projectExpectedStartMs,
+  type EventCatalogStorageSnapshot,
+  type EventGame,
   type InMemoryEventCatalogStorage,
 } from "@/lib/event-catalog";
 import { createInMemoryFoundationStorage } from "@/lib/foundation-storage-memory";
@@ -35,6 +38,108 @@ function createFixture(storage: InMemoryEventCatalogStorage = createInMemoryEven
 }
 
 describe("Event operations catalog", () => {
+  test("precomputes conflict indexes with the strict legacy overlap result", () => {
+    const starts = new Map([
+      ["slot-0", 0],
+      ["slot-10", 10 * 60_000],
+      ["slot-15", 15 * 60_000],
+      ["slot-20", 20 * 60_000],
+      ["slot-30", 30 * 60_000],
+      ["slot-60", 60 * 60_000],
+    ]);
+    const snapshot = {
+      findGameplaySlot(gameplaySlotId: string) {
+        const scheduledStartMs = starts.get(gameplaySlotId);
+        return scheduledStartMs === undefined
+          ? null
+          : { gameplaySlotId, scheduledStartMs, expectedDelayMs: 0 };
+      },
+      findPitchSlot(pitchSlotId: string) {
+        const gameplaySlotId = pitchSlotId.split("@")[1];
+        return gameplaySlotId === undefined
+          ? null
+          : { pitchSlotId, gameplaySlotId, expectedDelayMs: 0 };
+      },
+    } as Pick<EventCatalogStorageSnapshot, "findGameplaySlot" | "findPitchSlot">;
+    const game = (
+      eventGameId: string,
+      slot: string,
+      pitch: string,
+      teams: readonly [string | null, string | null],
+      gameDayId = "day-1",
+    ): EventGame =>
+      ({
+        eventGameId,
+        eventId: "event-1",
+        gameDayId,
+        gameplaySlotId: slot,
+        pitchSlotId: `${pitch}@${slot}`,
+        gameCode: null,
+        gameDesignation: null,
+        sideA: { sideId: `${eventGameId}-a`, eventTeamId: teams[0] },
+        sideB: { sideId: `${eventGameId}-b`, eventTeamId: teams[1] },
+        createdAtMs: 1,
+        updatedAtMs: 1,
+      }) as EventGame;
+    const games = [
+      game("multi-a", "slot-0", "pitch-a", ["team-multi", "team-x"]),
+      game("multi-b", "slot-10", "pitch-b", ["team-multi", "team-y"]),
+      game("multi-c", "slot-20", "pitch-c", ["team-multi", "team-z"]),
+      game("touch-a", "slot-0", "pitch-d", ["team-touch", null]),
+      game("touch-b", "slot-30", "pitch-e", ["team-touch", null]),
+      game("pitch-a", "slot-0", "shared", ["team-p", null]),
+      { ...game("pitch-b", "slot-60", "unused", ["team-q", null]), pitchSlotId: "shared@slot-0" },
+      game("other-day", "slot-10", "pitch-f", ["team-multi", null], "day-2"),
+    ];
+    const oldResult = new Map(
+      games.map((candidate) => {
+        const start = starts.get(candidate.gameplaySlotId) ?? 0;
+        const end = start + 30 * 60_000;
+        const teamIds = [candidate.sideA.eventTeamId, candidate.sideB.eventTeamId].filter(
+          (teamId): teamId is string => teamId !== null,
+        );
+        return [
+          candidate.eventGameId,
+          {
+            scheduleConflict: games.some(
+              (other) =>
+                other.eventGameId !== candidate.eventGameId &&
+                other.pitchSlotId === candidate.pitchSlotId,
+            ),
+            teamScheduleConflict: games.some((other) => {
+              const otherStart = starts.get(other.gameplaySlotId) ?? 0;
+              return (
+                other.eventGameId !== candidate.eventGameId &&
+                other.gameDayId === candidate.gameDayId &&
+                [other.sideA.eventTeamId, other.sideB.eventTeamId].some(
+                  (teamId) => teamId !== null && teamIds.includes(teamId),
+                ) &&
+                otherStart < end &&
+                start < otherStart + 30 * 60_000
+              );
+            }),
+          },
+        ] as const;
+      }),
+    );
+    const indexBuilds: string[] = [];
+    const projected = projectScheduleGames(snapshot, games, {
+      onConflictIndexBuilt: (kind) => indexBuilds.push(kind),
+    });
+    expect(indexBuilds).toEqual(["pitch", "team"]);
+    expect(
+      new Map(
+        projected.map((candidate) => [
+          candidate.eventGameId,
+          {
+            scheduleConflict: candidate.scheduleConflict,
+            teamScheduleConflict: candidate.teamScheduleConflict,
+          },
+        ]),
+      ),
+    ).toEqual(oldResult);
+  });
+
   test("defaults each new Game Day to disabled Heat Stoppage Configuration", async () => {
     const fixture = createFixture();
     const event = await fixture.catalog.createEvent(
