@@ -190,14 +190,35 @@ describe("Grant secret UI lifecycle", () => {
   let fetchHandler: (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
 
   beforeEach(() => {
-    testWindow = new Window({ url: "http://timer.quadball.app/event-admin?eventId=event" });
+    testWindow = new Window({ url: "https://timer.quadball.app/event-admin?eventId=event" });
     Object.assign(globalThis, {
       window: testWindow,
       document: testWindow.document,
       navigator: testWindow.navigator,
-      fetch: (input: string | URL | Request, init?: RequestInit) => fetchHandler(input, init),
+      fetch: (input: string | URL | Request, init?: RequestInit) => {
+        const url =
+          typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+        const method = (init?.method ?? (input instanceof Request ? input.method : "GET"))
+          .toUpperCase()
+          .trim();
+        const headers = new Headers(init?.headers);
+        if (method !== "GET" && url.includes("/api/event-admin/")) {
+          expect(headers.get("x-event-admin-csrf")).toBe(
+            url.endsWith("/api/event-admin/admit") ? null : "event-admin-proof",
+          );
+        }
+        if (method !== "GET" && url.includes("/api/pitch-manager/")) {
+          expect(headers.get("x-pitch-manager-csrf")).toBe(
+            url.endsWith("/api/pitch-manager/admit") ? null : "pitch-manager-proof",
+          );
+        }
+        return fetchHandler(input, init);
+      },
     });
     (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+    document.cookie = "__Host-event-admin-csrf=event-admin-proof; Path=/; Secure; SameSite=Strict";
+    document.cookie =
+      "__Host-pitch-manager-csrf=pitch-manager-proof; Path=/; Secure; SameSite=Strict";
     container = document.createElement("div");
     document.body.appendChild(container);
     root = createRoot(container);
@@ -211,8 +232,10 @@ describe("Grant secret UI lifecycle", () => {
       const url =
         typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
       const method = init?.method ?? "GET";
-      if (url.endsWith("/api/event-admin/admit"))
+      if (url.endsWith("/api/event-admin/admit")) {
+        expect(new Headers(init?.headers).has("x-event-admin-csrf")).toBe(false);
         return json({ status: "admitted", sessionExpiresAtMs: 123_000 });
+      }
       if (url.includes("/api/event-admin/hub")) {
         hubCalls += 1;
         if (hubCalls === 1) return json({ status: "rejected" }, 401);
@@ -230,6 +253,7 @@ describe("Grant secret UI lifecycle", () => {
         });
       }
       if (url.includes("/heat-stoppage-configuration") && method === "PATCH") {
+        expect(new Headers(init?.headers).get("x-event-admin-csrf")).toBe("event-admin-proof");
         configurationUpdates += 1;
         const rawBody = typeof init?.body === "string" ? init.body : "";
         const body = JSON.parse(rawBody) as { configuration: typeof configuration };
@@ -829,8 +853,14 @@ describe("Grant secret UI lifecycle", () => {
           ? json({ status: "rejected", message: "Authentication failed." }, 401)
           : json({ status: "accepted", value: pitchManagerView });
       }
-      if (url.endsWith("/api/pitch-manager/admit")) return json({ status: "admitted" });
-      if (url.endsWith("/api/pitch-manager/leave")) return json({ status: "left" });
+      if (url.endsWith("/api/pitch-manager/admit")) {
+        expect(new Headers(init?.headers).has("x-pitch-manager-csrf")).toBe(false);
+        return json({ status: "admitted" });
+      }
+      if (url.endsWith("/api/pitch-manager/leave")) {
+        expect(new Headers(init?.headers).get("x-pitch-manager-csrf")).toBe("pitch-manager-proof");
+        return json({ status: "left" });
+      }
       if (url.endsWith("/control-grant") && method === "GET") {
         controlLookupCalls += 1;
         return controlLookupCalls === 1
@@ -855,7 +885,8 @@ describe("Grant secret UI lifecycle", () => {
             formatVersion: 1,
           },
         });
-      if (url.endsWith("/control-grant/rotate") && method === "POST")
+      if (url.endsWith("/control-grant/rotate") && method === "POST") {
+        expect(new Headers(init?.headers).get("x-pitch-manager-csrf")).toBe("pitch-manager-proof");
         return json({
           status: "accepted",
           value: {
@@ -864,6 +895,7 @@ describe("Grant secret UI lifecycle", () => {
             affectedSessionCount: 3,
           },
         });
+      }
       if (url.endsWith("/control-grant/sessions"))
         return json({ status: "retryable-failure" }, 503);
       throw new Error(`Unexpected request: ${method} ${url}`);

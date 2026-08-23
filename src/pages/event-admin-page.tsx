@@ -293,6 +293,7 @@ export function EventAdminPage({
 }: {
   qrRenderer?: GrantQrRenderer;
 } = {}) {
+  const fetch = eventAdminFetch;
   const queryEventId = new URLSearchParams(window.location.search).get("eventId") ?? "";
   const [eventId, setEventId] = useState(queryEventId);
   const [credential, setCredential] = useState("");
@@ -3397,6 +3398,36 @@ export function EventAdminPage({
       </Card>
     </main>
   );
+}
+
+async function eventAdminFetch(input: RequestInfo | URL, init: RequestInit = {}) {
+  const method = (init.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase();
+  const headers = new Headers(init.headers);
+  if (method !== "GET" && !requestPath(input).endsWith("/api/event-admin/admit")) {
+    const technicalAdminCsrf = readBrowserCookie("__Host-technical-admin-csrf");
+    const eventAdminCsrf = readBrowserCookie("__Host-event-admin-csrf");
+    if (technicalAdminCsrf !== null) {
+      headers.set("x-technical-admin-csrf", technicalAdminCsrf);
+    } else if (eventAdminCsrf !== null) {
+      headers.set("x-event-admin-csrf", eventAdminCsrf);
+    }
+  }
+  return globalThis.fetch(input, { ...init, headers });
+}
+
+function requestPath(input: RequestInfo | URL): string {
+  const value =
+    typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+  return new URL(value, window.location.href).pathname;
+}
+
+function readBrowserCookie(name: string): string | null {
+  const prefix = `${name}=`;
+  const value = document.cookie
+    .split(";")
+    .map((part) => part.trim())
+    .find((part) => part.startsWith(prefix));
+  return value === undefined ? null : value.slice(prefix.length);
 }
 
 function DelayPreviewView({

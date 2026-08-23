@@ -70,6 +70,7 @@ export function PitchManagerPage({
 }: {
   qrRenderer?: GrantQrRenderer;
 } = {}) {
+  const fetch = pitchManagerFetch;
   const [credential, setCredential] = useState("");
   const [grantCode, setGrantCode] = useState("");
   const [scope, setScope] = useState<Scope | null>(null);
@@ -709,4 +710,34 @@ export function PitchManagerPage({
       </Card>
     </main>
   );
+}
+
+async function pitchManagerFetch(input: RequestInfo | URL, init: RequestInit = {}) {
+  const method = (init.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase();
+  const headers = new Headers(init.headers);
+  if (method !== "GET" && !requestPath(input).endsWith("/api/pitch-manager/admit")) {
+    const technicalAdminCsrf = readBrowserCookie("__Host-technical-admin-csrf");
+    const pitchManagerCsrf = readBrowserCookie("__Host-pitch-manager-csrf");
+    if (technicalAdminCsrf !== null) {
+      headers.set("x-technical-admin-csrf", technicalAdminCsrf);
+    } else if (pitchManagerCsrf !== null) {
+      headers.set("x-pitch-manager-csrf", pitchManagerCsrf);
+    }
+  }
+  return globalThis.fetch(input, { ...init, headers });
+}
+
+function requestPath(input: RequestInfo | URL): string {
+  const value =
+    typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+  return new URL(value, window.location.href).pathname;
+}
+
+function readBrowserCookie(name: string): string | null {
+  const prefix = `${name}=`;
+  const value = document.cookie
+    .split(";")
+    .map((part) => part.trim())
+    .find((part) => part.startsWith(prefix));
+  return value === undefined ? null : value.slice(prefix.length);
 }

@@ -3,6 +3,15 @@ import { createHash, randomBytes } from "node:crypto";
 import { dirname } from "node:path";
 import index from "./index.html";
 import { readJsonBodyWithinLimit } from "@/lib/http-body";
+import {
+  deriveGrantSessionCsrfToken,
+  EVENT_ADMIN_CSRF_COOKIE,
+  EVENT_ADMIN_CSRF_HEADER,
+  PITCH_MANAGER_CSRF_COOKIE,
+  PITCH_MANAGER_CSRF_HEADER,
+  verifyGrantSessionCsrfToken,
+  type GrantSessionCsrfRole,
+} from "@/lib/grant-session-csrf";
 import { collectHtmlBundleAssetPaths } from "@/lib/html-bundle-assets";
 import { isInternalHealthHost } from "@/lib/internal-health";
 import { SHARED_LIMITS } from "@/lib/validation-policy";
@@ -467,7 +476,7 @@ async function startServer() {
         | "reactivatePitchManagerGrant",
     ) => {
       if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
-      const authority = resolveEventAdministrationAuthority(req, technicalAdminAuth);
+      const authority = resolveEventAdministrationMutationAuthority(req, technicalAdminAuth);
       const path = new URL(req.url).pathname.split("/");
       if (authority === null) return sensitiveGenericAuthFailure(401);
       const result =
@@ -557,7 +566,10 @@ async function startServer() {
       operation: "inspect" | "create" | "replace" | "disable",
     ) => {
       if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
-      const authority = resolveEventAdministrationAuthority(req, technicalAdminAuth);
+      const authority =
+        operation === "inspect"
+          ? resolveEventAdministrationAuthority(req, technicalAdminAuth)
+          : resolveEventAdministrationMutationAuthority(req, technicalAdminAuth);
       const path = new URL(req.url).pathname.split("/");
       if (authority === null) return sensitiveGenericAuthFailure(401);
       const common = [path[4] ?? "", path[6] ?? "", path[8] ?? ""] as const;
@@ -585,9 +597,13 @@ async function startServer() {
     ) => {
       if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
       const authority =
-        audience === "pitch-manager"
-          ? resolvePitchManagerAuthority(req, technicalAdminAuth)
-          : resolveEventAdministrationAuthority(req, technicalAdminAuth);
+        operation === "inspect"
+          ? audience === "pitch-manager"
+            ? resolvePitchManagerAuthority(req, technicalAdminAuth)
+            : resolveEventAdministrationAuthority(req, technicalAdminAuth)
+          : audience === "pitch-manager"
+            ? resolvePitchManagerMutationAuthority(req, technicalAdminAuth)
+            : resolveEventAdministrationMutationAuthority(req, technicalAdminAuth);
       const path = new URL(req.url).pathname.split("/");
       if (authority === null) return sensitiveGenericAuthFailure(401);
       const common = [path[4] ?? "", path[6] ?? "", path[8] ?? "", path[10] ?? ""] as const;
@@ -1301,10 +1317,16 @@ async function startServer() {
               ["set-cookie", eventAdminContextCookie(context)],
             ];
             if (typeof result.sessionExpiresAtMs === "number")
-              sessionHeaders.push([
-                "set-cookie",
-                eventAdminSessionCookie(result.sessionBearer, result.sessionExpiresAtMs),
-              ]);
+              sessionHeaders.push(
+                [
+                  "set-cookie",
+                  eventAdminSessionCookie(result.sessionBearer, result.sessionExpiresAtMs),
+                ],
+                [
+                  "set-cookie",
+                  eventAdminCsrfCookie(result.sessionBearer, result.sessionExpiresAtMs),
+                ],
+              );
             return sensitiveJson(
               {
                 status: "admitted",
@@ -1324,7 +1346,10 @@ async function startServer() {
           {
             async POST(req: Request) {
               if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
-              const authority = resolveEventAdministrationAuthority(req, technicalAdminAuth);
+              const authority = resolveEventAdministrationMutationAuthority(
+                req,
+                technicalAdminAuth,
+              );
               if (authority === null) return sensitiveGenericAuthFailure(401);
               const body = await readJsonRecord(req);
               if (body === null) return sensitiveEventAdministrationResponse(invalidEventBody());
@@ -1348,7 +1373,10 @@ async function startServer() {
           {
             async POST(req: Request) {
               if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
-              const authority = resolveEventAdministrationAuthority(req, technicalAdminAuth);
+              const authority = resolveEventAdministrationMutationAuthority(
+                req,
+                technicalAdminAuth,
+              );
               if (authority === null) return sensitiveGenericAuthFailure(401);
               const body = await readJsonRecord(req);
               if (body === null) return sensitiveEventAdministrationResponse(invalidEventBody());
@@ -1366,7 +1394,7 @@ async function startServer() {
         "/api/event-admin/events/:eventId/game-days/:gameDayId/event-games/:eventGameId/reopen": {
           async POST(req: Request) {
             if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
-            const authority = resolveEventAdministrationAuthority(req, technicalAdminAuth);
+            const authority = resolveEventAdministrationMutationAuthority(req, technicalAdminAuth);
             if (authority === null) return sensitiveGenericAuthFailure(401);
             const body = await readJsonRecord(req);
             if (body === null) return sensitiveEventAdministrationResponse(invalidEventBody());
@@ -1385,7 +1413,10 @@ async function startServer() {
           {
             async POST(req: Request) {
               if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
-              const authority = resolveEventAdministrationAuthority(req, technicalAdminAuth);
+              const authority = resolveEventAdministrationMutationAuthority(
+                req,
+                technicalAdminAuth,
+              );
               if (authority === null) return sensitiveGenericAuthFailure(401);
               const body = await readJsonRecord(req);
               if (body === null) return sensitiveEventAdministrationResponse(invalidEventBody());
@@ -1418,7 +1449,10 @@ async function startServer() {
             },
             async POST(req: Request) {
               if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
-              const authority = resolveEventAdministrationAuthority(req, technicalAdminAuth);
+              const authority = resolveEventAdministrationMutationAuthority(
+                req,
+                technicalAdminAuth,
+              );
               const path = new URL(req.url).pathname.split("/");
               if (authority === null) return sensitiveGenericAuthFailure(401);
               return sensitiveEventAdministrationMutationResponse(
@@ -1481,7 +1515,10 @@ async function startServer() {
             },
             async POST(req: Request) {
               if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
-              const authority = resolveEventAdministrationAuthority(req, technicalAdminAuth);
+              const authority = resolveEventAdministrationMutationAuthority(
+                req,
+                technicalAdminAuth,
+              );
               const path = new URL(req.url).pathname.split("/");
               if (authority === null) return sensitiveGenericAuthFailure(401);
               return sensitiveEventAdministrationMutationResponse(
@@ -1502,7 +1539,8 @@ async function startServer() {
             POST: (req: Request) =>
               controlGrantMutation(
                 req,
-                (request) => resolveEventAdministrationAuthority(request, technicalAdminAuth),
+                (request) =>
+                  resolveEventAdministrationMutationAuthority(request, technicalAdminAuth),
                 "reveal",
               ),
           },
@@ -1520,7 +1558,8 @@ async function startServer() {
             POST: (req: Request) =>
               controlGrantMutation(
                 req,
-                (request) => resolveEventAdministrationAuthority(request, technicalAdminAuth),
+                (request) =>
+                  resolveEventAdministrationMutationAuthority(request, technicalAdminAuth),
                 "rotate",
               ),
           },
@@ -1547,7 +1586,8 @@ async function startServer() {
             POST: (req: Request) =>
               controlGrantMutation(
                 req,
-                (request) => resolveEventAdministrationAuthority(request, technicalAdminAuth),
+                (request) =>
+                  resolveEventAdministrationMutationAuthority(request, technicalAdminAuth),
                 "revoke-session",
               ),
           },
@@ -1582,10 +1622,16 @@ async function startServer() {
               ["set-cookie", pitchManagerContextCookie(context)],
             ];
             if (typeof result.sessionExpiresAtMs === "number")
-              sessionHeaders.push([
-                "set-cookie",
-                pitchManagerSessionCookie(result.sessionBearer, result.sessionExpiresAtMs),
-              ]);
+              sessionHeaders.push(
+                [
+                  "set-cookie",
+                  pitchManagerSessionCookie(result.sessionBearer, result.sessionExpiresAtMs),
+                ],
+                [
+                  "set-cookie",
+                  pitchManagerCsrfCookie(result.sessionBearer, result.sessionExpiresAtMs),
+                ],
+              );
             return sensitiveJson(
               {
                 status: "admitted",
@@ -1648,7 +1694,7 @@ async function startServer() {
             },
             async POST(req: Request) {
               if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
-              const authority = resolvePitchManagerAuthority(req, technicalAdminAuth);
+              const authority = resolvePitchManagerMutationAuthority(req, technicalAdminAuth);
               const path = new URL(req.url).pathname.split("/");
               if (authority === null) return sensitiveGenericAuthFailure(401);
               return sensitiveEventAdministrationMutationResponse(
@@ -1670,7 +1716,7 @@ async function startServer() {
             POST: (req: Request) =>
               controlGrantMutation(
                 req,
-                (request) => resolvePitchManagerAuthority(request, technicalAdminAuth),
+                (request) => resolvePitchManagerMutationAuthority(request, technicalAdminAuth),
                 "reveal",
                 "pitch-manager",
               ),
@@ -1680,7 +1726,7 @@ async function startServer() {
             POST: (req: Request) =>
               controlGrantMutation(
                 req,
-                (request) => resolvePitchManagerAuthority(request, technicalAdminAuth),
+                (request) => resolvePitchManagerMutationAuthority(request, technicalAdminAuth),
                 "rotate",
                 "pitch-manager",
               ),
@@ -1708,7 +1754,7 @@ async function startServer() {
             POST: (req: Request) =>
               controlGrantMutation(
                 req,
-                (request) => resolvePitchManagerAuthority(request, technicalAdminAuth),
+                (request) => resolvePitchManagerMutationAuthority(request, technicalAdminAuth),
                 "revoke-session",
                 "pitch-manager",
               ),
@@ -1716,11 +1762,14 @@ async function startServer() {
         "/api/pitch-manager/leave": {
           async POST(req: Request) {
             if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
-            const sessionBearer = readPitchManagerSession(req.headers.get("cookie"));
-            if (sessionBearer === null) return sensitiveGenericAuthFailure(401);
-            const result = await eventAdministration.leavePitchManagerSession(sessionBearer);
+            const authority = resolvePitchManagerMutationAuthority(req, technicalAdminAuth);
+            if (authority?.kind !== "grant-session") return sensitiveGenericAuthFailure(401);
+            const result = await eventAdministration.leavePitchManagerSession(
+              authority.sessionBearer,
+            );
             return sensitiveJson(result, result.status === "updated" ? 200 : 401, [
               ["set-cookie", clearPitchManagerSessionCookie()],
+              ["set-cookie", clearPitchManagerCsrfCookie()],
             ]);
           },
         },
@@ -1784,7 +1833,7 @@ async function startServer() {
         "/api/event-admin/events/:eventId/access-sheets": {
           async POST(req: Request) {
             if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
-            const authority = resolveEventAdministrationAuthority(req, technicalAdminAuth);
+            const authority = resolveEventAdministrationMutationAuthority(req, technicalAdminAuth);
             const body = await readJsonRecord(req);
             const eventId = new URL(req.url).pathname.split("/").at(-2) ?? "";
             if (authority === null || body === null) return sensitiveGenericAuthFailure(401);
@@ -1805,7 +1854,7 @@ async function startServer() {
         "/api/event-admin/events/:eventId/publication-status": {
           async POST(req: Request) {
             if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
-            const authority = resolveEventAdministrationAuthority(req, technicalAdminAuth);
+            const authority = resolveEventAdministrationMutationAuthority(req, technicalAdminAuth);
             const body = await readJsonRecord(req);
             const eventId = new URL(req.url).pathname.split("/").at(-2) ?? "";
             if (authority === null || body === null) return sensitiveGenericAuthFailure(401);
@@ -1821,7 +1870,7 @@ async function startServer() {
         "/api/event-admin/events/:eventId/catalog-removal/preview": {
           async POST(req: Request) {
             if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
-            const authority = resolveEventAdministrationAuthority(req, technicalAdminAuth);
+            const authority = resolveEventAdministrationMutationAuthority(req, technicalAdminAuth);
             const body = await readJsonRecord(req);
             const eventId = new URL(req.url).pathname.split("/").at(-3) ?? "";
             if (authority === null) return sensitiveGenericAuthFailure(401);
@@ -1837,7 +1886,7 @@ async function startServer() {
         "/api/event-admin/events/:eventId/catalog-removal": {
           async DELETE(req: Request) {
             if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
-            const authority = resolveEventAdministrationAuthority(req, technicalAdminAuth);
+            const authority = resolveEventAdministrationMutationAuthority(req, technicalAdminAuth);
             const body = await readJsonRecord(req);
             const eventId = new URL(req.url).pathname.split("/").at(-2) ?? "";
             if (authority === null) return sensitiveGenericAuthFailure(401);
@@ -1859,7 +1908,7 @@ async function startServer() {
         "/api/event-admin/events/:eventId/teams": {
           async POST(req: Request) {
             if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
-            const authority = resolveEventAdministrationAuthority(req, technicalAdminAuth);
+            const authority = resolveEventAdministrationMutationAuthority(req, technicalAdminAuth);
             const body = await readJsonRecord(req);
             const eventId = new URL(req.url).pathname.split("/").at(-2) ?? "";
             if (authority === null || body === null) return sensitiveGenericAuthFailure(401);
@@ -1877,7 +1926,7 @@ async function startServer() {
         "/api/event-admin/events/:eventId/teams/:eventTeamId": {
           async PATCH(req: Request) {
             if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
-            const authority = resolveEventAdministrationAuthority(req, technicalAdminAuth);
+            const authority = resolveEventAdministrationMutationAuthority(req, technicalAdminAuth);
             const body = await readJsonRecord(req);
             const path = new URL(req.url).pathname.split("/");
             if (authority === null || body === null) return sensitiveGenericAuthFailure(401);
@@ -1895,7 +1944,7 @@ async function startServer() {
         "/api/event-admin/events/:eventId/teams/:eventTeamId/roster": {
           async PUT(req: Request) {
             if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
-            const authority = resolveEventAdministrationAuthority(req, technicalAdminAuth);
+            const authority = resolveEventAdministrationMutationAuthority(req, technicalAdminAuth);
             const body = await readJsonRecord(req);
             const path = new URL(req.url).pathname.split("/");
             if (authority === null || body === null) return sensitiveGenericAuthFailure(401);
@@ -1913,7 +1962,7 @@ async function startServer() {
         "/api/event-admin/events/:eventId/pitches": {
           async POST(req: Request) {
             if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
-            const authority = resolveEventAdministrationAuthority(req, technicalAdminAuth);
+            const authority = resolveEventAdministrationMutationAuthority(req, technicalAdminAuth);
             const body = await readJsonRecord(req);
             const eventId = new URL(req.url).pathname.split("/").at(-2) ?? "";
             if (authority === null || body === null) return sensitiveGenericAuthFailure(401);
@@ -1927,7 +1976,7 @@ async function startServer() {
         "/api/event-admin/events/:eventId/pitches/:pitchId": {
           async PATCH(req: Request) {
             if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
-            const authority = resolveEventAdministrationAuthority(req, technicalAdminAuth);
+            const authority = resolveEventAdministrationMutationAuthority(req, technicalAdminAuth);
             const body = await readJsonRecord(req);
             const path = new URL(req.url).pathname.split("/");
             if (authority === null || body === null) return sensitiveGenericAuthFailure(401);
@@ -1945,7 +1994,7 @@ async function startServer() {
         "/api/event-admin/events/:eventId/game-days/:gameDayId/gameplay-slots": {
           async POST(req: Request) {
             if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
-            const authority = resolveEventAdministrationAuthority(req, technicalAdminAuth);
+            const authority = resolveEventAdministrationMutationAuthority(req, technicalAdminAuth);
             const body = await readJsonRecord(req);
             const path = new URL(req.url).pathname.split("/");
             if (authority === null || body === null) return sensitiveGenericAuthFailure(401);
@@ -1967,7 +2016,7 @@ async function startServer() {
         "/api/event-admin/events/:eventId/game-days/:gameDayId/heat-stoppage-configuration": {
           async PATCH(req: Request) {
             if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
-            const authority = resolveEventAdministrationAuthority(req, technicalAdminAuth);
+            const authority = resolveEventAdministrationMutationAuthority(req, technicalAdminAuth);
             const body = await readJsonRecord(req);
             const path = new URL(req.url).pathname.split("/");
             if (authority === null || body === null) return sensitiveGenericAuthFailure(401);
@@ -1985,7 +2034,7 @@ async function startServer() {
         "/api/event-admin/events/:eventId/game-days/:gameDayId/event-games": {
           async POST(req: Request) {
             if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
-            const authority = resolveEventAdministrationAuthority(req, technicalAdminAuth);
+            const authority = resolveEventAdministrationMutationAuthority(req, technicalAdminAuth);
             const body = await readJsonRecord(req);
             const path = new URL(req.url).pathname.split("/");
             if (authority === null || body === null) return sensitiveGenericAuthFailure(401);
@@ -2012,7 +2061,10 @@ async function startServer() {
           {
             async POST(req: Request) {
               if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
-              const authority = resolveEventAdministrationAuthority(req, technicalAdminAuth);
+              const authority = resolveEventAdministrationMutationAuthority(
+                req,
+                technicalAdminAuth,
+              );
               const body = await readJsonRecord(req);
               const path = new URL(req.url).pathname.split("/");
               if (authority === null || body === null) return sensitiveGenericAuthFailure(401);
@@ -2032,7 +2084,10 @@ async function startServer() {
           {
             async POST(req: Request) {
               if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
-              const authority = resolveEventAdministrationAuthority(req, technicalAdminAuth);
+              const authority = resolveEventAdministrationMutationAuthority(
+                req,
+                technicalAdminAuth,
+              );
               const body = await readJsonRecord(req);
               const path = new URL(req.url).pathname.split("/");
               if (authority === null || body === null) return sensitiveGenericAuthFailure(401);
@@ -2052,7 +2107,10 @@ async function startServer() {
           {
             async POST(req: Request) {
               if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
-              const authority = resolveEventAdministrationAuthority(req, technicalAdminAuth);
+              const authority = resolveEventAdministrationMutationAuthority(
+                req,
+                technicalAdminAuth,
+              );
               const body = await readJsonRecord(req);
               const path = new URL(req.url).pathname.split("/");
               if (authority === null || body === null) return sensitiveGenericAuthFailure(401);
@@ -2071,7 +2129,10 @@ async function startServer() {
           {
             async POST(req: Request) {
               if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
-              const authority = resolveEventAdministrationAuthority(req, technicalAdminAuth);
+              const authority = resolveEventAdministrationMutationAuthority(
+                req,
+                technicalAdminAuth,
+              );
               const body = await readJsonRecord(req);
               const path = new URL(req.url).pathname.split("/");
               if (authority === null || body === null) return sensitiveGenericAuthFailure(401);
@@ -2091,7 +2152,10 @@ async function startServer() {
           {
             async POST(req: Request) {
               if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
-              const authority = resolveEventAdministrationAuthority(req, technicalAdminAuth);
+              const authority = resolveEventAdministrationMutationAuthority(
+                req,
+                technicalAdminAuth,
+              );
               const body = await readJsonRecord(req);
               const path = new URL(req.url).pathname.split("/");
               if (authority === null || body === null) return sensitiveGenericAuthFailure(401);
@@ -2109,7 +2173,7 @@ async function startServer() {
         "/api/event-admin/events/:eventId/game-days/:gameDayId/event-games/:eventGameId/reassign": {
           async POST(req: Request) {
             if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
-            const authority = resolveEventAdministrationAuthority(req, technicalAdminAuth);
+            const authority = resolveEventAdministrationMutationAuthority(req, technicalAdminAuth);
             const body = await readJsonRecord(req);
             const path = new URL(req.url).pathname.split("/");
             if (authority === null || body === null) return sensitiveGenericAuthFailure(401);
@@ -2128,7 +2192,7 @@ async function startServer() {
         "/api/event-admin/events/:eventId/game-days/:gameDayId/event-games/:eventGameId/identity": {
           async POST(req: Request) {
             if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
-            const authority = resolveEventAdministrationAuthority(req, technicalAdminAuth);
+            const authority = resolveEventAdministrationMutationAuthority(req, technicalAdminAuth);
             const body = await readJsonRecord(req);
             const path = new URL(req.url).pathname.split("/");
             if (authority === null || body === null) return sensitiveGenericAuthFailure(401);
@@ -2153,7 +2217,7 @@ async function startServer() {
         "/api/event-admin/events/:eventId/event-games/:eventGameId/presentation": {
           async POST(req: Request) {
             if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
-            const authority = resolveEventAdministrationAuthority(req, technicalAdminAuth);
+            const authority = resolveEventAdministrationMutationAuthority(req, technicalAdminAuth);
             const body = await readJsonRecord(req);
             const path = new URL(req.url).pathname.split("/");
             if (authority === null || body === null) return sensitiveGenericAuthFailure(401);
@@ -2206,12 +2270,15 @@ async function startServer() {
         },
         "/api/event-admin/leave": {
           async POST(req: Request) {
-            if (eventAdministration === null) return genericAuthFailure(503);
-            const sessionBearer = readEventAdminSession(req.headers.get("cookie"));
-            if (sessionBearer === null) return genericAuthFailure(401);
-            const result = await eventAdministration.leaveEventAdminSession(sessionBearer);
+            if (eventAdministration === null) return sensitiveGenericAuthFailure(503);
+            const authority = resolveEventAdministrationMutationAuthority(req, technicalAdminAuth);
+            if (authority?.kind !== "grant-session") return sensitiveGenericAuthFailure(401);
+            const result = await eventAdministration.leaveEventAdminSession(
+              authority.sessionBearer,
+            );
             return sensitiveJson(result, result.status === "updated" ? 200 : 401, [
               ["set-cookie", clearEventAdminSessionCookie()],
+              ["set-cookie", clearEventAdminCsrfCookie()],
             ]);
           },
         },
@@ -3227,6 +3294,8 @@ function sensitiveJson(
 }
 
 async function readJsonRecord(req: Request): Promise<Record<string, unknown> | null> {
+  const contentType = req.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase();
+  if (contentType !== "application/json") return null;
   const result = await readJsonBodyWithinLimit(req);
   return result.ok && isRecord(result.body) ? result.body : null;
 }
@@ -3419,6 +3488,12 @@ function sensitiveEventAdministrationMutationResponse<T>(
               ? pitchManagerSessionCookie(authority.sessionBearer, result.sessionExpiresAtMs)
               : eventAdminSessionCookie(authority.sessionBearer, result.sessionExpiresAtMs),
           ],
+          [
+            "set-cookie",
+            audience === "pitch-manager"
+              ? pitchManagerCsrfCookie(authority.sessionBearer, result.sessionExpiresAtMs)
+              : eventAdminCsrfCookie(authority.sessionBearer, result.sessionExpiresAtMs),
+          ],
         ]
       : [];
   return sensitiveEventAdministrationResponse(result, acceptedStatus, refreshHeaders);
@@ -3455,6 +3530,42 @@ function resolvePitchManagerAuthority(
   if (technical !== null) return technical;
   const sessionBearer = readPitchManagerSession(req.headers.get("cookie"));
   return sessionBearer === null ? null : { kind: "grant-session", sessionBearer };
+}
+
+function resolveEventAdministrationMutationAuthority(
+  req: Request,
+  technicalAdminAuth: ReturnType<typeof createTechnicalAdminAuth>,
+): EventAdministrationAuthority | null {
+  return resolveMutationAuthority(req, technicalAdminAuth, "event-admin");
+}
+
+function resolvePitchManagerMutationAuthority(
+  req: Request,
+  technicalAdminAuth: ReturnType<typeof createTechnicalAdminAuth>,
+): EventAdministrationAuthority | null {
+  return resolveMutationAuthority(req, technicalAdminAuth, "pitch-manager");
+}
+
+function resolveMutationAuthority(
+  req: Request,
+  technicalAdminAuth: ReturnType<typeof createTechnicalAdminAuth>,
+  role: GrantSessionCsrfRole,
+): EventAdministrationAuthority | null {
+  if (!technicalAdminAuth.isExpectedBinding(requestBinding(req))) return null;
+  const cookieHeader = req.headers.get("cookie");
+  if (readTechnicalAdminCookie(cookieHeader) !== null) {
+    return requireTechnicalAdminMutationToken(req, technicalAdminAuth);
+  }
+  const sessionBearer =
+    role === "event-admin"
+      ? readEventAdminSession(cookieHeader)
+      : readPitchManagerSession(cookieHeader);
+  const csrfToken = req.headers.get(
+    role === "event-admin" ? EVENT_ADMIN_CSRF_HEADER : PITCH_MANAGER_CSRF_HEADER,
+  );
+  if (sessionBearer === null || !verifyGrantSessionCsrfToken(role, sessionBearer, csrfToken))
+    return null;
+  return { kind: "grant-session", sessionBearer };
 }
 
 function readEventAdminContext(header: string | null): string | null {
@@ -3494,6 +3605,10 @@ function eventAdminSessionCookie(value: string, expiresAtMs: number): string {
   return `__Host-event-admin-session=${encodeURIComponent(value)}; Path=/; Max-Age=${maxAgeSeconds}; HttpOnly; Secure; SameSite=Strict`;
 }
 
+function eventAdminCsrfCookie(sessionBearer: string, expiresAtMs: number): string {
+  return grantSessionCsrfCookie("event-admin", sessionBearer, expiresAtMs);
+}
+
 function pitchManagerContextCookie(value: string): string {
   return `__Host-pitch-manager-context=${encodeURIComponent(value)}; Path=/; HttpOnly; Secure; SameSite=Strict`;
 }
@@ -3503,12 +3618,39 @@ function pitchManagerSessionCookie(value: string, expiresAtMs: number): string {
   return `__Host-pitch-manager-session=${encodeURIComponent(value)}; Path=/; Max-Age=${maxAgeSeconds}; HttpOnly; Secure; SameSite=Strict`;
 }
 
+function pitchManagerCsrfCookie(sessionBearer: string, expiresAtMs: number): string {
+  return grantSessionCsrfCookie("pitch-manager", sessionBearer, expiresAtMs);
+}
+
+function grantSessionCsrfCookie(
+  role: GrantSessionCsrfRole,
+  sessionBearer: string,
+  expiresAtMs: number,
+): string {
+  const maxAgeSeconds = Math.max(
+    0,
+    role === "event-admin"
+      ? Math.min(2_592_000, Math.ceil((expiresAtMs - Date.now()) / 1_000))
+      : Math.ceil((expiresAtMs - Date.now()) / 1_000),
+  );
+  const name = role === "event-admin" ? EVENT_ADMIN_CSRF_COOKIE : PITCH_MANAGER_CSRF_COOKIE;
+  return `${name}=${deriveGrantSessionCsrfToken(role, sessionBearer)}; Path=/; Max-Age=${maxAgeSeconds}; Secure; SameSite=Strict`;
+}
+
 function clearEventAdminSessionCookie(): string {
   return "__Host-event-admin-session=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict";
 }
 
+function clearEventAdminCsrfCookie(): string {
+  return `${EVENT_ADMIN_CSRF_COOKIE}=; Path=/; Max-Age=0; Secure; SameSite=Strict`;
+}
+
 function clearPitchManagerSessionCookie(): string {
   return "__Host-pitch-manager-session=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict";
+}
+
+function clearPitchManagerCsrfCookie(): string {
+  return `${PITCH_MANAGER_CSRF_COOKIE}=; Path=/; Max-Age=0; Secure; SameSite=Strict`;
 }
 
 function readRuntimeCapacity(value: string | undefined, fallback: number): number {
