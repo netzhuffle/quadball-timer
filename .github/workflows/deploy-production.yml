@@ -5,11 +5,19 @@ on:
     branches:
       - main
     paths-ignore:
+      - .github/dependabot.yml
       - AGENTS.md
       - CONTEXT.md
       - README.md
+      - deploy/**/*.md
       - docs/**
-      - .github/dependabot.yml
+      - src/**/*.d.ts
+      - src/**/*.focused.ts
+      - src/**/*.focused.tsx
+      - src/**/*.spec.ts
+      - src/**/*.spec.tsx
+      - src/**/*.test.ts
+      - src/**/*.test.tsx
   workflow_dispatch:
 
 permissions:
@@ -288,7 +296,7 @@ jobs:
           chmod 644 "$ssh_dir/known_hosts"
           echo "SSH_DIR=$ssh_dir" >> "$GITHUB_ENV"
 
-      - name: Transfer and activate Production release after approval
+      - name: Transfer and activate Production release after Test
         env:
           DEPLOY_HOST: ${{ secrets.PROD_HOST }}
           DEPLOY_USER: ${{ secrets.PROD_USER }}

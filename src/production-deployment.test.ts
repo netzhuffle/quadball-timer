@@ -57,7 +57,7 @@ describe("Production deployment contract", () => {
     expect(monitoring).toContain("`root:quadball-timer-test`");
   });
 
-  test("builds one shared immutable artifact and gates Production after Test", () => {
+  test("deploys runtime-affecting main changes through Test and then Production", () => {
     const workflow = readFileSync(
       join(repositoryRoot, ".github/workflows/deploy-production.yml"),
       "utf8",
@@ -71,6 +71,16 @@ describe("Production deployment contract", () => {
     expect(workflow).toContain("needs: [build, deploy-test]");
     expect(workflow).toContain("name: production");
     expect(workflow).toContain("Download shared release artifact");
+    expect(workflow).toContain("paths-ignore:");
+    expect(workflow).toContain("- docs/**");
+    expect(workflow).toContain("- README.md");
+    expect(workflow).toContain("- deploy/**/*.md");
+    expect(workflow).toContain("- src/**/*.test.ts");
+    expect(workflow).toContain("- src/**/*.focused.ts");
+    expect(workflow).not.toContain("paths:\n");
+    expect(workflow).not.toContain("- src/**\n");
+    expect(workflow).not.toContain("- build.ts");
+    expect(workflow).not.toContain("- package.json");
   });
 
   test("reports independent Test and Production outcomes with release identity", () => {
@@ -92,7 +102,7 @@ describe("Production deployment contract", () => {
     );
   });
 
-  test("puts Production approval in the main workflow", async () => {
+  test("automatically activates Production after successful Test", async () => {
     const workflow = readFileSync(
       join(repositoryRoot, ".github/workflows/deploy-production.yml"),
       "utf8",
@@ -102,7 +112,8 @@ describe("Production deployment contract", () => {
     expect(workflow).toContain("needs: [build, deploy-test]");
     expect(workflow).toContain("environment:\n      name: production");
     expect(workflow).toContain("Download shared release artifact");
-    expect(workflow).toContain("Transfer and activate Production release after approval");
+    expect(workflow).toContain("Transfer and activate Production release after Test");
+    expect(workflow).not.toContain("after approval");
     expect(workflow).toContain("name: production");
     expect(await pathExists(join(repositoryRoot, ".github/workflows/promote-production.yml"))).toBe(
       false,

@@ -392,7 +392,7 @@ An immutable deployable candidate whose bytes and provenance are fixed as one un
 _Avoid_: build, deployment package, latest artifact
 
 **Test Activation**:
-The automatic validation of a Release Bundle in the disposable Test Environment after an eligible merge to `main`.
+The automatic validation of a Release Bundle in the disposable Test Environment after a deploy-affecting push to `main`.
 _Avoid_: Test promotion, Test deployment candidate
 
 **Promotion Source Run**:
@@ -400,9 +400,9 @@ The successful validation record whose Test Activation certified the Release Bun
 _Avoid_: latest run, source build, production run
 
 **Production Promotion**:
-The manual transfer and activation of the exact Release Bundle validated by a Promotion Source Run, after the required Production Approval.
+The transfer and activation of the exact Release Bundle validated by a Promotion Source Run. Under the temporary post-SQM deployment policy, it starts automatically after successful Test Activation.
 _Avoid_: Production deploy, rebuild-and-deploy, hotfix push
 
 **Production Approval**:
-The explicit human review granted before a Production Promotion may activate its selected Release Bundle.
-_Avoid_: automatic approval, deployment confirmation
+An explicit human review that may be required before Production Promotion under a guarded deployment policy. The temporary post-SQM automatic deployment policy does not require one.
+_Avoid_: deployment confirmation

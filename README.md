@@ -78,12 +78,13 @@ release when the installed unit does not provide this state contract.
 
 The permanent Test Environment is deployed independently at
 `https://test.timer.quadball.app` by the Test job in
-`.github/workflows/deploy-production.yml`. Every eligible merge to `main` builds
-one immutable Release Bundle and performs Test Activation only. Production is
-activated by the Production job in the same workflow after you approve the
-`production` Environment. It uses the exact shared Test-validated bundle and
-never rebuilds it. Follow `deploy/production-promotion.md` for the operator
-steps.
+`.github/workflows/deploy-production.yml`. Every push to `main` that changes a
+runtime, build, dependency, or deployment input builds one immutable Release
+Bundle and performs Test Activation. After Test succeeds, the Production job
+automatically activates the exact shared Test-validated bundle without
+rebuilding it. Documentation-only, test-only, and other non-deployable changes
+do not start this workflow. This is the temporary post-SQM deployment policy.
+Follow `deploy/production-promotion.md` for the current operational sequence.
 Test uses
 the separate `quadball-timer-test` service on `127.0.0.1:3001`, release root
 `/srv/quadball-timer-test`, and state directory `/var/lib/quadball-timer-test`.
@@ -95,11 +96,12 @@ standing backup or availability guarantee. See
 The Test Environment Technical Admin verification checklist is in
 `deploy/technical-admin-bootstrap-test-checklist.md`.
 
-Pushes to `main` skip CI and Test Activation when every changed path is limited to
-`AGENTS.md`, `CONTEXT.md`, `README.md`, `docs/`, or `.github/dependabot.yml`.
-Files under `docs/` are also excluded from formatting, linting, and type-aware
-validation. Manually dispatch the Test workflow to force CI/Test Activation; use
-the separate Production promotion workflow for a reviewed Production Approval.
+The deployment workflow uses a conservative ignore list for known
+documentation-only and test-only paths. Those pushes do not run its build,
+test, Test Activation, or Production activation stages. Any new or unclassified
+path deploys by default, so adding a deployable input does not require extending
+a positive trigger list. Files under `docs/` also remain excluded from
+formatting, linting, and type-aware validation.
 
 ## Quality checks
 
