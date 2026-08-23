@@ -17,6 +17,9 @@ export const AD_HOC_REPLAY_SUSTAINED_PER_SECOND = 20;
 // envelope remains 100 so malformed or oversized replay requests fail closed.
 export const AD_HOC_REPLAY_BURST = AD_HOC_REPLAY_SUSTAINED_PER_SECOND;
 export const AD_HOC_REPLAY_MAX_UNACKNOWLEDGED_BATCHES = 1;
+// Bounds only rejected and causally blocked replay evidence retained per Ad Hoc
+// Game. Accepted history remains intact and governed by replay semantics.
+export const AD_HOC_MAX_RETAINED_REJECTED_OPERATIONS_PER_GAME = 16;
 
 // Ad Hoc still applies its own 256-controller workflow cap below. The shared
 // WebSocket envelope leaves room for 500 public spectators and two reserved
