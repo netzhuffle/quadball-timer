@@ -4,6 +4,9 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { writeFileSync } from "node:fs";
 import { createGrantKeyRingDocument, writeGrantKeyRingFile } from "@/lib/grant-key-ring-custody";
+import { SHARED_LIMITS } from "@/lib/validation-policy";
+
+const OVERSIZED_CREDENTIAL = "credential-must-not-be-echoed";
 
 describe("Event Hub early response headers", () => {
   test("marks unauthenticated and unavailable early responses as sensitive", async () => {
@@ -63,6 +66,18 @@ describe("Pitch Manager early response headers", () => {
       await expectSensitiveFailure(unavailableLeave, 503, { error: "Authentication failed." });
     });
   });
+
+  test("rejects an oversized admission body without echoing credentials", async () => {
+    await withServer({}, async (serverUrl) => {
+      const response = await fetch(new URL("/api/pitch-manager/admit", serverUrl), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: credentialBodyWithByteLength(SHARED_LIMITS.transport.httpJsonBodyBytes + 1),
+      });
+
+      await expectOversizedCredentialFailure(response);
+    });
+  });
 });
 
 describe("Event Admin admission response headers", () => {
@@ -94,7 +109,42 @@ describe("Event Admin admission response headers", () => {
       await expectSensitiveFailure(unavailable, 503, { error: "Authentication failed." });
     });
   });
+
+  test("accepts the exact body limit and rejects limit plus one without echoing credentials", async () => {
+    await withServer({}, async (serverUrl) => {
+      const exactLimit = await fetch(new URL("/api/event-admin/admit", serverUrl), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: credentialBodyWithByteLength(SHARED_LIMITS.transport.httpJsonBodyBytes),
+      });
+      expect(exactLimit.status).toBe(401);
+      expect(exactLimit.headers.get("cache-control")).toBe("no-store");
+      expect(exactLimit.headers.get("referrer-policy")).toBe("no-referrer");
+      expect(await exactLimit.text()).not.toContain(OVERSIZED_CREDENTIAL);
+
+      const oversized = await fetch(new URL("/api/event-admin/admit", serverUrl), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: credentialBodyWithByteLength(SHARED_LIMITS.transport.httpJsonBodyBytes + 1),
+      });
+
+      await expectOversizedCredentialFailure(oversized);
+    });
+  });
 });
+
+async function expectOversizedCredentialFailure(response: Response) {
+  expect(response.status).toBe(413);
+  expect(await response.text()).not.toContain(OVERSIZED_CREDENTIAL);
+}
+
+function credentialBodyWithByteLength(byteLength: number): string {
+  const prefix = `{"qrCredential":"${OVERSIZED_CREDENTIAL}","padding":"`;
+  const suffix = '"}';
+  const body = `${prefix}${"x".repeat(byteLength - prefix.length - suffix.length)}${suffix}`;
+  expect(new TextEncoder().encode(body).byteLength).toBe(byteLength);
+  return body;
+}
 
 async function expectSensitiveFailure(
   response: Response,

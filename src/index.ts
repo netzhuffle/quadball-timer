@@ -636,6 +636,7 @@ async function startServer() {
     server = serve<SessionData>({
       hostname: process.env.HOST ?? "127.0.0.1",
       port,
+      maxRequestBodySize: SHARED_LIMITS.transport.httpJsonBodyBytes,
       error(error) {
         monitoring.captureException(error, { category: "server", component: "http" });
         return json({ error: "Internal server error." }, 500);
@@ -3226,12 +3227,8 @@ function sensitiveJson(
 }
 
 async function readJsonRecord(req: Request): Promise<Record<string, unknown> | null> {
-  try {
-    const value: unknown = await req.json();
-    return isRecord(value) ? value : null;
-  } catch {
-    return null;
-  }
+  const result = await readJsonBodyWithinLimit(req);
+  return result.ok && isRecord(result.body) ? result.body : null;
 }
 
 async function readCeremonyBody(
