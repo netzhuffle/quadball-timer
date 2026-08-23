@@ -1,12 +1,16 @@
 import { describe, expect, test } from "bun:test";
 import {
   AD_HOC_DISCONNECTED_GRACE_MS,
+  DEFAULT_AD_HOC_IQA_RULES,
   createAdHocGamesService,
   createInMemoryAdHocStore,
   type AdHocStore,
   type AdHocGamesService,
 } from "@/lib/ad-hoc-games";
-import { AD_HOC_MAX_RETAINED_REJECTED_OPERATIONS_PER_GAME } from "@/lib/ad-hoc-resource-budgets";
+import {
+  AD_HOC_MAX_CONNECTED_CONTROLLERS,
+  AD_HOC_MAX_RETAINED_REJECTED_OPERATIONS_PER_GAME,
+} from "@/lib/ad-hoc-resource-budgets";
 import { applyGameCommand, createInitialGameState } from "@/lib/game-engine";
 import { deriveAdHocOptimisticState } from "@/lib/game-page-support";
 import type { AdHocPendingOperation } from "@/lib/ad-hoc-controller-session";
@@ -255,6 +259,137 @@ describe("Ad Hoc Games service", () => {
     expect(
       (await games.read({ gameId: created.gameId, sessionId: created.sessionId })).status,
     ).toBe("accepted");
+  });
+
+  test("authorizes a bounded positional broadcast from one Game read and one shared projection", async () => {
+    const base = createInMemoryAdHocStore();
+    let reads = 0;
+    let projections = 0;
+    const games = createAdHocGamesService({
+      store: {
+        ...base,
+        readGame(gameId) {
+          reads += 1;
+          return base.readGame(gameId);
+        },
+      },
+      now: () => 1_000,
+      iqaRules: {
+        ...DEFAULT_AD_HOC_IQA_RULES,
+        project(state, nowMs) {
+          projections += 1;
+          return DEFAULT_AD_HOC_IQA_RULES.project(state, nowMs);
+        },
+      },
+    });
+    const created = await games.create({ homeName: "Home", awayName: "Away" });
+    if (created.status !== "accepted") throw new Error("creation failed");
+
+    reads = 0;
+    projections = 0;
+    for (
+      let candidateCount = 0;
+      candidateCount <= AD_HOC_MAX_CONNECTED_CONTROLLERS;
+      candidateCount += 1
+    ) {
+      reads = 0;
+      projections = 0;
+      const result = await games.authorizeBroadcast({
+        gameId: created.gameId,
+        sessionIds: Array.from({ length: candidateCount }, () => created.sessionId),
+        nowMs: 2_000,
+      });
+      expect(result.status).toBe("accepted");
+      if (result.status === "accepted") {
+        expect(result.authorized).toEqual(Array.from({ length: candidateCount }, () => true));
+      }
+      expect(reads).toBe(1);
+      expect(projections).toBe(1);
+    }
+
+    reads = 0;
+    projections = 0;
+    const unauthorized = "unauthorized-session-abcdefghijklmnopqrstuvwxyz";
+    const sessionIds = Array.from({ length: AD_HOC_MAX_CONNECTED_CONTROLLERS }, (_, index) =>
+      index % 2 === 0 ? created.sessionId : unauthorized,
+    );
+    const maximum = await games.authorizeBroadcast({
+      gameId: created.gameId,
+      sessionIds,
+      nowMs: 3_000,
+    });
+    expect(maximum.status).toBe("accepted");
+    if (maximum.status !== "accepted") return;
+    expect(maximum.authorized).toHaveLength(AD_HOC_MAX_CONNECTED_CONTROLLERS);
+    expect(maximum.authorized.slice(0, 4)).toEqual([true, false, true, false]);
+    expect(maximum.game).not.toHaveProperty("sessionId");
+    expect(JSON.stringify(maximum)).not.toContain(created.sessionId);
+    expect(JSON.stringify(maximum)).not.toContain(unauthorized);
+    expect(JSON.stringify(maximum)).not.toContain(
+      base.readGame(created.gameId)!.sessions[0]!.sessionHash,
+    );
+    expect(reads).toBe(1);
+    expect(projections).toBe(1);
+
+    const finished = await games.apply({
+      gameId: created.gameId,
+      sessionId: created.sessionId,
+      operations: [
+        {
+          id: "finish-before-broadcast",
+          clientSentAtMs: 3_100,
+          command: { type: "record-double-forfeit" },
+        },
+      ],
+      nowMs: 3_100,
+    });
+    expect(finished.status).toBe("accepted");
+    reads = 0;
+    projections = 0;
+    const finishedBroadcast = await games.authorizeBroadcast({
+      gameId: created.gameId,
+      sessionIds: [created.sessionId],
+      nowMs: 3_200,
+    });
+    expect(finishedBroadcast).toMatchObject({
+      status: "accepted",
+      authorized: [true],
+      game: { controlQr: null, state: { isFinished: true } },
+    });
+    expect(reads).toBe(1);
+    expect(projections).toBe(1);
+
+    reads = 0;
+    projections = 0;
+    await games.leave({ gameId: created.gameId, sessionId: created.sessionId });
+    const removed = await games.authorizeBroadcast({
+      gameId: created.gameId,
+      sessionIds: [created.sessionId],
+      nowMs: 4_000,
+    });
+    expect(removed).toMatchObject({ status: "accepted", authorized: [false] });
+    expect(reads).toBe(1);
+    expect(projections).toBe(1);
+
+    reads = 0;
+    projections = 0;
+    expect(
+      await games.authorizeBroadcast({
+        gameId: created.gameId,
+        sessionIds: Array.from(
+          { length: AD_HOC_MAX_CONNECTED_CONTROLLERS + 1 },
+          () => unauthorized,
+        ),
+      }),
+    ).toEqual({ status: "unavailable" });
+    expect(
+      await games.authorizeBroadcast({ gameId: created.gameId, sessionIds: ["short"] }),
+    ).toEqual({ status: "unavailable" });
+    expect(await games.authorizeBroadcast({ gameId: "invalid", sessionIds: [] })).toEqual({
+      status: "unavailable",
+    });
+    expect(reads).toBe(0);
+    expect(projections).toBe(0);
   });
 
   test("returns duplicate acknowledgements without rewriting unchanged Game state", async () => {

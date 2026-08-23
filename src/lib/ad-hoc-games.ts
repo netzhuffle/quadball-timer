@@ -69,6 +69,16 @@ export type AdHocGameView = GameView & {
   controlQr: string | null;
 };
 
+export type AuthorizedAdHocGameProjection = Omit<AdHocGameView, "sessionId">;
+
+export type AdHocBroadcastAuthorizationResult =
+  | {
+      status: "accepted";
+      game: AuthorizedAdHocGameProjection;
+      authorized: readonly boolean[];
+    }
+  | { status: "unavailable" };
+
 export type AdHocCreationInput = {
   homeName: unknown;
   awayName: unknown;
@@ -781,6 +791,44 @@ export function createAdHocGamesService(options: AdHocGamesServiceOptions = {}) 
       return {
         status: "accepted",
         game: projectAuthorizedGame(game, sessionId, null, input.nowMs ?? now(), iqaRules),
+      };
+    },
+
+    async authorizeBroadcast(input: {
+      gameId: unknown;
+      sessionIds: unknown;
+      nowMs?: number;
+    }): Promise<AdHocBroadcastAuthorizationResult> {
+      const gameId = validateGameId(input.gameId);
+      const nowMs = input.nowMs ?? now();
+      if (
+        gameId === null ||
+        !isSafeTimestamp(nowMs) ||
+        !Array.isArray(input.sessionIds) ||
+        input.sessionIds.length > AD_HOC_MAX_CONNECTED_CONTROLLERS
+      ) {
+        return { status: "unavailable" };
+      }
+      const sessionIds = input.sessionIds.map(validateBearer);
+      if (sessionIds.some((sessionId) => sessionId === null)) {
+        return { status: "unavailable" };
+      }
+      let game: StoredAdHocGame | null;
+      try {
+        game = store.readGame(gameId);
+      } catch {
+        return { status: "unavailable" };
+      }
+      if (game === null || game.environmentIdentity !== environmentIdentity) {
+        return { status: "unavailable" };
+      }
+      const authorizedSessionHashes = new Set(game.sessions.map((session) => session.sessionHash));
+      return {
+        status: "accepted",
+        game: projectAuthorizedGameShared(game, nowMs, iqaRules),
+        authorized: sessionIds.map(
+          (sessionId) => sessionId !== null && authorizedSessionHashes.has(digest(sessionId)),
+        ),
       };
     },
 
@@ -2170,12 +2218,24 @@ function projectAuthorizedGame(
   nowMs: number,
   rules: AdHocIqaGameRules = DEFAULT_AD_HOC_IQA_RULES,
 ): AdHocGameView {
+  const shared = projectAuthorizedGameShared(game, nowMs, rules);
+  return {
+    ...shared,
+    sessionId,
+    controlQr: shared.state.isFinished ? null : (controlQr ?? game.controlQr),
+  };
+}
+
+function projectAuthorizedGameShared(
+  game: StoredAdHocGame,
+  nowMs: number,
+  rules: AdHocIqaGameRules = DEFAULT_AD_HOC_IQA_RULES,
+): AuthorizedAdHocGameProjection {
   const view = rules.project(game.state, nowMs);
   return {
     ...view,
     gameId: game.gameId,
-    sessionId,
-    controlQr: view.state.isFinished ? null : (controlQr ?? game.controlQr),
+    controlQr: view.state.isFinished ? null : game.controlQr,
   };
 }
 

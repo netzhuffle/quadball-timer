@@ -8,6 +8,7 @@ import {
 import {
   adHocFallbackRoute,
   admitGame,
+  broadcastGameSnapshot,
   calculateAdHocUpgradeCapacity,
   createGame,
   leaveGame,
@@ -15,6 +16,7 @@ import {
   readAuthorizedAdHocGame,
   readGame,
   resolveAdHocWebSocketSubscription,
+  type AdHocBroadcastSocket,
 } from "./index";
 
 function service(): AdHocGamesService {
@@ -45,6 +47,87 @@ async function createViaHttp(games: AdHocGamesService, homeName: string, browser
 }
 
 describe("Ad Hoc HTTP and WebSocket authority boundaries", () => {
+  test("reuses ordinary broadcast serialization while isolating sender acknowledgement and queue failure", async () => {
+    const games = service();
+    const created = await games.create({ homeName: "Home", awayName: "Away" });
+    if (created.status !== "accepted") throw new Error("creation failed");
+    const admitted = await games.admit({
+      gameId: created.gameId,
+      controlQr: created.controlQr,
+    });
+    if (admitted.status !== "accepted") throw new Error("admission failed");
+
+    const socket = (sessionId: string, sendResult: "success" | "failure" = "success") => {
+      const messages: string[] = [];
+      const closes: Array<{ code: number; reason: string }> = [];
+      const candidate: AdHocBroadcastSocket = {
+        data: { subscription: { type: "game", gameId: created.gameId, sessionId } },
+        send(serialized) {
+          messages.push(serialized);
+          return sendResult === "success" ? new TextEncoder().encode(serialized).byteLength : 0;
+        },
+        close(code, reason) {
+          closes.push({ code, reason });
+        },
+      };
+      return { candidate, messages, closes };
+    };
+    const sender = socket(created.sessionId);
+    const ordinary = socket(admitted.game.sessionId);
+    const pressured = socket(admitted.game.sessionId, "failure");
+    const removed = socket("removed-session-abcdefghijklmnopqrstuvwxyz");
+    let serializations = 0;
+    const serialize = (payload: Parameters<typeof JSON.stringify>[0]) => {
+      serializations += 1;
+      return JSON.stringify(payload);
+    };
+
+    const delivered = await broadcastGameSnapshot({
+      gameId: created.gameId,
+      service: games,
+      sender: sender.candidate,
+      candidates: [sender.candidate, ordinary.candidate, pressured.candidate, removed.candidate],
+      senderAckedCommandIds: ["accepted-command"],
+      operationOutcomes: [
+        { operationId: "accepted-command", workflow: "ad-hoc", status: "accepted" },
+      ],
+      serverNowMs: 2_000,
+      serialize,
+    });
+
+    expect(delivered).toBe(true);
+    expect(serializations).toBe(2);
+    expect(ordinary.messages).toEqual(pressured.messages);
+    expect(removed.messages).toEqual([]);
+    expect(sender.messages).toHaveLength(1);
+    expect(JSON.parse(sender.messages[0]!).ackedCommandIds).toEqual(["accepted-command"]);
+    expect(JSON.parse(ordinary.messages[0]!).ackedCommandIds).toEqual([]);
+    expect(pressured.closes).toEqual([{ code: 1013, reason: "Ad Hoc output backpressure." }]);
+    expect(games.getResourceMetrics().queuePressure).toBe(1);
+    expect([...sender.messages, ...ordinary.messages].join("")).not.toContain(created.sessionId);
+
+    await games.leave({ gameId: created.gameId, sessionId: created.sessionId });
+    serializations = 0;
+    sender.messages.length = 0;
+    ordinary.messages.length = 0;
+    expect(
+      await broadcastGameSnapshot({
+        gameId: created.gameId,
+        service: games,
+        sender: sender.candidate,
+        candidates: [sender.candidate, ordinary.candidate],
+        senderAckedCommandIds: ["must-not-be-acknowledged"],
+        operationOutcomes: [],
+        serverNowMs: 3_000,
+        serialize,
+      }),
+    ).toBe(false);
+    expect(sender.messages).toEqual([]);
+    expect(ordinary.messages).toHaveLength(1);
+    expect(JSON.parse(ordinary.messages[0]!).ackedCommandIds).toEqual([]);
+    expect(serializations).toBe(1);
+  });
+
   test("caps pre-upgrade Ad Hoc capacity below the configured Event reserve", () => {
     expect(
       calculateAdHocUpgradeCapacity({
