@@ -130,23 +130,7 @@ import {
   parseTechnicalAdminBootstrapCli,
   runTechnicalAdminBootstrapCli,
 } from "@/lib/technical-admin-bootstrap";
-
-export type SessionSubscription =
-  | {
-      type: "none";
-    }
-  | {
-      type: "lobby";
-    }
-  | {
-      type: "game";
-      gameId: string;
-      sessionId: string;
-    }
-  | {
-      type: "public-event";
-      eventId: string;
-    };
+import { queueWebSocketSubscription, type SessionSubscription } from "@/lib/websocket-subscription";
 
 type SessionData = {
   id: string;
@@ -156,37 +140,6 @@ type SessionData = {
   subscriptionWork: Promise<void>;
   closed: boolean;
 };
-
-export type WebSocketSubscriptionQueue = Pick<SessionData, "subscription" | "subscriptionWork">;
-
-export function canBeginWebSocketSubscription(subscription: SessionData["subscription"]): boolean {
-  return subscription.type === "none";
-}
-
-export function queueWebSocketSubscription(
-  queue: WebSocketSubscriptionQueue,
-  operation: {
-    isClosed?: () => boolean;
-    alreadySubscribed: (message: string) => void;
-    subscribe: () => Promise<void>;
-  },
-): Promise<"started" | "already-subscribed" | "closed"> {
-  const handleSubscription = async () => {
-    if (operation.isClosed?.()) return "closed" as const;
-    if (!canBeginWebSocketSubscription(queue.subscription)) {
-      operation.alreadySubscribed("WebSocket is already subscribed.");
-      return "already-subscribed" as const;
-    }
-    await operation.subscribe();
-    return "started" as const;
-  };
-  const queued = queue.subscriptionWork.then(handleSubscription, handleSubscription);
-  queue.subscriptionWork = queued.then(
-    () => undefined,
-    () => undefined,
-  );
-  return queued;
-}
 
 export type AdHocBroadcastSocket = {
   data: { subscription: SessionSubscription };
@@ -2468,45 +2421,36 @@ async function startServer() {
 
             case "subscribe-public-event": {
               const eventId = parsed.message.eventId;
-              const queued = queueWebSocketSubscription(ws.data, {
-                isClosed: () => ws.data.closed,
-                alreadySubscribed(message) {
-                  sendMessage(ws, {
-                    type: "error",
-                    message,
-                  });
-                },
-                async subscribe() {
-                  const subscriber = {
-                    send(serialized: string) {
-                      return sendPublicAudienceSerializedEnvelope(ws, serialized);
-                    },
-                    close(code: number, reason: string) {
-                      if (!ws.data.closed) ws.close(code, reason);
-                    },
-                  };
-                  const result = await publicEventWebSocketHub.subscribe(
-                    ws.data.id,
+              const queued = queueServerWebSocketSubscription(ws, async () => {
+                const subscriber = {
+                  send(serialized: string) {
+                    return sendPublicAudienceSerializedEnvelope(ws, serialized);
+                  },
+                  close(code: number, reason: string) {
+                    if (!ws.data.closed) ws.close(code, reason);
+                  },
+                };
+                const result = await publicEventWebSocketHub.subscribe(
+                  ws.data.id,
+                  eventId,
+                  subscriber,
+                );
+                if (ws.data.closed) return;
+                if (result.status === "rejected") {
+                  sendMessage(ws, { type: "error", message: result.message });
+                  ws.close(1013, result.message);
+                  return;
+                }
+                if (result.status !== "admitted") {
+                  sendPublicEventStreamMessage(ws, {
+                    protocol: "public-event-stream-v1",
+                    type: "event-unavailable",
                     eventId,
-                    subscriber,
-                  );
-                  if (ws.data.closed) return;
-                  if (result.status === "rejected") {
-                    sendMessage(ws, { type: "error", message: result.message });
-                    ws.close(1013, result.message);
-                    return;
-                  }
-                  if (result.status !== "admitted") {
-                    sendPublicEventStreamMessage(ws, {
-                      protocol: "public-event-stream-v1",
-                      type: "event-unavailable",
-                      eventId,
-                    });
-                    ws.close(1008, "Event unavailable.");
-                    return;
-                  }
-                  ws.data.subscription = { type: "public-event", eventId };
-                },
+                  });
+                  ws.close(1008, "Event unavailable.");
+                  return;
+                }
+                ws.data.subscription = { type: "public-event", eventId };
               });
               await queued;
               return;
@@ -2514,78 +2458,69 @@ async function startServer() {
 
             case "subscribe-game": {
               const subscribeGameId = parsed.message.gameId;
-              const queued = queueWebSocketSubscription(ws.data, {
-                isClosed: () => ws.data.closed,
-                alreadySubscribed(message) {
-                  sendMessage(ws, {
-                    type: "error",
-                    message,
-                  });
-                },
-                async subscribe() {
-                  const result = await resolveAdHocWebSocketSubscription({
-                    service: adHocService,
-                    cookieHeader: ws.data.cookieHeader,
-                    gameId: subscribeGameId,
-                  });
-                  if (result.status === "capacity") {
-                    if (!ws.data.closed) {
-                      adHocService.recordResourcePressure("connection-shed");
-                      sendMessage(ws, {
-                        type: "error",
-                        message: "Ad Hoc connection busy. Try again later.",
-                        retryAfterMs: result.retryAfterMs,
-                      });
-                      setTimeout(() => ws.close(1013, "Ad Hoc connection busy."), 25);
-                    }
-                    return;
+              const queued = queueServerWebSocketSubscription(ws, async () => {
+                const result = await resolveAdHocWebSocketSubscription({
+                  service: adHocService,
+                  cookieHeader: ws.data.cookieHeader,
+                  gameId: subscribeGameId,
+                });
+                if (result.status === "capacity") {
+                  if (!ws.data.closed) {
+                    adHocService.recordResourcePressure("connection-shed");
+                    sendMessage(ws, {
+                      type: "error",
+                      message: "Ad Hoc connection busy. Try again later.",
+                      retryAfterMs: result.retryAfterMs,
+                    });
+                    setTimeout(() => ws.close(1013, "Ad Hoc connection busy."), 25);
                   }
-                  if (result.status !== "accepted") {
-                    if (!ws.data.closed) {
-                      sendMessage(ws, {
-                        type: "error",
-                        message: adHocService.genericUnavailableMessage,
-                      });
-                      ws.close(1008, "Ad Hoc subscription unavailable.");
-                    }
-                    return;
-                  }
-                  const identity = {
-                    gameId: subscribeGameId,
-                    sessionId: result.sessionId,
-                  };
-                  const tracking = await liveAdHocSessions.subscribe(ws.data.id, {
-                    ...identity,
-                  });
-                  if (!tracking.attached) {
-                    if (liveAdHocSessions.count(identity) === 0) {
-                      await adHocService.setConnection({ ...identity, connected: false });
-                    }
-                    if (!ws.data.closed) {
-                      sendMessage(ws, {
-                        type: "error",
-                        message: adHocService.genericUnavailableMessage,
-                      });
-                      ws.close(1008, "Ad Hoc subscription unavailable.");
-                    }
-                    return;
-                  }
-                  ws.data.sessionId = result.sessionId;
-                  ws.data.subscription = {
-                    type: "game",
-                    gameId: subscribeGameId,
-                    sessionId: result.sessionId,
-                  };
+                  return;
+                }
+                if (result.status !== "accepted") {
                   if (!ws.data.closed) {
                     sendMessage(ws, {
-                      type: "game-snapshot",
-                      game: stripSession(result.game),
-                      serverNowMs: Date.now(),
-                      ackedCommandIds: [],
+                      type: "error",
+                      message: adHocService.genericUnavailableMessage,
                     });
+                    ws.close(1008, "Ad Hoc subscription unavailable.");
                   }
-                  if (!tracking.previousDisconnectDurable) void liveAdHocSessions.retryPending();
-                },
+                  return;
+                }
+                const identity = {
+                  gameId: subscribeGameId,
+                  sessionId: result.sessionId,
+                };
+                const tracking = await liveAdHocSessions.subscribe(ws.data.id, {
+                  ...identity,
+                });
+                if (!tracking.attached) {
+                  if (liveAdHocSessions.count(identity) === 0) {
+                    await adHocService.setConnection({ ...identity, connected: false });
+                  }
+                  if (!ws.data.closed) {
+                    sendMessage(ws, {
+                      type: "error",
+                      message: adHocService.genericUnavailableMessage,
+                    });
+                    ws.close(1008, "Ad Hoc subscription unavailable.");
+                  }
+                  return;
+                }
+                ws.data.sessionId = result.sessionId;
+                ws.data.subscription = {
+                  type: "game",
+                  gameId: subscribeGameId,
+                  sessionId: result.sessionId,
+                };
+                if (!ws.data.closed) {
+                  sendMessage(ws, {
+                    type: "game-snapshot",
+                    game: stripSession(result.game),
+                    serverNowMs: Date.now(),
+                    ackedCommandIds: [],
+                  });
+                }
+                if (!tracking.previousDisconnectDurable) void liveAdHocSessions.retryPending();
               });
               await queued;
               return;
@@ -3117,6 +3052,19 @@ function sendAdHocSerializedEnvelope(ws: AdHocBroadcastSocket, serialized: strin
     overflowCloseReason: "Ad Hoc output limit reached.",
     shortSendCloseReason: "Ad Hoc output backpressure.",
     sendErrorCloseReason: "Ad Hoc output unavailable.",
+  });
+}
+
+function queueServerWebSocketSubscription(
+  ws: ServerWebSocket<SessionData>,
+  subscribe: () => Promise<void>,
+) {
+  return queueWebSocketSubscription(ws.data, {
+    isClosed: () => ws.data.closed,
+    alreadySubscribed(message) {
+      sendMessage(ws, { type: "error", message });
+    },
+    subscribe,
   });
 }
 
