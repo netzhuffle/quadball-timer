@@ -3187,7 +3187,7 @@ function readAdHocSource(cookieHeader: string | null): string | null {
 }
 
 function adHocSourceCookie(source: string): string {
-  return `${AD_HOC_SOURCE_COOKIE_NAME}=${encodeURIComponent(source)}; Path=/; Max-Age=31536000; HttpOnly; SameSite=Lax`;
+  return `${AD_HOC_SOURCE_COOKIE_NAME}=${encodeURIComponent(source)}; Path=/; Max-Age=31536000; HttpOnly; SameSite=Lax; Secure`;
 }
 
 function adHocSessionCookieName(gameId: unknown): string | null {
@@ -3196,11 +3196,11 @@ function adHocSessionCookieName(gameId: unknown): string | null {
 }
 
 function adHocSessionCookie(gameId: string, sessionId: string): string {
-  return `${adHocSessionCookieName(gameId)}=${encodeURIComponent(sessionId)}; Path=/; Max-Age=31536000; HttpOnly; SameSite=Lax`;
+  return `${adHocSessionCookieName(gameId)}=${encodeURIComponent(sessionId)}; Path=/; Max-Age=31536000; HttpOnly; SameSite=Lax; Secure`;
 }
 
 function clearAdHocSessionCookie(gameId: string): string {
-  return `${adHocSessionCookieName(gameId)}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax`;
+  return `${adHocSessionCookieName(gameId)}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax; Secure`;
 }
 
 export function adHocFallbackRoute(req: Request) {

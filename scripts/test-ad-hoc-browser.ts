@@ -161,6 +161,7 @@ async function run() {
 
         const gameId = new URL(first.url()).pathname.split("/").at(-1);
         if (gameId === undefined) throw new Error("Game route did not contain a Game ID.");
+        assertSecureAdHocCookies(await firstContext.cookies(), [gameId], true);
         const actionSheetContext = await browser!.newContext({ ignoreHTTPSErrors: true });
         const actionSheetPage = await actionSheetContext.newPage();
         actionSheetPage.setDefaultTimeout(15_000);
@@ -170,11 +171,15 @@ async function run() {
         await waitForHealthyControllerHeader(actionSheetPage);
         await assertControllerActionSheet(actionSheetPage, "Ad Hoc initial Controller");
         await actionSheetContext.close();
+        let additionalGameId = "";
         for (let index = 0; index < 4; index += 1) {
           await first.goto(origin);
           await first.getByRole("button", { name: /Start an Ad Hoc Game/ }).click();
           await first.waitForURL(/\/game\/adhoc-/u);
+          if (index === 0) additionalGameId = new URL(first.url()).pathname.split("/").at(-1) ?? "";
         }
+        if (additionalGameId === "") throw new Error("Additional Game route had no Game ID.");
+        assertSecureAdHocCookies(await firstContext.cookies(), [gameId, additionalGameId], true);
         await first.goto(origin);
         await first.getByRole("button", { name: /Start an Ad Hoc Game/ }).click();
         await first
@@ -241,6 +246,7 @@ async function run() {
         const handoffUrl = `${origin}/#adhoc-game=${encodeURIComponent(gameId)}&adhoc-control=${encodeURIComponent(controlQr)}`;
         await second.goto(handoffUrl);
         await waitForGameRoute(second, gameId);
+        assertSecureAdHocCookies(await secondContext.cookies(), [gameId]);
         await assertAccessibleQr(second, "second browser");
 
         const startGame = second.getByRole("button", { name: "Start game" });
@@ -348,6 +354,27 @@ async function run() {
         await waitForGameRoute(second, gameId);
         await first.getByText("Paused", { exact: true }).waitFor();
 
+        const alternateSnapshot = await first.evaluate(async (id) => {
+          const response = await fetch(`/api/games/${id}`);
+          return (await response.json()) as { game?: { controlQr?: string | null } };
+        }, creationRetryGameId);
+        const alternateQr = alternateSnapshot.game?.controlQr;
+        if (typeof alternateQr !== "string")
+          throw new Error("Alternate Ad Hoc handoff QR was unavailable.");
+        const siblingAdmissionStatus = await second.evaluate(
+          async ({ siblingGameId, controlQr }) => {
+            const response = await fetch(`/api/games/${encodeURIComponent(siblingGameId)}/admit`, {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({ controlQr }),
+            });
+            return response.status;
+          },
+          { siblingGameId: creationRetryGameId, controlQr: alternateQr },
+        );
+        if (siblingAdmissionStatus !== 200) throw new Error("Sibling Game admission failed.");
+        assertSecureAdHocCookies(await secondContext.cookies(), [gameId, creationRetryGameId]);
+
         // An Ad Hoc returnable session must use the same shared replacement
         // confirmation before an Event admission transport is touched.
         await second.getByRole("button", { name: "Leave Ad Hoc Game Controller" }).click();
@@ -390,6 +417,20 @@ async function run() {
           eventReplacementOrder.slice(0, eventAdmissionIndex).some((entry) => entry !== "finalize")
         )
           throw new Error(`Ad Hoc→Event replacement order was ${eventReplacementOrder.join(",")}.`);
+        if (
+          (await secondContext.cookies()).some(
+            (cookie) => cookie.name === `adhoc_session_${gameId}`,
+          )
+        ) {
+          throw new Error("Confirmed replacement retained the finalized Ad Hoc session cookie.");
+        }
+        assertSecureAdHocCookies(await secondContext.cookies(), [creationRetryGameId]);
+        const siblingReadStatus = await second.evaluate(async (siblingGameId) => {
+          const response = await fetch(`/api/games/${encodeURIComponent(siblingGameId)}`);
+          return response.status;
+        }, creationRetryGameId);
+        if (siblingReadStatus !== 200)
+          throw new Error("Confirmed replacement removed sibling Ad Hoc authority.");
         second.off("request", recordEventOpen);
 
         const creationContext = await browser!.newContext({
@@ -438,13 +479,6 @@ async function run() {
         const admissionStorageState = await creationContext.storageState();
         await creationContext.close();
 
-        const alternateSnapshot = await first.evaluate(async (id) => {
-          const response = await fetch(`/api/games/${id}`);
-          return (await response.json()) as { game?: { controlQr?: string | null } };
-        }, creationRetryGameId);
-        const alternateQr = alternateSnapshot.game?.controlQr;
-        if (typeof alternateQr !== "string")
-          throw new Error("Alternate Ad Hoc handoff QR was unavailable.");
         const admissionContext = await browser!.newContext({
           ignoreHTTPSErrors: true,
           storageState: admissionStorageState,
@@ -770,6 +804,25 @@ async function waitForServer() {
 
 async function waitForGameRoute(page: Page, gameId: string) {
   if (page.url() !== `${origin}/game/${gameId}`) await page.waitForURL(`${origin}/game/${gameId}`);
+}
+
+function assertSecureAdHocCookies(
+  cookies: readonly { name: string; secure: boolean }[],
+  gameIds: readonly string[],
+  requireSource = false,
+) {
+  if (requireSource) {
+    const source = cookies.find((cookie) => cookie.name === "adhoc_source");
+    if (source === undefined || !source.secure) {
+      throw new Error("The Ad Hoc source cookie was absent or not Secure.");
+    }
+  }
+  for (const gameId of gameIds) {
+    const session = cookies.find((cookie) => cookie.name === `adhoc_session_${gameId}`);
+    if (session === undefined || !session.secure) {
+      throw new Error("An expected Ad Hoc session cookie was absent or not Secure.");
+    }
+  }
 }
 
 async function waitForHealthyControllerHeader(page: Page) {

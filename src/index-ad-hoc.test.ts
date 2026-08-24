@@ -296,6 +296,13 @@ describe("Ad Hoc HTTP and WebSocket authority boundaries", () => {
     const authoritySet = `${first.cookie}; ${second.cookie}`;
     expect(first.setCookie).toContain("Max-Age=31536000");
     expect(second.setCookie).toContain("Max-Age=31536000");
+    expect(first.setCookie).toMatch(/adhoc_source=[^,]+; Secure(?:,|$)/u);
+    expect(first.setCookie).toMatch(
+      new RegExp(`adhoc_session_${first.gameId}=[^,]+; Secure(?:,|$)`, "u"),
+    );
+    expect(second.setCookie).toMatch(
+      new RegExp(`adhoc_session_${second.gameId}=[^,]+; Secure(?:,|$)`, "u"),
+    );
 
     expect(readAdHocSession(authoritySet, first.gameId)).toBeTruthy();
     expect(readAdHocSession(authoritySet, second.gameId)).toBeTruthy();
@@ -350,6 +357,9 @@ describe("Ad Hoc HTTP and WebSocket authority boundaries", () => {
     ).toBe(200);
     expect(left.headers.get("set-cookie")).toContain(`adhoc_session_${first.gameId}=`);
     expect(left.headers.get("set-cookie")).toContain("Max-Age=0");
+    expect(left.headers.get("set-cookie")).toContain(
+      "Path=/; Max-Age=0; HttpOnly; SameSite=Lax; Secure",
+    );
   });
 
   test("lets an admitted Ad Hoc Controller operate with equal authority", async () => {
@@ -397,6 +407,7 @@ describe("Ad Hoc HTTP and WebSocket authority boundaries", () => {
     expect(firstAdmission.status).toBe(200);
     const firstCookie = firstAdmission.headers.get("set-cookie");
     if (firstCookie === null) throw new Error("first admission did not return a session");
+    expect(firstCookie).toContain("HttpOnly; SameSite=Lax; Secure");
 
     const secondAdmission = await admitGame(
       new Request(`http://localhost/api/games/${created.gameId}/admit`, {
