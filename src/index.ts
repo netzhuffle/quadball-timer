@@ -130,23 +130,7 @@ import {
   parseTechnicalAdminBootstrapCli,
   runTechnicalAdminBootstrapCli,
 } from "@/lib/technical-admin-bootstrap";
-
-type SessionSubscription =
-  | {
-      type: "none";
-    }
-  | {
-      type: "lobby";
-    }
-  | {
-      type: "game";
-      gameId: string;
-      sessionId: string;
-    }
-  | {
-      type: "public-event";
-      eventId: string;
-    };
+import { queueWebSocketSubscription, type SessionSubscription } from "@/lib/websocket-subscription";
 
 type SessionData = {
   id: string;
@@ -2437,15 +2421,7 @@ async function startServer() {
 
             case "subscribe-public-event": {
               const eventId = parsed.message.eventId;
-              const handleSubscription = async () => {
-                if (ws.data.closed) return;
-                if (ws.data.subscription.type !== "none") {
-                  sendMessage(ws, {
-                    type: "error",
-                    message: "WebSocket is already subscribed.",
-                  });
-                  return;
-                }
+              const queued = queueServerWebSocketSubscription(ws, async () => {
                 const subscriber = {
                   send(serialized: string) {
                     return sendPublicAudienceSerializedEnvelope(ws, serialized);
@@ -2475,16 +2451,14 @@ async function startServer() {
                   return;
                 }
                 ws.data.subscription = { type: "public-event", eventId };
-              };
-              const queued = ws.data.subscriptionWork.then(handleSubscription, handleSubscription);
-              ws.data.subscriptionWork = queued.catch(() => undefined);
+              });
               await queued;
               return;
             }
 
             case "subscribe-game": {
               const subscribeGameId = parsed.message.gameId;
-              const handleSubscription = async () => {
+              const queued = queueServerWebSocketSubscription(ws, async () => {
                 const result = await resolveAdHocWebSocketSubscription({
                   service: adHocService,
                   cookieHeader: ws.data.cookieHeader,
@@ -2547,9 +2521,7 @@ async function startServer() {
                   });
                 }
                 if (!tracking.previousDisconnectDurable) void liveAdHocSessions.retryPending();
-              };
-              const queued = ws.data.subscriptionWork.then(handleSubscription, handleSubscription);
-              ws.data.subscriptionWork = queued.catch(() => undefined);
+              });
               await queued;
               return;
             }
@@ -3080,6 +3052,19 @@ function sendAdHocSerializedEnvelope(ws: AdHocBroadcastSocket, serialized: strin
     overflowCloseReason: "Ad Hoc output limit reached.",
     shortSendCloseReason: "Ad Hoc output backpressure.",
     sendErrorCloseReason: "Ad Hoc output unavailable.",
+  });
+}
+
+function queueServerWebSocketSubscription(
+  ws: ServerWebSocket<SessionData>,
+  subscribe: () => Promise<void>,
+) {
+  return queueWebSocketSubscription(ws.data, {
+    isClosed: () => ws.data.closed,
+    alreadySubscribed(message) {
+      sendMessage(ws, { type: "error", message });
+    },
+    subscribe,
   });
 }
 
