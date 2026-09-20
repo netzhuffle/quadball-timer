@@ -1175,8 +1175,7 @@ describe("App", () => {
 
     await act(async () => {
       root.render(<App />);
-      await Promise.resolve();
-      await Promise.resolve();
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
     });
 
     expect(container.textContent).toContain("Score Button Color Test");
@@ -1184,6 +1183,33 @@ describe("App", () => {
       (section) => section.getAttribute("data-color-preview") === "true",
     );
     expect(previews).toHaveLength(100);
+  });
+
+  test.each([
+    ["/event-admin", "Event Hub"],
+    ["/pitch-manager", "Pitch Manager handoff"],
+    ["/admin", "Passkey authentication is required."],
+    ["/admin/enroll#token=disposable-token", "Enroll Technical Admin"],
+  ])("direct deferred route %s preserves its admission screen", async (path, expected) => {
+    testWindow.history.replaceState(null, "", path);
+    await act(async () => {
+      root.render(<App />);
+      // Dynamic module loading is asynchronous even though its page is not fetching data.
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    });
+    for (let attempt = 0; attempt < 20 && !container.textContent?.includes(expected); attempt++) {
+      await act(async () => {
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      });
+    }
+    expect(container.textContent).toContain(expected);
+    expect(container.textContent).not.toContain("could not load");
+    if (path.includes("enroll")) expect(testWindow.location.hash).toBe("");
+    await act(async () => {
+      testWindow.history.pushState(null, "", "/game/test-game");
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    });
+    expect(container.textContent).toContain("Tap game time or team names to adjust.");
   });
 
   test("lists public Events without an unscheduled section", async () => {

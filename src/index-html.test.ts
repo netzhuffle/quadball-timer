@@ -60,4 +60,53 @@ describe("index.html", () => {
     expect(assetCacheControl(false, false)).toBe("no-cache");
     expect(assetCacheControl(true, true)).toBe("no-cache");
   });
+
+  test("includes deferred and shared browser manifest assets without exposing maps or HTML", () => {
+    const files: NonNullable<Bun.HTMLBundle["files"]> = [
+      {
+        path: "./chunk-admin123.js",
+        loader: "js",
+        isEntry: true,
+        headers: { etag: "admin", "content-type": "text/javascript" },
+      },
+      {
+        path: "/$bunfs/root/chunk-shared12.js",
+        loader: "js",
+        isEntry: false,
+        headers: { etag: "shared", "content-type": "text/javascript" },
+      },
+      {
+        path: "./chunk-admin123.js.map",
+        loader: "file",
+        isEntry: false,
+        headers: { etag: "map", "content-type": "application/json" },
+      },
+      {
+        path: "./index.html",
+        loader: "html",
+        isEntry: true,
+        headers: { etag: "html", "content-type": "text/html" },
+      },
+    ];
+    expect(
+      collectHtmlBundleAssetPaths(
+        '<script src="./chunk-main123.js"></script>',
+        "/$bunfs/root",
+        files,
+      ),
+    ).toEqual(
+      new Map([
+        ["/chunk-main123.js", "/$bunfs/root/chunk-main123.js"],
+        ["/chunk-admin123.js", "/$bunfs/root/chunk-admin123.js"],
+        ["/chunk-shared12.js", "/$bunfs/root/chunk-shared12.js"],
+      ]),
+    );
+    const route = createHtmlBundleRoute("<!doctype html><html></html>", "/$bunfs/root", {
+      testEnvironment: false,
+      bundleFiles: files,
+    });
+    const response = route(new Request("https://timer.example/chunk-admin123.js"));
+    expect(response.headers.get("content-type")).toContain("javascript");
+    expect(response.headers.get("cache-control")).toBe("public, max-age=31536000, immutable");
+  });
 });

@@ -2709,7 +2709,11 @@ export async function createHtmlRoute({
   // Bun's source HTML route owns development-time TSX transpilation. The built
   // release HTML contains versioned browser assets and is safe to serve directly.
   if (/src=["']\.\/frontend\.tsx["']/u.test(html)) return index;
-  return createHtmlBundleRoute(html, dirname(index.index), { testEnvironment, browserMonitoring });
+  return createHtmlBundleRoute(html, dirname(index.index), {
+    testEnvironment,
+    browserMonitoring,
+    bundleFiles: index.files,
+  });
 }
 
 export function createHtmlBundleRoute(
@@ -2718,8 +2722,10 @@ export function createHtmlBundleRoute(
   {
     testEnvironment,
     browserMonitoring,
+    bundleFiles,
   }: {
     testEnvironment: boolean;
+    bundleFiles?: Bun.HTMLBundle["files"];
     browserMonitoring?: {
       dsn?: string;
       environment: "production" | "test";
@@ -2758,7 +2764,7 @@ export function createHtmlBundleRoute(
         }
       : { "cache-control": "no-cache" }),
   });
-  const assetPaths = collectHtmlBundleAssetPaths(html, assetDirectory);
+  const assetPaths = collectHtmlBundleAssetPaths(html, assetDirectory, bundleFiles);
 
   return (req: Request) => {
     const assetPath = assetPaths.get(new URL(req.url).pathname);

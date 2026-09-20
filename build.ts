@@ -186,6 +186,9 @@ const buildConfig: Bun.BuildConfig = {
   entrypoints,
   plugins: [plugin],
   minify: true,
+  splitting: true,
+  // Compiled bytecode defaults to CJS; route splitting requires explicit ESM.
+  format: "esm",
   bytecode: shouldCompile,
   target: "bun",
   sourcemap: shouldCompile ? "none" : "linked",

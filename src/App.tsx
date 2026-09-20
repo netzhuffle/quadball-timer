@@ -1,10 +1,7 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { lazy, useCallback, useEffect, useRef, useState } from "react";
+import { DeferredRoute } from "@/components/deferred-route";
 import { Card, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import type { ControllerRole } from "@/lib/game-types";
-import { ColorTestPage } from "@/pages/color-test-page";
-import { EventOperationsPrototypePage } from "@/pages/event-operations-prototype-page";
-import { EventAdminPage } from "@/pages/event-admin-page";
-import { PitchManagerPage } from "@/pages/pitch-manager-page";
 import { EventGameControllerPage } from "@/pages/event-game-controller-page";
 import { GamePage } from "@/pages/game-page";
 import {
@@ -18,9 +15,27 @@ import {
   PublicEventHomePage,
   PublicEventPage,
 } from "@/pages/public-event-page";
-import { TechnicalAdminPage } from "@/pages/technical-admin-page";
 import { useControllerDepartureEntry } from "@/components/controller-departure";
 import "./index.css";
+
+// Controllers and their action panels stay in the initial graph, including offline actions.
+const ColorTestPage = lazy(() =>
+  import("@/pages/color-test-page").then((module) => ({ default: module.ColorTestPage })),
+);
+const EventOperationsPrototypePage = lazy(() =>
+  import("@/pages/event-operations-prototype-page").then((module) => ({
+    default: module.EventOperationsPrototypePage,
+  })),
+);
+const EventAdminPage = lazy(() =>
+  import("@/pages/event-admin-page").then((module) => ({ default: module.EventAdminPage })),
+);
+const PitchManagerPage = lazy(() =>
+  import("@/pages/pitch-manager-page").then((module) => ({ default: module.PitchManagerPage })),
+);
+const TechnicalAdminPage = lazy(() =>
+  import("@/pages/technical-admin-page").then((module) => ({ default: module.TechnicalAdminPage })),
+);
 
 type Route =
   | {
@@ -90,19 +105,35 @@ export function App({
   }
 
   if (route.type === "color-test") {
-    return <ColorTestPage />;
+    return (
+      <DeferredRoute key={route.type} name="Color test">
+        <ColorTestPage />
+      </DeferredRoute>
+    );
   }
 
   if (route.type === "event-operations-prototype") {
-    return <EventOperationsPrototypePage />;
+    return (
+      <DeferredRoute key={route.type} name="Event operations prototype">
+        <EventOperationsPrototypePage />
+      </DeferredRoute>
+    );
   }
 
   if (route.type === "event-admin") {
-    return <EventAdminPage />;
+    return (
+      <DeferredRoute key={route.type} name="Event administration">
+        <EventAdminPage />
+      </DeferredRoute>
+    );
   }
 
   if (route.type === "pitch-manager") {
-    return <PitchManagerPage />;
+    return (
+      <DeferredRoute key={route.type} name="Pitch management">
+        <PitchManagerPage />
+      </DeferredRoute>
+    );
   }
 
   if (route.type === "event-game-controller") {
@@ -110,7 +141,11 @@ export function App({
   }
 
   if (route.type === "technical-admin") {
-    return <TechnicalAdminPage enrollment={route.enrollment} />;
+    return (
+      <DeferredRoute key={route.type} name="Technical administration">
+        <TechnicalAdminPage enrollment={route.enrollment} />
+      </DeferredRoute>
+    );
   }
 
   if (route.type === "ad-hoc-handoff") {
