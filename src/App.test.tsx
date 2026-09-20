@@ -98,6 +98,16 @@ describe("App", () => {
   let container: HTMLDivElement;
   let root: Root;
 
+  async function waitForRouteContent(expected: string) {
+    const deadline = performance.now() + 1_000;
+    // Imports settle outside React; flush their renders until the admission UI is ready.
+    while (!container.textContent?.includes(expected) && performance.now() < deadline) {
+      await act(async () => {
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      });
+    }
+  }
+
   test("accepts underscore-containing generated Ad Hoc Game IDs", () => {
     expect(parseRoute("/game/adhoc-id_with_underscore", "")).toEqual({
       type: "game",
@@ -1175,8 +1185,8 @@ describe("App", () => {
 
     await act(async () => {
       root.render(<App />);
-      await new Promise<void>((resolve) => setTimeout(resolve, 0));
     });
+    await waitForRouteContent("Score Button Color Test");
 
     expect(container.textContent).toContain("Score Button Color Test");
     const previews = Array.from(container.getElementsByTagName("section")).filter(
@@ -1194,14 +1204,8 @@ describe("App", () => {
     testWindow.history.replaceState(null, "", path);
     await act(async () => {
       root.render(<App />);
-      // Dynamic module loading is asynchronous even though its page is not fetching data.
-      await new Promise<void>((resolve) => setTimeout(resolve, 0));
     });
-    for (let attempt = 0; attempt < 20 && !container.textContent?.includes(expected); attempt++) {
-      await act(async () => {
-        await new Promise<void>((resolve) => setTimeout(resolve, 0));
-      });
-    }
+    await waitForRouteContent(expected);
     expect(container.textContent).toContain(expected);
     expect(container.textContent).not.toContain("could not load");
     if (path.includes("enroll")) expect(testWindow.location.hash).toBe("");
