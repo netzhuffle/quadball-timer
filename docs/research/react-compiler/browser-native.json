@@ -1,0 +1,158 @@
+{
+  "browser": "chromium",
+  "samples": [
+    {
+      "sample": 0,
+      "phases": [
+        {
+          "name": "clock",
+          "elapsedMs": 1292.484875,
+          "commits": 9,
+          "renderedFibers": 306
+        },
+        {
+          "name": "correction",
+          "elapsedMs": 165.25208399999997,
+          "commits": 5,
+          "renderedFibers": 170
+        },
+        {
+          "name": "dialog",
+          "elapsedMs": 148.66329199999973,
+          "commits": 4,
+          "renderedFibers": 137
+        },
+        {
+          "name": "reconnect",
+          "elapsedMs": 414.78845900000033,
+          "commits": 5,
+          "renderedFibers": 170
+        }
+      ],
+      "assets": [
+        {
+          "name": "/chunk-rk0cxrjg.js",
+          "bytes": 1034849,
+          "memoCacheSymbolOccurrences": 1,
+          "sha256": "af756dc1bd66357bdc12afe8ffd8ca35993f70454c3f5bbb186e45ca41a8c154"
+        },
+        {
+          "name": "/chunk-6cradrz5.js",
+          "bytes": 1021,
+          "memoCacheSymbolOccurrences": 1,
+          "sha256": "82d16df58ea5935cdf3276b5e00b45bf3ac1350e221c55f2e0fb062ab8370c4e"
+        },
+        {
+          "name": "/chunk-615rghjm.js",
+          "bytes": 86423,
+          "memoCacheSymbolOccurrences": 0,
+          "sha256": "c30015d436d498a53ed953058ef715faa35d9c917ebcf9b14334c812f3e7edfa"
+        }
+      ],
+      "refreshes": 2,
+      "errors": []
+    },
+    {
+      "sample": 1,
+      "phases": [
+        {
+          "name": "clock",
+          "elapsedMs": 1294.348458,
+          "commits": 9,
+          "renderedFibers": 306
+        },
+        {
+          "name": "correction",
+          "elapsedMs": 165.25675000000047,
+          "commits": 5,
+          "renderedFibers": 170
+        },
+        {
+          "name": "dialog",
+          "elapsedMs": 149.0615829999997,
+          "commits": 4,
+          "renderedFibers": 137
+        },
+        {
+          "name": "reconnect",
+          "elapsedMs": 415.21870800000033,
+          "commits": 5,
+          "renderedFibers": 170
+        }
+      ],
+      "assets": [
+        {
+          "name": "/chunk-rk0cxrjg.js",
+          "bytes": 1034849,
+          "memoCacheSymbolOccurrences": 1,
+          "sha256": "af756dc1bd66357bdc12afe8ffd8ca35993f70454c3f5bbb186e45ca41a8c154"
+        },
+        {
+          "name": "/chunk-6cradrz5.js",
+          "bytes": 1021,
+          "memoCacheSymbolOccurrences": 1,
+          "sha256": "82d16df58ea5935cdf3276b5e00b45bf3ac1350e221c55f2e0fb062ab8370c4e"
+        },
+        {
+          "name": "/chunk-615rghjm.js",
+          "bytes": 86423,
+          "memoCacheSymbolOccurrences": 0,
+          "sha256": "c30015d436d498a53ed953058ef715faa35d9c917ebcf9b14334c812f3e7edfa"
+        }
+      ],
+      "refreshes": 2,
+      "errors": []
+    },
+    {
+      "sample": 2,
+      "phases": [
+        {
+          "name": "clock",
+          "elapsedMs": 1275.6487499999994,
+          "commits": 9,
+          "renderedFibers": 306
+        },
+        {
+          "name": "correction",
+          "elapsedMs": 165.1469159999997,
+          "commits": 5,
+          "renderedFibers": 170
+        },
+        {
+          "name": "dialog",
+          "elapsedMs": 148.92941599999995,
+          "commits": 3,
+          "renderedFibers": 103
+        },
+        {
+          "name": "reconnect",
+          "elapsedMs": 414.71800000000076,
+          "commits": 6,
+          "renderedFibers": 204
+        }
+      ],
+      "assets": [
+        {
+          "name": "/chunk-rk0cxrjg.js",
+          "bytes": 1034849,
+          "memoCacheSymbolOccurrences": 1,
+          "sha256": "af756dc1bd66357bdc12afe8ffd8ca35993f70454c3f5bbb186e45ca41a8c154"
+        },
+        {
+          "name": "/chunk-6cradrz5.js",
+          "bytes": 1021,
+          "memoCacheSymbolOccurrences": 1,
+          "sha256": "82d16df58ea5935cdf3276b5e00b45bf3ac1350e221c55f2e0fb062ab8370c4e"
+        },
+        {
+          "name": "/chunk-615rghjm.js",
+          "bytes": 86423,
+          "memoCacheSymbolOccurrences": 0,
+          "sha256": "c30015d436d498a53ed953058ef715faa35d9c917ebcf9b14334c812f3e7edfa"
+        }
+      ],
+      "refreshes": 2,
+      "errors": []
+    }
+  ]
+}
