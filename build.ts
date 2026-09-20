@@ -3,6 +3,7 @@ import plugin from "bun-plugin-tailwind";
 import { existsSync } from "fs";
 import { rm } from "fs/promises";
 import path from "path";
+import { writeBundleAnalysis } from "./scripts/bundle-analysis";
 
 if (process.argv.includes("--help") || process.argv.includes("-h")) {
   console.log(`
@@ -11,6 +12,7 @@ if (process.argv.includes("--help") || process.argv.includes("-h")) {
 Usage: bun run build.ts [options]
 
 Common Options:
+  --analyze               Write browser bundle report to out/bundle-analysis (ordinary build only)
   --compile               Generate a standalone executable
   --compile-target <name> Compile target for executable builds (default: bun-linux-x64-modern)
   --outfile <path>        Executable output path when compiling (default: dist/quadball-timer)
@@ -38,6 +40,7 @@ Examples:
 }
 
 type ParsedBuildConfig = Partial<Bun.BuildConfig> & {
+  analyze?: boolean;
   compileTarget?: Bun.Build.CompileTarget;
   outfile?: string;
   outdir?: string;
@@ -130,6 +133,7 @@ console.log("\n🚀 Starting build process...\n");
 
 const cliConfig = parseArgs();
 const {
+  analyze,
   compile: compileOption,
   compileTarget,
   outdir: cliOutdir,
@@ -146,6 +150,19 @@ const outdir = shouldCompile
   : typeof cliOutdir === "string"
     ? cliOutdir
     : path.join(process.cwd(), "dist");
+
+const analysisDirectory = path.resolve("out/bundle-analysis");
+if (analyze) {
+  if (shouldCompile)
+    throw new Error(
+      "Use bun run build --analyze before build:executable; compiled builds do not expose emitted browser artifacts",
+    );
+  const relative = path.relative(path.resolve(outdir), analysisDirectory);
+  const inverse = path.relative(analysisDirectory, path.resolve(outdir));
+  if (!relative.startsWith("..") || !inverse.startsWith("..")) {
+    throw new Error("Build output and analysis directory must not overlap");
+  }
+}
 
 if (existsSync(outdir)) {
   console.log(`🗑️ Cleaning previous build at ${outdir}`);
@@ -189,9 +206,13 @@ const buildConfig: Bun.BuildConfig = {
         outdir,
       }),
   ...buildConfigOverrides,
+  ...(analyze ? { metafile: true } : {}),
 };
 
 const result = await Bun.build(buildConfig);
+
+if (!result.success) throw new Error("Build failed", { cause: result.logs });
+if (analyze) await writeBundleAnalysis(result, outdir, analysisDirectory);
 
 const end = performance.now();
 
