@@ -1,84 +1,191 @@
-import { useId, useLayoutEffect, useRef, useState } from "react";
-import type {
-  PublicAudienceTimelineEntry,
-  PublicAudienceTimelineLane,
-} from "@/lib/game-timeline-projection";
+import { useEffect, useId, useLayoutEffect, useRef, useState, type CSSProperties } from "react";
+import { Play, Flag, Users, Target, Timer, Pause, Sun, Trophy, UserCheck } from "lucide-react";
+import type { PublicAudienceTimelineEntry } from "@/lib/game-timeline-projection";
+import {
+  activeBreakRemainingMs,
+  visibleTimelineEntries,
+  type TimelineBreakState,
+} from "@/pages/public-timeline-breaks";
+import { mixHexColors } from "@/lib/team-colors";
+import "./public-game-timeline.css";
+
+type Presentation = {
+  pitchOrientation: "side-a-left" | "side-b-left";
+  displayedTeamColors: { sideA: string | null; sideB: string | null };
+};
+type ReadingPosition = { key: string; top: number; height: number };
 
 export function PublicGameTimeline({
-  entries,
+  entries: sourceEntries,
+  presentation,
+  game,
+  connected = false,
 }: {
   entries: readonly PublicAudienceTimelineEntry[];
+  presentation?: Presentation;
+  game?: TimelineBreakState;
+  connected?: boolean;
 }) {
+  const entries = visibleTimelineEntries(sourceEntries);
   const headingId = useId();
-  const scrollRef = useRef<HTMLDivElement | null>(null);
-  const previousHeightRef = useRef<number | null>(null);
-  const atLiveEdgeRef = useRef(true);
+  const regionRef = useRef<HTMLDivElement | null>(null);
+  const readingRef = useRef<ReadingPosition | null>(null);
+  const previousKeysRef = useRef<Set<string>>(new Set());
   const [hasNewPlay, setHasNewPlay] = useState(false);
-  const signature = JSON.stringify(entries);
+  const [topClearance, setTopClearance] = useState(16);
+  const hasEntries = entries.length > 0;
+  const signature = JSON.stringify({ entries, presentation });
+  const occurrences = new Map<string, number>();
+  const keyedEntries = [...entries]
+    .reverse()
+    .map((entry) => {
+      const identity = `${entry.kind}:${entry.gameTimeMs}:${entry.lane}:${"player" in entry ? entry.player?.number : ""}:${entry.kind === "card" ? entry.cardColor : ""}`;
+      const occurrence = occurrences.get(identity) ?? 0;
+      occurrences.set(identity, occurrence + 1);
+      return { entry, key: `${identity}:${occurrence}` };
+    })
+    .reverse();
 
   useLayoutEffect(() => {
-    const node = scrollRef.current;
-    if (node === null) return;
-    const previousHeight = previousHeightRef.current;
-    if (previousHeight !== null && !atLiveEdgeRef.current) {
-      node.scrollTop += node.scrollHeight - previousHeight;
-      setHasNewPlay(true);
-    } else if (atLiveEdgeRef.current) {
-      node.scrollTop = 0;
+    const region = regionRef.current;
+    if (!region) return;
+    const rememberPosition = () => {
+      const bounds = region.getBoundingClientRect();
+      const inset = compactHeaderBottom();
+      const reading = bounds.top < inset - 8 && bounds.bottom > inset;
+      const anchor = Array.from(region.querySelectorAll<HTMLElement>("[data-timeline-key]")).find(
+        (node) => node.getBoundingClientRect().bottom > inset,
+      );
+      readingRef.current =
+        reading && anchor
+          ? {
+              key: anchor.dataset.timelineKey!,
+              top: anchor.getBoundingClientRect().top,
+              height: region.scrollHeight,
+            }
+          : null;
+      if (bounds.top >= inset - 8) setHasNewPlay(false);
+    };
+    // Measure the actual compact score: wrapping names can make it taller than a fixed allowance.
+    const measureClearance = () => {
+      setTopClearance(compactHeaderBottom() + 16);
+    };
+    const observer = new window.ResizeObserver(measureClearance);
+    observer.observe(document.body);
+    const scoreboard = document.querySelector<HTMLElement>("[data-scoreboard-expanded]");
+    if (scoreboard) observer.observe(scoreboard);
+    const mutations = new window.MutationObserver(() => {
+      const compact = document.querySelector<HTMLElement>("[data-scoreboard-compact]");
+      if (compact) observer.observe(compact);
+      measureClearance();
+    });
+    mutations.observe(document.body, { childList: true, subtree: true });
+    rememberPosition();
+    measureClearance();
+    window.addEventListener("scroll", rememberPosition, { passive: true });
+    window.addEventListener("resize", measureClearance);
+    return () => {
+      observer.disconnect();
+      mutations.disconnect();
+      window.removeEventListener("scroll", rememberPosition);
+      window.removeEventListener("resize", measureClearance);
+    };
+  }, [hasEntries]);
+
+  useLayoutEffect(() => {
+    const region = regionRef.current;
+    if (!region) return;
+    const keys = new Set(
+      Array.from(
+        region.querySelectorAll<HTMLElement>("[data-timeline-key]"),
+        (node) => node.dataset.timelineKey!,
+      ),
+    );
+    const reading = readingRef.current;
+    if (reading) {
+      const anchor = Array.from(region.querySelectorAll<HTMLElement>("[data-timeline-key]")).find(
+        (node) => node.dataset.timelineKey === reading.key,
+      );
+      window.scrollBy({
+        top: anchor
+          ? anchor.getBoundingClientRect().top - reading.top
+          : region.scrollHeight - reading.height,
+        behavior: "instant",
+      });
+      if (anchor)
+        readingRef.current = {
+          key: reading.key,
+          top: anchor.getBoundingClientRect().top,
+          height: region.scrollHeight,
+        };
+      if ([...keys].some((key) => !previousKeysRef.current.has(key))) setHasNewPlay(true);
     }
-    previousHeightRef.current = node.scrollHeight;
+    previousKeysRef.current = keys;
   }, [signature]);
 
   if (entries.length === 0) return null;
-
   return (
-    <section className="space-y-2" aria-labelledby={headingId} data-game-timeline>
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <div>
-          <h3 id={headingId} className="text-base font-semibold">
-            Game Timeline
-          </h3>
-          <p className="text-xs text-muted-foreground">Newest first · effective public play</p>
-        </div>
-        {hasNewPlay ? (
-          <button
-            type="button"
-            aria-label="Show newest play"
-            className="rounded-full border px-3 py-1 text-xs font-semibold text-primary hover:bg-accent focus:outline-none focus:ring-2 focus:ring-ring"
-            onClick={() => {
-              const node = scrollRef.current;
-              if (node !== null) {
-                node.scrollTo({ top: 0, behavior: prefersReducedMotion() ? "auto" : "smooth" });
-                node.focus({ preventScroll: true });
-              }
-              atLiveEdgeRef.current = true;
-              setHasNewPlay(false);
-            }}
-          >
-            New play
-          </button>
-        ) : null}
-      </div>
+    <section
+      className="daylight-timeline"
+      aria-labelledby={headingId}
+      data-game-timeline
+      style={
+        {
+          "--timeline-top-clearance": `${topClearance}px`,
+        } as CSSProperties
+      }
+    >
+      <h3 id={headingId}>Game Timeline</h3>
+      <span role="status" className="sr-only">
+        {hasNewPlay ? "New play available" : ""}
+      </span>
+      {hasNewPlay ? (
+        <button
+          type="button"
+          aria-label="Show newest play"
+          className="daylight-new-play"
+          onClick={() => {
+            const region = regionRef.current;
+            if (region) {
+              region.scrollIntoView({
+                block: "start",
+                behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches
+                  ? "instant"
+                  : "smooth",
+              });
+              region.focus({ preventScroll: true });
+            }
+            readingRef.current = null;
+            setHasNewPlay(false);
+          }}
+        >
+          New play
+        </button>
+      ) : null}
       <div
-        ref={scrollRef}
-        className="max-h-[32rem] overflow-y-auto overscroll-contain rounded-xl border bg-muted/20 p-2 [overflow-anchor:none] focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
-        // Keyboard users must be able to focus and scroll this labelled overflow region.
+        ref={regionRef}
+        className="daylight-timeline-region"
+        // The labelled history remains keyboard-focusable for page navigation.
         // oxlint-disable-next-line jsx-a11y/no-noninteractive-tabindex
         tabIndex={0}
         role="region"
-        onScroll={(event) => {
-          const node = event.currentTarget;
-          atLiveEdgeRef.current = node.scrollTop <= 8;
-          if (atLiveEdgeRef.current) setHasNewPlay(false);
-        }}
         data-timeline-scroll-region
         aria-label="Game Timeline"
       >
-        <ol className="space-y-2">
-          {entries.map((entry, index) => (
+        <ol>
+          {keyedEntries.map(({ entry, key }) => (
             <TimelineEntry
-              key={`${entry.kind}-${entry.gameTimeMs ?? "unknown"}-${index}`}
+              key={key}
               entry={entry}
+              entryKey={key}
+              presentation={presentation}
+              countdown={
+                <ActiveBreakCountdown
+                  entry={entry}
+                  entries={entries}
+                  game={connected ? game : undefined}
+                />
+              }
             />
           ))}
         </ol>
@@ -87,63 +194,159 @@ export function PublicGameTimeline({
   );
 }
 
-function prefersReducedMotion(): boolean {
-  return (
-    typeof window !== "undefined" &&
-    typeof window.matchMedia === "function" &&
-    window.matchMedia("(prefers-reduced-motion: reduce)").matches
-  );
-}
-
-function TimelineEntry({ entry }: { entry: PublicAudienceTimelineEntry }) {
+function TimelineEntry({
+  entry,
+  entryKey,
+  presentation,
+  countdown,
+}: {
+  entry: PublicAudienceTimelineEntry;
+  entryKey: string;
+  presentation?: Presentation;
+  countdown: React.ReactNode;
+}) {
   const display = timelineDisplay(entry);
+  const side =
+    entry.lane === "center"
+      ? "center"
+      : (entry.lane === "side-a") !== (presentation?.pitchOrientation === "side-b-left")
+        ? "left"
+        : "right";
+  const teamColor =
+    entry.lane === "center"
+      ? null
+      : entry.lane === "side-a"
+        ? presentation?.displayedTeamColors.sideA
+        : presentation?.displayedTeamColors.sideB;
+  const color =
+    entry.kind === "card" ? undefined : mixHexColors(teamColor ?? "#1754b4", "#10213f", 0.55);
+  const Icon =
+    entry.kind === "flag-catch"
+      ? Flag
+      : entry.kind === "seeker-release"
+        ? Users
+        : entry.kind === "overtime"
+          ? Target
+          : entry.kind === "timeout"
+            ? Timer
+            : entry.kind === "suspension"
+              ? Pause
+              : entry.kind === "heat-stoppage"
+                ? Sun
+                : entry.kind === "finish"
+                  ? Trophy
+                  : entry.kind === "penalty"
+                    ? UserCheck
+                    : Play;
   return (
     <li
-      className="grid gap-2 rounded-lg border bg-card p-3 text-sm sm:grid-cols-[minmax(0,1fr)_6rem_minmax(0,1fr)]"
+      className="daylight-timeline-entry"
       data-timeline-kind={entry.kind}
       data-timeline-lane={entry.lane}
+      data-timeline-side={side}
+      data-timeline-key={entryKey}
+      data-card-color={entry.kind === "card" ? entry.cardColor : undefined}
+      style={{ "--entry-color": color } as CSSProperties}
     >
-      <div
-        className="relative flex min-h-12 flex-col items-center justify-center gap-1 sm:col-start-2 sm:row-start-1"
-        data-timeline-spine
-      >
-        <span className="absolute inset-y-0 w-px bg-slate-300" aria-hidden="true" />
-        <span className="relative z-10 rounded bg-muted px-1.5 py-0.5 font-mono text-xs text-muted-foreground">
-          {formatGameTime(entry.gameTimeMs)}
-        </span>
-        <span className="relative z-10 h-2 w-2 rounded-full bg-primary" aria-hidden="true" />
+      <div className="daylight-timeline-time" data-timeline-spine>
+        <span>{formatGameTime(entry.gameTimeMs)}</span>
       </div>
-      <div className={`min-w-0 break-words ${laneClass(entry.lane)}`} data-timeline-content>
-        <div className="flex items-center gap-2 sm:hidden">
-          <span className="font-sans text-xs text-muted-foreground">{display.label}</span>
+      <div className="daylight-timeline-ledger" data-timeline-content>
+        <span className="daylight-timeline-icon" aria-hidden="true">
+          {entry.kind === "card" ? (
+            <span className="daylight-card-icon" />
+          ) : entry.kind === "goal" ? (
+            <svg
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              aria-hidden="true"
+            >
+              <circle cx="12" cy="9" r="6.5" />
+              <path d="M12 15.5V22" />
+            </svg>
+          ) : (
+            <Icon />
+          )}
+        </span>
+        <div className="daylight-timeline-copy">
+          <p className="daylight-timeline-type">{display.summary}</p>
+          {countdown}
+          {(entry.kind === "seeker-release" || entry.kind === "overtime") && entry.score != null ? (
+            <p data-timeline-phase-score aria-label="Score at this phase">
+              {presentation?.pitchOrientation === "side-b-left"
+                ? entry.score.sideB
+                : entry.score.sideA}
+              {" – "}
+              {presentation?.pitchOrientation === "side-b-left"
+                ? entry.score.sideA
+                : entry.score.sideB}
+            </p>
+          ) : null}
+          {entry.teamName !== null ? (
+            <p className="daylight-timeline-team">
+              {entry.kind === "finish" ? "Winner: " : ""}
+              {entry.teamName}
+            </p>
+          ) : null}
+          {"player" in entry && entry.player !== null ? (
+            <p>
+              Player #{entry.player.number}
+              {entry.player.name === null ? "" : ` · ${entry.player.name}`}
+            </p>
+          ) : null}
+          {entry.kind === "card" && entry.penaltyReason !== null ? (
+            <p>Penalty Reason: {entry.penaltyReason}</p>
+          ) : null}
         </div>
-        <p className="font-medium sm:pt-1">{display.summary}</p>
-        {entry.teamName !== null ? (
-          <p className="text-xs text-muted-foreground">{entry.teamName}</p>
-        ) : null}
-        {"player" in entry && entry.player !== null ? (
-          <p className="text-xs text-muted-foreground">
-            Player #{entry.player.number}
-            {entry.player.name === null ? "" : ` · ${entry.player.name}`}
-          </p>
-        ) : null}
-        {entry.kind === "card" && entry.penaltyReason !== null ? (
-          <p className="text-xs text-muted-foreground">Penalty Reason: {entry.penaltyReason}</p>
-        ) : null}
-        {entry.kind === "card" && entry.cardColor !== null ? (
-          <p className="text-xs text-muted-foreground">Card color: {entry.cardColor}</p>
-        ) : null}
       </div>
     </li>
   );
 }
 
+function ActiveBreakCountdown({
+  entry,
+  entries,
+  game,
+}: {
+  entry: PublicAudienceTimelineEntry;
+  entries: readonly PublicAudienceTimelineEntry[];
+  game?: TimelineBreakState;
+}) {
+  const [elapsedMs, setElapsedMs] = useState(0);
+  const initialRemainingMs = activeBreakRemainingMs(entry, entries, game, 0);
+  useEffect(() => {
+    setElapsedMs(0);
+    if (initialRemainingMs === null) return;
+    const observedAt = performance.now();
+    const interval = window.setInterval(() => {
+      const elapsed = performance.now() - observedAt;
+      setElapsedMs(elapsed);
+      if (elapsed >= initialRemainingMs) window.clearInterval(interval);
+    }, 100);
+    return () => window.clearInterval(interval);
+  }, [game, initialRemainingMs]);
+  const remaining = activeBreakRemainingMs(entry, entries, game, elapsedMs);
+  return remaining === null ? null : (
+    <p role="timer" aria-label="Break time remaining" data-timeline-countdown>
+      {Math.ceil(remaining / 1000)}s remaining
+    </p>
+  );
+}
+
 function timelineDisplay(entry: PublicAudienceTimelineEntry): { label: string; summary: string } {
   switch (entry.kind) {
+    case "game-start":
+      return { label: "Game start", summary: "Game started" };
     case "goal":
       return { label: "Goal", summary: `Goal · ${entry.points} points` };
     case "card":
-      return { label: "Card", summary: `Card · ${entry.cardColor ?? "recorded"}` };
+      return {
+        label: "Card",
+        summary:
+          entry.cardColor === "ejection" ? "Ejection" : `${entry.cardColor ?? "Recorded"} card`,
+      };
     case "penalty":
       return {
         label: "Penalty",
@@ -152,7 +355,7 @@ function timelineDisplay(entry: PublicAudienceTimelineEntry): { label: string; s
     case "timeout":
       return {
         label: "Team Timeout",
-        summary: `Team Timeout · ${entry.action?.replaceAll("-", " ") ?? "recorded"}`,
+        summary: "Team Timeout",
       };
     case "suspension":
       return {
@@ -161,15 +364,18 @@ function timelineDisplay(entry: PublicAudienceTimelineEntry): { label: string; s
       };
     case "heat-stoppage":
       return {
-        label: "Heat Stoppage",
-        summary: `Heat Stoppage · ${entry.action?.replaceAll("-", " ") ?? "recorded"}`,
+        label: "Heat Break",
+        summary: "Heat Break",
       };
     case "seeker-release":
       return { label: "Seeker Release", summary: "Seekers released" };
     case "flag-catch":
       return { label: "Flag Catch", summary: `Flag Catch · ${entry.points} points` };
     case "overtime":
-      return { label: "Overtime", summary: `Overtime · target ${entry.targetScore ?? "set"}` };
+      return {
+        label: "Overtime",
+        summary: `Overtime started · target ${entry.targetScore ?? "set"}`,
+      };
     case "finish":
       return {
         label: "Game Finish",
@@ -178,20 +384,16 @@ function timelineDisplay(entry: PublicAudienceTimelineEntry): { label: string; s
   }
 }
 
-function laneClass(lane: PublicAudienceTimelineLane): string {
-  switch (lane) {
-    case "side-a":
-      return "sm:col-start-1 sm:row-start-1 sm:border-r-2 sm:border-primary/30 sm:pr-4 sm:text-right";
-    case "side-b":
-      return "sm:col-start-3 sm:row-start-1 sm:border-l-2 sm:border-primary/30 sm:pl-4";
-    case "center":
-      return "sm:col-span-3 sm:col-start-1 sm:row-start-2 sm:justify-self-center sm:max-w-2xl sm:text-center";
-  }
-}
-
 function formatGameTime(gameTimeMs: number | null): string {
   if (gameTimeMs === null) return "Game time unavailable";
   const minutes = Math.floor(gameTimeMs / 60_000);
   const seconds = Math.floor((gameTimeMs % 60_000) / 1_000);
   return `${minutes}:${String(seconds).padStart(2, "0")}`;
+}
+
+function compactHeaderBottom(): number {
+  const compact = document.querySelector<HTMLElement>("[data-scoreboard-compact]");
+  if (!compact) return 0;
+  const rect = compact.getBoundingClientRect();
+  return rect.top < window.innerHeight / 2 ? Math.max(0, rect.bottom) : 0;
 }

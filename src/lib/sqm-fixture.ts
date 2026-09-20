@@ -213,7 +213,12 @@ export function createSqmFixtureGameProjection(
       },
     },
     canonicalPath: `/events/${encodeURIComponent(SQM_FIXTURE_EVENT_ID)}/games/${encodeURIComponent(definition.key)}`,
-    timeline: [],
+    // Ad Hoc fixtures have no Event Game commencement record. A positive recorded
+    // clock or running play proves start; a finish flag alone may be an unplayed forfeit.
+    timeline:
+      isHardcodedFirstGame || isRunning || (state?.gameClockMs ?? 0) > 0
+        ? [{ kind: "game-start", gameTimeMs: 0, lane: "center", teamName: null }]
+        : [],
     spectatorAvailable: isHardcodedFirstGame || gameId !== null,
   };
 }

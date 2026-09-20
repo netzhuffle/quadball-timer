@@ -216,22 +216,23 @@ try {
   const harnessTimeline = harnessPage.locator("[data-game-timeline]");
   await harnessTimeline.waitFor();
   const harnessScroll = harnessTimeline.locator("[data-timeline-scroll-region]");
-  await harnessScroll.hover();
-  await harnessPage.mouse.wheel(0, 600);
-  await harnessPage.waitForFunction(
-    (selector) => ((document.querySelector(selector) as HTMLElement | null)?.scrollTop ?? 0) > 8,
-    "[data-timeline-scroll-region]",
+  await harnessScroll.evaluate((element) =>
+    window.scrollTo(0, window.scrollY + element.getBoundingClientRect().top + 600),
   );
-  const harnessBeforeNewPlay = await harnessScroll.evaluate((element) => ({
-    bottomDistance: element.scrollHeight - element.clientHeight - element.scrollTop,
-    scrollTop: element.scrollTop,
+  await harnessPage.waitForFunction(() => window.scrollY > 500);
+  await harnessPage.evaluate(() => window.dispatchEvent(new Event("scroll")));
+  const harnessBeforeNewPlay = await harnessPage.evaluate(() => ({
+    bottomDistance: document.documentElement.scrollHeight - window.scrollY,
+    scrollTop: window.scrollY,
   }));
-  assert(harnessBeforeNewPlay.scrollTop > 0, "Timeline harness could not leave the live edge");
-  await harnessPage.getByRole("button", { name: "Deliver newer play while away" }).click();
+  // Deliver without scrolling back to the fixture controls.
+  await harnessPage
+    .getByRole("button", { name: "Deliver newer play while away" })
+    .evaluate((element) => (element as HTMLButtonElement).click());
   await harnessPage.getByRole("button", { name: "Show newest play" }).waitFor();
-  const harnessAfterNewPlay = await harnessScroll.evaluate((element) => ({
-    bottomDistance: element.scrollHeight - element.clientHeight - element.scrollTop,
-    scrollTop: element.scrollTop,
+  const harnessAfterNewPlay = await harnessPage.evaluate(() => ({
+    bottomDistance: document.documentElement.scrollHeight - window.scrollY,
+    scrollTop: window.scrollY,
   }));
   assert(
     Math.abs(harnessAfterNewPlay.bottomDistance - harnessBeforeNewPlay.bottomDistance) <= 4,
@@ -239,18 +240,63 @@ try {
   );
   await harnessPage.getByRole("button", { name: "Show newest play" }).click();
   await harnessPage.waitForFunction(
-    (selector) => ((document.querySelector(selector) as HTMLElement | null)?.scrollTop ?? 0) <= 8,
-    "[data-timeline-scroll-region]",
+    () =>
+      document.querySelector("[data-timeline-scroll-region]")!.getBoundingClientRect().top >= -8,
   );
-  await harnessPage.getByRole("button", { name: "Deliver newer play at live edge" }).click();
-  await harnessPage.waitForFunction(
-    (selector) => ((document.querySelector(selector) as HTMLElement | null)?.scrollTop ?? 0) <= 8,
-    "[data-timeline-scroll-region]",
-  );
+  await harnessPage
+    .getByRole("button", { name: "Deliver newer play at live edge" })
+    .evaluate((element) => (element as HTMLButtonElement).click());
   assert(
     (await harnessPage.getByRole("button", { name: "Show newest play" }).count()) === 0,
     "Timeline harness exposed New play at the live edge",
   );
+  await assertOpposingTimeline(harnessPage);
+  const yellowCard = harnessPage
+    .locator('[data-timeline-kind="card"]')
+    .filter({ hasText: "yellow card" });
+  const beforeSwap = await yellowCard.evaluate((element) => ({
+    left: element.querySelector("[data-timeline-content]")!.getBoundingClientRect().left,
+    color: getComputedStyle(element.querySelector(".daylight-card-icon")!).backgroundColor,
+  }));
+  await harnessPage
+    .getByRole("button", { name: "Swap Pitch Orientation" })
+    .evaluate((element) => (element as HTMLButtonElement).click());
+  const afterSwap = await yellowCard.evaluate((element) => ({
+    left: element.querySelector("[data-timeline-content]")!.getBoundingClientRect().left,
+    color: getComputedStyle(element.querySelector(".daylight-card-icon")!).backgroundColor,
+  }));
+  assert(
+    afterSwap.left < beforeSwap.left &&
+      afterSwap.color === beforeSwap.color &&
+      afterSwap.color === "rgb(247, 186, 0)",
+    "Pitch Orientation did not swap team ownership independently of the yellow card color",
+  );
+  await assertOpposingTimeline(harnessPage);
+
+  await harnessPage
+    .getByRole("button", { name: "Show finished game" })
+    .evaluate((element) => (element as HTMLButtonElement).click());
+  const finish = harnessPage.locator('[data-timeline-kind="finish"]');
+  await finish.getByText("Winner: Berner Boggarts", { exact: true }).waitFor();
+  for (const width of [360, 1280]) {
+    await harnessPage.setViewportSize({ width, height: 800 });
+    await finish.scrollIntoViewIfNeeded();
+    assert(
+      await finish.evaluate((element) => {
+        const row = element.getBoundingClientRect();
+        const content = element.querySelector("[data-timeline-content]")!.getBoundingClientRect();
+        return (
+          Math.abs((row.left + row.right - content.left - content.right) / 2) < 2 &&
+          document.documentElement.scrollWidth <= innerWidth
+        );
+      }),
+      "Finish winner is not centered or overflows",
+    );
+    if (process.env.PUBLIC_BROWSER_SCREENSHOTS)
+      await harnessPage.screenshot({
+        path: join(process.env.PUBLIC_BROWSER_SCREENSHOTS, `finish-winner-${width}.png`),
+      });
+  }
 
   const stableGamePath = `/events/${encodeURIComponent(seeded.currentId)}/games/${encodeURIComponent(
     seeded.currentGames[1]!.game.eventGameId,
@@ -766,7 +812,41 @@ async function verifyDaylightScoreboardStates(
     game.gameSuspension = "suspended";
     game.teamTimeout = { status: "started", side: "side-a", remainingMs: 30_000 };
     if (game.clock) game.clock.synchronization = "stale";
+    game.timeline = game.timeline.map((entry) => ({
+      ...entry,
+      teamName:
+        entry.lane === "center"
+          ? null
+          : entry.lane === "side-a"
+            ? game.sideA.name
+            : game.sideB.name,
+      ...(entry.kind === "card"
+        ? {
+            player: { number: 77, name: "Alexandria-Montgomery Longplayername" },
+            penaltyReason:
+              "Repeated illegal contact against an opponent without possession of the ball",
+          }
+        : {}),
+    }));
     await capture("long-names-suspended-phone");
+    await visual.evaluate(() => scrollTo(0, document.documentElement.scrollHeight));
+    await visual.locator("[data-scoreboard-compact]").waitFor();
+    assert(
+      await visual
+        .locator(".daylight-clock-freshness")
+        .evaluate(
+          (element) =>
+            element.getBoundingClientRect().height > 0 && getComputedStyle(element).opacity === "1",
+        ),
+      "Compact morph hid stale clock warning",
+    );
+    await visual.waitForFunction(() => {
+      const last = document
+        .querySelector("[data-game-timeline] li:last-child")!
+        .getBoundingClientRect();
+      const compact = document.querySelector("[data-scoreboard-compact]")!.getBoundingClientRect();
+      return last.top > compact.bottom && last.bottom <= innerHeight;
+    });
     assert(
       (await visual.locator("[data-scoreboard-expanded] img").count()) === 0,
       "Unverified combined identity received artwork",
@@ -1298,6 +1378,17 @@ async function exerciseLiveSpectatorGameBehavior(
   await page.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight));
   await compactScoreboard.waitFor();
   const timelineRegion = page.locator('[data-timeline-scroll-region][role="region"][tabindex="0"]');
+  const start = page.locator('[data-timeline-kind="game-start"]');
+  assert(
+    (await start.count()) === 1 && (await start.innerText()).includes("0:00"),
+    "Started Game did not expose exactly one zero-time commencement milestone",
+  );
+  const startCentered = await start.evaluate((element) => {
+    const bar = element.getBoundingClientRect();
+    const label = element.querySelector("[data-timeline-content]")!.getBoundingClientRect();
+    return Math.abs((label.left + label.right) / 2 - (bar.left + bar.right) / 2) < 2;
+  });
+  assert(startCentered, "Game start did not use a centered lifecycle bar");
   await timelineRegion.scrollIntoViewIfNeeded();
   await page.getByRole("link", { name: "Back to Event" }).focus();
   await page.waitForFunction(() => !document.querySelector("[data-scoreboard-compact]"));
@@ -1311,27 +1402,25 @@ async function exerciseLiveSpectatorGameBehavior(
   });
   const timelineBefore = await timelineRegion.evaluate((element) => {
     const region = element as HTMLDivElement;
-    const maximumScrollTop = region.scrollHeight - region.clientHeight;
-    region.scrollTop = Math.min(200, maximumScrollTop);
-    region.dispatchEvent(new Event("scroll", { bubbles: true }));
-    const regionRect = region.getBoundingClientRect();
     const anchor = Array.from(region.querySelectorAll<HTMLElement>("[data-timeline-kind]")).find(
       (entry) => {
         const rect = entry.getBoundingClientRect();
-        return rect.top >= regionRect.top && rect.bottom <= regionRect.bottom;
+        const headerBottom =
+          document.querySelector("[data-scoreboard-compact]")?.getBoundingClientRect().bottom ?? 0;
+        return rect.top >= headerBottom && rect.bottom <= window.innerHeight - 64;
       },
     );
     return {
-      scrollTop: region.scrollTop,
+      scrollTop: window.scrollY,
       scrollHeight: region.scrollHeight,
-      clientHeight: region.clientHeight,
+      clientHeight: window.innerHeight,
       focused: document.activeElement === region,
       focusVisible: region.matches(":focus-visible"),
       boxShadow: getComputedStyle(region).boxShadow,
       reducedMotion: window.matchMedia("(prefers-reduced-motion: reduce)").matches,
       scrollBehavior: getComputedStyle(region).scrollBehavior,
       anchorText: anchor?.textContent ?? null,
-      anchorTop: anchor === undefined ? null : anchor.getBoundingClientRect().top - regionRect.top,
+      anchorTop: anchor === undefined ? null : anchor.getBoundingClientRect().top,
     };
   });
   assert(
@@ -1360,13 +1449,10 @@ async function exerciseLiveSpectatorGameBehavior(
       (entry) => entry.textContent === anchorText,
     );
     return {
-      scrollTop: region.scrollTop,
+      scrollTop: window.scrollY,
       scrollHeight: region.scrollHeight,
       focused: document.activeElement === region,
-      anchorTop:
-        anchor === undefined
-          ? null
-          : anchor.getBoundingClientRect().top - region.getBoundingClientRect().top,
+      anchorTop: anchor === undefined ? null : anchor.getBoundingClientRect().top,
     };
   }, timelineBefore.anchorText);
   const timelineHeightDelta = timelineAfter.scrollHeight - timelineBefore.scrollHeight;
@@ -1384,10 +1470,29 @@ async function exerciseLiveSpectatorGameBehavior(
     (await newPlay.innerText()) === "New play",
     `${options.engineLabel} did not expose the accessible New play action`,
   );
+  assert(
+    await newPlay.evaluate((element) => {
+      const button = element.getBoundingClientRect();
+      const score = document.querySelector("[data-scoreboard-compact]")!.getBoundingClientRect();
+      return (
+        button.top > score.bottom &&
+        button.bottom <= innerHeight &&
+        button.left >= 0 &&
+        button.right <= innerWidth
+      );
+    }),
+    `${options.engineLabel} New play overlaps the top score`,
+  );
+  if (process.env.PUBLIC_GAME_EVIDENCE_DIR)
+    await page.screenshot({
+      path: join(process.env.PUBLIC_GAME_EVIDENCE_DIR, `${options.engineLabel}-new-play.png`),
+    });
   await newPlay.focus();
   await page.keyboard.press("Enter");
   const activatedTimeline = await timelineRegion.evaluate((element) => ({
-    scrollTop: (element as HTMLDivElement).scrollTop,
+    scrollTop:
+      (document.querySelector("[data-scoreboard-compact]")?.getBoundingClientRect().bottom ?? 0) -
+      element.getBoundingClientRect().top,
     focused: document.activeElement === element,
     firstKind: element.querySelector("[data-timeline-kind]")?.getAttribute("data-timeline-kind"),
   }));
@@ -1428,6 +1533,58 @@ async function exerciseLiveSpectatorGameBehavior(
     (await page.locator('[data-game-code="BUSY-2"][data-schedule-status="running"]').count()) >= 1,
     `${options.engineLabel} stream update removed the canonical schedule card`,
   );
+}
+
+async function assertOpposingTimeline(page: Page) {
+  for (const width of [360, 566, 1280]) {
+    await page.setViewportSize({ width, height: 900 });
+    const bounds = await page.locator("[data-game-timeline]").evaluate((element) => {
+      const rect = element.getBoundingClientRect();
+      const middle = rect.left + rect.width / 2;
+      const entries = Array.from(element.querySelectorAll<HTMLElement>("[data-timeline-kind]"));
+      return {
+        overflow: document.documentElement.scrollWidth > innerWidth,
+        borders: entries.every((entry) =>
+          entry.dataset.timelineLane === "center"
+            ? getComputedStyle(entry).borderBottomWidth === "1px"
+            : getComputedStyle(entry.querySelector("[data-timeline-content]")!)
+                .borderBottomWidth === "0px",
+        ),
+        lanes: entries
+          .filter((entry) => entry.dataset.timelineLane !== "center")
+          .every((entry) => {
+            const content = entry.querySelector("[data-timeline-content]")!.getBoundingClientRect();
+            const time = entry.querySelector("[data-timeline-spine]")!.getBoundingClientRect();
+            return entry.dataset.timelineSide === "left"
+              ? content.right <= time.left && content.right < middle
+              : content.left >= time.right && content.left > middle;
+          }),
+        wrapped: entries.every((entry) => {
+          const content = entry.querySelector("[data-timeline-content]")!;
+          return Array.from(content.querySelectorAll("p")).every(
+            (text) => text.scrollWidth <= text.clientWidth,
+          );
+        }),
+      };
+    });
+    assert(
+      !bounds.overflow && bounds.lanes && bounds.wrapped && bounds.borders,
+      `${width}px opposing Timeline bounds failed: ${JSON.stringify(bounds)}`,
+    );
+    const screenshotDirectory = process.env.PUBLIC_BROWSER_SCREENSHOTS;
+    if (screenshotDirectory) {
+      mkdirSync(screenshotDirectory, { recursive: true });
+      await page.evaluate(() => window.scrollTo(0, 0));
+      await page.screenshot({
+        path: join(
+          screenshotDirectory,
+          `timeline-${width}-${await page.locator('[data-timeline-kind="card"]').first().getAttribute("data-timeline-side")}.png`,
+        ),
+        fullPage: true,
+      });
+    }
+  }
+  await page.setViewportSize({ width: 360, height: 740 });
 }
 
 function publicRosterTimelineEntry(page: Page, publicName: string) {

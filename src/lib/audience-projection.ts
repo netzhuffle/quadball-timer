@@ -484,7 +484,13 @@ function projectAudienceGameFromInput(
       },
     },
     canonicalPath: `/events/${encodeURIComponent(event.eventId)}/games/${encodeURIComponent(game.eventGameId)}`,
-    timeline: projectAudienceGameTimeline(snapshot, game, input.gameFacts, input.timelineState),
+    timeline: projectAudienceGameTimeline(
+      snapshot,
+      game,
+      input.gameFacts,
+      input.timelineState,
+      input.winnerGameSideId,
+    ),
     ...(input.teamAssignmentCorrected
       ? { teamAssignmentNotice: "event-team-assignment-corrected" as const }
       : {}),
@@ -637,12 +643,15 @@ function projectAudienceGameTimeline(
   game: ProjectedEventGame,
   gameFacts: LiveEventGameDerivedState["gameFacts"],
   timelineState: PublicAudienceTimelineDerivedState,
+  winnerGameSideId: string | null,
 ): readonly PublicAudienceTimelineEntry[] {
   const root = snapshot.findRootByEventGameId(game.eventGameId);
   if (root === null) return [];
   const sideAssignments = publicTimelineSideAssignments(snapshot, game, root);
   return projectPublicGameTimeline({
     facts: gameFacts,
+    commencedAtMs: root.lifecycle.commencedAtMs,
+    winnerGameSideId,
     sideA: sideAssignments.sideA,
     sideB: sideAssignments.sideB,
     lookupRosterName: (eventTeamId, playerNumber) => {

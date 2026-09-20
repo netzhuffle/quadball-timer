@@ -619,7 +619,15 @@ export function PublicEventGamePage({
             ) : null}
             <section className="daylight-history" aria-label="Game history">
               {game.timeline.length > 0 ? (
-                <PublicGameTimeline entries={game.timeline} />
+                <PublicGameTimeline
+                  entries={game.timeline}
+                  presentation={game.presentation}
+                  game={game}
+                  connected={
+                    connectionStatus === "connected" &&
+                    game.clock?.synchronization === "synchronized"
+                  }
+                />
               ) : (
                 <>
                   <h2>Game Timeline</h2>
@@ -965,7 +973,7 @@ function GameCard({
           ) : null}
         </div>
         {(!compact || game.scheduleStatus === "past") && game.timeline.length > 0 ? (
-          <PublicGameTimeline entries={game.timeline} />
+          <PublicGameTimeline entries={game.timeline} presentation={game.presentation} />
         ) : null}
       </CardContent>
     </Card>

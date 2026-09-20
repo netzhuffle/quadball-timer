@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test, spyOn } from "bun:test";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { Window } from "happy-dom";
@@ -44,7 +44,170 @@ describe("public Game Timeline browser seam", () => {
     });
   });
 
-  test("wraps long public content and preserves both scroll positions on new play", async () => {
+  test("shows one Team Timeout and Heat Break, ticking only active rows without new-play announcements", async () => {
+    let tick: (() => void) | undefined;
+    const clock = spyOn(performance, "now").mockReturnValue(1000);
+    const intervalHandle = testWindow.setInterval(() => {}, 60000);
+    const scheduler = spyOn(testWindow, "setInterval").mockImplementation((callback) => {
+      if (typeof callback === "function") tick = () => callback();
+      return intervalHandle;
+    });
+    try {
+      const base = { gameTimeMs: 60000, lane: "side-a" as const, teamName: "Alpha" };
+      const entries: PublicAudienceTimelineEntry[] = [
+        { ...base, kind: "timeout", action: "complete" },
+        { ...base, kind: "timeout", action: "start" },
+        { ...base, kind: "timeout", action: "stoppage" },
+        { ...base, lane: "center", kind: "heat-stoppage", action: "end" },
+        { ...base, lane: "center", kind: "heat-stoppage", action: "start" },
+      ];
+      const game = {
+        result: { status: "unfinished" as const, winner: null, locked: false },
+        teamTimeout: { status: "started" as const, side: "side-a" as const, remainingMs: 2500 },
+        heatStoppage: {
+          status: "ended" as const,
+          mode: "enabled" as const,
+          pending: false,
+          remainingMs: null,
+          allowedDurationMs: 60000,
+          actualDurationMs: 60000,
+        },
+      };
+      await act(async () =>
+        root.render(<PublicGameTimeline entries={entries} game={game} connected />),
+      );
+      expect(container.querySelectorAll('[data-timeline-kind="timeout"]')).toHaveLength(1);
+      expect(container.querySelectorAll('[data-timeline-kind="heat-stoppage"]')).toHaveLength(1);
+      expect(container.textContent).toContain("Team Timeout");
+      expect(container.textContent).toContain("Heat Break");
+      expect(container.textContent).toContain("3s remaining");
+      expect(container.textContent).not.toContain("stoppage");
+      clock.mockReturnValue(2000);
+      await act(async () => tick?.());
+      expect(container.textContent).toContain("2s remaining");
+      expect(container.textContent).not.toContain("New play available");
+      clock.mockReturnValue(3500);
+      await act(async () => tick?.());
+      expect(container.querySelector("[data-timeline-countdown]")).toBeNull();
+      expect(container.textContent).toContain("1:00");
+      await act(async () =>
+        root.render(
+          <PublicGameTimeline
+            entries={entries}
+            game={{ ...game, result: { ...game.result, status: "finished" } }}
+            connected
+          />,
+        ),
+      );
+      expect(container.querySelector('[role="timer"]')).toBeNull();
+      const heatGame = {
+        ...game,
+        teamTimeout: { ...game.teamTimeout, status: "completed" as const },
+        heatStoppage: { ...game.heatStoppage, status: "extended" as const, remainingMs: 1700 },
+      };
+      await act(async () =>
+        root.render(<PublicGameTimeline entries={entries} game={heatGame} connected />),
+      );
+      expect(
+        container.querySelector('[data-timeline-kind="heat-stoppage"]')?.textContent,
+      ).toContain("2s remaining");
+      expect(container.querySelector('[data-timeline-kind="timeout"]')?.textContent).not.toContain(
+        "remaining",
+      );
+      clock.mockReturnValue(4500);
+      await act(async () => tick?.());
+      expect(
+        container.querySelector('[data-timeline-kind="heat-stoppage"]')?.textContent,
+      ).toContain("1s remaining");
+      await act(async () =>
+        root.render(<PublicGameTimeline entries={entries} game={heatGame} connected={false} />),
+      );
+      expect(container.querySelector('[role="timer"]')).toBeNull();
+      await act(async () =>
+        root.render(<PublicGameTimeline entries={[]} game={heatGame} connected />),
+      );
+      expect(container.querySelector("[data-game-timeline]")).toBeNull();
+    } finally {
+      clock.mockRestore();
+      scheduler.mockRestore();
+    }
+  });
+
+  test("phase scores follow pitch orientation and absent history remains absent", async () => {
+    for (const pitchOrientation of ["side-a-left", "side-b-left"] as const) {
+      await act(async () =>
+        root.render(
+          <PublicGameTimeline
+            entries={[
+              {
+                kind: "overtime",
+                gameTimeMs: 1_300_000,
+                lane: "center",
+                teamName: null,
+                targetScore: 100,
+                score: { sideA: 70, sideB: 60 },
+              },
+              {
+                kind: "seeker-release",
+                gameTimeMs: 1_200_000,
+                lane: "center",
+                teamName: null,
+                score: { sideA: 70, sideB: 30 },
+              },
+              { kind: "seeker-release", gameTimeMs: 1_200_000, lane: "center", teamName: null },
+            ]}
+            presentation={{ pitchOrientation, displayedTeamColors: { sideA: null, sideB: null } }}
+          />,
+        ),
+      );
+      expect(
+        [...container.querySelectorAll("[data-timeline-phase-score]")].map(
+          (node) => node.textContent,
+        ),
+      ).toEqual(
+        pitchOrientation === "side-a-left" ? ["70 – 60", "70 – 30"] : ["60 – 70", "30 – 70"],
+      );
+      expect(container.textContent).toContain("Overtime started · target 100");
+      expect(
+        container
+          .querySelector('[data-timeline-kind="overtime"]')
+          ?.getAttribute("data-timeline-side"),
+      ).toBe("center");
+    }
+  });
+
+  test("names the finish winner explicitly and replaces it after a correction", async () => {
+    for (const teamName of ["Berner Boggarts", "Corrected winner", null]) {
+      await act(async () => {
+        root.render(
+          <PublicGameTimeline
+            entries={[
+              {
+                kind: "finish",
+                gameTimeMs: 1_323_000,
+                lane: "center",
+                teamName,
+                outcome: "result",
+                resultKind: "flag-catch",
+              },
+            ]}
+            presentation={{
+              pitchOrientation: "side-b-left",
+              displayedTeamColors: { sideA: "#fff000", sideB: "#003399" },
+            }}
+          />,
+        );
+      });
+      expect(container.textContent).toContain("22:03");
+      expect(container.textContent).toContain("Game Finish · flag catch");
+      if (teamName) expect(container.textContent).toContain(`Winner: ${teamName}`);
+      else expect(container.textContent).not.toContain("Winner:");
+      if (teamName !== "Berner Boggarts")
+        expect(container.textContent).not.toContain("Berner Boggarts");
+    }
+  });
+
+  test("retains public details and applies effective history updates", async () => {
     const initialEntries = [
       entry("goal", 60_000, "A very long team name that must wrap inside the timeline", {
         number: 7,
@@ -69,78 +232,32 @@ describe("public Game Timeline browser seam", () => {
       "A very long reason that should remain readable without widening the page",
     );
     expect(container.textContent).not.toContain("undefined");
-    expect(container.querySelector('[data-timeline-lane="side-a"]')).not.toBeNull();
-    expect(container.querySelector('[data-timeline-lane="side-b"]')).not.toBeNull();
-    expect(container.querySelector('[data-timeline-lane="center"]')).not.toBeNull();
-    expect(
-      container.querySelector('[data-timeline-lane="side-a"] [data-timeline-content]')?.className,
-    ).toContain("sm:col-start-1");
-    expect(
-      container.querySelector('[data-timeline-lane="side-b"] [data-timeline-content]')?.className,
-    ).toContain("sm:col-start-3");
-    expect(
-      container.querySelector('[data-timeline-lane="center"] [data-timeline-content]')?.className,
-    ).toContain("sm:col-span-3");
-    expect(container.querySelectorAll("[data-timeline-spine]").length).toBe(4);
+    expect(container.textContent).toContain("yellow card");
+    expect(container.textContent).toContain("1:00");
+    expect(container.querySelector('[role="region"]')?.getAttribute("aria-label")).toBe(
+      "Game Timeline",
+    );
 
-    const region = container.querySelector(
-      "[data-timeline-scroll-region]",
-    ) as HTMLDivElement | null;
-    if (region === null) throw new Error("Expected timeline scroll region.");
-    let height = 200;
-    Object.defineProperty(region, "scrollHeight", {
-      configurable: true,
-      get: () => height,
-    });
-    region.scrollTo = ((optionsOrX: ScrollToOptions | number) => {
-      region.scrollTop = typeof optionsOrX === "number" ? optionsOrX : (optionsOrX.top ?? 0);
-    }) as typeof region.scrollTo;
-
-    await act(async () => {
-      root.render(<PublicGameTimeline entries={initialEntries.slice(0, 1)} />);
-      await Promise.resolve();
-    });
-    region.scrollTop = 80;
-    region.dispatchEvent(new testWindow.Event("scroll", { bubbles: true }) as unknown as Event);
-    height = 260;
     await act(async () => {
       root.render(
         <PublicGameTimeline
           entries={[
-            entry("timeout", 70_000, "A newly arrived play"),
-            ...initialEntries.slice(0, 1),
+            entry("goal", 60_000, "Corrected team", { number: 7, name: "Corrected roster name" }),
           ]}
         />,
       );
       await Promise.resolve();
     });
-    expect(region.scrollTop).toBe(140);
-    expect(container.querySelector("button")?.textContent).toBe("New play");
-
-    await act(async () => {
-      container
-        .querySelector("button")
-        ?.dispatchEvent(new testWindow.Event("click", { bubbles: true }) as unknown as Event);
-      await Promise.resolve();
-    });
-    expect(region.scrollTop).toBe(0);
-    expect(document.activeElement).toBe(region);
-
-    height = 320;
-    await act(async () => {
-      root.render(
-        <PublicGameTimeline
-          entries={[
-            entry("goal", 80_000, "Live-edge play"),
-            entry("timeout", 70_000, "A newly arrived play"),
-            ...initialEntries.slice(0, 1),
-          ]}
-        />,
-      );
-      await Promise.resolve();
-    });
-    expect(region.scrollTop).toBe(0);
+    expect(container.textContent).toContain("Corrected roster name");
+    expect(container.textContent).not.toContain("Avery A. Player");
+    expect(container.textContent).not.toContain("yellow card");
     expect(container.querySelector("button")).toBeNull();
+
+    await act(async () => {
+      root.render(<PublicGameTimeline entries={[]} />);
+      await Promise.resolve();
+    });
+    expect(container.textContent).toBe("");
   });
 });
 
@@ -166,7 +283,7 @@ function entry(
       penaltyReason: "A very long reason that should remain readable without widening the page",
     };
   }
-  if (kind === "timeout") return { ...base, kind, action: "stoppage" };
+  if (kind === "timeout") return { ...base, kind, action: "start" };
   if (kind === "suspension") return { ...base, kind, action: "start" };
   throw new Error(`Unsupported browser fixture kind: ${kind}`);
 }

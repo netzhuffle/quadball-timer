@@ -354,7 +354,7 @@ Automatic removal when creating an Ad Hoc Game would exceed the 50-Game capacity
 _Avoid_: Manual removal, finished-game cleanup, retention expiry
 
 **Game Timeline**:
-The spectator-visible complete history of effective game events, ordered newest-first by game time and updated when a Correction changes the record. Player names, player numbers, Penalty Reasons, and other game-event details are intentionally public; correction provenance and Audit Trail evidence remain private.
+The spectator-visible complete history of effective game events, excluding routine pause and resume actions, ordered newest-first by game time and updated when a Correction changes the record. Player names, player numbers, Penalty Reasons, and other game-event details are intentionally public; correction provenance and Audit Trail evidence remain private.
 _Avoid_: Audit log, command log
 
 **Game Commencement**:
