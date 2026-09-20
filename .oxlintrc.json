@@ -1,0 +1,33 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": [
+    "typescript",
+    "unicorn",
+    "oxc",
+    "react",
+    "jsx-a11y",
+    "import"
+  ],
+  "rules": {
+    "react/rules-of-hooks": "error",
+    "import/no-self-import": "error",
+    "react/refs": "off",
+    "react/set-state-in-effect": "off",
+    "react/use-memo": "off",
+    "jsx-a11y/prefer-tag-over-role": "off"
+  },
+  "env": {
+    "builtin": true
+  },
+  "ignorePatterns": [
+    "docs/**"
+  ],
+  "options": {
+    "typeAware": true,
+    "typeCheck": true,
+    "denyWarnings": true
+  },
+  "categories": {
+    "correctness": "error"
+  }
+}

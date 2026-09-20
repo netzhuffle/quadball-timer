@@ -98,6 +98,16 @@ describe("App", () => {
   let container: HTMLDivElement;
   let root: Root;
 
+  async function waitForRouteContent(expected: string) {
+    const deadline = performance.now() + 1_000;
+    // Imports settle outside React; flush their renders until the admission UI is ready.
+    while (!container.textContent?.includes(expected) && performance.now() < deadline) {
+      await act(async () => {
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      });
+    }
+  }
+
   test("accepts underscore-containing generated Ad Hoc Game IDs", () => {
     expect(parseRoute("/game/adhoc-id_with_underscore", "")).toEqual({
       type: "game",
@@ -1175,15 +1185,35 @@ describe("App", () => {
 
     await act(async () => {
       root.render(<App />);
-      await Promise.resolve();
-      await Promise.resolve();
     });
+    await waitForRouteContent("Score Button Color Test");
 
     expect(container.textContent).toContain("Score Button Color Test");
     const previews = Array.from(container.getElementsByTagName("section")).filter(
       (section) => section.getAttribute("data-color-preview") === "true",
     );
     expect(previews).toHaveLength(100);
+  });
+
+  test.each([
+    ["/event-admin", "Event Hub"],
+    ["/pitch-manager", "Pitch Manager handoff"],
+    ["/admin", "Passkey authentication is required."],
+    ["/admin/enroll#token=disposable-token", "Enroll Technical Admin"],
+  ])("direct deferred route %s preserves its admission screen", async (path, expected) => {
+    testWindow.history.replaceState(null, "", path);
+    await act(async () => {
+      root.render(<App />);
+    });
+    await waitForRouteContent(expected);
+    expect(container.textContent).toContain(expected);
+    expect(container.textContent).not.toContain("could not load");
+    if (path.includes("enroll")) expect(testWindow.location.hash).toBe("");
+    await act(async () => {
+      testWindow.history.pushState(null, "", "/game/test-game");
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    });
+    expect(container.textContent).toContain("Tap game time or team names to adjust.");
   });
 
   test("lists public Events without an unscheduled section", async () => {

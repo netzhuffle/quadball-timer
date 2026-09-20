@@ -3,6 +3,7 @@ import plugin from "bun-plugin-tailwind";
 import { existsSync } from "fs";
 import { rm } from "fs/promises";
 import path from "path";
+import { writeBundleAnalysis } from "./scripts/bundle-analysis";
 
 if (process.argv.includes("--help") || process.argv.includes("-h")) {
   console.log(`
@@ -11,8 +12,9 @@ if (process.argv.includes("--help") || process.argv.includes("-h")) {
 Usage: bun run build.ts [options]
 
 Common Options:
+  --analyze               Write browser bundle report to out/bundle-analysis (ordinary build only)
   --compile               Generate a standalone executable
-  --compile-target <name> Compile target for executable builds (default: bun-linux-x64-modern)
+  --compile-target <name> Compile target for executable builds (default: bun-linux-x64)
   --outfile <path>        Executable output path when compiling (default: dist/quadball-timer)
   --outdir <path>          Output directory (default: "dist")
   --minify                 Enable minification (or --minify.whitespace, --minify.syntax, etc)
@@ -32,12 +34,13 @@ Common Options:
 
 Examples:
   bun run build.ts --outdir=dist --target=bun --minify --sourcemap=linked
-  bun run build.ts --compile --compile-target=bun-linux-x64-modern --outfile=dist/quadball-timer
+  bun run build.ts --compile --compile-target=bun-linux-x64 --outfile=dist/quadball-timer
 `);
   process.exit(0);
 }
 
 type ParsedBuildConfig = Partial<Bun.BuildConfig> & {
+  analyze?: boolean;
   compileTarget?: Bun.Build.CompileTarget;
   outfile?: string;
   outdir?: string;
@@ -130,6 +133,7 @@ console.log("\n🚀 Starting build process...\n");
 
 const cliConfig = parseArgs();
 const {
+  analyze,
   compile: compileOption,
   compileTarget,
   outdir: cliOutdir,
@@ -147,6 +151,19 @@ const outdir = shouldCompile
     ? cliOutdir
     : path.join(process.cwd(), "dist");
 
+const analysisDirectory = path.resolve("out/bundle-analysis");
+if (analyze) {
+  if (shouldCompile)
+    throw new Error(
+      "Use bun run build --analyze before build:executable; compiled builds do not expose emitted browser artifacts",
+    );
+  const relative = path.relative(path.resolve(outdir), analysisDirectory);
+  const inverse = path.relative(analysisDirectory, path.resolve(outdir));
+  if (!relative.startsWith("..") || !inverse.startsWith("..")) {
+    throw new Error("Build output and analysis directory must not overlap");
+  }
+}
+
 if (existsSync(outdir)) {
   console.log(`🗑️ Cleaning previous build at ${outdir}`);
   await rm(outdir, { recursive: true, force: true });
@@ -163,12 +180,16 @@ const compileConfig =
   typeof compileOption === "object" && compileOption !== null && !Array.isArray(compileOption)
     ? (compileOption as Bun.CompileBuildOptions)
     : {};
-const executableTarget = compileTarget ?? compileConfig.target ?? "bun-linux-x64-modern";
+// Bun 1.4 x64 uses one baseline runtime; legacy SIMD suffixes are compatibility aliases.
+const executableTarget = compileTarget ?? compileConfig.target ?? "bun-linux-x64";
 
 const buildConfig: Bun.BuildConfig = {
   entrypoints,
   plugins: [plugin],
   minify: true,
+  splitting: true,
+  // Compiled bytecode defaults to CJS; route splitting requires explicit ESM.
+  format: "esm",
   bytecode: shouldCompile,
   target: "bun",
   sourcemap: shouldCompile ? "none" : "linked",
@@ -189,9 +210,13 @@ const buildConfig: Bun.BuildConfig = {
         outdir,
       }),
   ...buildConfigOverrides,
+  ...(analyze ? { metafile: true } : {}),
 };
 
 const result = await Bun.build(buildConfig);
+
+if (!result.success) throw new Error("Build failed", { cause: result.logs });
+if (analyze) await writeBundleAnalysis(result, outdir, analysisDirectory);
 
 const end = performance.now();
 

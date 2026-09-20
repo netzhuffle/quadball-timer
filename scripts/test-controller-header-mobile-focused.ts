@@ -13,7 +13,7 @@ const journeys = [
 
 for (const journey of journeys) {
   console.log(`Focused Integration journey: ${journey.name}`);
-  const child = Bun.spawn(["bun", journey.command], {
+  const child = Bun.spawn([process.execPath, "--no-orphans", journey.command], {
     cwd: process.cwd(),
     stdin: "inherit",
     stdout: "inherit",

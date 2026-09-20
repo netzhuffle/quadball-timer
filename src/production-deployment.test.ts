@@ -34,6 +34,7 @@ describe("Production deployment contract", () => {
       "utf8",
     );
 
+    expect(unit).toContain("TimeoutStopSec=15s");
     expect(unit).toContain("StateDirectory=quadball-timer");
     expect(unit).toContain("StateDirectoryMode=0750");
     expect(unit).toContain(

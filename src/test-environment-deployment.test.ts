@@ -12,6 +12,7 @@ describe("Test Environment deployment contract", () => {
       "utf8",
     );
 
+    expect(unit).toContain("TimeoutStopSec=15s");
     expect(unit).toContain("User=quadball-timer-test");
     expect(unit).toContain("WorkingDirectory=/srv/quadball-timer-test/current");
     expect(unit).toContain("Environment=PORT=3001");

@@ -278,6 +278,7 @@ export type AdHocLiveSessionTrackerOptions = {
   retryBaseDelayMs?: number;
   retryMaxDelayMs?: number;
   scheduleRetry?: (delayMs: number, task: () => void) => void;
+  trackWork?: (work: Promise<unknown>) => void;
 };
 
 export function createAdHocLiveSessionTracker(
@@ -299,6 +300,7 @@ export function createAdHocLiveSessionTracker(
       const timer = setTimeout(task, delayMs);
       (timer as ReturnType<typeof setTimeout> & { unref?: () => void }).unref?.();
     });
+  let retriesStopped = false;
   let retryScheduled = false;
   let retryDelayMs = retryBaseDelayMs;
   let retryInFlight: Promise<boolean> | null = null;
@@ -312,6 +314,7 @@ export function createAdHocLiveSessionTracker(
   ) => {
     const previous = tasks.get(key) ?? Promise.resolve();
     const next = previous.then(work, work);
+    options.trackWork?.(next);
     tasks.set(key, next);
     void next.then(
       () => {
@@ -330,11 +333,11 @@ export function createAdHocLiveSessionTracker(
     return next;
   };
   const scheduleRetry = () => {
-    if (retryScheduled || pendingDisconnects.size === 0) return;
+    if (retriesStopped || retryScheduled || pendingDisconnects.size === 0) return;
     retryScheduled = true;
     schedule(retryDelayMs, () => {
       retryScheduled = false;
-      void retryPending();
+      if (!retriesStopped) void retryPending();
     });
   };
   const disconnectIfLast = (identity: AdHocLiveSessionIdentity) => {
@@ -445,9 +448,13 @@ export function createAdHocLiveSessionTracker(
     tombstoneCount() {
       return closedSockets.size;
     },
+    stopRetries() {
+      retriesStopped = true;
+    },
     async retryPending(): Promise<boolean> {
       if (retryInFlight !== null) return await retryInFlight;
       const current = performRetry();
+      options.trackWork?.(current);
       retryInFlight = current;
       void current.then(
         () => {

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useEffectEvent, useRef, useState } from "react";
 import QRCode from "qrcode/lib/browser";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -390,13 +390,13 @@ export function EventAdminPage({
   const gameDayScopeKey = (nextEventId = eventId, nextGameDayId = selectedGameDayId) =>
     `event-admin-game-day:${nextEventId}:${nextGameDayId ?? "none"}`;
 
-  const invalidateLockedGameRequest = () => {
+  const invalidateLockedGameRequest = useCallback(() => {
     lockedGameRequestGeneration.current += 1;
     const current = lockedGameRequestToken.current;
     if (current !== null) secretOwner.invalidate(current.grantToken.scopeKey);
     lockedGameRequestToken.current = null;
     setLockedGamePreview(null);
-  };
+  }, [secretOwner]);
 
   const captureLockedGameRequest = (): LockedGameRequestToken | null => {
     const currentEventId = eventId.trim();
@@ -535,7 +535,7 @@ export function EventAdminPage({
 
   useEffect(() => {
     invalidateLockedGameRequest();
-  }, [eventId, selectedGameDayId, hub?.authority]);
+  }, [eventId, selectedGameDayId, hub?.authority, invalidateLockedGameRequest]);
 
   const loadHub = async (nextGameDayId = selectedGameDayId, providedToken?: GrantSecretToken) => {
     accessSheetOwner.invalidate();
@@ -1586,8 +1586,12 @@ export function EventAdminPage({
     }
   };
 
-  useEffect(() => {
+  // Admission loads once; later scope changes are explicit user actions.
+  const loadInitialHub = useEffectEvent(() => {
     if (eventId.length > 0) void loadHub().catch(() => undefined);
+  });
+  useEffect(() => {
+    loadInitialHub();
   }, []);
 
   const run = async (action: () => Promise<void>, ownerToken?: GrantSecretToken) => {

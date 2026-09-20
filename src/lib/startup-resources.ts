@@ -15,7 +15,15 @@ export function createStartupCleanup() {
     run(): void {
       if (completed) return;
       completed = true;
-      while (cleanups.length > 0) cleanups.pop()?.();
+      const errors: unknown[] = [];
+      while (cleanups.length > 0) {
+        try {
+          cleanups.pop()?.();
+        } catch (error) {
+          errors.push(error);
+        }
+      }
+      if (errors.length > 0) throw new AggregateError(errors, "Resource cleanup failed.");
     },
   };
 }

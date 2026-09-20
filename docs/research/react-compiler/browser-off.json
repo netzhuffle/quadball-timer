@@ -1,0 +1,140 @@
+{
+  "browser": "chromium",
+  "samples": [
+    {
+      "sample": 0,
+      "phases": [
+        {
+          "name": "clock",
+          "elapsedMs": 1293.3728749999998,
+          "commits": 9,
+          "renderedFibers": 306
+        },
+        {
+          "name": "correction",
+          "elapsedMs": 162.21704199999976,
+          "commits": 5,
+          "renderedFibers": 170
+        },
+        {
+          "name": "dialog",
+          "elapsedMs": 149.32887500000015,
+          "commits": 4,
+          "renderedFibers": 137
+        },
+        {
+          "name": "reconnect",
+          "elapsedMs": 431.1395419999999,
+          "commits": 6,
+          "renderedFibers": 204
+        }
+      ],
+      "assets": [
+        {
+          "name": "/chunk-6t6mkb4n.js",
+          "bytes": 1070772,
+          "memoCacheSymbolOccurrences": 1,
+          "sha256": "1afedb0a49b5d92748fa8be61e850cd07ed79a0bde29206a36b257a9c14440fa"
+        },
+        {
+          "name": "/chunk-camex9nx.js",
+          "bytes": 1004,
+          "memoCacheSymbolOccurrences": 0,
+          "sha256": "50a3dd60055013bc6d7450f190fda3d62a0f6aba7b77e960e7956914f08bf290"
+        }
+      ],
+      "refreshes": 2,
+      "errors": []
+    },
+    {
+      "sample": 1,
+      "phases": [
+        {
+          "name": "clock",
+          "elapsedMs": 1296.3892920000003,
+          "commits": 9,
+          "renderedFibers": 306
+        },
+        {
+          "name": "correction",
+          "elapsedMs": 162.6528330000001,
+          "commits": 5,
+          "renderedFibers": 170
+        },
+        {
+          "name": "dialog",
+          "elapsedMs": 146.7462919999998,
+          "commits": 4,
+          "renderedFibers": 137
+        },
+        {
+          "name": "reconnect",
+          "elapsedMs": 429.8615,
+          "commits": 6,
+          "renderedFibers": 204
+        }
+      ],
+      "assets": [
+        {
+          "name": "/chunk-6t6mkb4n.js",
+          "bytes": 1070772,
+          "memoCacheSymbolOccurrences": 1,
+          "sha256": "1afedb0a49b5d92748fa8be61e850cd07ed79a0bde29206a36b257a9c14440fa"
+        },
+        {
+          "name": "/chunk-camex9nx.js",
+          "bytes": 1004,
+          "memoCacheSymbolOccurrences": 0,
+          "sha256": "50a3dd60055013bc6d7450f190fda3d62a0f6aba7b77e960e7956914f08bf290"
+        }
+      ],
+      "refreshes": 2,
+      "errors": []
+    },
+    {
+      "sample": 2,
+      "phases": [
+        {
+          "name": "clock",
+          "elapsedMs": 1296.9357909999999,
+          "commits": 9,
+          "renderedFibers": 306
+        },
+        {
+          "name": "correction",
+          "elapsedMs": 165.4659160000001,
+          "commits": 5,
+          "renderedFibers": 170
+        },
+        {
+          "name": "dialog",
+          "elapsedMs": 145.13295799999923,
+          "commits": 3,
+          "renderedFibers": 103
+        },
+        {
+          "name": "reconnect",
+          "elapsedMs": 431.9633329999997,
+          "commits": 6,
+          "renderedFibers": 204
+        }
+      ],
+      "assets": [
+        {
+          "name": "/chunk-6t6mkb4n.js",
+          "bytes": 1070772,
+          "memoCacheSymbolOccurrences": 1,
+          "sha256": "1afedb0a49b5d92748fa8be61e850cd07ed79a0bde29206a36b257a9c14440fa"
+        },
+        {
+          "name": "/chunk-camex9nx.js",
+          "bytes": 1004,
+          "memoCacheSymbolOccurrences": 0,
+          "sha256": "50a3dd60055013bc6d7450f190fda3d62a0f6aba7b77e960e7956914f08bf290"
+        }
+      ],
+      "refreshes": 2,
+      "errors": []
+    }
+  ]
+}

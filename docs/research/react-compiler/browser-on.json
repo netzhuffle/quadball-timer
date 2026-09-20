@@ -1,0 +1,140 @@
+{
+  "browser": "chromium",
+  "samples": [
+    {
+      "sample": 0,
+      "phases": [
+        {
+          "name": "clock",
+          "elapsedMs": 1293.761625,
+          "commits": 9,
+          "renderedFibers": 306
+        },
+        {
+          "name": "correction",
+          "elapsedMs": 165.11425000000008,
+          "commits": 5,
+          "renderedFibers": 170
+        },
+        {
+          "name": "dialog",
+          "elapsedMs": 145.0887499999999,
+          "commits": 4,
+          "renderedFibers": 137
+        },
+        {
+          "name": "reconnect",
+          "elapsedMs": 432.1495,
+          "commits": 6,
+          "renderedFibers": 204
+        }
+      ],
+      "assets": [
+        {
+          "name": "/chunk-m4c23a5h.js",
+          "bytes": 1106230,
+          "memoCacheSymbolOccurrences": 1,
+          "sha256": "9102bcb94c52dc85fa654b1d39127f802d85243afd195965163e1d5efc7c2288"
+        },
+        {
+          "name": "/chunk-mb4dr1rs.js",
+          "bytes": 1094,
+          "memoCacheSymbolOccurrences": 1,
+          "sha256": "9789c5a3ea61e13605f74deb1d4147cea04fd08c80a4c192483071f9149308d1"
+        }
+      ],
+      "refreshes": 2,
+      "errors": []
+    },
+    {
+      "sample": 1,
+      "phases": [
+        {
+          "name": "clock",
+          "elapsedMs": 1289.0548329999997,
+          "commits": 9,
+          "renderedFibers": 306
+        },
+        {
+          "name": "correction",
+          "elapsedMs": 163.89962500000001,
+          "commits": 5,
+          "renderedFibers": 170
+        },
+        {
+          "name": "dialog",
+          "elapsedMs": 147.65120800000022,
+          "commits": 3,
+          "renderedFibers": 103
+        },
+        {
+          "name": "reconnect",
+          "elapsedMs": 415.7365,
+          "commits": 6,
+          "renderedFibers": 204
+        }
+      ],
+      "assets": [
+        {
+          "name": "/chunk-m4c23a5h.js",
+          "bytes": 1106230,
+          "memoCacheSymbolOccurrences": 1,
+          "sha256": "9102bcb94c52dc85fa654b1d39127f802d85243afd195965163e1d5efc7c2288"
+        },
+        {
+          "name": "/chunk-mb4dr1rs.js",
+          "bytes": 1094,
+          "memoCacheSymbolOccurrences": 1,
+          "sha256": "9789c5a3ea61e13605f74deb1d4147cea04fd08c80a4c192483071f9149308d1"
+        }
+      ],
+      "refreshes": 2,
+      "errors": []
+    },
+    {
+      "sample": 2,
+      "phases": [
+        {
+          "name": "clock",
+          "elapsedMs": 1294.8052499999994,
+          "commits": 9,
+          "renderedFibers": 306
+        },
+        {
+          "name": "correction",
+          "elapsedMs": 164.99833300000046,
+          "commits": 5,
+          "renderedFibers": 170
+        },
+        {
+          "name": "dialog",
+          "elapsedMs": 132.1569159999999,
+          "commits": 3,
+          "renderedFibers": 103
+        },
+        {
+          "name": "reconnect",
+          "elapsedMs": 415.5915420000001,
+          "commits": 5,
+          "renderedFibers": 170
+        }
+      ],
+      "assets": [
+        {
+          "name": "/chunk-m4c23a5h.js",
+          "bytes": 1106230,
+          "memoCacheSymbolOccurrences": 1,
+          "sha256": "9102bcb94c52dc85fa654b1d39127f802d85243afd195965163e1d5efc7c2288"
+        },
+        {
+          "name": "/chunk-mb4dr1rs.js",
+          "bytes": 1094,
+          "memoCacheSymbolOccurrences": 1,
+          "sha256": "9789c5a3ea61e13605f74deb1d4147cea04fd08c80a4c192483071f9149308d1"
+        }
+      ],
+      "refreshes": 2,
+      "errors": []
+    }
+  ]
+}

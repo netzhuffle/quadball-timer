@@ -1,0 +1,90 @@
+function ControllerActionSheet(t0) {
+  let $ = react_compiler_runtime3.c(38);
+  let { activePanel, onPanelChange, panel, tabThemes, topOffsetPx } = t0;
+  let previousPanelRef = import_react5.useRef(null);
+  let t1;
+  if ($[0] === __MEMO_CACHE_SENTINEL)
+    t1 = {}, $[0] = t1;
+  else
+    t1 = $[0];
+  let actionButtonRefs = import_react5.useRef(t1);
+  let t2, t3;
+  if ($[1] !== activePanel)
+    t2 = () => {
+      let previousPanel = previousPanelRef.current;
+      previousPanelRef.current = activePanel;
+      if (previousPanel !== null && activePanel === null)
+        actionButtonRefs.current[previousPanel]?.focus();
+    }, t3 = [
+      activePanel
+    ], $[1] = activePanel, $[2] = t2, $[3] = t3;
+  else
+    t2 = $[2], t3 = $[3];
+  import_react5.useEffect(t2, t3);
+
+---
+
+function EventControllerActionPanel(t0) {
+  let $ = react_compiler_runtime7.c(96);
+  let { activePanel, busy, projection, cardGameSideId, setCardGameSideId, cardPlayerNumber, setCardPlayerNumber, cardType, setCardType, cardFoulBeforeScore, setCardFoulBeforeScore, cardSeekerPenaltyConfirmed, setCardSeekerPenaltyConfirmed, recordCard, trigger, recordDoubleForfeit, recordFlagCatch, recordConcession, recordForfeit, onAccepted, pendingResultConfirmation, setPendingResultConfirmation, recordResult } = t0;
+  let sideIds, t1;
+  if ($[0] !== activePanel || $[1] !== busy || $[2] !== cardFoulBeforeScore || $[3] !== cardGameSideId || $[4] !== cardPlayerNumber || $[5] !== cardSeekerPenaltyConfirmed || $[6] !== cardType || $[7] !== onAccepted || $[8] !== projection?.scoreByGameSide || $[9] !== projection?.timeout || $[10] !== recordCard || $[11] !== setCardFoulBeforeScore || $[12] !== setCardGameSideId || $[13] !== setCardPlayerNumber || $[14] !== setCardSeekerPenaltyConfirmed || $[15] !== setCardType || $[16] !== trigger) {
+
+---
+
+function EventGameControllerPage() {
+  const persisted = readBrowserEventControllerSession();
+  const [qrCredential, setQrCredential] = import_react7.useState("");
+  const [grantCode, setGrantCode] = import_react7.useState("");
+  const qrCredentialInputRef = import_react7.useRef(null);
+  const grantCodeInputRef = import_react7.useRef(null);
+  const [sessionBearer, setSessionBearer] = import_react7.useState(null);
+  const [eventGameId, setEventGameId] = import_react7.useState(null);
+  const [projection, setProjection] = import_react7.useState(null);
+  const [projectionStatus, setProjectionStatus] = import_react7.useState("unavailable");
+  const [revealedQr, setRevealedQr] = import_react7.useState(null);
+  const [qrDialogOpen, setQrDialogOpen] = import_react7.useState(false);
+
+---
+
+function useControllerDepartureEntry({
+  destination,
+  triggerRef,
+  onCommitted,
+  onUnavailable,
+  onCancelled
+}) {
+  const departureModule = getBrowserControllerDeparture();
+  const destinationRef = import_react6.useRef(destination);
+  const onCommittedRef = import_react6.useRef(onCommitted);
+  const onUnavailableRef = import_react6.useRef(onUnavailable);
+  const onCancelledRef = import_react6.useRef(onCancelled);
+  destinationRef.current = destination;
+  onCommittedRef.current = onCommitted;
+  onUnavailableRef.current = onUnavailable;
+  onCancelledRef.current = onCancelled;
+  const [prompt, setPrompt] = import_react6.useState();
+  const [busy, setBusy] = import_react6.useState(false);
+  const busyRef = import_react6.useRef(false);
+  const mountedRef = import_react6.useRef(true);
+
+---
+
+function useRoute(initialAdHocHandoff, initialAdHocHandoffAttempted) {
+  let $ = react_compiler_runtime13.c(5);
+  let t0;
+  if ($[0] !== initialAdHocHandoff || $[1] !== initialAdHocHandoffAttempted)
+    t0 = () => initialAdHocHandoff !== null ? {
+      type: "ad-hoc-handoff",
+      handoff: initialAdHocHandoff
+    } : initialAdHocHandoffAttempted ? {
+      type: "ad-hoc-unavailable"
+    } : parseRoute(window.location.pathname, window.location.search, window.location.hash), $[0] = initialAdHocHandoff, $[1] = initialAdHocHandoffAttempted, $[2] = t0;
+  else
+    t0 = $[2];
+  let [route, setRoute] = import_react12.useState(t0);
+  let t1, t2;
+  if ($[3] === __MEMO_CACHE_SENTINEL)
+    t1 = () => {
+      let onPopState = () => {
+        setRoute(parseRoute(window.location.pathname, window.location.search, window.location.hash));

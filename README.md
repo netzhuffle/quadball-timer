@@ -29,6 +29,13 @@ bun install
 bun dev
 ```
 
+For dependency updates, follow the [package review and deduplication guidance](docs/agents/dependency-maintenance.md).
+
+Development and the `test:focused:*browser*` commands (including
+`test:focused:adhoc-browser` and `test:focused:controller-header-mobile`) use
+Bun's `--no-orphans` safety net. See [launcher lifecycle](docs/development-launchers.md)
+for ownership, platform limits, and the intentional disposable lifecycle check.
+
 ## Deployment
 
 Production deploys upload a compiled Linux executable and activate it under
@@ -102,6 +109,9 @@ test, Test Activation, or Production activation stages. Any new or unclassified
 path deploys by default, so adding a deployable input does not require extending
 a positive trigger list. Files under `docs/` also remain excluded from
 formatting, linting, and type-aware validation.
+
+The Linux executable uses the canonical Bun x64 target; see
+[compiler target semantics and ordinary verification](docs/development/linux-executable-target.md).
 
 ## Quality checks
 

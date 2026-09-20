@@ -1615,6 +1615,160 @@ describe("Event operations catalog", () => {
       expect(after.value.length).toBe(before.value.length);
   });
 
+  test("preserves strict Scheduled Start syntax instead of accepting Temporal extensions", async () => {
+    const fixture = createFixture();
+    const event = await fixture.catalog.createEvent({ name: "Strict", timeZone: "UTC" }, authority);
+    if (event.status !== "accepted") throw new Error("Expected Event.");
+    const day = await fixture.catalog.addGameDay(
+      event.value.eventId,
+      { date: "2024-02-29" },
+      authority,
+    );
+    if (day.status !== "accepted") throw new Error("Expected Game Day.");
+    const before = await fixture.catalog.listAuditTrail(event.value.eventId, authority);
+    for (const scheduledStart of [
+      "2024-02-29t12:30",
+      "2024-02-29 12:30",
+      "20240229T1230",
+      "2024-02-29T12:30Z",
+      "2024-02-29T12:30+00:00",
+      "2024-02-29T12:30[UTC]",
+      "2024-02-29T12:30[u-ca=iso8601]",
+      "2024-02-29T12:30:00.000",
+      "+002024-02-29T12:30",
+      "2024-2-29T12:30",
+      "2024-02-29T1:30",
+      "2024-02-29T12:30\n",
+      " 2024-02-29T12:30",
+      1709209800000,
+      null,
+    ]) {
+      expect(
+        await fixture.catalog.createGameplaySlot(
+          event.value.eventId,
+          day.value.gameDayId,
+          { sequence: 1, scheduledStart },
+          authority,
+        ),
+      ).toMatchObject({
+        status: "rejected",
+        reason: "invalid-input",
+        detail: "Scheduled Start must be a local Event time.",
+      });
+    }
+    for (const time of ["24:00", "12:60", "12:30:60", "99:99:99"]) {
+      expect(
+        await fixture.catalog.createGameplaySlot(
+          event.value.eventId,
+          day.value.gameDayId,
+          { sequence: 1, scheduledStart: `2024-02-29T${time}` },
+          authority,
+        ),
+      ).toMatchObject({
+        status: "rejected",
+        reason: "invalid-input",
+        detail: "Scheduled Start must be a valid local Event time.",
+      });
+    }
+    for (const date of ["2024-03-01", "2023-02-29", "2024-02-30", "2024-13-01"]) {
+      expect(
+        await fixture.catalog.createGameplaySlot(
+          event.value.eventId,
+          day.value.gameDayId,
+          { sequence: 1, scheduledStart: `${date}T12:30` },
+          authority,
+        ),
+      ).toMatchObject({
+        status: "rejected",
+        reason: "invalid-input",
+        detail: "Scheduled Start must be on the selected Game Day.",
+      });
+    }
+    expect(await fixture.catalog.listAuditTrail(event.value.eventId, authority)).toEqual(before);
+    expect(await fixture.catalog.inspectEvent(event.value.eventId, authority)).toMatchObject({
+      status: "accepted",
+      value: { gameplaySlots: [] },
+    });
+  });
+
+  test.each([
+    ["UTC", "0100-01-01T12:00", "Scheduled Start is not a real local Event time."],
+    ["UTC", "0999-12-31T12:00", "Scheduled Start is not a real local Event time."],
+    ["Europe/Zurich", "2026-03-29T02:30", "Scheduled Start is not a real local Event time."],
+    [
+      "Europe/Zurich",
+      "2026-10-25T02:30",
+      "Scheduled Start is ambiguous during the Event timezone fallback.",
+    ],
+    ["Australia/Lord_Howe", "2026-10-04T02:15", "Scheduled Start is not a real local Event time."],
+    [
+      "Australia/Lord_Howe",
+      "2026-04-05T01:45",
+      "Scheduled Start is ambiguous during the Event timezone fallback.",
+    ],
+    ["Pacific/Apia", "2011-12-30T12:00", "Scheduled Start is not a real local Event time."],
+  ])(
+    "rejects timezone discontinuities distinctly in %s at %s",
+    async (timeZone, scheduledStart, detail) => {
+      const fixture = createFixture();
+      const event = await fixture.catalog.createEvent({ name: "Transition", timeZone }, authority);
+      if (event.status !== "accepted") throw new Error("Expected Event.");
+      const day = await fixture.catalog.addGameDay(
+        event.value.eventId,
+        { date: scheduledStart.slice(0, 10) },
+        authority,
+      );
+      if (day.status !== "accepted") throw new Error("Expected Game Day.");
+      expect(
+        await fixture.catalog.createGameplaySlot(
+          event.value.eventId,
+          day.value.gameDayId,
+          { sequence: 1, scheduledStart },
+          authority,
+        ),
+      ).toMatchObject({ status: "rejected", reason: "invalid-input", detail });
+    },
+  );
+
+  test.each([
+    ["UTC", "1000-01-01T00:00", "1000-01-01T00:00:00Z"],
+    ["UTC", "2024-02-29T23:59:59", "2024-02-29T23:59:59Z"],
+    ["Asia/Kathmandu", "2026-01-01T00:00", "2025-12-31T18:15:00Z"],
+    ["America/Los_Angeles", "2026-12-31T23:59:59", "2027-01-01T07:59:59Z"],
+    ["Australia/Lord_Howe", "2026-10-04T01:59:59", "2026-10-03T15:29:59Z"],
+    ["Australia/Lord_Howe", "2026-10-04T02:30", "2026-10-03T15:30:00Z"],
+    ["Australia/Lord_Howe", "2026-04-05T01:29:59", "2026-04-04T14:29:59Z"],
+    ["Australia/Lord_Howe", "2026-04-05T02:00", "2026-04-04T15:30:00Z"],
+  ])(
+    "stores and projects epoch milliseconds in %s at %s",
+    async (timeZone, scheduledStart, expectedUtc) => {
+      const fixture = createFixture();
+      const event = await fixture.catalog.createEvent({ name: "Boundary", timeZone }, authority);
+      if (event.status !== "accepted") throw new Error("Expected Event.");
+      const day = await fixture.catalog.addGameDay(
+        event.value.eventId,
+        { date: scheduledStart.slice(0, 10) },
+        authority,
+      );
+      if (day.status !== "accepted") throw new Error("Expected Game Day.");
+      const slot = await fixture.catalog.createGameplaySlot(
+        event.value.eventId,
+        day.value.gameDayId,
+        { sequence: 1, scheduledStart },
+        authority,
+      );
+      expect(slot).toMatchObject({
+        status: "accepted",
+        value: { scheduledStartMs: Date.parse(expectedUtc) },
+      });
+      const projection = await fixture.catalog.inspectEvent(event.value.eventId, authority);
+      expect(JSON.parse(JSON.stringify(projection))).toMatchObject({
+        status: "accepted",
+        value: { gameplaySlots: [{ scheduledStartMs: Date.parse(expectedUtc) }] },
+      });
+    },
+  );
+
   test("preflights every Game before rejecting a late-invalid multi-Game confirmation", async () => {
     const fixture = createFixture();
     const event = await fixture.catalog.createEvent({ name: "Batch", timeZone: "UTC" }, authority);

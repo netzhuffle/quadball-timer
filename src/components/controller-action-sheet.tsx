@@ -48,7 +48,6 @@ export function ControllerActionSheet({
         <section
           id="controller-action-panel"
           data-controller-action-panel="true"
-          role="region"
           aria-label={`${panelLabel(activePanel)} actions`}
           className="pointer-events-auto min-h-0 max-h-[calc(100%_-_4rem)] overflow-y-auto overscroll-contain rounded-t-2xl border border-b-0 border-slate-300 bg-white/95 p-2 shadow-[0_12px_30px_rgba(15,23,42,0.2)] backdrop-blur-sm [&_button]:min-h-11"
         >

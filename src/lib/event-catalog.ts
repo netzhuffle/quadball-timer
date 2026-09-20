@@ -3335,66 +3335,18 @@ function validateScheduledStart(
     new Date(Date.UTC(year, month - 1, day)).toISOString().slice(0, 10) !== localDate
   )
     return { ok: false, error: "Scheduled Start must be a valid local Event time." };
-  const wallUtcMs = Date.UTC(year, month - 1, day, hour, minute, second);
-  const formatter = new Intl.DateTimeFormat("en-US", {
-    timeZone,
-    hourCycle: "h23",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-  });
-  let candidateMs = wallUtcMs;
-  for (let attempt = 0; attempt < 4; attempt += 1) {
-    const parts = Object.fromEntries(
-      formatter.formatToParts(new Date(candidateMs)).map((part) => [part.type, part.value]),
-    );
-    const representedWallUtcMs = Date.UTC(
-      Number(parts.year),
-      Number(parts.month) - 1,
-      Number(parts.day),
-      Number(parts.hour),
-      Number(parts.minute),
-      Number(parts.second),
-    );
-    candidateMs += wallUtcMs - representedWallUtcMs;
-  }
-  const localPartsMatch = (instantMs: number) => {
-    const parts = Object.fromEntries(
-      formatter.formatToParts(new Date(instantMs)).map((part) => [part.type, part.value]),
-    );
-    return (
-      `${parts.year}-${parts.month}-${parts.day}T${parts.hour}:${parts.minute}:${parts.second}` ===
-      `${localDate}T${hourText}:${minuteText}:${secondText}`
-    );
-  };
-  const offsetAt = (instantMs: number) => {
-    const parts = Object.fromEntries(
-      formatter.formatToParts(new Date(instantMs)).map((part) => [part.type, part.value]),
-    );
-    return (
-      Date.UTC(
-        Number(parts.year),
-        Number(parts.month) - 1,
-        Number(parts.day),
-        Number(parts.hour),
-        Number(parts.minute),
-        Number(parts.second),
-      ) - instantMs
-    );
-  };
-  const dayMs = 24 * 60 * 60 * 1000;
-  const candidates = new Set<number>();
-  for (const probeMs of [candidateMs - dayMs, candidateMs, candidateMs + dayMs])
-    candidates.add(wallUtcMs - offsetAt(probeMs));
-  const validCandidates = [...candidates].filter(localPartsMatch);
-  if (validCandidates.length === 0)
+  const local = Temporal.PlainDateTime.from({ year, month, day, hour, minute, second });
+  // Earlier/later agree for ordinary times. A gap shifts the wall time; an
+  // overlap preserves it at two different instants, including non-hour changes.
+  const earlier = local.toZonedDateTime(timeZone, { disambiguation: "earlier" });
+  // The previous formatter rejected years below 1000 because its year field was
+  // not zero-padded. Preserve that boundary instead of expanding accepted starts.
+  if (year < 1000 || !earlier.toPlainDateTime().equals(local))
     return { ok: false, error: "Scheduled Start is not a real local Event time." };
-  if (validCandidates.length > 1)
+  const later = local.toZonedDateTime(timeZone, { disambiguation: "later" });
+  if (earlier.epochMilliseconds !== later.epochMilliseconds)
     return { ok: false, error: "Scheduled Start is ambiguous during the Event timezone fallback." };
-  return { ok: true, value: validCandidates[0] as number };
+  return { ok: true, value: earlier.epochMilliseconds };
 }
 
 function validateOptionalText(

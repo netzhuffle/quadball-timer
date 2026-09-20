@@ -24,7 +24,10 @@ function semanticProjectionFingerprint(projection: PublicAudienceEventProjection
  */
 export function createPublicAudienceEventStream(
   projection: Pick<AudienceProjectionReader, "read">,
-  options: { refreshIntervalMs?: number } = {},
+  options: {
+    refreshIntervalMs?: number;
+    trackBackgroundWork?: (work: Promise<unknown>) => void;
+  } = {},
 ): PublicAudienceEventStream {
   const revisions = new Map<string, { fingerprint: string; version: number }>();
   const provider: PublicAudienceProjectionProvider<PublicAudienceEventProjection> = {
@@ -118,7 +121,9 @@ export function createPublicAudienceEventStream(
       state.pending = true;
       return;
     }
-    void runRefresh(eventId, state);
+    const work = runRefresh(eventId, state);
+    options.trackBackgroundWork?.(work);
+    void work.catch(() => undefined);
   }
 
   async function runRefresh(eventId: string, state: { inFlight: boolean; pending: boolean }) {
@@ -151,7 +156,9 @@ export function createPublicAudienceEventStream(
         subscribedEventIds.has(eventId) &&
         stream.subscriberCount(eventId) > 0
       ) {
-        void runRefresh(eventId, state);
+        const work = runRefresh(eventId, state);
+        options.trackBackgroundWork?.(work);
+        void work.catch(() => undefined);
       } else {
         refreshStates.delete(eventId);
       }

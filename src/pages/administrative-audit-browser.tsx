@@ -119,7 +119,7 @@ export function AdministrativeAuditBrowser({
       generation.current += 1;
       mounted.current = false;
     };
-  }, [eventId, route, queryKey]);
+  }, [eventId, route, queryKey, direction, filters]);
 
   const loadMore = (projection: (typeof PROJECTIONS)[number]) => {
     const page = pages[projection];

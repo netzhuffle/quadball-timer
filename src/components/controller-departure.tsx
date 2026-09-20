@@ -267,7 +267,6 @@ function ControllerDepartureDialog({
         aria-modal="true"
         aria-labelledby={titleId}
         aria-describedby={descriptionId}
-        onMouseDown={(event) => event.stopPropagation()}
       >
         <h2 id={titleId} className="text-lg font-semibold text-slate-950">
           {title}

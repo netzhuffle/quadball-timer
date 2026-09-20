@@ -460,7 +460,9 @@ export function PenaltyColumnsSection({
                 column.visiblePenalties.map((entry) => {
                   const releaseActions = pendingReleaseByPlayer[entry.playerKey] ?? [];
 
+                  // Only editable cards receive the button role, tab stop, and active handlers.
                   return (
+                    // oxlint-disable-next-line jsx-a11y/no-static-element-interactions
                     <div
                       key={entry.playerKey}
                       data-penalty-card-id={entry.cardEventId ?? undefined}
