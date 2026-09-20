@@ -159,7 +159,7 @@ async function verifyCorruptGrantState(
     const randomness = createDeterministicRandomness();
     const original = createAuthority(storage, { randomness, keyRing: originalKeyRing });
     const created = await createGrant(original);
-    await expect(
+    expect(
       storage.transaction((transaction) => {
         const grant = transaction.findGrantById(created.grantId);
         if (grant === null) throw new Error("Expected the stored Grant.");

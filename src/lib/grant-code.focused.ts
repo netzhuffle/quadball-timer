@@ -169,7 +169,7 @@ describe("focused SQLite Grant Code integration", () => {
         anchor: transaction.readGrantAdmissionStateAnchor?.() ?? null,
       }));
       let failedRevision = -1;
-      await expect(
+      expect(
         storage.transaction((transaction) => {
           failedRevision = transaction.revision;
           transaction.writeGrantAdmissionTelemetry?.({
@@ -195,7 +195,7 @@ describe("focused SQLite Grant Code integration", () => {
 
       const firstAudit = before.audit[0];
       if (firstAudit === undefined) throw new Error("Expected Grant audit evidence.");
-      await expect(
+      expect(
         storage.transaction((transaction) =>
           transaction.appendGrantAudit({
             ...firstAudit,

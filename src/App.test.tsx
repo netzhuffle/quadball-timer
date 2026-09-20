@@ -373,11 +373,11 @@ describe("App", () => {
   function setControllerCredential(value: string) {
     const input = container.querySelector("input#control-grant") as HTMLInputElement | null;
     if (input === null) throw new Error("Expected Controller credential input.");
-    const setter = Object.getOwnPropertyDescriptor(
+    const descriptor = Object.getOwnPropertyDescriptor(
       testWindow.HTMLInputElement.prototype,
       "value",
-    )?.set;
-    setter?.call(input, value);
+    );
+    descriptor?.set?.call(input, value);
     input.dispatchEvent(new testWindow.Event("input", { bubbles: true }) as unknown as Event);
   }
 

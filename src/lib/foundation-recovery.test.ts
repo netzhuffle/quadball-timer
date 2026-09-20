@@ -191,7 +191,7 @@ describe("Event foundation recovery", () => {
       expect(manifest.actionCount).toBe(0);
 
       const manifestPath = join(backupDirectory, `${manifest.snapshotId}.manifest.json`);
-      await expect(recovery.verifyBackup(manifestPath)).resolves.toEqual(manifest);
+      expect(recovery.verifyBackup(manifestPath)).resolves.toEqual(manifest);
       legacy.close();
 
       const migrated = openSqliteFoundationStorage(legacyPath, {

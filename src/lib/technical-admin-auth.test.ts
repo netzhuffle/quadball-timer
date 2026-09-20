@@ -1151,7 +1151,7 @@ describe("Technical Admin authentication", () => {
     authData.set(new Uint8Array(new Bun.CryptoHasher("sha256").update("timer.example").digest()));
     authData[32] = 0x05;
 
-    await expect(
+    expect(
       verifier.verifyAuthentication(
         {
           id: "credential-1",
