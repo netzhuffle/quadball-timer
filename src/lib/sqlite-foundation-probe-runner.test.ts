@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import packageJson from "../../package.json" with { type: "json" };
 import { runCompiledSqliteFoundationProbe } from "@/lib/sqlite-foundation-probe-runner";
 import {
   DockerAdmissionError,
@@ -12,7 +13,7 @@ function fakeExecution(overrides: Partial<DockerProbeExecution> = {}): DockerPro
       artifactIdentity: {
         os: "linux",
         architecture: "x64",
-        bunVersion: "1.3.14",
+        bunVersion: packageJson.packageManager.slice("bun@".length),
         bunRevision: "abcdef12",
         sqliteVersion: "3.53.0",
       },
