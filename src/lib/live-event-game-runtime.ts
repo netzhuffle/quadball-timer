@@ -43,6 +43,7 @@ export type LiveEventGameRuntime = {
     eventGameIds: readonly string[],
   ): Promise<ReadonlyMap<string, AudienceProjectionGameInputOutcome>>;
   readiness(): Promise<FoundationStorageReadiness>;
+  stopBackgroundWork(): void;
   close(): void;
 };
 
@@ -151,6 +152,7 @@ export async function openLiveEventGameRuntime(input: {
   clock?: () => number;
   knownDodgeballIdsForEventGame?: (eventGameId: string) => readonly string[] | undefined;
   onControllerCapacityChange?: () => void;
+  trackBackgroundWork?: (work: Promise<unknown>) => void;
   audienceInputDiagnostics?: {
     onEpochRead?(): void;
     onRecordRead?(eventGameId: string): void;
@@ -367,11 +369,18 @@ export async function openLiveEventGameRuntime(input: {
           resolvePublishedHeatStoppageConfiguration(snapshot, scope),
         ),
     });
+    let backgroundStopped = false;
+    const runBackground = (operation: () => Promise<unknown>) => {
+      if (backgroundStopped) return;
+      const work = operation();
+      input.trackBackgroundWork?.(work);
+      void work.catch(() => undefined);
+    };
     const lockTimer = setInterval(() => {
-      void control.reconcileEventGameLocks();
+      runBackground(() => control.reconcileEventGameLocks());
     }, 1_000);
     refreshEventCapacitySnapshot = () => {
-      void control.reconcileActiveControllerSessions();
+      runBackground(() => control.reconcileActiveControllerSessions());
     };
     const audienceInputCache = new Map<
       string,
@@ -452,7 +461,12 @@ export async function openLiveEventGameRuntime(input: {
         return outcomes;
       },
       readiness: () => storage.readiness(),
+      stopBackgroundWork() {
+        backgroundStopped = true;
+        clearInterval(lockTimer);
+      },
       close() {
+        backgroundStopped = true;
         closed = true;
         audienceInputCacheGeneration += 1;
         audienceInputCache.clear();

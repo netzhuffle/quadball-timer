@@ -20,6 +20,8 @@ StateDirectoryMode=0750
 ExecStart=/srv/quadball-timer/current/quadball-timer
 Restart=always
 RestartSec=3
+# Server drains for 8s, then allows 1s for forced connection settlement.
+TimeoutStopSec=15s
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full

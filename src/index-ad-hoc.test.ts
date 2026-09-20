@@ -155,6 +155,31 @@ describe("Ad Hoc HTTP and WebSocket authority boundaries", () => {
     ).toBe(0);
   });
 
+  test("shutdown disables scheduled disconnect retries while retaining pending recovery", async () => {
+    const scheduled: (() => void)[] = [];
+    let attempts = 0;
+    const tracker = createAdHocLiveSessionTracker(
+      async () => {
+        attempts += 1;
+        return false;
+      },
+      {
+        scheduleRetry: (_delay, task) => {
+          scheduled.push(task);
+        },
+      },
+    );
+    await tracker.subscribe("socket", { gameId: "game", sessionId: "session" });
+    await tracker.disconnect("socket");
+    expect(attempts).toBe(1);
+    tracker.stopRetries();
+    scheduled.shift()!();
+    await Promise.resolve();
+    expect(attempts).toBe(1);
+    expect(tracker.pendingCount()).toBe(1);
+    expect(scheduled).toHaveLength(0);
+  });
+
   test("deduplicates concurrent socket subscriptions and retries a failed final disconnect", async () => {
     const disconnected: string[] = [];
     let durable = false;

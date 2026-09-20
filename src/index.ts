@@ -95,6 +95,7 @@ import { openSqliteFoundationStorage } from "@/lib/foundation-storage-sqlite";
 import type { FoundationStorage } from "@/lib/foundation-storage";
 import { assertProductionStateBoundary } from "@/lib/runtime-storage-config";
 import { createStartupCleanup } from "@/lib/startup-resources";
+import { createServerDrain, createServerWorkTracker, drainServerRoutes } from "@/lib/server-drain";
 import { parseGrantKeyRingCli, runGrantKeyRingCli } from "@/lib/grant-key-ring-cli";
 import { GrantKeyRingCustodyError } from "@/lib/grant-key-ring-custody";
 import {
@@ -221,6 +222,37 @@ async function startServer() {
   });
   const startupCleanup = createStartupCleanup();
   const cleanup = () => startupCleanup.run();
+  const work = createServerWorkTracker();
+  let accepting = true;
+  let stopBackground = () => {};
+  let disconnectSocket = (_ws: ServerWebSocket<SessionData>) => {};
+  const drain = createServerDrain({
+    work,
+    stopAdmission: () => {
+      accepting = false;
+    },
+    stopBackground: () => stopBackground(),
+    closeSockets: () => {
+      for (const reservation of pendingSocketReservations.values()) clearTimeout(reservation);
+      pendingSocketReservations.clear();
+      for (const socket of sockets) {
+        disconnectSocket(socket);
+        socket.close(1012, "Server restarting.");
+      }
+    },
+    stopServer: async (force) => {
+      await server?.stop(force);
+    },
+    closeStorage: cleanup,
+    terminate: () => process.exit(1),
+    report: (result) => {
+      console.log(
+        `Server shutdown ${result.outcome}; cleanup errors: ${result.errors.length}; pending work: ${work.count()}.`,
+      );
+      for (const error of result.errors)
+        monitoring.captureException(error, { category: "server", component: "shutdown" });
+    },
+  });
 
   try {
     const port = Number(process.env.PORT ?? 3000);
@@ -275,12 +307,18 @@ async function startServer() {
               reconcileConnectionsAtStartup: true,
             }),
     });
-    const liveAdHocSessions = createAdHocLiveSessionTracker((identity) =>
-      adHocService.setConnection({
-        gameId: identity.gameId,
-        sessionId: identity.sessionId,
-        connected: false,
-      }),
+    const liveAdHocSessions = createAdHocLiveSessionTracker(
+      (identity) =>
+        adHocService.setConnection({
+          gameId: identity.gameId,
+          sessionId: identity.sessionId,
+          connected: false,
+        }),
+      {
+        trackWork: (task) => {
+          void work.track(task);
+        },
+      },
     );
     startupCleanup.add(() => adHocService.close());
     const databasePath = storagePaths.technicalAdminDatabase;
@@ -378,7 +416,17 @@ async function startServer() {
         },
       },
     });
-    const publicEventStream = createPublicAudienceEventStream(audienceProjection);
+    const publicEventStream = createPublicAudienceEventStream(audienceProjection, {
+      trackBackgroundWork: (task) => {
+        void work.track(task);
+      },
+    });
+    stopBackground = () => {
+      technicalAdminAuth.stopRetentionMaintenance();
+      liveAdHocSessions.stopRetries();
+      liveEventRuntime?.stopBackgroundWork();
+      publicEventStream.close();
+    };
     let reconcilePublicSpectators = () => {};
     const publicEventWebSocketHub = createPublicAudienceEventWebSocketHub({
       stream: publicEventStream,
@@ -425,6 +473,9 @@ async function startServer() {
     if (liveEventKeyRing !== null) {
       try {
         liveEventRuntime = await openLiveEventGameRuntime({
+          trackBackgroundWork: (task) => {
+            void work.track(task);
+          },
           databasePath: liveEventDatabasePath,
           environmentId: environment,
           keyRing: liveEventKeyRing,
@@ -631,12 +682,6 @@ async function startServer() {
         ? { cert: Bun.file(process.env.TLS_CERT_FILE), key: Bun.file(process.env.TLS_KEY_FILE) }
         : undefined;
 
-    shutdown = () => {
-      cleanup();
-    };
-    process.once("SIGTERM", shutdown);
-    process.once("SIGINT", shutdown);
-
     const browserMonitoringDsn =
       monitoringIdentity === null
         ? undefined
@@ -649,7 +694,26 @@ async function startServer() {
           : browserMonitoringPublicConfig(monitoringIdentity, browserMonitoringDsn),
     });
 
-    server = serve<SessionData>({
+    disconnectSocket = (ws) => {
+      if (ws.data.closed) return;
+      releasePendingSocketReservation(ws.data.id);
+      sockets.delete(ws);
+      ws.data.closed = true;
+      publicEventWebSocketHub.disconnect(ws.data.id, "client-closed");
+      void work
+        .track(
+          ws.data.subscriptionWork
+            .then(
+              () => liveAdHocSessions.disconnect(ws.data.id),
+              () => liveAdHocSessions.disconnect(ws.data.id),
+            )
+            .then(async (durable) => {
+              if (!durable && accepting) await liveAdHocSessions.retryPending();
+            }),
+        )
+        .catch(() => undefined);
+    };
+    const serverOptions = {
       hostname: process.env.HOST ?? "127.0.0.1",
       port,
       maxRequestBodySize: SHARED_LIMITS.transport.httpJsonBodyBytes,
@@ -2376,21 +2440,13 @@ async function startServer() {
         open(ws) {
           releasePendingSocketReservation(ws.data.id);
           sockets.add(ws);
+          if (!accepting) {
+            disconnectSocket(ws);
+            ws.close(1012, "Server restarting.");
+          }
         },
         close(ws) {
-          releasePendingSocketReservation(ws.data.id);
-          sockets.delete(ws);
-          ws.data.closed = true;
-          publicEventWebSocketHub.disconnect(ws.data.id, "client-closed");
-          void ws.data.subscriptionWork
-            .then(
-              () => liveAdHocSessions.disconnect(ws.data.id),
-              () => liveAdHocSessions.disconnect(ws.data.id),
-            )
-            .then((durable) => {
-              if (!durable) void liveAdHocSessions.retryPending();
-            })
-            .catch(() => undefined);
+          disconnectSocket(ws);
         },
         async message(ws, message) {
           if (typeof message !== "string") {
@@ -2414,7 +2470,10 @@ async function startServer() {
 
           switch (parsed.message.type) {
             case "subscribe-lobby": {
-              sendMessage(ws, { type: "error", message: adHocService.genericUnavailableMessage });
+              sendMessage(ws, {
+                type: "error",
+                message: adHocService.genericUnavailableMessage,
+              });
               ws.close(1008, "Ad Hoc subscription unavailable.");
               return;
             }
@@ -2520,7 +2579,8 @@ async function startServer() {
                     ackedCommandIds: [],
                   });
                 }
-                if (!tracking.previousDisconnectDurable) void liveAdHocSessions.retryPending();
+                if (!tracking.previousDisconnectDurable && accepting)
+                  void work.track(liveAdHocSessions.retryPending());
               });
               await queued;
               return;
@@ -2596,8 +2656,25 @@ async function startServer() {
           }
         },
       },
+    } satisfies Bun.Serve.Options<SessionData>;
+    serverOptions.routes = drainServerRoutes(serverOptions.routes, {
+      accepting: () => accepting,
+      work,
     });
-    startupCleanup.add(() => void server?.stop());
+    const receiveMessage = serverOptions.websocket.message.bind(serverOptions.websocket);
+    serverOptions.websocket.message = async (ws, message) => {
+      if (!accepting || ws.data.closed) return;
+      await work.track(receiveMessage(ws, message));
+    };
+    server = serve<SessionData>(serverOptions);
+    shutdown = () => {
+      void drain.stop().catch((error) => {
+        console.error("Server shutdown failed unexpectedly.", error);
+        process.exit(1);
+      });
+    };
+    process.on("SIGTERM", shutdown);
+    process.on("SIGINT", shutdown);
 
     console.log(`Server running at ${server.url}`);
   } catch (error) {
@@ -2606,7 +2683,7 @@ async function startServer() {
       process.removeListener("SIGTERM", shutdown);
       process.removeListener("SIGINT", shutdown);
     }
-    cleanup();
+    await drain.stop();
     throw error;
   }
 }

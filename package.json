@@ -18,6 +18,7 @@
     "test:focused:event-game-routes": "bun test --isolate ./src/lib/live-event-game-transport.focused.ts",
     "test:focused:technical-admin": "bun test --isolate ./src/lib/technical-admin-auth-sqlite.focused.ts",
     "test:focused:technical-admin-bootstrap": "bun test --isolate ./src/lib/technical-admin-bootstrap.focused.ts",
+    "test:focused:server-drain": "bun test --isolate ./src/lib/server-drain.focused.ts",
     "test:focused:startup": "bun test --isolate ./src/index-startup.focused.ts",
     "build": "bun run build.ts",
     "build:executable": "bun run build.ts --compile --compile-target=bun-linux-x64-modern --outfile=dist/quadball-timer",
