@@ -28,6 +28,7 @@ import {
   type TechnicalAdminAuthority,
 } from "@/lib/technical-admin-auth";
 
+const fixtureNow = Date.now();
 const directory = mkdtempSync(join(tmpdir(), "quadball-timer-public-browser-"));
 const foundationDatabase = join(directory, "foundation.sqlite");
 const eventGameDatabase = join(directory, "event-game.sqlite");
@@ -334,6 +335,8 @@ try {
     sportingOrder: 1_000,
   });
 
+  await verifyDaylightScoreboardStates(page, current, stableGamePath);
+
   await page.getByRole("button", { name: "All events" }).click();
   await page.waitForURL(`${origin}/events?view=all`);
   await page.getByRole("heading", { name: "Current Events" }).waitFor();
@@ -586,6 +589,450 @@ async function openEventAndActivateSpectatorGame(
   );
 }
 
+async function verifyDaylightScoreboardStates(
+  page: Page,
+  current: PublicEventFixture,
+  gamePath: string,
+) {
+  const response = await page.request.get(`${origin}/api/audience/events/${current.eventId}`);
+  const payload = (await response.json()) as {
+    status: string;
+    value: import("@/lib/audience-projection").PublicAudienceEventProjection;
+  };
+  const projection = structuredClone(payload.value);
+  const game = projection.schedule.scheduleGames.find(
+    (candidate) => candidate.canonicalPath === gamePath,
+  );
+  if (!game) throw new Error("Scoreboard visual fixture Game missing");
+  const visual = await page.context().newPage();
+  await visual.setViewportSize({ width: 360, height: 740 });
+  await visual.routeWebSocket("**/ws", () => {});
+  await visual.route("**/api/audience/events/*", (route) =>
+    route.fulfill({ json: { status: "accepted", value: projection } }),
+  );
+  const capture = async (name: string) => {
+    await visual.goto(`${origin}${gamePath}`);
+    await visual.locator("[data-scoreboard-expanded]").waitFor();
+    await visual.evaluate(() => document.fonts.ready);
+    assert(
+      await visual.evaluate(() => document.documentElement.scrollWidth <= innerWidth),
+      `${name} scoreboard overflowed 360px`,
+    );
+    assert(
+      await visual.locator("[data-scoreboard-expanded]").evaluate((scoreboard) => {
+        const clock = scoreboard
+          .querySelector('[aria-label="Game clock"]')!
+          .getBoundingClientRect();
+        return [
+          ...scoreboard.querySelectorAll(
+            ".daylight-team-art, .daylight-team-name, .daylight-score",
+          ),
+        ].every((element) => {
+          const item = element.getBoundingClientRect();
+          return (
+            item.right <= clock.left ||
+            item.left >= clock.right ||
+            item.bottom <= clock.top ||
+            item.top >= clock.bottom
+          );
+        });
+      }),
+      `${name} team identity or score overlaps the clock`,
+    );
+    if (process.env.PUBLIC_GAME_EVIDENCE_DIR)
+      await visual.screenshot({
+        path: join(process.env.PUBLIC_GAME_EVIDENCE_DIR, `${name}.png`),
+        fullPage: true,
+      });
+  };
+  try {
+    game.sideA = { name: "Berner Boggarts", color: "#155c32", score: 110 };
+    game.sideB = { name: "Turicum Thunderbirds", color: "#12395a", score: 100 };
+    game.presentation.displayedTeamColors = { sideA: "#155c32", sideB: "#12395a" };
+    game.presentation.pitchOrientation = "side-a-left";
+    game.phase = "overtime";
+    game.overtimeTarget = 130;
+    game.flagState.catchingSide = "side-a";
+    if (game.clock) game.clock.gameTimeMs = 1_638_000;
+    projection.shortName = "SQM 2026";
+    projection.timeZone = "Europe/Zurich";
+    game.startedAtMs = Date.parse("2026-08-16T07:32:00Z");
+    await capture("verified-artwork-overtime-phone");
+    assert(
+      (await visual.getByRole("link", { name: "Back to Event", exact: true }).innerText()).includes(
+        "SQM 2026",
+      ),
+      "Short Event navigation name missing",
+    );
+    const startStrip = visual.locator('[aria-label="Game start and Pitch"]');
+    assert(
+      (await startStrip.innerText()).includes("Started 09:32"),
+      "Actual start did not use Event timezone",
+    );
+    assert(
+      !(await startStrip.innerText()).includes("Expected"),
+      "Actual start repeated an expected start",
+    );
+    delete projection.shortName;
+    delete game.startedAtMs;
+    await visual.waitForFunction(() =>
+      [...document.querySelectorAll<HTMLImageElement>("[data-scoreboard-expanded] img")].every(
+        (img) => img.complete && img.naturalWidth > 0,
+      ),
+    );
+    assert(
+      (await visual.locator("[data-scoreboard-expanded] img").count()) === 2,
+      "Verified logos missing",
+    );
+    await visual.locator("[data-scoreboard-expanded] img").first().dispatchEvent("error");
+    assert(
+      (await visual.locator("[data-scoreboard-expanded] img").count()) === 1,
+      "Broken logo did not use initials",
+    );
+    assert(
+      (await visual.locator("[data-scoreboard-expanded]").innerText()).includes("BB"),
+      "Broken logo initials missing",
+    );
+    await visual.evaluate(() => scrollTo(0, document.documentElement.scrollHeight));
+    const compact = visual.locator("[data-scoreboard-compact]");
+    await compact.waitFor();
+    assert(
+      (await compact.innerText()).toLowerCase().includes("target 130"),
+      "Compact overtime target missing",
+    );
+    await compact.evaluate(async (element) => {
+      await Promise.all(
+        element
+          .getAnimations({ subtree: true })
+          .filter((animation) => animation.timeline === document.timeline)
+          .map((animation) => animation.finished),
+      );
+    });
+    assert(
+      await compact.evaluate((element) => element.getBoundingClientRect().top <= 4),
+      "Compact score is not at the top",
+    );
+    await visual.emulateMedia({ reducedMotion: "reduce" });
+    assert(
+      await compact.evaluate((element) => getComputedStyle(element).animationName === "none"),
+      "Reduced motion compact animation remains",
+    );
+    await compact.getByRole("button", { name: "Return to full scoreboard" }).click();
+    await visual.waitForFunction(() => scrollY === 0);
+    await compact.waitFor({ state: "detached" });
+    await visual.evaluate(() => scrollTo(0, document.documentElement.scrollHeight));
+    await compact.waitFor();
+    assert(
+      (await compact.getByText("Flag catch").count()) === 1,
+      "Compact accessible catch marker missing",
+    );
+    const originalEventName = projection.name;
+    const originalPitch = game.pitch;
+    const originalPitchName = game.pitchName;
+    game.pitchName = undefined;
+    projection.name = "Swiss Quadball Championship and International Invitational Weekend";
+    game.pitch = "North championship pitch beside the main entrance";
+    await capture("long-event-and-pitch-phone");
+    const back = visual.getByRole("link", { name: "Back to Event", exact: true });
+    assert((await back.innerText()).includes(projection.name), "Long Event name was lost");
+    assert(
+      await visual.locator(".daylight-game").evaluate((header) => {
+        const link = header.querySelector(".daylight-game-header a")!;
+        const pitch = header.querySelector(".daylight-start-strip")!;
+        const a = link.getBoundingClientRect();
+        const b = pitch.getBoundingClientRect();
+        const inView = (rect: DOMRect) =>
+          rect.left >= 0 && rect.right <= innerWidth && rect.width > 0 && rect.height > 0;
+        const hit = document.elementFromPoint(a.left + a.width / 2, a.top + a.height / 2);
+        return (
+          inView(a) &&
+          inView(b) &&
+          (a.right <= b.left || b.right <= a.left || a.bottom <= b.top || b.bottom <= a.top) &&
+          (hit === link || (hit !== null && link.contains(hit))) &&
+          pitch.scrollWidth <= pitch.clientWidth
+        );
+      }),
+      "Long Event/back link and Pitch must remain visible, separate and usable at 360px",
+    );
+    await back.click();
+    await visual.waitForURL(`${origin}/events/${encodeURIComponent(current.eventId)}`);
+    projection.name = originalEventName;
+    game.pitch = originalPitch;
+    game.pitchName = originalPitchName;
+    game.sideA.name = "Basel / Luzern Combined Team With A Very Long Public Name";
+    game.sideB.name = "Another Exceptionally Long Team Identity That Must Wrap";
+    game.presentation.displayedTeamColors = { sideA: "#facc15", sideB: "#ffffff" };
+    game.operationalStatus = "suspended";
+    game.gameSuspension = "suspended";
+    game.teamTimeout = { status: "started", side: "side-a", remainingMs: 30_000 };
+    if (game.clock) game.clock.synchronization = "stale";
+    await capture("long-names-suspended-phone");
+    assert(
+      (await visual.locator("[data-scoreboard-expanded] img").count()) === 0,
+      "Unverified combined identity received artwork",
+    );
+    game.operationalStatus = "finished";
+    game.result = { status: "finished", winner: "side-a", locked: true };
+    game.timeline = [];
+    await capture("finished-empty-history-phone");
+
+    assert(
+      (await visual.locator(".daylight-status").textContent())?.trim() === "Finished",
+      "Finished must supersede overtime, target, and stale clock state",
+    );
+    assert(
+      (await visual
+        .locator(".daylight-details, section.daylight-morph-scoreboard .daylight-meta")
+        .count()) === 0,
+      "Finished Game retained routine or stale exceptional details",
+    );
+    assert(
+      (await visual.locator("header h1").count()) === 0,
+      "Navigation retained duplicate Game designation",
+    );
+    await visual
+      .getByRole("heading", { level: 1, name: /Game scoreboard/ })
+      .waitFor({ state: "attached" });
+    game.operationalStatus = "scheduled";
+    game.result = { status: "unfinished", winner: null, locked: false };
+    game.clock = { ...game.clock!, synchronization: "synchronized" };
+    await capture("not-started-phone");
+    assert(
+      (await visual.locator(".daylight-status").textContent())?.trim() === "Not started",
+      "Scheduled Game exposed a future phase or overtime target",
+    );
+    game.operationalStatus = "running";
+    for (const phase of ["seeker-floor", "seekers-released", "overtime"] as const) {
+      game.phase = phase;
+      await capture(`${phase}-phone`);
+      assert(
+        !(await visual.locator(".daylight-status").textContent())?.includes("Finished"),
+        "Unfinished Game incorrectly finished",
+      );
+    }
+
+    assert(
+      (await visual.locator("main").innerText()).includes("No public play history"),
+      "Empty history missing",
+    );
+    game.spectatorAvailable = false;
+    await visual.reload();
+    await visual.getByRole("heading", { name: "Game unavailable" }).waitFor();
+  } finally {
+    await visual.close();
+  }
+}
+
+async function verifyGameNameMorph(page: Page, current: PublicEventFixture, gamePath: string) {
+  const response = await page.request.get(`${origin}/api/audience/events/${current.eventId}`);
+  const payload = (await response.json()) as {
+    value: import("@/lib/audience-projection").PublicAudienceEventProjection;
+  };
+  const projection = structuredClone(payload.value);
+  const game = projection.schedule.scheduleGames.find(
+    (candidate) => candidate.canonicalPath === gamePath,
+  )!;
+  game.sideA.name = "Berner Boggarts";
+  game.sideB.name = "Turicum Thunderbirds";
+  const visual = await page.context().newPage();
+  await visual.routeWebSocket("**/ws", () => {});
+  await visual.route("**/api/audience/events/*", (route) =>
+    route.fulfill({ json: { status: "accepted", value: projection } }),
+  );
+  try {
+    await visual.goto(`${origin}${gamePath}`);
+    await visual.locator("[data-scoreboard-expanded]").waitFor();
+    await visual.evaluate(() => document.fonts.ready);
+    for (const width of [360, 390, 566, 1280]) {
+      await visual.setViewportSize({ width, height: 740 });
+      await visual.evaluate(async () => {
+        scrollTo(0, 0);
+        // Let viewport/font geometry recalibrate before measuring scroll-only movement.
+        await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      });
+      await visual.waitForFunction(
+        () =>
+          document
+            .querySelector("[data-collapse-progress]")
+            ?.getAttribute("data-collapse-progress") === "0",
+      );
+      const nativeAlignment = await visual.evaluate(async () => {
+        const board = document.querySelector("[data-scoreboard-expanded]")!;
+        const start = (document.querySelector("[data-scoreboard-sentinel]") as HTMLElement)
+          .offsetTop;
+        const errors: number[] = [];
+        const content = document.querySelector("[data-scoreboard-content]")!;
+        const contentTop = content.getBoundingClientRect().top + scrollY;
+        const displacements: number[] = [];
+        const artwork = board.querySelector(".daylight-team-art")!;
+        const expandedArtwork = parseFloat(getComputedStyle(artwork).width);
+        const native = board.hasAttribute("data-scoreboard-native-scroll");
+        for (const target of [start + 240, 0]) {
+          scrollTo({ top: target, behavior: "smooth" });
+          const deadline = performance.now() + 2000;
+          let settled = 0;
+          await new Promise<void>((resolve) => {
+            const sample = () => {
+              const expected = Math.max(0, Math.min(1, (scrollY - start) / 180));
+              const rendered =
+                (expandedArtwork - parseFloat(getComputedStyle(artwork).width)) /
+                (expandedArtwork - 32);
+              errors.push(Math.abs(expected - rendered));
+              displacements.push(
+                Math.abs(content.getBoundingClientRect().top + scrollY - contentTop),
+              );
+              settled = Math.abs(scrollY - target) < 1 ? settled + 1 : 0;
+              if (settled >= 2 || performance.now() > deadline) resolve();
+              else requestAnimationFrame(() => setTimeout(sample, 0));
+            };
+            requestAnimationFrame(() => setTimeout(sample, 0));
+          });
+        }
+        return {
+          native,
+          maximumError: Math.max(...errors),
+          maximumContentDisplacement: Math.max(...displacements),
+        };
+      });
+      assert(
+        nativeAlignment.maximumContentDisplacement < 2,
+        `${page.context().browser()!.browserType().name()} width${width} timeline shifted ${nativeAlignment.maximumContentDisplacement}px independently of scrolling`,
+      );
+      assert(
+        nativeAlignment.native,
+        "Supported browser did not use native scoreboard scroll animation",
+      );
+      assert(
+        nativeAlignment.maximumError < 0.02,
+        `Scoreboard lagged native scrolling by ${nativeAlignment.maximumError * 180}px`,
+      );
+      const heights = await visual.evaluate(async () => {
+        const board = document.querySelector("[data-scoreboard-expanded]")!;
+        const top = (document.querySelector("[data-scoreboard-sentinel]") as HTMLElement).offsetTop;
+        const rows: number[] = [];
+        for (const direction of [1, -1])
+          for (let step = 0; step <= 60; step++) {
+            scrollTo(0, top + 3 * (direction === 1 ? step : 60 - step));
+            await new Promise((resolve) =>
+              requestAnimationFrame(() => requestAnimationFrame(resolve)),
+            );
+            rows.push(board.getBoundingClientRect().height);
+          }
+        return rows;
+      });
+      const maximumStep = Math.max(
+        ...heights.slice(1).map((height, i) => Math.abs(height - heights[i]!)),
+      );
+      const averageStep = (Math.max(...heights) - Math.min(...heights)) / 60;
+      if (process.env.PUBLIC_GAME_EVIDENCE_DIR)
+        await Bun.write(
+          join(
+            process.env.PUBLIC_GAME_EVIDENCE_DIR,
+            `name-morph-${page.context().browser()!.browserType().name()}-${width}.json`,
+          ),
+          JSON.stringify({ width, nativeAlignment, maximumStep, averageStep, heights }),
+        );
+      assert(
+        maximumStep <= Math.max(10, averageStep * 2.5),
+        `Wrapped-name morph jumped ${maximumStep}px for a 3px scroll at width${width}`,
+      );
+      assert(
+        Math.abs(heights[0]! - heights.at(-1)!) < 1,
+        "Wrapped-name morph did not reverse to the original height",
+      );
+    }
+  } finally {
+    await visual.close();
+  }
+}
+
+async function verifyGameScrollRange(page: Page, current: PublicEventFixture, gamePath: string) {
+  const response = await page.request.get(`${origin}/api/audience/events/${current.eventId}`);
+  const payload = (await response.json()) as {
+    value: import("@/lib/audience-projection").PublicAudienceEventProjection;
+  };
+  const projection = structuredClone(payload.value);
+  const game = projection.schedule.scheduleGames.find(
+    (candidate) => candidate.canonicalPath === gamePath,
+  )!;
+  game.timeline = [];
+  const visual = await page.context().newPage();
+  await visual.routeWebSocket("**/ws", () => {});
+  await visual.route("**/api/audience/events/*", (route) =>
+    route.fulfill({ json: { status: "accepted", value: projection } }),
+  );
+  try {
+    await visual.setViewportSize({ width: 566, height: 1600 });
+    await visual.goto(`${origin}${gamePath}`);
+    await visual.locator("[data-scoreboard-expanded]").waitFor();
+    await visual.evaluate(() => document.fonts.ready);
+    assert(
+      await visual.evaluate(
+        () => document.documentElement.scrollHeight <= document.documentElement.clientHeight,
+      ),
+      "Short Game fixture unexpectedly scrolls",
+    );
+    for (const y of [-200, 500]) {
+      await visual.evaluate((y) => {
+        Object.defineProperty(window, "scrollY", { configurable: true, value: y });
+        dispatchEvent(new Event("scroll"));
+      }, y);
+      await visual.evaluate(
+        () => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))),
+      );
+      assert(
+        (await visual
+          .locator("[data-collapse-progress]")
+          .getAttribute("data-collapse-progress")) === "0",
+        "Short Game rubber-band scrolling collapsed the scoreboard",
+      );
+    }
+    await visual.setViewportSize({ width: 360, height: 260 });
+    await visual.waitForFunction(
+      () =>
+        Number(
+          document
+            .querySelector("[data-collapse-progress]")
+            ?.getAttribute("data-collapse-progress"),
+        ) > 0,
+    );
+    await visual.setViewportSize({ width: 566, height: 1600 });
+    await visual.waitForFunction(
+      () =>
+        document
+          .querySelector("[data-collapse-progress]")
+          ?.getAttribute("data-collapse-progress") === "0",
+    );
+    await visual.evaluate(() => {
+      const history = document.createElement("div");
+      history.setAttribute("data-test-history-growth", "");
+      history.style.height = "1800px";
+      document.querySelector("[data-scoreboard-content]")!.append(history);
+    });
+    await visual.waitForFunction(
+      () =>
+        document
+          .querySelector("[data-collapse-progress]")
+          ?.getAttribute("data-collapse-progress") === "1",
+    );
+    await visual.evaluate(() => document.querySelector("[data-test-history-growth]")!.remove());
+    await visual.waitForFunction(
+      () =>
+        document
+          .querySelector("[data-collapse-progress]")
+          ?.getAttribute("data-collapse-progress") === "0",
+    );
+    assert(
+      await visual.evaluate(
+        () => document.documentElement.scrollHeight <= document.documentElement.clientHeight,
+      ),
+      "Morph created overflow on the short Game",
+    );
+  } finally {
+    await visual.close();
+  }
+}
+
 async function exerciseLiveSpectatorGameBehavior(
   page: Page,
   seeded: SeededPublicEvent,
@@ -599,6 +1046,8 @@ async function exerciseLiveSpectatorGameBehavior(
     sportingOrder: number;
   },
 ) {
+  await verifyGameScrollRange(page, current, stableGamePath);
+  await verifyGameNameMorph(page, current, stableGamePath);
   const websocket = {
     routeCount: 0,
     activeRoute: null as DisconnectableWebSocketRoute | null,
@@ -638,11 +1087,14 @@ async function exerciseLiveSpectatorGameBehavior(
         .querySelector("[data-live-projection-status]")
         ?.textContent?.includes("connected") === true,
   );
-  const initialClock = await page.locator("[data-scoreboard-expanded] .font-mono").innerText();
+  const initialClock = await page
+    .locator('[data-scoreboard-expanded] [aria-label="Game clock"]')
+    .innerText();
   await page.waitForFunction(
     (initial) =>
-      document.querySelector("[data-scoreboard-expanded] .font-mono")?.textContent?.trim() !==
-      initial,
+      document
+        .querySelector('[data-scoreboard-expanded] [aria-label="Game clock"]')
+        ?.textContent?.trim() !== initial,
     initialClock,
   );
   assert(initialClock.length > 0, `${options.engineLabel} did not render its live Clock`);
@@ -681,28 +1133,182 @@ async function exerciseLiveSpectatorGameBehavior(
     `${options.engineLabel} retained the superseded roster label after recovery`,
   );
 
+  if (process.env.PUBLIC_GAME_EVIDENCE_DIR) {
+    const evidence = process.env.PUBLIC_GAME_EVIDENCE_DIR;
+    mkdirSync(evidence, { recursive: true });
+    await page.evaluate(() => window.scrollTo(0, 0));
+    await page.screenshot({
+      path: join(evidence, `${options.engineLabel}-game-phone.png`),
+      fullPage: true,
+    });
+    await page.setViewportSize({ width: 1280, height: 900 });
+    await page.screenshot({
+      path: join(evidence, `${options.engineLabel}-game-desktop.png`),
+      fullPage: true,
+    });
+    await page.setViewportSize({ width: 360, height: 740 });
+  }
+  const morph = page.locator("[data-scoreboard-expanded]");
+  const originalScoreboard = await morph.elementHandle();
+  for (const width of [360, 566, 1280]) {
+    await page.setViewportSize({ width, height: 740 });
+    await page.evaluate(() => scrollTo(0, 0));
+    await page.waitForFunction(
+      () =>
+        Number(
+          getComputedStyle(document.querySelector("[data-scoreboard-expanded]")!).getPropertyValue(
+            "--score-collapse",
+          ),
+        ) === 0,
+    );
+    if (process.env.PUBLIC_GAME_EVIDENCE_DIR)
+      await page.screenshot({
+        path: join(
+          process.env.PUBLIC_GAME_EVIDENCE_DIR,
+          `${options.engineLabel}-morph-expanded-${width}.png`,
+        ),
+      });
+    const expandedHeight = await morph.evaluate(
+      (element) => element.getBoundingClientRect().height,
+    );
+    const top = await page
+      .locator("[data-scoreboard-sentinel]")
+      .evaluate((element) => (element as HTMLElement).offsetTop);
+    await page.evaluate(async (y) => {
+      scrollTo(0, y);
+      await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    }, top + 90);
+    await page.waitForFunction(() => {
+      const progress = Number(
+        getComputedStyle(document.querySelector("[data-scoreboard-expanded]")!).getPropertyValue(
+          "--score-collapse",
+        ),
+      );
+      return Math.abs(progress - 0.5) < 0.001;
+    });
+    const midwayHeight = await morph.evaluate((element) => element.getBoundingClientRect().height);
+    if (process.env.PUBLIC_GAME_EVIDENCE_DIR)
+      await page.screenshot({
+        path: join(
+          process.env.PUBLIC_GAME_EVIDENCE_DIR,
+          `${options.engineLabel}-morph-mid-${width}.png`,
+        ),
+      });
+    await page.evaluate((y) => scrollTo(0, y), top + 200);
+    await page.waitForFunction(
+      () =>
+        Number(
+          getComputedStyle(document.querySelector("[data-scoreboard-expanded]")!).getPropertyValue(
+            "--score-collapse",
+          ),
+        ) === 1,
+    );
+    if (process.env.PUBLIC_GAME_EVIDENCE_DIR)
+      await page.screenshot({
+        path: join(
+          process.env.PUBLIC_GAME_EVIDENCE_DIR,
+          `${options.engineLabel}-morph-compact-${width}.png`,
+        ),
+      });
+    const compactHeight = await morph.evaluate((element) => element.getBoundingClientRect().height);
+    assert(
+      expandedHeight > midwayHeight && midwayHeight > compactHeight,
+      `${options.engineLabel} width${width} scoreboard heights expanded=${expandedHeight}, midway=${midwayHeight}, compact=${compactHeight}; ${await morph.evaluate((element) => JSON.stringify({ progress: element.getAttribute("data-collapse-progress"), y: scrollY, sentinel: (document.querySelector("[data-scoreboard-sentinel]") as HTMLElement)?.offsetTop, height: element.getBoundingClientRect().height, art: getComputedStyle(element.querySelector(".daylight-team-art")!).height }))}`,
+    );
+    assert(
+      await originalScoreboard?.evaluate(
+        (element) => element === document.querySelector("[data-scoreboard-compact]"),
+      ),
+      "Morph replaced the scoreboard node",
+    );
+    await page.evaluate(async (y) => {
+      scrollTo(0, y);
+      await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    }, top + 90);
+    await page.waitForFunction(
+      () =>
+        Math.abs(
+          Number(
+            getComputedStyle(
+              document.querySelector("[data-scoreboard-expanded]")!,
+            ).getPropertyValue("--score-collapse"),
+          ) - 0.5,
+        ) < 0.001,
+    );
+    assert(
+      Math.abs(
+        (await morph.evaluate((element) => element.getBoundingClientRect().height)) - midwayHeight,
+      ) < 2,
+      `${options.engineLabel} width${width} scoreboard did not reverse: midway=${midwayHeight}, reverse=${await morph.evaluate((element) => element.getBoundingClientRect().height)}`,
+    );
+  }
+  await originalScoreboard?.dispose();
+  await page.setViewportSize({ width: 360, height: 740 });
   await page.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight));
-  const compactScoreboard = page.locator(
-    '[data-scoreboard-compact][aria-label="Compact live scoreboard"]',
-  );
+  const compactScoreboard = page.locator('[data-scoreboard-compact][aria-label="Live scoreboard"]');
   await compactScoreboard.waitFor({ state: "visible" });
+  await compactScoreboard.evaluate(async (element) => {
+    await Promise.all(
+      element
+        .getAnimations({ subtree: true })
+        .filter((animation) => animation.timeline === document.timeline)
+        .map((animation) => animation.finished),
+    );
+  });
+  if (process.env.PUBLIC_GAME_EVIDENCE_DIR)
+    await page.screenshot({
+      path: join(process.env.PUBLIC_GAME_EVIDENCE_DIR, `${options.engineLabel}-game-compact.png`),
+    });
   assert(
     await compactScoreboard.evaluate((element) => {
       const rect = element.getBoundingClientRect();
       return (
         getComputedStyle(element).position === "sticky" &&
         rect.top >= 0 &&
-        rect.top <= 16 &&
+        rect.top <= 4 &&
         rect.right <= document.documentElement.clientWidth
       );
     }),
-    `${options.engineLabel} 360px Game did not expose a usable sticky compact score`,
+    `${options.engineLabel} 360px Game did not expose a usable top compact score`,
   );
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await compactScoreboard.waitFor();
+  if (process.env.PUBLIC_GAME_EVIDENCE_DIR)
+    await page.screenshot({
+      path: join(
+        process.env.PUBLIC_GAME_EVIDENCE_DIR,
+        `${options.engineLabel}-game-compact-desktop.png`,
+      ),
+    });
+  await page.setViewportSize({ width: 360, height: 740 });
   await page.emulateMedia({ reducedMotion: "reduce" });
+  assert(
+    await compactScoreboard.evaluate(
+      (element) => getComputedStyle(element).animationName === "none",
+    ),
+    "Compact header ignored reduced motion",
+  );
+  await compactScoreboard.getByRole("button", { name: "Return to full scoreboard" }).click();
+  await page.waitForFunction(() => window.scrollY === 0);
+  await compactScoreboard.waitFor({ state: "detached" });
+  assert(
+    await page.locator("main").evaluate((element) => document.activeElement === element),
+    "Returning to full scoreboard lost keyboard focus",
+  );
+  await page.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight));
+  await compactScoreboard.waitFor();
   const timelineRegion = page.locator('[data-timeline-scroll-region][role="region"][tabindex="0"]');
   await timelineRegion.scrollIntoViewIfNeeded();
-  await page.getByRole("button", { name: "Back to Event" }).focus();
+  await page.getByRole("link", { name: "Back to Event" }).focus();
+  await page.waitForFunction(() => !document.querySelector("[data-scoreboard-compact]"));
   await page.keyboard.press("Tab");
+  await timelineRegion.evaluate(async (element) => {
+    window.scrollTo(0, window.scrollY + element.getBoundingClientRect().top + 200);
+    await new Promise<void>((resolve) =>
+      requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+    );
+    window.dispatchEvent(new Event("scroll"));
+  });
   const timelineBefore = await timelineRegion.evaluate((element) => {
     const region = element as HTMLDivElement;
     const maximumScrollTop = region.scrollHeight - region.clientHeight;
@@ -981,7 +1587,7 @@ async function createBusySchedule(
   if (blueTeam.status !== "accepted" || redTeam.status !== "accepted") {
     throw new Error("busy Event Team creation failed");
   }
-  const now = Date.now();
+  const now = fixtureNow;
   const starts = [
     now - 90 * 60_000,
     now - 30 * 60_000,
@@ -990,11 +1596,21 @@ async function createBusySchedule(
     now + 20 * 60_000,
     now + 90 * 60_000,
   ];
+  const daysByDate = new Map([[new Date(fixtureNow).toISOString().slice(0, 10), gameDayId]]);
   const created: Array<{ game: EventGame; pitchId: string; pitchSlotId: string }> = [];
   for (const [index, startMs] of starts.entries()) {
+    const slotDate = new Date(startMs).toISOString().slice(0, 10);
+    let slotDayId = daysByDate.get(slotDate);
+    if (slotDayId === undefined) {
+      const extraDay = await catalog.addGameDay(eventId, { date: slotDate }, authority);
+      if (extraDay.status !== "accepted")
+        throw new Error("boundary fixture Game Day creation failed");
+      slotDayId = extraDay.value.gameDayId;
+      daysByDate.set(slotDate, slotDayId);
+    }
     const slot = await catalog.createGameplaySlot(
       eventId,
-      gameDayId,
+      slotDayId,
       { sequence: index + 1, scheduledStart: new Date(startMs).toISOString().slice(0, 16) },
       authority,
     );
@@ -1002,7 +1618,7 @@ async function createBusySchedule(
     if (index === 2) {
       const delayed = await catalog.setGameplaySlotExpectedDelay(
         eventId,
-        gameDayId,
+        slotDayId,
         slot.value.gameplaySlotId,
         { expectedDelayMs: 5 * 60_000 },
         authority,
@@ -1018,7 +1634,7 @@ async function createBusySchedule(
     if (pitchSlot === undefined) throw new Error("busy Event Pitch Slot creation failed");
     const game = await catalog.createEventGame(
       eventId,
-      gameDayId,
+      slotDayId,
       {
         gameplaySlotId: slot.value.gameplaySlotId,
         pitchSlotId: pitchSlot.pitchSlotId,
@@ -1032,7 +1648,7 @@ async function createBusySchedule(
     if (game.status !== "accepted") throw new Error("busy Event Game creation failed");
     const confirmed = await catalog.confirmGameplaySlotTeams(
       eventId,
-      gameDayId,
+      slotDayId,
       slot.value.gameplaySlotId,
       {
         games: [
@@ -1082,7 +1698,7 @@ async function seedCommittedGameRecords(seeded: {
       }
       const root = createSeedRoot(
         seeded.currentId,
-        seeded.currentGameDayId,
+        entry.game.gameDayId,
         entry.game.eventGameId,
         entry.pitchId,
         entry.pitchSlotId,
@@ -1470,7 +2086,7 @@ function createSeedAction(
 }
 
 function dateOffset(offset: number) {
-  const date = new Date();
+  const date = new Date(fixtureNow);
   date.setUTCDate(date.getUTCDate() + offset);
   return date.toISOString().slice(0, 10);
 }

@@ -1,0 +1,2 @@
+@font-face { font-family: 'Daylight Condensed'; src: url('../assets/daylight/RobotoCondensed.ttf') format('truetype'); font-weight: 100 900; font-display: swap; }
+:root { --font-daylight: 'Daylight Condensed', 'Arial Narrow', sans-serif; }

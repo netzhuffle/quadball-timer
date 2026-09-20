@@ -689,6 +689,7 @@ describe("Audience Publication Projection", () => {
               scheduledStartMs: Date.parse("2026-08-14T10:30:00.000Z"),
               expectedStartMs: Date.parse("2026-08-14T10:30:00.000Z"),
               pitch: null,
+              pitchName: "Pitch 1",
             },
           ],
         },
@@ -706,6 +707,7 @@ describe("Audience Publication Projection", () => {
               scheduledStartMs: Date.parse("2026-08-14T10:30:00.000Z"),
               expectedStartMs: Date.parse("2026-08-14T10:50:00.000Z"),
               pitch: null,
+              pitchName: "Pitch 1",
             },
           ],
         },
@@ -835,6 +837,7 @@ describe("Audience Publication Projection", () => {
       value: {
         eventId: "sqm-2026",
         name: "Schweizer Quadball Meisterschaft 2026",
+        shortName: "SQM 2026",
         timeZone: "Europe/Zurich",
         gameDays: ["2026-08-16"],
         lifecycle: "current",

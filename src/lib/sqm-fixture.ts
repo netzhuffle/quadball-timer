@@ -90,6 +90,7 @@ export function createSqmFixtureEvent(
   return {
     eventId: SQM_FIXTURE_EVENT_ID,
     name: SQM_FIXTURE_EVENT_NAME,
+    shortName: "SQM 2026",
     timeZone: SQM_FIXTURE_TIME_ZONE,
     publicationStatus: "published",
     gameDays: [SQM_FIXTURE_GAME_DAY],
