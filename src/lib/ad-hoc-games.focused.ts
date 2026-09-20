@@ -1025,14 +1025,14 @@ describe("Ad Hoc SQLite focused integration", () => {
         retainedGameCount: 0,
         creationEventCount: 0,
       });
-      await expect(recovery.verifyRecoverySnapshot(snapshotPath, facts)).resolves.toEqual(facts);
+      expect(recovery.verifyRecoverySnapshot(snapshotPath, facts)).resolves.toEqual(facts);
 
       const futureDatabase = new Database(databasePath, { create: false, strict: true });
       futureDatabase.run("UPDATE adhoc_schema SET version = 6 WHERE id = 1");
       futureDatabase.close();
-      await expect(
-        recovery.createRecoveryVacuumSnapshot(join(root, "future.sqlite")),
-      ).rejects.toThrow("Ad Hoc recovery database schema is incompatible.");
+      expect(recovery.createRecoveryVacuumSnapshot(join(root, "future.sqlite"))).rejects.toThrow(
+        "Ad Hoc recovery database schema is incompatible.",
+      );
     } finally {
       await rm(root, { recursive: true, force: true });
     }

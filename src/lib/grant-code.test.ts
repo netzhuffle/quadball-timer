@@ -273,7 +273,7 @@ describe("Grant Codes", () => {
     }));
     const firstAudit = beforeMalformedAudit.audit[0];
     if (firstAudit === undefined) throw new Error("Expected Grant audit evidence.");
-    await expect(
+    expect(
       storage.transaction((transaction) =>
         transaction.appendGrantAudit({
           ...firstAudit,
@@ -300,7 +300,7 @@ describe("Grant Codes", () => {
       telemetry: transaction.readGrantAdmissionTelemetry?.("code", "A".repeat(43)) ?? null,
     }));
     let failedRevision = -1;
-    await expect(
+    expect(
       storage.transaction((transaction) => {
         failedRevision = transaction.revision;
         transaction.writeGrantAdmissionTelemetry?.({

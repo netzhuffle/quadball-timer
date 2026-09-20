@@ -292,7 +292,7 @@ export function registerGrantAuthorityContract(
       await withStorage(createStorage, async (storage) => {
         const authority = createAuthority(storage);
         const created = await createGrant(authority);
-        await expect(
+        expect(
           storage.transaction((transaction) => {
             const grant = transaction.findGrantById(created.grantId);
             if (grant === null) throw new Error("Expected the stored Grant.");
@@ -335,7 +335,7 @@ export function registerGrantAuthorityContract(
       await withStorage(createStorage, async (storage) => {
         const authority = createAuthority(storage);
         const created = await createGrant(authority);
-        await expect(
+        expect(
           storage.transaction((transaction) => {
             const grant = transaction.findGrantById(created.grantId);
             if (grant === null) throw new Error("Expected the stored Grant.");

@@ -323,8 +323,8 @@ describe("Event Game Controller reconnect browser seam", () => {
     let tick: (() => void) | null = null;
     const cleared: number[] = [];
     const intervalId = 97;
-    const originalSetInterval = testWindow.setInterval;
-    const originalClearInterval = testWindow.clearInterval;
+    const originalSetInterval = testWindow.setInterval.bind(testWindow);
+    const originalClearInterval = testWindow.clearInterval.bind(testWindow);
     Object.defineProperty(testWindow, "setInterval", {
       configurable: true,
       value: (callback: TimerHandler, timeout?: number) => {
@@ -359,11 +359,11 @@ describe("Event Game Controller reconnect browser seam", () => {
   }
 
   function setInputValue(input: HTMLInputElement, value: string) {
-    const setter = Object.getOwnPropertyDescriptor(
+    const descriptor = Object.getOwnPropertyDescriptor(
       testWindow.HTMLInputElement.prototype,
       "value",
-    )?.set;
-    setter?.call(input, value);
+    );
+    descriptor?.set?.call(input, value);
     input.dispatchEvent(new testWindow.Event("input", { bubbles: true }) as unknown as Event);
     input.dispatchEvent(new testWindow.Event("change", { bubbles: true }) as unknown as Event);
   }

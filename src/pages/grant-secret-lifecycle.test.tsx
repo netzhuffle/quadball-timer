@@ -2175,30 +2175,30 @@ describe("Grant secret UI lifecycle", () => {
   }
 
   function setInputValue(input: HTMLInputElement, value: string) {
-    const setter = Object.getOwnPropertyDescriptor(
+    const descriptor = Object.getOwnPropertyDescriptor(
       testWindow.HTMLInputElement.prototype,
       "value",
-    )?.set;
-    setter?.call(input, value);
+    );
+    descriptor?.set?.call(input, value);
     input.dispatchEvent(new testWindow.Event("input", { bubbles: true }) as unknown as Event);
     input.dispatchEvent(new testWindow.Event("change", { bubbles: true }) as unknown as Event);
   }
 
   function setSelectValue(select: HTMLSelectElement, value: string) {
-    const setter = Object.getOwnPropertyDescriptor(
+    const descriptor = Object.getOwnPropertyDescriptor(
       testWindow.HTMLSelectElement.prototype,
       "value",
-    )?.set;
-    setter?.call(select, value);
+    );
+    descriptor?.set?.call(select, value);
     select.dispatchEvent(new testWindow.Event("change", { bubbles: true }) as unknown as Event);
   }
 
   function setTextareaValue(textarea: HTMLTextAreaElement, value: string) {
-    const setter = Object.getOwnPropertyDescriptor(
+    const descriptor = Object.getOwnPropertyDescriptor(
       testWindow.HTMLTextAreaElement.prototype,
       "value",
-    )?.set;
-    setter?.call(textarea, value);
+    );
+    descriptor?.set?.call(textarea, value);
     textarea.dispatchEvent(new testWindow.Event("input", { bubbles: true }) as unknown as Event);
     textarea.dispatchEvent(new testWindow.Event("change", { bubbles: true }) as unknown as Event);
   }
