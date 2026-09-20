@@ -7,7 +7,10 @@ import { captureAdHocHandoffFromLocation } from "@/lib/ad-hoc-handoff";
 import { createInitialGameState, projectGameView } from "@/lib/game-engine";
 import { DEFAULT_AWAY_TEAM_COLOR, DEFAULT_HOME_TEAM_COLOR } from "@/lib/team-colors";
 import { createInitialClockBaseline, projectClockBaseline } from "@/lib/clock-authority";
-import type { PublicAudienceEventProjection } from "@/lib/audience-projection";
+import type {
+  PublicAudienceEventProjection,
+  PublicAudienceGameProjection,
+} from "@/lib/audience-projection";
 
 class MockWebSocket {
   static CONNECTING = 0;
@@ -67,7 +70,7 @@ function publishedEventProjection(eventId: string, name: string): PublicAudience
     name,
     timeZone: "UTC",
     publicationStatus: "published",
-    gameDays: ["2026-08-14"],
+    gameDays: [new Date(Date.now()).toISOString().slice(0, 10)],
     lifecycle: "current",
     canonicalPath: `/events/${eventId}`,
     teams: [],
@@ -79,6 +82,44 @@ function publishedEventProjection(eventId: string, name: string): PublicAudience
       scheduleGames: [],
       focusIndex: null,
     },
+  };
+}
+
+function publicCardGame(status: "running" | "future" | "past"): PublicAudienceGameProjection {
+  return {
+    eventId: "card-event",
+    eventGameId: "available",
+    gameCode: "GAME-1",
+    gameDesignation: "First Game",
+    canonicalPath: "/events/card-event/games/available",
+    scheduledStartMs: 0,
+    expectedStartMs: 0,
+    scheduleStatus: status,
+    operationalStatus:
+      status === "past" ? "finished" : status === "running" ? "running" : "scheduled",
+    gameSuspension: "none",
+    phase: "seeker-floor",
+    pitch: null,
+    sideA: { name: "Blue Team", color: "#123456", score: 20 },
+    sideB: { name: "Red Team", color: "#654321", score: 10 },
+    overtimeTarget: null,
+    clock: null,
+    teamTimeout: { status: "inactive", side: null, remainingMs: null },
+    heatStoppage: {
+      status: "inactive",
+      mode: null,
+      pending: status === "running",
+      allowedDurationMs: null,
+      actualDurationMs: null,
+      remainingMs: null,
+    },
+    flagState: { catchingSide: null },
+    result: { status: "unfinished", winner: null, locked: false },
+    presentation: {
+      pitchOrientation: "side-a-left",
+      displayedTeamColors: { sideA: "#123456", sideB: "#654321" },
+    },
+    timeline: [],
   };
 }
 
@@ -1232,7 +1273,7 @@ describe("App", () => {
                 name: "Current Event",
                 timeZone: "UTC",
                 publicationStatus: "published",
-                gameDays: ["2026-08-14"],
+                gameDays: [new Date(Date.now()).toISOString().slice(0, 10)],
                 lifecycle: "current",
                 canonicalPath: "/events/current",
                 teams: [],
@@ -1265,7 +1306,7 @@ describe("App", () => {
                 name: "Another Current Event",
                 timeZone: "UTC",
                 publicationStatus: "published",
-                gameDays: ["2026-08-14"],
+                gameDays: [new Date(Date.now()).toISOString().slice(0, 10)],
                 lifecycle: "current",
                 canonicalPath: "/events/current-two",
                 teams: [],
@@ -1322,7 +1363,7 @@ describe("App", () => {
                 name: "Only Current Event",
                 timeZone: "UTC",
                 publicationStatus: "published",
-                gameDays: ["2026-08-14"],
+                gameDays: [new Date(Date.now()).toISOString().slice(0, 10)],
                 lifecycle: "current",
                 canonicalPath: "/events/only-current",
                 teams: [],
@@ -1416,7 +1457,7 @@ describe("App", () => {
               name: "Visible Event",
               timeZone: "UTC",
               publicationStatus: "published",
-              gameDays: ["2026-08-14"],
+              gameDays: [new Date(Date.now()).toISOString().slice(0, 10)],
               lifecycle: "current",
               canonicalPath: "/events/visible-event",
               teams: [],
@@ -1443,7 +1484,7 @@ describe("App", () => {
                 name: "Visible Event",
                 timeZone: "UTC",
                 publicationStatus: "published",
-                gameDays: ["2026-08-14"],
+                gameDays: [new Date(Date.now()).toISOString().slice(0, 10)],
                 lifecycle: "current",
                 canonicalPath: "/events/visible-event",
                 teams: [],
@@ -1463,7 +1504,7 @@ describe("App", () => {
       await Promise.resolve();
     });
 
-    const allEvents = Array.from(container.getElementsByTagName("button")).find((button) =>
+    const allEvents = Array.from(container.getElementsByTagName("a")).find((button) =>
       (button.textContent ?? "").includes("All events"),
     );
     expect(allEvents).not.toBeNull();
@@ -1516,6 +1557,487 @@ describe("App", () => {
 
     expect(container.textContent).toContain("Updated Streamed Event");
   });
+
+  test("opens a separate Event schedule from the calendar and returns to the live arena", async () => {
+    const projection = publishedEventProjection("calendar-event", "Calendar Event");
+    testWindow.history.replaceState(null, "", projection.canonicalPath);
+    globalThis.fetch = (async () =>
+      new Response(JSON.stringify({ status: "accepted", value: projection }), {
+        headers: { "content-type": "application/json" },
+      })) as unknown as typeof fetch;
+    await act(async () => {
+      root.render(<App />);
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(container.querySelector('[data-schedule-group="live-now"]')).not.toBeNull();
+    expect(container.querySelector('[data-schedule-group="event-schedule"]')).toBeNull();
+    const calendar = container.querySelector<HTMLAnchorElement>(
+      '[aria-label="View Event schedule"]',
+    );
+    await act(async () => {
+      calendar?.click();
+      await Promise.resolve();
+    });
+    expect(testWindow.location.search).toBe("?view=schedule");
+    expect(container.querySelector('[data-schedule-group="event-schedule"]')).not.toBeNull();
+    expect(container.querySelector('[data-schedule-group="live-now"]')).toBeNull();
+    const back = container.querySelector<HTMLAnchorElement>(
+      `a[href="${projection.canonicalPath}"]`,
+    );
+    await act(async () => {
+      back?.click();
+      await Promise.resolve();
+    });
+    expect(container.querySelector('[data-schedule-group="live-now"]')).not.toBeNull();
+  });
+
+  test.each([
+    { name: "today", timeZone: "UTC", gameDays: ["2026-09-21"], schedule: false },
+    { name: "past", timeZone: "UTC", gameDays: ["2026-08-16"], schedule: true },
+    { name: "future", timeZone: "UTC", gameDays: ["2026-09-22"], schedule: true },
+    {
+      name: "multi-day containing today",
+      timeZone: "UTC",
+      gameDays: ["2026-09-20", "2026-09-21", "2026-09-22"],
+      schedule: false,
+    },
+    {
+      name: "gap between game days",
+      timeZone: "UTC",
+      gameDays: ["2026-09-20", "2026-09-22"],
+      schedule: true,
+    },
+    {
+      name: "previous day west of UTC",
+      timeZone: "America/Los_Angeles",
+      gameDays: ["2026-09-20"],
+      schedule: false,
+    },
+    {
+      name: "UTC date not yet reached west of UTC",
+      timeZone: "America/Los_Angeles",
+      gameDays: ["2026-09-21"],
+      schedule: true,
+    },
+    { name: "unscheduled", timeZone: "UTC", gameDays: [], schedule: true },
+  ])(
+    "routes $name Event direct visits by its local Game Days",
+    async ({ timeZone, gameDays, schedule }) => {
+      const originalNow = Date.now;
+      Date.now = () => Date.UTC(2026, 8, 21, 0, 30);
+      try {
+        const projection = {
+          ...publishedEventProjection("day-routing", "Day routing"),
+          timeZone,
+          gameDays,
+        };
+        projection.schedule.runningGames = [publicCardGame("running")];
+        globalThis.fetch = (async () =>
+          new Response(JSON.stringify({ status: "accepted", value: projection }), {
+            headers: { "content-type": "application/json" },
+          })) as unknown as typeof fetch;
+        testWindow.history.replaceState(null, "", projection.canonicalPath);
+        await act(async () => {
+          root.render(<App />);
+          await Promise.resolve();
+          await Promise.resolve();
+          await Promise.resolve();
+        });
+        expect(container.querySelector('[data-schedule-group="live-now"]') !== null).toBe(
+          !schedule,
+        );
+        expect(container.querySelector('[data-schedule-group="event-schedule"]') !== null).toBe(
+          schedule,
+        );
+        expect(testWindow.location.search).toBe(schedule ? "?view=schedule" : "");
+        expect(container.querySelector('[aria-label="View Event schedule"]') !== null).toBe(
+          !schedule,
+        );
+        if (schedule)
+          expect(container.querySelector("a.event-back")?.getAttribute("href")).toBe(
+            "/events?view=all",
+          );
+      } finally {
+        Date.now = originalNow;
+      }
+    },
+  );
+
+  test.each([false, true])(
+    "non-today Event discovery routes directly to schedule (explicit list: %s)",
+    async (showAll) => {
+      const projection = publishedEventProjection("past-current", "Past current");
+      projection.gameDays = ["2000-01-01"];
+      globalThis.fetch = (async (input) =>
+        new Response(
+          JSON.stringify({
+            status: "accepted",
+            value: (typeof input === "string"
+              ? input
+              : input instanceof URL
+                ? input.href
+                : input.url
+            ).endsWith("/api/audience/events")
+              ? { events: [projection] }
+              : projection,
+          }),
+          { headers: { "content-type": "application/json" } },
+        )) as typeof fetch;
+      testWindow.history.replaceState(null, "", showAll ? "/events?view=all" : "/events");
+      await act(async () => {
+        root.render(<App />);
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      if (showAll) {
+        const link = container.querySelector<HTMLAnchorElement>(
+          `a[href="${projection.canonicalPath}?view=schedule"]`,
+        );
+        expect(link).not.toBeNull();
+        await act(async () => {
+          link?.click();
+          await Promise.resolve();
+          await Promise.resolve();
+          await Promise.resolve();
+        });
+      }
+      expect(testWindow.location.pathname).toBe(projection.canonicalPath);
+      expect(testWindow.location.search).toBe("?view=schedule");
+      expect(container.querySelector('[data-schedule-group="live-now"]')).toBeNull();
+      expect(container.querySelector('[data-schedule-group="event-schedule"]')).not.toBeNull();
+    },
+  );
+
+  test.each(["awaiting-start", "future"] as const)(
+    "shows the earliest %s Games in Up next even while other Games run",
+    async (status) => {
+      const projection = publishedEventProjection("next-event", "Next Games");
+      const now = Date.UTC(2026, 8, 21, 12);
+      const expected = now + (status === "future" ? 2 : -2) * 60 * 60 * 1000;
+      const next: PublicAudienceGameProjection = {
+        ...publicCardGame("future"),
+        eventGameId: "next",
+        gameCode: "NEXT",
+        scheduleStatus: status,
+        scheduledStartMs: expected - 60_000,
+        expectedStartMs: expected,
+      };
+      const unavailable = {
+        ...next,
+        eventGameId: "unavailable",
+        gameCode: "UNAVAILABLE",
+        spectatorAvailable: false,
+      };
+      const suspended = {
+        ...next,
+        eventGameId: "suspended",
+        gameCode: "SUSPENDED",
+        operationalStatus: "suspended" as const,
+        gameSuspension: "suspended" as const,
+      };
+      projection.schedule.asOfMs = now;
+      projection.schedule.runningGames = [publicCardGame("running")];
+      projection.schedule.upcomingGames = [];
+      projection.schedule.scheduleGames = [
+        { ...next, eventGameId: "later", gameCode: "LATER", expectedStartMs: expected + 60_000 },
+        { ...publicCardGame("past"), eventGameId: "past", gameCode: "PAST" },
+        ...projection.schedule.runningGames,
+        next,
+        unavailable,
+        suspended,
+      ];
+      testWindow.history.replaceState(null, "", projection.canonicalPath);
+      globalThis.fetch = (async () =>
+        new Response(JSON.stringify({ status: "accepted", value: projection }), {
+          headers: { "content-type": "application/json" },
+        })) as unknown as typeof fetch;
+      await act(async () => {
+        root.render(<App />);
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      const upcoming = container.querySelector('[data-schedule-group="coming-up"]');
+      expect(
+        [...upcoming!.querySelectorAll("[data-game-code]")]
+          .map((card) => card.getAttribute("data-game-code"))
+          .join(","),
+      ).toBe("NEXT,UNAVAILABLE,SUSPENDED");
+      expect(upcoming?.textContent).not.toContain("Awaiting start");
+      expect(upcoming?.textContent).toContain("Suspended");
+      expect(upcoming?.querySelector('[data-game-code="UNAVAILABLE"]')?.closest("a")).toBeNull();
+      expect(upcoming?.textContent).toContain("Expected");
+      expect(container.querySelector("[data-live-projection-status]")?.textContent).toContain(
+        "3 upcoming Games.",
+      );
+      expect(container.querySelector("[data-live-projection-status]")?.textContent).not.toContain(
+        "0 upcoming Games.",
+      );
+      await act(async () => {
+        container.querySelector<HTMLAnchorElement>('[aria-label="View Event schedule"]')?.click();
+        await Promise.resolve();
+      });
+      expect(
+        container.querySelector('[data-schedule-group="event-schedule"]')?.textContent,
+      ).not.toContain("Awaiting start");
+    },
+  );
+
+  test("orders running Games by Expected Start, natural Pitch order and stable Game identity", async () => {
+    const projection = publishedEventProjection("arena-order", "Arena order");
+    const games = [
+      { eventGameId: "late-pitch-1", pitch: "Pitch 1", expectedStartMs: 200, scheduledStartMs: 0 },
+      { eventGameId: "pitch-10", pitch: "Pitch 10", expectedStartMs: 100, scheduledStartMs: 0 },
+      { eventGameId: "pitch-2-z", pitch: "Pitch 2", expectedStartMs: 100, scheduledStartMs: 10 },
+      {
+        eventGameId: "pitch-1",
+        pitch: "legacy pitch",
+        pitchName: "Pitch 1",
+        expectedStartMs: 100,
+        scheduledStartMs: 90,
+      },
+      { eventGameId: "pitch-2-a", pitch: "Pitch 2", expectedStartMs: 100, scheduledStartMs: 90 },
+    ].map((details, index) => ({
+      ...publicCardGame("running"),
+      ...details,
+      gameCode: details.eventGameId,
+      gameDesignation: `Game ${index}`,
+      canonicalPath: `/events/arena-order/games/${details.eventGameId}`,
+    }));
+    projection.schedule.runningGames = games;
+    projection.schedule.scheduleGames = games.slice(1).concat(games[0]!);
+    testWindow.history.replaceState(null, "", projection.canonicalPath);
+    globalThis.fetch = (async () =>
+      new Response(JSON.stringify({ status: "accepted", value: projection }), {
+        headers: { "content-type": "application/json" },
+      })) as unknown as typeof fetch;
+    await act(async () => {
+      root.render(<App />);
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const visibleOrder = () =>
+      [...container.querySelectorAll('[data-schedule-group="live-now"] [data-game-code]')]
+        .map((card) => card.getAttribute("data-game-code"))
+        .join(",");
+    expect(visibleOrder()).toBe("pitch-1,pitch-2-a,pitch-2-z,pitch-10,late-pitch-1");
+    await act(async () => {
+      MockWebSocket.instances.at(-1)?.receive({
+        protocol: "public-event-stream-v1",
+        type: "projection-replaced",
+        eventId: projection.eventId,
+        version: 2,
+        projection: {
+          ...projection,
+          schedule: { ...projection.schedule, runningGames: [...games].reverse() },
+        },
+      });
+      await Promise.resolve();
+    });
+    expect(visibleOrder()).toBe("pitch-1,pitch-2-a,pitch-2-z,pitch-10,late-pitch-1");
+    await act(async () => {
+      container.querySelector<HTMLAnchorElement>('[aria-label="View Event schedule"]')?.click();
+      await Promise.resolve();
+    });
+    expect(
+      [...container.querySelectorAll('[data-schedule-group="event-schedule"] [data-game-code]')]
+        .map((card) => card.getAttribute("data-game-code"))
+        .join(","),
+    ).toBe("pitch-10,pitch-2-z,pitch-1,pitch-2-a,late-pitch-1");
+  });
+
+  test.each([
+    {
+      name: "separates a delayed Pitch from its original simultaneous start",
+      times: [
+        [9, 9],
+        [9, 10],
+      ],
+      labels: ["09:00 AM", "10:00 AM"],
+      groups: [["GAME-1"], ["GAME-2"]],
+      focused: ["GAME-2"],
+    },
+    {
+      name: "combines different scheduled slots that now share Expected Start",
+      times: [
+        [9, 11],
+        [10, 11],
+      ],
+      labels: ["11:00 AM"],
+      groups: [["GAME-1", "GAME-2"]],
+      focused: ["GAME-1", "GAME-2"],
+    },
+    {
+      name: "retains expected chronology when an earlier scheduled game is delayed past another",
+      times: [
+        [10, 10],
+        [9, 11],
+      ],
+      labels: ["10:00 AM", "11:00 AM"],
+      groups: [["GAME-1"], ["GAME-2"]],
+      focused: ["GAME-2"],
+    },
+  ])("$name", async ({ times, labels, groups, focused }) => {
+    const projection = publishedEventProjection("delay-event", "Delayed Pitches");
+    const hour = (value: number) => Date.UTC(2026, 8, 21, value);
+    projection.schedule.scheduleGames = times.map(([scheduled, expected], index) => ({
+      ...publicCardGame("future"),
+      eventGameId: `game-${index}`,
+      gameCode: `GAME-${index + 1}`,
+      pitch: `Pitch ${index + 1}`,
+      scheduledStartMs: hour(scheduled!),
+      expectedStartMs: hour(expected!),
+    }));
+    projection.schedule.focusIndex = 1;
+    testWindow.history.replaceState(null, "", `${projection.canonicalPath}?view=schedule`);
+    globalThis.fetch = (async () =>
+      new Response(JSON.stringify({ status: "accepted", value: projection }), {
+        headers: { "content-type": "application/json" },
+      })) as unknown as typeof fetch;
+    const originalScroll = Object.getOwnPropertyDescriptor(
+      testWindow.HTMLElement.prototype,
+      "scrollIntoView",
+    );
+    const scrolled: (string | null)[][] = [];
+    testWindow.HTMLElement.prototype.scrollIntoView = function () {
+      scrolled.push(
+        [...this.querySelectorAll("[data-game-code]")].map((card) =>
+          card.getAttribute("data-game-code"),
+        ),
+      );
+    };
+    try {
+      await act(async () => {
+        root.render(<App />);
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      const rendered = [...container.querySelectorAll("[data-time-group]")];
+      expect(rendered.map((group) => group.querySelector("time")?.textContent).join("|")).toBe(
+        labels.join("|"),
+      );
+      expect(
+        JSON.stringify(
+          rendered.map((group) =>
+            [...group.querySelectorAll("[data-game-code]")].map((card) =>
+              card.getAttribute("data-game-code"),
+            ),
+          ),
+        ),
+      ).toBe(JSON.stringify(groups));
+      expect(JSON.stringify(scrolled)).toBe(JSON.stringify([focused]));
+      for (const game of projection.schedule.scheduleGames.filter(
+        (game) => game.expectedStartMs !== game.scheduledStartMs,
+      )) {
+        const card = container.querySelector(`[data-game-code="${game.gameCode}"]`);
+        expect(card?.textContent).toContain("Scheduled");
+        expect(card?.textContent).toContain(
+          new Intl.DateTimeFormat(undefined, {
+            timeZone: "UTC",
+            hour: "2-digit",
+            minute: "2-digit",
+          }).format(game.scheduledStartMs),
+        );
+      }
+      await act(async () => {
+        MockWebSocket.instances.at(-1)?.receive({
+          protocol: "public-event-stream-v1",
+          type: "projection-replaced",
+          eventId: projection.eventId,
+          version: 2,
+          projection: {
+            ...projection,
+            schedule: { ...projection.schedule, asOfMs: 1, focusIndex: 0 },
+          },
+        });
+        await Promise.resolve();
+      });
+      expect(JSON.stringify(scrolled)).toBe(JSON.stringify([focused]));
+    } finally {
+      if (originalScroll)
+        Object.defineProperty(testWindow.HTMLElement.prototype, "scrollIntoView", originalScroll);
+      else Reflect.deleteProperty(testWindow.HTMLElement.prototype, "scrollIntoView");
+    }
+  });
+
+  test.each(["running", "future", "past"] as const)(
+    "opens the whole %s Game card on its own screen and preserves native link gestures",
+    async (status) => {
+      const projection = publishedEventProjection("card-event", "Card Event");
+      const game = publicCardGame(status);
+      const unavailable = {
+        ...game,
+        eventGameId: "unavailable",
+        gameCode: "GAME-2",
+        gameDesignation: "Unavailable Game",
+        canonicalPath: "/events/card-event/games/unavailable",
+        spectatorAvailable: false,
+      };
+      projection.schedule.scheduleGames = [game, unavailable];
+      if (status === "running") projection.schedule.runningGames = [game, unavailable];
+      if (status === "future") projection.schedule.upcomingGames = [game, unavailable];
+      testWindow.history.replaceState(null, "", `${projection.canonicalPath}?view=schedule`);
+      globalThis.fetch = (async () =>
+        new Response(JSON.stringify({ status: "accepted", value: projection }), {
+          headers: { "content-type": "application/json" },
+        })) as unknown as typeof fetch;
+      await act(async () => {
+        root.render(<App />);
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      const links = container.querySelectorAll(`a[href="${game.canonicalPath}"]`);
+      expect(links.length).toBe(1);
+      expect(container.querySelector(`a[href="${unavailable.canonicalPath}"]`)).toBeNull();
+      expect(container.querySelector("[data-game-timeline]")).toBeNull();
+      expect(container.textContent).not.toContain("Game history");
+      if (status === "running")
+        expect(container.textContent).toContain("Heat stoppage: Inactive · decision pending");
+      for (const link of links) {
+        expect(link.querySelector("article")).not.toBeNull();
+        expect(link.querySelector("a, button, details")).toBeNull();
+        expect(link.getAttribute("aria-label")).toContain("Blue Team vs Red Team");
+      }
+      const link = links[0]!;
+      const score = link.querySelector("article")!;
+      for (const gesture of [
+        { metaKey: true },
+        { ctrlKey: true },
+        { shiftKey: true },
+        { altKey: true },
+        { button: 1 },
+      ]) {
+        const click = new testWindow.MouseEvent("click", {
+          bubbles: true,
+          cancelable: true,
+          ...gesture,
+        });
+        score.dispatchEvent(click as unknown as Event);
+        expect(click.defaultPrevented).toBe(false);
+        // Happy DOM follows even modified links; reset its native navigation.
+        testWindow.history.replaceState(null, "", `${projection.canonicalPath}?view=schedule`);
+      }
+      await act(async () => {
+        score.dispatchEvent(
+          new testWindow.MouseEvent("click", {
+            bubbles: true,
+            cancelable: true,
+          }) as unknown as Event,
+        );
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(testWindow.location.pathname).toBe(game.canonicalPath);
+      expect(container.querySelector("[data-scoreboard-expanded]")).not.toBeNull();
+      expect(container.textContent).toContain("No public play history is available yet.");
+    },
+  );
 
   test("refetches the authoritative projection before reconnecting after a dropped WebSocket", async () => {
     testWindow.history.replaceState(null, "", "/events/reconnect-event");

@@ -1,0 +1,85 @@
+@import '../components/daylight.css';
+.daylight-event {font-family:var(--font-daylight);color:#10213f;background:#fbfcfd;max-width:960px;margin:auto;min-height:100vh;padding-bottom:24px;}
+.daylight-event a:focus-visible {outline:3px solid #1762bd;outline-offset:3px;}
+.event-heading {padding:24px 20px 18px;border-bottom:1px solid #d5deea;position:relative;}
+.event-back {display:flex;gap:8px;align-items:center;font-size:14px;max-width:calc(100% - 36px);overflow-wrap:anywhere;}
+.event-heading h1 {font-size:38px;font-weight:700;line-height:1.15;margin-top:12px;padding-right:34px;overflow-wrap:anywhere;}
+.event-heading p {color:#526580;font-size:16px;padding-right:22px;margin-top:4px;}
+.event-calendar {position:absolute;right:20px;top:69px;color:#345375;padding:5px;}
+.event-schedule-heading .event-back {font-size:23px;font-weight:700;}
+.event-schedule-heading .event-calendar {top:24px;}
+.event-horizon {padding:18px 12px 12px;}
+.event-section-heading {display:flex;justify-content:space-between;align-items:baseline;gap:8px;margin:0 4px 10px;text-transform:uppercase;}
+.event-section-heading h2 {font-size:17px;font-weight:700;}
+.event-section-heading > span {font-size:12px;color:#405774;}
+.event-running-count::before {content:'●';color:#11682b;margin-right:7px;}
+.event-live-grid {display:grid;gap:12px;}
+.event-game-link {display:block;height:100%;color:inherit;text-decoration:none;border-radius:10px;min-width:0;}
+.event-game-card {position:relative;min-width:0;border:1px solid #ccd6e3;border-radius:10px;overflow:hidden;height:100%;}
+.event-card-arena {position:relative;display:grid;grid-template-columns:1fr 1fr;}
+.event-pitch-chip {font-size:11px;line-height:1.2;color:#17542b;background:#fff;border-radius:4px;padding:2px 4px;position:absolute;top:7px;left:6px;z-index:2;}
+.event-live-card .event-card-arena {min-height:160px;background:repeating-linear-gradient(135deg,transparent 0 29px,#dfe7ef55 30px,transparent 31px);}
+.event-card-side {min-width:0;position:relative;isolation:isolate;}
+.event-live-card .event-card-side {display:grid;grid-template-columns:minmax(0,1fr) 55px;gap:3px;padding:30px 14px 10px 5px;align-items:center;}
+.event-live-card .event-card-side:nth-child(2) {grid-template-columns:55px minmax(0,1fr);padding:30px 5px 10px 14px;}
+.event-live-card .event-card-side::before {content:'';position:absolute;inset:0 42% 0 0;background:var(--team-color);clip-path:polygon(0 0,62% 0,94% 35%,100% 100%,0 100%);z-index:-1;}
+.event-live-card .event-card-side:nth-child(2)::before {inset:0 0 0 42%;clip-path:polygon(38% 0,100% 0,100% 100%,0 100%,6% 35%);}
+.event-live-card .event-card-side:nth-child(2) .event-card-identity {order:2;}
+.event-card-identity {min-width:0;overflow-wrap:anywhere;}
+.event-live-card .event-card-identity {display:flex;flex-direction:column;align-items:center;text-align:center;color:var(--team-ink);font-size:14px;font-weight:700;line-height:1.1;text-transform:uppercase;}
+.event-live-card .daylight-team-art {width:66px;height:66px;font-size:26px;margin-bottom:5px;}
+.event-live-card .event-card-side > strong {font-size:44px;line-height:1;margin-top:34px;white-space:nowrap;text-align:center;}
+.event-card-side sup {font-size:.45em;vertical-align:top;position:relative;top:.15em;}
+.event-card-clock {position:absolute;top:12px;left:50%;transform:translateX(-50%);text-align:center;width:145px;line-height:1.15;}
+.event-card-clock strong {display:block;font-size:23px;}
+.event-card-clock span {font-size:13px;font-weight:700;color:#16582d;}
+.event-card-versus {position:absolute;left:50%;top:96px;transform:translateX(-50%);font-size:12px;}
+.event-card-warning,.event-time-change {font-size:12px;line-height:1.25;padding:4px 7px;background:#f3f6f9;color:#405774;}
+.event-card-warning {color:#74460c;background:#fff5df;}
+.event-catch-legend {font-size:12px;margin:12px 8px 0;}
+.event-empty {padding:12px 4px;font-size:15px;color:#50617a;}
+.event-upcoming {border-top:1px solid #d5deea;padding:12px;}
+.event-upcoming-group + .event-upcoming-group {margin-top:16px;}
+.event-upcoming-grid {display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;}
+.event-upcoming-card .event-pitch-chip {position:static;display:block;text-align:center;font-size:10px;padding-top:7px;background:transparent;color:#405774;}
+.event-upcoming-card .event-card-arena {gap:14px;padding:9px 5px;align-items:center;}
+.event-upcoming-card .daylight-team-art {width:32px;height:32px;font-size:13px;margin:auto;}
+.event-upcoming-card .event-card-versus {top:19px;font-size:10px;}
+.event-chronology {padding:22px 16px;}
+.event-time-rail {list-style:none;padding:0 0 0 7px;margin:0;}
+.event-time-rail > li {--rail-dot-center:33px;display:grid;grid-template-columns:72px minmax(0,1fr);gap:6px;position:relative;padding:0 0 24px 12px;border-left:1px solid transparent;scroll-margin-top:20px;}
+.event-time-rail > li::after {content:'';position:absolute;left:-1px;top:0;bottom:0;width:1px;background:#bfccdd;}
+.event-time-rail > li:first-child::after {top:var(--rail-dot-center);}
+.event-time-rail > li:last-child::after {bottom:calc(100% - var(--rail-dot-center));}
+.event-time-rail > li[data-current] {--rail-dot-center:34.5px;}
+.event-time-rail > li::before {z-index:1;content:'';position:absolute;width:8px;height:8px;border-radius:50%;background:#405d7a;left:-4.5px;top:29px;}
+.event-time-rail > li[data-current]::before {background:#fff;border:4px solid #15622c;width:17px;height:17px;left:-9px;top:26px;}
+.event-rail-time {font-size:17px;color:#405774;}
+.event-rail-time > span {display:block;text-transform:uppercase;font-size:12px;min-height:22px;}
+.event-time-rail > li[data-current] .event-rail-time {color:#15622c;font-weight:700;}
+.event-time-group {margin-top:21px;border:1px solid #c5d1df;border-radius:6px;overflow:hidden;}
+.event-time-group .event-game-card {border:0;border-radius:0;}
+.event-time-group > * + * {border-top:1px solid #c5d1df;}
+.event-time-group .event-game-link {border-radius:0;}
+.event-time-group .event-game-link:focus-visible {outline-offset:-3px;}
+.event-schedule-card {padding:5px;}
+.event-schedule-card .event-pitch-chip {position:static;display:inline-block;padding:0 3px;font-size:11px;color:#405774;background:transparent;}
+.event-live-label {font-size:10px;border:1px solid #187131;color:#187131;border-radius:3px;padding:0 3px;text-transform:uppercase;}
+.event-schedule-card .event-card-arena {display:block;}
+.event-schedule-card .event-card-side {display:flex;gap:4px;align-items:center;padding:3px 2px;}
+.event-schedule-card .event-card-identity {display:flex;align-items:center;gap:5px;flex:1;font-size:13px;line-height:1.2;}
+.event-schedule-card .daylight-team-art {width:23px;height:23px;font-size:10px;}
+.event-schedule-card strong {position:relative;flex-shrink:0;padding-right:.5em;font-size:15px;white-space:nowrap;}
+.event-schedule-card .event-card-side sup {position:absolute;top:.05em;right:0;font-size:.85em;line-height:1;vertical-align:baseline;}
+@media(min-width:700px) {.event-live-grid {grid-template-columns:repeat(2,minmax(0,1fr));}.event-live-card .event-card-arena {min-height:185px;}.event-live-card .daylight-team-art {width:80px;height:80px;}.event-upcoming-grid {grid-template-columns:repeat(4,minmax(0,1fr));}.event-upcoming-card .daylight-team-art {width:48px;height:48px;}.event-chronology {max-width:720px;margin:auto;}.event-schedule-card .event-card-identity {font-size:17px;}.event-schedule-card .daylight-team-art {width:30px;height:30px;}}
+.event-time-group .event-game-link,.event-time-group .event-game-card {height:auto;}
+.event-live-card .event-card-identity {font-size:13px;}
+.event-live-card .event-card-identity {width:100%;max-width:100px;justify-self:start;}
+.event-live-card .event-card-side:nth-child(2) .event-card-identity {justify-self:end;}
+.event-schedule-upcoming {display:grid;grid-template-columns:48px minmax(0,1fr);align-items:center;gap:3px;}
+.event-schedule-upcoming .event-card-arena {display:grid;grid-template-columns:1fr 1fr;gap:18px;}
+.event-schedule-upcoming .event-card-side {justify-content:center;}
+.event-schedule-upcoming .event-card-identity {flex:0 1 auto;}
+.event-schedule-upcoming .daylight-team-art {width:32px;height:32px;font-size:13px;}
+.event-schedule-upcoming .event-card-versus {top:10px;font-size:11px;}
+.event-schedule-upcoming .event-time-change,.event-schedule-upcoming .event-card-warning {grid-column:1/-1;}

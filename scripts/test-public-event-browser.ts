@@ -142,406 +142,462 @@ try {
   const current = listPayload.value.events.find((event) => event.eventId === seeded.currentId);
   if (!current) throw new Error("seeded current Event was not listed");
 
-  await page.goto(`${origin}/events`);
-  await page.waitForURL(`${origin}${current.canonicalPath}`);
-  await page.getByRole("heading", { name: "Published Current" }).waitFor();
-  await page.getByRole("heading", { name: "Coming up" }).waitFor();
-  await page.getByRole("heading", { name: "Event schedule" }).waitFor();
-  assert((await page.getByRole("main").count()) === 1, "public Event page has no main landmark");
-  const skipLink = page.getByRole("link", { name: "Skip to main content" });
-  await skipLink.focus();
-  assert(
-    await skipLink.evaluate((element) => document.activeElement === element),
-    "skip link could not receive keyboard focus",
-  );
-  assert(
-    (await skipLink.getAttribute("href")) === "#main-content" &&
-      (await page.locator("#main-content").count()) === 1,
-    "skip link did not provide a keyboard destination",
-  );
-  assert(
-    (await page.locator('[data-live-projection-status][role="status"]').count()) === 1,
-    "public Event did not expose a live-update status announcement",
-  );
-  const liveNow = page.locator('[data-schedule-group="live-now"]');
-  await liveNow.locator('[data-game-code="BUSY-2"]').waitFor();
-  await liveNow.locator('[data-game-code="BUSY-3"]').waitFor();
-  assert(
-    (await liveNow.locator('[data-schedule-card][data-schedule-status="running"]').count()) === 2,
-    "both committed running Games were not shown in Live now",
-  );
-  const schedule = page.locator('[data-schedule-group="event-schedule"]');
-  for (const [code, status] of [
-    ["BUSY-1", "past"],
-    ["BUSY-2", "running"],
-    ["BUSY-4", "awaiting-start"],
-    ["BUSY-5", "future"],
-  ] as const) {
+  if (process.env.PUBLIC_EVENT_REFERENCE_ONLY === "1") {
+    await verifyEventReference(page, current);
+    console.log(JSON.stringify({ status: "passed", eventReference: true }));
+  } else {
+    await page.goto(`${origin}/events`);
+    await page.waitForURL(`${origin}${current.canonicalPath}`);
+    await page.getByRole("heading", { name: "Published Current" }).waitFor();
+    await page.getByRole("heading", { name: /Up next/ }).waitFor();
+    assert((await page.getByRole("main").count()) === 1, "public Event page has no main landmark");
+    const skipLink = page.getByRole("link", { name: "Skip to main content" });
+    await skipLink.focus();
     assert(
-      (await schedule
-        .locator(`[data-game-code="${code}"][data-schedule-status="${status}"]`)
-        .count()) === 1,
-      `${code} did not retain chronological status ${status}; ${await schedule.innerText()}`,
+      await skipLink.evaluate((element) => document.activeElement === element),
+      "skip link could not receive keyboard focus",
     );
-  }
-  const finishedTimeline = schedule.locator(
-    '[data-game-code="BUSY-1"][data-schedule-status="past"] [data-game-timeline]',
-  );
-  await finishedTimeline.waitFor();
-  assert(
-    (await finishedTimeline.locator('[data-timeline-kind="finish"]').count()) === 1,
-    "finished Game did not render its effective public Timeline",
-  );
-  assert(
-    (await page.locator('[data-schedule-group="coming-up"] h3[id^="expected-"]').count()) === 1,
-    "Coming up Games were not grouped by Expected Start",
-  );
-  await page.getByText("Pitch Pitch 1").first().waitFor();
-  await page.getByText("Pitch Pitch 2").first().waitFor();
-  await page.getByText("Scheduled Start").first().waitFor();
-  assert(
-    (await page.locator("body").innerText()).includes("Expected Start"),
-    "Expected Start was not rendered",
-  );
-  assert(
-    await page.evaluate(
-      () => document.documentElement.scrollWidth <= document.documentElement.clientWidth,
-    ),
-    "360px phone-sized Event schedule overflows horizontally",
-  );
-
-  const harnessPage = await context.newPage();
-  setupBrowserPage(harnessPage, consoleErrors);
-  await harnessPage.goto(`${harnessOrigin}/`);
-  const harnessTimeline = harnessPage.locator("[data-game-timeline]");
-  await harnessTimeline.waitFor();
-  const harnessScroll = harnessTimeline.locator("[data-timeline-scroll-region]");
-  await harnessScroll.evaluate((element) =>
-    window.scrollTo(0, window.scrollY + element.getBoundingClientRect().top + 600),
-  );
-  await harnessPage.waitForFunction(() => window.scrollY > 500);
-  await harnessPage.evaluate(() => window.dispatchEvent(new Event("scroll")));
-  const harnessBeforeNewPlay = await harnessPage.evaluate(() => ({
-    bottomDistance: document.documentElement.scrollHeight - window.scrollY,
-    scrollTop: window.scrollY,
-  }));
-  // Deliver without scrolling back to the fixture controls.
-  await harnessPage
-    .getByRole("button", { name: "Deliver newer play while away" })
-    .evaluate((element) => (element as HTMLButtonElement).click());
-  await harnessPage.getByRole("button", { name: "Show newest play" }).waitFor();
-  const harnessAfterNewPlay = await harnessPage.evaluate(() => ({
-    bottomDistance: document.documentElement.scrollHeight - window.scrollY,
-    scrollTop: window.scrollY,
-  }));
-  assert(
-    Math.abs(harnessAfterNewPlay.bottomDistance - harnessBeforeNewPlay.bottomDistance) <= 4,
-    "Timeline harness changed the older-entry viewport position",
-  );
-  await harnessPage.getByRole("button", { name: "Show newest play" }).click();
-  await harnessPage.waitForFunction(
-    () =>
-      document.querySelector("[data-timeline-scroll-region]")!.getBoundingClientRect().top >= -8,
-  );
-  await harnessPage
-    .getByRole("button", { name: "Deliver newer play at live edge" })
-    .evaluate((element) => (element as HTMLButtonElement).click());
-  assert(
-    (await harnessPage.getByRole("button", { name: "Show newest play" }).count()) === 0,
-    "Timeline harness exposed New play at the live edge",
-  );
-  await assertOpposingTimeline(harnessPage);
-  const yellowCard = harnessPage
-    .locator('[data-timeline-kind="card"]')
-    .filter({ hasText: "yellow card" });
-  const beforeSwap = await yellowCard.evaluate((element) => ({
-    left: element.querySelector("[data-timeline-content]")!.getBoundingClientRect().left,
-    color: getComputedStyle(element.querySelector(".daylight-card-icon")!).backgroundColor,
-  }));
-  await harnessPage
-    .getByRole("button", { name: "Swap Pitch Orientation" })
-    .evaluate((element) => (element as HTMLButtonElement).click());
-  const afterSwap = await yellowCard.evaluate((element) => ({
-    left: element.querySelector("[data-timeline-content]")!.getBoundingClientRect().left,
-    color: getComputedStyle(element.querySelector(".daylight-card-icon")!).backgroundColor,
-  }));
-  assert(
-    afterSwap.left < beforeSwap.left &&
-      afterSwap.color === beforeSwap.color &&
-      afterSwap.color === "rgb(247, 186, 0)",
-    "Pitch Orientation did not swap team ownership independently of the yellow card color",
-  );
-  await assertOpposingTimeline(harnessPage);
-
-  await harnessPage
-    .getByRole("button", { name: "Show finished game" })
-    .evaluate((element) => (element as HTMLButtonElement).click());
-  const finish = harnessPage.locator('[data-timeline-kind="finish"]');
-  await finish.getByText("Winner: Berner Boggarts", { exact: true }).waitFor();
-  for (const width of [360, 1280]) {
-    await harnessPage.setViewportSize({ width, height: 800 });
-    await finish.scrollIntoViewIfNeeded();
     assert(
-      await finish.evaluate((element) => {
-        const row = element.getBoundingClientRect();
-        const content = element.querySelector("[data-timeline-content]")!.getBoundingClientRect();
-        return (
-          Math.abs((row.left + row.right - content.left - content.right) / 2) < 2 &&
-          document.documentElement.scrollWidth <= innerWidth
-        );
-      }),
-      "Finish winner is not centered or overflows",
+      (await skipLink.getAttribute("href")) === "#main-content" &&
+        (await page.locator("#main-content").count()) === 1,
+      "skip link did not provide a keyboard destination",
     );
-    if (process.env.PUBLIC_BROWSER_SCREENSHOTS)
-      await harnessPage.screenshot({
-        path: join(process.env.PUBLIC_BROWSER_SCREENSHOTS, `finish-winner-${width}.png`),
+    assert(
+      (await page.locator('[data-live-projection-status][role="status"]').count()) === 1,
+      "public Event did not expose a live-update status announcement",
+    );
+    const liveNow = page.locator('[data-schedule-group="live-now"]');
+    await liveNow.locator('[data-game-code="BUSY-2"]').waitFor();
+    await liveNow.locator('[data-game-code="BUSY-3"]').waitFor();
+    assert(
+      (await liveNow.locator('[data-schedule-card][data-schedule-status="running"]').count()) === 2,
+      "both committed running Games were not shown in Live now",
+    );
+    await page.getByRole("link", { name: "View Event schedule" }).click();
+    await page.waitForURL(`${origin}${current.canonicalPath}?view=schedule`);
+    const schedule = page.locator('[data-schedule-group="event-schedule"]');
+    await schedule.waitFor();
+    for (const [code, status] of [
+      ["BUSY-1", "past"],
+      ["BUSY-2", "running"],
+      ["BUSY-4", "awaiting-start"],
+      ["BUSY-5", "future"],
+    ] as const) {
+      assert(
+        (await schedule
+          .locator(`[data-game-code="${code}"][data-schedule-status="${status}"]`)
+          .count()) === 1,
+        `${code} did not retain chronological status ${status}; ${await schedule.innerText()}`,
+      );
+    }
+    assert(
+      (await schedule.locator("details, [data-game-timeline]").count()) === 0,
+      "Event schedule must open Game details on their own screen",
+    );
+    for (const code of ["BUSY-1", "BUSY-2", "BUSY-5"]) {
+      const card = schedule.locator(`[data-game-code="${code}"]`);
+      const link = card.locator("..");
+      assert((await link.count()) === 1, `${code} must have one Game link`);
+      assert(
+        (await link.locator("article").count()) === 1,
+        `${code} link must contain the whole Game card`,
+      );
+      const path = await link.getAttribute("href");
+      await card.click();
+      await page.waitForURL(`${origin}${path}`);
+      await page.locator("[data-scoreboard-expanded]").waitFor();
+      if (code === "BUSY-5")
+        await page.getByText("No public play history is available yet.").waitFor();
+      else await page.locator("[data-game-timeline]").waitFor();
+      if (code === "BUSY-1") await page.locator('[data-timeline-kind="finish"]').waitFor();
+      await page.getByRole("link", { name: "Back to Event" }).click();
+      await page.getByRole("heading", { name: current.name }).waitFor();
+      await page.getByRole("link", { name: "View Event schedule" }).click();
+    }
+    await page.goto(`${origin}${current.canonicalPath}`);
+    await page.getByRole("heading", { name: current.name }).waitFor();
+    assert(
+      (await page.locator('[data-schedule-group="coming-up"] h2').count()) === 1,
+      "Coming up Games were not grouped by Expected Start",
+    );
+    await page.getByText("Pitch 1", { exact: true }).first().waitFor();
+    await page.getByText("Pitch 2", { exact: true }).first().waitFor();
+
+    assert(
+      ((await page.locator("body").textContent()) ?? "").includes("Expected Start"),
+      "Expected Start was not rendered",
+    );
+    assert(
+      await page.evaluate(
+        () => document.documentElement.scrollWidth <= document.documentElement.clientWidth,
+      ),
+      "360px phone-sized Event schedule overflows horizontally",
+    );
+
+    await page.evaluate(() => document.fonts.ready);
+    const arenaSizes = await liveNow
+      .locator("[data-schedule-card]")
+      .evaluateAll((cards) => cards.map((card) => card.getBoundingClientRect().width));
+    assert(
+      Math.abs(arenaSizes[0]! - arenaSizes[1]!) < 2,
+      "Simultaneous games have unequal visual weight",
+    );
+    if (process.env.PUBLIC_GAME_EVIDENCE_DIR) {
+      await page.evaluate(() => scrollTo(0, 0));
+      await page.screenshot({
+        path: join(process.env.PUBLIC_GAME_EVIDENCE_DIR, "event-360.png"),
+        fullPage: true,
       });
-  }
+      await page.setViewportSize({ width: 1280, height: 900 });
+      await page.screenshot({
+        path: join(process.env.PUBLIC_GAME_EVIDENCE_DIR, "event-desktop.png"),
+        fullPage: true,
+      });
+      await page.setViewportSize({ width: 360, height: 844 });
+    }
+    await verifyDaylightEventStates(page, current);
 
-  const stableGamePath = `/events/${encodeURIComponent(seeded.currentId)}/games/${encodeURIComponent(
-    seeded.currentGames[1]!.game.eventGameId,
-  )}`;
-  await openEventAndActivateSpectatorGame(page, current, stableGamePath, {
-    expectedScore: "0",
-    expectedTimelineText: "Original Player",
-    focusGameLink: async (keyboardGameLink) => {
-      const keyboardAllEvents = page.getByRole("button", { name: "All events" });
-      await keyboardAllEvents.focus();
-      await page.keyboard.press("Shift+Tab");
-      assert(
-        await page.evaluate(
-          () =>
-            document.activeElement?.getAttribute("href") === "#main-content" &&
-            document.activeElement?.matches(":focus-visible") === true,
-        ),
-        "skip navigation did not receive visible keyboard focus",
-      );
-      await page.keyboard.press("Tab");
-      assert(
-        await keyboardAllEvents.evaluate((element) => document.activeElement === element),
-        "keyboard focus did not move from skip navigation to Event navigation",
-      );
-      await page.keyboard.press("Tab");
-      assert(
-        await keyboardGameLink.evaluate((element) => document.activeElement === element),
-        "keyboard focus did not move into schedule Game navigation",
-      );
-      await page.keyboard.press("Shift+Tab");
-      assert(
-        await keyboardAllEvents.evaluate((element) => document.activeElement === element),
-        "Shift-Tab did not return focus to Event navigation",
-      );
-      await page.keyboard.press("Tab");
-      assert(
-        await keyboardGameLink.evaluate((element) => document.activeElement === element),
-        "Tab did not restore focus to the canonical spectator Game link",
-      );
-      assert(
-        await keyboardGameLink.evaluate(
-          (element) =>
-            element.matches(":focus-visible") && getComputedStyle(element).boxShadow !== "none",
-        ),
-        "canonical spectator Game link did not expose visible keyboard focus styling",
-      );
-    },
-  });
-
-  await page.setViewportSize({ width: 1280, height: 900 });
-  await page.goto(`${origin}${current.canonicalPath}`);
-  await page.getByRole("heading", { name: "Published Current" }).waitFor();
-  assert(
-    await page.evaluate(
-      () => document.documentElement.scrollWidth <= document.documentElement.clientWidth,
-    ),
-    "desktop Event schedule overflows horizontally",
-  );
-  assert(
-    (await page.locator("[data-schedule-card]").count()) >= 5,
-    "desktop Event journey did not render the schedule",
-  );
-  await page.setViewportSize({ width: 360, height: 844 });
-
-  const streamedGame = schedule.locator('[data-game-code="BUSY-2"]');
-  assert(
-    (await streamedGame.getByRole("link", { name: /Open spectator Game/ }).count()) === 1,
-    "schedule Game did not expose a keyboard-operable spectator link",
-  );
-  const initialScore = await streamedGame.locator('[aria-label="Side A score"]').innerText();
-  assert(initialScore === "0", "canonical Event page did not render the initial scoreboard");
-  assert(
-    (await streamedGame.locator('[data-timeline-kind="goal"]').count()) === 0,
-    "canonical Event page unexpectedly rendered the future goal",
-  );
-
-  await exerciseLiveSpectatorGameBehavior(page, seeded, current, stableGamePath, {
-    engineLabel: "Chromium",
-    initialRosterName: "Original Player",
-    correctedRosterName: "Corrected Player",
-    actionPrefix: "browser-convergence",
-    sportingOrder: 1_000,
-  });
-
-  await verifyDaylightScoreboardStates(page, current, stableGamePath);
-
-  await page.getByRole("button", { name: "All events" }).click();
-  await page.waitForURL(`${origin}/events?view=all`);
-  await page.getByRole("heading", { name: "Current Events" }).waitFor();
-  await page.getByRole("link", { name: "Published Current" }).click();
-  await page.waitForURL(`${origin}${current.canonicalPath}`);
-  await page.getByRole("heading", { name: "Published Current" }).waitFor();
-  await page.getByRole("button", { name: "All events" }).click();
-  await page.waitForURL(`${origin}/events?view=all`);
-
-  await page.route(`${origin}/api/audience/events`, async (route) => {
-    await route.fulfill({
-      status: 200,
-      contentType: "application/json",
-      body: JSON.stringify({
-        status: "accepted",
-        value: {
-          events: [
-            { ...current, lifecycle: "future", gameDays: [futureDate()] },
-            {
-              ...current,
-              eventId: "event-unscheduled",
-              name: "Unscheduled Event",
-              lifecycle: "unscheduled",
-              gameDays: [],
-              canonicalPath: "/events/event-unscheduled",
-            },
-          ],
-        },
-      }),
-    });
-  });
-  await page.goto(`${origin}/events`);
-  await page.getByRole("heading", { name: "Current Events" }).waitFor();
-  assert(page.url() === `${origin}/events`, "zero-current discovery auto-opened an Event");
-  await page.getByText("No Event is current today.").waitFor();
-  await page.unroute(`${origin}/api/audience/events`);
-
-  await page.route(`${origin}/api/audience/events`, async (route) => {
-    await route.fulfill({
-      status: 200,
-      contentType: "application/json",
-      body: JSON.stringify({
-        status: "accepted",
-        value: {
-          events: [
-            current,
-            {
-              ...current,
-              eventId: "event-current-two",
-              name: "Second Current",
-              canonicalPath: "/events/event-current-two",
-            },
-          ],
-        },
-      }),
-    });
-  });
-  await page.goto(`${origin}/events`);
-  await page.getByRole("heading", { name: "Current Events" }).waitFor();
-  assert(page.url() === `${origin}/events`, "multiple-current discovery auto-opened an Event");
-  await page.getByRole("link", { name: "Second Current" }).waitFor();
-  await page.unroute(`${origin}/api/audience/events`);
-
-  const sitemap = await context.request.get(`${origin}/sitemap.xml`);
-  const sitemapBody = await sitemap.text();
-  assert(sitemap.status() === 200, "sitemap was unavailable");
-  assert(sitemapBody.includes(current.canonicalPath), "Published Event was omitted from sitemap");
-  assert(!sitemapBody.includes(seeded.hiddenId), "hidden Event was included in sitemap");
-
-  for (const eventId of [seeded.hiddenId, "unknown-event"]) {
-    const response = await page.goto(`${origin}/events/${eventId}`);
-    await page.getByRole("heading", { name: "Event unavailable" }).waitFor();
-    assert(response?.headers()["x-robots-tag"] === "noindex", `${eventId} page was indexable`);
+    const harnessPage = await context.newPage();
+    setupBrowserPage(harnessPage, consoleErrors);
+    await harnessPage.goto(`${harnessOrigin}/`);
+    const harnessTimeline = harnessPage.locator("[data-game-timeline]");
+    await harnessTimeline.waitFor();
+    const harnessScroll = harnessTimeline.locator("[data-timeline-scroll-region]");
+    await harnessScroll.evaluate((element) =>
+      window.scrollTo(0, window.scrollY + element.getBoundingClientRect().top + 600),
+    );
+    await harnessPage.waitForFunction(() => window.scrollY > 500);
+    await harnessPage.evaluate(() => window.dispatchEvent(new Event("scroll")));
+    const harnessBeforeNewPlay = await harnessPage.evaluate(() => ({
+      bottomDistance: document.documentElement.scrollHeight - window.scrollY,
+      scrollTop: window.scrollY,
+    }));
+    // Deliver without scrolling back to the fixture controls.
+    await harnessPage
+      .getByRole("button", { name: "Deliver newer play while away" })
+      .evaluate((element) => (element as HTMLButtonElement).click());
+    await harnessPage.getByRole("button", { name: "Show newest play" }).waitFor();
+    const harnessAfterNewPlay = await harnessPage.evaluate(() => ({
+      bottomDistance: document.documentElement.scrollHeight - window.scrollY,
+      scrollTop: window.scrollY,
+    }));
     assert(
-      (await page
-        .getByText("The Event may be hidden, unknown, or temporarily unavailable.")
-        .count()) === 1,
-      `${eventId} did not render the generic unavailable experience`,
+      Math.abs(harnessAfterNewPlay.bottomDistance - harnessBeforeNewPlay.bottomDistance) <= 4,
+      "Timeline harness changed the older-entry viewport position",
+    );
+    await harnessPage.getByRole("button", { name: "Show newest play" }).click();
+    await harnessPage.waitForFunction(
+      () =>
+        document.querySelector("[data-timeline-scroll-region]")!.getBoundingClientRect().top >= -8,
+    );
+    await harnessPage
+      .getByRole("button", { name: "Deliver newer play at live edge" })
+      .evaluate((element) => (element as HTMLButtonElement).click());
+    assert(
+      (await harnessPage.getByRole("button", { name: "Show newest play" }).count()) === 0,
+      "Timeline harness exposed New play at the live edge",
+    );
+    await assertOpposingTimeline(harnessPage);
+    const yellowCard = harnessPage
+      .locator('[data-timeline-kind="card"]')
+      .filter({ hasText: "yellow card" });
+    const beforeSwap = await yellowCard.evaluate((element) => ({
+      left: element.querySelector("[data-timeline-content]")!.getBoundingClientRect().left,
+      color: getComputedStyle(element.querySelector(".daylight-card-icon")!).backgroundColor,
+    }));
+    await harnessPage
+      .getByRole("button", { name: "Swap Pitch Orientation" })
+      .evaluate((element) => (element as HTMLButtonElement).click());
+    const afterSwap = await yellowCard.evaluate((element) => ({
+      left: element.querySelector("[data-timeline-content]")!.getBoundingClientRect().left,
+      color: getComputedStyle(element.querySelector(".daylight-card-icon")!).backgroundColor,
+    }));
+    assert(
+      afterSwap.left < beforeSwap.left &&
+        afterSwap.color === beforeSwap.color &&
+        afterSwap.color === "rgb(247, 186, 0)",
+      "Pitch Orientation did not swap team ownership independently of the yellow card color",
+    );
+    await assertOpposingTimeline(harnessPage);
+    await harnessPage
+      .getByRole("button", { name: "Show finished game" })
+      .evaluate((element) => (element as HTMLButtonElement).click());
+    const finish = harnessPage.locator('[data-timeline-kind="finish"]');
+    await finish.getByText("Winner: Berner Boggarts", { exact: true }).waitFor();
+    for (const width of [360, 1280]) {
+      await harnessPage.setViewportSize({ width, height: 800 });
+      await finish.scrollIntoViewIfNeeded();
+      assert(
+        await finish.evaluate((element) => {
+          const row = element.getBoundingClientRect();
+          const content = element.querySelector("[data-timeline-content]")!.getBoundingClientRect();
+          return (
+            Math.abs((row.left + row.right - content.left - content.right) / 2) < 2 &&
+            document.documentElement.scrollWidth <= innerWidth
+          );
+        }),
+        "Finish winner is not centered or overflows",
+      );
+      if (process.env.PUBLIC_BROWSER_SCREENSHOTS)
+        await harnessPage.screenshot({
+          path: join(process.env.PUBLIC_BROWSER_SCREENSHOTS, `finish-winner-${width}.png`),
+        });
+    }
+
+    const stableGamePath = `/events/${encodeURIComponent(seeded.currentId)}/games/${encodeURIComponent(
+      seeded.currentGames[1]!.game.eventGameId,
+    )}`;
+    await openEventAndActivateSpectatorGame(page, current, stableGamePath, {
+      expectedScore: "0",
+      expectedTimelineText: "Original Player",
+      focusGameLink: async (keyboardGameLink) => {
+        const keyboardAllEvents = page.getByRole("link", { name: "All events" });
+        await keyboardAllEvents.focus();
+        await page.keyboard.press("Shift+Tab");
+        assert(
+          await page.evaluate(
+            () =>
+              document.activeElement?.getAttribute("href") === "#main-content" &&
+              document.activeElement?.matches(":focus-visible") === true,
+          ),
+          "skip navigation did not receive visible keyboard focus",
+        );
+        await page.keyboard.press("Tab");
+        assert(
+          await keyboardAllEvents.evaluate((element) => document.activeElement === element),
+          "keyboard focus did not move from skip navigation to Event navigation",
+        );
+        await page.keyboard.press("Tab");
+        await page.keyboard.press("Tab");
+        assert(
+          await keyboardGameLink.evaluate((element) => document.activeElement === element),
+          "keyboard focus did not move into schedule Game navigation",
+        );
+        await page.keyboard.press("Shift+Tab");
+        await page.keyboard.press("Shift+Tab");
+        assert(
+          await keyboardAllEvents.evaluate((element) => document.activeElement === element),
+          "Shift-Tab did not return focus to Event navigation",
+        );
+        await page.keyboard.press("Tab");
+        await page.keyboard.press("Tab");
+        assert(
+          await keyboardGameLink.evaluate((element) => document.activeElement === element),
+          "Tab did not restore focus to the canonical spectator Game link",
+        );
+        assert(
+          await keyboardGameLink.evaluate(
+            (element) =>
+              element.matches(":focus-visible") &&
+              (getComputedStyle(element).boxShadow !== "none" ||
+                getComputedStyle(element).outlineStyle !== "none"),
+          ),
+          "canonical spectator Game link did not expose visible keyboard focus styling",
+        );
+      },
+    });
+
+    await page.setViewportSize({ width: 1280, height: 900 });
+    await page.goto(`${origin}${current.canonicalPath}`);
+    await page.getByRole("heading", { name: "Published Current" }).waitFor();
+    assert(
+      await page.evaluate(
+        () => document.documentElement.scrollWidth <= document.documentElement.clientWidth,
+      ),
+      "desktop Event schedule overflows horizontally",
+    );
+    assert(
+      (await page.locator("[data-schedule-card]").count()) >= 3,
+      "desktop Event journey did not render the schedule",
+    );
+    await page.getByRole("link", { name: "View Event schedule" }).click();
+    await page.setViewportSize({ width: 360, height: 844 });
+
+    const streamedGame = schedule.locator('[data-game-code="BUSY-2"]');
+    assert(
+      (await streamedGame.locator("..").getAttribute("href")) !== null,
+      "schedule Game did not expose a keyboard-operable spectator link",
+    );
+    const initialScore = await streamedGame.locator('[aria-label="Side A score"]').innerText();
+    assert(initialScore === "0", "canonical Event page did not render the initial scoreboard");
+    assert(
+      (await streamedGame.locator('[data-timeline-kind="goal"]').count()) === 0,
+      "canonical Event page unexpectedly rendered the future goal",
+    );
+
+    await exerciseLiveSpectatorGameBehavior(page, seeded, current, stableGamePath, {
+      engineLabel: "Chromium",
+      initialRosterName: "Original Player",
+      correctedRosterName: "Corrected Player",
+      actionPrefix: "browser-convergence",
+      sportingOrder: 1_000,
+    });
+
+    await verifyDaylightScoreboardStates(page, current, stableGamePath);
+
+    await page.getByRole("link", { name: "All events" }).click();
+    await page.waitForURL(`${origin}/events?view=all`);
+    await page.getByRole("heading", { name: "Current Events" }).waitFor();
+    await page.getByRole("link", { name: "Published Current" }).click();
+    await page.waitForURL(`${origin}${current.canonicalPath}`);
+    await page.getByRole("heading", { name: "Published Current" }).waitFor();
+    await page.getByRole("link", { name: "All events" }).click();
+    await page.waitForURL(`${origin}/events?view=all`);
+
+    await page.route(`${origin}/api/audience/events`, async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          status: "accepted",
+          value: {
+            events: [
+              { ...current, lifecycle: "future", gameDays: [futureDate()] },
+              {
+                ...current,
+                eventId: "event-unscheduled",
+                name: "Unscheduled Event",
+                lifecycle: "unscheduled",
+                gameDays: [],
+                canonicalPath: "/events/event-unscheduled",
+              },
+            ],
+          },
+        }),
+      });
+    });
+    await page.goto(`${origin}/events`);
+    await page.getByRole("heading", { name: "Current Events" }).waitFor();
+    assert(page.url() === `${origin}/events`, "zero-current discovery auto-opened an Event");
+    await page.getByText("No Event is current today.").waitFor();
+    await page.unroute(`${origin}/api/audience/events`);
+
+    await page.route(`${origin}/api/audience/events`, async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          status: "accepted",
+          value: {
+            events: [
+              current,
+              {
+                ...current,
+                eventId: "event-current-two",
+                name: "Second Current",
+                canonicalPath: "/events/event-current-two",
+              },
+            ],
+          },
+        }),
+      });
+    });
+    await page.goto(`${origin}/events`);
+    await page.getByRole("heading", { name: "Current Events" }).waitFor();
+    assert(page.url() === `${origin}/events`, "multiple-current discovery auto-opened an Event");
+    await page.getByRole("link", { name: "Second Current" }).waitFor();
+    await page.unroute(`${origin}/api/audience/events`);
+
+    const sitemap = await context.request.get(`${origin}/sitemap.xml`);
+    const sitemapBody = await sitemap.text();
+    assert(sitemap.status() === 200, "sitemap was unavailable");
+    assert(sitemapBody.includes(current.canonicalPath), "Published Event was omitted from sitemap");
+    assert(!sitemapBody.includes(seeded.hiddenId), "hidden Event was included in sitemap");
+
+    for (const eventId of [seeded.hiddenId, "unknown-event"]) {
+      const response = await page.goto(`${origin}/events/${eventId}`);
+      await page.getByRole("heading", { name: "Event unavailable" }).waitFor();
+      assert(response?.headers()["x-robots-tag"] === "noindex", `${eventId} page was indexable`);
+      assert(
+        (await page
+          .getByText("The Event may be hidden, unknown, or temporarily unavailable.")
+          .count()) === 1,
+        `${eventId} did not render the generic unavailable experience`,
+      );
+      await page.getByRole("button", { name: "Back to Home" }).click();
+      await page.waitForURL(`${origin}/events?view=all`);
+    }
+
+    await page.route(`${origin}/api/audience/events/database-failure`, async (route) => {
+      await route.fulfill({
+        status: 503,
+        contentType: "application/json",
+        body: JSON.stringify({ status: "unavailable" }),
+      });
+    });
+    const databaseFailureResponse = await page.goto(`${origin}/events/database-failure`);
+    await page.getByRole("heading", { name: "Event unavailable" }).waitFor();
+    assert(
+      databaseFailureResponse?.headers()["x-robots-tag"] === "noindex",
+      "database-failure page was indexable",
     );
     await page.getByRole("button", { name: "Back to Home" }).click();
     await page.waitForURL(`${origin}/events?view=all`);
-  }
+    await page.unroute(`${origin}/api/audience/events/database-failure`);
 
-  await page.route(`${origin}/api/audience/events/database-failure`, async (route) => {
-    await route.fulfill({
-      status: 503,
-      contentType: "application/json",
-      body: JSON.stringify({ status: "unavailable" }),
-    });
-  });
-  const databaseFailureResponse = await page.goto(`${origin}/events/database-failure`);
-  await page.getByRole("heading", { name: "Event unavailable" }).waitFor();
-  assert(
-    databaseFailureResponse?.headers()["x-robots-tag"] === "noindex",
-    "database-failure page was indexable",
-  );
-  await page.getByRole("button", { name: "Back to Home" }).click();
-  await page.waitForURL(`${origin}/events?view=all`);
-  await page.unroute(`${origin}/api/audience/events/database-failure`);
-
-  await page.goto(`${origin}${current.canonicalPath}`);
-  await page.getByRole("heading", { name: "Published Current" }).waitFor();
-  await page.getByText("Corrected Player").waitFor();
-  webkitBrowser = await webkit.launch({ headless: true });
-  try {
-    await runWebKitCriticalPath(webkitBrowser, seeded, current, stableGamePath);
-  } finally {
-    await webkitBrowser.close();
-    webkitBrowser = null;
+    await page.goto(`${origin}${current.canonicalPath}`);
+    await page.getByRole("heading", { name: "Published Current" }).waitFor();
+    assert(
+      (await page.locator("[data-game-timeline]").count()) === 0,
+      "Event page embedded Game history",
+    );
+    webkitBrowser = await webkit.launch({ headless: true });
+    try {
+      await runWebKitCriticalPath(webkitBrowser, seeded, current, stableGamePath);
+    } finally {
+      await webkitBrowser.close();
+      webkitBrowser = null;
+    }
+    await assertWithdrawnPublicEvent(page, current.name, "WebKit Corrected Player", "Chromium");
+    await page.goto(`${origin}/events?view=all`);
+    await page.getByRole("heading", { name: "Current Events" }).waitFor();
+    const adHoc = page.getByRole("button", { name: /Start an Ad Hoc Game/ });
+    await page.getByLabel("Away color").focus();
+    await page.keyboard.press("Tab");
+    assert(
+      await adHoc.evaluate(
+        (element) =>
+          document.activeElement === element &&
+          element.matches(":focus-visible") &&
+          getComputedStyle(element).boxShadow !== "none",
+      ),
+      "Ad Hoc handoff did not expose visible focus styling",
+    );
+    await page.keyboard.press("Enter");
+    await page.waitForURL(new RegExp(`${origin}/game/adhoc-[a-zA-Z0-9_-]+$`));
+    assert(consoleErrors.length === 0, `browser console errors: ${consoleErrors.join(" | ")}`);
+    console.log(
+      JSON.stringify({
+        status: "passed",
+        zeroCurrent: true,
+        oneCurrentAutoOpen: true,
+        multipleCurrentDiscovery: true,
+        busyPhoneSchedule: true,
+        publicEventScheduleScoreTimelineConvergence: true,
+        stableGameScheduleScoreTimelineConvergence: true,
+        canonicalNavigation: true,
+        unavailableHiddenUnknown: true,
+        unavailableDatabaseFailure: true,
+        publishedSitemapExclusion: true,
+        adHocHandoff: true,
+        keyboardAccessible: true,
+        semanticLandmarks: true,
+        liveUpdateAnnouncements: true,
+        spectatorGameNavigation: true,
+        keyboardTimeline: true,
+        stickyCompactScore: true,
+        timelineNewPlayPreservesContext: true,
+        effectiveGameCorrection: true,
+        reducedMotionTimeline: true,
+        webkitPublicCriticalPath: true,
+        webkitLiveConvergence: true,
+        webkitRosterReconnectRecovery: true,
+        webkitTimelineContextPreservation: true,
+        webkitEffectiveGameCorrection: true,
+        webkitPublicationWithdrawal: true,
+      }),
+    );
   }
-  await assertWithdrawnPublicEvent(page, current.name, "WebKit Corrected Player", "Chromium");
-  await page.goto(`${origin}/events?view=all`);
-  await page.getByRole("heading", { name: "Current Events" }).waitFor();
-  const adHoc = page.getByRole("button", { name: /Start an Ad Hoc Game/ });
-  await page.getByLabel("Away color").focus();
-  await page.keyboard.press("Tab");
-  assert(
-    await adHoc.evaluate(
-      (element) =>
-        document.activeElement === element &&
-        element.matches(":focus-visible") &&
-        getComputedStyle(element).boxShadow !== "none",
-    ),
-    "Ad Hoc handoff did not expose visible focus styling",
-  );
-  await page.keyboard.press("Enter");
-  await page.waitForURL(new RegExp(`${origin}/game/adhoc-[a-zA-Z0-9_-]+$`));
-  assert(consoleErrors.length === 0, `browser console errors: ${consoleErrors.join(" | ")}`);
-  console.log(
-    JSON.stringify({
-      status: "passed",
-      zeroCurrent: true,
-      oneCurrentAutoOpen: true,
-      multipleCurrentDiscovery: true,
-      busyPhoneSchedule: true,
-      publicEventScheduleScoreTimelineConvergence: true,
-      stableGameScheduleScoreTimelineConvergence: true,
-      canonicalNavigation: true,
-      unavailableHiddenUnknown: true,
-      unavailableDatabaseFailure: true,
-      publishedSitemapExclusion: true,
-      adHocHandoff: true,
-      keyboardAccessible: true,
-      semanticLandmarks: true,
-      liveUpdateAnnouncements: true,
-      spectatorGameNavigation: true,
-      keyboardTimeline: true,
-      stickyCompactScore: true,
-      timelineNewPlayPreservesContext: true,
-      effectiveGameCorrection: true,
-      reducedMotionTimeline: true,
-      webkitPublicCriticalPath: true,
-      webkitLiveConvergence: true,
-      webkitRosterReconnectRecovery: true,
-      webkitTimelineContextPreservation: true,
-      webkitEffectiveGameCorrection: true,
-      webkitPublicationWithdrawal: true,
-    }),
-  );
 } catch (error) {
   console.error(error instanceof Error ? (error.stack ?? error.message) : String(error));
   if (browserPage) {
@@ -598,7 +654,6 @@ async function openEventAndActivateSpectatorGame(
   await page.goto(`${origin}${current.canonicalPath}`);
   await page.getByRole("heading", { name: current.name }).waitFor();
   assert((await page.getByRole("main").count()) === 1, "public Event has no main landmark");
-  await page.getByRole("heading", { name: "Event schedule" }).waitFor();
   await page.locator('[data-schedule-group="live-now"]').waitFor();
   assert(
     await page.evaluate(
@@ -606,7 +661,7 @@ async function openEventAndActivateSpectatorGame(
     ),
     "360px public Event overflows horizontally",
   );
-  const gameLink = page.locator('[data-game-code="BUSY-2"] a[href*="/games/"]').first();
+  const gameLink = page.locator('a[href*="/games/"]:has([data-game-code="BUSY-2"])').first();
   await options.focusGameLink(gameLink);
   assert(
     await gameLink.evaluate((element) => document.activeElement === element),
@@ -633,6 +688,195 @@ async function openEventAndActivateSpectatorGame(
         .querySelector("[data-live-projection-status]")
         ?.textContent?.includes("connected") === true,
   );
+}
+
+async function verifyEventReference(page: Page, current: PublicEventFixture) {
+  const payload = (await (
+    await page.request.get(`${origin}/api/audience/events/${current.eventId}`)
+  ).json()) as { value: import("@/lib/audience-projection").PublicAudienceEventProjection };
+  const projection = structuredClone(payload.value);
+  projection.name = "SQM 2026";
+  for (const games of [
+    projection.schedule.runningGames,
+    projection.schedule.upcomingGames,
+    projection.schedule.scheduleGames,
+  ])
+    for (const game of games) {
+      game.sideA.name = "Berner Boggarts";
+      game.sideB.name = "Turicum Thunderbirds";
+      game.presentation.displayedTeamColors = { sideA: "#14652b", sideB: "#13466a" };
+      if (game.scheduleStatus === "running") {
+        game.sideA.score = 80;
+        game.sideB.score = 60;
+      }
+    }
+  const running = projection.schedule.runningGames;
+  assert(running.length === 2, "Reference fixture must contain two running Games");
+  for (const [index, source] of running.entries()) {
+    for (const game of [...running, ...projection.schedule.scheduleGames].filter(
+      (game) => game.eventGameId === source.eventGameId,
+    )) {
+      game.expectedStartMs = running[0]!.expectedStartMs;
+      game.pitch = `Pitch ${2 - index}`;
+      game.pitchName = game.pitch;
+    }
+  }
+  await page.routeWebSocket("**/ws", () => {});
+  await page.route("**/api/audience/events/*", (route) =>
+    route.fulfill({ json: { status: "accepted", value: projection } }),
+  );
+  const capture = async (name: string) => {
+    await page.evaluate(() => document.fonts.ready);
+    assert(
+      await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth),
+      `${name} overflows`,
+    );
+    if (process.env.PUBLIC_GAME_EVIDENCE_DIR)
+      await page.screenshot({
+        path: join(process.env.PUBLIC_GAME_EVIDENCE_DIR, `${name}.png`),
+        fullPage: true,
+      });
+  };
+  for (const width of [360, 566, 1280]) {
+    await page.setViewportSize({ width, height: 900 });
+    await page.goto(`${origin}${current.canonicalPath}`);
+    await page.getByRole("heading", { name: "Live now" }).waitFor();
+    assert(
+      (await page.locator('[data-schedule-group="event-schedule"]').count()) === 0,
+      "Schedule remains below overview",
+    );
+    await page.getByRole("heading", { name: /Up next/ }).waitFor();
+    assert(
+      (await page.locator('[data-schedule-group="live-now"] [data-schedule-card]').count()) === 2,
+      "Simultaneous live games missing",
+    );
+    const runningOrder = await page
+      .locator('[data-schedule-group="live-now"] [data-game-code]')
+      .evaluateAll((cards) => cards.map((card) => card.getAttribute("data-game-code")));
+    assert(
+      runningOrder.join(",") === [running[1]!.gameCode, running[0]!.gameCode].join(","),
+      "Equal-start running Games did not show Pitch 1 before Pitch 2",
+    );
+    await capture(`reference-event-${width}`);
+    await page.getByRole("link", { name: "View Event schedule" }).click();
+    await page.getByRole("heading", { name: "Event schedule", exact: true }).waitFor();
+    assert(
+      (await page.locator('[data-schedule-group="live-now"]').count()) === 0,
+      "Overview remains on schedule screen",
+    );
+    assert(
+      (await page
+        .locator("[data-time-group]")
+        .filter({ has: page.locator('[data-schedule-status="running"]') })
+        .count()) ===
+        new Set(projection.schedule.runningGames.map((game) => game.expectedStartMs)).size,
+      "Running games were not grouped by Expected Start",
+    );
+    assert(
+      (await page.locator('[data-schedule-status="running"] img').count()) === 4,
+      "Live schedule logos missing",
+    );
+    await page.evaluate(() => scrollTo(0, 0));
+    await capture(`reference-schedule-${width}`);
+    const gameLink = page.getByRole("link", { name: /Open spectator Game/ }).first();
+    const href = await gameLink.getAttribute("href");
+    await gameLink.focus();
+    await page.keyboard.press("Enter");
+    await page.waitForURL(`${origin}${href}`);
+    await page.locator("[data-scoreboard-expanded]").waitFor();
+  }
+  projection.gameDays = ["2000-01-01"];
+  await page.setViewportSize({ width: 360, height: 900 });
+  await page.goto(`${origin}${current.canonicalPath}`);
+  await page.waitForURL(`${origin}${current.canonicalPath}?view=schedule`);
+  await page.locator('[data-schedule-group="event-schedule"]').waitFor();
+  assert(
+    (await page.locator('[data-schedule-group="live-now"]').count()) === 0,
+    "Non-today Event exposed live overview",
+  );
+  assert(
+    (await page.getByRole("link", { name: "View Event schedule" }).count()) === 0,
+    "Non-today Event retained live/schedule toggle",
+  );
+  await page.evaluate(() => scrollTo(0, 0));
+  await capture("reference-non-today-360");
+  await page.getByRole("link", { name: "All events", exact: true }).click();
+  await page.waitForURL(`${origin}/events?view=all`);
+  await page.getByRole("heading", { name: "Events", exact: true }).waitFor();
+}
+
+async function verifyDaylightEventStates(page: Page, current: PublicEventFixture) {
+  const payload = (await (
+    await page.request.get(`${origin}/api/audience/events/${current.eventId}`)
+  ).json()) as { value: import("@/lib/audience-projection").PublicAudienceEventProjection };
+  const projection = structuredClone(payload.value);
+  const visual = await page.context().newPage();
+  await visual.routeWebSocket("**/ws", () => {});
+  await visual.route("**/api/audience/events/*", (route) =>
+    route.fulfill({ json: { status: "accepted", value: projection } }),
+  );
+  const capture = async (name: string) => {
+    await visual.goto(`${origin}${current.canonicalPath}`);
+    await visual.getByRole("heading", { name: projection.name }).waitFor();
+    await visual.evaluate(() => document.fonts.ready);
+    assert(
+      await visual.evaluate(() => document.documentElement.scrollWidth <= innerWidth),
+      `${name} overflows at 360px`,
+    );
+    if (process.env.PUBLIC_GAME_EVIDENCE_DIR)
+      await visual.screenshot({
+        path: join(process.env.PUBLIC_GAME_EVIDENCE_DIR, `${name}.png`),
+        fullPage: true,
+      });
+  };
+  try {
+    for (const game of [
+      ...projection.schedule.runningGames,
+      ...projection.schedule.scheduleGames,
+    ]) {
+      game.sideA.name = "Basel Basilisks / Luzern with a very long combined team name";
+      game.sideB.name = "Turicum Thunderbirds";
+      game.sideA.score = 110;
+      game.sideB.score = 100;
+      game.phase = "overtime";
+      game.overtimeTarget = 130;
+      game.flagState.catchingSide = "side-a";
+      if (game.scheduleStatus === "running") {
+        game.heatStoppage.status = "inactive";
+        game.heatStoppage.pending = true;
+      }
+    }
+    await capture("event-long-names");
+    await visual.getByText("Target 130", { exact: false }).first().waitFor();
+    await visual.getByRole("link", { name: "View Event schedule" }).click();
+    await visual.getByText("Heat stoppage: Inactive · decision pending").first().waitFor();
+    const rail = visual.getByRole("list", { name: "Chronological Event schedule" });
+    assert(
+      await rail.evaluate(() => window.scrollY > 0),
+      "Schedule did not open at its current point",
+    );
+    projection.schedule.runningGames = [];
+    for (const game of [
+      ...projection.schedule.upcomingGames,
+      ...projection.schedule.scheduleGames,
+    ]) {
+      game.pitch = null;
+      if (game.scheduleStatus === "running") {
+        game.scheduleStatus = "past";
+        game.operationalStatus = "finished";
+      }
+    }
+    projection.pitches = projection.pitches.slice(0, 1);
+    await capture("event-between-games");
+    await visual.getByText("Next games below").waitFor();
+    projection.schedule.upcomingGames = [];
+    projection.schedule.scheduleGames = [];
+    projection.schedule.focusIndex = null;
+    await capture("event-empty");
+    await visual.getByText("No upcoming games scheduled.").waitFor();
+  } finally {
+    await visual.close();
+  }
 }
 
 async function verifyDaylightScoreboardStates(
@@ -1528,7 +1772,10 @@ async function exerciseLiveSpectatorGameBehavior(
     (await page.locator('[data-game-code="BUSY-2"] [data-timeline-kind="goal"]').count()) === 0,
     `${options.engineLabel} corrected Goal remained in the Event Timeline`,
   );
-  await publicRosterTimelineEntry(page, options.correctedRosterName).waitFor();
+  assert(
+    (await page.locator("[data-game-timeline]").count()) === 0,
+    "Event page embedded Game history",
+  );
   assert(
     (await page.locator('[data-game-code="BUSY-2"][data-schedule-status="running"]').count()) >= 1,
     `${options.engineLabel} stream update removed the canonical schedule card`,
@@ -1627,7 +1874,9 @@ async function runWebKitCriticalPath(
         assert(
           await gameLink.evaluate(
             (element) =>
-              document.activeElement === element && getComputedStyle(element).boxShadow !== "none",
+              document.activeElement === element &&
+              (getComputedStyle(element).boxShadow !== "none" ||
+                getComputedStyle(element).outlineStyle !== "none"),
           ),
           "WebKit spectator Game link did not expose visible keyboard focus",
         );
