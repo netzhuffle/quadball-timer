@@ -31,6 +31,11 @@ bun dev
 
 For dependency updates, follow the [package review and deduplication guidance](docs/agents/dependency-maintenance.md).
 
+Development and the `test:focused:*browser*` commands (including
+`test:focused:adhoc-browser` and `test:focused:controller-header-mobile`) use
+Bun's `--no-orphans` safety net. See [launcher lifecycle](docs/development-launchers.md)
+for ownership, platform limits, and the intentional disposable lifecycle check.
+
 ## Deployment
 
 Production deploys upload a compiled Linux executable and activate it under
