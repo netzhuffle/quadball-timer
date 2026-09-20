@@ -4,7 +4,13 @@ export function importChains(meta: Bun.BuildMetafile, entry: string) {
   const chains = new Map<string, string[]>([[entry, [entry]]]);
   for (const [source, chain] of chains) {
     for (const edge of meta.inputs[source]?.imports ?? []) {
-      if (!edge.external && !chains.has(edge.path)) chains.set(edge.path, [...chain, edge.path]);
+      // Bun marks split dynamic imports as external and rewrites their paths to
+      // emitted chunks. Recover only known source entrypoints, not true externals.
+      const chunkEntry =
+        edge.kind === "dynamic-import" ? meta.outputs[edge.path]?.entryPoint : undefined;
+      const target =
+        chunkEntry && meta.inputs[chunkEntry] ? chunkEntry : edge.external ? undefined : edge.path;
+      if (target && !chains.has(target)) chains.set(target, [...chain, target]);
     }
   }
   return chains;

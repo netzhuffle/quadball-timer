@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { summarizeBundle } from "./bundle-analysis";
+import { importChains, summarizeBundle } from "./bundle-analysis";
 
 test("separates server, eager browser closure, deferred routes and shared chunks", () => {
   const meta: Bun.BuildMetafile = {
@@ -79,4 +79,56 @@ test("fails closed when nested browser metadata is unavailable", () => {
   expect(() => summarizeBundle({ inputs: {}, outputs: {} }, {}, "")).toThrow(
     "missing the browser graph",
   );
+});
+
+test("recovers Bun rewritten dynamic chunk edges without following true external imports", () => {
+  const meta: Bun.BuildMetafile = {
+    inputs: {
+      "src/App.tsx": {
+        bytes: 10,
+        imports: [
+          {
+            path: "./chunk-e7nfzgzw.js",
+            kind: "dynamic-import",
+            original: "@/pages/event-admin-page",
+            external: true,
+          },
+          { path: "external-package", kind: "dynamic-import", external: true },
+          { path: "external-static", kind: "import-statement", external: true },
+        ],
+      },
+      "src/pages/event-admin-page.tsx": {
+        bytes: 10,
+        imports: [{ path: "src/pages/administrative-audit-browser.tsx", kind: "import-statement" }],
+      },
+      "src/pages/administrative-audit-browser.tsx": {
+        bytes: 10,
+        imports: [{ path: "src/App.tsx", kind: "import-statement" }],
+      },
+      "external-package": { bytes: 10, imports: [] },
+      "external-static": { bytes: 10, imports: [] },
+    },
+    outputs: {
+      "./chunk-e7nfzgzw.js": {
+        bytes: 10,
+        inputs: {},
+        imports: [],
+        exports: [],
+        entryPoint: "src/pages/event-admin-page.tsx",
+      },
+    },
+  };
+  const chains = importChains(meta, "src/App.tsx");
+  expect(chains.get("src/pages/event-admin-page.tsx")).toEqual([
+    "src/App.tsx",
+    "src/pages/event-admin-page.tsx",
+  ]);
+  expect(chains.get("src/pages/administrative-audit-browser.tsx")).toEqual([
+    "src/App.tsx",
+    "src/pages/event-admin-page.tsx",
+    "src/pages/administrative-audit-browser.tsx",
+  ]);
+  expect(chains.has("external-package")).toBe(false);
+  expect(chains.has("external-static")).toBe(false);
+  expect(chains.has("./chunk-e7nfzgzw.js")).toBe(false);
 });
