@@ -14,7 +14,7 @@ Usage: bun run build.ts [options]
 Common Options:
   --analyze               Write browser bundle report to out/bundle-analysis (ordinary build only)
   --compile               Generate a standalone executable
-  --compile-target <name> Compile target for executable builds (default: bun-linux-x64-modern)
+  --compile-target <name> Compile target for executable builds (default: bun-linux-x64)
   --outfile <path>        Executable output path when compiling (default: dist/quadball-timer)
   --outdir <path>          Output directory (default: "dist")
   --minify                 Enable minification (or --minify.whitespace, --minify.syntax, etc)
@@ -34,7 +34,7 @@ Common Options:
 
 Examples:
   bun run build.ts --outdir=dist --target=bun --minify --sourcemap=linked
-  bun run build.ts --compile --compile-target=bun-linux-x64-modern --outfile=dist/quadball-timer
+  bun run build.ts --compile --compile-target=bun-linux-x64 --outfile=dist/quadball-timer
 `);
   process.exit(0);
 }
@@ -180,7 +180,8 @@ const compileConfig =
   typeof compileOption === "object" && compileOption !== null && !Array.isArray(compileOption)
     ? (compileOption as Bun.CompileBuildOptions)
     : {};
-const executableTarget = compileTarget ?? compileConfig.target ?? "bun-linux-x64-modern";
+// Bun 1.4 x64 uses one baseline runtime; legacy SIMD suffixes are compatibility aliases.
+const executableTarget = compileTarget ?? compileConfig.target ?? "bun-linux-x64";
 
 const buildConfig: Bun.BuildConfig = {
   entrypoints,

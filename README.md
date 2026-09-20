@@ -105,6 +105,9 @@ path deploys by default, so adding a deployable input does not require extending
 a positive trigger list. Files under `docs/` also remain excluded from
 formatting, linting, and type-aware validation.
 
+The Linux executable uses the canonical Bun x64 target; see
+[compiler target semantics and ordinary verification](docs/development/linux-executable-target.md).
+
 ## Quality checks
 
 ```bash
