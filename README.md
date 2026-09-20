@@ -29,6 +29,8 @@ bun install
 bun dev
 ```
 
+For dependency updates, follow the [package review and deduplication guidance](docs/agents/dependency-maintenance.md).
+
 ## Deployment
 
 Production deploys upload a compiled Linux executable and activate it under
