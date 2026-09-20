@@ -62,6 +62,8 @@ export function PublicGameTimeline({
       <div
         ref={scrollRef}
         className="max-h-[32rem] overflow-y-auto overscroll-contain rounded-xl border bg-muted/20 p-2 [overflow-anchor:none] focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
+        // Keyboard users must be able to focus and scroll this labelled overflow region.
+        // oxlint-disable-next-line jsx-a11y/no-noninteractive-tabindex
         tabIndex={0}
         role="region"
         onScroll={(event) => {

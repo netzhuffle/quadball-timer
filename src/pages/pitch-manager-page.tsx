@@ -167,7 +167,7 @@ export function PitchManagerPage({
         secretOwner.capture(secretScopeKey(nextScope));
       });
     },
-    [secretOwner, scope],
+    [secretOwner, fetch],
   );
 
   const admit = async () => {

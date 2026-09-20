@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useEffectEvent, useRef, useState, type ReactNode } from "react";
 import QRCode from "qrcode/lib/browser";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -318,25 +318,29 @@ function EventCatalogPanel({
   const secretScopeKey = (eventId = selected?.eventId) =>
     `technical-admin:event:${eventId ?? "catalog"}`;
 
-  const clearEventAdminSecrets = () => {
+  const selectedEventId = selected?.eventId;
+  const clearEventAdminSecrets = useCallback(() => {
     setEventAdminCodePlaintext(null);
     setRevealedCredential(null);
     setQrDataUrl(null);
     setEventAdminRotationCount(null);
     setSecretWarning(null);
     setMessage(null);
-    secretOwner.invalidate(secretScopeKey());
-  };
+    secretOwner.invalidate(`technical-admin:event:${selectedEventId ?? "catalog"}`);
+  }, [secretOwner, selectedEventId]);
   const [removalPreview, setRemovalPreview] = useState<EventCatalogRemovalPreview | null>(null);
 
+  const clearSecretsOnUnmount = useEffectEvent(() => clearEventAdminSecrets());
   useEffect(() => {
     clearSecretsRef.current = clearEventAdminSecrets;
+  }, [clearSecretsRef, clearEventAdminSecrets]);
+  useEffect(() => {
     return () => {
       secretOwner.unmount();
-      clearEventAdminSecrets();
+      clearSecretsOnUnmount();
       clearSecretsRef.current = () => undefined;
     };
-  }, [secretOwner]);
+  }, [secretOwner, clearSecretsRef]);
 
   const renderEventAdminQr = async (
     credential = revealedCredential,
@@ -423,8 +427,9 @@ function EventCatalogPanel({
     setEventAdminCode(code);
   };
 
+  const refreshInitialCatalog = useEffectEvent(() => refresh());
   useEffect(() => {
-    void refresh().catch((error: unknown) =>
+    void refreshInitialCatalog().catch((error: unknown) =>
       setMessage(error instanceof Error ? error.message : "Unable to load Events."),
     );
   }, []);

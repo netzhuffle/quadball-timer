@@ -564,13 +564,14 @@ export function GamePage({ gameId, role }: { gameId: string; role: ControllerRol
   }, [liveState]);
 
   useEffect(() => {
+    const timers = scorePulseTimersRef.current;
     return () => {
       const teams: TeamId[] = ["home", "away"];
       for (const team of teams) {
-        const timer = scorePulseTimersRef.current[team];
+        const timer = timers[team];
         if (timer !== null) {
           window.clearTimeout(timer);
-          scorePulseTimersRef.current[team] = null;
+          timers[team] = null;
         }
       }
     };
@@ -631,8 +632,9 @@ export function GamePage({ gameId, role }: { gameId: string; role: ControllerRol
     refocusRenameInputAfterSideSwapRef.current = false;
   }, [liveState?.displaySidesSwapped, renamingTeam]);
 
+  const hasLiveState = liveState !== null;
   useEffect(() => {
-    if (liveState === null) {
+    if (!hasLiveState) {
       return;
     }
 
@@ -673,7 +675,13 @@ export function GamePage({ gameId, role }: { gameId: string; role: ControllerRol
       }
       window.removeEventListener("resize", scheduleMeasure);
     };
-  }, [liveState?.awayName, liveState?.displaySidesSwapped, liveState?.homeName, renamingTeam]);
+  }, [
+    liveState?.awayName,
+    liveState?.displaySidesSwapped,
+    liveState?.homeName,
+    renamingTeam,
+    hasLiveState,
+  ]);
 
   useEffect(() => {
     const element = controllerTopSectionRef.current;
@@ -1386,7 +1394,9 @@ function AdHocControlHandoff({
   }, [payload]);
 
   if (!qrOpen) return null;
+  // Escape and the Close button provide keyboard dismissal; clicking the backdrop is supplementary.
   return (
+    // oxlint-disable-next-line jsx-a11y/click-events-have-key-events, jsx-a11y/no-noninteractive-element-interactions
     <div
       id="ad-hoc-control-qr-dialog"
       aria-label="Ad Hoc Control QR dialog"

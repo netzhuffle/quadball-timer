@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useEffectEvent, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { ControllerHeader } from "@/components/controller-header";
 import { ControllerActionSheet } from "@/components/controller-action-sheet";
@@ -266,6 +266,7 @@ export function EventGameControllerPage() {
     },
   });
 
+  const terminateDepartedController = useEffectEvent(() => terminateMountedController());
   useEffect(() => {
     return departureModule.subscribe(() => {
       const currentEventGameId = eventGameId;
@@ -278,7 +279,7 @@ export function EventGameControllerPage() {
           sessionReferenceIdRef.current ?? undefined,
         )
       ) {
-        terminateMountedController();
+        terminateDepartedController();
       }
     });
   }, [departureModule, eventGameId]);
@@ -395,13 +396,14 @@ export function EventGameControllerPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  const refreshForegroundController = useEffectEvent(() => refreshController(true));
   useEffect(() => {
     const reconcileWhenForegrounded = () => {
       if (document.visibilityState === "hidden") return;
       projectClockImmediately();
       updateControllerConnectionStatus();
       void (async () => {
-        const revalidated = await refreshController(true);
+        const revalidated = await refreshForegroundController();
         if (revalidated && replicaRef.current !== null) {
           await flushReplica(replicaRef.current);
         }
@@ -1844,7 +1846,12 @@ export function EventGameControllerPage() {
               <p className="text-sm text-muted-foreground">
                 The saved Event authority is being confirmed before this device reconnects.
               </p>
-              <button ref={restoreTriggerRef} className="sr-only" tabIndex={-1} />
+              <button
+                ref={restoreTriggerRef}
+                className="sr-only"
+                tabIndex={-1}
+                aria-label="Restore Event Game Controller"
+              />
             </div>
           ) : controllerUnavailable ? (
             <div
@@ -2765,6 +2772,7 @@ export function EventGameControllerPage() {
       {qrDialogOpen && revealedQr !== null ? (
         <div
           className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/50 p-4"
+          role="presentation"
           onClick={(event) => {
             if (event.target === event.currentTarget) closeQrDialog();
           }}
