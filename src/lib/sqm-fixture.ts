@@ -1,3 +1,4 @@
+import type { PublicAudienceTimelineEntry } from "@/lib/game-timeline-projection";
 import { createInitialClockBaseline, projectClockBaseline } from "@/lib/clock-authority";
 import type { GameView } from "@/lib/game-types";
 import type {
@@ -107,8 +108,9 @@ export function createSqmFixtureGameProjection(
   game: GameView | null,
   gameId: string | null,
   nowMs: number,
+  timeline?: readonly PublicAudienceTimelineEntry[],
 ): PublicAudienceGameProjection {
-  const isHardcodedFirstGame = definition.key === "secret1";
+  const isHardcodedFirstGame = definition.key === "secret1" && game === null;
   const state = isHardcodedFirstGame ? undefined : game?.state;
   const isFinished = isHardcodedFirstGame || state?.isFinished === true;
   const isSuspended = state?.isSuspended === true;
@@ -216,9 +218,10 @@ export function createSqmFixtureGameProjection(
     // Ad Hoc fixtures have no Event Game commencement record. A positive recorded
     // clock or running play proves start; a finish flag alone may be an unplayed forfeit.
     timeline:
-      isHardcodedFirstGame || isRunning || (state?.gameClockMs ?? 0) > 0
+      timeline ??
+      (isHardcodedFirstGame || isRunning || (state?.gameClockMs ?? 0) > 0
         ? [{ kind: "game-start", gameTimeMs: 0, lane: "center", teamName: null }]
-        : [],
+        : []),
     spectatorAvailable: isHardcodedFirstGame || gameId !== null,
   };
 }

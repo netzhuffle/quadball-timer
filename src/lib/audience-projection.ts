@@ -229,7 +229,11 @@ export type AudienceProjectionOptions = {
   now?: () => number;
   gameInput?: AudienceProjectionGameInputReader;
   sqmFixtureGame?: {
-    read(fixtureKey: SqmFixtureKey): Promise<{ gameId: string; game: GameView } | null>;
+    read(fixtureKey: SqmFixtureKey): Promise<{
+      gameId: string;
+      game: GameView;
+      timeline?: readonly PublicAudienceTimelineEntry[];
+    } | null>;
   };
 };
 
@@ -365,6 +369,7 @@ async function projectSqmFixtureEvent(
         current?.game ?? null,
         current?.gameId ?? null,
         nowMs,
+        current?.timeline,
       );
     }),
   );
