@@ -4,10 +4,11 @@ import { parseHexColor } from "@/lib/team-colors";
 import type { CSSProperties } from "react";
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardDescription } from "@/components/ui/card";
+import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { ArrowLeft, CalendarDays } from "lucide-react";
+import { ArrowLeft, CalendarDays, Check, ChevronRight, CirclePlus, Shield } from "lucide-react";
+import "./public-discovery.css";
 import "./public-event-daylight.css";
 import { getAdHocBrowserId } from "@/lib/ad-hoc-handoff";
 import type {
@@ -61,10 +62,7 @@ export function PublicEventHomePage({ showAll = false }: { showAll?: boolean }) 
   }, [departureModule, showAll]);
 
   return (
-    <PublicShell
-      title="Public Event discovery"
-      description="Find a Published Event and follow its public schedule. No sign-in is required."
-    >
+    <DiscoveryShell title="Events" footer={<StartAdHocGame />}>
       {events === null && !discoveryUnavailable ? (
         <div className="space-y-6">
           <ControllerDepartureReturnCard />
@@ -75,7 +73,6 @@ export function PublicEventHomePage({ showAll = false }: { showAll?: boolean }) 
           >
             Loading Published Events…
           </p>
-          <StartAdHocGame />
         </div>
       ) : discoveryUnavailable ? (
         <div className="space-y-6">
@@ -86,7 +83,6 @@ export function PublicEventHomePage({ showAll = false }: { showAll?: boolean }) 
           >
             Event discovery is unavailable.
           </p>
-          <StartAdHocGame />
         </div>
       ) : (
         <div className="space-y-6">
@@ -94,7 +90,7 @@ export function PublicEventHomePage({ showAll = false }: { showAll?: boolean }) 
           <EventDiscovery events={events ?? []} />
         </div>
       )}
-    </PublicShell>
+    </DiscoveryShell>
   );
 }
 
@@ -1139,9 +1135,10 @@ function EventDiscovery({ events }: { events: readonly PublicAudienceEventProjec
   return (
     <div className="space-y-6">
       <EventGroup title="Current Events" events={current} empty="No Event is current today." />
-      <EventGroup title="Upcoming Events" events={future} empty="No upcoming Published Events." />
-      <StartAdHocGame />
-      <EventGroup title="Past Events" events={past} empty="No past Published Events." />
+      <div className="discovery-timeline">
+        <EventGroup title="Upcoming Events" events={future} empty="No upcoming Published Events." />
+        <EventGroup title="Past Events" events={past} empty="No past Published Events." />
+      </div>
     </div>
   );
 }
@@ -1157,7 +1154,7 @@ function EventGroup({
 }) {
   return (
     <section aria-labelledby={title.toLowerCase().replaceAll(" ", "-")}>
-      <h2 id={title.toLowerCase().replaceAll(" ", "-")} className="mb-3 text-xl font-semibold">
+      <h2 id={title.toLowerCase().replaceAll(" ", "-")} className="discovery-section-title">
         {title}
       </h2>
       {events.length === 0 ? (
@@ -1165,12 +1162,12 @@ function EventGroup({
           {empty}
         </p>
       ) : (
-        <div className="grid gap-3 sm:grid-cols-2">
+        <div className="discovery-event-list">
           {events.map((event) => (
             <a
               key={event.eventId}
               href={publicEventEntryPath(event)}
-              className="rounded-2xl border bg-card/80 p-4 shadow-sm transition hover:border-primary focus:outline-none focus:ring-2 focus:ring-ring"
+              className={`discovery-event ${event.lifecycle === "current" ? "discovery-current" : ""}`}
               onClick={(click) => {
                 if (
                   click.button !== 0 ||
@@ -1184,10 +1181,26 @@ function EventGroup({
                 navigateTo(publicEventEntryPath(event));
               }}
             >
-              <span className="font-semibold">{event.name}</span>
-              <span className="mt-1 block text-sm text-muted-foreground">
-                {event.gameDays.length > 0 ? event.gameDays.join(" · ") : "Unscheduled"}
+              <EventDate event={event} />
+              <span className="discovery-event-details">
+                <span className="discovery-event-name">{event.name}</span>
+                {event.location?.trim() && (
+                  <span className="discovery-event-location">{event.location}</span>
+                )}
+                <span className="discovery-event-dates">
+                  {event.gameDays.length > 0
+                    ? event.gameDays.map(formatDiscoveryDate).join(" · ")
+                    : "Unscheduled"}
+                </span>
+                {event.lifecycle === "current" && (
+                  <span className="discovery-running">
+                    {event.schedule.runningGames.length > 0
+                      ? `${event.schedule.runningGames.length} ${event.schedule.runningGames.length === 1 ? "game" : "games"} running`
+                      : "Current Event"}
+                  </span>
+                )}
               </span>
+              {event.lifecycle === "current" && <ChevronRight aria-hidden="true" size={22} />}
             </a>
           ))}
         </div>
@@ -1197,6 +1210,103 @@ function EventGroup({
 }
 
 function StartAdHocGame() {
+  return (
+    <a
+      href="/ad-hoc/new"
+      className="discovery-primary"
+      onClick={(event) => {
+        if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey)
+          return;
+        event.preventDefault();
+        navigateTo("/ad-hoc/new");
+      }}
+    >
+      <CirclePlus aria-hidden="true" />
+      Start an Ad Hoc Game
+    </a>
+  );
+}
+
+function formatDiscoveryDate(date: string) {
+  return new Intl.DateTimeFormat("en", {
+    day: "numeric",
+    month: "long",
+    year: "numeric",
+    timeZone: "UTC",
+  }).format(new Date(`${date}T12:00:00Z`));
+}
+
+function EventDate({ event }: { event: PublicAudienceEventProjection }) {
+  const date = event.gameDays[0];
+  if (!date) return <span className="discovery-date">TBD</span>;
+  const parsed = new Date(`${date}T12:00:00Z`);
+  return (
+    <span className="discovery-date" aria-hidden="true">
+      <span>
+        {new Intl.DateTimeFormat("en", { month: "short", timeZone: "UTC" }).format(parsed)}
+      </span>
+      <strong>{parsed.getUTCDate()}</strong>
+    </span>
+  );
+}
+
+function DiscoveryShell({
+  title,
+  children,
+  back = false,
+  footer,
+}: {
+  title: string;
+  children: ReactNode;
+  back?: boolean;
+  footer?: ReactNode;
+}) {
+  const headingRef = useRef<HTMLHeadingElement | null>(null);
+  useEffect(() => {
+    if (back) headingRef.current?.focus();
+  }, [back]);
+  return (
+    <div className="discovery-surface">
+      <div className={`discovery-shell${footer ? " discovery-with-footer" : ""}`}>
+        <a className="discovery-skip" href="#discovery-main">
+          Skip to main content
+        </a>
+        {back && (
+          <a
+            className="discovery-back"
+            href="/events?view=all"
+            onClick={(event) => {
+              if (
+                event.button !== 0 ||
+                event.metaKey ||
+                event.ctrlKey ||
+                event.shiftKey ||
+                event.altKey
+              )
+                return;
+              event.preventDefault();
+              navigateTo("/events?view=all");
+            }}
+          >
+            <ArrowLeft aria-hidden="true" size={18} />
+            Events
+          </a>
+        )}
+        <header>
+          <h1 ref={headingRef} tabIndex={-1}>
+            {title}
+          </h1>
+        </header>
+        <main id="discovery-main" tabIndex={-1}>
+          {children}
+        </main>
+        {footer && <footer className="discovery-footer">{footer}</footer>}
+      </div>
+    </div>
+  );
+}
+
+export function AdHocCreationPage() {
   const [homeName, setHomeName] = useState("Home");
   const [awayName, setAwayName] = useState("Away");
   const [homeColor, setHomeColor] = useState(DEFAULT_HOME_TEAM_COLOR);
@@ -1288,7 +1398,7 @@ function StartAdHocGame() {
       return false;
     }
 
-    const payload = (await response.json()) as { gameId?: string };
+    const payload = (await response.json().catch(() => ({}))) as { gameId?: string };
     if (typeof payload.gameId === "string") {
       creationPendingRef.current = false;
       setCreationPending(false);
@@ -1331,61 +1441,41 @@ function StartAdHocGame() {
   beginCreateGameRef.current = beginCreateGame;
 
   return (
-    <Card>
-      <CardHeader>
-        <h2 className="text-base leading-none font-semibold">Start Ad Hoc Game</h2>
-        <CardDescription>
-          Need an unscheduled Game? Start one here as an equal Ad Hoc Controller.
-        </CardDescription>
-      </CardHeader>
-      <CardContent className="space-y-3">
-        <div className="space-y-2">
-          <Label htmlFor="home-name">Home team</Label>
-          <Input
-            id="home-name"
-            value={homeName}
-            onChange={(event) => setHomeName(event.target.value)}
-          />
-        </div>
-        <div className="space-y-2">
-          <Label htmlFor="away-name">Away team</Label>
-          <Input
-            id="away-name"
-            value={awayName}
-            onChange={(event) => setAwayName(event.target.value)}
-          />
-        </div>
-        <div className="grid grid-cols-2 gap-3">
-          <div className="space-y-2">
-            <Label htmlFor="home-color">Home color</Label>
-            <Input
-              id="home-color"
-              type="color"
-              value={homeColor}
-              onChange={(event) => setHomeColor(event.target.value)}
-              className="h-10 cursor-pointer p-1"
-            />
-          </div>
-          <div className="space-y-2">
-            <Label htmlFor="away-color">Away color</Label>
-            <Input
-              id="away-color"
-              type="color"
-              value={awayColor}
-              onChange={(event) => setAwayColor(event.target.value)}
-              className="h-10 cursor-pointer p-1"
-            />
-          </div>
-        </div>
-        <Button
+    <DiscoveryShell title="Ad Hoc Game" back>
+      <p className="creation-description">
+        Create a quick game.
+        <br />
+        Perfect for practice or friendly matches.
+      </p>
+      <form
+        className="creation-form"
+        onSubmit={(event) => {
+          event.preventDefault();
+          void beginCreateGame();
+        }}
+      >
+        <CreationTeam
+          side="home"
+          name={homeName}
+          color={homeColor}
+          onName={setHomeName}
+          onColor={setHomeColor}
+        />
+        <CreationTeam
+          side="away"
+          name={awayName}
+          color={awayColor}
+          onName={setAwayName}
+          onColor={setAwayColor}
+        />
+        <button
           ref={replacementTriggerRef}
-          type="button"
-          className="w-full"
+          type="submit"
+          className="discovery-primary"
           disabled={creationPending || entry.busy}
-          onClick={() => void beginCreateGame()}
         >
-          Start an Ad Hoc Game <span className="sr-only">Create new game</span>
-        </Button>
+          Create game
+        </button>
         {creationStatus !== null ? (
           <p
             className={creationAlert ? "text-sm text-destructive" : "text-sm text-muted-foreground"}
@@ -1395,9 +1485,76 @@ function StartAdHocGame() {
             {creationStatus}
           </p>
         ) : null}
-      </CardContent>
+      </form>
       {entry.dialog}
-    </Card>
+    </DiscoveryShell>
+  );
+}
+
+const CREATION_SWATCHES = [
+  { name: "Red", color: "#ff4d35" },
+  { name: "Blue", color: "#00afe8" },
+  { name: "Green", color: "#21823b" },
+  { name: "Yellow", color: "#f4bc00" },
+  { name: "Purple", color: "#7956a8" },
+  { name: "Grey", color: "#92989c" },
+];
+
+function CreationTeam({
+  side,
+  name,
+  color,
+  onName,
+  onColor,
+}: {
+  side: "home" | "away";
+  name: string;
+  color: string;
+  onName: (value: string) => void;
+  onColor: (value: string) => void;
+}) {
+  const title = side === "home" ? "Home" : "Away";
+  return (
+    <fieldset className="creation-team">
+      <legend>Team {side === "home" ? "1 (Home)" : "2 (Away)"}</legend>
+      <div className="creation-name" style={{ borderColor: color }}>
+        <Label className="sr-only" htmlFor={`${side}-name`}>
+          {title} team
+        </Label>
+        <Input
+          id={`${side}-name`}
+          value={name}
+          required
+          onChange={(event) => onName(event.target.value)}
+        />
+        <Shield aria-hidden="true" style={{ color }} size={34} />
+      </div>
+      <p className="creation-color-label">Team color</p>
+      <div className="creation-swatches" role="group" aria-label={`${title} team color presets`}>
+        {CREATION_SWATCHES.map((swatch) => (
+          <button
+            key={swatch.color}
+            type="button"
+            aria-label={`${title} ${swatch.name}`}
+            aria-pressed={color.toLowerCase() === swatch.color}
+            style={{ backgroundColor: swatch.color }}
+            onClick={() => onColor(swatch.color)}
+          >
+            {color.toLowerCase() === swatch.color && <Check aria-hidden="true" />}
+          </button>
+        ))}
+      </div>
+      <div className="creation-custom">
+        <Label htmlFor={`${side}-color`}>Custom {side} color</Label>
+        <input
+          id={`${side}-color`}
+          aria-label={`${title} color`}
+          type="color"
+          value={color}
+          onChange={(event) => onColor(event.target.value)}
+        />
+      </div>
+    </fieldset>
   );
 }
 
@@ -1508,7 +1665,10 @@ function UnavailablePanel() {
           <p className="text-sm text-muted-foreground">
             The Event may be hidden, unknown, or temporarily unavailable.
           </p>
-          <Button onClick={() => navigateTo("/events?view=all")}>Back to Home</Button>
+          <Button onClick={() => navigateTo("/events?view=all")}>
+            <ArrowLeft size={18} aria-hidden="true" />
+            Back to Home
+          </Button>
         </CardContent>
       </Card>
     </PublicShell>

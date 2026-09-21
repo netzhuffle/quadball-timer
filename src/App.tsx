@@ -11,6 +11,7 @@ import {
   type AdHocHandoff,
 } from "@/lib/ad-hoc-handoff";
 import {
+  AdHocCreationPage,
   PublicEventGamePage,
   PublicEventHomePage,
   PublicEventPage,
@@ -38,6 +39,7 @@ const TechnicalAdminPage = lazy(() =>
 );
 
 type Route =
+  | { type: "ad-hoc-create" }
   | {
       type: "home";
       showAll?: boolean;
@@ -92,6 +94,8 @@ export function App({
   initialAdHocHandoffAttempted?: boolean;
 }) {
   const route = useRoute(initialAdHocHandoff, initialAdHocHandoffAttempted);
+
+  if (route.type === "ad-hoc-create") return <AdHocCreationPage />;
 
   if (route.type === "home") {
     return <PublicEventHomePage showAll={route.showAll} />;
@@ -274,6 +278,8 @@ export function parseRoute(pathname: string, search: string, hash = ""): Route {
       ...(new URLSearchParams(search).get("view") === "all" ? { showAll: true } : {}),
     };
   }
+
+  if (pathname === "/ad-hoc/new" || pathname === "/ad-hoc/new/") return { type: "ad-hoc-create" };
 
   const eventGameMatch = pathname.match(/^\/events\/([^/]+)\/games\/([^/]+)$/);
   if (eventGameMatch !== null) {

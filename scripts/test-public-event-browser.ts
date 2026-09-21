@@ -551,19 +551,20 @@ try {
     await assertWithdrawnPublicEvent(page, current.name, "WebKit Corrected Player", "Chromium");
     await page.goto(`${origin}/events?view=all`);
     await page.getByRole("heading", { name: "Current Events" }).waitFor();
-    const adHoc = page.getByRole("button", { name: /Start an Ad Hoc Game/ });
-    await page.getByLabel("Away color").focus();
-    await page.keyboard.press("Tab");
+    const adHoc = page.getByRole("link", { name: "Start an Ad Hoc Game" });
+    await adHoc.focus();
     assert(
       await adHoc.evaluate(
         (element) =>
           document.activeElement === element &&
           element.matches(":focus-visible") &&
-          getComputedStyle(element).boxShadow !== "none",
+          getComputedStyle(element).outlineStyle !== "none",
       ),
       "Ad Hoc handoff did not expose visible focus styling",
     );
     await page.keyboard.press("Enter");
+    await page.waitForURL(`${origin}/ad-hoc/new`);
+    await page.getByRole("button", { name: "Create game", exact: true }).click();
     await page.waitForURL(new RegExp(`${origin}/game/adhoc-[a-zA-Z0-9_-]+$`));
     assert(consoleErrors.length === 0, `browser console errors: ${consoleErrors.join(" | ")}`);
     console.log(

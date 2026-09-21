@@ -259,6 +259,75 @@ describe("App", () => {
     expect(container.textContent).toContain("Return to Ad Hoc Game");
   });
 
+  test("dedicated creation preserves Controller return on entry, back and cancelled submission", async () => {
+    testWindow.history.replaceState(null, "", "/events?view=all");
+    const retained = JSON.stringify({
+      version: "controller-departure-v1",
+      status: "returnable",
+      departure: {
+        workflow: "ad-hoc",
+        gameId: "adhoc-return",
+        navigationPath: "/game/adhoc-return",
+        identity: { title: "Ad Hoc Game", homeName: "Home", awayName: "Away" },
+      },
+      expiresAtMs: Date.now() + 300_000,
+      blockedGameIds: [],
+      pendingFinalizations: [],
+      reconciliationPending: [],
+    });
+    testWindow.localStorage.setItem("quadball:controller-departure", retained);
+    const posts: string[] = [];
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url =
+        typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (init?.method === "POST") posts.push(url);
+      return new Response(JSON.stringify({ status: "accepted", value: { events: [] } }), {
+        status: 200,
+      });
+    }) as typeof fetch;
+    await act(async () => {
+      root.render(<App />);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const clickLink = async (text: string) => {
+      const link = Array.from(container.getElementsByTagName("a")).find(
+        (item) => item.textContent === text,
+      );
+      expect(link).toBeDefined();
+      await act(async () => {
+        link?.click();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+    };
+    await clickLink("Start an Ad Hoc Game");
+    expect(testWindow.location.pathname).toBe("/ad-hoc/new");
+    expect(testWindow.localStorage.getItem("quadball:controller-departure")).toBe(retained);
+    expect(posts).toHaveLength(0);
+    await clickLink("Events");
+    expect(container.textContent).toContain("Return to Ad Hoc Game");
+    expect(posts).toHaveLength(0);
+    await clickLink("Start an Ad Hoc Game");
+    await act(async () => {
+      Array.from(container.getElementsByTagName("button"))
+        .find((button) => button.textContent?.includes("Create game"))
+        ?.click();
+      await Promise.resolve();
+    });
+    expect(container.querySelector('[role="dialog"]')).not.toBeNull();
+    expect(posts).toHaveLength(0);
+    await act(async () => {
+      Array.from(container.getElementsByTagName("button"))
+        .find((button) => button.textContent === "Cancel")
+        ?.click();
+      await Promise.resolve();
+    });
+    expect(container.querySelector('[role="dialog"]')).toBeNull();
+    expect(testWindow.localStorage.getItem("quadball:controller-departure")).toBe(retained);
+    expect(posts).toHaveLength(0);
+  });
+
   test("terminates the rendered Controller when Return reconciliation proves the Game unavailable", async () => {
     testWindow.localStorage.setItem(
       "quadball:controller-departure",
@@ -1086,7 +1155,7 @@ describe("App", () => {
   });
 
   test("create game posts team color fields", async () => {
-    testWindow.history.replaceState(null, "", "/");
+    testWindow.history.replaceState(null, "", "/ad-hoc/new");
 
     const requests: Array<{ url: string; body: string | null }> = [];
     globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
@@ -1140,7 +1209,7 @@ describe("App", () => {
     }
 
     const createButton = Array.from(container.getElementsByTagName("button")).find((button) =>
-      (button.textContent ?? "").includes("Create new game"),
+      (button.textContent ?? "").includes("Create game"),
     );
     expect(createButton).not.toBeNull();
 
@@ -1160,7 +1229,7 @@ describe("App", () => {
   });
 
   test("owns one rendered creation retry chain and prevents duplicate submission", async () => {
-    testWindow.history.replaceState(null, "", "/");
+    testWindow.history.replaceState(null, "", "/ad-hoc/new");
     const requests: string[] = [];
     const retryCallbacks: (() => void)[] = [];
     testWindow.setTimeout = ((callback: () => void) => {
@@ -1198,7 +1267,7 @@ describe("App", () => {
       await Promise.resolve();
     });
     const createButton = Array.from(container.getElementsByTagName("button")).find((button) =>
-      (button.textContent ?? "").includes("Create new game"),
+      (button.textContent ?? "").includes("Create game"),
     );
     expect(createButton).not.toBeNull();
     await act(async () => {
@@ -1278,10 +1347,18 @@ describe("App", () => {
                 canonicalPath: "/events/current",
                 teams: [],
                 pitches: [],
+                schedule: {
+                  asOfMs: 0,
+                  runningGames: [],
+                  upcomingGames: [],
+                  scheduleGames: [],
+                  focusIndex: null,
+                },
               },
               {
                 eventId: "future",
                 name: "Future Event",
+                location: "Sample City, Switzerland",
                 timeZone: "UTC",
                 publicationStatus: "published",
                 gameDays: ["2026-08-15"],
@@ -1289,6 +1366,13 @@ describe("App", () => {
                 canonicalPath: "/events/future",
                 teams: [],
                 pitches: [],
+                schedule: {
+                  asOfMs: 0,
+                  runningGames: [],
+                  upcomingGames: [],
+                  scheduleGames: [],
+                  focusIndex: null,
+                },
               },
               {
                 eventId: "unscheduled",
@@ -1300,6 +1384,13 @@ describe("App", () => {
                 canonicalPath: "/events/unscheduled",
                 teams: [],
                 pitches: [],
+                schedule: {
+                  asOfMs: 0,
+                  runningGames: [],
+                  upcomingGames: [],
+                  scheduleGames: [],
+                  focusIndex: null,
+                },
               },
               {
                 eventId: "current-two",
@@ -1311,6 +1402,13 @@ describe("App", () => {
                 canonicalPath: "/events/current-two",
                 teams: [],
                 pitches: [],
+                schedule: {
+                  asOfMs: 0,
+                  runningGames: [],
+                  upcomingGames: [],
+                  scheduleGames: [],
+                  focusIndex: null,
+                },
               },
               {
                 eventId: "past",
@@ -1322,6 +1420,13 @@ describe("App", () => {
                 canonicalPath: "/events/past",
                 teams: [],
                 pitches: [],
+                schedule: {
+                  asOfMs: 0,
+                  runningGames: [],
+                  upcomingGames: [],
+                  scheduleGames: [],
+                  focusIndex: null,
+                },
               },
             ],
           },
@@ -1340,11 +1445,14 @@ describe("App", () => {
     const text = container.textContent ?? "";
     expect(text).toContain("Current Event");
     expect(text).toContain("Future Event");
+    expect(text).toContain("Sample City, Switzerland");
+    expect(container.querySelectorAll(".discovery-event-location")).toHaveLength(1);
     expect(text).not.toContain("Unscheduled Events");
-    expect(text).toContain("Start Ad Hoc Game");
+    expect(text).toContain("Start an Ad Hoc Game");
     expect(text).toContain("Past Event");
-    expect(text.indexOf("Future Event")).toBeLessThan(text.indexOf("Start Ad Hoc Game"));
-    expect(text.indexOf("Start Ad Hoc Game")).toBeLessThan(text.indexOf("Past Event"));
+    expect(text.indexOf("Future Event")).toBeLessThan(text.indexOf("Start an Ad Hoc Game"));
+    expect(text.indexOf("Past Event")).toBeLessThan(text.indexOf("Start an Ad Hoc Game"));
+    expect(container.querySelector("footer")?.textContent).toContain("Start an Ad Hoc Game");
   });
 
   test("opens the sole current Published Event from Home", async () => {
@@ -1368,6 +1476,13 @@ describe("App", () => {
                 canonicalPath: "/events/only-current",
                 teams: [],
                 pitches: [],
+                schedule: {
+                  asOfMs: 0,
+                  runningGames: [],
+                  upcomingGames: [],
+                  scheduleGames: [],
+                  focusIndex: null,
+                },
               },
             ],
           },
@@ -1404,6 +1519,13 @@ describe("App", () => {
                 canonicalPath: "/events/future-only",
                 teams: [],
                 pitches: [],
+                schedule: {
+                  asOfMs: 0,
+                  runningGames: [],
+                  upcomingGames: [],
+                  scheduleGames: [],
+                  focusIndex: null,
+                },
               },
             ],
           },
@@ -1489,6 +1611,13 @@ describe("App", () => {
                 canonicalPath: "/events/visible-event",
                 teams: [],
                 pitches: [],
+                schedule: {
+                  asOfMs: 0,
+                  runningGames: [],
+                  upcomingGames: [],
+                  scheduleGames: [],
+                  focusIndex: null,
+                },
               },
             ],
           },
