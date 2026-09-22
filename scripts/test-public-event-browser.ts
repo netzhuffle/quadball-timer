@@ -905,6 +905,15 @@ async function verifyDaylightScoreboardStates(
     await visual.goto(`${origin}${gamePath}`);
     await visual.locator("[data-scoreboard-expanded]").waitFor();
     await visual.evaluate(() => document.fonts.ready);
+    // A mounted scoreboard and loaded fonts can precede the browser's first
+    // resolved grid reservation. Scroll only once its visible content is below
+    // the expanded board, so a one-shot bottom scroll uses the rendered range.
+    await visual.waitForFunction(() => {
+      const scoreboard = document.querySelector("[data-scoreboard-expanded]");
+      const content = document.querySelector("[data-scoreboard-content]");
+      if (!scoreboard || !content) return false;
+      return content.getBoundingClientRect().top >= scoreboard.getBoundingClientRect().bottom - 1;
+    });
     assert(
       await visual.evaluate(() => document.documentElement.scrollWidth <= innerWidth),
       `${name} scoreboard overflowed 360px`,
