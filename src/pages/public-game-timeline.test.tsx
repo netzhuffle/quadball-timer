@@ -44,6 +44,30 @@ describe("public Game Timeline browser seam", () => {
     });
   });
 
+  test("standalone history does not borrow another scoreboard's reading clearance", async () => {
+    const unrelatedScoreboard = document.createElement("section");
+    unrelatedScoreboard.setAttribute("data-scoreboard-compact", "");
+    unrelatedScoreboard.setAttribute("data-scoreboard-expanded", "");
+    unrelatedScoreboard.getBoundingClientRect = () => new testWindow.DOMRect(0, 0, 360, 120);
+    document.body.prepend(unrelatedScoreboard);
+    try {
+      await act(async () =>
+        root.render(
+          <PublicGameTimeline
+            entries={[{ kind: "game-start", gameTimeMs: 0, lane: "center", teamName: null }]}
+          />,
+        ),
+      );
+      expect(
+        container
+          .querySelector<HTMLElement>("[data-game-timeline]")
+          ?.style.getPropertyValue("--timeline-top-clearance"),
+      ).toBe("16px");
+    } finally {
+      unrelatedScoreboard.remove();
+    }
+  });
+
   test("shows one Team Timeout and Heat Break, ticking only active rows without new-play announcements", async () => {
     let tick: (() => void) | undefined;
     const clock = spyOn(performance, "now").mockReturnValue(1000);

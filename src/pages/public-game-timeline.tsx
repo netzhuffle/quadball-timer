@@ -1,4 +1,5 @@
-import { useEffect, useId, useLayoutEffect, useRef, useState, type CSSProperties } from "react";
+import { GameTimelineReadingRegion } from "@/pages/game-spectator-viewport";
+import { useEffect, useState, type CSSProperties } from "react";
 import { Play, Flag, Users, Target, Timer, Pause, Sun, Trophy, UserCheck } from "lucide-react";
 import type { PublicAudienceTimelineEntry } from "@/lib/game-timeline-projection";
 import {
@@ -13,7 +14,6 @@ type Presentation = {
   pitchOrientation: "side-a-left" | "side-b-left";
   displayedTeamColors: { sideA: string | null; sideB: string | null };
 };
-type ReadingPosition = { key: string; top: number; height: number };
 
 export function PublicGameTimeline({
   entries: sourceEntries,
@@ -27,13 +27,6 @@ export function PublicGameTimeline({
   connected?: boolean;
 }) {
   const entries = visibleTimelineEntries(sourceEntries);
-  const headingId = useId();
-  const regionRef = useRef<HTMLDivElement | null>(null);
-  const readingRef = useRef<ReadingPosition | null>(null);
-  const previousKeysRef = useRef<Set<string>>(new Set());
-  const [hasNewPlay, setHasNewPlay] = useState(false);
-  const [topClearance, setTopClearance] = useState(16);
-  const hasEntries = entries.length > 0;
   const signature = JSON.stringify({ entries, presentation });
   const occurrences = new Map<string, number>();
   const keyedEntries = [...entries]
@@ -46,151 +39,27 @@ export function PublicGameTimeline({
     })
     .reverse();
 
-  useLayoutEffect(() => {
-    const region = regionRef.current;
-    if (!region) return;
-    const rememberPosition = () => {
-      const bounds = region.getBoundingClientRect();
-      const inset = compactHeaderBottom();
-      const reading = bounds.top < inset - 8 && bounds.bottom > inset;
-      const anchor = Array.from(region.querySelectorAll<HTMLElement>("[data-timeline-key]")).find(
-        (node) => node.getBoundingClientRect().bottom > inset,
-      );
-      readingRef.current =
-        reading && anchor
-          ? {
-              key: anchor.dataset.timelineKey!,
-              top: anchor.getBoundingClientRect().top,
-              height: region.scrollHeight,
-            }
-          : null;
-      if (bounds.top >= inset - 8) setHasNewPlay(false);
-    };
-    // Measure the actual compact score: wrapping names can make it taller than a fixed allowance.
-    const measureClearance = () => {
-      setTopClearance(compactHeaderBottom() + 16);
-    };
-    const observer = new window.ResizeObserver(measureClearance);
-    observer.observe(document.body);
-    const scoreboard = document.querySelector<HTMLElement>("[data-scoreboard-expanded]");
-    if (scoreboard) observer.observe(scoreboard);
-    const mutations = new window.MutationObserver(() => {
-      const compact = document.querySelector<HTMLElement>("[data-scoreboard-compact]");
-      if (compact) observer.observe(compact);
-      measureClearance();
-    });
-    mutations.observe(document.body, { childList: true, subtree: true });
-    rememberPosition();
-    measureClearance();
-    window.addEventListener("scroll", rememberPosition, { passive: true });
-    window.addEventListener("resize", measureClearance);
-    return () => {
-      observer.disconnect();
-      mutations.disconnect();
-      window.removeEventListener("scroll", rememberPosition);
-      window.removeEventListener("resize", measureClearance);
-    };
-  }, [hasEntries]);
-
-  useLayoutEffect(() => {
-    const region = regionRef.current;
-    if (!region) return;
-    const keys = new Set(
-      Array.from(
-        region.querySelectorAll<HTMLElement>("[data-timeline-key]"),
-        (node) => node.dataset.timelineKey!,
-      ),
-    );
-    const reading = readingRef.current;
-    if (reading) {
-      const anchor = Array.from(region.querySelectorAll<HTMLElement>("[data-timeline-key]")).find(
-        (node) => node.dataset.timelineKey === reading.key,
-      );
-      window.scrollBy({
-        top: anchor
-          ? anchor.getBoundingClientRect().top - reading.top
-          : region.scrollHeight - reading.height,
-        behavior: "instant",
-      });
-      if (anchor)
-        readingRef.current = {
-          key: reading.key,
-          top: anchor.getBoundingClientRect().top,
-          height: region.scrollHeight,
-        };
-      if ([...keys].some((key) => !previousKeysRef.current.has(key))) setHasNewPlay(true);
-    }
-    previousKeysRef.current = keys;
-  }, [signature]);
-
   if (entries.length === 0) return null;
   return (
-    <section
-      className="daylight-timeline"
-      aria-labelledby={headingId}
-      data-game-timeline
-      style={
-        {
-          "--timeline-top-clearance": `${topClearance}px`,
-        } as CSSProperties
-      }
-    >
-      <h3 id={headingId}>Game Timeline</h3>
-      <span role="status" className="sr-only">
-        {hasNewPlay ? "New play available" : ""}
-      </span>
-      {hasNewPlay ? (
-        <button
-          type="button"
-          aria-label="Show newest play"
-          className="daylight-new-play"
-          onClick={() => {
-            const region = regionRef.current;
-            if (region) {
-              region.scrollIntoView({
-                block: "start",
-                behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches
-                  ? "instant"
-                  : "smooth",
-              });
-              region.focus({ preventScroll: true });
+    <GameTimelineReadingRegion signature={signature}>
+      <ol>
+        {keyedEntries.map(({ entry, key }) => (
+          <TimelineEntry
+            key={key}
+            entry={entry}
+            entryKey={key}
+            presentation={presentation}
+            countdown={
+              <ActiveBreakCountdown
+                entry={entry}
+                entries={entries}
+                game={connected ? game : undefined}
+              />
             }
-            readingRef.current = null;
-            setHasNewPlay(false);
-          }}
-        >
-          New play
-        </button>
-      ) : null}
-      <div
-        ref={regionRef}
-        className="daylight-timeline-region"
-        // The labelled history remains keyboard-focusable for page navigation.
-        // oxlint-disable-next-line jsx-a11y/no-noninteractive-tabindex
-        tabIndex={0}
-        role="region"
-        data-timeline-scroll-region
-        aria-label="Game Timeline"
-      >
-        <ol>
-          {keyedEntries.map(({ entry, key }) => (
-            <TimelineEntry
-              key={key}
-              entry={entry}
-              entryKey={key}
-              presentation={presentation}
-              countdown={
-                <ActiveBreakCountdown
-                  entry={entry}
-                  entries={entries}
-                  game={connected ? game : undefined}
-                />
-              }
-            />
-          ))}
-        </ol>
-      </div>
-    </section>
+          />
+        ))}
+      </ol>
+    </GameTimelineReadingRegion>
   );
 }
 
@@ -389,11 +258,4 @@ function formatGameTime(gameTimeMs: number | null): string {
   const minutes = Math.floor(gameTimeMs / 60_000);
   const seconds = Math.floor((gameTimeMs % 60_000) / 1_000);
   return `${minutes}:${String(seconds).padStart(2, "0")}`;
-}
-
-function compactHeaderBottom(): number {
-  const compact = document.querySelector<HTMLElement>("[data-scoreboard-compact]");
-  if (!compact) return 0;
-  const rect = compact.getBoundingClientRect();
-  return rect.top < window.innerHeight / 2 ? Math.max(0, rect.bottom) : 0;
 }
