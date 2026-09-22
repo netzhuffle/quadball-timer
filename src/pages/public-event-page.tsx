@@ -23,6 +23,7 @@ import {
   type PublicAudienceProjectionMessage,
 } from "@/lib/public-event-stream";
 import { DEFAULT_AWAY_TEAM_COLOR, DEFAULT_HOME_TEAM_COLOR } from "@/lib/team-colors";
+import { GameSpectatorViewport } from "@/pages/game-spectator-viewport";
 import { PublicGameTimeline } from "@/pages/public-game-timeline";
 import {
   ControllerDepartureReturnCard,
@@ -355,25 +356,6 @@ function isPublicAudienceProjectionMessage(
   );
 }
 
-function measureExpandedScoreboard(scoreboard: HTMLElement): number {
-  const nativeScroll = scoreboard.hasAttribute("data-scoreboard-native-scroll");
-  scoreboard.removeAttribute("data-scoreboard-native-scroll");
-  const progress = scoreboard.style.getPropertyValue("--score-collapse");
-  scoreboard.style.setProperty("--score-collapse", "0");
-  const names = [...scoreboard.querySelectorAll<HTMLElement>(".daylight-team-name")];
-  // Measure natural wrapping before reserving each name's shrinking footprint.
-  // Text may reflow during the morph, but must not move the scores in a jump.
-  for (const name of names) name.style.removeProperty("--expanded-name-height");
-  const heights = names.map((name) => name.getBoundingClientRect().height);
-  names.forEach((name, index) =>
-    name.style.setProperty("--expanded-name-height", `${heights[index]}px`),
-  );
-  const height = scoreboard.getBoundingClientRect().height;
-  scoreboard.style.setProperty("--score-collapse", progress);
-  scoreboard.toggleAttribute("data-scoreboard-native-scroll", nativeScroll);
-  return height;
-}
-
 export function PublicEventGamePage({
   eventId,
   eventGameId,
@@ -385,100 +367,6 @@ export function PublicEventGamePage({
   const game =
     event?.schedule.scheduleGames.find((candidate) => candidate.eventGameId === eventGameId) ??
     null;
-  const scoreboardLayoutRef = useRef<HTMLDivElement | null>(null);
-  const scoreboardSentinelRef = useRef<HTMLDivElement | null>(null);
-  const scoreboardRef = useRef<HTMLElement | null>(null);
-  const scoreboardContentRef = useRef<HTMLDivElement | null>(null);
-  const expandedHeightRef = useRef(0);
-  const recalibrateScoreboardRef = useRef<(() => void) | null>(null);
-  const hasGame = game !== null && game.spectatorAvailable !== false;
-
-  useEffect(() => {
-    const sentinel = scoreboardSentinelRef.current;
-    const scoreboard = scoreboardRef.current;
-    const content = scoreboardContentRef.current;
-    const layout = scoreboardLayoutRef.current;
-    if (!sentinel || !scoreboard || !content || !layout || !hasGame) return;
-    const page = sentinel.closest<HTMLElement>(".daylight-game")!;
-    const reducedMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)");
-    const supportsNativeScroll =
-      window.CSS?.supports?.("animation-timeline", "scroll(root)") === true;
-    let start = 0;
-    let maximumScroll = 0;
-    let nativeScroll = false;
-    let active = true;
-    const update = () => {
-      const scrollY = Math.max(0, Math.min(window.scrollY, maximumScroll));
-      const distance = maximumScroll > 0 ? Math.max(0, scrollY - start) : 0;
-      const progress = reducedMotion?.matches ? Number(distance > 0) : Math.min(1, distance / 180);
-      // Native CSS samples the scroll timeline directly. The fallback also stays
-      // local to this element; neither path rerenders the timeline while scrolling.
-      if (!nativeScroll) scoreboard.style.setProperty("--score-collapse", String(progress));
-      scoreboard.dataset.collapseProgress = String(progress);
-      scoreboard.toggleAttribute("data-scoreboard-compact", progress > 0);
-    };
-    const refreshRange = () => {
-      const bottomPadding = Number.parseFloat(window.getComputedStyle(page).paddingBottom) || 0;
-      const viewportHeight = document.documentElement.clientHeight || window.innerHeight;
-      start = sentinel.offsetTop;
-      // Only the expanded content extent can enable the morph, never viewport minimum height.
-      maximumScroll = Math.max(
-        0,
-        start + expandedHeightRef.current + content.offsetHeight + bottomPadding - viewportHeight,
-      );
-      nativeScroll = supportsNativeScroll && !reducedMotion?.matches && maximumScroll > 0;
-      scoreboard.style.setProperty("--score-collapse-start", `${start}px`);
-      scoreboard.style.setProperty("--score-collapse-end", `${start + 180}px`);
-      scoreboard.toggleAttribute("data-scoreboard-native-scroll", nativeScroll);
-      update();
-    };
-    const resize = () => {
-      expandedHeightRef.current = measureExpandedScoreboard(scoreboard);
-      layout.style.setProperty("--scoreboard-expanded-height", `${expandedHeightRef.current}px`);
-      refreshRange();
-    };
-    recalibrateScoreboardRef.current = resize;
-    const contentObserver = new window.ResizeObserver(refreshRange);
-    contentObserver.observe(content);
-    resize();
-    window.addEventListener("scroll", update, { passive: true });
-    window.addEventListener("resize", resize);
-    scoreboard.addEventListener("load", resize, true);
-    document.fonts?.addEventListener("loadingdone", resize);
-    void document.fonts?.ready.then(() => {
-      if (active) resize();
-    });
-    reducedMotion?.addEventListener("change", refreshRange);
-    return () => {
-      active = false;
-      recalibrateScoreboardRef.current = null;
-      window.removeEventListener("scroll", update);
-      window.removeEventListener("resize", resize);
-      scoreboard.removeEventListener("load", resize, true);
-      document.fonts?.removeEventListener("loadingdone", resize);
-      contentObserver.disconnect();
-      reducedMotion?.removeEventListener("change", refreshRange);
-    };
-  }, [hasGame, eventId, eventGameId]);
-
-  useEffect(() => {
-    recalibrateScoreboardRef.current?.();
-  }, [
-    game?.sideA.name,
-    game?.sideB.name,
-    game?.pitchName,
-    game?.pitch,
-    game?.phase,
-    game?.operationalStatus,
-    game?.result.status,
-    game?.overtimeTarget,
-    game?.clock?.synchronization,
-    game?.startedAtMs,
-    event?.shortName,
-    event?.name,
-    connectionStatus,
-  ]);
-
   if (unavailable) return <GameUnavailablePanel eventId={eventId} />;
   if (game === null || game.spectatorAvailable === false) {
     if (event !== null) return <GameUnavailablePanel eventId={eventId} />;
@@ -566,107 +454,106 @@ export function PublicEventGamePage({
             Reconnecting live updates… Showing the last received score.
           </p>
         ) : null}
-        <div ref={scoreboardSentinelRef} aria-hidden="true" data-scoreboard-sentinel />
-        <div ref={scoreboardLayoutRef} className="daylight-scoreboard-layout">
-          <section
-            ref={scoreboardRef}
-            aria-label="Live scoreboard"
-            className="daylight-morph-scoreboard"
-            data-scoreboard-expanded
-            data-collapse-progress="0"
-            style={{ "--score-collapse": 0 } as CSSProperties}
-          >
-            <button
-              type="button"
-              className="daylight-score-return"
-              aria-label="Return to full scoreboard"
-              onClick={() => {
-                document.getElementById("main-content")?.focus({ preventScroll: true });
-                window.scrollTo({
-                  top: 0,
-                  behavior: window.matchMedia?.("(prefers-reduced-motion: reduce)").matches
-                    ? "auto"
-                    : "smooth",
-                });
-              }}
-            />
-            <div className="daylight-start-strip" aria-label="Game start and Pitch">
-              <span>
-                {game.startedAtMs === undefined ? "Scheduled" : "Started"}{" "}
-                <time dateTime={new Date(game.startedAtMs ?? game.scheduledStartMs).toISOString()}>
-                  {formatScheduleTime(
-                    game.startedAtMs ?? game.scheduledStartMs,
-                    event?.timeZone ?? "UTC",
-                  )}
-                </time>
-              </span>
-              {game.startedAtMs === undefined && game.expectedStartMs !== game.scheduledStartMs ? (
+        <GameSpectatorViewport
+          key={`${eventId}:${eventGameId}`}
+          layoutVersion={JSON.stringify([
+            game.sideA.name,
+            game.sideB.name,
+            game.pitchName,
+            game.pitch,
+            game.phase,
+            game.operationalStatus,
+            game.result.status,
+            game.overtimeTarget,
+            game.clock?.synchronization,
+            game.startedAtMs,
+            event?.shortName,
+            event?.name,
+            connectionStatus,
+          ])}
+          scoreboard={
+            <>
+              <div className="daylight-start-strip" aria-label="Game start and Pitch">
                 <span>
-                  Expected{" "}
-                  <time dateTime={new Date(game.expectedStartMs).toISOString()}>
-                    {formatScheduleTime(game.expectedStartMs, event?.timeZone ?? "UTC")}
+                  {game.startedAtMs === undefined ? "Scheduled" : "Started"}{" "}
+                  <time
+                    dateTime={new Date(game.startedAtMs ?? game.scheduledStartMs).toISOString()}
+                  >
+                    {formatScheduleTime(
+                      game.startedAtMs ?? game.scheduledStartMs,
+                      event?.timeZone ?? "UTC",
+                    )}
                   </time>
                 </span>
-              ) : null}
-              {(game.pitchName ?? game.pitch) ? <span>{game.pitchName ?? game.pitch}</span> : null}
-            </div>
-            <div className="daylight-arena">
-              {scoreSide(0)}
-              {scoreSide(1)}
-              <div className="daylight-clock" role="timer" aria-label="Game clock">
-                {game.clock ? formatClock(game.clock.gameTimeMs) : "—:—"}
+                {game.startedAtMs === undefined &&
+                game.expectedStartMs !== game.scheduledStartMs ? (
+                  <span>
+                    Expected{" "}
+                    <time dateTime={new Date(game.expectedStartMs).toISOString()}>
+                      {formatScheduleTime(game.expectedStartMs, event?.timeZone ?? "UTC")}
+                    </time>
+                  </span>
+                ) : null}
+                {(game.pitchName ?? game.pitch) ? (
+                  <span>{game.pitchName ?? game.pitch}</span>
+                ) : null}
               </div>
-            </div>
-            <div className="daylight-status">
-              {gameStatusLabels(game).map((label) => (
-                <span key={label}>{label}</span>
-              ))}
-              {!finished &&
-              game.operationalStatus !== "scheduled" &&
-              game.clock?.synchronization !== "synchronized" ? (
-                <span className="daylight-clock-freshness">
-                  {clockFreshnessLabel(game.clock?.synchronization ?? "unavailable")}
-                </span>
+              <div className="daylight-arena">
+                {scoreSide(0)}
+                {scoreSide(1)}
+                <div className="daylight-clock" role="timer" aria-label="Game clock">
+                  {game.clock ? formatClock(game.clock.gameTimeMs) : "—:—"}
+                </div>
+              </div>
+              <div className="daylight-status">
+                {gameStatusLabels(game).map((label) => (
+                  <span key={label}>{label}</span>
+                ))}
+                {!finished &&
+                game.operationalStatus !== "scheduled" &&
+                game.clock?.synchronization !== "synchronized" ? (
+                  <span className="daylight-clock-freshness">
+                    {clockFreshnessLabel(game.clock?.synchronization ?? "unavailable")}
+                  </span>
+                ) : null}
+              </div>
+            </>
+          }
+        >
+          {hasExceptionalDetails ? (
+            <dl className="daylight-details">
+              {game.teamTimeout.status !== "inactive" ? (
+                <StatusValue label="Team Timeout" value={timeoutLabel(game.teamTimeout)} />
               ) : null}
-            </div>
-          </section>
-          <div ref={scoreboardContentRef} data-scoreboard-content>
-            {hasExceptionalDetails ? (
-              <dl className="daylight-details">
-                {game.teamTimeout.status !== "inactive" ? (
-                  <StatusValue label="Team Timeout" value={timeoutLabel(game.teamTimeout)} />
-                ) : null}
-                {game.gameSuspension === "suspended" ? (
-                  <StatusValue label="Game Suspension" value="Suspended" />
-                ) : null}
-                {game.heatStoppage.status !== "inactive" || game.heatStoppage.pending ? (
-                  <StatusValue label="Heat Stoppage" value={heatLabel(game.heatStoppage)} />
-                ) : null}
-              </dl>
+              {game.gameSuspension === "suspended" ? (
+                <StatusValue label="Game Suspension" value="Suspended" />
+              ) : null}
+              {game.heatStoppage.status !== "inactive" || game.heatStoppage.pending ? (
+                <StatusValue label="Heat Stoppage" value={heatLabel(game.heatStoppage)} />
+              ) : null}
+            </dl>
+          ) : null}
+          <section className="daylight-history" aria-label="Game history">
+            {game.timeline.length > 0 ? (
+              <PublicGameTimeline
+                entries={game.timeline}
+                presentation={game.presentation}
+                game={game}
+                connected={
+                  connectionStatus === "connected" && game.clock?.synchronization === "synchronized"
+                }
+              />
+            ) : (
+              <>
+                <h2>Game Timeline</h2>
+                <p>No public play history is available yet.</p>
+              </>
+            )}
+            {game.flagState.catchingSide !== null ? (
+              <p className="mt-4 text-sm">* Flag catch</p>
             ) : null}
-            <section className="daylight-history" aria-label="Game history">
-              {game.timeline.length > 0 ? (
-                <PublicGameTimeline
-                  entries={game.timeline}
-                  presentation={game.presentation}
-                  game={game}
-                  connected={
-                    connectionStatus === "connected" &&
-                    game.clock?.synchronization === "synchronized"
-                  }
-                />
-              ) : (
-                <>
-                  <h2>Game Timeline</h2>
-                  <p>No public play history is available yet.</p>
-                </>
-              )}
-              {game.flagState.catchingSide !== null ? (
-                <p className="mt-4 text-sm">* Flag catch</p>
-              ) : null}
-            </section>
-          </div>
-        </div>
+          </section>
+        </GameSpectatorViewport>
       </main>
     </div>
   );
