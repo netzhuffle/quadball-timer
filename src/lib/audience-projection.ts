@@ -196,6 +196,8 @@ export type PublicAudienceEventProjection = {
   name: string;
   /** Optional verified navigation name; long names remain authoritative for discovery. */
   shortName?: string;
+  /** Optional public display text; omitted when no verified location is provided. */
+  location?: string;
   timeZone: string;
   publicationStatus: "published";
   gameDays: readonly string[];
@@ -227,7 +229,11 @@ export type AudienceProjectionOptions = {
   now?: () => number;
   gameInput?: AudienceProjectionGameInputReader;
   sqmFixtureGame?: {
-    read(fixtureKey: SqmFixtureKey): Promise<{ gameId: string; game: GameView } | null>;
+    read(fixtureKey: SqmFixtureKey): Promise<{
+      gameId: string;
+      game: GameView;
+      timeline?: readonly PublicAudienceTimelineEntry[];
+    } | null>;
   };
 };
 
@@ -363,6 +369,7 @@ async function projectSqmFixtureEvent(
         current?.game ?? null,
         current?.gameId ?? null,
         nowMs,
+        current?.timeline,
       );
     }),
   );

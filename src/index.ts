@@ -412,7 +412,9 @@ async function startServer() {
       sqmFixtureGame: {
         async read(fixtureKey) {
           const result = await adHocService.readFixture({ fixtureKey });
-          return result.status === "accepted" ? { gameId: result.gameId, game: result.game } : null;
+          return result.status === "accepted"
+            ? { gameId: result.gameId, game: result.game, timeline: result.timeline }
+            : null;
         },
       },
     });

@@ -91,6 +91,10 @@ async function run() {
     );
     await raceWithDeadline(
       (async () => {
+        if (process.argv.includes("--creation-only")) {
+          await exerciseDedicatedCreation();
+          return;
+        }
         let firstContext = await browser!.newContext({ ignoreHTTPSErrors: true });
         let secondContext = await browser!.newContext({ ignoreHTTPSErrors: true });
         let first = await firstContext.newPage();
@@ -134,7 +138,8 @@ async function run() {
           ).__quadballTimerInitialAdHocConnectionEvidence = evidence;
         });
         await first.goto(origin);
-        await first.getByRole("button", { name: /Start an Ad Hoc Game/ }).click();
+        await first.getByRole("link", { name: "Start an Ad Hoc Game" }).click();
+        await first.getByRole("button", { name: "Create game", exact: true }).click();
         await first.waitForURL(/\/game\/adhoc-/u);
         await waitForHealthyControllerHeader(first);
         const initialConnectionEvidence = await first.evaluate(() => {
@@ -166,7 +171,8 @@ async function run() {
         const actionSheetPage = await actionSheetContext.newPage();
         actionSheetPage.setDefaultTimeout(15_000);
         await actionSheetPage.goto(origin);
-        await actionSheetPage.getByRole("button", { name: /Start an Ad Hoc Game/ }).click();
+        await actionSheetPage.getByRole("link", { name: "Start an Ad Hoc Game" }).click();
+        await actionSheetPage.getByRole("button", { name: "Create game", exact: true }).click();
         await actionSheetPage.waitForURL(/\/game\/adhoc-/u);
         await waitForHealthyControllerHeader(actionSheetPage);
         await assertControllerActionSheet(actionSheetPage, "Ad Hoc initial Controller");
@@ -174,14 +180,16 @@ async function run() {
         let additionalGameId = "";
         for (let index = 0; index < 4; index += 1) {
           await first.goto(origin);
-          await first.getByRole("button", { name: /Start an Ad Hoc Game/ }).click();
+          await first.getByRole("link", { name: "Start an Ad Hoc Game" }).click();
+          await first.getByRole("button", { name: "Create game", exact: true }).click();
           await first.waitForURL(/\/game\/adhoc-/u);
           if (index === 0) additionalGameId = new URL(first.url()).pathname.split("/").at(-1) ?? "";
         }
         if (additionalGameId === "") throw new Error("Additional Game route had no Game ID.");
         assertSecureAdHocCookies(await firstContext.cookies(), [gameId, additionalGameId], true);
         await first.goto(origin);
-        await first.getByRole("button", { name: /Start an Ad Hoc Game/ }).click();
+        await first.getByRole("link", { name: "Start an Ad Hoc Game" }).click();
+        await first.getByRole("button", { name: "Create game", exact: true }).click();
         await first
           .getByRole("status")
           .filter({ hasText: /Retrying in/u })
@@ -447,7 +455,14 @@ async function run() {
           if (pathname.endsWith("/leave")) creationOrder.push("finalize");
         });
         await creationPage.goto(origin);
-        const startButton = creationPage.getByRole("button", { name: /Start an Ad Hoc Game/ });
+        await creationPage.getByRole("link", { name: "Start an Ad Hoc Game" }).click();
+        await creationPage.waitForURL(`${origin}/ad-hoc/new`);
+        if (creationOrder.length !== 0) throw new Error("Opening creation changed authority.");
+        await creationPage.getByRole("link", { name: "Events", exact: true }).click();
+        await creationPage.getByRole("button", { name: /Return to/ }).waitFor();
+        if (creationOrder.length !== 0) throw new Error("Leaving creation changed authority.");
+        await creationPage.getByRole("link", { name: "Start an Ad Hoc Game" }).click();
+        const startButton = creationPage.getByRole("button", { name: "Create game", exact: true });
         await startButton.click();
         await creationPage.getByRole("dialog").waitFor();
         if (creationOrder.length !== 0)
@@ -456,7 +471,7 @@ async function run() {
           );
         await creationPage.getByRole("dialog").getByRole("button", { name: "Cancel" }).click();
         await creationPage.waitForFunction(() =>
-          document.activeElement?.textContent?.includes("Start an Ad Hoc Game"),
+          document.activeElement?.textContent?.includes("Create game"),
         );
         await startButton.click();
         await creationPage.getByRole("dialog").getByRole("button", { name: "Continue" }).click();
@@ -568,7 +583,8 @@ async function run() {
         const setup = await setupContext.newPage();
         setup.setDefaultTimeout(15_000);
         await setup.goto(`${origin}/events?view=all`);
-        await setup.getByRole("button", { name: /Start an Ad Hoc Game/ }).click();
+        await setup.getByRole("link", { name: "Start an Ad Hoc Game" }).click();
+        await setup.getByRole("button", { name: "Create game", exact: true }).click();
         await setup.waitForURL(/\/game\/adhoc-/u);
         const victimGameId = new URL(setup.url()).pathname.split("/").at(-1);
         if (victimGameId === undefined)
@@ -585,7 +601,8 @@ async function run() {
         const pruner = await prunerContext.newPage();
         pruner.setDefaultTimeout(15_000);
         await pruner.goto(`${origin}/events?view=all`);
-        await pruner.getByRole("button", { name: /Start an Ad Hoc Game/ }).click();
+        await pruner.getByRole("link", { name: "Start an Ad Hoc Game" }).click();
+        await pruner.getByRole("button", { name: "Create game", exact: true }).click();
         await pruner.waitForURL(/\/game\/adhoc-/u);
         await prunerContext.close();
 
@@ -625,7 +642,8 @@ async function run() {
         const capacityPage = await capacityContext.newPage();
         capacityPage.setDefaultTimeout(15_000);
         await capacityPage.goto(`${origin}/events?view=all`);
-        await capacityPage.getByRole("button", { name: /Start an Ad Hoc Game/ }).click();
+        await capacityPage.getByRole("link", { name: "Start an Ad Hoc Game" }).click();
+        await capacityPage.getByRole("button", { name: "Create game", exact: true }).click();
         await capacityPage.getByRole("alert").waitFor();
         await capacityPage
           .getByRole("alert")
@@ -671,7 +689,7 @@ async function run() {
 try {
   await run();
 } catch (error) {
-  console.error(error instanceof Error ? error.message : error);
+  console.error(error instanceof Error ? error.stack : error);
   process.exitCode = 1;
 } finally {
   clearTimeout(lifecycleTimer);
@@ -825,10 +843,88 @@ function assertSecureAdHocCookies(
   }
 }
 
+async function exerciseDedicatedCreation() {
+  const context = await browser!.newContext({
+    ignoreHTTPSErrors: true,
+    viewport: { width: 360, height: 844 },
+  });
+  const page = await context.newPage();
+  page.setDefaultTimeout(5_000);
+  const mutations: string[] = [];
+  page.on("request", (request) => {
+    if (request.method() === "POST") mutations.push(new URL(request.url()).pathname);
+  });
+  await page.goto(`${origin}/events?view=all`);
+  await page.getByRole("link", { name: "Start an Ad Hoc Game" }).click();
+  await page.waitForURL(`${origin}/ad-hoc/new`);
+  if (
+    (await page.getByLabel("Home team", { exact: true }).inputValue()) !== "Home" ||
+    (await page.getByLabel("Away team", { exact: true }).inputValue()) !== "Away"
+  )
+    throw new Error("Creation defaults were lost.");
+  if (mutations.length) throw new Error("Opening form mutated Game authority.");
+  await page.getByRole("link", { name: "Events", exact: true }).click();
+  await page.getByRole("link", { name: "Start an Ad Hoc Game" }).click();
+  await page.getByRole("button", { name: "Create game", exact: true }).click();
+  await page.waitForURL(/\/game\/adhoc-/u);
+  await waitForHealthyControllerHeader(page);
+  await page.getByRole("button", { name: "Leave Ad Hoc Game Controller" }).click();
+  await page.getByRole("dialog").getByRole("button", { name: "Leave game", exact: true }).click();
+  await page.getByRole("button", { name: "Return to game", exact: true }).waitFor();
+  const before = mutations.length;
+  await page.getByRole("link", { name: "Start an Ad Hoc Game" }).click();
+  await page.getByRole("link", { name: "Events", exact: true }).click();
+  await page.getByRole("button", { name: "Return to game", exact: true }).waitFor();
+  await page.getByRole("link", { name: "Start an Ad Hoc Game" }).click();
+  if (mutations.length !== before) throw new Error("Form entry/exit replaced Controller return.");
+  await page.getByRole("button", { name: "Create game", exact: true }).click();
+  await page.getByRole("dialog").getByRole("button", { name: "Cancel", exact: true }).click();
+  if (mutations.length !== before) throw new Error("Cancelled creation mutated authority.");
+  await page.getByRole("button", { name: "Create game", exact: true }).click();
+  await page.getByRole("dialog").getByRole("button", { name: "Continue", exact: true }).click();
+  await page.waitForURL(/\/game\/adhoc-/u);
+  const replacement = mutations.slice(before);
+  if (
+    replacement.findIndex((path) => path.endsWith("/leave")) < 0 ||
+    replacement.at(-1) !== "/api/games"
+  )
+    throw new Error("Replacement did not finalize before creating.");
+  await page.goto(`${origin}/ad-hoc/new`);
+  await page.route("**/api/games", (route) =>
+    route.fulfill({
+      status: 503,
+      json: { error: "Ad Hoc capacity is currently full; no game was changed." },
+    }),
+  );
+  await page.getByRole("button", { name: "Create game", exact: true }).click();
+  await page.getByRole("alert").filter({ hasText: "Ad Hoc capacity is currently full" }).waitFor();
+  if (await page.getByRole("button", { name: "Create game", exact: true }).isDisabled())
+    throw new Error("Failed creation remained busy.");
+  await context.close();
+  console.log(
+    JSON.stringify({
+      status: "passed",
+      dedicatedCreation: true,
+      defaults: true,
+      successfulControllerHandoff: true,
+      returnPreservedOnEntryExit: true,
+      cancellation: true,
+      submissionTimeReplacement: true,
+      capacityFeedback: true,
+    }),
+  );
+}
+
 async function waitForHealthyControllerHeader(page: Page) {
   const header = page.getByRole("region", { name: "Controller header" });
   await header.waitFor();
-  await page.waitForFunction(() => document.querySelector("[data-controller-warning]") === null);
+  try {
+    await page.waitForFunction(() => document.querySelector("[data-controller-warning]") === null);
+  } catch (error) {
+    throw new Error(
+      `Controller header did not become healthy at ${new URL(page.url()).pathname}: ${(await header.textContent()) ?? ""}; ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
 }
 
 async function assertAccessibleQr(page: Page, stage: string) {

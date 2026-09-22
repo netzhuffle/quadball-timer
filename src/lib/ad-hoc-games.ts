@@ -1,3 +1,5 @@
+import { projectAdHocGameTimeline } from "@/lib/ad-hoc-timeline-projection";
+import type { PublicAudienceTimelineEntry } from "@/lib/game-timeline-projection";
 import { Database } from "bun:sqlite";
 import { createHash, randomBytes } from "node:crypto";
 import { chmodSync, mkdirSync } from "node:fs";
@@ -133,7 +135,13 @@ export type AdHocAccessResult =
   | { status: "unavailable"; detail: string };
 
 export type AdHocFixtureAccessResult =
-  | { status: "accepted"; gameId: string; fixtureKey: SqmFixtureKey; game: GameView }
+  | {
+      status: "accepted";
+      gameId: string;
+      fixtureKey: SqmFixtureKey;
+      game: GameView;
+      timeline: readonly PublicAudienceTimelineEntry[];
+    }
   | { status: "unavailable" };
 
 export type AdHocSubscriptionResult =
@@ -857,11 +865,13 @@ export function createAdHocGamesService(options: AdHocGamesServiceOptions = {}) 
         return { status: "unavailable" };
       }
       if (game === undefined) return { status: "unavailable" };
+      const nowMs = input.nowMs ?? now();
       return {
         status: "accepted",
         gameId: game.gameId,
         fixtureKey: input.fixtureKey,
-        game: iqaRules.project(game.state, input.nowMs ?? now()),
+        timeline: projectAdHocGameTimeline(game, iqaRules, nowMs),
+        game: iqaRules.project(game.state, nowMs),
       };
     },
 
