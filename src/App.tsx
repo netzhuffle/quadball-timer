@@ -44,6 +44,7 @@ type Route =
     }
   | {
       type: "event";
+      showSchedule?: boolean;
       eventId: string;
     }
   | {
@@ -97,7 +98,7 @@ export function App({
   }
 
   if (route.type === "event") {
-    return <PublicEventPage eventId={route.eventId} />;
+    return <PublicEventPage eventId={route.eventId} showSchedule={route.showSchedule} />;
   }
 
   if (route.type === "event-game") {
@@ -290,7 +291,11 @@ export function parseRoute(pathname: string, search: string, hash = ""): Route {
   const eventMatch = pathname.match(/^\/events\/([^/]+)$/);
   if (eventMatch !== null) {
     try {
-      return { type: "event", eventId: decodeURIComponent(eventMatch[1] ?? "") };
+      return {
+        type: "event",
+        eventId: decodeURIComponent(eventMatch[1] ?? ""),
+        ...(new URLSearchParams(search).get("view") === "schedule" ? { showSchedule: true } : {}),
+      };
     } catch {
       return { type: "home" };
     }

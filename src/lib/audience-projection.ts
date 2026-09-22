@@ -120,10 +120,14 @@ export type PublicAudienceGameProjection = PublicAudienceGameOperationalProjecti
   gameCode: string | null;
   gameDesignation: string | null;
   scheduledStartMs: number;
+  /** Actual authoritative commencement time, when recorded. */
+  startedAtMs?: number;
   expectedStartMs: number;
   scheduleStatus: PublicAudienceGameScheduleStatus;
   phase: PublicAudienceGamePhase;
   pitch: string | null;
+  /** Available Pitch for the individual Game, including single-Pitch Events. */
+  pitchName?: string;
   sideA: PublicAudienceGameSide;
   sideB: PublicAudienceGameSide;
   overtimeTarget: number | null;
@@ -190,6 +194,8 @@ export type PublicAudienceScheduleProjection = {
 export type PublicAudienceEventProjection = {
   eventId: string;
   name: string;
+  /** Optional verified navigation name; long names remain authoritative for discovery. */
+  shortName?: string;
   timeZone: string;
   publicationStatus: "published";
   gameDays: readonly string[];
@@ -428,12 +434,14 @@ function projectAudienceGameFromInput(
   const pitchSlot = snapshot.findPitchSlot(game.pitchSlotId);
   const pitch = pitchSlot === null ? null : (snapshot.findPitch(pitchSlot.pitchId)?.name ?? null);
   const multiplePitches = snapshot.listPitches(event.eventId).length > 1;
+  const startedAtMs = snapshot.findRootByEventGameId(game.eventGameId)?.lifecycle.commencedAtMs;
   return {
     eventId: event.eventId,
     eventGameId: game.eventGameId,
     gameCode: game.gameCode,
     gameDesignation: game.gameDesignation,
     scheduledStartMs: scheduledStartForGame(snapshot, game),
+    ...(startedAtMs == null ? {} : { startedAtMs }),
     expectedStartMs: game.expectedStartMs,
     scheduleStatus: classifyScheduleStatus(
       input.operationalStatus === "finished"
@@ -449,6 +457,7 @@ function projectAudienceGameFromInput(
     phase: input.phase,
     ...publicOperationalProjection(input.operationalStatus),
     pitch: multiplePitches ? pitch : null,
+    ...(pitch === null ? {} : { pitchName: pitch }),
     sideA,
     sideB,
     overtimeTarget: input.overtimeTarget,
@@ -475,7 +484,13 @@ function projectAudienceGameFromInput(
       },
     },
     canonicalPath: `/events/${encodeURIComponent(event.eventId)}/games/${encodeURIComponent(game.eventGameId)}`,
-    timeline: projectAudienceGameTimeline(snapshot, game, input.gameFacts, input.timelineState),
+    timeline: projectAudienceGameTimeline(
+      snapshot,
+      game,
+      input.gameFacts,
+      input.timelineState,
+      input.winnerGameSideId,
+    ),
     ...(input.teamAssignmentCorrected
       ? { teamAssignmentNotice: "event-team-assignment-corrected" as const }
       : {}),
@@ -628,12 +643,15 @@ function projectAudienceGameTimeline(
   game: ProjectedEventGame,
   gameFacts: LiveEventGameDerivedState["gameFacts"],
   timelineState: PublicAudienceTimelineDerivedState,
+  winnerGameSideId: string | null,
 ): readonly PublicAudienceTimelineEntry[] {
   const root = snapshot.findRootByEventGameId(game.eventGameId);
   if (root === null) return [];
   const sideAssignments = publicTimelineSideAssignments(snapshot, game, root);
   return projectPublicGameTimeline({
     facts: gameFacts,
+    commencedAtMs: root.lifecycle.commencedAtMs,
+    winnerGameSideId,
     sideA: sideAssignments.sideA,
     sideB: sideAssignments.sideB,
     lookupRosterName: (eventTeamId, playerNumber) => {

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { act } from "react";
+import { act, Profiler } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { Window } from "happy-dom";
 import { PublicEventGamePage } from "@/pages/public-event-page";
@@ -18,9 +18,29 @@ describe("public spectator Game page", () => {
   let testWindow: Window;
   let container: HTMLDivElement;
   let root: Root;
+  let contentHeight: number;
+  let currentProjection: ReturnType<typeof eventProjection>;
 
   beforeEach(() => {
+    currentProjection = eventProjection();
     testWindow = new Window({ url: "http://timer.quadball.app/events/event-1/games/game-1" });
+    contentHeight = 1100;
+    Object.defineProperty(testWindow.document.documentElement, "clientHeight", {
+      configurable: true,
+      value: 800,
+    });
+    Object.defineProperty(testWindow.HTMLElement.prototype, "offsetTop", {
+      configurable: true,
+      get() {
+        return this.hasAttribute("data-scoreboard-sentinel") ? 100 : 0;
+      },
+    });
+    Object.defineProperty(testWindow.HTMLElement.prototype, "offsetHeight", {
+      configurable: true,
+      get() {
+        return this.hasAttribute("data-scoreboard-content") ? contentHeight : 0;
+      },
+    });
     Object.assign(globalThis, {
       window: testWindow,
       document: testWindow.document,
@@ -40,7 +60,7 @@ describe("public spectator Game page", () => {
         }
       },
       fetch: async () =>
-        new Response(JSON.stringify({ status: "accepted", value: eventProjection() }), {
+        new Response(JSON.stringify({ status: "accepted", value: currentProjection }), {
           status: 200,
           headers: { "content-type": "application/json" },
         }),
@@ -71,7 +91,7 @@ describe("public spectator Game page", () => {
       originalActEnvironment;
   });
 
-  test("keeps the expanded score readable and exposes sporting freshness", async () => {
+  test("keeps the finished score readable without obsolete state or duplicate metadata", async () => {
     await act(async () => {
       root.render(<PublicEventGamePage eventId="event-1" eventGameId="game-1" />);
       await Promise.resolve();
@@ -81,17 +101,40 @@ describe("public spectator Game page", () => {
     const scoreboard = container.querySelector('[aria-label="Live scoreboard"]');
     expect(scoreboard?.className).not.toContain("sticky");
     expect(container.querySelector("[data-scoreboard-expanded]")).not.toBeNull();
-    expect(container.textContent).toContain("Winner Side A · Locked");
-    expect(container.textContent).toContain("Game Phase");
-    expect(container.textContent).toContain("Operational status");
-    expect(container.textContent).toContain("Team Timeout");
-    expect(container.textContent).toContain("Game Suspension");
-    expect(container.textContent).toContain("Heat Stoppage");
-    expect(container.textContent).toContain("Stale clock");
-    expect(container.textContent).toContain("Last synchronized:");
-    expect(container.textContent).toContain("started · 0:30 remaining");
-    expect(container.textContent).toContain("Suspended");
-    expect(container.textContent).toContain("Locked");
+    expect(container.querySelector(".daylight-status")?.textContent).toBe("Finished");
+    expect(container.querySelector(".daylight-details")).toBeNull();
+    expect(container.querySelector("header")?.textContent).not.toContain("Final");
+    expect(
+      container
+        .querySelector('header a[aria-label="Back to Event"] svg')
+        ?.getAttribute("aria-hidden"),
+    ).toBe("true");
+    expect(container.querySelector("header")?.textContent).not.toContain("←");
+    expect(container.querySelector("h1")?.textContent).toContain("Final:");
+    const announcement = container.querySelector("[data-live-projection-status]")?.textContent;
+    expect(announcement).toContain("Finished");
+    for (const obsolete of [
+      "Overtime",
+      "Suspended",
+      "Target",
+      "Locked",
+      "Winner Side A",
+      "Last synchronized:",
+    ])
+      expect(announcement).not.toContain(obsolete);
+    expect(container.querySelector("header")?.textContent).toContain("SQM 2026");
+    expect(container.querySelector("header")?.textContent).not.toContain("Published Event");
+    expect(container.querySelector('[aria-label="Game start and Pitch"]')?.textContent).toContain(
+      "Started",
+    );
+    expect(
+      container.querySelector('[aria-label="Game start and Pitch"] time')?.getAttribute("datetime"),
+    ).toBe("2026-08-16T07:32:00.000Z");
+    expect(container.querySelector('[aria-label="Game start and Pitch"]')?.textContent).toContain(
+      "09:32",
+    );
+    expect(container.textContent).not.toContain("Last synchronized:");
+    expect(container.textContent).not.toContain("Winner Side A · Locked");
     expect(container.textContent).toContain("Flag catch");
     expect(container.textContent).toContain("A Very Long Team Name That Must Wrap");
     expect(container.textContent).toContain("Another Long Team Name For A Narrow Screen");
@@ -99,7 +142,7 @@ describe("public spectator Game page", () => {
     expect(container.textContent).toContain(
       "An Event Team assignment was corrected. Current team identities are shown.",
     );
-    expect(container.querySelectorAll(".break-words").length).toBe(2);
+    expect(container.querySelectorAll("img").length).toBe(0);
     const expandedSides = Array.from(
       container.querySelectorAll("[data-scoreboard-expanded] [data-side-id]"),
     );
@@ -121,9 +164,8 @@ describe("public spectator Game page", () => {
     expect(compact?.textContent).toContain("30");
     expect(compact?.textContent).toContain("20");
     expect(compact?.textContent).toContain("2:05");
-    expect(compact?.textContent).toContain("Stale clock");
-    expect(compact?.textContent).toContain("Overtime");
-    expect(compact?.textContent).toContain("Operational status: Suspended");
+    expect(compact).toBe(scoreboard);
+    expect(compact?.querySelector(".daylight-status")?.textContent).toBe("Finished");
     expect(compact?.textContent).toContain("Flag catch");
     const compactSides = Array.from(compact?.querySelectorAll("[data-side-id]") ?? []);
     expect(compactSides.map((side) => side.getAttribute("data-side-id"))).toEqual([
@@ -132,6 +174,110 @@ describe("public spectator Game page", () => {
     ]);
     expect(compactSides[0]?.textContent).toContain("Flag catch");
     expect(compactSides[1]?.textContent).not.toContain("Flag catch");
+  });
+
+  test("preserves unfinished suspension, timeout, heat and stale-clock details and announcements", async () => {
+    currentProjection.schedule.scheduleGames[0]!.result = {
+      status: "unfinished",
+      winner: null,
+      locked: false,
+    };
+    await act(async () => {
+      root.render(<PublicEventGamePage eventId="event-1" eventGameId="game-1" />);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    for (const label of [
+      "Overtime",
+      "Suspended",
+      "Target 40",
+      "Stale clock",
+      "Team Timeout",
+      "Game Suspension",
+      "Heat Stoppage",
+      "started · 0:30 remaining",
+    ])
+      expect(container.textContent).toContain(label);
+    const announcement = container.querySelector("[data-live-projection-status]")?.textContent;
+    for (const label of ["Overtime", "Suspended", "Target 40"])
+      expect(announcement).toContain(label);
+    expect(announcement).not.toContain("Finished");
+    expect(container.textContent).not.toContain("Last synchronized:");
+    Object.defineProperty(testWindow, "scrollY", { configurable: true, value: 500 });
+    await act(async () => {
+      testWindow.dispatchEvent(new testWindow.Event("scroll"));
+    });
+    const compact = container.querySelector("[data-scoreboard-compact]");
+    for (const label of ["Overtime", "Suspended", "Target 40", "Stale clock"])
+      expect(compact?.textContent).toContain(label);
+  });
+
+  test.each(["scheduled", "running"] as const)(
+    "only warns about an unavailable clock after a Game has started (%s)",
+    async (status) => {
+      const game = currentProjection.schedule.scheduleGames[0]!;
+      game.result = { status: "unfinished", winner: null, locked: false };
+      game.operationalStatus = status;
+      game.phase = "seeker-floor";
+      game.clock = null;
+      if (status === "scheduled") delete game.startedAtMs;
+      await act(async () => {
+        root.render(<PublicEventGamePage eventId="event-1" eventGameId="game-1" />);
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      const statusText = container.querySelector(".daylight-status")?.textContent;
+      if (status === "scheduled") expect(statusText).toBe("Not started");
+      else expect(statusText).toContain("Clock unavailable");
+    },
+  );
+
+  test.each([
+    { height: 600, scroll: 500, progress: 0 },
+    { height: 1100, scroll: -200, progress: 0 },
+    { height: 1100, scroll: 190, progress: 0.5 },
+    { height: 890, scroll: 900, progress: 0.5 },
+  ])(
+    "clamps scroll to the expanded content range ($height/$scroll)",
+    async ({ height, scroll, progress }) => {
+      contentHeight = height;
+      await act(async () => {
+        root.render(<PublicEventGamePage eventId="event-1" eventGameId="game-1" />);
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      Object.defineProperty(testWindow, "scrollY", { configurable: true, value: scroll });
+      await act(async () => {
+        testWindow.dispatchEvent(new testWindow.Event("scroll"));
+        await Promise.resolve();
+      });
+      expect(
+        container.querySelector("[data-collapse-progress]")?.getAttribute("data-collapse-progress"),
+      ).toBe(String(progress));
+    },
+  );
+
+  test("does not rerender the spectator page during scoreboard scrolling", async () => {
+    let commits = 0;
+    await act(async () => {
+      root.render(
+        <Profiler id="spectator" onRender={() => commits++}>
+          <PublicEventGamePage eventId="event-1" eventGameId="game-1" />
+        </Profiler>,
+      );
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const initialCommits = commits;
+    for (const scrollY of [190, 250, 100, 500, 0])
+      await act(async () => {
+        Object.defineProperty(testWindow, "scrollY", { configurable: true, value: scrollY });
+        testWindow.dispatchEvent(new testWindow.Event("scroll"));
+      });
+    expect(commits).toBe(initialCommits);
+    expect(
+      container.querySelector("[data-collapse-progress]")?.getAttribute("data-collapse-progress"),
+    ).toBe("0");
   });
 
   test("renders Game unavailable after the Event loads without the requested Game identity", async () => {
@@ -153,6 +299,7 @@ function projection(): PublicAudienceGameProjection {
     gameCode: "A1",
     gameDesignation: "Final",
     scheduledStartMs: 1_000,
+    startedAtMs: Date.parse("2026-08-16T07:32:00Z"),
     expectedStartMs: 2_000,
     scheduleStatus: "past",
     operationalStatus: "suspended",
@@ -210,7 +357,8 @@ function eventProjection() {
   return {
     eventId: "event-1",
     name: "Published Event",
-    timeZone: "UTC",
+    shortName: "SQM 2026",
+    timeZone: "Europe/Zurich",
     publicationStatus: "published" as const,
     gameDays: ["2026-08-15"],
     lifecycle: "current" as const,

@@ -90,6 +90,7 @@ export function createSqmFixtureEvent(
   return {
     eventId: SQM_FIXTURE_EVENT_ID,
     name: SQM_FIXTURE_EVENT_NAME,
+    shortName: "SQM 2026",
     timeZone: SQM_FIXTURE_TIME_ZONE,
     publicationStatus: "published",
     gameDays: [SQM_FIXTURE_GAME_DAY],
@@ -212,7 +213,12 @@ export function createSqmFixtureGameProjection(
       },
     },
     canonicalPath: `/events/${encodeURIComponent(SQM_FIXTURE_EVENT_ID)}/games/${encodeURIComponent(definition.key)}`,
-    timeline: [],
+    // Ad Hoc fixtures have no Event Game commencement record. A positive recorded
+    // clock or running play proves start; a finish flag alone may be an unplayed forfeit.
+    timeline:
+      isHardcodedFirstGame || isRunning || (state?.gameClockMs ?? 0) > 0
+        ? [{ kind: "game-start", gameTimeMs: 0, lane: "center", teamName: null }]
+        : [],
     spectatorAvailable: isHardcodedFirstGame || gameId !== null,
   };
 }

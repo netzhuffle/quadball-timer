@@ -6,6 +6,223 @@ const sideA = { sideId: "side-a", eventTeamId: "team-a", teamName: "Blue" } as c
 const sideB = { sideId: "side-b", eventTeamId: "team-b", teamName: "Red" } as const;
 
 describe("public Game Timeline projection", () => {
+  test("phase scores use effective historical goals and preserve same-clock catch ordering", () => {
+    const facts = [
+      fact("goal", "side-b", 60_000, { points: 10 }, "first", true, 1),
+      fact("goal", "side-a", 90_000, { points: 10 }, "undone", false, 2),
+      fact("clock", null, 1_200_000, {}, "release", true, 3),
+      fact("goal", "side-b", 1_200_000, { points: 10 }, "after-release", true, 4),
+      fact("flag-catch", "side-a", 1_300_000, { points: 30 }, "catch", true, 5),
+      fact("goal", "side-b", 1_300_000, { points: 10 }, "after-catch", true, 6),
+      fact("clock", null, 1_400_000, {}, "later-clock", true, 7),
+    ];
+    const input = {
+      facts,
+      sideA,
+      sideB,
+      lookupRosterName: () => null,
+      derived: {
+        catch: { factId: "catch", gameTimeMs: 1_300_000, catchingGameSideId: "side-a" },
+        overtime: true,
+        overtimeTarget: 50,
+        result: null,
+      },
+    };
+    const timeline = projectPublicGameTimeline(input);
+    expect(timeline.find((entry) => entry.kind === "seeker-release")).toMatchObject({
+      score: { sideA: 0, sideB: 10 },
+    });
+    expect(timeline.find((entry) => entry.kind === "overtime")).toMatchObject({
+      score: { sideA: 30, sideB: 20 },
+      targetScore: 50,
+    });
+    expect(timeline.slice(0, 3).map((entry) => entry.kind)).toEqual([
+      "goal",
+      "overtime",
+      "flag-catch",
+    ]);
+    const closePlay = projectPublicGameTimeline({
+      ...input,
+      facts: facts.map((item) =>
+        item.factId === "first" ? { ...item, gameTimeMs: 1_310_000 } : item,
+      ),
+    });
+    expect(closePlay.find((entry) => entry.kind === "overtime")).toMatchObject({
+      score: { sideA: 30, sideB: 20 },
+    });
+    const corrected = projectPublicGameTimeline({
+      ...input,
+      facts: facts.map((item) => (item.factId === "first" ? { ...item, effective: false } : item)),
+    });
+    expect(corrected.find((entry) => entry.kind === "seeker-release")).toMatchObject({
+      score: { sideA: 0, sideB: 0 },
+    });
+    expect(corrected.find((entry) => entry.kind === "overtime")).toMatchObject({
+      score: { sideA: 30, sideB: 10 },
+    });
+    expect(
+      projectPublicGameTimeline({ ...input, derived: { ...input.derived, overtime: false } }).some(
+        (entry) => entry.kind === "overtime",
+      ),
+    ).toBe(false);
+  });
+
+  test("omits phase scores when scoring history cannot be placed or a catch is only a fallback", () => {
+    const input = {
+      facts: [fact("goal", "side-a", null, {}), fact("clock", null, 1_200_000, {})],
+      sideA,
+      sideB,
+      lookupRosterName: () => null,
+      derived: {
+        catch: { factId: "missing", gameTimeMs: 1_300_000, catchingGameSideId: "side-a" },
+        overtime: true,
+        overtimeTarget: 60,
+        result: null,
+      },
+    };
+    for (const entry of projectPublicGameTimeline(input)) {
+      if (entry.kind === "seeker-release" || entry.kind === "overtime")
+        expect(entry.score).toBeNull();
+    }
+  });
+
+  test("centers finish entries on the authoritative winner rather than the action side", () => {
+    for (const outcome of ["result", "concession", "forfeit"] as const) {
+      const timeline = projectPublicGameTimeline({
+        facts: [fact(outcome, "side-a", 1_323_000, { resultKind: outcome })],
+        sideA,
+        sideB,
+        winnerGameSideId: "side-b",
+        lookupRosterName: () => null,
+        derived: { catch: null, overtime: false, overtimeTarget: null, result: null },
+      });
+      expect(timeline).toEqual([
+        {
+          kind: "finish",
+          outcome,
+          resultKind: outcome,
+          gameTimeMs: 1_323_000,
+          lane: "center",
+          teamName: "Red",
+        },
+      ]);
+    }
+  });
+
+  test("resolves automatic finish and corrected winners without exposing an old winner", () => {
+    const input = {
+      facts: [fact("goal", "side-a", 1_323_000, { points: 10 }, "winning-goal")],
+      sideA,
+      sideB,
+      lookupRosterName: () => null,
+      derived: {
+        catch: null,
+        overtime: false,
+        overtimeTarget: null,
+        result: { factId: "winning-goal" },
+      },
+    };
+    expect(
+      projectPublicGameTimeline({ ...input, winnerGameSideId: "side-a" }).find(
+        (entry) => entry.kind === "finish",
+      ),
+    ).toMatchObject({ teamName: "Blue", lane: "center" });
+    expect(
+      projectPublicGameTimeline({ ...input, winnerGameSideId: "side-b" }).filter(
+        (entry) => entry.kind === "finish",
+      ),
+    ).toEqual([
+      {
+        kind: "finish",
+        gameTimeMs: 1_323_000,
+        lane: "center",
+        teamName: "Red",
+        outcome: "result",
+        resultKind: null,
+      },
+    ]);
+  });
+
+  test("does not invent a winner for ties, double forfeits or unavailable result ownership", () => {
+    for (const winnerGameSideId of [null, undefined, "unknown-side"]) {
+      const timeline = projectPublicGameTimeline({
+        facts: [fact("result", "side-a", 1_323_000, { resultKind: "tie" })],
+        sideA,
+        sideB,
+        winnerGameSideId,
+        lookupRosterName: () => null,
+        derived: { catch: null, overtime: false, overtimeTarget: null, result: null },
+      });
+      expect(timeline[0]).toMatchObject({ kind: "finish", lane: "center", teamName: null });
+    }
+    const doubleForfeit = projectPublicGameTimeline({
+      facts: [fact("double-forfeit", "side-a", 1_323_000, {})],
+      sideA,
+      sideB,
+      winnerGameSideId: null,
+      lookupRosterName: () => null,
+      derived: { catch: null, overtime: false, overtimeTarget: null, result: null },
+    });
+    expect(doubleForfeit[0]).toMatchObject({ kind: "finish", lane: "center", teamName: null });
+  });
+
+  test("shows one centered start at zero only after authoritative commencement", () => {
+    const input = {
+      facts: [],
+      sideA,
+      sideB,
+      lookupRosterName: () => null,
+      derived: { catch: null, overtime: false, overtimeTarget: null, result: null },
+    };
+    expect(projectPublicGameTimeline(input)).toEqual([]);
+    expect(projectPublicGameTimeline({ ...input, commencedAtMs: null })).toEqual([]);
+    expect(projectPublicGameTimeline({ ...input, commencedAtMs: 12345 })).toEqual([
+      { kind: "game-start", gameTimeMs: 0, lane: "center", teamName: null },
+    ]);
+    // Even a clock tap or an unplayed forfeit cannot substitute for commencement.
+    expect(
+      projectPublicGameTimeline({
+        ...input,
+        facts: [
+          fact("clock", null, 0, { command: "set-running", running: true }),
+          fact("forfeit", "side-a", 0, {}),
+        ],
+      }).some((entry) => entry.kind === "game-start"),
+    ).toBe(false);
+    const played = projectPublicGameTimeline({
+      ...input,
+      commencedAtMs: 12345,
+      facts: [fact("goal", "side-a", 0, { points: 10 })],
+    });
+    expect(played.map((entry) => entry.kind)).toEqual(["goal", "game-start"]);
+  });
+
+  test("omits routine clock controls while retaining meaningful stoppages and phase effects", () => {
+    const facts = [
+      fact("clock", null, 1_200_000, { command: "set-running", running: false }, "pause"),
+      fact("clock", null, 1_210_000, { command: "set-running", running: true }, "resume"),
+      fact("timeout", "side-a", 1_200_000, { timeoutAction: "start" }),
+      fact("suspension", null, 1_200_000, { suspensionAction: "resume" }),
+      fact("heat-stoppage", null, 1_200_000, { heatAction: "end" }),
+    ];
+    const original = structuredClone(facts);
+    const timeline = projectPublicGameTimeline({
+      facts,
+      sideA,
+      sideB,
+      lookupRosterName: () => null,
+      derived: { catch: null, overtime: false, overtimeTarget: null, result: null },
+    });
+    expect(timeline.map((entry) => entry.kind).sort()).toEqual([
+      "heat-stoppage",
+      "seeker-release",
+      "suspension",
+      "timeout",
+    ]);
+    expect(timeline.find((entry) => entry.kind === "seeker-release")?.gameTimeMs).toBe(1_200_000);
+    expect(facts).toEqual(original);
+  });
+
   test("projects every registered public kind, including penalty consequences and player data", () => {
     const facts = [
       fact("goal", "side-a", 1_000, { points: 10, playerNumber: 3 }),

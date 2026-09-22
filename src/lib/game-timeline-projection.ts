@@ -7,6 +7,7 @@ import {
 import { parseLivePenaltyPlayerKey } from "@/lib/live-event-penalties";
 
 export type PublicAudienceTimelineKind =
+  | "game-start"
   | "goal"
   | "card"
   | "penalty"
@@ -31,11 +32,16 @@ type PublicAudienceTimelineEntryBase = {
   teamName: string | null;
 };
 
+export type PublicAudienceTimelineScore = { sideA: number; sideB: number };
+
+type PhaseScore = { score?: PublicAudienceTimelineScore | null };
+
 type PlayerBearingEntry = PublicAudienceTimelineEntryBase & {
   player: PublicAudienceTimelinePlayer | null;
 };
 
 export type PublicAudienceTimelineEntry =
+  | (PublicAudienceTimelineEntryBase & { kind: "game-start" })
   | (PlayerBearingEntry & { kind: "goal"; points: number })
   | (PlayerBearingEntry & {
       kind: "card";
@@ -51,9 +57,10 @@ export type PublicAudienceTimelineEntry =
   | (PublicAudienceTimelineEntryBase & { kind: "timeout"; action: string | null })
   | (PublicAudienceTimelineEntryBase & { kind: "suspension"; action: string | null })
   | (PublicAudienceTimelineEntryBase & { kind: "heat-stoppage"; action: string | null })
-  | (PublicAudienceTimelineEntryBase & { kind: "seeker-release" })
+  | (PublicAudienceTimelineEntryBase & PhaseScore & { kind: "seeker-release" })
   | (PlayerBearingEntry & { kind: "flag-catch"; points: number })
-  | (PublicAudienceTimelineEntryBase & { kind: "overtime"; targetScore: number | null })
+  | (PublicAudienceTimelineEntryBase &
+      PhaseScore & { kind: "overtime"; targetScore: number | null })
   | (PublicAudienceTimelineEntryBase & {
       kind: "finish";
       outcome: "result" | "concession" | "forfeit" | "double-forfeit";
@@ -68,6 +75,8 @@ export type PublicAudienceTimelineSide = {
 
 export type PublicAudienceTimelineProjectionInput = {
   facts: readonly ControllerGameFact[];
+  commencedAtMs?: number | null;
+  winnerGameSideId?: string | null;
   sideA: PublicAudienceTimelineSide;
   sideB: PublicAudienceTimelineSide;
   lookupRosterName: (eventTeamId: string, playerNumber: number) => string | null;
@@ -119,11 +128,28 @@ export function projectPublicGameTimeline(
     [input.sideA.sideId, { ...input.sideA, lane: "side-a" as const }],
     [input.sideB.sideId, { ...input.sideB, lane: "side-b" as const }],
   ]);
+  // Result ownership comes from the authoritative effective result, not the
+  // finishing action's side (which may be the conceding or forfeiting team).
+  const winningTeamName =
+    input.winnerGameSideId == null
+      ? null
+      : (sideById.get(input.winnerGameSideId)?.teamName ?? null);
   const effectiveFacts = orderControllerGameFacts(input.facts).filter((fact) => fact.effective);
   const penaltyReasons = penaltyReasonsByCard(effectiveFacts);
   const entries: OrderedTimelineEntry[] = [];
+  if (input.commencedAtMs !== null && input.commencedAtMs !== undefined) {
+    addEntry(
+      entries,
+      { kind: "game-start", gameTimeMs: 0, lane: "center", teamName: null },
+      -1,
+      -1,
+      -1,
+    );
+  }
 
   effectiveFacts.forEach((fact, sequence) => {
+    // Routine pause/resume stays in private clock evidence. Phase synthesis below
+    // still uses those facts; meaningful timeout/suspension/heat events remain public.
     if (fact.factType === "clock" || fact.factType === "penalty-reason") return;
     if (!PUBLIC_FACT_TYPES.has(fact.factType)) return;
 
@@ -187,8 +213,8 @@ export function projectPublicGameTimeline(
           {
             ...common,
             kind: "finish",
-            lane: fact.factType === "double-forfeit" ? "center" : common.lane,
-            teamName: fact.factType === "double-forfeit" ? null : common.teamName,
+            lane: "center",
+            teamName: fact.factType === "double-forfeit" ? null : winningTeamName,
             outcome: fact.factType,
             resultKind: stringValue(data?.resultKind),
           },
@@ -258,7 +284,7 @@ export function projectPublicGameTimeline(
     }
   });
 
-  const seekerRelease = synthesizeSeekerRelease(effectiveFacts);
+  const seekerRelease = synthesizeSeekerRelease(effectiveFacts, input);
   if (seekerRelease !== null) entries.push(seekerRelease);
 
   if (input.derived.catch !== null && !entries.some((entry) => entry.kind === "flag-catch")) {
@@ -299,6 +325,17 @@ export function projectPublicGameTimeline(
           lane: "center",
           teamName: null,
           targetScore: input.derived.overtimeTarget ?? null,
+          score: effectiveFacts.some(
+            (fact) => fact.factType === "flag-catch" && fact.factId === input.derived.catch?.factId,
+          )
+            ? historicalScore(
+                effectiveFacts,
+                input,
+                input.derived.catch.gameTimeMs,
+                catchEntry.canonicalFactOrder,
+                true,
+              )
+            : null,
         },
         catchEntry.canonicalFactOrder,
         catchEntry.synchronizationOrder,
@@ -310,14 +347,13 @@ export function projectPublicGameTimeline(
   if (input.derived.result !== null && !entries.some((entry) => entry.kind === "finish")) {
     const resultFact = effectiveFacts.find((fact) => fact.factId === input.derived.result?.factId);
     if (resultFact !== undefined) {
-      const side = resultFact.gameSideId === null ? undefined : sideById.get(resultFact.gameSideId);
       addEntry(
         entries,
         {
           kind: "finish",
           gameTimeMs: resultFact.gameTimeMs,
-          lane: side?.lane ?? "center",
-          teamName: side?.teamName ?? null,
+          lane: "center",
+          teamName: winningTeamName,
           outcome: "result",
           resultKind: stringValue(recordData(resultFact.data)?.resultKind),
         },
@@ -343,8 +379,9 @@ export function projectPublicGameTimeline(
 
 function synthesizeSeekerRelease(
   effectiveFacts: readonly ControllerGameFact[],
+  input: PublicAudienceTimelineProjectionInput,
 ): OrderedTimelineEntry | null {
-  const source = effectiveFacts.findLast(
+  const source = effectiveFacts.find(
     (fact) =>
       fact.factType === "clock" &&
       fact.gameTimeMs !== null &&
@@ -353,6 +390,12 @@ function synthesizeSeekerRelease(
   if (source === undefined || source.gameTimeMs === null) return null;
   return {
     kind: "seeker-release",
+    score: historicalScore(
+      effectiveFacts,
+      input,
+      SEEKER_RELEASE_GAME_TIME_MS,
+      effectiveFacts.indexOf(source),
+    ),
     gameTimeMs: SEEKER_RELEASE_GAME_TIME_MS,
     lane: "center",
     teamName: null,
@@ -361,6 +404,38 @@ function synthesizeSeekerRelease(
     synchronizationOrder: source.synchronizationOrder,
     sequence: effectiveFacts.indexOf(source),
   };
+}
+
+/** Reconstruct the effective score at a phase boundary, never from the final scoreboard. */
+function historicalScore(
+  facts: readonly ControllerGameFact[],
+  input: PublicAudienceTimelineProjectionInput,
+  gameTimeMs: number | null,
+  boundaryOrder: number,
+  useSportingOrder = false,
+): PublicAudienceTimelineScore | null {
+  if (gameTimeMs === null) return null;
+  const score = { sideA: 0, sideB: 0 };
+  for (const [index, fact] of facts.entries()) {
+    if (fact.factType !== "goal" && fact.factType !== "flag-catch") continue;
+    if (useSportingOrder) {
+      if (index > boundaryOrder) continue;
+    } else {
+      if (fact.gameTimeMs === null) return null;
+      if (fact.gameTimeMs > gameTimeMs || (fact.gameTimeMs === gameTimeMs && index > boundaryOrder))
+        continue;
+    }
+    const side =
+      fact.gameSideId === input.sideA.sideId
+        ? "sideA"
+        : fact.gameSideId === input.sideB.sideId
+          ? "sideB"
+          : null;
+    if (side === null) return null;
+    score[side] +=
+      numberValue(recordData(fact.data)?.points) ?? (fact.factType === "goal" ? 10 : 30);
+  }
+  return score;
 }
 
 function penaltyReasonsByCard(facts: readonly ControllerGameFact[]): Map<string, string> {

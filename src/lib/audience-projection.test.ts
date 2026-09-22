@@ -281,7 +281,11 @@ describe("Audience Publication Projection", () => {
       overtimeTarget: 70,
       presentation: { displayedTeamColors: { sideA: "#123abc", sideB: "#456def" } },
     });
-    expect(corrected?.timeline.map((entry) => entry.kind)).toEqual(["overtime", "flag-catch"]);
+    expect(corrected?.timeline.map((entry) => entry.kind)).toEqual([
+      "overtime",
+      "flag-catch",
+      "game-start",
+    ]);
     expect(ordinary).not.toHaveProperty("teamAssignmentNotice");
     expect(JSON.stringify(result.value)).not.toContain("private-correction-operation");
     expect(JSON.stringify(result.value)).not.toContain("private-interpretation");
@@ -509,7 +513,11 @@ describe("Audience Publication Projection", () => {
     });
     if (afterReopen.status !== "accepted") return;
     expect(afterReopen.value.timeline).toEqual(beforeReopen.value.timeline);
-    expect(afterReopen.value.timeline.map((entry) => entry.kind)).toEqual(["finish", "goal"]);
+    expect(afterReopen.value.timeline.map((entry) => entry.kind)).toEqual([
+      "finish",
+      "goal",
+      "game-start",
+    ]);
     const serialized = JSON.stringify(afterReopen.value);
     expect(serialized).not.toContain("locked-game-correction");
     expect(serialized).not.toContain("game-reopening");
@@ -536,6 +544,10 @@ describe("Audience Publication Projection", () => {
       games,
       roots,
       actions: (root) => [createOutcomeAction(root, outcomeByGame[root.eventGameId]!)],
+      eventTeams: [
+        eventTeam("team-a", "event-schedule", "Blue"),
+        eventTeam("team-b", "event-schedule", "Red"),
+      ],
     });
     const audience = createAudienceProjection(
       { snapshot: async () => snapshot } as unknown as EventCatalogFoundationStorage,
@@ -550,6 +562,13 @@ describe("Audience Publication Projection", () => {
         (game) => game.timeline.find((entry) => entry.kind === "finish")?.outcome,
       ),
     ).toEqual(["concession", "forfeit", "double-forfeit"]);
+    for (const game of result.value.schedule.scheduleGames.slice(0, 2)) {
+      expect(game.result.winner).toBe("side-b");
+      expect(game.timeline.find((entry) => entry.kind === "finish")).toMatchObject({
+        lane: "center",
+        teamName: game.sideB.name,
+      });
+    }
     expect(result.value.schedule.scheduleGames[2]?.timeline).toContainEqual(
       expect.objectContaining({ kind: "finish", lane: "center", teamName: null }),
     );
@@ -689,6 +708,7 @@ describe("Audience Publication Projection", () => {
               scheduledStartMs: Date.parse("2026-08-14T10:30:00.000Z"),
               expectedStartMs: Date.parse("2026-08-14T10:30:00.000Z"),
               pitch: null,
+              pitchName: "Pitch 1",
             },
           ],
         },
@@ -706,6 +726,7 @@ describe("Audience Publication Projection", () => {
               scheduledStartMs: Date.parse("2026-08-14T10:30:00.000Z"),
               expectedStartMs: Date.parse("2026-08-14T10:50:00.000Z"),
               pitch: null,
+              pitchName: "Pitch 1",
             },
           ],
         },
@@ -835,6 +856,7 @@ describe("Audience Publication Projection", () => {
       value: {
         eventId: "sqm-2026",
         name: "Schweizer Quadball Meisterschaft 2026",
+        shortName: "SQM 2026",
         timeZone: "Europe/Zurich",
         gameDays: ["2026-08-16"],
         lifecycle: "current",
@@ -855,6 +877,7 @@ describe("Audience Publication Projection", () => {
                 score: 140,
               },
               clock: { gameTimeMs: 1_360_000 },
+              timeline: [{ kind: "game-start", gameTimeMs: 0, lane: "center", teamName: null }],
               spectatorAvailable: true,
             },
             {
@@ -926,6 +949,7 @@ describe("Audience Publication Projection", () => {
         sideA: { score: 40 },
         sideB: { score: 140 },
         clock: { gameTimeMs: 1_360_000 },
+        timeline: [{ kind: "game-start", gameTimeMs: 0, lane: "center", teamName: null }],
       },
     });
     const accepted = await audience.readGame("sqm-2026", "secret2");
@@ -938,6 +962,17 @@ describe("Audience Publication Projection", () => {
         sideB: { name: "Berner Boggarts", color: "#7f1d1d" },
       },
     });
+    if (accepted.status === "accepted") expect(accepted.value.timeline).toEqual([]);
+    game.state.isFinished = true;
+    const unplayedFinish = await audience.readGame("sqm-2026", "secret2");
+    if (unplayedFinish.status !== "accepted") throw new Error("Fixture unavailable");
+    expect(unplayedFinish.value.timeline).toEqual([]);
+    game.state.gameClockMs = 60_000;
+    const playedFinish = await audience.readGame("sqm-2026", "secret2");
+    if (playedFinish.status !== "accepted") throw new Error("Fixture unavailable");
+    expect(playedFinish.value.timeline).toEqual([
+      { kind: "game-start", gameTimeMs: 0, lane: "center", teamName: null },
+    ]);
     expect(await audience.readGame("sqm-2026", "secret3")).toEqual({ status: "unavailable" });
   });
 
@@ -1420,15 +1455,47 @@ describe("Audience Publication Projection", () => {
         name: "running",
         projection: createAudienceControllerProjection({
           clock: createAudienceClock({ running: true, synchronization: "synchronized" }),
+          gameFacts: [
+            {
+              factId: "routine-clock",
+              factType: "clock",
+              gameSideId: null,
+              gameTimeMs: 12000,
+              sportingOrder: 1,
+              synchronizationOrder: 1,
+              effective: true,
+              data: { command: "set-running", running: true },
+            },
+          ],
         }),
-        expected: { scheduleStatus: "running", operationalStatus: "running" },
+        expected: {
+          scheduleStatus: "running",
+          operationalStatus: "running",
+          timeline: [{ kind: "game-start", gameTimeMs: 0, lane: "center", teamName: null }],
+        },
       },
       {
         name: "paused-stale",
         projection: createAudienceControllerProjection({
           clock: createAudienceClock({ synchronization: "stale" }),
+          gameFacts: [
+            {
+              factId: "routine-clock",
+              factType: "clock",
+              gameSideId: null,
+              gameTimeMs: 12000,
+              sportingOrder: 1,
+              synchronizationOrder: 1,
+              effective: true,
+              data: { command: "set-running", running: false },
+            },
+          ],
         }),
-        expected: { operationalStatus: "paused", clock: { synchronization: "stale" } },
+        expected: {
+          operationalStatus: "paused",
+          clock: { synchronization: "stale" },
+          timeline: [{ kind: "game-start", gameTimeMs: 0, lane: "center", teamName: null }],
+        },
       },
       {
         name: "paused-estimated",

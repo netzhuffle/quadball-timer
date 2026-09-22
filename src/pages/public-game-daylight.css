@@ -1,0 +1,113 @@
+@import '../components/daylight.css';
+.daylight-game { overflow-anchor:none; font-family: var(--font-daylight); color:#10213f; background:#fbfcfd; max-width:880px; min-height:100vh; margin:auto; padding-bottom:32px; }
+.daylight-game a:focus-visible { outline:3px solid #1261c9; outline-offset:4px; }
+.daylight-game-header { display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:16px; padding:22px 20px; border-bottom:1px solid #d8e0e9; }
+.daylight-game-header a { display:flex; gap:12px; align-items:center; font-size:24px; font-weight:700; text-decoration:none; min-width:0; }
+.daylight-game-header a > span:last-child { min-width:0; overflow-wrap:anywhere; }
+.daylight-game-header a > svg { flex-shrink:0; }
+.daylight-pitch { border:1px solid #bac7d6; border-radius:5px; padding:5px 8px; font-size:16px; max-width:100%; overflow-wrap:anywhere; }
+.daylight-arena { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); position:relative; overflow:hidden; }
+.daylight-side { min-width:0; display:flex; align-items:center; flex-direction:column; padding:20px 18px 14px; background:var(--team-color); color:var(--team-ink); position:relative; isolation:isolate; }
+.daylight-side::before { content:''; position:absolute; inset:0; z-index:-1; background:repeating-linear-gradient(135deg,transparent 0 22px,#ffffff12 23px,transparent 24px); }
+.daylight-team-art { width:88px; height:88px; object-fit:contain; flex-shrink:0; }
+.daylight-initials { display:grid; place-items:center; border:2px solid currentColor; border-radius:50%; font-size:32px; font-weight:700; }
+.daylight-team-name { text-align:center; text-transform:uppercase; font-size:22px; font-weight:700; line-height:1.12; overflow-wrap:anywhere; margin-top:10px; width:100%; }
+.daylight-score { font-size:76px; font-weight:800; line-height:1; font-variant-numeric:tabular-nums; margin-top:10px; white-space:nowrap; }
+.daylight-score sup { font-size:.48em; position:relative; vertical-align:top; top:.13em; line-height:1; }
+.daylight-clock { position:absolute; left:50%; top:18px; transform:translateX(-50%); padding:3px 10px; background:#fbfcfd; color:#10213f; border-radius:4px; text-align:center; font-weight:700; font-size:32px; line-height:1.1; font-variant-numeric:tabular-nums; }
+.daylight-status { display:flex; justify-content:center; flex-wrap:wrap; gap:8px 20px; padding:12px; border-bottom:1px solid #d8e0e9; font-size:17px; font-weight:700; text-transform:uppercase; }
+.daylight-meta { padding:10px 18px; color:#50617a; font-size:14px; display:flex; flex-wrap:wrap; gap:4px 14px; border-bottom:1px solid #d8e0e9; }
+.daylight-details { margin:0; padding:8px 18px; display:flex; flex-wrap:wrap; gap:6px 18px; font-size:14px; }
+.daylight-details > div { display:flex; gap:5px; }
+.daylight-details dt { color:#50617a; }
+.daylight-history { padding:16px 18px; }
+.daylight-history > h2 { font-weight:700; text-transform:uppercase; font-size:20px; margin-bottom:12px; }
+@media(min-width:600px) { .daylight-side { padding:24px 70px; } .daylight-team-art { width:112px;height:112px; } .daylight-team-name { font-size:30px; } .daylight-score {font-size:110px;} .daylight-clock {top:90px;font-size:54px;} }
+@media(max-width:420px) { .daylight-team-art {width:68px;height:68px;} .daylight-side {padding:18px 22px 12px;} .daylight-clock {font-size:25px;top:20px;padding:4px;} .daylight-team-name {font-size:19px;} .daylight-score {font-size:64px;} }
+/* Keep the clock between the opposing identity/score columns, as in Daylight Arena. */
+.daylight-arena .daylight-side:first-child > * { align-self:center; }
+.daylight-arena .daylight-side:nth-child(2) > * { align-self:center; }
+.daylight-arena .daylight-team-name { width:68%; }
+.daylight-arena .daylight-clock { top:112px; font-size:44px; background:transparent; color:white; text-shadow:0 1px 3px #10213f, 0 0 2px #10213f; }
+@media(min-width:600px) { .daylight-arena .daylight-clock {top:150px;font-size:68px;} }
+.daylight-arena .daylight-score { margin-top:auto; padding-top:10px; }
+@media(max-width:599px) {
+  .daylight-arena .daylight-team-name { width:82%; }
+  .daylight-arena .daylight-clock { font-size:40px; }
+}
+/* The artwork row reserves the center for the clock. Names have their own row,
+   so real names can wrap without ever sharing the clock's vertical space. */
+.daylight-arena .daylight-clock { top:30px; }
+.daylight-arena .daylight-team-name { width:100%; }
+@media(min-width:600px) { .daylight-arena .daylight-clock { top:64px; } }
+
+.daylight-start-strip { display:flex; flex-wrap:wrap; justify-content:center; gap:4px 18px; padding:8px 14px; border-bottom:1px solid #d8e0e9; color:#50617a; font-size:15px; font-weight:600; }
+
+/* One scoreboard keeps its identity while its layout contracts with page scroll. */
+.daylight-morph-scoreboard { position:sticky; top:env(safe-area-inset-top, 0px); z-index:30; background:#fbfcfd; isolation:isolate; }
+.daylight-morph-scoreboard .daylight-side { padding:calc(18px - 12px * var(--score-collapse)) calc(22px - 8px * var(--score-collapse)) calc(12px - 6px * var(--score-collapse)); }
+.daylight-morph-scoreboard .daylight-team-art { width:calc(68px - 36px * var(--score-collapse)); height:calc(68px - 36px * var(--score-collapse)); font-size:calc(28px - 14px * var(--score-collapse)); }
+.daylight-morph-scoreboard .daylight-team-name { font-size:calc(19px - 7px * var(--score-collapse)); margin-top:calc(10px * (1 - var(--score-collapse))); max-height:calc(150px * (1 - var(--score-collapse))); opacity:calc(1 - var(--score-collapse)); overflow:hidden; }
+.daylight-morph-scoreboard .daylight-score { font-size:calc(64px - 26px * var(--score-collapse)); padding-top:calc(10px - 6px * var(--score-collapse)); }
+.daylight-morph-scoreboard .daylight-clock { top:calc(30px - 4px * var(--score-collapse)); font-size:calc(40px - 14px * var(--score-collapse)); }
+.daylight-morph-scoreboard .daylight-start-strip, .daylight-morph-scoreboard .daylight-meta { max-height:calc(140px * (1 - var(--score-collapse))); padding-top:calc(8px * (1 - var(--score-collapse))); padding-bottom:calc(8px * (1 - var(--score-collapse))); opacity:calc(1 - var(--score-collapse)); overflow:hidden; border-bottom-width:calc(1px * (1 - var(--score-collapse))); }
+.daylight-morph-scoreboard .daylight-status { padding:calc(12px - 8px * var(--score-collapse)); gap:4px 14px; font-size:calc(17px - 4px * var(--score-collapse)); }
+.daylight-score-return { position:absolute; inset:0; z-index:2; cursor:pointer; background:transparent; border:0; }
+.daylight-score-return:focus-visible { outline:3px solid #1261c9; outline-offset:-3px; }
+@media(min-width:600px) {
+  .daylight-morph-scoreboard .daylight-side { padding:calc(24px - 18px * var(--score-collapse)) calc(70px - 48px * var(--score-collapse)); }
+  .daylight-morph-scoreboard .daylight-team-art { width:calc(112px - 80px * var(--score-collapse)); height:calc(112px - 80px * var(--score-collapse)); }
+  .daylight-morph-scoreboard .daylight-team-name { font-size:calc(30px - 18px * var(--score-collapse)); }
+  .daylight-morph-scoreboard .daylight-score { font-size:calc(110px - 72px * var(--score-collapse)); }
+  .daylight-morph-scoreboard .daylight-clock { top:calc(64px - 38px * var(--score-collapse)); font-size:calc(68px - 42px * var(--score-collapse)); }
+}
+
+.daylight-morph-scoreboard .daylight-clock-freshness { font-size:12px; font-weight:400; text-transform:none; flex-basis:100%; text-align:center; color:#50617a; }
+
+/* Reserve the measured name footprint so changing line wraps cannot snap scores. */
+.daylight-morph-scoreboard .daylight-team-name {
+  height: calc(var(--expanded-name-height) * (1 - 7 / 19 * var(--score-collapse)));
+  flex-shrink: 0;
+}
+@media (min-width: 600px) {
+  .daylight-morph-scoreboard .daylight-team-name {
+    height: calc(var(--expanded-name-height) * (1 - 18 / 30 * var(--score-collapse)));
+  }
+}
+
+@property --score-collapse {
+  syntax: "<number>";
+  inherits: true;
+  initial-value: 0;
+}
+@keyframes scoreboard-scroll-morph {
+  from { --score-collapse: 0; }
+  to { --score-collapse: 1; }
+}
+.daylight-morph-scoreboard[data-scoreboard-native-scroll] {
+  animation: scoreboard-scroll-morph linear both;
+  animation-timeline: scroll(root);
+  animation-range: var(--score-collapse-start) var(--score-collapse-end);
+}
+.daylight-morph-scoreboard:not([data-scoreboard-compact]) .daylight-score-return {
+  display: none;
+}
+@media (prefers-reduced-motion: reduce) {
+  .daylight-morph-scoreboard[data-scoreboard-native-scroll] { animation: none; }
+}
+
+/* Reserve one stable row for the expanded scoreboard. Its sticky grid area spans
+   the complete history, while the timeline never participates in the morph. */
+.daylight-scoreboard-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: var(--scoreboard-expanded-height, auto) auto;
+}
+.daylight-scoreboard-layout > .daylight-morph-scoreboard {
+  grid-area: 1 / 1 / 3 / 2;
+  align-self: start;
+}
+.daylight-scoreboard-layout > [data-scoreboard-content] {
+  grid-area: 2 / 1 / 3 / 2;
+  min-width: 0;
+}

@@ -1,8 +1,14 @@
+import "@/pages/public-game-daylight.css";
+import { PublicTeamArtwork } from "@/components/public-team-artwork";
+import { parseHexColor } from "@/lib/team-colors";
+import type { CSSProperties } from "react";
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader } from "@/components/ui/card";
+import { Card, CardContent, CardHeader, CardDescription } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { ArrowLeft, CalendarDays } from "lucide-react";
+import "./public-event-daylight.css";
 import { getAdHocBrowserId } from "@/lib/ad-hoc-handoff";
 import type {
   PublicAudienceEventProjection,
@@ -41,7 +47,7 @@ export function PublicEventHomePage({ showAll = false }: { showAll?: boolean }) 
         if (!active) return;
         const current = nextEvents.filter((event) => event.lifecycle === "current");
         if (!showAll && current.length === 1 && departureModule.project().status !== "returnable") {
-          navigateTo(current[0]!.canonicalPath);
+          navigateTo(publicEventEntryPath(current[0]!));
           return;
         }
         setEvents(nextEvents);
@@ -92,8 +98,35 @@ export function PublicEventHomePage({ showAll = false }: { showAll?: boolean }) 
   );
 }
 
-export function PublicEventPage({ eventId }: { eventId: string }) {
+function eventScheduledToday(event: PublicAudienceEventProjection): boolean {
+  const today = new Intl.DateTimeFormat("en-CA", {
+    timeZone: event.timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(Date.now());
+  return event.gameDays.includes(today);
+}
+
+function publicEventEntryPath(event: PublicAudienceEventProjection): string {
+  return eventScheduledToday(event) ? event.canonicalPath : `${event.canonicalPath}?view=schedule`;
+}
+
+export function PublicEventPage({
+  eventId,
+  showSchedule = false,
+}: {
+  eventId: string;
+  showSchedule?: boolean;
+}) {
   const { event, unavailable, connectionStatus } = usePublicEventProjection(eventId);
+  const scheduledToday = event !== null && eventScheduledToday(event);
+  const scheduleView = showSchedule || !scheduledToday;
+  useEffect(() => {
+    if (event === null || scheduledToday || showSchedule) return;
+    window.history.replaceState(null, "", `${event.canonicalPath}?view=schedule`);
+    window.dispatchEvent(new PopStateEvent("popstate"));
+  }, [event, scheduledToday, showSchedule]);
 
   if (unavailable) return <UnavailablePanel />;
   if (event === null) {
@@ -112,67 +145,70 @@ export function PublicEventPage({ eventId }: { eventId: string }) {
   const schedule = event.schedule;
 
   return (
-    <PublicShell title={event.name} description={`Published Event · ${event.timeZone}`}>
-      <div className="space-y-4">
+    <div className="daylight-event">
+      <a
+        href="#main-content"
+        className="sr-only focus:not-sr-only focus:absolute focus:top-4 focus:left-4 z-50"
+      >
+        Skip to main content
+      </a>
+      <header
+        className={`event-heading ${scheduleView && scheduledToday ? "event-schedule-heading" : ""}`}
+      >
+        <EventNavigationLink
+          href={scheduleView && scheduledToday ? event.canonicalPath : "/events?view=all"}
+          className="event-back"
+        >
+          <ArrowLeft size={18} aria-hidden="true" />
+          {scheduleView && scheduledToday
+            ? ((event as PublicAudienceEventProjection & { shortName?: string }).shortName ??
+              event.name)
+            : "All events"}
+        </EventNavigationLink>
+        {!scheduleView || !scheduledToday ? (
+          <h1>
+            {(event as PublicAudienceEventProjection & { shortName?: string }).shortName ??
+              event.name}
+          </h1>
+        ) : (
+          <h1 className="sr-only">Event schedule</h1>
+        )}
+        <p>
+          {event.gameDays
+            .map((date) =>
+              new Intl.DateTimeFormat(undefined, {
+                weekday: "long",
+                day: "numeric",
+                month: "long",
+                year: "numeric",
+                timeZone: "UTC",
+              }).format(new Date(`${date}T12:00:00Z`)),
+            )
+            .join(" · ")}
+        </p>
+        {scheduledToday ? (
+          <EventNavigationLink
+            href={`${event.canonicalPath}?view=schedule`}
+            className="event-calendar"
+            label="View Event schedule"
+          >
+            <CalendarDays aria-hidden="true" size={23} />
+          </EventNavigationLink>
+        ) : null}
+      </header>
+      <main id="main-content" tabIndex={-1}>
         {event.teamAssignmentNotice !== undefined ? <TeamAssignmentCorrectionNotice /> : null}
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <p className="text-sm text-muted-foreground">{lifecycleLabel(event.lifecycle)}</p>
-          <Button variant="outline" onClick={() => navigateTo("/events?view=all")}>
-            All events
-          </Button>
-        </div>
         <LiveProjectionStatus status={connectionStatus} message={eventAnnouncement(event)} />
-        <ScheduleBoard schedule={schedule} timeZone={event.timeZone} />
-        <Card>
-          <CardHeader>
-            <h2 className="text-base leading-none font-semibold">Game Days</h2>
-            <CardDescription>
-              Published Event information from the authoritative catalog.
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-4">
-            {event.gameDays.length === 0 ? (
-              <p className="text-sm text-muted-foreground">No Game Days have been scheduled.</p>
-            ) : (
-              <ul className="grid gap-2 sm:grid-cols-2">
-                {event.gameDays.map((date) => (
-                  <li key={date} className="rounded-xl border px-3 py-2 text-sm">
-                    {date}
-                  </li>
-                ))}
-              </ul>
-            )}
-            {event.teams.length > 0 && (
-              <div>
-                <h3 className="text-sm font-semibold">Event Teams</h3>
-                <ul className="mt-2 grid gap-2 sm:grid-cols-2">
-                  {event.teams.map((team) => (
-                    <li
-                      key={`${team.name}-${team.color}`}
-                      className="rounded-xl border px-3 py-2 text-sm"
-                    >
-                      {team.name}
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            )}
-            {event.pitches.length > 1 && (
-              <div>
-                <h3 className="text-sm font-semibold">Pitches</h3>
-                <ul className="mt-2 flex flex-wrap gap-2">
-                  {event.pitches.map((pitch) => (
-                    <li key={pitch.name} className="rounded-full border px-3 py-1 text-sm">
-                      {pitch.name}
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            )}
-          </CardContent>
-        </Card>
-      </div>
-    </PublicShell>
+        {connectionStatus === "reconnecting" ? (
+          <p role="status">Reconnecting live updates… Showing the last received games.</p>
+        ) : null}
+        {scheduleView ? (
+          <ScheduleBoard schedule={schedule} timeZone={event.timeZone} />
+        ) : (
+          <EventArena schedule={schedule} timeZone={event.timeZone} />
+        )}
+      </main>
+    </div>
   );
 }
 
@@ -323,6 +359,25 @@ function isPublicAudienceProjectionMessage(
   );
 }
 
+function measureExpandedScoreboard(scoreboard: HTMLElement): number {
+  const nativeScroll = scoreboard.hasAttribute("data-scoreboard-native-scroll");
+  scoreboard.removeAttribute("data-scoreboard-native-scroll");
+  const progress = scoreboard.style.getPropertyValue("--score-collapse");
+  scoreboard.style.setProperty("--score-collapse", "0");
+  const names = [...scoreboard.querySelectorAll<HTMLElement>(".daylight-team-name")];
+  // Measure natural wrapping before reserving each name's shrinking footprint.
+  // Text may reflow during the morph, but must not move the scores in a jump.
+  for (const name of names) name.style.removeProperty("--expanded-name-height");
+  const heights = names.map((name) => name.getBoundingClientRect().height);
+  names.forEach((name, index) =>
+    name.style.setProperty("--expanded-name-height", `${heights[index]}px`),
+  );
+  const height = scoreboard.getBoundingClientRect().height;
+  scoreboard.style.setProperty("--score-collapse", progress);
+  scoreboard.toggleAttribute("data-scoreboard-native-scroll", nativeScroll);
+  return height;
+}
+
 export function PublicEventGamePage({
   eventId,
   eventGameId,
@@ -334,24 +389,99 @@ export function PublicEventGamePage({
   const game =
     event?.schedule.scheduleGames.find((candidate) => candidate.eventGameId === eventGameId) ??
     null;
-  const [compactScoreboard, setCompactScoreboard] = useState(false);
+  const scoreboardLayoutRef = useRef<HTMLDivElement | null>(null);
   const scoreboardSentinelRef = useRef<HTMLDivElement | null>(null);
+  const scoreboardRef = useRef<HTMLElement | null>(null);
+  const scoreboardContentRef = useRef<HTMLDivElement | null>(null);
+  const expandedHeightRef = useRef(0);
+  const recalibrateScoreboardRef = useRef<(() => void) | null>(null);
+  const hasGame = game !== null && game.spectatorAvailable !== false;
 
   useEffect(() => {
     const sentinel = scoreboardSentinelRef.current;
-    if (sentinel === null) return;
-    if (typeof IntersectionObserver === "function") {
-      const observer = new IntersectionObserver(([entry]) => {
-        setCompactScoreboard(entry?.isIntersecting === false);
-      });
-      observer.observe(sentinel);
-      return () => observer.disconnect();
-    }
-    const update = () => setCompactScoreboard(window.scrollY > 120);
-    update();
+    const scoreboard = scoreboardRef.current;
+    const content = scoreboardContentRef.current;
+    const layout = scoreboardLayoutRef.current;
+    if (!sentinel || !scoreboard || !content || !layout || !hasGame) return;
+    const page = sentinel.closest<HTMLElement>(".daylight-game")!;
+    const reducedMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)");
+    const supportsNativeScroll =
+      window.CSS?.supports?.("animation-timeline", "scroll(root)") === true;
+    let start = 0;
+    let maximumScroll = 0;
+    let nativeScroll = false;
+    let active = true;
+    const update = () => {
+      const scrollY = Math.max(0, Math.min(window.scrollY, maximumScroll));
+      const distance = maximumScroll > 0 ? Math.max(0, scrollY - start) : 0;
+      const progress = reducedMotion?.matches ? Number(distance > 0) : Math.min(1, distance / 180);
+      // Native CSS samples the scroll timeline directly. The fallback also stays
+      // local to this element; neither path rerenders the timeline while scrolling.
+      if (!nativeScroll) scoreboard.style.setProperty("--score-collapse", String(progress));
+      scoreboard.dataset.collapseProgress = String(progress);
+      scoreboard.toggleAttribute("data-scoreboard-compact", progress > 0);
+    };
+    const refreshRange = () => {
+      const bottomPadding = Number.parseFloat(window.getComputedStyle(page).paddingBottom) || 0;
+      const viewportHeight = document.documentElement.clientHeight || window.innerHeight;
+      start = sentinel.offsetTop;
+      // Only the expanded content extent can enable the morph, never viewport minimum height.
+      maximumScroll = Math.max(
+        0,
+        start + expandedHeightRef.current + content.offsetHeight + bottomPadding - viewportHeight,
+      );
+      nativeScroll = supportsNativeScroll && !reducedMotion?.matches && maximumScroll > 0;
+      scoreboard.style.setProperty("--score-collapse-start", `${start}px`);
+      scoreboard.style.setProperty("--score-collapse-end", `${start + 180}px`);
+      scoreboard.toggleAttribute("data-scoreboard-native-scroll", nativeScroll);
+      update();
+    };
+    const resize = () => {
+      expandedHeightRef.current = measureExpandedScoreboard(scoreboard);
+      layout.style.setProperty("--scoreboard-expanded-height", `${expandedHeightRef.current}px`);
+      refreshRange();
+    };
+    recalibrateScoreboardRef.current = resize;
+    const contentObserver = new window.ResizeObserver(refreshRange);
+    contentObserver.observe(content);
+    resize();
     window.addEventListener("scroll", update, { passive: true });
-    return () => window.removeEventListener("scroll", update);
-  }, [game]);
+    window.addEventListener("resize", resize);
+    scoreboard.addEventListener("load", resize, true);
+    document.fonts?.addEventListener("loadingdone", resize);
+    void document.fonts?.ready.then(() => {
+      if (active) resize();
+    });
+    reducedMotion?.addEventListener("change", refreshRange);
+    return () => {
+      active = false;
+      recalibrateScoreboardRef.current = null;
+      window.removeEventListener("scroll", update);
+      window.removeEventListener("resize", resize);
+      scoreboard.removeEventListener("load", resize, true);
+      document.fonts?.removeEventListener("loadingdone", resize);
+      contentObserver.disconnect();
+      reducedMotion?.removeEventListener("change", refreshRange);
+    };
+  }, [hasGame, eventId, eventGameId]);
+
+  useEffect(() => {
+    recalibrateScoreboardRef.current?.();
+  }, [
+    game?.sideA.name,
+    game?.sideB.name,
+    game?.pitchName,
+    game?.pitch,
+    game?.phase,
+    game?.operationalStatus,
+    game?.result.status,
+    game?.overtimeTarget,
+    game?.clock?.synchronization,
+    game?.startedAtMs,
+    event?.shortName,
+    event?.name,
+    connectionStatus,
+  ]);
 
   if (unavailable) return <GameUnavailablePanel eventId={eventId} />;
   if (game === null || game.spectatorAvailable === false) {
@@ -378,154 +508,171 @@ export function PublicEventGamePage({
           { sideId: "side-a" as const, side: game.sideA, label: "Side A" },
           { sideId: "side-b" as const, side: game.sideB, label: "Side B" },
         ];
-  const title = game.gameDesignation ?? game.gameCode ?? "Live spectator Game";
+  const finished = isGameFinished(game);
+  const hasExceptionalDetails =
+    !finished &&
+    (game.teamTimeout.status !== "inactive" ||
+      game.gameSuspension === "suspended" ||
+      game.heatStoppage.status !== "inactive" ||
+      game.heatStoppage.pending);
 
+  const scoreSide = (index: number) => {
+    const item = sides[index]!;
+    const color =
+      item.sideId === "side-a"
+        ? game.presentation.displayedTeamColors.sideA
+        : game.presentation.displayedTeamColors.sideB;
+    return (
+      <PublicScoreSide
+        key={item.sideId}
+        side={{ ...item.side, color }}
+        label={item.label}
+        sideId={item.sideId}
+        isCatching={game.flagState.catchingSide === item.sideId}
+      />
+    );
+  };
   return (
-    <PublicShell title={title} description="Public Audience Projection · no sign-in required">
-      <div className="space-y-4">
+    <div className="daylight-game">
+      <a href="#main-content" className="sr-only focus:not-sr-only">
+        Skip to main content
+      </a>
+      <header className="daylight-game-header">
+        <a
+          href={`/events/${encodeURIComponent(eventId)}`}
+          aria-label="Back to Event"
+          onClick={(click) => {
+            if (
+              click.button !== 0 ||
+              click.metaKey ||
+              click.ctrlKey ||
+              click.shiftKey ||
+              click.altKey
+            )
+              return;
+            click.preventDefault();
+            navigateTo(`/events/${encodeURIComponent(eventId)}`);
+          }}
+        >
+          <ArrowLeft size={18} aria-hidden="true" />
+          <span>{event?.shortName?.trim() || event?.name || "Event"}</span>
+        </a>
+      </header>
+      <main id="main-content" tabIndex={-1}>
+        <h1 className="sr-only">
+          {game.gameDesignation ?? game.gameCode ?? "Game"}: {game.sideA.name ?? "Side A"} vs{" "}
+          {game.sideB.name ?? "Side B"} — Game scoreboard
+        </h1>
         {game.teamAssignmentNotice !== undefined ? <TeamAssignmentCorrectionNotice /> : null}
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <Button
-            variant="outline"
-            onClick={() => navigateTo(`/events/${encodeURIComponent(eventId)}`)}
-          >
-            Back to Event
-          </Button>
-          <p className="text-sm text-muted-foreground">{game.pitch ?? "Event Game"}</p>
-        </div>
         <LiveProjectionStatus status={connectionStatus} message={gameAnnouncement(game)} />
-        <div
-          ref={scoreboardSentinelRef}
-          aria-hidden="true"
-          className="h-px"
-          data-scoreboard-sentinel
-        />
-        {compactScoreboard ? (
+        {connectionStatus === "reconnecting" ? (
+          <p role="status" className="daylight-meta">
+            Reconnecting live updates… Showing the last received score.
+          </p>
+        ) : null}
+        <div ref={scoreboardSentinelRef} aria-hidden="true" data-scoreboard-sentinel />
+        <div ref={scoreboardLayoutRef} className="daylight-scoreboard-layout">
           <section
-            aria-label="Compact live scoreboard"
-            className="sticky top-2 z-10 rounded-2xl border bg-background/95 p-2 shadow-lg backdrop-blur"
-            data-scoreboard-compact
+            ref={scoreboardRef}
+            aria-label="Live scoreboard"
+            className="daylight-morph-scoreboard"
+            data-scoreboard-expanded
+            data-collapse-progress="0"
+            style={{ "--score-collapse": 0 } as CSSProperties}
           >
-            <div className="mb-1 flex flex-wrap items-center justify-center gap-x-2 gap-y-0.5 text-[0.65rem] text-muted-foreground">
-              <span>Game Phase: {gamePhaseLabel(game.phase)}</span>
-              <span>Operational status: {operationalStatusLabel(game.operationalStatus)}</span>
-              <span>Schedule: {scheduleStatusLabel(game.scheduleStatus)}</span>
-            </div>
-            <div className="grid grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-2">
-              <CompactScoreSide
-                side={sides[0]!.side}
-                label={sides[0]!.label}
-                sideId={sides[0]!.sideId}
-                isCatching={game.flagState.catchingSide === sides[0]!.sideId}
-              />
-              <div className="flex flex-col items-center">
-                <span className="font-mono text-lg font-bold tabular-nums">
-                  {formatClock(game.clock?.gameTimeMs ?? 0)}
+            <button
+              type="button"
+              className="daylight-score-return"
+              aria-label="Return to full scoreboard"
+              onClick={() => {
+                document.getElementById("main-content")?.focus({ preventScroll: true });
+                window.scrollTo({
+                  top: 0,
+                  behavior: window.matchMedia?.("(prefers-reduced-motion: reduce)").matches
+                    ? "auto"
+                    : "smooth",
+                });
+              }}
+            />
+            <div className="daylight-start-strip" aria-label="Game start and Pitch">
+              <span>
+                {game.startedAtMs === undefined ? "Scheduled" : "Started"}{" "}
+                <time dateTime={new Date(game.startedAtMs ?? game.scheduledStartMs).toISOString()}>
+                  {formatScheduleTime(
+                    game.startedAtMs ?? game.scheduledStartMs,
+                    event?.timeZone ?? "UTC",
+                  )}
+                </time>
+              </span>
+              {game.startedAtMs === undefined && game.expectedStartMs !== game.scheduledStartMs ? (
+                <span>
+                  Expected{" "}
+                  <time dateTime={new Date(game.expectedStartMs).toISOString()}>
+                    {formatScheduleTime(game.expectedStartMs, event?.timeZone ?? "UTC")}
+                  </time>
                 </span>
-                <span className="text-[0.65rem] text-muted-foreground">
+              ) : null}
+              {(game.pitchName ?? game.pitch) ? <span>{game.pitchName ?? game.pitch}</span> : null}
+            </div>
+            <div className="daylight-arena">
+              {scoreSide(0)}
+              {scoreSide(1)}
+              <div className="daylight-clock" role="timer" aria-label="Game clock">
+                {game.clock ? formatClock(game.clock.gameTimeMs) : "—:—"}
+              </div>
+            </div>
+            <div className="daylight-status">
+              {gameStatusLabels(game).map((label) => (
+                <span key={label}>{label}</span>
+              ))}
+              {!finished &&
+              game.operationalStatus !== "scheduled" &&
+              game.clock?.synchronization !== "synchronized" ? (
+                <span className="daylight-clock-freshness">
                   {clockFreshnessLabel(game.clock?.synchronization ?? "unavailable")}
                 </span>
-              </div>
-              <CompactScoreSide
-                side={sides[1]!.side}
-                label={sides[1]!.label}
-                align="right"
-                sideId={sides[1]!.sideId}
-                isCatching={game.flagState.catchingSide === sides[1]!.sideId}
-              />
+              ) : null}
             </div>
           </section>
-        ) : null}
-        <section
-          aria-label="Live scoreboard"
-          className="rounded-3xl border bg-background/95 p-3 shadow-lg sm:p-5"
-          data-scoreboard-expanded
-        >
-          <div className="mb-3 flex flex-wrap items-center justify-between gap-2 text-sm">
-            <span className="font-semibold">{scheduleStatusLabel(game.scheduleStatus)}</span>
-            <span className="text-muted-foreground">
-              Game Phase: {gamePhaseLabel(game.phase)} · Operational status:{" "}
-              {operationalStatusLabel(game.operationalStatus)}
-            </span>
+          <div ref={scoreboardContentRef} data-scoreboard-content>
+            {hasExceptionalDetails ? (
+              <dl className="daylight-details">
+                {game.teamTimeout.status !== "inactive" ? (
+                  <StatusValue label="Team Timeout" value={timeoutLabel(game.teamTimeout)} />
+                ) : null}
+                {game.gameSuspension === "suspended" ? (
+                  <StatusValue label="Game Suspension" value="Suspended" />
+                ) : null}
+                {game.heatStoppage.status !== "inactive" || game.heatStoppage.pending ? (
+                  <StatusValue label="Heat Stoppage" value={heatLabel(game.heatStoppage)} />
+                ) : null}
+              </dl>
+            ) : null}
+            <section className="daylight-history" aria-label="Game history">
+              {game.timeline.length > 0 ? (
+                <PublicGameTimeline
+                  entries={game.timeline}
+                  presentation={game.presentation}
+                  game={game}
+                  connected={
+                    connectionStatus === "connected" &&
+                    game.clock?.synchronization === "synchronized"
+                  }
+                />
+              ) : (
+                <>
+                  <h2>Game Timeline</h2>
+                  <p>No public play history is available yet.</p>
+                </>
+              )}
+              {game.flagState.catchingSide !== null ? (
+                <p className="mt-4 text-sm">* Flag catch</p>
+              ) : null}
+            </section>
           </div>
-          <div className="grid grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-stretch gap-2 sm:gap-4">
-            <PublicScoreSide
-              side={sides[0]!.side}
-              label={sides[0]!.label}
-              sideId={sides[0]!.sideId}
-              isCatching={game.flagState.catchingSide === sides[0]!.sideId}
-            />
-            <div className="flex min-w-20 flex-col items-center justify-center rounded-2xl bg-muted/60 px-2 py-3">
-              <span className="font-mono text-3xl font-bold tabular-nums sm:text-4xl">
-                {formatClock(game.clock?.gameTimeMs ?? 0)}
-              </span>
-              <span className="mt-1 text-center text-xs text-muted-foreground">
-                {clockFreshnessLabel(game.clock?.synchronization ?? "unavailable")}
-              </span>
-            </div>
-            <PublicScoreSide
-              side={sides[1]!.side}
-              label={sides[1]!.label}
-              align="right"
-              sideId={sides[1]!.sideId}
-              isCatching={game.flagState.catchingSide === sides[1]!.sideId}
-            />
-          </div>
-          <div className="mt-3 flex flex-wrap justify-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
-            <span>
-              Last synchronized:{" "}
-              {formatLastSynchronization(game.clock?.lastSynchronizedAtMs ?? null)}
-            </span>
-            <span>Expected start: {formatDateTime(game.expectedStartMs)}</span>
-          </div>
-        </section>
-        <Card>
-          <CardHeader>
-            <h2 className="text-base leading-none font-semibold">
-              Game Phase and operational status
-            </h2>
-            <CardDescription>
-              Committed public information from the Event Game&apos;s Audience Projection.
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-3 text-sm">
-            <dl className="grid gap-3 sm:grid-cols-2">
-              <StatusValue label="Game Phase" value={gamePhaseLabel(game.phase)} />
-              <StatusValue
-                label="Operational status"
-                value={operationalStatusLabel(game.operationalStatus)}
-              />
-              <StatusValue
-                label="Overtime target"
-                value={game.phase === "overtime" ? `Target ${game.overtimeTarget ?? "—"}` : "No"}
-              />
-              <StatusValue
-                label="Flag"
-                value={
-                  game.flagState.catchingSide !== null
-                    ? `Caught by ${game.flagState.catchingSide}`
-                    : "Not caught"
-                }
-              />
-              <StatusValue label="Team Timeout" value={timeoutLabel(game.teamTimeout)} />
-              <StatusValue
-                label="Game Suspension"
-                value={game.gameSuspension === "suspended" ? "Suspended" : "None"}
-              />
-              <StatusValue label="Heat Stoppage" value={heatLabel(game.heatStoppage)} />
-              <StatusValue label="Result" value={resultLabel(game.result)} />
-            </dl>
-            {game.timeline.length > 0 ? (
-              <PublicGameTimeline entries={game.timeline} />
-            ) : (
-              <p className="rounded-xl border border-dashed p-3 text-muted-foreground">
-                No public play history is available yet.
-              </p>
-            )}
-          </CardContent>
-        </Card>
-      </div>
-    </PublicShell>
+        </div>
+      </main>
+    </div>
   );
 }
 
@@ -545,68 +692,50 @@ function PublicScoreSide({
   label,
   sideId,
   isCatching,
-  align = "left",
 }: {
   side: PublicAudienceGameProjection["sideA"];
   label: string;
   sideId: "side-a" | "side-b";
   isCatching: boolean;
-  align?: "left" | "right";
 }) {
+  const color = side.color ?? "#34465e";
   return (
     <div
-      className={`min-w-0 rounded-2xl border-2 bg-card p-3 ${align === "right" ? "text-right" : "text-left"}`}
-      style={{ borderColor: side.color ?? "hsl(var(--border))" }}
+      className="daylight-side"
+      style={{ "--team-color": color, "--team-ink": scoreTextColor(color) } as CSSProperties}
       data-side-id={sideId}
       role="group"
       aria-label={`${label}: ${side.name ?? "Unassigned Team"}, score ${side.score ?? "unavailable"}${isCatching ? ", flag catch" : ""}`}
     >
-      <p className="text-xs font-semibold tracking-wide text-muted-foreground uppercase">{label}</p>
-      <p className="mt-1 break-words text-base font-semibold leading-tight sm:text-xl">
-        {side.name ?? "Unassigned Team"}
-      </p>
-      <p className="mt-2 text-4xl font-bold tabular-nums sm:text-5xl">
+      <PublicTeamArtwork name={side.name} />
+      <p className="daylight-team-name break-words">{side.name ?? "Unassigned Team"}</p>
+      <p className="daylight-score">
         <span aria-label={`${label} score`}>{side.score ?? "—"}</span>
         {isCatching ? (
-          <span className="mt-1 block text-xs font-semibold tracking-wide text-foreground uppercase">
-            Flag catch
-          </span>
+          <sup>
+            <span aria-hidden="true">*</span>
+            <span className="sr-only">Flag catch</span>
+          </sup>
         ) : null}
       </p>
     </div>
   );
 }
 
-function CompactScoreSide({
-  side,
-  label,
-  sideId,
-  isCatching,
-  align = "left",
-}: {
-  side: PublicAudienceGameProjection["sideA"];
-  label: string;
-  sideId: "side-a" | "side-b";
-  isCatching: boolean;
-  align?: "left" | "right";
-}) {
-  return (
-    <div
-      className={`min-w-0 ${align === "right" ? "text-right" : "text-left"}`}
-      data-side-id={sideId}
-    >
-      <p className="truncate text-xs font-semibold">{side.name ?? "Unassigned Team"}</p>
-      <p className="truncate text-sm font-semibold">
-        <span aria-label={`${label} score`}>{side.score ?? "—"}</span>
-        {isCatching ? <span className="ml-1 text-[0.65rem] uppercase">Flag catch</span> : null}
-      </p>
-    </div>
-  );
+function scoreTextColor(color: string) {
+  const rgb = parseHexColor(color);
+  if (rgb === null) return "#ffffff";
+  const linear = (channel: number) => {
+    const value = channel / 255;
+    return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
+  };
+  const luminance = 0.2126 * linear(rgb.r) + 0.7152 * linear(rgb.g) + 0.0722 * linear(rgb.b);
+  return luminance > 0.179 ? "#000000" : "#ffffff";
 }
 
 function StatusValue({ label, value }: { label: string; value: string }) {
   return (
-    <div className="rounded-xl border p-3">
+    <div>
       <dt className="text-muted-foreground">{label}</dt>
       <dd className="mt-1 font-medium">{value}</dd>
     </div>
@@ -622,11 +751,116 @@ function GameUnavailablePanel({ eventId }: { eventId: string }) {
             The Game may be hidden, unknown, or temporarily unavailable.
           </p>
           <Button onClick={() => navigateTo(`/events/${encodeURIComponent(eventId)}`)}>
+            <ArrowLeft size={18} aria-hidden="true" />
             Back to Event
           </Button>
         </CardContent>
       </Card>
     </PublicShell>
+  );
+}
+
+function EventNavigationLink({
+  href,
+  children,
+  className,
+  label,
+}: {
+  href: string;
+  children: ReactNode;
+  className?: string;
+  label?: string;
+}) {
+  return (
+    <a
+      href={href}
+      className={className}
+      aria-label={label}
+      onClick={(click) => {
+        if (click.button !== 0 || click.metaKey || click.ctrlKey || click.shiftKey || click.altKey)
+          return;
+        click.preventDefault();
+        navigateTo(href);
+      }}
+    >
+      {children}
+    </a>
+  );
+}
+
+function nextUnstartedGames(schedule: PublicAudienceScheduleProjection) {
+  const unstartedGames = schedule.scheduleGames.filter(
+    (game) => game.scheduleStatus === "future" || game.scheduleStatus === "awaiting-start",
+  );
+  const nextExpectedStart = Math.min(...unstartedGames.map((game) => game.expectedStartMs));
+  return unstartedGames.filter((game) => game.expectedStartMs === nextExpectedStart);
+}
+
+function EventArena({
+  schedule,
+  timeZone,
+}: {
+  schedule: PublicAudienceScheduleProjection;
+  timeZone: string;
+}) {
+  const runningGames = [...schedule.runningGames].sort(
+    (left, right) =>
+      left.expectedStartMs - right.expectedStartMs ||
+      (left.pitchName ?? left.pitch ?? "").localeCompare(
+        right.pitchName ?? right.pitch ?? "",
+        "en",
+        { numeric: true },
+      ) ||
+      left.eventGameId.localeCompare(right.eventGameId, "en"),
+  );
+  const upcoming = nextUnstartedGames(schedule);
+  return (
+    <>
+      <section
+        className="event-horizon"
+        data-schedule-group="live-now"
+        aria-labelledby="event-arena-heading"
+      >
+        <div className="event-section-heading">
+          <h2 id="event-arena-heading">Live now</h2>
+          <span className="event-running-count">{schedule.runningGames.length} games running</span>
+        </div>
+        {schedule.runningGames.length ? (
+          <div className="event-live-grid">
+            {runningGames.map((game) => (
+              <GameCard key={game.eventGameId} game={game} timeZone={timeZone} mode="live" />
+            ))}
+          </div>
+        ) : (
+          <p className="event-empty">{upcoming.length ? "Next games below" : "No games running"}</p>
+        )}
+        {schedule.runningGames.some((game) => game.flagState.catchingSide) ? (
+          <p className="event-catch-legend">* Flag catch</p>
+        ) : null}
+      </section>
+      <section data-schedule-group="coming-up" className="event-upcoming" aria-label="Up next">
+        {groupEventGames(upcoming, "expectedStartMs").map((group) => (
+          <div key={group.time} className="event-upcoming-group">
+            <div className="event-section-heading">
+              <h2>
+                Up next · <time>{formatScheduleTime(group.time, timeZone)}</time>
+              </h2>
+              <span>
+                {group.games.length} {group.games.length === 1 ? "game" : "games"}
+              </span>
+            </div>
+            <div className="event-upcoming-grid">
+              {group.games.map((game) => (
+                <GameCard key={game.eventGameId} game={game} timeZone={timeZone} mode="upcoming" />
+              ))}
+            </div>
+          </div>
+        ))}
+        {!upcoming.length && !schedule.runningGames.length ? (
+          <p className="event-empty">No upcoming games scheduled.</p>
+        ) : null}
+      </section>
+    </>
   );
 }
 
@@ -638,305 +872,198 @@ function ScheduleBoard({
   timeZone: string;
 }) {
   const focusRef = useRef<HTMLLIElement | null>(null);
-
+  const positioned = useRef(false);
+  const groups = groupEventGames(schedule.scheduleGames, "expectedStartMs");
+  const focusGame =
+    schedule.focusIndex === null ? null : schedule.scheduleGames[schedule.focusIndex];
   useEffect(() => {
-    if (schedule.focusIndex === null) return;
-    focusRef.current?.scrollIntoView({ block: "nearest", inline: "nearest" });
-  }, [schedule.asOfMs, schedule.focusIndex]);
-
-  return (
-    <div className="space-y-6">
-      <ScheduleGroup
-        title="Live now"
-        description="Every running Game has equal prominence."
-        games={schedule.runningGames}
-        timeZone={timeZone}
-        empty="No Games are running now."
-        dataGroup="live-now"
-      />
-      <ScheduleGroup
-        title="Coming up"
-        description="Games with an Expected Start in the next hour."
-        games={schedule.upcomingGames}
-        timeZone={timeZone}
-        empty="No Games are expected in the next hour."
-        dataGroup="coming-up"
-        groupByExpectedStart
-      />
-      <section
-        aria-labelledby="event-schedule-heading"
-        className="space-y-3"
-        data-schedule-group="event-schedule"
-      >
-        <div>
-          <h2 id="event-schedule-heading" className="text-xl font-semibold">
-            Event schedule
-          </h2>
-          <p className="text-sm text-muted-foreground">
-            Chronological schedule positioned around the Event&apos;s current time.
-          </p>
-        </div>
-        {schedule.scheduleGames.length === 0 ? (
-          <p className="rounded-2xl border border-dashed p-4 text-sm text-muted-foreground">
-            No Games have been scheduled.
-          </p>
-        ) : (
-          <ol className="space-y-3">
-            {schedule.scheduleGames.map((game, index) => (
-              <li
-                key={scheduleGameKey(game, index)}
-                ref={index === schedule.focusIndex ? focusRef : undefined}
-                data-schedule-card
-                data-game-code={game.gameCode ?? undefined}
-                data-schedule-status={game.scheduleStatus}
-              >
-                <GameCard game={game} timeZone={timeZone} compact />
-              </li>
-            ))}
-          </ol>
-        )}
-      </section>
-    </div>
-  );
-}
-
-function ScheduleGroup({
-  title,
-  description,
-  games,
-  timeZone,
-  empty,
-  dataGroup,
-  groupByExpectedStart = false,
-}: {
-  title: string;
-  description: string;
-  games: readonly PublicAudienceGameProjection[];
-  timeZone: string;
-  empty: string;
-  dataGroup: string;
-  groupByExpectedStart?: boolean;
-}) {
+    if (positioned.current || !focusRef.current) return;
+    focusRef.current.scrollIntoView({ block: "start" });
+    positioned.current = true;
+  }, [schedule.focusIndex, schedule.asOfMs]);
   return (
     <section
-      aria-labelledby={title.toLowerCase().replaceAll(" ", "-")}
-      className="space-y-3"
-      data-schedule-group={dataGroup}
+      className="event-chronology"
+      data-schedule-group="event-schedule"
+      aria-label="Event schedule"
     >
-      <div>
-        <h2 id={title.toLowerCase().replaceAll(" ", "-")} className="text-xl font-semibold">
-          {title}
-        </h2>
-        <p className="text-sm text-muted-foreground">{description}</p>
-      </div>
-      {games.length === 0 ? (
-        <p className="rounded-2xl border border-dashed p-4 text-sm text-muted-foreground">
-          {empty}
-        </p>
-      ) : groupByExpectedStart ? (
-        <div className="space-y-4">
-          {groupGamesByExpectedStart(games).map((group) => (
-            <section
-              key={group.expectedStartMs}
-              aria-labelledby={`expected-${group.expectedStartMs}`}
-            >
-              <h3
-                id={`expected-${group.expectedStartMs}`}
-                className="text-sm font-semibold text-muted-foreground"
-              >
-                Expected Start {formatScheduleTime(group.expectedStartMs, timeZone)}
-              </h3>
-              <div className="mt-2 grid gap-3 md:grid-cols-2">
-                {group.games.map((game, index) => (
-                  <div
-                    key={scheduleGameKey(game, index)}
-                    data-schedule-card
-                    data-game-code={game.gameCode ?? undefined}
-                    data-schedule-status={game.scheduleStatus}
-                  >
-                    <GameCard game={game} timeZone={timeZone} />
-                  </div>
-                ))}
-              </div>
-            </section>
-          ))}
-        </div>
+      {!groups.length ? (
+        <p className="event-empty">No games have been scheduled.</p>
       ) : (
-        <div className="grid gap-3 md:grid-cols-2">
-          {games.map((game, index) => (
-            <div
-              key={scheduleGameKey(game, index)}
-              data-schedule-card
-              data-game-code={game.gameCode ?? undefined}
-              data-schedule-status={game.scheduleStatus}
-            >
-              <GameCard game={game} timeZone={timeZone} />
-            </div>
-          ))}
-        </div>
+        <ol className="event-time-rail" aria-label="Chronological Event schedule">
+          {groups.map((group, index) => {
+            const running = group.games.some((game) => game.scheduleStatus === "running");
+            const past = group.games.every((game) => game.scheduleStatus === "past");
+            const label = running ? "Now" : past ? "Past" : "Up next";
+            const previous = groups[index - 1];
+            const previousLabel = previous?.games.some((game) => game.scheduleStatus === "running")
+              ? "Now"
+              : previous?.games.every((game) => game.scheduleStatus === "past")
+                ? "Past"
+                : previous
+                  ? "Up next"
+                  : null;
+            return (
+              <li
+                key={group.time}
+                ref={group.time === focusGame?.expectedStartMs ? focusRef : undefined}
+                data-time-group
+                data-current={running || undefined}
+              >
+                <div className="event-rail-time">
+                  <span>{label !== previousLabel ? label : null}</span>
+                  <time>{formatScheduleTime(group.time, timeZone)}</time>
+                </div>
+                <div className="event-time-group">
+                  {group.games.map((game) => (
+                    <GameCard
+                      key={game.eventGameId}
+                      game={game}
+                      timeZone={timeZone}
+                      mode="schedule"
+                    />
+                  ))}
+                </div>
+              </li>
+            );
+          })}
+        </ol>
       )}
     </section>
   );
 }
 
+function groupEventGames(
+  games: readonly PublicAudienceGameProjection[],
+  key: "expectedStartMs" | "scheduledStartMs",
+) {
+  const groups = new Map<number, PublicAudienceGameProjection[]>();
+  for (const game of games) {
+    const group = groups.get(game[key]) ?? [];
+    group.push(game);
+    groups.set(game[key], group);
+  }
+  return [...groups].map(([time, games]) => ({ time, games }));
+}
+
 function GameCard({
   game,
   timeZone,
-  compact = false,
+  mode,
 }: {
   game: PublicAudienceGameProjection;
   timeZone: string;
-  compact?: boolean;
+  mode: "live" | "upcoming" | "schedule";
 }) {
-  const winnerName =
-    game.result.winner === "side-a"
-      ? game.sideA.name
-      : game.result.winner === "side-b"
-        ? game.sideB.name
-        : null;
-  return (
-    <Card className={compact ? "bg-card/70" : "border-primary/40 bg-card shadow-md"}>
-      <CardHeader className={compact ? "pb-3" : undefined}>
-        <div className="flex flex-wrap items-start justify-between gap-2">
-          <div>
-            <h3 className={compact ? "text-base font-semibold" : "text-lg font-semibold"}>
-              {game.spectatorAvailable === false ? (
-                <span>{game.gameDesignation ?? game.gameCode ?? "Scheduled Game"}</span>
-              ) : (
-                <a
-                  href={game.canonicalPath}
-                  className="rounded-sm underline-offset-4 hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
-                  onClick={(click) => {
-                    if (
-                      click.button !== 0 ||
-                      click.metaKey ||
-                      click.ctrlKey ||
-                      click.shiftKey ||
-                      click.altKey
-                    )
-                      return;
-                    click.preventDefault();
-                    navigateTo(game.canonicalPath);
-                  }}
-                >
-                  {game.gameDesignation ?? game.gameCode ?? "Scheduled Game"}
-                  <span className="sr-only"> Open spectator Game</span>
-                </a>
-              )}
-            </h3>
-            {game.gameDesignation !== null && game.gameCode !== null ? (
-              <CardDescription>Game {game.gameCode}</CardDescription>
-            ) : null}
-          </div>
-          <span
-            className={`rounded-full px-2.5 py-1 text-xs font-semibold ${scheduleStatusClass(game.scheduleStatus)}`}
-          >
-            {scheduleStatusLabel(game.scheduleStatus)}
+  const sides =
+    game.presentation.pitchOrientation === "side-b-left"
+      ? [
+          { side: game.sideB, id: "side-b" as const, label: "Side B" },
+          { side: game.sideA, id: "side-a" as const, label: "Side A" },
+        ]
+      : [
+          { side: game.sideA, id: "side-a" as const, label: "Side A" },
+          { side: game.sideB, id: "side-b" as const, label: "Side B" },
+        ];
+  const pitch =
+    game.pitch === null
+      ? null
+      : ((game as PublicAudienceGameProjection & { pitchName?: string | null }).pitchName ??
+        game.pitch);
+  const warnings = [
+    game.operationalStatus === "paused" || game.operationalStatus === "suspended"
+      ? operationalStatusLabel(game.operationalStatus)
+      : null,
+    game.phase === "overtime" ? `Target ${game.overtimeTarget ?? "—"}` : null,
+    game.clock && game.clock.synchronization !== "synchronized"
+      ? clockFreshnessLabel(game.clock.synchronization)
+      : null,
+    game.teamTimeout.status !== "inactive" ? `Timeout: ${timeoutLabel(game.teamTimeout)}` : null,
+    game.heatStoppage.status !== "inactive" || game.heatStoppage.pending
+      ? `Heat stoppage: ${heatLabel(game.heatStoppage)}`
+      : null,
+  ].filter(Boolean);
+  const upcoming = game.scheduleStatus === "future" || game.scheduleStatus === "awaiting-start";
+  const artworkOnly = mode === "upcoming" || (mode === "schedule" && upcoming);
+  const title = `${game.gameDesignation ?? game.gameCode ?? "Game"}: ${game.sideA.name ?? "TBD"} vs ${game.sideB.name ?? "TBD"}`;
+  const card = (
+    <article
+      className={`event-game-card event-${mode}-card${mode === "schedule" && upcoming ? " event-schedule-upcoming" : ""}`}
+      data-schedule-card
+      data-game-code={game.gameCode ?? undefined}
+      data-schedule-status={game.scheduleStatus}
+    >
+      <span className="sr-only">
+        {title}. Scheduled Start {formatScheduleTime(game.scheduledStartMs, timeZone)}. Expected
+        Start {formatScheduleTime(game.expectedStartMs, timeZone)}.
+      </span>
+      {pitch ? <span className="event-pitch-chip">{pitch}</span> : null}
+      {mode === "schedule" && game.scheduleStatus === "running" ? (
+        <span className="event-live-label">Live</span>
+      ) : null}
+      <div className="event-card-arena">
+        {sides.map(({ side, id, label }) => {
+          const color =
+            (id === "side-a"
+              ? game.presentation.displayedTeamColors.sideA
+              : game.presentation.displayedTeamColors.sideB) ?? "#52647a";
+          return (
+            <div
+              key={id}
+              className="event-card-side"
+              style={
+                { "--team-color": color, "--team-ink": scoreTextColor(color) } as CSSProperties
+              }
+            >
+              <div className="event-card-identity">
+                <PublicTeamArtwork name={side.name} />
+                <span className={artworkOnly ? "sr-only" : undefined}>{side.name ?? "TBD"}</span>
+              </div>
+              {!artworkOnly ? (
+                <strong aria-label={`${label} score`}>
+                  {side.score ?? "—"}
+                  {game.flagState.catchingSide === id ? <sup aria-label="Flag catch">*</sup> : null}
+                </strong>
+              ) : null}
+            </div>
+          );
+        })}
+        {mode !== "schedule" || artworkOnly ? (
+          <span className="event-card-versus" aria-hidden="true">
+            vs
           </span>
-        </div>
-      </CardHeader>
-      <CardContent className="space-y-3">
-        <div className="grid grid-cols-[1fr_auto] items-center gap-x-3 gap-y-2">
-          <GameSideRow
-            side={game.sideA}
-            label="Side A"
-            isCatching={game.flagState.catchingSide === "side-a"}
-          />
-          <GameSideRow
-            side={game.sideB}
-            label="Side B"
-            isCatching={game.flagState.catchingSide === "side-b"}
-          />
-        </div>
-        <div className="flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
-          <span>Scheduled Start {formatScheduleTime(game.scheduledStartMs, timeZone)}</span>
-          {game.expectedStartMs !== game.scheduledStartMs ? (
-            <span>Expected Start {formatScheduleTime(game.expectedStartMs, timeZone)}</span>
-          ) : null}
-          {game.pitch !== null ? <span>Pitch {game.pitch}</span> : null}
-        </div>
-        <div className="flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
-          <span>Game Phase: {gamePhaseLabel(game.phase)}</span>
-          <span>Operational status: {operationalStatusLabel(game.operationalStatus)}</span>
-          {game.overtimeTarget !== null ? (
-            <span>Overtime target: {game.overtimeTarget}</span>
-          ) : null}
-          {winnerName !== null ? <span>Winner: {winnerName}</span> : null}
-          {game.clock !== null ? (
-            game.clock.synchronization === "unavailable" ? (
-              <span>Clock unavailable · manual timing required</span>
-            ) : (
-              <span>
-                Clock {formatClock(game.clock.gameTimeMs)} ·{" "}
-                {clockStatusLabel(game.clock.synchronization)}
-              </span>
-            )
-          ) : null}
-        </div>
-        {(!compact || game.scheduleStatus === "past") && game.timeline.length > 0 ? (
-          <PublicGameTimeline entries={game.timeline} />
         ) : null}
-      </CardContent>
-    </Card>
+        {mode === "live" ? (
+          <div className="event-card-clock">
+            <strong>
+              {game.clock && game.clock.synchronization !== "unavailable"
+                ? formatClock(game.clock.gameTimeMs)
+                : "—:—"}
+            </strong>
+            <span>{gamePhaseLabel(game.phase)}</span>
+          </div>
+        ) : null}
+      </div>
+      {game.expectedStartMs !== game.scheduledStartMs && mode !== "live" ? (
+        <p className="event-time-change">
+          Expected {formatScheduleTime(game.expectedStartMs, timeZone)} · Scheduled{" "}
+          {formatScheduleTime(game.scheduledStartMs, timeZone)}
+        </p>
+      ) : null}
+      {warnings.length ? <p className="event-card-warning">{warnings.join(" · ")}</p> : null}
+    </article>
   );
-}
-
-function GameSideRow({
-  side,
-  label,
-  isCatching,
-}: {
-  side: PublicAudienceGameProjection["sideA"];
-  label: string;
-  isCatching: boolean;
-}) {
-  return (
-    <>
-      <span
-        className="min-w-0 truncate"
-        style={
-          side.color === null
-            ? undefined
-            : { borderInlineStart: `0.3rem solid ${side.color}`, paddingInlineStart: "0.5rem" }
-        }
-      >
-        <span className="sr-only">{label}: </span>
-        {side.name ?? "TBD"}
-        {isCatching ? <span className="ml-2 text-xs font-semibold">Flag catch</span> : null}
-      </span>
-      <span
-        className="text-right text-2xl font-semibold tabular-nums"
-        aria-label={`${label} score`}
-      >
-        {side.score ?? "—"}
-      </span>
-    </>
+  return game.spectatorAvailable === false ? (
+    card
+  ) : (
+    <EventNavigationLink
+      href={game.canonicalPath}
+      className="event-game-link"
+      label={`${title}. ${pitch ?? ""}. ${artworkOnly ? `Expected ${formatScheduleTime(game.expectedStartMs, timeZone)}` : `${game.sideA.score ?? "—"} to ${game.sideB.score ?? "—"}. ${gamePhaseLabel(game.phase)}${game.flagState.catchingSide ? ". Flag catch" : ""}`}. ${warnings.join(". ")}. Open spectator Game`}
+    >
+      {card}
+    </EventNavigationLink>
   );
-}
-
-function scheduleGameKey(game: PublicAudienceGameProjection, index: number) {
-  return `${game.gameCode ?? game.gameDesignation ?? "game"}-${index}`;
-}
-
-function groupGamesByExpectedStart(games: readonly PublicAudienceGameProjection[]) {
-  const groups = new Map<number, PublicAudienceGameProjection[]>();
-  for (const game of games) {
-    const group = groups.get(game.expectedStartMs) ?? [];
-    group.push(game);
-    groups.set(game.expectedStartMs, group);
-  }
-  return [...groups.entries()].map(([expectedStartMs, groupedGames]) => ({
-    expectedStartMs,
-    games: groupedGames,
-  }));
-}
-
-function scheduleStatusClass(status: PublicAudienceGameProjection["scheduleStatus"]) {
-  return GAME_SCHEDULE_STATUS_META[status].className;
-}
-
-function scheduleStatusLabel(status: PublicAudienceGameProjection["scheduleStatus"]) {
-  return GAME_SCHEDULE_STATUS_META[status].label;
 }
 
 function gamePhaseLabel(phase: PublicAudienceGameProjection["phase"]) {
@@ -959,19 +1086,6 @@ function operationalStatusLabel(status: PublicAudienceGameProjection["operationa
           : "Scheduled";
 }
 
-const GAME_SCHEDULE_STATUS_META = {
-  running: { label: "Running", className: "bg-primary text-primary-foreground" },
-  "awaiting-start": {
-    label: "Awaiting start",
-    className: "bg-amber-100 text-amber-950 dark:bg-amber-950 dark:text-amber-100",
-  },
-  past: { label: "Past", className: "bg-muted text-muted-foreground" },
-  future: { label: "Future", className: "bg-secondary text-secondary-foreground" },
-} satisfies Record<
-  PublicAudienceGameProjection["scheduleStatus"],
-  { label: string; className: string }
->;
-
 function formatScheduleTime(milliseconds: number, timeZone: string) {
   return new Intl.DateTimeFormat(undefined, {
     timeZone,
@@ -986,13 +1100,6 @@ function formatClock(milliseconds: number) {
   return `${minutes}:${String(seconds).padStart(2, "0")}`;
 }
 
-function formatDateTime(milliseconds: number) {
-  return new Intl.DateTimeFormat(undefined, {
-    dateStyle: "medium",
-    timeStyle: "short",
-  }).format(new Date(milliseconds));
-}
-
 function clockFreshnessLabel(
   status: NonNullable<PublicAudienceGameProjection["clock"]>["synchronization"],
 ) {
@@ -1005,10 +1112,6 @@ function clockFreshnessLabel(
         : "Clock unavailable";
 }
 
-function formatLastSynchronization(milliseconds: number | null) {
-  return milliseconds === null ? "unavailable" : formatDateTime(milliseconds);
-}
-
 function timeoutLabel(timeout: PublicAudienceGameProjection["teamTimeout"]) {
   return timeout.status === "inactive"
     ? "None"
@@ -1019,24 +1122,13 @@ function timeoutLabel(timeout: PublicAudienceGameProjection["teamTimeout"]) {
 
 function heatLabel(heat: PublicAudienceGameProjection["heatStoppage"]) {
   return heat.status === "inactive"
-    ? "Inactive"
+    ? `Inactive${heat.pending ? " · decision pending" : ""}`
     : `${heat.status}${heat.remainingMs === null ? "" : ` · ${formatDuration(heat.remainingMs)} remaining`}${heat.pending ? " · decision pending" : ""}`;
 }
 
 function formatDuration(milliseconds: number) {
   const seconds = Math.ceil(Math.max(0, milliseconds) / 1_000);
   return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
-}
-
-function resultLabel(result: PublicAudienceGameProjection["result"]) {
-  if (result.status === "unfinished") return "In progress";
-  return `${result.winner === null ? "Finished" : `Winner ${result.winner === "side-a" ? "Side A" : "Side B"}`}${result.locked ? " · Locked" : ""}`;
-}
-
-function clockStatusLabel(
-  status: NonNullable<PublicAudienceGameProjection["clock"]>["synchronization"],
-) {
-  return status === "synchronized" ? "synced" : status;
 }
 
 function EventDiscovery({ events }: { events: readonly PublicAudienceEventProjection[] }) {
@@ -1077,7 +1169,7 @@ function EventGroup({
           {events.map((event) => (
             <a
               key={event.eventId}
-              href={event.canonicalPath}
+              href={publicEventEntryPath(event)}
               className="rounded-2xl border bg-card/80 p-4 shadow-sm transition hover:border-primary focus:outline-none focus:ring-2 focus:ring-ring"
               onClick={(click) => {
                 if (
@@ -1089,7 +1181,7 @@ function EventGroup({
                 )
                   return;
                 click.preventDefault();
-                navigateTo(event.canonicalPath);
+                navigateTo(publicEventEntryPath(event));
               }}
             >
               <span className="font-semibold">{event.name}</span>
@@ -1368,11 +1460,28 @@ function LiveProjectionStatus({
   );
 }
 
+function isGameFinished(game: PublicAudienceGameProjection): boolean {
+  return game.operationalStatus === "finished" || game.result.status === "finished";
+}
+
+function gameStatusLabels(game: PublicAudienceGameProjection): string[] {
+  if (isGameFinished(game)) return ["Finished"];
+  const labels = [
+    game.operationalStatus === "scheduled" ? "Not started" : gamePhaseLabel(game.phase),
+  ];
+  if (game.operationalStatus === "paused" || game.operationalStatus === "suspended")
+    labels.push(operationalStatusLabel(game.operationalStatus));
+  if (game.operationalStatus !== "scheduled" && game.phase === "overtime")
+    labels.push(`Target ${game.overtimeTarget ?? "—"}`);
+  return labels;
+}
+
 function gameAnnouncement(game: PublicAudienceGameProjection): string {
-  return `${formatScoreAnnouncement(game)}. ${gamePhaseLabel(game.phase)}. ${operationalStatusLabel(game.operationalStatus)}.`;
+  return `${formatScoreAnnouncement(game)}. ${gameStatusLabels(game).join(". ")}.`;
 }
 
 function eventAnnouncement(event: PublicAudienceEventProjection): string {
+  const upcomingCount = nextUnstartedGames(event.schedule).length;
   const liveScores = event.schedule.runningGames.map(formatScoreAnnouncement).join("; ");
   const liveSummary =
     liveScores.length === 0
@@ -1382,7 +1491,7 @@ function eventAnnouncement(event: PublicAudienceEventProjection): string {
     (count, game) => count + game.timeline.length,
     0,
   );
-  return `${liveSummary} ${event.schedule.upcomingGames.length} upcoming Game${event.schedule.upcomingGames.length === 1 ? "" : "s"}. ${timelineCount} public Timeline entr${timelineCount === 1 ? "y" : "ies"}.`;
+  return `${liveSummary} ${upcomingCount} upcoming Game${upcomingCount === 1 ? "" : "s"}. ${timelineCount} public Timeline entr${timelineCount === 1 ? "y" : "ies"}.`;
 }
 
 function formatScoreAnnouncement(game: PublicAudienceGameProjection): string {
@@ -1404,16 +1513,6 @@ function UnavailablePanel() {
       </Card>
     </PublicShell>
   );
-}
-
-function lifecycleLabel(lifecycle: PublicAudienceEventProjection["lifecycle"]): string {
-  return lifecycle === "current"
-    ? "Current Event"
-    : lifecycle === "future"
-      ? "Upcoming Event"
-      : lifecycle === "unscheduled"
-        ? "Unscheduled Event"
-        : "Past Event";
 }
 
 type AudienceEventResponse =

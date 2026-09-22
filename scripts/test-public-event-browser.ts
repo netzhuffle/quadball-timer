@@ -28,6 +28,7 @@ import {
   type TechnicalAdminAuthority,
 } from "@/lib/technical-admin-auth";
 
+const fixtureNow = Date.now();
 const directory = mkdtempSync(join(tmpdir(), "quadball-timer-public-browser-"));
 const foundationDatabase = join(directory, "foundation.sqlite");
 const eventGameDatabase = join(directory, "event-game.sqlite");
@@ -141,358 +142,462 @@ try {
   const current = listPayload.value.events.find((event) => event.eventId === seeded.currentId);
   if (!current) throw new Error("seeded current Event was not listed");
 
-  await page.goto(`${origin}/events`);
-  await page.waitForURL(`${origin}${current.canonicalPath}`);
-  await page.getByRole("heading", { name: "Published Current" }).waitFor();
-  await page.getByRole("heading", { name: "Coming up" }).waitFor();
-  await page.getByRole("heading", { name: "Event schedule" }).waitFor();
-  assert((await page.getByRole("main").count()) === 1, "public Event page has no main landmark");
-  const skipLink = page.getByRole("link", { name: "Skip to main content" });
-  await skipLink.focus();
-  assert(
-    await skipLink.evaluate((element) => document.activeElement === element),
-    "skip link could not receive keyboard focus",
-  );
-  assert(
-    (await skipLink.getAttribute("href")) === "#main-content" &&
-      (await page.locator("#main-content").count()) === 1,
-    "skip link did not provide a keyboard destination",
-  );
-  assert(
-    (await page.locator('[data-live-projection-status][role="status"]').count()) === 1,
-    "public Event did not expose a live-update status announcement",
-  );
-  const liveNow = page.locator('[data-schedule-group="live-now"]');
-  await liveNow.locator('[data-game-code="BUSY-2"]').waitFor();
-  await liveNow.locator('[data-game-code="BUSY-3"]').waitFor();
-  assert(
-    (await liveNow.locator('[data-schedule-card][data-schedule-status="running"]').count()) === 2,
-    "both committed running Games were not shown in Live now",
-  );
-  const schedule = page.locator('[data-schedule-group="event-schedule"]');
-  for (const [code, status] of [
-    ["BUSY-1", "past"],
-    ["BUSY-2", "running"],
-    ["BUSY-4", "awaiting-start"],
-    ["BUSY-5", "future"],
-  ] as const) {
+  if (process.env.PUBLIC_EVENT_REFERENCE_ONLY === "1") {
+    await verifyEventReference(page, current);
+    console.log(JSON.stringify({ status: "passed", eventReference: true }));
+  } else {
+    await page.goto(`${origin}/events`);
+    await page.waitForURL(`${origin}${current.canonicalPath}`);
+    await page.getByRole("heading", { name: "Published Current" }).waitFor();
+    await page.getByRole("heading", { name: /Up next/ }).waitFor();
+    assert((await page.getByRole("main").count()) === 1, "public Event page has no main landmark");
+    const skipLink = page.getByRole("link", { name: "Skip to main content" });
+    await skipLink.focus();
     assert(
-      (await schedule
-        .locator(`[data-game-code="${code}"][data-schedule-status="${status}"]`)
-        .count()) === 1,
-      `${code} did not retain chronological status ${status}; ${await schedule.innerText()}`,
+      await skipLink.evaluate((element) => document.activeElement === element),
+      "skip link could not receive keyboard focus",
     );
-  }
-  const finishedTimeline = schedule.locator(
-    '[data-game-code="BUSY-1"][data-schedule-status="past"] [data-game-timeline]',
-  );
-  await finishedTimeline.waitFor();
-  assert(
-    (await finishedTimeline.locator('[data-timeline-kind="finish"]').count()) === 1,
-    "finished Game did not render its effective public Timeline",
-  );
-  assert(
-    (await page.locator('[data-schedule-group="coming-up"] h3[id^="expected-"]').count()) === 1,
-    "Coming up Games were not grouped by Expected Start",
-  );
-  await page.getByText("Pitch Pitch 1").first().waitFor();
-  await page.getByText("Pitch Pitch 2").first().waitFor();
-  await page.getByText("Scheduled Start").first().waitFor();
-  assert(
-    (await page.locator("body").innerText()).includes("Expected Start"),
-    "Expected Start was not rendered",
-  );
-  assert(
-    await page.evaluate(
-      () => document.documentElement.scrollWidth <= document.documentElement.clientWidth,
-    ),
-    "360px phone-sized Event schedule overflows horizontally",
-  );
-
-  const harnessPage = await context.newPage();
-  setupBrowserPage(harnessPage, consoleErrors);
-  await harnessPage.goto(`${harnessOrigin}/`);
-  const harnessTimeline = harnessPage.locator("[data-game-timeline]");
-  await harnessTimeline.waitFor();
-  const harnessScroll = harnessTimeline.locator("[data-timeline-scroll-region]");
-  await harnessScroll.hover();
-  await harnessPage.mouse.wheel(0, 600);
-  await harnessPage.waitForFunction(
-    (selector) => ((document.querySelector(selector) as HTMLElement | null)?.scrollTop ?? 0) > 8,
-    "[data-timeline-scroll-region]",
-  );
-  const harnessBeforeNewPlay = await harnessScroll.evaluate((element) => ({
-    bottomDistance: element.scrollHeight - element.clientHeight - element.scrollTop,
-    scrollTop: element.scrollTop,
-  }));
-  assert(harnessBeforeNewPlay.scrollTop > 0, "Timeline harness could not leave the live edge");
-  await harnessPage.getByRole("button", { name: "Deliver newer play while away" }).click();
-  await harnessPage.getByRole("button", { name: "Show newest play" }).waitFor();
-  const harnessAfterNewPlay = await harnessScroll.evaluate((element) => ({
-    bottomDistance: element.scrollHeight - element.clientHeight - element.scrollTop,
-    scrollTop: element.scrollTop,
-  }));
-  assert(
-    Math.abs(harnessAfterNewPlay.bottomDistance - harnessBeforeNewPlay.bottomDistance) <= 4,
-    "Timeline harness changed the older-entry viewport position",
-  );
-  await harnessPage.getByRole("button", { name: "Show newest play" }).click();
-  await harnessPage.waitForFunction(
-    (selector) => ((document.querySelector(selector) as HTMLElement | null)?.scrollTop ?? 0) <= 8,
-    "[data-timeline-scroll-region]",
-  );
-  await harnessPage.getByRole("button", { name: "Deliver newer play at live edge" }).click();
-  await harnessPage.waitForFunction(
-    (selector) => ((document.querySelector(selector) as HTMLElement | null)?.scrollTop ?? 0) <= 8,
-    "[data-timeline-scroll-region]",
-  );
-  assert(
-    (await harnessPage.getByRole("button", { name: "Show newest play" }).count()) === 0,
-    "Timeline harness exposed New play at the live edge",
-  );
-
-  const stableGamePath = `/events/${encodeURIComponent(seeded.currentId)}/games/${encodeURIComponent(
-    seeded.currentGames[1]!.game.eventGameId,
-  )}`;
-  await openEventAndActivateSpectatorGame(page, current, stableGamePath, {
-    expectedScore: "0",
-    expectedTimelineText: "Original Player",
-    focusGameLink: async (keyboardGameLink) => {
-      const keyboardAllEvents = page.getByRole("button", { name: "All events" });
-      await keyboardAllEvents.focus();
-      await page.keyboard.press("Shift+Tab");
-      assert(
-        await page.evaluate(
-          () =>
-            document.activeElement?.getAttribute("href") === "#main-content" &&
-            document.activeElement?.matches(":focus-visible") === true,
-        ),
-        "skip navigation did not receive visible keyboard focus",
-      );
-      await page.keyboard.press("Tab");
-      assert(
-        await keyboardAllEvents.evaluate((element) => document.activeElement === element),
-        "keyboard focus did not move from skip navigation to Event navigation",
-      );
-      await page.keyboard.press("Tab");
-      assert(
-        await keyboardGameLink.evaluate((element) => document.activeElement === element),
-        "keyboard focus did not move into schedule Game navigation",
-      );
-      await page.keyboard.press("Shift+Tab");
-      assert(
-        await keyboardAllEvents.evaluate((element) => document.activeElement === element),
-        "Shift-Tab did not return focus to Event navigation",
-      );
-      await page.keyboard.press("Tab");
-      assert(
-        await keyboardGameLink.evaluate((element) => document.activeElement === element),
-        "Tab did not restore focus to the canonical spectator Game link",
-      );
-      assert(
-        await keyboardGameLink.evaluate(
-          (element) =>
-            element.matches(":focus-visible") && getComputedStyle(element).boxShadow !== "none",
-        ),
-        "canonical spectator Game link did not expose visible keyboard focus styling",
-      );
-    },
-  });
-
-  await page.setViewportSize({ width: 1280, height: 900 });
-  await page.goto(`${origin}${current.canonicalPath}`);
-  await page.getByRole("heading", { name: "Published Current" }).waitFor();
-  assert(
-    await page.evaluate(
-      () => document.documentElement.scrollWidth <= document.documentElement.clientWidth,
-    ),
-    "desktop Event schedule overflows horizontally",
-  );
-  assert(
-    (await page.locator("[data-schedule-card]").count()) >= 5,
-    "desktop Event journey did not render the schedule",
-  );
-  await page.setViewportSize({ width: 360, height: 844 });
-
-  const streamedGame = schedule.locator('[data-game-code="BUSY-2"]');
-  assert(
-    (await streamedGame.getByRole("link", { name: /Open spectator Game/ }).count()) === 1,
-    "schedule Game did not expose a keyboard-operable spectator link",
-  );
-  const initialScore = await streamedGame.locator('[aria-label="Side A score"]').innerText();
-  assert(initialScore === "0", "canonical Event page did not render the initial scoreboard");
-  assert(
-    (await streamedGame.locator('[data-timeline-kind="goal"]').count()) === 0,
-    "canonical Event page unexpectedly rendered the future goal",
-  );
-
-  await exerciseLiveSpectatorGameBehavior(page, seeded, current, stableGamePath, {
-    engineLabel: "Chromium",
-    initialRosterName: "Original Player",
-    correctedRosterName: "Corrected Player",
-    actionPrefix: "browser-convergence",
-    sportingOrder: 1_000,
-  });
-
-  await page.getByRole("button", { name: "All events" }).click();
-  await page.waitForURL(`${origin}/events?view=all`);
-  await page.getByRole("heading", { name: "Current Events" }).waitFor();
-  await page.getByRole("link", { name: "Published Current" }).click();
-  await page.waitForURL(`${origin}${current.canonicalPath}`);
-  await page.getByRole("heading", { name: "Published Current" }).waitFor();
-  await page.getByRole("button", { name: "All events" }).click();
-  await page.waitForURL(`${origin}/events?view=all`);
-
-  await page.route(`${origin}/api/audience/events`, async (route) => {
-    await route.fulfill({
-      status: 200,
-      contentType: "application/json",
-      body: JSON.stringify({
-        status: "accepted",
-        value: {
-          events: [
-            { ...current, lifecycle: "future", gameDays: [futureDate()] },
-            {
-              ...current,
-              eventId: "event-unscheduled",
-              name: "Unscheduled Event",
-              lifecycle: "unscheduled",
-              gameDays: [],
-              canonicalPath: "/events/event-unscheduled",
-            },
-          ],
-        },
-      }),
-    });
-  });
-  await page.goto(`${origin}/events`);
-  await page.getByRole("heading", { name: "Current Events" }).waitFor();
-  assert(page.url() === `${origin}/events`, "zero-current discovery auto-opened an Event");
-  await page.getByText("No Event is current today.").waitFor();
-  await page.unroute(`${origin}/api/audience/events`);
-
-  await page.route(`${origin}/api/audience/events`, async (route) => {
-    await route.fulfill({
-      status: 200,
-      contentType: "application/json",
-      body: JSON.stringify({
-        status: "accepted",
-        value: {
-          events: [
-            current,
-            {
-              ...current,
-              eventId: "event-current-two",
-              name: "Second Current",
-              canonicalPath: "/events/event-current-two",
-            },
-          ],
-        },
-      }),
-    });
-  });
-  await page.goto(`${origin}/events`);
-  await page.getByRole("heading", { name: "Current Events" }).waitFor();
-  assert(page.url() === `${origin}/events`, "multiple-current discovery auto-opened an Event");
-  await page.getByRole("link", { name: "Second Current" }).waitFor();
-  await page.unroute(`${origin}/api/audience/events`);
-
-  const sitemap = await context.request.get(`${origin}/sitemap.xml`);
-  const sitemapBody = await sitemap.text();
-  assert(sitemap.status() === 200, "sitemap was unavailable");
-  assert(sitemapBody.includes(current.canonicalPath), "Published Event was omitted from sitemap");
-  assert(!sitemapBody.includes(seeded.hiddenId), "hidden Event was included in sitemap");
-
-  for (const eventId of [seeded.hiddenId, "unknown-event"]) {
-    const response = await page.goto(`${origin}/events/${eventId}`);
-    await page.getByRole("heading", { name: "Event unavailable" }).waitFor();
-    assert(response?.headers()["x-robots-tag"] === "noindex", `${eventId} page was indexable`);
     assert(
-      (await page
-        .getByText("The Event may be hidden, unknown, or temporarily unavailable.")
-        .count()) === 1,
-      `${eventId} did not render the generic unavailable experience`,
+      (await skipLink.getAttribute("href")) === "#main-content" &&
+        (await page.locator("#main-content").count()) === 1,
+      "skip link did not provide a keyboard destination",
+    );
+    assert(
+      (await page.locator('[data-live-projection-status][role="status"]').count()) === 1,
+      "public Event did not expose a live-update status announcement",
+    );
+    const liveNow = page.locator('[data-schedule-group="live-now"]');
+    await liveNow.locator('[data-game-code="BUSY-2"]').waitFor();
+    await liveNow.locator('[data-game-code="BUSY-3"]').waitFor();
+    assert(
+      (await liveNow.locator('[data-schedule-card][data-schedule-status="running"]').count()) === 2,
+      "both committed running Games were not shown in Live now",
+    );
+    await page.getByRole("link", { name: "View Event schedule" }).click();
+    await page.waitForURL(`${origin}${current.canonicalPath}?view=schedule`);
+    const schedule = page.locator('[data-schedule-group="event-schedule"]');
+    await schedule.waitFor();
+    for (const [code, status] of [
+      ["BUSY-1", "past"],
+      ["BUSY-2", "running"],
+      ["BUSY-4", "awaiting-start"],
+      ["BUSY-5", "future"],
+    ] as const) {
+      assert(
+        (await schedule
+          .locator(`[data-game-code="${code}"][data-schedule-status="${status}"]`)
+          .count()) === 1,
+        `${code} did not retain chronological status ${status}; ${await schedule.innerText()}`,
+      );
+    }
+    assert(
+      (await schedule.locator("details, [data-game-timeline]").count()) === 0,
+      "Event schedule must open Game details on their own screen",
+    );
+    for (const code of ["BUSY-1", "BUSY-2", "BUSY-5"]) {
+      const card = schedule.locator(`[data-game-code="${code}"]`);
+      const link = card.locator("..");
+      assert((await link.count()) === 1, `${code} must have one Game link`);
+      assert(
+        (await link.locator("article").count()) === 1,
+        `${code} link must contain the whole Game card`,
+      );
+      const path = await link.getAttribute("href");
+      await card.click();
+      await page.waitForURL(`${origin}${path}`);
+      await page.locator("[data-scoreboard-expanded]").waitFor();
+      if (code === "BUSY-5")
+        await page.getByText("No public play history is available yet.").waitFor();
+      else await page.locator("[data-game-timeline]").waitFor();
+      if (code === "BUSY-1") await page.locator('[data-timeline-kind="finish"]').waitFor();
+      await page.getByRole("link", { name: "Back to Event" }).click();
+      await page.getByRole("heading", { name: current.name }).waitFor();
+      await page.getByRole("link", { name: "View Event schedule" }).click();
+    }
+    await page.goto(`${origin}${current.canonicalPath}`);
+    await page.getByRole("heading", { name: current.name }).waitFor();
+    assert(
+      (await page.locator('[data-schedule-group="coming-up"] h2').count()) === 1,
+      "Coming up Games were not grouped by Expected Start",
+    );
+    await page.getByText("Pitch 1", { exact: true }).first().waitFor();
+    await page.getByText("Pitch 2", { exact: true }).first().waitFor();
+
+    assert(
+      ((await page.locator("body").textContent()) ?? "").includes("Expected Start"),
+      "Expected Start was not rendered",
+    );
+    assert(
+      await page.evaluate(
+        () => document.documentElement.scrollWidth <= document.documentElement.clientWidth,
+      ),
+      "360px phone-sized Event schedule overflows horizontally",
+    );
+
+    await page.evaluate(() => document.fonts.ready);
+    const arenaSizes = await liveNow
+      .locator("[data-schedule-card]")
+      .evaluateAll((cards) => cards.map((card) => card.getBoundingClientRect().width));
+    assert(
+      Math.abs(arenaSizes[0]! - arenaSizes[1]!) < 2,
+      "Simultaneous games have unequal visual weight",
+    );
+    if (process.env.PUBLIC_GAME_EVIDENCE_DIR) {
+      await page.evaluate(() => scrollTo(0, 0));
+      await page.screenshot({
+        path: join(process.env.PUBLIC_GAME_EVIDENCE_DIR, "event-360.png"),
+        fullPage: true,
+      });
+      await page.setViewportSize({ width: 1280, height: 900 });
+      await page.screenshot({
+        path: join(process.env.PUBLIC_GAME_EVIDENCE_DIR, "event-desktop.png"),
+        fullPage: true,
+      });
+      await page.setViewportSize({ width: 360, height: 844 });
+    }
+    await verifyDaylightEventStates(page, current);
+
+    const harnessPage = await context.newPage();
+    setupBrowserPage(harnessPage, consoleErrors);
+    await harnessPage.goto(`${harnessOrigin}/`);
+    const harnessTimeline = harnessPage.locator("[data-game-timeline]");
+    await harnessTimeline.waitFor();
+    const harnessScroll = harnessTimeline.locator("[data-timeline-scroll-region]");
+    await harnessScroll.evaluate((element) =>
+      window.scrollTo(0, window.scrollY + element.getBoundingClientRect().top + 600),
+    );
+    await harnessPage.waitForFunction(() => window.scrollY > 500);
+    await harnessPage.evaluate(() => window.dispatchEvent(new Event("scroll")));
+    const harnessBeforeNewPlay = await harnessPage.evaluate(() => ({
+      bottomDistance: document.documentElement.scrollHeight - window.scrollY,
+      scrollTop: window.scrollY,
+    }));
+    // Deliver without scrolling back to the fixture controls.
+    await harnessPage
+      .getByRole("button", { name: "Deliver newer play while away" })
+      .evaluate((element) => (element as HTMLButtonElement).click());
+    await harnessPage.getByRole("button", { name: "Show newest play" }).waitFor();
+    const harnessAfterNewPlay = await harnessPage.evaluate(() => ({
+      bottomDistance: document.documentElement.scrollHeight - window.scrollY,
+      scrollTop: window.scrollY,
+    }));
+    assert(
+      Math.abs(harnessAfterNewPlay.bottomDistance - harnessBeforeNewPlay.bottomDistance) <= 4,
+      "Timeline harness changed the older-entry viewport position",
+    );
+    await harnessPage.getByRole("button", { name: "Show newest play" }).click();
+    await harnessPage.waitForFunction(
+      () =>
+        document.querySelector("[data-timeline-scroll-region]")!.getBoundingClientRect().top >= -8,
+    );
+    await harnessPage
+      .getByRole("button", { name: "Deliver newer play at live edge" })
+      .evaluate((element) => (element as HTMLButtonElement).click());
+    assert(
+      (await harnessPage.getByRole("button", { name: "Show newest play" }).count()) === 0,
+      "Timeline harness exposed New play at the live edge",
+    );
+    await assertOpposingTimeline(harnessPage);
+    const yellowCard = harnessPage
+      .locator('[data-timeline-kind="card"]')
+      .filter({ hasText: "yellow card" });
+    const beforeSwap = await yellowCard.evaluate((element) => ({
+      left: element.querySelector("[data-timeline-content]")!.getBoundingClientRect().left,
+      color: getComputedStyle(element.querySelector(".daylight-card-icon")!).backgroundColor,
+    }));
+    await harnessPage
+      .getByRole("button", { name: "Swap Pitch Orientation" })
+      .evaluate((element) => (element as HTMLButtonElement).click());
+    const afterSwap = await yellowCard.evaluate((element) => ({
+      left: element.querySelector("[data-timeline-content]")!.getBoundingClientRect().left,
+      color: getComputedStyle(element.querySelector(".daylight-card-icon")!).backgroundColor,
+    }));
+    assert(
+      afterSwap.left < beforeSwap.left &&
+        afterSwap.color === beforeSwap.color &&
+        afterSwap.color === "rgb(247, 186, 0)",
+      "Pitch Orientation did not swap team ownership independently of the yellow card color",
+    );
+    await assertOpposingTimeline(harnessPage);
+    await harnessPage
+      .getByRole("button", { name: "Show finished game" })
+      .evaluate((element) => (element as HTMLButtonElement).click());
+    const finish = harnessPage.locator('[data-timeline-kind="finish"]');
+    await finish.getByText("Winner: Berner Boggarts", { exact: true }).waitFor();
+    for (const width of [360, 1280]) {
+      await harnessPage.setViewportSize({ width, height: 800 });
+      await finish.scrollIntoViewIfNeeded();
+      assert(
+        await finish.evaluate((element) => {
+          const row = element.getBoundingClientRect();
+          const content = element.querySelector("[data-timeline-content]")!.getBoundingClientRect();
+          return (
+            Math.abs((row.left + row.right - content.left - content.right) / 2) < 2 &&
+            document.documentElement.scrollWidth <= innerWidth
+          );
+        }),
+        "Finish winner is not centered or overflows",
+      );
+      if (process.env.PUBLIC_BROWSER_SCREENSHOTS)
+        await harnessPage.screenshot({
+          path: join(process.env.PUBLIC_BROWSER_SCREENSHOTS, `finish-winner-${width}.png`),
+        });
+    }
+
+    const stableGamePath = `/events/${encodeURIComponent(seeded.currentId)}/games/${encodeURIComponent(
+      seeded.currentGames[1]!.game.eventGameId,
+    )}`;
+    await openEventAndActivateSpectatorGame(page, current, stableGamePath, {
+      expectedScore: "0",
+      expectedTimelineText: "Original Player",
+      focusGameLink: async (keyboardGameLink) => {
+        const keyboardAllEvents = page.getByRole("link", { name: "All events" });
+        await keyboardAllEvents.focus();
+        await page.keyboard.press("Shift+Tab");
+        assert(
+          await page.evaluate(
+            () =>
+              document.activeElement?.getAttribute("href") === "#main-content" &&
+              document.activeElement?.matches(":focus-visible") === true,
+          ),
+          "skip navigation did not receive visible keyboard focus",
+        );
+        await page.keyboard.press("Tab");
+        assert(
+          await keyboardAllEvents.evaluate((element) => document.activeElement === element),
+          "keyboard focus did not move from skip navigation to Event navigation",
+        );
+        await page.keyboard.press("Tab");
+        await page.keyboard.press("Tab");
+        assert(
+          await keyboardGameLink.evaluate((element) => document.activeElement === element),
+          "keyboard focus did not move into schedule Game navigation",
+        );
+        await page.keyboard.press("Shift+Tab");
+        await page.keyboard.press("Shift+Tab");
+        assert(
+          await keyboardAllEvents.evaluate((element) => document.activeElement === element),
+          "Shift-Tab did not return focus to Event navigation",
+        );
+        await page.keyboard.press("Tab");
+        await page.keyboard.press("Tab");
+        assert(
+          await keyboardGameLink.evaluate((element) => document.activeElement === element),
+          "Tab did not restore focus to the canonical spectator Game link",
+        );
+        assert(
+          await keyboardGameLink.evaluate(
+            (element) =>
+              element.matches(":focus-visible") &&
+              (getComputedStyle(element).boxShadow !== "none" ||
+                getComputedStyle(element).outlineStyle !== "none"),
+          ),
+          "canonical spectator Game link did not expose visible keyboard focus styling",
+        );
+      },
+    });
+
+    await page.setViewportSize({ width: 1280, height: 900 });
+    await page.goto(`${origin}${current.canonicalPath}`);
+    await page.getByRole("heading", { name: "Published Current" }).waitFor();
+    assert(
+      await page.evaluate(
+        () => document.documentElement.scrollWidth <= document.documentElement.clientWidth,
+      ),
+      "desktop Event schedule overflows horizontally",
+    );
+    assert(
+      (await page.locator("[data-schedule-card]").count()) >= 3,
+      "desktop Event journey did not render the schedule",
+    );
+    await page.getByRole("link", { name: "View Event schedule" }).click();
+    await page.setViewportSize({ width: 360, height: 844 });
+
+    const streamedGame = schedule.locator('[data-game-code="BUSY-2"]');
+    assert(
+      (await streamedGame.locator("..").getAttribute("href")) !== null,
+      "schedule Game did not expose a keyboard-operable spectator link",
+    );
+    const initialScore = await streamedGame.locator('[aria-label="Side A score"]').innerText();
+    assert(initialScore === "0", "canonical Event page did not render the initial scoreboard");
+    assert(
+      (await streamedGame.locator('[data-timeline-kind="goal"]').count()) === 0,
+      "canonical Event page unexpectedly rendered the future goal",
+    );
+
+    await exerciseLiveSpectatorGameBehavior(page, seeded, current, stableGamePath, {
+      engineLabel: "Chromium",
+      initialRosterName: "Original Player",
+      correctedRosterName: "Corrected Player",
+      actionPrefix: "browser-convergence",
+      sportingOrder: 1_000,
+    });
+
+    await verifyDaylightScoreboardStates(page, current, stableGamePath);
+
+    await page.getByRole("link", { name: "All events" }).click();
+    await page.waitForURL(`${origin}/events?view=all`);
+    await page.getByRole("heading", { name: "Current Events" }).waitFor();
+    await page.getByRole("link", { name: "Published Current" }).click();
+    await page.waitForURL(`${origin}${current.canonicalPath}`);
+    await page.getByRole("heading", { name: "Published Current" }).waitFor();
+    await page.getByRole("link", { name: "All events" }).click();
+    await page.waitForURL(`${origin}/events?view=all`);
+
+    await page.route(`${origin}/api/audience/events`, async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          status: "accepted",
+          value: {
+            events: [
+              { ...current, lifecycle: "future", gameDays: [futureDate()] },
+              {
+                ...current,
+                eventId: "event-unscheduled",
+                name: "Unscheduled Event",
+                lifecycle: "unscheduled",
+                gameDays: [],
+                canonicalPath: "/events/event-unscheduled",
+              },
+            ],
+          },
+        }),
+      });
+    });
+    await page.goto(`${origin}/events`);
+    await page.getByRole("heading", { name: "Current Events" }).waitFor();
+    assert(page.url() === `${origin}/events`, "zero-current discovery auto-opened an Event");
+    await page.getByText("No Event is current today.").waitFor();
+    await page.unroute(`${origin}/api/audience/events`);
+
+    await page.route(`${origin}/api/audience/events`, async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          status: "accepted",
+          value: {
+            events: [
+              current,
+              {
+                ...current,
+                eventId: "event-current-two",
+                name: "Second Current",
+                canonicalPath: "/events/event-current-two",
+              },
+            ],
+          },
+        }),
+      });
+    });
+    await page.goto(`${origin}/events`);
+    await page.getByRole("heading", { name: "Current Events" }).waitFor();
+    assert(page.url() === `${origin}/events`, "multiple-current discovery auto-opened an Event");
+    await page.getByRole("link", { name: "Second Current" }).waitFor();
+    await page.unroute(`${origin}/api/audience/events`);
+
+    const sitemap = await context.request.get(`${origin}/sitemap.xml`);
+    const sitemapBody = await sitemap.text();
+    assert(sitemap.status() === 200, "sitemap was unavailable");
+    assert(sitemapBody.includes(current.canonicalPath), "Published Event was omitted from sitemap");
+    assert(!sitemapBody.includes(seeded.hiddenId), "hidden Event was included in sitemap");
+
+    for (const eventId of [seeded.hiddenId, "unknown-event"]) {
+      const response = await page.goto(`${origin}/events/${eventId}`);
+      await page.getByRole("heading", { name: "Event unavailable" }).waitFor();
+      assert(response?.headers()["x-robots-tag"] === "noindex", `${eventId} page was indexable`);
+      assert(
+        (await page
+          .getByText("The Event may be hidden, unknown, or temporarily unavailable.")
+          .count()) === 1,
+        `${eventId} did not render the generic unavailable experience`,
+      );
+      await page.getByRole("button", { name: "Back to Home" }).click();
+      await page.waitForURL(`${origin}/events?view=all`);
+    }
+
+    await page.route(`${origin}/api/audience/events/database-failure`, async (route) => {
+      await route.fulfill({
+        status: 503,
+        contentType: "application/json",
+        body: JSON.stringify({ status: "unavailable" }),
+      });
+    });
+    const databaseFailureResponse = await page.goto(`${origin}/events/database-failure`);
+    await page.getByRole("heading", { name: "Event unavailable" }).waitFor();
+    assert(
+      databaseFailureResponse?.headers()["x-robots-tag"] === "noindex",
+      "database-failure page was indexable",
     );
     await page.getByRole("button", { name: "Back to Home" }).click();
     await page.waitForURL(`${origin}/events?view=all`);
-  }
+    await page.unroute(`${origin}/api/audience/events/database-failure`);
 
-  await page.route(`${origin}/api/audience/events/database-failure`, async (route) => {
-    await route.fulfill({
-      status: 503,
-      contentType: "application/json",
-      body: JSON.stringify({ status: "unavailable" }),
-    });
-  });
-  const databaseFailureResponse = await page.goto(`${origin}/events/database-failure`);
-  await page.getByRole("heading", { name: "Event unavailable" }).waitFor();
-  assert(
-    databaseFailureResponse?.headers()["x-robots-tag"] === "noindex",
-    "database-failure page was indexable",
-  );
-  await page.getByRole("button", { name: "Back to Home" }).click();
-  await page.waitForURL(`${origin}/events?view=all`);
-  await page.unroute(`${origin}/api/audience/events/database-failure`);
-
-  await page.goto(`${origin}${current.canonicalPath}`);
-  await page.getByRole("heading", { name: "Published Current" }).waitFor();
-  await page.getByText("Corrected Player").waitFor();
-  webkitBrowser = await webkit.launch({ headless: true });
-  try {
-    await runWebKitCriticalPath(webkitBrowser, seeded, current, stableGamePath);
-  } finally {
-    await webkitBrowser.close();
-    webkitBrowser = null;
+    await page.goto(`${origin}${current.canonicalPath}`);
+    await page.getByRole("heading", { name: "Published Current" }).waitFor();
+    assert(
+      (await page.locator("[data-game-timeline]").count()) === 0,
+      "Event page embedded Game history",
+    );
+    webkitBrowser = await webkit.launch({ headless: true });
+    try {
+      await runWebKitCriticalPath(webkitBrowser, seeded, current, stableGamePath);
+    } finally {
+      await webkitBrowser.close();
+      webkitBrowser = null;
+    }
+    await assertWithdrawnPublicEvent(page, current.name, "WebKit Corrected Player", "Chromium");
+    await page.goto(`${origin}/events?view=all`);
+    await page.getByRole("heading", { name: "Current Events" }).waitFor();
+    const adHoc = page.getByRole("button", { name: /Start an Ad Hoc Game/ });
+    await page.getByLabel("Away color").focus();
+    await page.keyboard.press("Tab");
+    assert(
+      await adHoc.evaluate(
+        (element) =>
+          document.activeElement === element &&
+          element.matches(":focus-visible") &&
+          getComputedStyle(element).boxShadow !== "none",
+      ),
+      "Ad Hoc handoff did not expose visible focus styling",
+    );
+    await page.keyboard.press("Enter");
+    await page.waitForURL(new RegExp(`${origin}/game/adhoc-[a-zA-Z0-9_-]+$`));
+    assert(consoleErrors.length === 0, `browser console errors: ${consoleErrors.join(" | ")}`);
+    console.log(
+      JSON.stringify({
+        status: "passed",
+        zeroCurrent: true,
+        oneCurrentAutoOpen: true,
+        multipleCurrentDiscovery: true,
+        busyPhoneSchedule: true,
+        publicEventScheduleScoreTimelineConvergence: true,
+        stableGameScheduleScoreTimelineConvergence: true,
+        canonicalNavigation: true,
+        unavailableHiddenUnknown: true,
+        unavailableDatabaseFailure: true,
+        publishedSitemapExclusion: true,
+        adHocHandoff: true,
+        keyboardAccessible: true,
+        semanticLandmarks: true,
+        liveUpdateAnnouncements: true,
+        spectatorGameNavigation: true,
+        keyboardTimeline: true,
+        stickyCompactScore: true,
+        timelineNewPlayPreservesContext: true,
+        effectiveGameCorrection: true,
+        reducedMotionTimeline: true,
+        webkitPublicCriticalPath: true,
+        webkitLiveConvergence: true,
+        webkitRosterReconnectRecovery: true,
+        webkitTimelineContextPreservation: true,
+        webkitEffectiveGameCorrection: true,
+        webkitPublicationWithdrawal: true,
+      }),
+    );
   }
-  await assertWithdrawnPublicEvent(page, current.name, "WebKit Corrected Player", "Chromium");
-  await page.goto(`${origin}/events?view=all`);
-  await page.getByRole("heading", { name: "Current Events" }).waitFor();
-  const adHoc = page.getByRole("button", { name: /Start an Ad Hoc Game/ });
-  await page.getByLabel("Away color").focus();
-  await page.keyboard.press("Tab");
-  assert(
-    await adHoc.evaluate(
-      (element) =>
-        document.activeElement === element &&
-        element.matches(":focus-visible") &&
-        getComputedStyle(element).boxShadow !== "none",
-    ),
-    "Ad Hoc handoff did not expose visible focus styling",
-  );
-  await page.keyboard.press("Enter");
-  await page.waitForURL(new RegExp(`${origin}/game/adhoc-[a-zA-Z0-9_-]+$`));
-  assert(consoleErrors.length === 0, `browser console errors: ${consoleErrors.join(" | ")}`);
-  console.log(
-    JSON.stringify({
-      status: "passed",
-      zeroCurrent: true,
-      oneCurrentAutoOpen: true,
-      multipleCurrentDiscovery: true,
-      busyPhoneSchedule: true,
-      publicEventScheduleScoreTimelineConvergence: true,
-      stableGameScheduleScoreTimelineConvergence: true,
-      canonicalNavigation: true,
-      unavailableHiddenUnknown: true,
-      unavailableDatabaseFailure: true,
-      publishedSitemapExclusion: true,
-      adHocHandoff: true,
-      keyboardAccessible: true,
-      semanticLandmarks: true,
-      liveUpdateAnnouncements: true,
-      spectatorGameNavigation: true,
-      keyboardTimeline: true,
-      stickyCompactScore: true,
-      timelineNewPlayPreservesContext: true,
-      effectiveGameCorrection: true,
-      reducedMotionTimeline: true,
-      webkitPublicCriticalPath: true,
-      webkitLiveConvergence: true,
-      webkitRosterReconnectRecovery: true,
-      webkitTimelineContextPreservation: true,
-      webkitEffectiveGameCorrection: true,
-      webkitPublicationWithdrawal: true,
-    }),
-  );
 } catch (error) {
   console.error(error instanceof Error ? (error.stack ?? error.message) : String(error));
   if (browserPage) {
@@ -549,7 +654,6 @@ async function openEventAndActivateSpectatorGame(
   await page.goto(`${origin}${current.canonicalPath}`);
   await page.getByRole("heading", { name: current.name }).waitFor();
   assert((await page.getByRole("main").count()) === 1, "public Event has no main landmark");
-  await page.getByRole("heading", { name: "Event schedule" }).waitFor();
   await page.locator('[data-schedule-group="live-now"]').waitFor();
   assert(
     await page.evaluate(
@@ -557,7 +661,7 @@ async function openEventAndActivateSpectatorGame(
     ),
     "360px public Event overflows horizontally",
   );
-  const gameLink = page.locator('[data-game-code="BUSY-2"] a[href*="/games/"]').first();
+  const gameLink = page.locator('a[href*="/games/"]:has([data-game-code="BUSY-2"])').first();
   await options.focusGameLink(gameLink);
   assert(
     await gameLink.evaluate((element) => document.activeElement === element),
@@ -586,6 +690,673 @@ async function openEventAndActivateSpectatorGame(
   );
 }
 
+async function verifyEventReference(page: Page, current: PublicEventFixture) {
+  const payload = (await (
+    await page.request.get(`${origin}/api/audience/events/${current.eventId}`)
+  ).json()) as { value: import("@/lib/audience-projection").PublicAudienceEventProjection };
+  const projection = structuredClone(payload.value);
+  projection.name = "SQM 2026";
+  for (const games of [
+    projection.schedule.runningGames,
+    projection.schedule.upcomingGames,
+    projection.schedule.scheduleGames,
+  ])
+    for (const game of games) {
+      game.sideA.name = "Berner Boggarts";
+      game.sideB.name = "Turicum Thunderbirds";
+      game.presentation.displayedTeamColors = { sideA: "#14652b", sideB: "#13466a" };
+      if (game.scheduleStatus === "running") {
+        game.sideA.score = 80;
+        game.sideB.score = 60;
+      }
+    }
+  const running = projection.schedule.runningGames;
+  assert(running.length === 2, "Reference fixture must contain two running Games");
+  for (const [index, source] of running.entries()) {
+    for (const game of [...running, ...projection.schedule.scheduleGames].filter(
+      (game) => game.eventGameId === source.eventGameId,
+    )) {
+      game.expectedStartMs = running[0]!.expectedStartMs;
+      game.pitch = `Pitch ${2 - index}`;
+      game.pitchName = game.pitch;
+    }
+  }
+  await page.routeWebSocket("**/ws", () => {});
+  await page.route("**/api/audience/events/*", (route) =>
+    route.fulfill({ json: { status: "accepted", value: projection } }),
+  );
+  const capture = async (name: string) => {
+    await page.evaluate(() => document.fonts.ready);
+    assert(
+      await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth),
+      `${name} overflows`,
+    );
+    if (process.env.PUBLIC_GAME_EVIDENCE_DIR)
+      await page.screenshot({
+        path: join(process.env.PUBLIC_GAME_EVIDENCE_DIR, `${name}.png`),
+        fullPage: true,
+      });
+  };
+  for (const width of [360, 566, 1280]) {
+    await page.setViewportSize({ width, height: 900 });
+    await page.goto(`${origin}${current.canonicalPath}`);
+    await page.getByRole("heading", { name: "Live now" }).waitFor();
+    assert(
+      (await page.locator('[data-schedule-group="event-schedule"]').count()) === 0,
+      "Schedule remains below overview",
+    );
+    await page.getByRole("heading", { name: /Up next/ }).waitFor();
+    assert(
+      (await page.locator('[data-schedule-group="live-now"] [data-schedule-card]').count()) === 2,
+      "Simultaneous live games missing",
+    );
+    const runningOrder = await page
+      .locator('[data-schedule-group="live-now"] [data-game-code]')
+      .evaluateAll((cards) => cards.map((card) => card.getAttribute("data-game-code")));
+    assert(
+      runningOrder.join(",") === [running[1]!.gameCode, running[0]!.gameCode].join(","),
+      "Equal-start running Games did not show Pitch 1 before Pitch 2",
+    );
+    await capture(`reference-event-${width}`);
+    await page.getByRole("link", { name: "View Event schedule" }).click();
+    await page.getByRole("heading", { name: "Event schedule", exact: true }).waitFor();
+    assert(
+      (await page.locator('[data-schedule-group="live-now"]').count()) === 0,
+      "Overview remains on schedule screen",
+    );
+    assert(
+      (await page
+        .locator("[data-time-group]")
+        .filter({ has: page.locator('[data-schedule-status="running"]') })
+        .count()) ===
+        new Set(projection.schedule.runningGames.map((game) => game.expectedStartMs)).size,
+      "Running games were not grouped by Expected Start",
+    );
+    assert(
+      (await page.locator('[data-schedule-status="running"] img').count()) === 4,
+      "Live schedule logos missing",
+    );
+    await page.evaluate(() => scrollTo(0, 0));
+    await capture(`reference-schedule-${width}`);
+    const gameLink = page.getByRole("link", { name: /Open spectator Game/ }).first();
+    const href = await gameLink.getAttribute("href");
+    await gameLink.focus();
+    await page.keyboard.press("Enter");
+    await page.waitForURL(`${origin}${href}`);
+    await page.locator("[data-scoreboard-expanded]").waitFor();
+  }
+  projection.gameDays = ["2000-01-01"];
+  await page.setViewportSize({ width: 360, height: 900 });
+  await page.goto(`${origin}${current.canonicalPath}`);
+  await page.waitForURL(`${origin}${current.canonicalPath}?view=schedule`);
+  await page.locator('[data-schedule-group="event-schedule"]').waitFor();
+  assert(
+    (await page.locator('[data-schedule-group="live-now"]').count()) === 0,
+    "Non-today Event exposed live overview",
+  );
+  assert(
+    (await page.getByRole("link", { name: "View Event schedule" }).count()) === 0,
+    "Non-today Event retained live/schedule toggle",
+  );
+  await page.evaluate(() => scrollTo(0, 0));
+  await capture("reference-non-today-360");
+  await page.getByRole("link", { name: "All events", exact: true }).click();
+  await page.waitForURL(`${origin}/events?view=all`);
+  await page.getByRole("heading", { name: "Events", exact: true }).waitFor();
+}
+
+async function verifyDaylightEventStates(page: Page, current: PublicEventFixture) {
+  const payload = (await (
+    await page.request.get(`${origin}/api/audience/events/${current.eventId}`)
+  ).json()) as { value: import("@/lib/audience-projection").PublicAudienceEventProjection };
+  const projection = structuredClone(payload.value);
+  const visual = await page.context().newPage();
+  await visual.routeWebSocket("**/ws", () => {});
+  await visual.route("**/api/audience/events/*", (route) =>
+    route.fulfill({ json: { status: "accepted", value: projection } }),
+  );
+  const capture = async (name: string) => {
+    await visual.goto(`${origin}${current.canonicalPath}`);
+    await visual.getByRole("heading", { name: projection.name }).waitFor();
+    await visual.evaluate(() => document.fonts.ready);
+    assert(
+      await visual.evaluate(() => document.documentElement.scrollWidth <= innerWidth),
+      `${name} overflows at 360px`,
+    );
+    if (process.env.PUBLIC_GAME_EVIDENCE_DIR)
+      await visual.screenshot({
+        path: join(process.env.PUBLIC_GAME_EVIDENCE_DIR, `${name}.png`),
+        fullPage: true,
+      });
+  };
+  try {
+    for (const game of [
+      ...projection.schedule.runningGames,
+      ...projection.schedule.scheduleGames,
+    ]) {
+      game.sideA.name = "Basel Basilisks / Luzern with a very long combined team name";
+      game.sideB.name = "Turicum Thunderbirds";
+      game.sideA.score = 110;
+      game.sideB.score = 100;
+      game.phase = "overtime";
+      game.overtimeTarget = 130;
+      game.flagState.catchingSide = "side-a";
+      if (game.scheduleStatus === "running") {
+        game.heatStoppage.status = "inactive";
+        game.heatStoppage.pending = true;
+      }
+    }
+    await capture("event-long-names");
+    await visual.getByText("Target 130", { exact: false }).first().waitFor();
+    await visual.getByRole("link", { name: "View Event schedule" }).click();
+    await visual.getByText("Heat stoppage: Inactive · decision pending").first().waitFor();
+    const rail = visual.getByRole("list", { name: "Chronological Event schedule" });
+    assert(
+      await rail.evaluate(() => window.scrollY > 0),
+      "Schedule did not open at its current point",
+    );
+    projection.schedule.runningGames = [];
+    for (const game of [
+      ...projection.schedule.upcomingGames,
+      ...projection.schedule.scheduleGames,
+    ]) {
+      game.pitch = null;
+      if (game.scheduleStatus === "running") {
+        game.scheduleStatus = "past";
+        game.operationalStatus = "finished";
+      }
+    }
+    projection.pitches = projection.pitches.slice(0, 1);
+    await capture("event-between-games");
+    await visual.getByText("Next games below").waitFor();
+    projection.schedule.upcomingGames = [];
+    projection.schedule.scheduleGames = [];
+    projection.schedule.focusIndex = null;
+    await capture("event-empty");
+    await visual.getByText("No upcoming games scheduled.").waitFor();
+  } finally {
+    await visual.close();
+  }
+}
+
+async function verifyDaylightScoreboardStates(
+  page: Page,
+  current: PublicEventFixture,
+  gamePath: string,
+) {
+  const response = await page.request.get(`${origin}/api/audience/events/${current.eventId}`);
+  const payload = (await response.json()) as {
+    status: string;
+    value: import("@/lib/audience-projection").PublicAudienceEventProjection;
+  };
+  const projection = structuredClone(payload.value);
+  const game = projection.schedule.scheduleGames.find(
+    (candidate) => candidate.canonicalPath === gamePath,
+  );
+  if (!game) throw new Error("Scoreboard visual fixture Game missing");
+  const visual = await page.context().newPage();
+  await visual.setViewportSize({ width: 360, height: 740 });
+  await visual.routeWebSocket("**/ws", () => {});
+  await visual.route("**/api/audience/events/*", (route) =>
+    route.fulfill({ json: { status: "accepted", value: projection } }),
+  );
+  const capture = async (name: string) => {
+    await visual.goto(`${origin}${gamePath}`);
+    await visual.locator("[data-scoreboard-expanded]").waitFor();
+    await visual.evaluate(() => document.fonts.ready);
+    assert(
+      await visual.evaluate(() => document.documentElement.scrollWidth <= innerWidth),
+      `${name} scoreboard overflowed 360px`,
+    );
+    assert(
+      await visual.locator("[data-scoreboard-expanded]").evaluate((scoreboard) => {
+        const clock = scoreboard
+          .querySelector('[aria-label="Game clock"]')!
+          .getBoundingClientRect();
+        return [
+          ...scoreboard.querySelectorAll(
+            ".daylight-team-art, .daylight-team-name, .daylight-score",
+          ),
+        ].every((element) => {
+          const item = element.getBoundingClientRect();
+          return (
+            item.right <= clock.left ||
+            item.left >= clock.right ||
+            item.bottom <= clock.top ||
+            item.top >= clock.bottom
+          );
+        });
+      }),
+      `${name} team identity or score overlaps the clock`,
+    );
+    if (process.env.PUBLIC_GAME_EVIDENCE_DIR)
+      await visual.screenshot({
+        path: join(process.env.PUBLIC_GAME_EVIDENCE_DIR, `${name}.png`),
+        fullPage: true,
+      });
+  };
+  try {
+    game.sideA = { name: "Berner Boggarts", color: "#155c32", score: 110 };
+    game.sideB = { name: "Turicum Thunderbirds", color: "#12395a", score: 100 };
+    game.presentation.displayedTeamColors = { sideA: "#155c32", sideB: "#12395a" };
+    game.presentation.pitchOrientation = "side-a-left";
+    game.phase = "overtime";
+    game.overtimeTarget = 130;
+    game.flagState.catchingSide = "side-a";
+    if (game.clock) game.clock.gameTimeMs = 1_638_000;
+    projection.shortName = "SQM 2026";
+    projection.timeZone = "Europe/Zurich";
+    game.startedAtMs = Date.parse("2026-08-16T07:32:00Z");
+    await capture("verified-artwork-overtime-phone");
+    assert(
+      (await visual.getByRole("link", { name: "Back to Event", exact: true }).innerText()).includes(
+        "SQM 2026",
+      ),
+      "Short Event navigation name missing",
+    );
+    const startStrip = visual.locator('[aria-label="Game start and Pitch"]');
+    assert(
+      (await startStrip.innerText()).includes("Started 09:32"),
+      "Actual start did not use Event timezone",
+    );
+    assert(
+      !(await startStrip.innerText()).includes("Expected"),
+      "Actual start repeated an expected start",
+    );
+    delete projection.shortName;
+    delete game.startedAtMs;
+    await visual.waitForFunction(() =>
+      [...document.querySelectorAll<HTMLImageElement>("[data-scoreboard-expanded] img")].every(
+        (img) => img.complete && img.naturalWidth > 0,
+      ),
+    );
+    assert(
+      (await visual.locator("[data-scoreboard-expanded] img").count()) === 2,
+      "Verified logos missing",
+    );
+    await visual.locator("[data-scoreboard-expanded] img").first().dispatchEvent("error");
+    assert(
+      (await visual.locator("[data-scoreboard-expanded] img").count()) === 1,
+      "Broken logo did not use initials",
+    );
+    assert(
+      (await visual.locator("[data-scoreboard-expanded]").innerText()).includes("BB"),
+      "Broken logo initials missing",
+    );
+    await visual.evaluate(() => scrollTo(0, document.documentElement.scrollHeight));
+    const compact = visual.locator("[data-scoreboard-compact]");
+    await compact.waitFor();
+    assert(
+      (await compact.innerText()).toLowerCase().includes("target 130"),
+      "Compact overtime target missing",
+    );
+    await compact.evaluate(async (element) => {
+      await Promise.all(
+        element
+          .getAnimations({ subtree: true })
+          .filter((animation) => animation.timeline === document.timeline)
+          .map((animation) => animation.finished),
+      );
+    });
+    assert(
+      await compact.evaluate((element) => element.getBoundingClientRect().top <= 4),
+      "Compact score is not at the top",
+    );
+    await visual.emulateMedia({ reducedMotion: "reduce" });
+    assert(
+      await compact.evaluate((element) => getComputedStyle(element).animationName === "none"),
+      "Reduced motion compact animation remains",
+    );
+    await compact.getByRole("button", { name: "Return to full scoreboard" }).click();
+    await visual.waitForFunction(() => scrollY === 0);
+    await compact.waitFor({ state: "detached" });
+    await visual.evaluate(() => scrollTo(0, document.documentElement.scrollHeight));
+    await compact.waitFor();
+    assert(
+      (await compact.getByText("Flag catch").count()) === 1,
+      "Compact accessible catch marker missing",
+    );
+    const originalEventName = projection.name;
+    const originalPitch = game.pitch;
+    const originalPitchName = game.pitchName;
+    game.pitchName = undefined;
+    projection.name = "Swiss Quadball Championship and International Invitational Weekend";
+    game.pitch = "North championship pitch beside the main entrance";
+    await capture("long-event-and-pitch-phone");
+    const back = visual.getByRole("link", { name: "Back to Event", exact: true });
+    assert((await back.innerText()).includes(projection.name), "Long Event name was lost");
+    assert(
+      await visual.locator(".daylight-game").evaluate((header) => {
+        const link = header.querySelector(".daylight-game-header a")!;
+        const pitch = header.querySelector(".daylight-start-strip")!;
+        const a = link.getBoundingClientRect();
+        const b = pitch.getBoundingClientRect();
+        const inView = (rect: DOMRect) =>
+          rect.left >= 0 && rect.right <= innerWidth && rect.width > 0 && rect.height > 0;
+        const hit = document.elementFromPoint(a.left + a.width / 2, a.top + a.height / 2);
+        return (
+          inView(a) &&
+          inView(b) &&
+          (a.right <= b.left || b.right <= a.left || a.bottom <= b.top || b.bottom <= a.top) &&
+          (hit === link || (hit !== null && link.contains(hit))) &&
+          pitch.scrollWidth <= pitch.clientWidth
+        );
+      }),
+      "Long Event/back link and Pitch must remain visible, separate and usable at 360px",
+    );
+    await back.click();
+    await visual.waitForURL(`${origin}/events/${encodeURIComponent(current.eventId)}`);
+    projection.name = originalEventName;
+    game.pitch = originalPitch;
+    game.pitchName = originalPitchName;
+    game.sideA.name = "Basel / Luzern Combined Team With A Very Long Public Name";
+    game.sideB.name = "Another Exceptionally Long Team Identity That Must Wrap";
+    game.presentation.displayedTeamColors = { sideA: "#facc15", sideB: "#ffffff" };
+    game.operationalStatus = "suspended";
+    game.gameSuspension = "suspended";
+    game.teamTimeout = { status: "started", side: "side-a", remainingMs: 30_000 };
+    if (game.clock) game.clock.synchronization = "stale";
+    game.timeline = game.timeline.map((entry) => ({
+      ...entry,
+      teamName:
+        entry.lane === "center"
+          ? null
+          : entry.lane === "side-a"
+            ? game.sideA.name
+            : game.sideB.name,
+      ...(entry.kind === "card"
+        ? {
+            player: { number: 77, name: "Alexandria-Montgomery Longplayername" },
+            penaltyReason:
+              "Repeated illegal contact against an opponent without possession of the ball",
+          }
+        : {}),
+    }));
+    await capture("long-names-suspended-phone");
+    await visual.evaluate(() => scrollTo(0, document.documentElement.scrollHeight));
+    await visual.locator("[data-scoreboard-compact]").waitFor();
+    assert(
+      await visual
+        .locator(".daylight-clock-freshness")
+        .evaluate(
+          (element) =>
+            element.getBoundingClientRect().height > 0 && getComputedStyle(element).opacity === "1",
+        ),
+      "Compact morph hid stale clock warning",
+    );
+    await visual.waitForFunction(() => {
+      const last = document
+        .querySelector("[data-game-timeline] li:last-child")!
+        .getBoundingClientRect();
+      const compact = document.querySelector("[data-scoreboard-compact]")!.getBoundingClientRect();
+      return last.top > compact.bottom && last.bottom <= innerHeight;
+    });
+    assert(
+      (await visual.locator("[data-scoreboard-expanded] img").count()) === 0,
+      "Unverified combined identity received artwork",
+    );
+    game.operationalStatus = "finished";
+    game.result = { status: "finished", winner: "side-a", locked: true };
+    game.timeline = [];
+    await capture("finished-empty-history-phone");
+
+    assert(
+      (await visual.locator(".daylight-status").textContent())?.trim() === "Finished",
+      "Finished must supersede overtime, target, and stale clock state",
+    );
+    assert(
+      (await visual
+        .locator(".daylight-details, section.daylight-morph-scoreboard .daylight-meta")
+        .count()) === 0,
+      "Finished Game retained routine or stale exceptional details",
+    );
+    assert(
+      (await visual.locator("header h1").count()) === 0,
+      "Navigation retained duplicate Game designation",
+    );
+    await visual
+      .getByRole("heading", { level: 1, name: /Game scoreboard/ })
+      .waitFor({ state: "attached" });
+    game.operationalStatus = "scheduled";
+    game.result = { status: "unfinished", winner: null, locked: false };
+    game.clock = { ...game.clock!, synchronization: "synchronized" };
+    await capture("not-started-phone");
+    assert(
+      (await visual.locator(".daylight-status").textContent())?.trim() === "Not started",
+      "Scheduled Game exposed a future phase or overtime target",
+    );
+    game.operationalStatus = "running";
+    for (const phase of ["seeker-floor", "seekers-released", "overtime"] as const) {
+      game.phase = phase;
+      await capture(`${phase}-phone`);
+      assert(
+        !(await visual.locator(".daylight-status").textContent())?.includes("Finished"),
+        "Unfinished Game incorrectly finished",
+      );
+    }
+
+    assert(
+      (await visual.locator("main").innerText()).includes("No public play history"),
+      "Empty history missing",
+    );
+    game.spectatorAvailable = false;
+    await visual.reload();
+    await visual.getByRole("heading", { name: "Game unavailable" }).waitFor();
+  } finally {
+    await visual.close();
+  }
+}
+
+async function verifyGameNameMorph(page: Page, current: PublicEventFixture, gamePath: string) {
+  const response = await page.request.get(`${origin}/api/audience/events/${current.eventId}`);
+  const payload = (await response.json()) as {
+    value: import("@/lib/audience-projection").PublicAudienceEventProjection;
+  };
+  const projection = structuredClone(payload.value);
+  const game = projection.schedule.scheduleGames.find(
+    (candidate) => candidate.canonicalPath === gamePath,
+  )!;
+  game.sideA.name = "Berner Boggarts";
+  game.sideB.name = "Turicum Thunderbirds";
+  const visual = await page.context().newPage();
+  await visual.routeWebSocket("**/ws", () => {});
+  await visual.route("**/api/audience/events/*", (route) =>
+    route.fulfill({ json: { status: "accepted", value: projection } }),
+  );
+  try {
+    await visual.goto(`${origin}${gamePath}`);
+    await visual.locator("[data-scoreboard-expanded]").waitFor();
+    await visual.evaluate(() => document.fonts.ready);
+    for (const width of [360, 390, 566, 1280]) {
+      await visual.setViewportSize({ width, height: 740 });
+      await visual.evaluate(async () => {
+        scrollTo(0, 0);
+        // Let viewport/font geometry recalibrate before measuring scroll-only movement.
+        await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      });
+      await visual.waitForFunction(
+        () =>
+          document
+            .querySelector("[data-collapse-progress]")
+            ?.getAttribute("data-collapse-progress") === "0",
+      );
+      const nativeAlignment = await visual.evaluate(async () => {
+        const board = document.querySelector("[data-scoreboard-expanded]")!;
+        const start = (document.querySelector("[data-scoreboard-sentinel]") as HTMLElement)
+          .offsetTop;
+        const errors: number[] = [];
+        const content = document.querySelector("[data-scoreboard-content]")!;
+        const contentTop = content.getBoundingClientRect().top + scrollY;
+        const displacements: number[] = [];
+        const artwork = board.querySelector(".daylight-team-art")!;
+        const expandedArtwork = parseFloat(getComputedStyle(artwork).width);
+        const native = board.hasAttribute("data-scoreboard-native-scroll");
+        for (const target of [start + 240, 0]) {
+          scrollTo({ top: target, behavior: "smooth" });
+          const deadline = performance.now() + 2000;
+          let settled = 0;
+          await new Promise<void>((resolve) => {
+            const sample = () => {
+              const expected = Math.max(0, Math.min(1, (scrollY - start) / 180));
+              const rendered =
+                (expandedArtwork - parseFloat(getComputedStyle(artwork).width)) /
+                (expandedArtwork - 32);
+              errors.push(Math.abs(expected - rendered));
+              displacements.push(
+                Math.abs(content.getBoundingClientRect().top + scrollY - contentTop),
+              );
+              settled = Math.abs(scrollY - target) < 1 ? settled + 1 : 0;
+              if (settled >= 2 || performance.now() > deadline) resolve();
+              else requestAnimationFrame(() => setTimeout(sample, 0));
+            };
+            requestAnimationFrame(() => setTimeout(sample, 0));
+          });
+        }
+        return {
+          native,
+          maximumError: Math.max(...errors),
+          maximumContentDisplacement: Math.max(...displacements),
+        };
+      });
+      assert(
+        nativeAlignment.maximumContentDisplacement < 2,
+        `${page.context().browser()!.browserType().name()} width${width} timeline shifted ${nativeAlignment.maximumContentDisplacement}px independently of scrolling`,
+      );
+      assert(
+        nativeAlignment.native,
+        "Supported browser did not use native scoreboard scroll animation",
+      );
+      assert(
+        nativeAlignment.maximumError < 0.02,
+        `Scoreboard lagged native scrolling by ${nativeAlignment.maximumError * 180}px`,
+      );
+      const heights = await visual.evaluate(async () => {
+        const board = document.querySelector("[data-scoreboard-expanded]")!;
+        const top = (document.querySelector("[data-scoreboard-sentinel]") as HTMLElement).offsetTop;
+        const rows: number[] = [];
+        for (const direction of [1, -1])
+          for (let step = 0; step <= 60; step++) {
+            scrollTo(0, top + 3 * (direction === 1 ? step : 60 - step));
+            await new Promise((resolve) =>
+              requestAnimationFrame(() => requestAnimationFrame(resolve)),
+            );
+            rows.push(board.getBoundingClientRect().height);
+          }
+        return rows;
+      });
+      const maximumStep = Math.max(
+        ...heights.slice(1).map((height, i) => Math.abs(height - heights[i]!)),
+      );
+      const averageStep = (Math.max(...heights) - Math.min(...heights)) / 60;
+      if (process.env.PUBLIC_GAME_EVIDENCE_DIR)
+        await Bun.write(
+          join(
+            process.env.PUBLIC_GAME_EVIDENCE_DIR,
+            `name-morph-${page.context().browser()!.browserType().name()}-${width}.json`,
+          ),
+          JSON.stringify({ width, nativeAlignment, maximumStep, averageStep, heights }),
+        );
+      assert(
+        maximumStep <= Math.max(10, averageStep * 2.5),
+        `Wrapped-name morph jumped ${maximumStep}px for a 3px scroll at width${width}`,
+      );
+      assert(
+        Math.abs(heights[0]! - heights.at(-1)!) < 1,
+        "Wrapped-name morph did not reverse to the original height",
+      );
+    }
+  } finally {
+    await visual.close();
+  }
+}
+
+async function verifyGameScrollRange(page: Page, current: PublicEventFixture, gamePath: string) {
+  const response = await page.request.get(`${origin}/api/audience/events/${current.eventId}`);
+  const payload = (await response.json()) as {
+    value: import("@/lib/audience-projection").PublicAudienceEventProjection;
+  };
+  const projection = structuredClone(payload.value);
+  const game = projection.schedule.scheduleGames.find(
+    (candidate) => candidate.canonicalPath === gamePath,
+  )!;
+  game.timeline = [];
+  const visual = await page.context().newPage();
+  await visual.routeWebSocket("**/ws", () => {});
+  await visual.route("**/api/audience/events/*", (route) =>
+    route.fulfill({ json: { status: "accepted", value: projection } }),
+  );
+  try {
+    await visual.setViewportSize({ width: 566, height: 1600 });
+    await visual.goto(`${origin}${gamePath}`);
+    await visual.locator("[data-scoreboard-expanded]").waitFor();
+    await visual.evaluate(() => document.fonts.ready);
+    assert(
+      await visual.evaluate(
+        () => document.documentElement.scrollHeight <= document.documentElement.clientHeight,
+      ),
+      "Short Game fixture unexpectedly scrolls",
+    );
+    for (const y of [-200, 500]) {
+      await visual.evaluate((y) => {
+        Object.defineProperty(window, "scrollY", { configurable: true, value: y });
+        dispatchEvent(new Event("scroll"));
+      }, y);
+      await visual.evaluate(
+        () => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))),
+      );
+      assert(
+        (await visual
+          .locator("[data-collapse-progress]")
+          .getAttribute("data-collapse-progress")) === "0",
+        "Short Game rubber-band scrolling collapsed the scoreboard",
+      );
+    }
+    await visual.setViewportSize({ width: 360, height: 260 });
+    await visual.waitForFunction(
+      () =>
+        Number(
+          document
+            .querySelector("[data-collapse-progress]")
+            ?.getAttribute("data-collapse-progress"),
+        ) > 0,
+    );
+    await visual.setViewportSize({ width: 566, height: 1600 });
+    await visual.waitForFunction(
+      () =>
+        document
+          .querySelector("[data-collapse-progress]")
+          ?.getAttribute("data-collapse-progress") === "0",
+    );
+    await visual.evaluate(() => {
+      const history = document.createElement("div");
+      history.setAttribute("data-test-history-growth", "");
+      history.style.height = "1800px";
+      document.querySelector("[data-scoreboard-content]")!.append(history);
+    });
+    await visual.waitForFunction(
+      () =>
+        document
+          .querySelector("[data-collapse-progress]")
+          ?.getAttribute("data-collapse-progress") === "1",
+    );
+    await visual.evaluate(() => document.querySelector("[data-test-history-growth]")!.remove());
+    await visual.waitForFunction(
+      () =>
+        document
+          .querySelector("[data-collapse-progress]")
+          ?.getAttribute("data-collapse-progress") === "0",
+    );
+    assert(
+      await visual.evaluate(
+        () => document.documentElement.scrollHeight <= document.documentElement.clientHeight,
+      ),
+      "Morph created overflow on the short Game",
+    );
+  } finally {
+    await visual.close();
+  }
+}
+
 async function exerciseLiveSpectatorGameBehavior(
   page: Page,
   seeded: SeededPublicEvent,
@@ -599,6 +1370,8 @@ async function exerciseLiveSpectatorGameBehavior(
     sportingOrder: number;
   },
 ) {
+  await verifyGameScrollRange(page, current, stableGamePath);
+  await verifyGameNameMorph(page, current, stableGamePath);
   const websocket = {
     routeCount: 0,
     activeRoute: null as DisconnectableWebSocketRoute | null,
@@ -638,11 +1411,14 @@ async function exerciseLiveSpectatorGameBehavior(
         .querySelector("[data-live-projection-status]")
         ?.textContent?.includes("connected") === true,
   );
-  const initialClock = await page.locator("[data-scoreboard-expanded] .font-mono").innerText();
+  const initialClock = await page
+    .locator('[data-scoreboard-expanded] [aria-label="Game clock"]')
+    .innerText();
   await page.waitForFunction(
     (initial) =>
-      document.querySelector("[data-scoreboard-expanded] .font-mono")?.textContent?.trim() !==
-      initial,
+      document
+        .querySelector('[data-scoreboard-expanded] [aria-label="Game clock"]')
+        ?.textContent?.trim() !== initial,
     initialClock,
   );
   assert(initialClock.length > 0, `${options.engineLabel} did not render its live Clock`);
@@ -681,51 +1457,214 @@ async function exerciseLiveSpectatorGameBehavior(
     `${options.engineLabel} retained the superseded roster label after recovery`,
   );
 
+  if (process.env.PUBLIC_GAME_EVIDENCE_DIR) {
+    const evidence = process.env.PUBLIC_GAME_EVIDENCE_DIR;
+    mkdirSync(evidence, { recursive: true });
+    await page.evaluate(() => window.scrollTo(0, 0));
+    await page.screenshot({
+      path: join(evidence, `${options.engineLabel}-game-phone.png`),
+      fullPage: true,
+    });
+    await page.setViewportSize({ width: 1280, height: 900 });
+    await page.screenshot({
+      path: join(evidence, `${options.engineLabel}-game-desktop.png`),
+      fullPage: true,
+    });
+    await page.setViewportSize({ width: 360, height: 740 });
+  }
+  const morph = page.locator("[data-scoreboard-expanded]");
+  const originalScoreboard = await morph.elementHandle();
+  for (const width of [360, 566, 1280]) {
+    await page.setViewportSize({ width, height: 740 });
+    await page.evaluate(() => scrollTo(0, 0));
+    await page.waitForFunction(
+      () =>
+        Number(
+          getComputedStyle(document.querySelector("[data-scoreboard-expanded]")!).getPropertyValue(
+            "--score-collapse",
+          ),
+        ) === 0,
+    );
+    if (process.env.PUBLIC_GAME_EVIDENCE_DIR)
+      await page.screenshot({
+        path: join(
+          process.env.PUBLIC_GAME_EVIDENCE_DIR,
+          `${options.engineLabel}-morph-expanded-${width}.png`,
+        ),
+      });
+    const expandedHeight = await morph.evaluate(
+      (element) => element.getBoundingClientRect().height,
+    );
+    const top = await page
+      .locator("[data-scoreboard-sentinel]")
+      .evaluate((element) => (element as HTMLElement).offsetTop);
+    await page.evaluate(async (y) => {
+      scrollTo(0, y);
+      await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    }, top + 90);
+    await page.waitForFunction(() => {
+      const progress = Number(
+        getComputedStyle(document.querySelector("[data-scoreboard-expanded]")!).getPropertyValue(
+          "--score-collapse",
+        ),
+      );
+      return Math.abs(progress - 0.5) < 0.001;
+    });
+    const midwayHeight = await morph.evaluate((element) => element.getBoundingClientRect().height);
+    if (process.env.PUBLIC_GAME_EVIDENCE_DIR)
+      await page.screenshot({
+        path: join(
+          process.env.PUBLIC_GAME_EVIDENCE_DIR,
+          `${options.engineLabel}-morph-mid-${width}.png`,
+        ),
+      });
+    await page.evaluate((y) => scrollTo(0, y), top + 200);
+    await page.waitForFunction(
+      () =>
+        Number(
+          getComputedStyle(document.querySelector("[data-scoreboard-expanded]")!).getPropertyValue(
+            "--score-collapse",
+          ),
+        ) === 1,
+    );
+    if (process.env.PUBLIC_GAME_EVIDENCE_DIR)
+      await page.screenshot({
+        path: join(
+          process.env.PUBLIC_GAME_EVIDENCE_DIR,
+          `${options.engineLabel}-morph-compact-${width}.png`,
+        ),
+      });
+    const compactHeight = await morph.evaluate((element) => element.getBoundingClientRect().height);
+    assert(
+      expandedHeight > midwayHeight && midwayHeight > compactHeight,
+      `${options.engineLabel} width${width} scoreboard heights expanded=${expandedHeight}, midway=${midwayHeight}, compact=${compactHeight}; ${await morph.evaluate((element) => JSON.stringify({ progress: element.getAttribute("data-collapse-progress"), y: scrollY, sentinel: (document.querySelector("[data-scoreboard-sentinel]") as HTMLElement)?.offsetTop, height: element.getBoundingClientRect().height, art: getComputedStyle(element.querySelector(".daylight-team-art")!).height }))}`,
+    );
+    assert(
+      await originalScoreboard?.evaluate(
+        (element) => element === document.querySelector("[data-scoreboard-compact]"),
+      ),
+      "Morph replaced the scoreboard node",
+    );
+    await page.evaluate(async (y) => {
+      scrollTo(0, y);
+      await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    }, top + 90);
+    await page.waitForFunction(
+      () =>
+        Math.abs(
+          Number(
+            getComputedStyle(
+              document.querySelector("[data-scoreboard-expanded]")!,
+            ).getPropertyValue("--score-collapse"),
+          ) - 0.5,
+        ) < 0.001,
+    );
+    assert(
+      Math.abs(
+        (await morph.evaluate((element) => element.getBoundingClientRect().height)) - midwayHeight,
+      ) < 2,
+      `${options.engineLabel} width${width} scoreboard did not reverse: midway=${midwayHeight}, reverse=${await morph.evaluate((element) => element.getBoundingClientRect().height)}`,
+    );
+  }
+  await originalScoreboard?.dispose();
+  await page.setViewportSize({ width: 360, height: 740 });
   await page.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight));
-  const compactScoreboard = page.locator(
-    '[data-scoreboard-compact][aria-label="Compact live scoreboard"]',
-  );
+  const compactScoreboard = page.locator('[data-scoreboard-compact][aria-label="Live scoreboard"]');
   await compactScoreboard.waitFor({ state: "visible" });
+  await compactScoreboard.evaluate(async (element) => {
+    await Promise.all(
+      element
+        .getAnimations({ subtree: true })
+        .filter((animation) => animation.timeline === document.timeline)
+        .map((animation) => animation.finished),
+    );
+  });
+  if (process.env.PUBLIC_GAME_EVIDENCE_DIR)
+    await page.screenshot({
+      path: join(process.env.PUBLIC_GAME_EVIDENCE_DIR, `${options.engineLabel}-game-compact.png`),
+    });
   assert(
     await compactScoreboard.evaluate((element) => {
       const rect = element.getBoundingClientRect();
       return (
         getComputedStyle(element).position === "sticky" &&
         rect.top >= 0 &&
-        rect.top <= 16 &&
+        rect.top <= 4 &&
         rect.right <= document.documentElement.clientWidth
       );
     }),
-    `${options.engineLabel} 360px Game did not expose a usable sticky compact score`,
+    `${options.engineLabel} 360px Game did not expose a usable top compact score`,
   );
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await compactScoreboard.waitFor();
+  if (process.env.PUBLIC_GAME_EVIDENCE_DIR)
+    await page.screenshot({
+      path: join(
+        process.env.PUBLIC_GAME_EVIDENCE_DIR,
+        `${options.engineLabel}-game-compact-desktop.png`,
+      ),
+    });
+  await page.setViewportSize({ width: 360, height: 740 });
   await page.emulateMedia({ reducedMotion: "reduce" });
+  assert(
+    await compactScoreboard.evaluate(
+      (element) => getComputedStyle(element).animationName === "none",
+    ),
+    "Compact header ignored reduced motion",
+  );
+  await compactScoreboard.getByRole("button", { name: "Return to full scoreboard" }).click();
+  await page.waitForFunction(() => window.scrollY === 0);
+  await compactScoreboard.waitFor({ state: "detached" });
+  assert(
+    await page.locator("main").evaluate((element) => document.activeElement === element),
+    "Returning to full scoreboard lost keyboard focus",
+  );
+  await page.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight));
+  await compactScoreboard.waitFor();
   const timelineRegion = page.locator('[data-timeline-scroll-region][role="region"][tabindex="0"]');
+  const start = page.locator('[data-timeline-kind="game-start"]');
+  assert(
+    (await start.count()) === 1 && (await start.innerText()).includes("0:00"),
+    "Started Game did not expose exactly one zero-time commencement milestone",
+  );
+  const startCentered = await start.evaluate((element) => {
+    const bar = element.getBoundingClientRect();
+    const label = element.querySelector("[data-timeline-content]")!.getBoundingClientRect();
+    return Math.abs((label.left + label.right) / 2 - (bar.left + bar.right) / 2) < 2;
+  });
+  assert(startCentered, "Game start did not use a centered lifecycle bar");
   await timelineRegion.scrollIntoViewIfNeeded();
-  await page.getByRole("button", { name: "Back to Event" }).focus();
+  await page.getByRole("link", { name: "Back to Event" }).focus();
+  await page.waitForFunction(() => !document.querySelector("[data-scoreboard-compact]"));
   await page.keyboard.press("Tab");
+  await timelineRegion.evaluate(async (element) => {
+    window.scrollTo(0, window.scrollY + element.getBoundingClientRect().top + 200);
+    await new Promise<void>((resolve) =>
+      requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+    );
+    window.dispatchEvent(new Event("scroll"));
+  });
   const timelineBefore = await timelineRegion.evaluate((element) => {
     const region = element as HTMLDivElement;
-    const maximumScrollTop = region.scrollHeight - region.clientHeight;
-    region.scrollTop = Math.min(200, maximumScrollTop);
-    region.dispatchEvent(new Event("scroll", { bubbles: true }));
-    const regionRect = region.getBoundingClientRect();
     const anchor = Array.from(region.querySelectorAll<HTMLElement>("[data-timeline-kind]")).find(
       (entry) => {
         const rect = entry.getBoundingClientRect();
-        return rect.top >= regionRect.top && rect.bottom <= regionRect.bottom;
+        const headerBottom =
+          document.querySelector("[data-scoreboard-compact]")?.getBoundingClientRect().bottom ?? 0;
+        return rect.top >= headerBottom && rect.bottom <= window.innerHeight - 64;
       },
     );
     return {
-      scrollTop: region.scrollTop,
+      scrollTop: window.scrollY,
       scrollHeight: region.scrollHeight,
-      clientHeight: region.clientHeight,
+      clientHeight: window.innerHeight,
       focused: document.activeElement === region,
       focusVisible: region.matches(":focus-visible"),
       boxShadow: getComputedStyle(region).boxShadow,
       reducedMotion: window.matchMedia("(prefers-reduced-motion: reduce)").matches,
       scrollBehavior: getComputedStyle(region).scrollBehavior,
       anchorText: anchor?.textContent ?? null,
-      anchorTop: anchor === undefined ? null : anchor.getBoundingClientRect().top - regionRect.top,
+      anchorTop: anchor === undefined ? null : anchor.getBoundingClientRect().top,
     };
   });
   assert(
@@ -754,13 +1693,10 @@ async function exerciseLiveSpectatorGameBehavior(
       (entry) => entry.textContent === anchorText,
     );
     return {
-      scrollTop: region.scrollTop,
+      scrollTop: window.scrollY,
       scrollHeight: region.scrollHeight,
       focused: document.activeElement === region,
-      anchorTop:
-        anchor === undefined
-          ? null
-          : anchor.getBoundingClientRect().top - region.getBoundingClientRect().top,
+      anchorTop: anchor === undefined ? null : anchor.getBoundingClientRect().top,
     };
   }, timelineBefore.anchorText);
   const timelineHeightDelta = timelineAfter.scrollHeight - timelineBefore.scrollHeight;
@@ -778,10 +1714,29 @@ async function exerciseLiveSpectatorGameBehavior(
     (await newPlay.innerText()) === "New play",
     `${options.engineLabel} did not expose the accessible New play action`,
   );
+  assert(
+    await newPlay.evaluate((element) => {
+      const button = element.getBoundingClientRect();
+      const score = document.querySelector("[data-scoreboard-compact]")!.getBoundingClientRect();
+      return (
+        button.top > score.bottom &&
+        button.bottom <= innerHeight &&
+        button.left >= 0 &&
+        button.right <= innerWidth
+      );
+    }),
+    `${options.engineLabel} New play overlaps the top score`,
+  );
+  if (process.env.PUBLIC_GAME_EVIDENCE_DIR)
+    await page.screenshot({
+      path: join(process.env.PUBLIC_GAME_EVIDENCE_DIR, `${options.engineLabel}-new-play.png`),
+    });
   await newPlay.focus();
   await page.keyboard.press("Enter");
   const activatedTimeline = await timelineRegion.evaluate((element) => ({
-    scrollTop: (element as HTMLDivElement).scrollTop,
+    scrollTop:
+      (document.querySelector("[data-scoreboard-compact]")?.getBoundingClientRect().bottom ?? 0) -
+      element.getBoundingClientRect().top,
     focused: document.activeElement === element,
     firstKind: element.querySelector("[data-timeline-kind]")?.getAttribute("data-timeline-kind"),
   }));
@@ -817,11 +1772,66 @@ async function exerciseLiveSpectatorGameBehavior(
     (await page.locator('[data-game-code="BUSY-2"] [data-timeline-kind="goal"]').count()) === 0,
     `${options.engineLabel} corrected Goal remained in the Event Timeline`,
   );
-  await publicRosterTimelineEntry(page, options.correctedRosterName).waitFor();
+  assert(
+    (await page.locator("[data-game-timeline]").count()) === 0,
+    "Event page embedded Game history",
+  );
   assert(
     (await page.locator('[data-game-code="BUSY-2"][data-schedule-status="running"]').count()) >= 1,
     `${options.engineLabel} stream update removed the canonical schedule card`,
   );
+}
+
+async function assertOpposingTimeline(page: Page) {
+  for (const width of [360, 566, 1280]) {
+    await page.setViewportSize({ width, height: 900 });
+    const bounds = await page.locator("[data-game-timeline]").evaluate((element) => {
+      const rect = element.getBoundingClientRect();
+      const middle = rect.left + rect.width / 2;
+      const entries = Array.from(element.querySelectorAll<HTMLElement>("[data-timeline-kind]"));
+      return {
+        overflow: document.documentElement.scrollWidth > innerWidth,
+        borders: entries.every((entry) =>
+          entry.dataset.timelineLane === "center"
+            ? getComputedStyle(entry).borderBottomWidth === "1px"
+            : getComputedStyle(entry.querySelector("[data-timeline-content]")!)
+                .borderBottomWidth === "0px",
+        ),
+        lanes: entries
+          .filter((entry) => entry.dataset.timelineLane !== "center")
+          .every((entry) => {
+            const content = entry.querySelector("[data-timeline-content]")!.getBoundingClientRect();
+            const time = entry.querySelector("[data-timeline-spine]")!.getBoundingClientRect();
+            return entry.dataset.timelineSide === "left"
+              ? content.right <= time.left && content.right < middle
+              : content.left >= time.right && content.left > middle;
+          }),
+        wrapped: entries.every((entry) => {
+          const content = entry.querySelector("[data-timeline-content]")!;
+          return Array.from(content.querySelectorAll("p")).every(
+            (text) => text.scrollWidth <= text.clientWidth,
+          );
+        }),
+      };
+    });
+    assert(
+      !bounds.overflow && bounds.lanes && bounds.wrapped && bounds.borders,
+      `${width}px opposing Timeline bounds failed: ${JSON.stringify(bounds)}`,
+    );
+    const screenshotDirectory = process.env.PUBLIC_BROWSER_SCREENSHOTS;
+    if (screenshotDirectory) {
+      mkdirSync(screenshotDirectory, { recursive: true });
+      await page.evaluate(() => window.scrollTo(0, 0));
+      await page.screenshot({
+        path: join(
+          screenshotDirectory,
+          `timeline-${width}-${await page.locator('[data-timeline-kind="card"]').first().getAttribute("data-timeline-side")}.png`,
+        ),
+        fullPage: true,
+      });
+    }
+  }
+  await page.setViewportSize({ width: 360, height: 740 });
 }
 
 function publicRosterTimelineEntry(page: Page, publicName: string) {
@@ -864,7 +1874,9 @@ async function runWebKitCriticalPath(
         assert(
           await gameLink.evaluate(
             (element) =>
-              document.activeElement === element && getComputedStyle(element).boxShadow !== "none",
+              document.activeElement === element &&
+              (getComputedStyle(element).boxShadow !== "none" ||
+                getComputedStyle(element).outlineStyle !== "none"),
           ),
           "WebKit spectator Game link did not expose visible keyboard focus",
         );
@@ -981,7 +1993,7 @@ async function createBusySchedule(
   if (blueTeam.status !== "accepted" || redTeam.status !== "accepted") {
     throw new Error("busy Event Team creation failed");
   }
-  const now = Date.now();
+  const now = fixtureNow;
   const starts = [
     now - 90 * 60_000,
     now - 30 * 60_000,
@@ -990,11 +2002,21 @@ async function createBusySchedule(
     now + 20 * 60_000,
     now + 90 * 60_000,
   ];
+  const daysByDate = new Map([[new Date(fixtureNow).toISOString().slice(0, 10), gameDayId]]);
   const created: Array<{ game: EventGame; pitchId: string; pitchSlotId: string }> = [];
   for (const [index, startMs] of starts.entries()) {
+    const slotDate = new Date(startMs).toISOString().slice(0, 10);
+    let slotDayId = daysByDate.get(slotDate);
+    if (slotDayId === undefined) {
+      const extraDay = await catalog.addGameDay(eventId, { date: slotDate }, authority);
+      if (extraDay.status !== "accepted")
+        throw new Error("boundary fixture Game Day creation failed");
+      slotDayId = extraDay.value.gameDayId;
+      daysByDate.set(slotDate, slotDayId);
+    }
     const slot = await catalog.createGameplaySlot(
       eventId,
-      gameDayId,
+      slotDayId,
       { sequence: index + 1, scheduledStart: new Date(startMs).toISOString().slice(0, 16) },
       authority,
     );
@@ -1002,7 +2024,7 @@ async function createBusySchedule(
     if (index === 2) {
       const delayed = await catalog.setGameplaySlotExpectedDelay(
         eventId,
-        gameDayId,
+        slotDayId,
         slot.value.gameplaySlotId,
         { expectedDelayMs: 5 * 60_000 },
         authority,
@@ -1018,7 +2040,7 @@ async function createBusySchedule(
     if (pitchSlot === undefined) throw new Error("busy Event Pitch Slot creation failed");
     const game = await catalog.createEventGame(
       eventId,
-      gameDayId,
+      slotDayId,
       {
         gameplaySlotId: slot.value.gameplaySlotId,
         pitchSlotId: pitchSlot.pitchSlotId,
@@ -1032,7 +2054,7 @@ async function createBusySchedule(
     if (game.status !== "accepted") throw new Error("busy Event Game creation failed");
     const confirmed = await catalog.confirmGameplaySlotTeams(
       eventId,
-      gameDayId,
+      slotDayId,
       slot.value.gameplaySlotId,
       {
         games: [
@@ -1082,7 +2104,7 @@ async function seedCommittedGameRecords(seeded: {
       }
       const root = createSeedRoot(
         seeded.currentId,
-        seeded.currentGameDayId,
+        entry.game.gameDayId,
         entry.game.eventGameId,
         entry.pitchId,
         entry.pitchSlotId,
@@ -1470,7 +2492,7 @@ function createSeedAction(
 }
 
 function dateOffset(offset: number) {
-  const date = new Date();
+  const date = new Date(fixtureNow);
   date.setUTCDate(date.getUTCDate() + offset);
   return date.toISOString().slice(0, 10);
 }
