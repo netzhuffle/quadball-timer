@@ -1,9 +1,9 @@
-# SQM 2026 goal scorers
+# Ad Hoc goal scorer annotations
 
-The first three games have supplementary goal-scorer annotations transcribed from the three paper score sheets supplied on 23 September 2026 and approved by the requester that day. `src/lib/sqm-goal-scorers.json` maps the original score-action IDs to the approved player number or name, with fixture, side, and game-time guards.
+Scorer annotations are stored in `adhoc_games.goal_scorers_json` in the Ad Hoc SQLite database. Each annotation references a score-action ID and guards its game time and side. Its player can have a number, a name, or both; a null player means the scorer is unknown. Public projection uses only matching effective ten-point goals. Sporting commands, scores, timings and results remain immutable.
 
-There are 39 goals: 35 numbered scorers, three name-only scorers, and one unknown. Leon scored Basel's first and third goals in game 3. Juri scored Turicum's goal at paper score 20:60. The scorer at 20:50 is intentionally unknown. Turicum's final goal (20:130 on paper) is #10.
+Startup adds the optional column with an empty-array default. It imports no scorer data. This is additive metadata compatible with schema version 5: older binaries ignore and preserve the new column on sporting writes. Existing SQLite snapshots include the column without adding a new relation or changing the backup contract.
 
-Photo order is game 1, game 3, game 2. Game 3's paper side order is opposite the application's internal side order. Its final two goal rows also appear in the opposite order to the recorded actions: Basel's Leon goal at 22:58 precedes Turicum's #10 goal at 23:05 in the action history. Assignments follow team and original action identity; timings and sporting order are unchanged. Undone goals are excluded.
+The requester supplied and approved the first three SQM games' scorer assignments on 23 September 2026. Their separate database import is a user-executed sudo handoff, not deployment code. Future database corrections are read directly; there is no compiled scorer lookup or startup reseeding.
 
-These are public display annotations on the protected SQM fixture, not rewrites of the original score commands or inferred roster identities. A mismatched, undone, or non-goal action receives no annotation. Original scores, catches, penalty events, clocks, and results remain unchanged. Reverting the annotation change removes the displayed scorers without a database rollback.
+For SQM, the handoff validates the original effective score-action IDs, sides, points and source timestamps, backs up the database, then updates only the three annotation values in one transaction. It leaves one unidentified scorer blank and gives three goals names without fabricated jersey numbers. The last two game-3 paper rows differ from action order; scorer attribution follows team and original action identity, retaining recorded timings.

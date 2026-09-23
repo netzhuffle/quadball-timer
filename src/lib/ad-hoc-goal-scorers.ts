@@ -1,16 +1,21 @@
-import annotations from "./sqm-goal-scorers.json";
 import type { ControllerGameFact } from "@/lib/live-event-game-control";
 import type { PublicAudienceTimelinePlayer } from "@/lib/game-timeline-projection";
 
-/** Approved paper-score-sheet annotations; original sporting actions remain immutable. */
-export function sqmGoalPlayers(
-  fixtureKey: string | undefined,
+export type AdHocGoalScorer = {
+  scoreActionId: string;
+  gameTimeMs: number;
+  side: "home" | "away";
+  player: PublicAudienceTimelinePlayer | null;
+};
+
+/** Stored annotations may label only the matching effective goal. */
+export function adHocGoalPlayers(
+  annotations: readonly AdHocGoalScorer[],
   facts: readonly ControllerGameFact[],
 ): ReadonlyMap<string, PublicAudienceTimelinePlayer> {
   const players = new Map<string, PublicAudienceTimelinePlayer>();
-  if (fixtureKey === undefined) return players;
   for (const annotation of annotations) {
-    if (annotation.fixtureKey !== fixtureKey || annotation.player === null) continue;
+    if (annotation.player === null) continue;
     const fact = facts.find((candidate) => candidate.factId === annotation.scoreActionId);
     if (
       fact?.effective !== true ||
