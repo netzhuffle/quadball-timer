@@ -36,17 +36,13 @@ test("disabled auth never issues authority, sessions, or enrollment but retains 
   expect(auth.emergencyReset().ok).toBe(false);
 });
 test("preview WebSockets admit only the exact configured origin and host", () => {
-  const origin = "https://mars.example.ts.net:8443";
-  expect(isAllowedWebSocketOrigin(origin, "mars.example.ts.net:8443", origin)).toBe(true);
-  expect(isAllowedWebSocketOrigin(origin, "mars.example.ts.net:8444", origin)).toBe(false);
+  const origin = "https://preview.example.com:8443";
+  expect(isAllowedWebSocketOrigin(origin, "preview.example.com:8443", origin)).toBe(true);
+  expect(isAllowedWebSocketOrigin(origin, "preview.example.com:8444", origin)).toBe(false);
   expect(
-    isAllowedWebSocketOrigin(
-      "https://other.example.ts.net:8443",
-      "mars.example.ts.net:8443",
-      origin,
-    ),
+    isAllowedWebSocketOrigin("https://other.example.com:8443", "preview.example.com:8443", origin),
   ).toBe(false);
-  expect(isAllowedWebSocketOrigin(origin, "mars.example.ts.net:8443")).toBe(false);
+  expect(isAllowedWebSocketOrigin(origin, "preview.example.com:8443")).toBe(false);
   expect(isAllowedWebSocketOrigin("http://localhost:3000", "localhost:3000", origin)).toBe(false);
   expect(isAllowedWebSocketOrigin("https://timer.quadball.app", "timer.quadball.app", origin)).toBe(
     false,

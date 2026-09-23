@@ -26,7 +26,7 @@ test("restarts preserve keys and game identity across ports and HTTPS origins", 
   expect(initializeDevelopmentState(worktree)).toBe(directory);
   expect(readFileSync(join(directory, "state.json"), "utf8")).toBe(before);
   const http = developmentEnvironment(directory, 3000, "http://localhost:3000");
-  const https = developmentEnvironment(directory, 3001, "https://mars.example.ts.net:8443");
+  const https = developmentEnvironment(directory, 3001, "https://preview.example.com:8443");
   expect(http.AD_HOC_ENVIRONMENT_ID).toBe(https.AD_HOC_ENVIRONMENT_ID);
   expect(http.DEV_EVENT_GAME_KEY_RING_FILE).toBe(https.DEV_EVENT_GAME_KEY_RING_FILE);
   expect(http.AD_HOC_DATABASE).toBe(https.AD_HOC_DATABASE);
@@ -78,7 +78,7 @@ test("missing keys and running source fail without replacing data or creating a 
 
 test("HTTP external origins and malformed ports are rejected", () => {
   const directory = initializeDevelopmentState(root());
-  expect(() => developmentEnvironment(directory, 3000, "http://mars.local:3000")).toThrow(
+  expect(() => developmentEnvironment(directory, 3000, "http://preview.local:3000")).toThrow(
     "loopback",
   );
   expect(() => developmentEnvironment(directory, 0, "http://localhost:3000")).toThrow("Port");

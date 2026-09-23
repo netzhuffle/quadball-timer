@@ -113,7 +113,7 @@ export function developmentEnvironment(
     throw new Error("Use an exact HTTP or HTTPS public origin.");
   if (url.protocol === "http:" && !["localhost", "127.0.0.1", "[::1]"].includes(url.hostname))
     throw new Error(
-      "HTTP development must use a loopback origin; use Tailscale HTTPS for other devices.",
+      "HTTP development must use a loopback origin; use an HTTPS preview for other devices.",
     );
   const state = readDevelopmentState(directory);
   const adminDirectory = join(directory, "technical-admin");

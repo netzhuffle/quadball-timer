@@ -40,19 +40,19 @@ removes `.local/dev/runtime.lock`. After an unclean exit, inspect its recorded
 `pid` and verify that the launcher and its server are gone before removing that
 lock. Do not delete databases or keys as a way to fix startup.
 
-## HTTPS and Tailscale previews
+## HTTPS previews
 
 Local HTTP explicitly disables Technical Admin enrollment and login; it does not
-bypass protected operations. Use the `tailscale-devserver` skill for login and
-phone/tablet testing. Its helper continues to own Serve routes, lifetime, logs,
-and sleep protection. Select the exact private HTTPS origin before launching:
+bypass protected operations. For login and phone/tablet testing, configure an
+HTTPS reverse proxy to forward requests to the local server while preserving the
+Host and Origin headers. Select its exact HTTPS origin before launching:
 
 ```fish
-bun run dev --port 3001 --public-origin https://mars.example.ts.net:8443
+bun run dev --port 3001 --public-origin https://preview.example.com:8443
 ```
 
-Use the actual hostname and unused HTTPS port selected by the skill. The Bun
-listener remains HTTP on `127.0.0.1:3001`; Tailscale terminates HTTPS. The configured
+Replace the example hostname and port with those of your HTTPS proxy. The Bun
+listener remains HTTP on `127.0.0.1:3001`; the proxy terminates HTTPS. The configured
 origin is used for passkeys, secure cookies, and exact WebSocket admission. Do not
 adopt an HTTP-mode server for an authenticated preview: stop it and start with the
 correct HTTPS origin. Reuse the same HTTPS origin on subsequent runs when possible.
@@ -60,7 +60,7 @@ correct HTTPS origin. Reuse the same HTTPS origin on subsequent runs when possib
 To enroll this worktree's Technical Admin while its HTTPS preview is running:
 
 ```fish
-bun run dev --public-origin https://mars.example.ts.net:8443 --admin-enroll
+bun run dev --public-origin https://preview.example.com:8443 --admin-enroll
 ```
 
 Open the short-lived enrollment URL printed by that command through the preview.
