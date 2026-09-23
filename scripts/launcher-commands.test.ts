@@ -16,7 +16,7 @@ test("orphan containment stays on development and intentional browser launchers"
     "test:focused:public-event-browser",
     "test:focused:technical-admin-browser",
   ]);
-  expect(manifest.scripts.dev).toContain("--hot src/index.ts");
+  expect(manifest.scripts.dev).toContain("scripts/dev.ts");
   expect(manifest.scripts.test).not.toContain("focused");
   expect(manifest.scripts.check).not.toContain("launcher-lifecycle");
 });

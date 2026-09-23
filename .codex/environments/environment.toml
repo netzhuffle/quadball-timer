@@ -5,4 +5,5 @@ name = "quadball-timer"
 [setup]
 script = '''
 cd "$CODEX_WORKTREE_PATH"
-bun install --frozen-lockfile'''
+bun install --frozen-lockfile
+bun run dev:setup'''

@@ -1,3 +1,4 @@
+import { createDisabledLocalAuth, isLocalHttpDevelopment } from "@/lib/local-http-auth";
 import { serve, type ServerWebSocket } from "bun";
 import { createHash, randomBytes } from "node:crypto";
 import { dirname } from "node:path";
@@ -321,20 +322,27 @@ async function startServer() {
       },
     );
     startupCleanup.add(() => adHocService.close());
-    const databasePath = storagePaths.technicalAdminDatabase;
-    technicalAdminRepository = createSqliteTechnicalAdminAuthRepository(databasePath, {
-      environment: technicalAdminConfig.environment,
-      origin: technicalAdminConfig.origin,
-      rpId: technicalAdminConfig.rpId,
-    });
-    startupCleanup.add(() => technicalAdminRepository?.close());
-    technicalAdminAuth = createTechnicalAdminAuth(technicalAdminConfig, technicalAdminRepository);
-    startupCleanup.add(() => {
-      technicalAdminAuth.stopRetentionMaintenance();
-      technicalAdminAuth.close();
-    });
-    technicalAdminAuth.storageStatus();
-    technicalAdminAuth.startRetentionMaintenance(createTechnicalAdminRetentionScheduler());
+    if (isLocalHttpDevelopment(technicalAdminConfig)) {
+      technicalAdminAuth = createDisabledLocalAuth(technicalAdminConfig);
+      console.log(
+        "Local HTTP development: Technical Admin login is disabled. Use an HTTPS preview to enroll or log in.",
+      );
+    } else {
+      const databasePath = storagePaths.technicalAdminDatabase;
+      technicalAdminRepository = createSqliteTechnicalAdminAuthRepository(databasePath, {
+        environment: technicalAdminConfig.environment,
+        origin: technicalAdminConfig.origin,
+        rpId: technicalAdminConfig.rpId,
+      });
+      startupCleanup.add(() => technicalAdminRepository?.close());
+      technicalAdminAuth = createTechnicalAdminAuth(technicalAdminConfig, technicalAdminRepository);
+      startupCleanup.add(() => {
+        technicalAdminAuth.stopRetentionMaintenance();
+        technicalAdminAuth.close();
+      });
+      technicalAdminAuth.storageStatus();
+      technicalAdminAuth.startRetentionMaintenance(createTechnicalAdminRetentionScheduler());
+    }
 
     const foundationDatabasePath = storagePaths.foundationDatabase;
     let eventCatalogStorage;
@@ -726,7 +734,15 @@ async function startServer() {
       ...(tls ? { tls } : {}),
       routes: {
         "/ws": async (req: Bun.BunRequest<"/ws">, routeServer: Bun.Server<SessionData>) => {
-          if (!isAllowedWebSocketOrigin(req.headers.get("origin"), req.headers.get("host"))) {
+          if (
+            !isAllowedWebSocketOrigin(
+              req.headers.get("origin"),
+              req.headers.get("host"),
+              environment === "test" && process.env.NODE_ENV === "development"
+                ? technicalAdminConfig.origin
+                : undefined,
+            )
+          ) {
             return json(
               {
                 error: "WebSocket origin not allowed.",
@@ -2350,7 +2366,9 @@ async function startServer() {
         },
         "/healthz": createPublicHealthRoute({
           foundationStorage,
-          technicalAdminAuth,
+          technicalAdminAuth: isLocalHttpDevelopment(technicalAdminConfig)
+            ? null
+            : technicalAdminAuth,
         }),
         "/internal/healthz": {
           GET(req: Request) {

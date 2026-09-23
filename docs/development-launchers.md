@@ -1,5 +1,75 @@
 # Development and browser launcher lifecycle
 
+## Local setup and persistent state
+
+Run `bun install --frozen-lockfile`, then `bun run dev`. The launcher initializes
+`.local/dev/` once and serves HTTP at `http://localhost:3000`. Choose another
+port with `bun run dev --port 3001`. Each worktree owns its own gitignored
+databases, development keys, and stable Ad Hoc environment identity. Restarting
+or changing the preview URL preserves sporting data. Missing or invalid keys
+cause an error rather than replacement keys being generated for existing data.
+
+Fresh state enables the live Event Game reader. An imported older presentation
+preview can retain its original catalog-only projections with `liveEventGames:
+false` in `.local/dev/state.json`. Such previews may contain scheduled samples
+without complete live records; enabling the live reader makes discovery fail
+closed for those samples. This setting is copied with the dataset and does not
+affect SQM's Protected Fixture Ad Hoc Games. Restart after changing it. Converting
+these legacy samples into complete live fixtures is tracked in issue #364.
+
+`bun run dev:setup` performs initialization without starting a server. Codex's
+worktree environment setup feature runs this command after dependency installation
+through `.codex/environments/environment.toml`; it is not runtime configuration.
+The initial databases are empty and their schemas are created at server startup.
+
+To initialize a **new** worktree from main instead, stop main's dev server and
+replace the setup hook's `bun run dev:setup` line with:
+
+```fish
+bun run dev:setup --copy-from "/absolute/path/to/main-worktree"
+```
+
+The source must already have `.local/dev/`. The command copies sporting databases,
+SQLite sidecars, keys, and their identity together; it refuses an existing
+destination or a source owned by a running launcher. Stop any manually started
+process using those databases too. Technical Admin credentials are excluded, so
+the new worktree gets its own enrollment. Do not copy Production data or keys.
+
+Only one server may own a worktree's development state at a time. Normal shutdown
+removes `.local/dev/runtime.lock`. After an unclean exit, inspect its recorded
+`pid` and verify that the launcher and its server are gone before removing that
+lock. Do not delete databases or keys as a way to fix startup.
+
+## HTTPS and Tailscale previews
+
+Local HTTP explicitly disables Technical Admin enrollment and login; it does not
+bypass protected operations. Use the `tailscale-devserver` skill for login and
+phone/tablet testing. Its helper continues to own Serve routes, lifetime, logs,
+and sleep protection. Select the exact private HTTPS origin before launching:
+
+```fish
+bun run dev --port 3001 --public-origin https://mars.example.ts.net:8443
+```
+
+Use the actual hostname and unused HTTPS port selected by the skill. The Bun
+listener remains HTTP on `127.0.0.1:3001`; Tailscale terminates HTTPS. The configured
+origin is used for passkeys, secure cookies, and exact WebSocket admission. Do not
+adopt an HTTP-mode server for an authenticated preview: stop it and start with the
+correct HTTPS origin. Reuse the same HTTPS origin on subsequent runs when possible.
+
+To enroll this worktree's Technical Admin while its HTTPS preview is running:
+
+```fish
+bun run dev --public-origin https://mars.example.ts.net:8443 --admin-enroll
+```
+
+Open the short-lived enrollment URL printed by that command through the preview.
+It does not reset an existing credential. Each exact HTTPS origin has a separate
+Technical Admin database under `.local/dev/technical-admin/`; changing the hostname
+or HTTPS port requires separate enrollment but keeps sporting data. Existing
+browser admissions do not transfer between hosts automatically. This local
+development command does not alter deployed bootstrap authority or deployment.
+
 Use the package commands, such as `bun dev` and
 `bun run test:focused:event-game-controller-browser`. They pass `--no-orphans`
 to their owning Bun process. Direct `bun scripts/test-…` invocations bypass

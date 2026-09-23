@@ -1,3 +1,4 @@
+import { loadGrantKeyRingFile } from "@/lib/grant-key-ring-custody";
 import { randomBytes } from "node:crypto";
 import type {
   AudienceProjectionGameInput,
@@ -484,6 +485,18 @@ export async function openLiveEventGameRuntime(input: {
 export function readLiveEventGrantKeyRing(
   environmentVariables: Record<string, string | undefined> = process.env,
 ): GrantKeyRing | null {
+  const developmentKeyRing = environmentVariables.DEV_EVENT_GAME_KEY_RING_FILE?.trim();
+  if (developmentKeyRing) {
+    if (
+      environmentVariables.NODE_ENV !== "development" ||
+      environmentVariables.QUADBALL_ENVIRONMENT !== "test"
+    ) {
+      throw new Error("The development Event Game key ring is restricted to local Test runtimes.");
+    }
+    return loadGrantKeyRingFile(developmentKeyRing, "test", {
+      requiredOwnerUid: process.getuid?.() ?? 0,
+    }).keyRing;
+  }
   const encryption = readKey(environmentVariables.EVENT_GAME_ENCRYPTION_KEY, 32);
   const lookup = readKey(environmentVariables.EVENT_GAME_LOOKUP_KEY, 32);
   const audit = readKey(environmentVariables.EVENT_GAME_AUDIT_KEY, 32);
