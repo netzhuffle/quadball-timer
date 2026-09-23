@@ -1,5 +1,5 @@
 import type { FoundationStorage } from "@/lib/foundation-storage";
-import type { TechnicalAdminAuth, TechnicalAdminStorageStatus } from "@/lib/technical-admin-auth";
+import type { TechnicalAdminAuth } from "@/lib/technical-admin-auth";
 
 /**
  * The intentionally small core dependency surface of the public health contract. Optional
@@ -7,7 +7,8 @@ import type { TechnicalAdminAuth, TechnicalAdminStorageStatus } from "@/lib/tech
  */
 export type PublicHealthDependencies = {
   foundationStorage: Pick<FoundationStorage, "readiness"> | undefined;
-  technicalAdminAuth: Pick<TechnicalAdminAuth, "storageStatus">;
+  /** Null only when local HTTP development deliberately disables passkey authentication. */
+  technicalAdminAuth: Pick<TechnicalAdminAuth, "storageStatus"> | null;
 };
 
 const PUBLIC_HEALTH_HEADERS = {
@@ -38,13 +39,13 @@ export function createPublicHealthRoute(dependencies: PublicHealthDependencies) 
 }
 
 export async function isPubliclyHealthy(dependencies: PublicHealthDependencies): Promise<boolean> {
-  let technicalAdminStatus: TechnicalAdminStorageStatus;
-  try {
-    technicalAdminStatus = dependencies.technicalAdminAuth.storageStatus();
-  } catch {
-    return false;
+  if (dependencies.technicalAdminAuth !== null) {
+    try {
+      if (dependencies.technicalAdminAuth.storageStatus().state !== "ready") return false;
+    } catch {
+      return false;
+    }
   }
-  if (technicalAdminStatus.state !== "ready") return false;
 
   if (dependencies.foundationStorage === undefined) return false;
   return isFoundationStorageHealthy(dependencies.foundationStorage);

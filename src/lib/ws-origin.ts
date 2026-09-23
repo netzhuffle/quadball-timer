@@ -2,7 +2,11 @@ const PRODUCTION_ORIGIN = "https://timer.quadball.app";
 const TEST_HOSTNAME = "test.timer.quadball.app";
 const LOCAL_HOSTNAMES = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
 
-export function isAllowedWebSocketOrigin(originHeader: string | null, hostHeader: string | null) {
+export function isAllowedWebSocketOrigin(
+  originHeader: string | null,
+  hostHeader: string | null,
+  developmentOrigin?: string,
+) {
   if (originHeader === null || hostHeader === null) {
     return false;
   }
@@ -12,6 +16,10 @@ export function isAllowedWebSocketOrigin(originHeader: string | null, hostHeader
 
   if (origin === null || host === null) {
     return false;
+  }
+
+  if (developmentOrigin !== undefined) {
+    return originHeader === developmentOrigin && hostHeader === new URL(developmentOrigin).host;
   }
 
   if (origin.origin === PRODUCTION_ORIGIN) {

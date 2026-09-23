@@ -91,6 +91,24 @@ async function expectPublicHealthResponse(
 }
 
 describe("public health contract", () => {
+  test("deliberately disabled local auth still requires healthy foundation storage", async () => {
+    expect(
+      await isPubliclyHealthy({ foundationStorage: readyFoundation, technicalAdminAuth: null }),
+    ).toBe(true);
+    expect(
+      await isPubliclyHealthy({ foundationStorage: undefined, technicalAdminAuth: null }),
+    ).toBe(false);
+    expect(
+      await isPubliclyHealthy({
+        foundationStorage: {
+          readiness: async () => {
+            throw new Error("unavailable");
+          },
+        },
+        technicalAdminAuth: null,
+      }),
+    ).toBe(false);
+  });
   test("mounts the literal /healthz route and serves its HTTP contract", async () => {
     const server = Bun.serve({
       port: 0,

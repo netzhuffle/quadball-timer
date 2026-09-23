@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "bun --no-orphans --hot src/index.ts",
+    "dev": "bun --no-orphans scripts/dev.ts",
     "start": "cd dist && NODE_ENV=production bun index.js",
     "grant:key-ring": "bun scripts/grant-key-ring.ts",
     "monitoring:test": "bun src/index.ts --emit-test-monitoring-error",
@@ -45,7 +45,8 @@
     "check:bun-version": "bun scripts/check-bun-version.ts",
     "check:testing-policy": "bun scripts/check-testing-policy.ts",
     "check": "bun run check:bun-version && bun run check:testing-policy && bun run format:check && bun run lint && bun run lint:shell",
-    "test:focused:launcher-lifecycle": "bun --no-orphans scripts/test-launcher-lifecycle-focused.ts"
+    "test:focused:launcher-lifecycle": "bun --no-orphans scripts/test-launcher-lifecycle-focused.ts",
+    "dev:setup": "bun scripts/dev.ts --setup"
   },
   "dependencies": {
     "@radix-ui/react-label": "^2.1.15",
