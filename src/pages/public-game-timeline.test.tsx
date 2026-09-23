@@ -231,6 +231,19 @@ describe("public Game Timeline browser seam", () => {
     }
   });
 
+  test("renders a name-only scorer without a jersey number label", async () => {
+    await act(async () => {
+      root.render(
+        <PublicGameTimeline
+          entries={[entry("goal", 60_000, "Basel", { number: null, name: "Leon" })]}
+        />,
+      );
+    });
+    expect(container.textContent).toContain("Leon");
+    expect(container.textContent).not.toContain("Player #");
+    expect(container.textContent).not.toContain("null");
+  });
+
   test("retains public details and applies effective history updates", async () => {
     const initialEntries = [
       entry("goal", 60_000, "A very long team name that must wrap inside the timeline", {

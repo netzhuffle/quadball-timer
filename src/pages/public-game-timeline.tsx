@@ -161,8 +161,9 @@ function TimelineEntry({
           ) : null}
           {"player" in entry && entry.player !== null ? (
             <p>
-              Player #{entry.player.number}
-              {entry.player.name === null ? "" : ` · ${entry.player.name}`}
+              {entry.player.number === null
+                ? entry.player.name
+                : `Player #${entry.player.number}${entry.player.name === null ? "" : ` · ${entry.player.name}`}`}
             </p>
           ) : null}
           {entry.kind === "card" && entry.penaltyReason !== null ? (
