@@ -1,4 +1,5 @@
 import { isDeepStrictEqual } from "node:util";
+import { adHocGoalPlayers } from "@/lib/ad-hoc-goal-scorers";
 import type { StoredAdHocGame } from "@/lib/ad-hoc-games";
 import { orderControllerOperations } from "@/lib/controller-synchronization";
 import { advanceGameState } from "@/lib/game-engine";
@@ -14,7 +15,8 @@ export function projectAdHocGameTimeline(
   game: Pick<
     StoredAdHocGame,
     "initialState" | "state" | "operations" | "replayBaselineOperationIds"
-  >,
+  > &
+    Pick<StoredAdHocGame, "goalScorers">,
   rules: IqaSportingRules = DEFAULT_IQA_SPORTING_RULES,
   nowMs = game.state.updatedAtMs,
 ): readonly PublicAudienceTimelineEntry[] {
@@ -192,6 +194,7 @@ export function projectAdHocGameTimeline(
   }
   const caught = facts.find((fact) => fact.factType === "flag-catch" && fact.effective);
   const timeline = projectPublicGameTimeline({
+    goalPlayers: adHocGoalPlayers(game.goalScorers ?? [], facts),
     facts,
     sideA: { sideId: "home", eventTeamId: null, teamName: game.state.homeName },
     sideB: { sideId: "away", eventTeamId: null, teamName: game.state.awayName },

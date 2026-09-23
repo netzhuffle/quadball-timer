@@ -22,7 +22,7 @@ export type PublicAudienceTimelineKind =
 export type PublicAudienceTimelineLane = "side-a" | "side-b" | "center";
 
 export type PublicAudienceTimelinePlayer = {
-  number: number;
+  number: number | null;
   name: string | null;
 };
 
@@ -74,6 +74,7 @@ export type PublicAudienceTimelineSide = {
 };
 
 export type PublicAudienceTimelineProjectionInput = {
+  goalPlayers?: ReadonlyMap<string, PublicAudienceTimelinePlayer>;
   facts: readonly ControllerGameFact[];
   commencedAtMs?: number | null;
   winnerGameSideId?: string | null;
@@ -168,7 +169,9 @@ export function projectPublicGameTimeline(
             ...common,
             kind: "goal",
             points: numberValue(data?.points) ?? 10,
-            player: playerForFact(fact, side, input.lookupRosterName, effectiveFacts),
+            player:
+              input.goalPlayers?.get(fact.factId) ??
+              playerForFact(fact, side, input.lookupRosterName, effectiveFacts),
           },
           sequence,
           fact.synchronizationOrder,

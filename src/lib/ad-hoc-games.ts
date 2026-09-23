@@ -1,4 +1,5 @@
 import { projectAdHocGameTimeline } from "@/lib/ad-hoc-timeline-projection";
+import type { AdHocGoalScorer } from "@/lib/ad-hoc-goal-scorers";
 import type { PublicAudienceTimelineEntry } from "@/lib/game-timeline-projection";
 import { Database } from "bun:sqlite";
 import { createHash, randomBytes } from "node:crypto";
@@ -167,6 +168,7 @@ type StoredOperation = {
 };
 
 export type StoredAdHocGame = {
+  goalScorers?: readonly AdHocGoalScorer[];
   gameId: string;
   environmentIdentity: string;
   createdAtMs: number;
@@ -1776,6 +1778,11 @@ export function openSqliteAdHocStore(
     operations_json TEXT NOT NULL
   )`);
   const columns = db.query("PRAGMA table_info(adhoc_games)").all() as { name?: string }[];
+  // Additive optional metadata: older binaries preserve this column on sporting writes.
+  // No scorer data is seeded by deployment or startup.
+  if (!columns.some((column) => column.name === "goal_scorers_json")) {
+    db.run("ALTER TABLE adhoc_games ADD COLUMN goal_scorers_json TEXT NOT NULL DEFAULT '[]'");
+  }
   if (!columns.some((column) => column.name === "environment_identity")) {
     db.run("ALTER TABLE adhoc_games ADD COLUMN environment_identity TEXT NOT NULL DEFAULT ''");
   }
@@ -1984,7 +1991,7 @@ export function openSqliteAdHocStore(
         }
         deleteExpiredCreationEvents(nowMs);
         db.run(
-          "INSERT INTO adhoc_games (game_id, environment_identity, created_at_ms, fixture_key, state_json, initial_state_json, replay_baseline_operation_ids_json, control_qr, control_qr_hash, sessions_json, operations_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          "INSERT INTO adhoc_games (game_id, environment_identity, created_at_ms, fixture_key, state_json, initial_state_json, replay_baseline_operation_ids_json, control_qr, control_qr_hash, sessions_json, operations_json, goal_scorers_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
           [
             game.gameId,
             game.environmentIdentity,
@@ -1997,6 +2004,7 @@ export function openSqliteAdHocStore(
             game.controlQrHash,
             JSON.stringify(game.sessions),
             JSON.stringify(game.operations),
+            JSON.stringify(game.goalScorers ?? []),
           ],
         );
         db.run(
@@ -2020,13 +2028,15 @@ export function openSqliteAdHocStore(
               ("rollback" in result && result.rollback === true))
           )
         ) {
+          validateStoredGame(game);
           db.run(
-            "UPDATE adhoc_games SET state_json = ?, sessions_json = ?, operations_json = ?, replay_baseline_operation_ids_json = ? WHERE game_id = ?",
+            "UPDATE adhoc_games SET state_json = ?, sessions_json = ?, operations_json = ?, replay_baseline_operation_ids_json = ?, goal_scorers_json = ? WHERE game_id = ?",
             [
               JSON.stringify(game.state),
               JSON.stringify(game.sessions),
               JSON.stringify(game.operations),
               JSON.stringify(game.replayBaselineOperationIds ?? []),
+              JSON.stringify(game.goalScorers ?? []),
               gameId,
             ],
           );
@@ -2046,6 +2056,7 @@ function parseStoredRow(row: Record<string, string | number>): StoredAdHocGame {
     operation.status ??= "accepted";
   }
   const parsed = {
+    goalScorers: JSON.parse(String(row.goal_scorers_json ?? "[]")) as AdHocGoalScorer[],
     gameId: String(row.game_id),
     environmentIdentity: String(row.environment_identity ?? ""),
     createdAtMs: Number(row.created_at_ms),
@@ -2266,6 +2277,32 @@ function validateStoredGame(game: StoredAdHocGame): StoredAdHocGame {
   if (game.fixtureKey !== undefined && !isSqmFixtureKey(game.fixtureKey))
     throw new Error("Stored Ad Hoc fixture key is invalid.");
   validateGameState(game.state, game.gameId);
+  if (game.goalScorers !== undefined) {
+    if (!Array.isArray(game.goalScorers) || game.goalScorers.length > game.state.scoreEvents.length)
+      throw new Error("Stored goal scorers are invalid.");
+    const scorerIds = new Set<string>();
+    for (const scorer of game.goalScorers) {
+      if (!isRecord(scorer)) throw new Error("Stored goal scorer is invalid.");
+      requireOpaque(scorer.scoreActionId, "scoreActionId");
+      requireSafeNonNegative(scorer.gameTimeMs, "scorer gameTimeMs");
+      if (scorerIds.has(scorer.scoreActionId) || (scorer.side !== "home" && scorer.side !== "away"))
+        throw new Error("Stored goal scorer identity is invalid.");
+      scorerIds.add(scorer.scoreActionId);
+      const player = scorer.player;
+      if (
+        player !== null &&
+        (!isRecord(player) ||
+          (player.number !== null &&
+            (!Number.isInteger(player.number) || player.number < 0 || player.number > 99)) ||
+          (player.name !== null &&
+            (typeof player.name !== "string" ||
+              player.name.trim().length === 0 ||
+              player.name.length > 200)) ||
+          (player.number === null && player.name === null))
+      )
+        throw new Error("Stored goal scorer player is invalid.");
+    }
+  }
   if (game.initialState !== undefined) validateGameState(game.initialState, game.gameId);
   if (!Array.isArray(game.replayBaselineOperationIds))
     throw new Error("Stored replay baseline is invalid.");
