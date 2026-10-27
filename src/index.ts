@@ -2463,6 +2463,7 @@ async function startServer() {
           console: true,
         },
       websocket: {
+        maxPayloadLength: SHARED_LIMITS.transport.websocketTextFrameBytes,
         error(error, ws) {
           socketFailure.fail(error, ws);
         },
