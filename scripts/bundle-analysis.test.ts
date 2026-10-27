@@ -81,7 +81,7 @@ test("fails closed when nested browser metadata is unavailable", () => {
   );
 });
 
-test("recovers Bun rewritten dynamic chunk edges without following true external imports", () => {
+test("follows source entry points independently of outputs without following true external imports", () => {
   const meta: Bun.BuildMetafile = {
     inputs: {
       "src/App.tsx": {
@@ -91,6 +91,13 @@ test("recovers Bun rewritten dynamic chunk edges without following true external
             path: "./chunk-e7nfzgzw.js",
             kind: "dynamic-import",
             original: "@/pages/event-admin-page",
+            entryPoint: "src/pages/event-admin-page.tsx",
+            external: true,
+          },
+          {
+            path: "./unknown-chunk.js",
+            kind: "dynamic-import",
+            entryPoint: "src/missing.tsx",
             external: true,
           },
           { path: "external-package", kind: "dynamic-import", external: true },
@@ -108,15 +115,7 @@ test("recovers Bun rewritten dynamic chunk edges without following true external
       "external-package": { bytes: 10, imports: [] },
       "external-static": { bytes: 10, imports: [] },
     },
-    outputs: {
-      "./chunk-e7nfzgzw.js": {
-        bytes: 10,
-        inputs: {},
-        imports: [],
-        exports: [],
-        entryPoint: "src/pages/event-admin-page.tsx",
-      },
-    },
+    outputs: {},
   };
   const chains = importChains(meta, "src/App.tsx");
   expect(chains.get("src/pages/event-admin-page.tsx")).toEqual([
@@ -128,6 +127,9 @@ test("recovers Bun rewritten dynamic chunk edges without following true external
     "src/pages/event-admin-page.tsx",
     "src/pages/administrative-audit-browser.tsx",
   ]);
+  expect(chains.has("src/missing.tsx")).toBe(false);
+  expect(chains.has("./unknown-chunk.js")).toBe(false);
+  expect(chains.size).toBe(3);
   expect(chains.has("external-package")).toBe(false);
   expect(chains.has("external-static")).toBe(false);
   expect(chains.has("./chunk-e7nfzgzw.js")).toBe(false);
