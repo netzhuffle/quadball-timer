@@ -89,6 +89,12 @@ try {
     sqliteVersion?: string;
   };
 
+  if (runtime.bunVersion !== Bun.version) {
+    throw new Error(
+      `Compiled executable embeds Bun ${runtime.bunVersion ?? "unknown"}, but the release builder runs ${Bun.version}.`,
+    );
+  }
+
   const bundleMembers: ReleaseBundleMember[] = [];
   for (const bundlePath of RELEASE_BUNDLE_ALLOWLIST) {
     const bytes = await readFile(join(stagingDirectory, bundlePath));
