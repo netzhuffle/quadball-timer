@@ -36,3 +36,6 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 
 # Persistent worktree development databases and keys
 .local/
+
+# Local agent implementation plans
+/plans/
