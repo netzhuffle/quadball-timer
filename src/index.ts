@@ -1,3 +1,4 @@
+import { createWebSocketFailureBoundary } from "@/lib/websocket-failure-boundary";
 import { createDisabledLocalAuth, isLocalHttpDevelopment } from "@/lib/local-http-auth";
 import { serve, type ServerWebSocket } from "bun";
 import { createHash, randomBytes } from "node:crypto";
@@ -723,6 +724,13 @@ async function startServer() {
         )
         .catch(() => undefined);
     };
+    const socketFailure = createWebSocketFailureBoundary({
+      work,
+      accepting: () => accepting,
+      closed: (ws: ServerWebSocket<SessionData>) => ws.data.closed,
+      monitoring,
+      disconnect: disconnectSocket,
+    });
     const serverOptions = {
       hostname: process.env.HOST ?? "127.0.0.1",
       port,
@@ -2455,6 +2463,9 @@ async function startServer() {
           console: true,
         },
       websocket: {
+        error(error, ws) {
+          socketFailure.fail(error, ws);
+        },
         backpressureLimit: AD_HOC_MAX_QUEUED_OUTPUT_BYTES,
         closeOnBackpressureLimit: true,
         open(ws) {
@@ -2683,8 +2694,7 @@ async function startServer() {
     });
     const receiveMessage = serverOptions.websocket.message.bind(serverOptions.websocket);
     serverOptions.websocket.message = async (ws, message) => {
-      if (!accepting || ws.data.closed) return;
-      await work.track(receiveMessage(ws, message));
+      await socketFailure.dispatch(ws, () => receiveMessage(ws, message));
     };
     server = serve<SessionData>(serverOptions);
     shutdown = () => {
